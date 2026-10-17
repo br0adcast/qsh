@@ -1027,7 +1027,14 @@ impl<'a> Climb<'a> {
                 }
             }
             (None, trust::KeySource::Pinned) => {
-                match trust::after_silence(host, port, sockaddr, server.key, discovery) {
+                match trust::after_silence(
+                    host,
+                    port,
+                    sockaddr,
+                    server.key,
+                    discovery,
+                    &self.setup.pins,
+                ) {
                     trust::AfterSilence::Changed(e) => {
                         self.say_loud(format!("qsh: {e}"));
                         return (DirectOutcome::KeyChanged, None);
