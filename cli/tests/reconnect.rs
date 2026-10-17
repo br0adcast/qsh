@@ -360,6 +360,63 @@ fn a_dead_link_reconnects_by_itself_after_a_failed_round() {
     );
 }
 
+/// ICMP refusal accelerates a dead live socket and the following UDP rounds.
+#[test]
+fn a_closed_live_port_starts_recovery_and_retries_before_the_silent_deadline() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    drop(relay);
+    assert!(
+        wait_for(Duration::from_secs(15), || verbose_log(config.path())
+            .contains("recovery: UDP round 2")),
+        "explicit refusal should reach a second UDP round before 45 seconds: {}",
+        verbose_log(config.path())
+    );
+    assert!(client.child.try_wait().unwrap().is_none());
+    client.master.write_all(b"\x1d.").unwrap();
+    assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(1));
+}
+
+/// A refused primary must not detach a session that another path can carry.
+#[test]
+fn refusal_on_one_road_keeps_the_authenticated_alternative_and_shell() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let first = format!("127.0.0.1:{},ssh=1", relay.port);
+    let second = format!("127.0.0.1:{}", daemon.port);
+    let mut client = spawn_qsh(
+        &[
+            "--verbose",
+            "-i",
+            key_path.to_str().unwrap(),
+            &first,
+            &second,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    drop(relay);
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(15)),
+        "{}",
+        screen.text()
+    );
+    let log = verbose_log(config.path());
+    assert!(!log.contains("recovery: UDP round"), "{log}");
+    assert!(!log.contains("trying ssh"), "{log}");
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
 /// A daemon that restarted has no session to return to: the reconnect ends
 /// the run with code 13 and says why, once the terminal is restored.
 #[test]

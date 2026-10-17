@@ -11,8 +11,12 @@
 //! user sees and whether the next key is worth trying, so it is a pure
 //! function with its own tests.
 
+use crate::port_probe::{PortProbe, ProbeResult};
+use ::connect::recovery_gate::RecoveryEpoch;
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+#[cfg(test)]
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
@@ -298,7 +302,7 @@ pub struct Attempt {
     pub client: Arc<StdClient>,
     pub events: Arc<Events>,
     started: std::time::Instant,
-    refusal_probe: Mutex<Option<UdpSocket>>,
+    refusal_probe: Mutex<Option<PortProbe>>,
 }
 
 /// How an attempt proves who it is.
@@ -389,24 +393,22 @@ impl Attempt {
         }
     }
 
-    /// A foreground-only, best-effort check alongside the real handshake.
-    /// The key request creates no session and its response is never trusted.
-    /// A separate connected socket can receive ICMP errors without filtering
-    /// the transport's multipath replies. Silence does not change its deadline.
+    /// Best-effort refusal hint alongside the real handshake. The transport's
+    /// main socket stays unconnected so authenticated alternative paths work.
     pub fn probe_port_refusal(&self, addr: SocketAddr) {
-        let bind = if addr.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let probe = (|| -> std::io::Result<UdpSocket> {
-            let socket = UdpSocket::bind(bind)?;
-            socket.connect(addr)?;
-            socket.set_nonblocking(true)?;
-            socket.send(&transport::wire::encode_key_request())?;
-            Ok(socket)
-        })();
-        *self.refusal_probe.lock().expect("refusal probe mutex") = probe.ok();
+        self.probe_port_refusal_stamped(
+            addr,
+            RecoveryEpoch {
+                connection: 0,
+                network: 0,
+            },
+            0,
+        );
+    }
+
+    pub fn probe_port_refusal_stamped(&self, addr: SocketAddr, epoch: RecoveryEpoch, attempt: u64) {
+        *self.refusal_probe.lock().expect("refusal probe mutex") =
+            PortProbe::start(addr, epoch, attempt).ok();
     }
 
     fn port_refusal(&self) -> Option<SendFailure> {
@@ -415,24 +417,15 @@ impl Attempt {
             *probe = None;
             return None;
         }
-        let socket = probe.as_ref()?;
-        let mut buf = [0; 256];
-        match socket.recv(&mut buf) {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                None
-            }
+        match probe.as_mut()?.poll() {
+            ProbeResult::Pending => None,
             result => {
                 *probe = None;
-                match result {
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        Some((e.kind(), e.to_string()))
-                    }
-                    _ => None,
+                if matches!(result, ProbeResult::Refused { .. }) {
+                    let error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+                    Some((error.kind(), error.to_string()))
+                } else {
+                    None
                 }
             }
         }

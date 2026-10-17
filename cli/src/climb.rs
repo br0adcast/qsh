@@ -454,6 +454,9 @@ impl<'a> Climb<'a> {
 
     pub fn run(&mut self) -> Climbed {
         let cancel = knock::Cancel::new();
+        if let Some(recovery) = self.recovery {
+            return self.run_cancellable(&recovery.cancel);
+        }
         if self.background() {
             return self.run_cancellable(&cancel);
         }
@@ -816,7 +819,21 @@ impl<'a> Climb<'a> {
         // dual-stack resolver puts the AAAA record first. See
         // `connect::preferred_addr`.
         // `Err(None)`: the resolver answered with no address at all.
-        let resolved = if self.background() {
+        let resolved = if let Some(recovery) = self.recovery.filter(|r| r.catalog_managed()) {
+            let started = std::time::Instant::now();
+            loop {
+                if self.interrupted() || cancel.is_cancelled() {
+                    break Err(None);
+                }
+                if let Some(endpoint) = recovery.endpoint(i) {
+                    break Ok(endpoint);
+                }
+                if started.elapsed() >= crate::road_catalog::DNS_TIMEOUT {
+                    break Err(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        } else if self.background() {
             match (host.as_str(), port).to_socket_addrs() {
                 Ok(it) => attempt::preferred_addr(it).ok_or(None),
                 Err(error) => Err(Some(error.to_string())),
@@ -853,7 +870,7 @@ impl<'a> Climb<'a> {
         };
         let diagnostic = self
             .recovery
-            .map(|r| r.discovery(i, self.setup.discovery.clone()));
+            .map(|r| r.discovery(i, self.revision, self.setup.discovery.clone()));
         let foreground_discovery = trust::ForegroundDiscovery(self.setup.discovery.as_ref());
         let discovery: &dyn trust::Discover = diagnostic
             .as_ref()
@@ -1078,6 +1095,13 @@ impl<'a> Climb<'a> {
         sockaddr: SocketAddr,
         key: [u8; 32],
     ) -> (DirectOutcome, Option<String>) {
+        if self.interrupted() {
+            self.forget(&att);
+            return (
+                DirectOutcome::NoAnswer(NoAnswerWhy::Silent { waited_secs: 0 }),
+                None,
+            );
+        }
         let outcome = landed(self.background(), att.client.resumed());
         if outcome == DirectOutcome::Connected {
             let mut slot = self
@@ -1126,7 +1150,7 @@ impl<'a> Climb<'a> {
         }
         let diagnostic = self
             .recovery
-            .map(|r| r.discovery(i, self.setup.discovery.clone()));
+            .map(|r| r.discovery(i, self.revision, self.setup.discovery.clone()));
         let foreground_discovery = trust::ForegroundDiscovery(self.setup.discovery.as_ref());
         let discovery: &dyn trust::Discover = diagnostic
             .as_ref()
@@ -1201,6 +1225,11 @@ impl<'a> Climb<'a> {
     /// pinned without asking, with one line. A key pinned there in the
     /// meantime -- another `qsh` -- is left as it is.
     fn proved(&self, host: &str, port: u16, server: &trust::ServerKey) {
+        // Recovery publication is owned by the main loop after stamp validation.
+        // A late handshake must never write trust from its worker thread.
+        if self.recovery.is_some() || self.interrupted() {
+            return;
+        }
         let trust::KeySource::Neighbour { of } = &server.source else {
             return;
         };
@@ -1253,7 +1282,9 @@ impl<'a> Climb<'a> {
             self.tx.clone(),
             self.setup.token,
         );
-        if !self.background() {
+        if let Some((epoch, sweep)) = self.recovery_attempt {
+            att.probe_port_refusal_stamped(sockaddr, epoch, sweep.0);
+        } else {
             att.probe_port_refusal(sockaddr);
         }
         // The one substrate this run's session ever uses: `ChannelSession`

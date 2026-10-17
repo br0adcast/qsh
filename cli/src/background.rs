@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ::connect::reconnect::RoundEnd;
-use ::connect::recovery_gate::{RecoveryEpoch, SweepId};
+use ::connect::recovery_gate::{AddressId, RecoveryEpoch, SweepId};
 use ::connect::Address;
+use std::net::SocketAddr;
 
 use crate::climb::{Climb, Climbed, Connected, Mode, Setup};
 use crate::recovery::Recovery;
@@ -35,13 +36,25 @@ pub enum Round {
 /// Dropping an unfinished recovery cancels both workers. If a success was
 /// already queued, detach it as well: nobody will drain its terminal bytes.
 pub struct RoundTask {
-    done: Receiver<Round>,
+    done: Receiver<(u64, Round)>,
     recovery: Arc<Recovery>,
+    setup: Arc<Setup>,
 }
 
 impl RoundTask {
     pub fn try_recv(&self) -> Result<Round, std::sync::mpsc::TryRecvError> {
-        self.done.try_recv()
+        let (revision, round) = self.done.try_recv()?;
+        if self.recovery.interrupted(revision) {
+            if let Round::Connected { connected, .. } = round {
+                connected.attempt.detach();
+            }
+            return Err(std::sync::mpsc::TryRecvError::Disconnected);
+        }
+        Ok(round)
+    }
+
+    pub fn update_endpoints(&self, epoch: RecoveryEpoch, endpoints: Vec<(AddressId, SocketAddr)>) {
+        self.recovery.update_endpoints(epoch, endpoints);
     }
 
     pub fn retry_now(&self) {
@@ -51,18 +64,23 @@ impl RoundTask {
 
 impl Drop for RoundTask {
     fn drop(&mut self) {
-        self.recovery.cancel.cancel();
-        if let Ok(Round::Connected { connected, .. }) = self.done.try_recv() {
+        self.recovery.stop(&self.setup);
+        if let Ok((_, Round::Connected { connected, .. })) = self.done.try_recv() {
             connected.attempt.detach();
         }
     }
 }
 
-struct CancelOnDrop(knock::Cancel);
-
+struct CancelOnDrop {
+    recovery: Arc<Recovery>,
+    setup: Arc<Setup>,
+    armed: bool,
+}
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.0.cancel();
+        if self.armed {
+            self.recovery.stop(&self.setup);
+        }
     }
 }
 
@@ -80,17 +98,64 @@ pub fn spawn_round(
     round: u64,
     progress: Sender<UiEvent>,
 ) -> RoundTask {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let epoch = RecoveryEpoch {
         connection: round,
         network: 0,
     };
     let recovery = Arc::new(Recovery::new(epoch, addresses.len()));
+    launch(
+        setup,
+        addresses,
+        first,
+        (cols, rows),
+        round,
+        progress,
+        epoch,
+        recovery,
+    )
+}
+
+/// Production recovery consumes the main loop's retained bounded DNS catalog.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_catalog_round(
+    setup: Arc<Setup>,
+    addresses: Vec<Address>,
+    first: usize,
+    size: (u16, u16),
+    round: u64,
+    progress: Sender<UiEvent>,
+    epoch: RecoveryEpoch,
+    membership: Vec<AddressId>,
+    endpoints: Vec<(AddressId, SocketAddr)>,
+) -> RoundTask {
+    let recovery = Arc::new(Recovery::with_catalog(epoch, membership, endpoints));
+    launch(
+        setup, addresses, first, size, round, progress, epoch, recovery,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch(
+    setup: Arc<Setup>,
+    addresses: Vec<Address>,
+    first: usize,
+    (cols, rows): (u16, u16),
+    round: u64,
+    progress: Sender<UiEvent>,
+    epoch: RecoveryEpoch,
+    recovery: Arc<Recovery>,
+) -> RoundTask {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let owner_setup = setup.clone();
     let worker = recovery.clone();
     std::thread::Builder::new()
         .name("qsh-reconnect".into())
         .spawn(move || {
-            let _cancel = CancelOnDrop(worker.cancel.clone());
+            let mut cancel = CancelOnDrop {
+                recovery: worker.clone(),
+                setup: setup.clone(),
+                armed: true,
+            };
             worker.spawn_ssh(setup.clone(), addresses.clone(), first);
             let mut udp_round = 0u64;
             loop {
@@ -141,12 +206,23 @@ pub fn spawn_round(
                         unreachable!("a background round has no exit code ({code})")
                     }
                 };
-                // Cancel SSH before handing over the only live connection.
-                worker.cancel.cancel();
-                if let Err(std::sync::mpsc::SendError(Round::Connected { connected, .. })) =
-                    done_tx.send(round)
+                // finish(Recovered) has already revoked SSH. Keep this task's
+                // stamp active until the owner consumes or drops the result.
+                if worker.interrupted(revision) {
+                    if let Round::Connected { connected, .. } = round {
+                        connected.attempt.detach();
+                    }
+                    if !worker.wait_udp(started, revision) {
+                        return;
+                    }
+                    continue;
+                }
+                cancel.armed = false;
+                if let Err(std::sync::mpsc::SendError((_, Round::Connected { connected, .. }))) =
+                    done_tx.send((revision, round))
                 {
                     connected.attempt.detach();
+                    worker.stop(&setup);
                 }
                 return;
             }
@@ -155,6 +231,7 @@ pub fn spawn_round(
     RoundTask {
         done: done_rx,
         recovery,
+        setup: owner_setup,
     }
 }
 

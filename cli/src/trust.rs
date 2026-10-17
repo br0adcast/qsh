@@ -89,12 +89,23 @@ type KeyResult = Result<[u8; 32], DiscoveryError>;
 struct PendingDiscovery {
     addr: SocketAddr,
     result: std::sync::mpsc::Receiver<KeyResult>,
+    cancel: knock::Cancel,
+}
+impl Drop for PendingDiscovery {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// One diagnostic slot per configured address, so DNS/port changes cannot
 /// accumulate completed results. Queries keep the normal discovery budget.
 #[derive(Default)]
 pub struct BackgroundDiscovery(std::sync::Mutex<Option<PendingDiscovery>>);
+impl BackgroundDiscovery {
+    pub fn invalidate(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 /// Nonblocking adapter used only after a recovery handshake got no answer.
 /// The driver of the next handshake can run while this query is pending.
@@ -124,13 +135,22 @@ impl Discover for RecoveryDiscovery<'_> {
         } else {
             let (tx, result) = channel();
             let source = self.source.clone();
+            let cancel = knock::Cancel::new();
+            let worker_cancel = cancel.clone();
             std::thread::Builder::new()
                 .name("qsh-key-diagnostic".into())
                 .spawn(move || {
-                    let _ = tx.send(source.key(addr));
+                    let result = source.key_until(addr, &|| worker_cancel.is_cancelled());
+                    if !worker_cancel.is_cancelled() {
+                        let _ = tx.send(result);
+                    }
                 })
                 .map_err(|e| DiscoveryError::Local(e.to_string()))?;
-            *pending = Some(PendingDiscovery { addr, result });
+            *pending = Some(PendingDiscovery {
+                addr,
+                result,
+                cancel,
+            });
         }
         // No key has arrived yet. The already-failed handshake determines
         // the user-facing timeout; a diagnostic never extends that timeout.

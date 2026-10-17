@@ -21,6 +21,7 @@ use ::connect::recovery_gate::{AddressId, RecoveryEpoch};
 use ::connect::Address;
 use client::channel::{ChannelId, ChannelSession, SessionEvent};
 use client::qsh::QshSubstrate;
+use qsh::port_probe::{PortProbe, RefusalWindow};
 use qsh::road_catalog::{BoundedResolver, RoadCatalog, RoadWork};
 use transport::driver_std::UseRoadOutcome;
 use transport::paths::{PathState, RoadInfo};
@@ -229,6 +230,8 @@ fn run(a: args::Args) -> i32 {
         road_epoch,
         road_origin: Instant::now(),
         road_active: remote,
+        refusal: None,
+        probe_attempt: 0,
         keep: false,
         round: None,
         rounds: 0,
@@ -401,6 +404,8 @@ struct Links {
     road_epoch: RecoveryEpoch,
     road_origin: Instant,
     road_active: SocketAddr,
+    refusal: Option<(RefusalWindow, Option<PortProbe>, Duration)>,
+    probe_attempt: u64,
     /// The person left with `Ctrl-] .`: the live link is let go quietly, so
     /// the session stays on the server.
     keep: bool,
@@ -488,7 +493,12 @@ impl Links {
     /// an answer.
     fn turn(&mut self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
         self.refresh_catalog();
+        let accelerate = self.poll_refusal();
         let mut actions = self.refresh_roads(sess, now_ms);
+        if accelerate {
+            log::log("recovery: refused live port after complete QSH path sweep");
+            actions.extend(self.on(Event::Now, sess, now_ms));
+        }
         actions.extend(self.on(Event::Tick, sess, now_ms));
         let Some(round) = &self.round else {
             return actions;
@@ -540,16 +550,20 @@ impl Links {
                 if let Some(live) = self.live.take() {
                     live.attempt.detach();
                 }
+                self.advance_epoch(false);
                 self.shell_channel = None;
                 let actions = sess.on_link_gone(now_ms);
                 self.rounds += 1;
-                self.round = Some(background::spawn_round(
+                self.round = Some(background::spawn_catalog_round(
                     self.setup.clone(),
                     self.addresses.clone(),
                     first,
                     sess.size(),
                     self.rounds,
                     self.tx.clone(),
+                    self.road_epoch,
+                    self.catalog.address_ids(),
+                    self.catalog.endpoints(),
                 ));
                 actions
             }
@@ -599,8 +613,7 @@ impl Links {
         log::log(&connect::features_line(attempt.client.features()));
         self.addresses[addr].qsh_port = port;
         self.at = addr;
-        self.road_epoch.connection += 1;
-        self.resolver.cancel();
+        self.advance_epoch(false);
         self.catalog = RoadCatalog::new(self.addresses.clone(), self.road_epoch);
         self.catalog.seed(AddressId(addr), remote);
         self.road_active = remote;
@@ -664,6 +677,9 @@ impl Links {
                 }
             }
         }
+        if let Some(round) = &self.round {
+            round.update_endpoints(self.road_epoch, self.catalog.endpoints());
+        }
         self.labels = self
             .catalog
             .endpoints()
@@ -685,6 +701,86 @@ impl Links {
                 host_port(&address.host, address.qsh_port),
             ));
         }
+    }
+
+    /// Invalidate every writer before changing the common catalog/worker epoch.
+    fn advance_epoch(&mut self, network: bool) {
+        self.setup.invalidate_ssh_authorization();
+        self.round = None;
+        if network {
+            self.road_epoch.network += 1;
+        } else {
+            self.road_epoch.connection += 1;
+        }
+        self.resolver.cancel();
+        self.catalog.reset(self.road_epoch);
+        self.refusal = None;
+    }
+
+    /// Notification hook only: desktop also keeps periodic DNS/probes/retries.
+    /// No platform network watcher is installed by this module.
+    fn network_changed(&mut self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
+        let recovering = self.round.is_some();
+        self.advance_epoch(true);
+        if recovering {
+            self.obey(
+                Order::Climb {
+                    first: self.at,
+                    detach: false,
+                },
+                sess,
+                now_ms,
+            )
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn poll_refusal(&mut self) -> bool {
+        let Some(live) = &self.live else {
+            self.refusal = None;
+            return false;
+        };
+        let client = &live.attempt.client;
+        if u64::from(client.stats().silent_secs) < transport::PATH_DOWN_AFTER.as_secs() {
+            self.refusal = None;
+            return false;
+        }
+        let now = self.road_origin.elapsed();
+        let active = client.active_path().unwrap_or(self.road_active);
+        if self.refusal.is_none() {
+            self.probe_attempt += 1;
+            self.refusal = Some((
+                RefusalWindow::new(
+                    self.road_epoch,
+                    self.probe_attempt,
+                    now,
+                    self.catalog.address_ids(),
+                ),
+                None,
+                Duration::ZERO,
+            ));
+        }
+        let (window, probe, retry_at) = self.refusal.as_mut().expect("refusal window");
+        if now >= *retry_at {
+            *probe = PortProbe::start(active, self.road_epoch, self.probe_attempt).ok();
+            *retry_at = now + Duration::from_secs(1);
+        }
+        if let Some(probe) = probe {
+            window.observe_refusal(probe.poll());
+        }
+        for (endpoint, sent) in client.path_probes() {
+            if let Some(sent) = sent.checked_duration_since(self.road_origin) {
+                window.probed(endpoint, sent);
+            }
+        }
+        let verified: Vec<_> = client
+            .roads()
+            .iter()
+            .filter(|road| road.state == PathState::Verified)
+            .map(|road| road.addr)
+            .collect();
+        window.ready(now, active, &self.catalog.endpoints(), &verified)
     }
 
     /// Tells `Session` how the live connection's roads look, when it is time
@@ -736,6 +832,7 @@ impl Links {
         };
         let client = live.attempt.client.clone();
         let tx = self.tx.clone();
+        let link = live.link;
         let started = std::thread::Builder::new()
             .name("qsh-use-road".into())
             .spawn(move || {
@@ -746,7 +843,10 @@ impl Links {
                     UseRoadOutcome::Moved | UseRoadOutcome::AlreadyInUse
                 );
                 // The main loop gone means the run is ending: nobody to tell.
-                let _ = tx.send(UiEvent::RoadSwitched { ok });
+                let _ = tx.send(UiEvent::FromLink {
+                    link,
+                    event: Box::new(UiEvent::RoadSwitched { ok }),
+                });
             });
         match started {
             Ok(_) => Vec::new(),
@@ -766,6 +866,7 @@ impl Links {
     /// holds a live connection into the session: it is let go quietly, not
     /// dropped -- dropping it could send `Close` while "kept" is printed.
     fn leave(self) {
+        self.setup.invalidate_ssh_authorization();
         let host = self.addresses[self.at].host.as_str();
         if let Some(Ok(Round::Connected { connected, .. })) =
             self.round.as_ref().map(background::RoundTask::try_recv)
@@ -1229,6 +1330,7 @@ fn interactive(
                 // The live link died under the session -- no `Close` from
                 // either side, so the server keeps the session: reconnect
                 // into it rather than leave (`Session` would leave with 0).
+                UiEvent::NetworkChanged => links.network_changed(&mut sess, now_ms()),
                 UiEvent::Link(LinkState::Closed) if links.died() => {
                     let mut actions = flush_shell_bytes(&mut shell_bytes, &mut sess, now_ms());
                     log::log("the link died; reconnecting");
