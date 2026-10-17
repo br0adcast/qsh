@@ -20,6 +20,11 @@ use russh::{Channel, MethodKind, MethodSet};
 
 #[derive(Default, Clone)]
 pub struct FakeAuth {
+    /// Accept every user public key, for host-verification boundary tests.
+    pub accept_any_key: bool,
+    pub activity: Arc<ServerActivity>,
+    /// Successive exec outputs, without running a shell or touching user state.
+    pub exec_outputs: Vec<Vec<u8>>,
     pub open_gate: Option<Arc<tokio::sync::Notify>>,
     pub read_delay: Duration,
     pub sftp: Option<SftpBehavior>,
@@ -34,6 +39,13 @@ pub struct FakeAuth {
     /// Drop the TCP connection, without a word, at this point of the login:
     /// a network loss, not a refusal.
     pub hang_up: Option<HangUp>,
+}
+
+#[derive(Default)]
+pub struct ServerActivity {
+    pub connections: AtomicUsize,
+    pub userauth: AtomicUsize,
+    pub exec: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -117,6 +129,7 @@ impl FakeServer {
                             _ = &mut stopped => return,
                             accepted = listener.accept() => {
                                 let Ok((stream, _)) = accepted else { return };
+                                auth.activity.connections.fetch_add(1, Ordering::SeqCst);
                                 let handler = Login::new(Arc::clone(&auth));
                                 let stream = DelayedRead { stream, delay: auth.read_delay, enabled: handler.authenticated.clone(), timer: None, ready: false };
                                 let config = Arc::clone(&config);
@@ -209,6 +222,9 @@ impl Login {
     /// What the server lists as still possible.
     fn methods(&self) -> MethodSet {
         let mut kinds = Vec::new();
+        if self.auth.accept_any_key {
+            kinds.push(MethodKind::PublicKey);
+        }
         if self.needs_first_factor() {
             // Only the key opens the way, as with `AuthenticationMethods`.
             kinds.push(MethodKind::PublicKey);
@@ -390,6 +406,7 @@ impl russh::server::Handler for Login {
     }
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
         }
@@ -397,6 +414,7 @@ impl russh::server::Handler for Login {
     }
 
     async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
         }
@@ -412,10 +430,11 @@ impl russh::server::Handler for Login {
         _user: &str,
         key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
         }
-        if self.is_partial_key(key) {
+        if self.auth.accept_any_key || self.is_partial_key(key) {
             return Ok(Auth::Accept);
         }
         Ok(self.reject())
@@ -426,6 +445,11 @@ impl russh::server::Handler for Login {
         _user: &str,
         key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
+        if self.auth.accept_any_key {
+            self.authenticated.store(true, Ordering::SeqCst);
+            return Ok(Auth::Accept);
+        }
         if !self.is_partial_key(key) {
             return Ok(self.reject());
         }
@@ -445,6 +469,7 @@ impl russh::server::Handler for Login {
         _submethods: &str,
         response: Option<Response<'a>>,
     ) -> Result<Auth, Self::Error> {
+        self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
         }
@@ -472,6 +497,25 @@ impl russh::server::Handler for Login {
             return Ok(Auth::Accept);
         }
         Ok(self.round())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        _command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let index = self.auth.activity.exec.fetch_add(1, Ordering::SeqCst);
+        if let Some(output) = self.auth.exec_outputs.get(index) {
+            session.channel_success(channel)?;
+            session.data(channel, output.clone())?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
     }
 
     async fn channel_open_session(

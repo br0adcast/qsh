@@ -238,7 +238,7 @@ impl std::error::Error for SshError {}
 
 /// What the host-key check saw, for the error that follows a refusal.
 #[derive(Default)]
-pub(crate) struct HostKeySlot(Mutex<Option<Result<(), SshError>>>);
+pub(crate) struct HostKeySlot(Mutex<Option<Result<HostKeyInfo, SshError>>>);
 
 /// How the russh session ended, as its handler was told; read when a login
 /// step finds the session gone.
@@ -282,7 +282,7 @@ impl russh::client::Handler for Handler {
         let wire = key.to_bytes().map_err(russh::Error::from)?;
         let info = host_key_info(&wire).map_err(|_| russh::Error::WrongServerSig)?;
         let (ok, verdict) = match host_key::judge(&wire, &self.known) {
-            host_key::Verdict::Trusted => (true, Ok(())),
+            host_key::Verdict::Trusted => (true, Ok(info)),
             host_key::Verdict::Unknown => (false, Err(SshError::UnknownHostKey(info))),
             host_key::Verdict::Changed => (false, Err(SshError::HostKeyChanged(info))),
         };
@@ -327,7 +327,37 @@ pub(crate) async fn establish(
     events: &dyn SshEvents,
     credits: Arc<write_budget::WriteCredits>,
     cancel: &knock::Cancel,
-) -> Result<russh::client::Handle<Handler>, SshError> {
+) -> Result<(russh::client::Handle<Handler>, HostKeyInfo), SshError> {
+    let verified = establish_kex(params, bind, events, credits, cancel).await?;
+    let mut handle = verified.handle;
+    let mut login = auth::Login {
+        handle: &mut handle,
+        username: &params.username,
+        host: &params.host,
+        step_timeout: params.connect_timeout,
+        clock: auth::PromptClock::default(),
+        ended: verified.ended,
+    };
+    with_cancel(auth::authenticate(&mut login, auth), cancel).await??;
+    Ok((handle, verified.host_key))
+}
+
+/// A checked key is published only after russh completes KEX, including
+/// verification of the server's signature. The handler callback alone is
+/// only an offer, not proof that the server owns that key.
+struct VerifiedConnection {
+    handle: russh::client::Handle<Handler>,
+    host_key: HostKeyInfo,
+    ended: Arc<EndSlot>,
+}
+
+async fn establish_kex(
+    params: &SshParams,
+    bind: Arc<dyn knock::SocketBind>,
+    events: &dyn SshEvents,
+    credits: Arc<write_budget::WriteCredits>,
+    cancel: &knock::Cancel,
+) -> Result<VerifiedConnection, SshError> {
     let target = open_target(params, bind.as_ref(), events, cancel)?;
     events.on_connect_stage(SshConnectStage::Connecting);
     let stream = tcp_connect(target, params, bind.as_ref(), cancel).await?;
@@ -367,7 +397,7 @@ pub(crate) async fn establish(
             )))
         }
     };
-    let mut handle = match connected {
+    let handle = match connected {
         Ok(h) => h,
         Err(e) => {
             // A refused host key surfaces as a russh error; the slot says why.
@@ -377,16 +407,41 @@ pub(crate) async fn establish(
             return Err(SshError::Protocol(e.to_string()));
         }
     };
-    let mut login = auth::Login {
-        handle: &mut handle,
-        username: &params.username,
-        host: &params.host,
-        step_timeout: params.connect_timeout,
-        clock: auth::PromptClock::default(),
+    let host_key = slot.0.lock().unwrap().take().ok_or_else(|| {
+        SshError::Protocol("the SSH handshake completed without a checked host key".into())
+    })??;
+    Ok(VerifiedConnection {
+        handle,
+        host_key,
         ended,
-    };
-    with_cancel(auth::authenticate(&mut login, auth), cancel).await??;
-    Ok(handle)
+    })
+}
+
+/// Completes verified SSH key exchange and closes the connection without
+/// user authentication or opening channels. Unknown and changed keys are
+/// errors, just as for `connect`; a later connection must check its own key.
+pub fn verify_host(
+    params: SshParams,
+    bind: Arc<dyn knock::SocketBind>,
+    cancel: &knock::Cancel,
+) -> Result<HostKeyInfo, SshError> {
+    struct Silent;
+    impl SshEvents for Silent {
+        fn on_channel(&self, _: client::channel::SubstrateEvent) {}
+        fn on_closed(&self, _: String) {}
+    }
+    // The runtime and handle are dropped together, closing the probe socket.
+    runtime().block_on(async {
+        let verified = establish_kex(
+            &params,
+            bind,
+            &Silent,
+            Arc::new(write_budget::WriteCredits::default()),
+            cancel,
+        )
+        .await?;
+        Ok(verified.host_key)
+    })
 }
 
 /// The compression algorithms offered, most preferred first: OpenSSH's

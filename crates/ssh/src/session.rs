@@ -155,9 +155,15 @@ impl ChannelSubstrate for SshSubstrate {
 pub struct SshConnection {
     commands: Commands,
     closed: Arc<AtomicBool>,
+    host_key: crate::HostKeyInfo,
 }
 
 impl SshConnection {
+    /// The server key from this connection's completed, verified key exchange.
+    pub fn server_host_key(&self) -> crate::HostKeyInfo {
+        self.host_key.clone()
+    }
+
     /// Upload a new file on this validated connection. Existing files are refused.
     /// Blocks until the transfer completes, fails, times out, or is cancelled.
     pub fn upload_file(
@@ -222,7 +228,7 @@ pub fn connect(
     cancel: &knock::Cancel,
 ) -> Result<(SshConnection, SshSubstrate), SshError> {
     let (commands, rx) = commands();
-    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), SshError>>();
+    let (ready_tx, ready_rx) = std_mpsc::channel::<Result<crate::HostKeyInfo, SshError>>();
     let closed = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
     let close_once = Arc::new(CloseOnce {
@@ -246,12 +252,12 @@ pub fn connect(
                 )
                 .await
                 {
-                    Ok(h) => {
+                    Ok((h, host_key)) => {
                         if cancel_for_thread.is_cancelled() {
                             let _ = ready_tx.send(Err(SshError::Cancelled));
                             return;
                         }
-                        if ready_tx.send(Ok(())).is_err() {
+                        if ready_tx.send(Ok(host_key)).is_err() {
                             return;
                         }
                         h
@@ -280,10 +286,11 @@ pub fn connect(
             SshError::ResourceLimit(format!("could not start the connection thread: {e}"))
         })?;
     match ready_rx.recv() {
-        Ok(Ok(())) => {
+        Ok(Ok(host_key)) => {
             let connection = SshConnection {
                 commands: commands.clone(),
                 closed,
+                host_key,
             };
             if cancel.is_cancelled() {
                 connection.close();
@@ -989,6 +996,10 @@ mod tests {
             let connection = SshConnection {
                 commands: commands.clone(),
                 closed: Arc::clone(&closed),
+                host_key: crate::host_key_info(
+                    &crate::test_support::SoftSigner::random().public_wire(),
+                )
+                .unwrap(),
             };
             let started = std::time::Instant::now();
             connection.close();
@@ -1076,6 +1087,10 @@ mod tests {
         let connection = SshConnection {
             commands: commands.clone(),
             closed: Arc::new(AtomicBool::new(false)),
+            host_key: crate::host_key_info(
+                &crate::test_support::SoftSigner::random().public_wire(),
+            )
+            .unwrap(),
         };
         let mut sub = SshSubstrate { commands };
         for _ in 0..256 {
