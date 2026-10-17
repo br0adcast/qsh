@@ -1,11 +1,10 @@
-//! Portable path/migration tests without the Linux-only daemon test harness.
+//! Portable client-path tests without the Linux-only daemon test harness.
 #[path = "../src/paths.rs"]
 mod paths;
 use qsh::{log, sessions};
 
 mod tests {
     use super::paths::*;
-    use crate::sessions;
     use sshauth::known_hosts::{HostVerdict, KnownHosts};
     use std::os::unix::fs::symlink;
     use std::{
@@ -31,13 +30,20 @@ mod tests {
             assert_eq!(cache_dir(), cache);
             assert_eq!(crate::sessions::default_dir(), config.join("sessions"));
             assert_eq!(crate::log::path(), cache.join("log"));
-            if cfg!(target_os = "macos") {
-                let hosts = KnownHosts::open(config.join("known_hosts"));
-                assert_eq!(
-                    hosts.check("example.org", 60000, &[7; 32]).unwrap(),
-                    HostVerdict::Known
-                );
-            }
+            assert!(!std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            let hosts = KnownHosts::open(config.join("known_hosts"));
+            assert_eq!(
+                hosts.check("example.org", 60000, &[7; 32]).unwrap(),
+                HostVerdict::Unknown
+            );
+            let old = KnownHosts::open(home.join("Library/Application Support/qsh/known_hosts"));
+            assert_eq!(
+                old.check("example.org", 60000, &[7; 32]).unwrap(),
+                HostVerdict::Known
+            );
             return;
         }
         for mode in ["default", "xdg"] {
@@ -87,41 +93,23 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_trust_updates_and_live_session_locks() {
+    fn old_directory_is_not_imported() {
         let home = tempfile::tempdir().unwrap();
         let old = home.path().join("Library/Application Support/qsh");
         let new = home.path().join(".config/qsh");
-        let old_hosts = KnownHosts::open(old.join("known_hosts"));
-        old_hosts.pin("example.org", 60000, &[7; 32]).unwrap();
-        let live = sessions::claim(&old.join("sessions"), "example.org", 60000);
-        prepare_at(&new, Some(&old)).unwrap();
-        let new_hosts = KnownHosts::open(new.join("known_hosts"));
-        assert_eq!(
-            new_hosts.check("example.org", 60000, &[7; 32]).unwrap(),
-            HostVerdict::Known
-        );
-        let other = sessions::claim(&new.join("sessions"), "example.org", 60000);
-        assert_ne!(
-            other.token, live.token,
-            "the old client's lock still protects its shell"
-        );
-        new_hosts.pin("another.example", 60000, &[8; 32]).unwrap();
-        assert_eq!(
-            old_hosts.check("another.example", 60000, &[8; 32]).unwrap(),
-            HostVerdict::Known
-        );
-        let token = live.token;
-        drop(live);
-        assert_eq!(
-            sessions::claim(&new.join("sessions"), "example.org", 60000).token,
-            token
-        );
-        assert!(old.is_dir(), "original data remains in place");
-        prepare_at(&new, Some(&old)).unwrap();
+        KnownHosts::open(old.join("known_hosts"))
+            .pin("example.org", 60000, &[7; 32])
+            .unwrap();
+        prepare_at(&new).unwrap();
+        assert!(!std::fs::symlink_metadata(&new)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!new.join("known_hosts").exists());
     }
 
     #[test]
-    fn conflicting_directories_are_not_merged_or_overwritten() {
+    fn existing_xdg_store_is_preserved() {
         let home = tempfile::tempdir().unwrap();
         let old = home.path().join("old");
         let new = home.path().join("new");
@@ -129,9 +117,7 @@ mod tests {
         std::fs::create_dir(&new).unwrap();
         std::fs::write(old.join("known_hosts"), "old data").unwrap();
         std::fs::write(new.join("known_hosts"), "new data").unwrap();
-        let error = prepare_at(&new, Some(&old)).unwrap_err().to_string();
-        assert!(error.contains(&old.display().to_string()), "{error}");
-        assert!(error.contains(&new.display().to_string()), "{error}");
+        prepare_at(&new).unwrap();
         assert_eq!(
             std::fs::read_to_string(old.join("known_hosts")).unwrap(),
             "old data"
@@ -143,29 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_migration_is_atomic_and_idempotent() {
-        let home = tempfile::tempdir().unwrap();
-        let old = home.path().join("old");
-        let new = home.path().join("config/qsh");
-        std::fs::create_dir(&old).unwrap();
-        std::thread::scope(|scope| {
-            let first = scope.spawn(|| prepare_at(&new, Some(&old)));
-            let second = scope.spawn(|| prepare_at(&new, Some(&old)));
-            first.join().unwrap().unwrap();
-            second.join().unwrap().unwrap();
-        });
-        assert_eq!(
-            std::fs::canonicalize(&new).unwrap(),
-            std::fs::canonicalize(&old).unwrap()
-        );
-    }
-
-    #[test]
-    fn fresh_setup_creates_a_private_directory_without_legacy_state() {
+    fn fresh_setup_creates_a_private_directory() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let new = home.path().join("config/qsh");
-        prepare_at(&new, Some(&home.path().join("absent"))).unwrap();
+        prepare_at(&new).unwrap();
         assert_eq!(
             std::fs::metadata(&new).unwrap().permissions().mode() & 0o777,
             0o700
@@ -174,30 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn broken_links_and_non_directories_do_not_silently_reset_trust() {
+    fn unusable_xdg_directory_is_reported() {
         let home = tempfile::tempdir().unwrap();
-        let old = home.path().join("old");
-        let new = home.path().join("new");
-        symlink(home.path().join("missing"), &old).unwrap();
-        assert!(prepare_at(&new, Some(&old)).is_err());
-        assert!(!new.exists());
-        std::fs::remove_file(&old).unwrap();
-        symlink(home.path().join("missing"), &new).unwrap();
-        assert!(prepare_at(&new, Some(&old)).is_err());
-        std::fs::remove_file(&new).unwrap();
-        std::fs::write(&old, "not a directory").unwrap();
-        assert!(prepare_at(&new, Some(&old)).is_err());
-    }
-
-    #[test]
-    fn existing_aliases_are_accepted_but_nested_destinations_are_refused() {
-        let home = tempfile::tempdir().unwrap();
-        let old = home.path().join("old");
-        let alias = home.path().join("alias");
-        std::fs::create_dir(&old).unwrap();
-        symlink(&old, &alias).unwrap();
-        prepare_at(&alias, Some(&old)).unwrap();
-        prepare_at(&old, Some(&old)).unwrap();
-        assert!(prepare_at(&old.join("nested/qsh"), Some(&old)).is_err());
+        let config = home.path().join("config");
+        symlink(home.path().join("missing"), &config).unwrap();
+        assert!(prepare_at(&config).is_err());
+        std::fs::remove_file(&config).unwrap();
+        std::fs::write(&config, "not a directory").unwrap();
+        assert!(prepare_at(&config).is_err());
     }
 }

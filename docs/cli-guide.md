@@ -63,15 +63,9 @@ otherwise supply their own key. The accepted key is stored in:
 Session tokens live in the adjacent `sessions` directory. XDG overrides must be
 absolute paths; empty or relative values use the defaults above.
 
-On macOS, if `~/Library/Application Support/qsh` already exists, qsh creates a
-directory symlink at the new config location pointing to that existing store.
-The original data stays in place: trust updates and session locks remain shared
-with older clients, including those already running. Do not delete the original
-directory while this link is in use. New installations create a regular XDG
-config directory. If both locations exist independently, or the old store is
-unreadable or broken, qsh stops before connecting and reports the conflict;
-close old clients and reconcile the stores manually before trying again.
-Server-side qshd state and host keys are unaffected.
+The client uses only the selected XDG store. Previous macOS files under
+`~/Library/Application Support/qsh` are not imported or linked automatically;
+existing files remain untouched. Server-side qshd state and host keys are unaffected.
 
 SSH independently uses `~/.ssh/known_hosts`, including hashed entries,
 `[host]:port`, and revoked keys. Unknown SSH keys need confirmation; changed
