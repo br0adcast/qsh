@@ -23,6 +23,7 @@ pub mod report;
 pub mod session;
 pub mod sessions;
 pub mod signals;
+pub mod ssh_bindings;
 pub mod ssh_step;
 pub mod status;
 pub mod statusline;
