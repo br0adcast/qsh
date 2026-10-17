@@ -103,9 +103,9 @@ back or you leave. Ctrl-] r starts a round at once, and over a link that
 still works it lets that link go first. The status line says what is going
 on; with --status off, a plate on the top row does.
 
-Every run is logged to ~/.cache/qsh/log (~/Library/Caches/qsh/log on
-macOS), one line per record: the time in UTC, the process id, the level
-and the part of qsh it comes from. Past 1 MiB it moves to log.1. A knock's
+Every run is logged to ~/.cache/qsh/log on Linux and macOS (or
+$XDG_CACHE_HOME/qsh/log), one line per record: the time in UTC, the process
+id, the level and the part of qsh it comes from. Past 1 MiB it moves to log.1. A knock's
 ports and data, passwords, passphrases and keys are never written.
 
 Exit codes (when the shell on the server exits, qsh exits with its code):
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn the_help_names_the_log_on_linux_and_macos() {
         assert!(USAGE.contains("~/.cache/qsh/log"));
-        assert!(USAGE.contains("~/Library/Caches/qsh/log"));
+        assert!(USAGE.contains("$XDG_CACHE_HOME/qsh/log"));
         assert!(USAGE.contains("--verbose             more detail in the log"));
     }
 

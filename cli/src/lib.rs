@@ -15,6 +15,7 @@ pub mod known_hosts;
 pub mod log;
 pub mod mouse;
 pub mod overlay;
+pub mod paths;
 pub mod prompt;
 pub mod recovery;
 pub mod releases;

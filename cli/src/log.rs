@@ -1,5 +1,5 @@
-//! The client's log: `~/.cache/qsh/log` (`~/Library/Caches/qsh/log` on
-//! macOS), written on every run through the shared `logging` crate -- one
+//! The client's log: `$XDG_CACHE_HOME/qsh/log`, or `~/.cache/qsh/log` on Unix,
+//! written on every run through the shared `logging` crate -- one
 //! timestamped line per record, with the pid, the level and the component.
 //! The terminal is busy drawing the remote shell's own screen, so detail
 //! goes here and only precise messages go to the person.
@@ -61,10 +61,7 @@ pub fn init(verbose: bool) {
 
 /// Where the log is, the path the person is told to look at.
 pub fn path() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qsh")
-        .join("log")
+    crate::paths::cache_dir().join("log")
 }
 
 /// A record of this program's own, at `info`.
@@ -201,10 +198,11 @@ mod tests {
 
     #[test]
     fn the_path_is_the_cache_dir_s() {
-        let want = dirs::cache_dir()
-            .expect("cache dir")
-            .join("qsh")
-            .join("log");
+        let root = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| dirs::home_dir().expect("home").join(".cache"));
+        let want = root.join("qsh/log");
         assert_eq!(path(), want);
     }
 

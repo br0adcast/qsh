@@ -58,8 +58,20 @@ otherwise supply their own key. The accepted key is stored in:
 
 | Platform | qsh server-key store |
 | --- | --- |
-| Linux | `~/.config/qsh/known_hosts`, following the configured XDG config directory. |
-| macOS | `~/Library/Application Support/qsh/known_hosts`. |
+| Linux and macOS | `$XDG_CONFIG_HOME/qsh/known_hosts`, otherwise `~/.config/qsh/known_hosts`. |
+
+Session tokens live in the adjacent `sessions` directory. XDG overrides must be
+absolute paths; empty or relative values use the defaults above.
+
+On macOS, if `~/Library/Application Support/qsh` already exists, qsh creates a
+directory symlink at the new config location pointing to that existing store.
+The original data stays in place: trust updates and session locks remain shared
+with older clients, including those already running. Do not delete the original
+directory while this link is in use. New installations create a regular XDG
+config directory. If both locations exist independently, or the old store is
+unreadable or broken, qsh stops before connecting and reports the conflict;
+close old clients and reconcile the stores manually before trying again.
+Server-side qshd state and host keys are unaffected.
 
 SSH independently uses `~/.ssh/known_hosts`, including hashed entries,
 `[host]:port`, and revoked keys. Unknown SSH keys need confirmation; changed
@@ -273,8 +285,11 @@ The client log is enabled without `--verbose`:
 
 | Platform | Location |
 | --- | --- |
-| Linux | `$XDG_CACHE_HOME/qsh/log`, otherwise `~/.cache/qsh/log`. |
-| macOS | `~/Library/Caches/qsh/log`. |
+| Linux and macOS | `$XDG_CACHE_HOME/qsh/log`, otherwise `~/.cache/qsh/log`. |
+
+New logs use the XDG cache directory. Previous macOS logs under
+`~/Library/Caches/qsh` are left in place; they are not copied or removed.
+Downloaded release archives already use the XDG cache directory.
 
 After exceeding 1 MiB, `log` becomes `log.1` and a new log starts; one prior file
 is retained. Directories use mode 0700 and files 0600. Logging failures do not

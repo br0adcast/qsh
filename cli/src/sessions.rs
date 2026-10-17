@@ -107,10 +107,7 @@ pub fn claim(dir: &Path, host: &str, port: u16) -> Claim {
 
 /// Default store location: `~/.config/qsh/sessions`, beside `known_hosts`.
 pub fn default_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qsh")
-        .join("sessions")
+    crate::paths::config_dir().join("sessions")
 }
 
 /// A slot's file name. The host goes in verbatim except for characters that
