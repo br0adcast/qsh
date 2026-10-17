@@ -336,6 +336,7 @@ pub(crate) async fn establish(
         host: &params.host,
         step_timeout: params.connect_timeout,
         clock: auth::PromptClock::default(),
+        cancel: cancel.clone(),
         ended: verified.ended,
     };
     with_cancel(auth::authenticate(&mut login, auth), cancel).await??;
@@ -548,17 +549,23 @@ pub(crate) async fn with_cancel<F: std::future::Future>(
     cancel: &knock::Cancel,
 ) -> Result<F::Output, SshError> {
     tokio::pin!(fut);
-    loop {
+    // A ready I/O response may resume a multi-action future before the timer
+    // branch runs. Check on every poll, including that wakeup, before advancing it.
+    let guarded = std::future::poll_fn(|cx| {
         if cancel.is_cancelled() {
-            return Err(SshError::Cancelled);
+            return std::task::Poll::Ready(Err(SshError::Cancelled));
         }
+        let out = fut.as_mut().poll(cx);
+        if cancel.is_cancelled() {
+            std::task::Poll::Ready(Err(SshError::Cancelled))
+        } else {
+            out.map(Ok)
+        }
+    });
+    tokio::pin!(guarded);
+    loop {
         tokio::select! {
-            out = &mut fut => {
-                if cancel.is_cancelled() {
-                    return Err(SshError::Cancelled);
-                }
-                return Ok(out);
-            },
+            out = &mut guarded => return out,
             _ = tokio::time::sleep(knock::SLICE) => {}
         }
     }

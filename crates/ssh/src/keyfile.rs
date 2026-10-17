@@ -99,7 +99,7 @@ pub(crate) fn append_signature(mut to_sign: Vec<u8>, blob: &[u8]) -> Vec<u8> {
 /// The encoded SSH signature of `data`, as russh makes it for a key it
 /// holds (its own helper is private): RSA with the negotiated hash, other
 /// types as they are.
-fn sign_with_hash_alg(
+pub(crate) fn sign_with_hash_alg(
     key: &PrivateKey,
     hash_alg: Option<HashAlg>,
     data: &[u8],
