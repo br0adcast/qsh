@@ -690,15 +690,22 @@ fn udp_recovers_during_a_long_ssh_backoff() {
     );
     relay.cut();
     client.master.write_all(b"\x1dr").unwrap();
+    let mut tcp_admissions = 0;
     assert!(
         wait_for(Duration::from_secs(45), || {
             // An immediate EOF makes each SSH step fail without adding a timeout.
             if let Ok((stream, _)) = listener.accept() {
+                tcp_admissions += 1;
                 drop(stream);
             }
             verbose_log(config.path()).contains("next SSH round in 16 s; UDP keeps trying")
         }),
         "SSH must retain its growing pauses: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        tcp_admissions >= 5,
+        "five actual TCP logins must produce the 16-second backoff; NeedsPrompt alone is not evidence: {tcp_admissions}; {}",
         verbose_log(config.path())
     );
     assert!(!screen.top().contains("next attempt in"));
