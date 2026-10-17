@@ -177,6 +177,40 @@ fn spawn_to(port: u16, key_path: &std::path::Path, config: &std::path::Path) -> 
     )
 }
 
+/// Grant a test-only public SSH key so greeting/backoff tests reach their
+/// loopback listener under the same explicit authorization policy as users.
+fn seed_recovery_binding(config: &std::path::Path, daemon_port: u16, ssh_port: u16) {
+    use connect::server_identity::{ServerIdentity, SshBinding, SshEndpoint};
+    let qsh_key =
+        sshauth::discover::discover(([127, 0, 0, 1], daemon_port).into(), Duration::from_secs(1))
+            .unwrap();
+    let key =
+        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let binding = SshBinding {
+        server: ServerIdentity {
+            qsh_key,
+            username: qsh::args::parse_args(&["127.0.0.1".into()]).unwrap().login,
+        },
+        endpoint: SshEndpoint {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+        },
+        host_key: sshauth::record::encode_public_key(key.public_key()).unwrap(),
+    };
+    qsh::known_hosts::KnownHosts::new(config.join(".ssh/known_hosts"), None)
+        .add("127.0.0.1", ssh_port, "ssh-ed25519", &binding.host_key)
+        .unwrap();
+    qsh::ssh_bindings::SshBindings::open(config.join("qsh/ssh_bindings.json"))
+        .grant(
+            &binding,
+            &qsh::ssh_bindings::TrustWritePermit::new(connect::recovery_gate::RecoveryEpoch {
+                connection: 0,
+                network: 0,
+            }),
+        )
+        .unwrap();
+}
+
 /// `Ctrl-] r` over a live link lets it go and returns to the same session:
 /// a new connection is made (the client's log says it reattached, the
 /// plate said it was reconnecting), the shell still knows a variable set
@@ -436,6 +470,11 @@ fn udp_recovers_while_ssh_is_waiting_for_its_greeting() {
     let screen = Screen::of(&client);
     answer_yes(&mut client, &screen, &daemon);
     mark_the_shell(&mut client, &screen, &daemon);
+    seed_recovery_binding(
+        config.path(),
+        daemon.port,
+        listener.local_addr().unwrap().port(),
+    );
     relay.cut();
     client.master.write_all(b"\x1dr").unwrap();
     let mut ssh = None;
@@ -509,6 +548,11 @@ fn udp_recovers_during_a_long_ssh_backoff() {
     let screen = Screen::of(&client);
     answer_yes(&mut client, &screen, &daemon);
     mark_the_shell(&mut client, &screen, &daemon);
+    seed_recovery_binding(
+        config.path(),
+        daemon.port,
+        listener.local_addr().unwrap().port(),
+    );
     relay.cut();
     client.master.write_all(b"\x1dr").unwrap();
     assert!(
