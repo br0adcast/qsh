@@ -71,6 +71,23 @@ impl TrustWritePermit {
         *self.epoch.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    pub(crate) fn ensure_active(&self) -> Result<(), BindingError> {
+        drop(self.active()?);
+        Ok(())
+    }
+
+    /// Serialize ordinary foreground host-trust writes with epoch invalidation.
+    /// The closure must not call back into this permit or the binding store.
+    pub(crate) fn write_if_active<T>(
+        &self,
+        cancel: &knock::Cancel,
+        write: impl FnOnce() -> io::Result<T>,
+    ) -> Result<T, BindingError> {
+        let _active = self.active()?;
+        check_cancel(Some(cancel))?;
+        write().map_err(BindingError::Io)
+    }
+
     fn active(&self) -> Result<MutexGuard<'_, Option<RecoveryEpoch>>, BindingError> {
         let guard = self.epoch.lock().map_err(|_| BindingError::Cancelled)?;
         if guard.is_none() {
@@ -164,19 +181,41 @@ impl SshBindings {
         binding: &SshBinding,
         permit: &TrustWritePermit,
     ) -> Result<(), BindingError> {
+        self.grant_inner(binding, permit, None)
+    }
+
+    /// Foreground writes check cancellation again after waiting for the store
+    /// lock and immediately before commit. Epoch changes invalidate `permit`.
+    pub fn grant_cancellable(
+        &self,
+        binding: &SshBinding,
+        permit: &TrustWritePermit,
+        cancel: &knock::Cancel,
+    ) -> Result<(), BindingError> {
+        self.grant_inner(binding, permit, Some(cancel))
+    }
+
+    fn grant_inner(
+        &self,
+        binding: &SshBinding,
+        permit: &TrustWritePermit,
+        cancel: Option<&knock::Cancel>,
+    ) -> Result<(), BindingError> {
+        check_cancel(cancel)?;
         drop(permit.active()?);
         let record = Record::from_binding(binding);
         record.validate()?;
         fs::create_dir_all(self.directory())?;
         let _lock = WriteLock::acquire(&self.path)?;
         drop(permit.active()?);
+        check_cancel(cancel)?;
         let mut store = self.read()?;
         if store.bindings.contains(&record) {
             return Ok(());
         }
         store.bindings.push(record);
         let contents = serde_json::to_vec(&store).map_err(|_| BindingError::InvalidFormat)?;
-        self.write_atomic(&contents, permit)
+        self.write_atomic_cancellable(&contents, permit, cancel)
     }
 
     fn read(&self) -> Result<Store, BindingError> {
@@ -209,7 +248,17 @@ impl SshBindings {
             .unwrap_or_else(|| Path::new("."))
     }
 
+    #[cfg(test)]
     fn write_atomic(&self, contents: &[u8], permit: &TrustWritePermit) -> Result<(), BindingError> {
+        self.write_atomic_cancellable(contents, permit, None)
+    }
+
+    fn write_atomic_cancellable(
+        &self,
+        contents: &[u8],
+        permit: &TrustWritePermit,
+        cancel: Option<&knock::Cancel>,
+    ) -> Result<(), BindingError> {
         let mut prefix = std::ffi::OsString::from(".");
         prefix.push(self.path.file_name().ok_or(BindingError::InvalidFormat)?);
         prefix.push(".tmp.");
@@ -226,9 +275,18 @@ impl SshBindings {
         #[cfg(unix)]
         let directory = File::open(self.directory())?;
         let _active = permit.active()?;
+        check_cancel(cancel)?;
         fs::rename(temporary.path(), &self.path)?;
         #[cfg(unix)]
         directory.sync_all()?;
+        Ok(())
+    }
+}
+
+fn check_cancel(cancel: Option<&knock::Cancel>) -> Result<(), BindingError> {
+    if cancel.is_some_and(knock::Cancel::is_cancelled) {
+        Err(BindingError::Cancelled)
+    } else {
         Ok(())
     }
 }

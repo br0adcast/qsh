@@ -109,6 +109,8 @@ fn accept_installs_and_opens_shell() {
     client.master.write_all(b"yes\n").unwrap();
     screen.wait("Key fingerprint");
     client.master.write_all(b"yes\n").unwrap();
+    screen.wait("Authorize SSH recovery");
+    client.master.write_all(b"no\n").unwrap();
     client.type_line("echo INSTALL_'OK'");
     screen.wait("INSTALL_OK");
     assert!(image_path(&sb).is_file());
@@ -141,6 +143,8 @@ fn enter_accepts_installation_and_opens_shell() {
     client.master.write_all(b"\n").unwrap();
     screen.wait("Key fingerprint");
     client.master.write_all(b"yes\n").unwrap();
+    screen.wait("Authorize SSH recovery");
+    client.master.write_all(b"no\n").unwrap();
     client.type_line("echo INSTALL_'OK'");
     screen.wait("INSTALL_OK");
     assert!(image_path(&sb).is_file());
@@ -241,8 +245,20 @@ fn background_never_installs_even_with_cached_image() {
     seed(home.path());
     let relay = UdpRelay::start(daemon.port);
     let address = format!("127.0.0.1:{},ssh={}", relay.port, sb.sshd.port);
-    let (mut client, screen) = start(home.path(), &identity, &[address]);
+    let mut client = spawn_qsh(
+        &[
+            "--authorize-ssh",
+            "--verbose",
+            "-i",
+            identity.to_str().unwrap(),
+            &address,
+        ],
+        home.path(),
+    );
+    let screen = Screen::of(&client);
     screen.wait("Key fingerprint");
+    client.master.write_all(b"yes\n").unwrap();
+    screen.wait("Authorize SSH recovery");
     client.master.write_all(b"yes\n").unwrap();
     client.type_line("echo BEFORE_'RECOVERY'");
     screen.wait("BEFORE_RECOVERY");
