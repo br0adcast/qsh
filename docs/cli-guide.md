@@ -90,8 +90,9 @@ locations. An existing managed service is reported and reused instead of launchi
 If no daemon is found during an interactive connection:
 
 1. qsh asks permission to install a daemon for the remote OS and architecture.
-2. It downloads the **exact client version** from GitHub Releases and verifies
-   the archive against that release's `SHA256SUMS`.
+2. It fetches `SHA256SUMS` for the **exact client version** from GitHub Releases
+   on every installation attempt. A cached archive is reused only if its bytes
+   match the current checksum; otherwise qsh downloads and verifies it again.
 3. It caches the verified image under `$XDG_CACHE_HOME/qsh/releases`, or
    `~/.cache/qsh/releases` when that variable is unset, on both Linux and macOS.
 4. It transfers the image over SFTP to a temporary file, checks the remote bytes,
@@ -105,14 +106,20 @@ available line width and adapts when the window is resized. Redirected output
 uses plain text without animation.
 
 Linux and Darwin targets support x86_64 and aarch64. Corrupt cached images are
-rejected. Upload and startup have separate deadlines and support cancellation;
+rejected. If GitHub is temporarily unreachable, qsh can use a previously verified
+cache after checking its integrity again. A missing release, invalid metadata,
+checksum mismatch, unsafe redirect, or TLS verification failure stops installation
+instead of allowing a stale cache. After a new checksum is received, failure to
+download the matching archive also stops installation.
+
+Upload and startup have separate deadlines and support cancellation;
 time spent answering a prompt does not consume the network budget.
 
 Declining installation ends the address ladder. Installation does not use `sudo`,
 replace a system service, or update a daemon already found on the server.
 There are no `--install` or `--yes` flags. Background recovery never prompts,
-downloads, or installs. Without a matching published release, network access, or
-write permission, install the daemon manually.
+downloads, or installs. Without a matching published release, a usable download
+or verified offline cache, and write permission, install the daemon manually.
 
 SSH is only the bootstrap path for this console client. The terminal session
 always uses qsh's UDP transport.

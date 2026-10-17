@@ -39,7 +39,7 @@ fn release_cache_path_uses_xdg_then_home_independently_of_host_os() {
 }
 
 #[test]
-fn selected_release_cache_loads_complete_generation_without_http() {
+fn selected_release_cache_loads_complete_generation_when_github_is_unreachable() {
     let home = tempfile::tempdir().unwrap();
     let xdg = tempfile::tempdir().unwrap();
     for configured in [Some(xdg.path().as_os_str()), None] {
@@ -53,7 +53,7 @@ fn selected_release_cache_loads_complete_generation_without_http() {
         load(&expected, Fake::new(archive())).unwrap();
         let offline = Fake::offline();
         assert_eq!(&*load(&root, offline.clone()).unwrap().bytes, IMAGE);
-        assert_eq!(offline.calls(), 0);
+        assert_eq!(offline.calls(), 1);
     }
 }
 
@@ -99,7 +99,7 @@ fn valid_cache_is_offline_and_repairs_image_from_verified_archive() {
         fs::read(object(root.path(), &bytes).join("image")).unwrap(),
         IMAGE
     );
-    assert_eq!(offline.calls(), 0);
+    assert_eq!(offline.calls(), 2);
 }
 #[test]
 fn corrupt_archive_is_redownloaded_and_generation_repaired() {
@@ -294,7 +294,7 @@ fn concurrent_processes_publish_a_complete_generation() {
     }
     let offline = Fake::offline();
     assert_eq!(&*load(root.path(), offline.clone()).unwrap().bytes, IMAGE);
-    assert_eq!(offline.calls(), 0);
+    assert_eq!(offline.calls(), 1);
     assert_eq!(
         fs::read_dir(
             root.path()
@@ -417,7 +417,7 @@ fn offline_image_repair_honors_publication_budget() {
 }
 #[test]
 fn another_download_does_not_hold_the_cache_lock() {
-    use qsh::releases::{FetchLimits, ReleaseTransport};
+    use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
     use std::sync::{mpsc, Mutex};
     struct Paused {
         started: mpsc::Sender<()>,
@@ -431,7 +431,7 @@ fn another_download_does_not_hold_the_cache_lock() {
             limits: FetchLimits,
             cancel: &knock::Cancel,
             observer: &dyn bringup::BringUpObserver,
-        ) -> Result<Vec<u8>, ImageError> {
+        ) -> Result<Vec<u8>, FetchError> {
             if url.ends_with("SHA256SUMS") {
                 self.started.send(()).unwrap();
                 self.release
@@ -479,4 +479,117 @@ fn another_download_does_not_hold_the_cache_lock() {
     let first = worker.join().unwrap();
     assert_eq!(&*first.unwrap().bytes, IMAGE);
     assert_eq!(&*second.unwrap().bytes, IMAGE);
+}
+
+#[test]
+fn a_cache_hit_checks_current_metadata_without_downloading_the_archive() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    let online = Fake::new(archive());
+    assert_eq!(&*load(root.path(), online.clone()).unwrap().bytes, IMAGE);
+    assert_eq!(online.calls(), 1, "fetch SHA256SUMS even on a cache hit");
+}
+
+#[test]
+fn changed_published_checksum_replaces_the_cached_generation() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    let replacement = b"a replacement verified daemon";
+    let updated = Fake::new(gzip(&tar(&[(&format!("{STEM}/qshd"), b'0', replacement)])));
+    assert_eq!(
+        &*load(root.path(), updated.clone()).unwrap().bytes,
+        replacement
+    );
+    assert_eq!(updated.calls(), 2);
+}
+
+#[test]
+fn invalid_metadata_never_falls_back_to_a_valid_cache() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    for sums in [
+        vec![],
+        b"invalid checksum metadata".to_vec(),
+        [sums(&archive()), sums(&archive())].concat(),
+        format!("{}  {STEM}.tar.gz\n", "00".repeat(32)).into_bytes(),
+    ] {
+        let online = Arc::new(Fake {
+            sums,
+            archive: archive(),
+            calls: AtomicUsize::new(0),
+            offline: false,
+        });
+        assert!(matches!(
+            load(root.path(), online),
+            Err(ImageError::Checksum)
+        ));
+    }
+}
+
+#[test]
+fn rejected_metadata_and_cancel_never_use_a_cached_image() {
+    use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
+    struct Rejected(ImageError);
+    impl ReleaseTransport for Rejected {
+        fn fetch(
+            &self,
+            _: &str,
+            _: FetchLimits,
+            _: &knock::Cancel,
+            _: &dyn bringup::BringUpObserver,
+        ) -> Result<Vec<u8>, FetchError> {
+            Err(FetchError::Rejected(self.0.clone()))
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    for error in [
+        ImageError::Unavailable("HTTP 404".into()),
+        ImageError::Download("untrusted certificate".into()),
+        ImageError::Download("unsafe redirect".into()),
+        ImageError::Cancelled,
+    ] {
+        let result =
+            GitHubImages::with_transport(root.path().into(), Arc::new(Rejected(error.clone())))
+                .load(
+                    &request(),
+                    &InstallTiming::default(),
+                    &knock::Cancel::new(),
+                    &Silent,
+                );
+        assert_eq!(format!("{:?}", result.unwrap_err()), format!("{error:?}"));
+    }
+}
+
+#[test]
+fn archive_outage_after_a_new_checksum_does_not_fall_back_to_old_data() {
+    use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
+    struct MetadataOnly(Vec<u8>);
+    impl ReleaseTransport for MetadataOnly {
+        fn fetch(
+            &self,
+            url: &str,
+            _: FetchLimits,
+            _: &knock::Cancel,
+            _: &dyn bringup::BringUpObserver,
+        ) -> Result<Vec<u8>, FetchError> {
+            if url.ends_with("SHA256SUMS") {
+                Ok(self.0.clone())
+            } else {
+                Err(FetchError::TemporarilyUnavailable("offline".into()))
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    let updated = gzip(&tar(&[(&format!("{STEM}/qshd"), b'0', b"updated image")]));
+    let result =
+        GitHubImages::with_transport(root.path().into(), Arc::new(MetadataOnly(sums(&updated))))
+            .load(
+                &request(),
+                &InstallTiming::default(),
+                &knock::Cancel::new(),
+                &Silent,
+            );
+    assert!(matches!(result, Err(ImageError::Download(_))));
 }

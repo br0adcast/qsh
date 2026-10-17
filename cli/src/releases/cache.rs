@@ -125,6 +125,7 @@ impl Cache {
     pub(super) fn load(
         &self,
         request: &ImageRequest,
+        expected_sha: Option<&[u8; 32]>,
         budget: &Budget<'_>,
         publication: Duration,
     ) -> Result<Option<DaemonImage>, ImageError> {
@@ -136,6 +137,9 @@ impl Cache {
             Err(ImageError::Cancelled) => return Err(ImageError::Cancelled),
             Err(_) => return Ok(None),
         };
+        if expected_sha.is_some_and(|expected| expected != &cached.sha) {
+            return Ok(None);
+        }
         if cached.repair {
             let publication = Budget::new(publication, budget.cancel);
             atomic_file(&cached.object, "image", &cached.image.bytes, &publication)?;

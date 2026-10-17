@@ -27,6 +27,8 @@ render = { path = "../crates/render" }
 sha1 = "0.10"
 sha2 = "0.10"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-webpki-roots"] }
+# Inspect typed TLS failures before allowing an offline cache fallback.
+rustls = { version = "0.23", default-features = false }
 flate2 = "1"
 tar = "=0.4.46"
 serde = { version = "1", features = ["derive"] }

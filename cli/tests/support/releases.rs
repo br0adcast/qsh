@@ -1,5 +1,5 @@
-use bringup::{BringUpObserver, BringUpProgress, ImageError, ImageRequest, Platform};
-use qsh::releases::{FetchLimits, ReleaseTransport};
+use bringup::{BringUpObserver, BringUpProgress, ImageRequest, Platform};
+use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::sync::{
@@ -86,10 +86,10 @@ impl ReleaseTransport for Fake {
         _: FetchLimits,
         _: &knock::Cancel,
         _: &dyn BringUpObserver,
-    ) -> Result<Vec<u8>, ImageError> {
+    ) -> Result<Vec<u8>, FetchError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.offline {
-            return Err(ImageError::Download("offline".into()));
+            return Err(FetchError::TemporarilyUnavailable("offline".into()));
         }
         Ok(if url.ends_with("SHA256SUMS") {
             self.sums.clone()

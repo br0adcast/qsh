@@ -375,6 +375,11 @@ pub fn spawn_qsh_on(
         .env("XDG_CACHE_HOME", config_home)
         .env("TERM", "xterm-256color")
         .env("HISTFILE", "/dev/null")
+        // Release checks must fail locally so seeded offline caches are used.
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("https_proxy", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
         .stdin(Stdio::from(slave.try_clone().expect("clone")))
         .stdout(Stdio::from(slave.try_clone().expect("clone")))
         .stderr(Stdio::from(slave.try_clone().expect("clone")));
