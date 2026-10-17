@@ -36,6 +36,27 @@ pub struct FetchLimits {
     pub max_bytes: usize,
 }
 
+/// Only temporary network/service failures permit a verified offline cache.
+#[derive(Debug, Clone)]
+pub enum FetchError {
+    TemporarilyUnavailable(String),
+    Rejected(ImageError),
+}
+
+impl From<ImageError> for FetchError {
+    fn from(error: ImageError) -> Self {
+        Self::Rejected(error)
+    }
+}
+impl From<FetchError> for ImageError {
+    fn from(error: FetchError) -> Self {
+        match error {
+            FetchError::TemporarilyUnavailable(reason) => Self::Download(reason),
+            FetchError::Rejected(error) => error,
+        }
+    }
+}
+
 /// A bounded download seam; production uses certificate-verified HTTPS only.
 pub trait ReleaseTransport: Send + Sync {
     fn fetch(
@@ -44,7 +65,7 @@ pub trait ReleaseTransport: Send + Sync {
         limits: FetchLimits,
         cancel: &Cancel,
         observer: &dyn BringUpObserver,
-    ) -> Result<Vec<u8>, ImageError>;
+    ) -> Result<Vec<u8>, FetchError>;
 }
 
 pub struct GitHubImages {
@@ -99,15 +120,9 @@ impl ImageSource for GitHubImages {
         validate(request)?;
         let check = Budget::new(timing.verify, cancel);
         check.check()?;
-        let cache = cache::Cache::open(&self.cache_root, request, &check)?;
-        if let Some(image) = cache.load(request, &check, timing.publish)? {
-            return Ok(image);
-        }
-        // Network I/O must not monopolize the cache lock: another process can
-        // finish its own download or use a complete generation while we wait.
-        drop(cache);
+        // Contact GitHub before consulting the cache, without holding its lock.
         let (sums_url, archive_url) = release_urls(request)?;
-        let sums = self.transport.fetch(
+        let sums = match self.transport.fetch(
             &sums_url,
             FetchLimits {
                 total: timing.metadata,
@@ -116,13 +131,30 @@ impl ImageSource for GitHubImages {
             },
             cancel,
             observer,
-        )?;
+        ) {
+            Ok(sums) => sums,
+            Err(FetchError::TemporarilyUnavailable(reason)) => {
+                let check = Budget::new(timing.verify, cancel);
+                let cache = cache::Cache::open(&self.cache_root, request, &check)?;
+                return cache
+                    .load(request, None, &check, timing.publish)?
+                    .ok_or(ImageError::Download(reason));
+            }
+            Err(FetchError::Rejected(error)) => return Err(error),
+        };
         if sums.len() > SUMS_LIMIT {
             return Err(ImageError::Download(
                 "release metadata exceeds 1 MiB".into(),
             ));
         }
         let archive_sha = archive::expected_hash(&sums, &format!("{}.tar.gz", stem(request)))?;
+        let check = Budget::new(timing.verify, cancel);
+        let cache = cache::Cache::open(&self.cache_root, request, &check)?;
+        if let Some(image) = cache.load(request, Some(&archive_sha), &check, timing.publish)? {
+            return Ok(image);
+        }
+        drop(cache);
+        // Once GitHub names a hash, a failed download must not use older data.
         Budget::new(timing.download, cancel).check()?;
         let bytes = self.transport.fetch(
             &archive_url,

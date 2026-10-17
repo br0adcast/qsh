@@ -1,4 +1,4 @@
-use super::{FetchLimits, ReleaseTransport};
+use super::{FetchError, FetchLimits, ReleaseTransport};
 use bringup::{BringUpObserver, ImageError};
 use knock::Cancel;
 
@@ -10,7 +10,7 @@ impl ReleaseTransport for HttpsTransport {
         limits: FetchLimits,
         cancel: &Cancel,
         observer: &dyn BringUpObserver,
-    ) -> Result<Vec<u8>, ImageError> {
+    ) -> Result<Vec<u8>, FetchError> {
         fetch(reqwest::Client::builder(), url, limits, cancel, observer)
     }
 }
@@ -31,22 +31,22 @@ fn fetch(
     limits: FetchLimits,
     cancel: &Cancel,
     observer: &dyn BringUpObserver,
-) -> Result<Vec<u8>, ImageError> {
+) -> Result<Vec<u8>, FetchError> {
     if cancel.is_cancelled() {
-        return Err(ImageError::Cancelled);
+        return Err(FetchError::Rejected(ImageError::Cancelled));
     }
     let runtime = RuntimeOwner(Some(
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| ImageError::Download(clean(&error.to_string())))?,
+            .map_err(|error| rejected(clean(&error.to_string())))?,
     ));
     runtime.0.as_ref().expect("runtime is alive").block_on(async {
         // One deadline surrounds DNS, connect, redirects, headers and body.
         tokio::select! {
             biased;
-            _ = cancelled(cancel) => Err(ImageError::Cancelled),
-            _ = tokio::time::sleep(limits.total) => Err(ImageError::Download("release download deadline exceeded".into())),
+            _ = cancelled(cancel) => Err(FetchError::Rejected(ImageError::Cancelled)),
+            _ = tokio::time::sleep(limits.total) => Err(FetchError::TemporarilyUnavailable("release download deadline exceeded".into())),
             result = download(builder, url, limits, observer) => result,
         }
     })
@@ -57,7 +57,7 @@ async fn download(
     url: &str,
     limits: FetchLimits,
     observer: &dyn BringUpObserver,
-) -> Result<Vec<u8>, ImageError> {
+) -> Result<Vec<u8>, FetchError> {
     let client = builder
         .https_only(true)
         .user_agent(concat!("qsh/", env!("CARGO_PKG_VERSION")))
@@ -70,66 +70,67 @@ async fn download(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(download_error)?;
-    let mut url = reqwest::Url::parse(url)
-        .map_err(|error| ImageError::Download(clean(&error.to_string())))?;
+    let mut url = reqwest::Url::parse(url).map_err(|error| rejected(clean(&error.to_string())))?;
     let mut redirects = 0;
     let mut response = loop {
         if url.scheme() != "https" {
-            return Err(ImageError::Download("release URLs must use HTTPS".into()));
+            return Err(rejected("release URLs must use HTTPS".into()));
         }
         let response = tokio::time::timeout(limits.idle, client.get(url.clone()).send())
             .await
-            .map_err(|_| ImageError::Download("release download idle timeout".into()))?
+            .map_err(|_| {
+                FetchError::TemporarilyUnavailable("release download idle timeout".into())
+            })?
             .map_err(download_error)?;
         if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
             if redirects == 5 {
-                return Err(ImageError::Download(
-                    "release has more than five redirects".into(),
-                ));
+                return Err(rejected("release has more than five redirects".into()));
             }
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| ImageError::Download("invalid release redirect location".into()))?;
+                .ok_or_else(|| rejected("invalid release redirect location".into()))?;
             url = response
                 .url()
                 .join(location)
-                .map_err(|error| ImageError::Download(clean(&error.to_string())))?;
+                .map_err(|error| rejected(clean(&error.to_string())))?;
             redirects += 1;
         } else {
             break response;
         }
     };
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(ImageError::Unavailable(
-            "release asset not found (HTTP 404)".into(),
-        ));
+        return Err(missing("release asset not found (HTTP 404)".into()));
+    }
+    if response.status().is_server_error() || matches!(response.status().as_u16(), 408 | 429) {
+        return Err(FetchError::TemporarilyUnavailable(format!(
+            "release server returned HTTP {}",
+            response.status().as_u16()
+        )));
     }
     if !response.status().is_success() {
-        return Err(ImageError::Download(format!(
+        return Err(rejected(format!(
             "release server returned HTTP {}",
             response.status().as_u16()
         )));
     }
     let total = response.content_length();
     if total.is_some_and(|size| size > limits.max_bytes as u64) {
-        return Err(ImageError::Download(
-            "release download exceeds its size limit".into(),
-        ));
+        return Err(rejected("release download exceeds its size limit".into()));
     }
     let mut bytes = Vec::new();
     let mut last_progress = std::time::Instant::now();
     loop {
         let chunk = tokio::time::timeout(limits.idle, response.chunk())
             .await
-            .map_err(|_| ImageError::Download("release download idle timeout".into()))?
+            .map_err(|_| {
+                FetchError::TemporarilyUnavailable("release download idle timeout".into())
+            })?
             .map_err(download_error)?;
         let Some(chunk) = chunk else { break };
         if chunk.len() > limits.max_bytes.saturating_sub(bytes.len()) {
-            return Err(ImageError::Download(
-                "release download exceeds its size limit".into(),
-            ));
+            return Err(rejected("release download exceeds its size limit".into()));
         }
         bytes.extend_from_slice(&chunk);
         if last_progress.elapsed() >= std::time::Duration::from_millis(250) {
@@ -164,8 +165,37 @@ fn clean(text: &str) -> String {
         .collect()
 }
 
-fn download_error(error: reqwest::Error) -> ImageError {
-    ImageError::Download(clean(&error.without_url().to_string()))
+fn rejected(reason: String) -> FetchError {
+    FetchError::Rejected(ImageError::Download(reason))
+}
+
+fn missing(reason: String) -> FetchError {
+    FetchError::Rejected(ImageError::Unavailable(reason))
+}
+
+fn download_error(error: reqwest::Error) -> FetchError {
+    // reqwest classifies TLS verification failures as connection failures too.
+    // Inspect the typed source chain, never human-readable error text.
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    let mut tls_failure = false;
+    while let Some(cause) = source {
+        tls_failure |= cause.is::<rustls::Error>();
+        // io::Error::source skips its payload's outer layer. Follow get_ref
+        // instead so nested I/O wrappers cannot hide the rustls error.
+        source = if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io.get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            cause.source()
+        };
+    }
+    let temporary = !tls_failure && (error.is_connect() || error.is_timeout());
+    let reason = clean(&error.without_url().to_string());
+    if temporary {
+        FetchError::TemporarilyUnavailable(reason)
+    } else {
+        rejected(reason)
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +273,8 @@ def serve(raw):
    if path == '/downgrade': s.sendall(b'HTTP/1.1 302 Found\r\nLocation: http://localhost:1/no\r\nContent-Length: 0\r\n\r\n'); return
    if path == '/encoded':
     body = gzip.compress(b'abcd'); s.sendall(('HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n' % len(body)).encode() + body); return
+   if path.startswith('/status/'):
+    code = int(path.rsplit('/', 1)[1]); s.sendall(('HTTP/1.1 %d Status\r\nContent-Length: 0\r\n\r\n' % code).encode()); return
    if path == '/404': s.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'); return
    if path == '/headers': time.sleep(2)
    if path == '/huge': s.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n'); return
@@ -287,7 +319,7 @@ while True:
             path: &str,
             limits: FetchLimits,
             cancel: &Cancel,
-        ) -> Result<Vec<u8>, ImageError> {
+        ) -> Result<Vec<u8>, FetchError> {
             fetch(
                 self.builder(),
                 &format!("https://localhost:{}{path}", self.port),
@@ -317,14 +349,14 @@ while True:
             assert!(
                 matches!(
                     server.get(path, limits(), &cancel),
-                    Err(ImageError::Download(_))
+                    Err(FetchError::Rejected(ImageError::Download(_)))
                 ),
                 "{path}"
             );
         }
         assert!(matches!(
             server.get("/404", limits(), &cancel),
-            Err(ImageError::Unavailable(_))
+            Err(FetchError::Rejected(ImageError::Unavailable(_)))
         ));
         assert!(fetch(
             server.builder(),
@@ -334,15 +366,64 @@ while True:
             &Silent
         )
         .is_err());
-        assert!(fetch(
-            reqwest::Client::builder().no_proxy(),
-            &format!("https://localhost:{}/ok", server.port),
-            limits(),
-            &cancel,
-            &Silent
-        )
-        .is_err());
+        assert!(matches!(
+            fetch(
+                reqwest::Client::builder().no_proxy(),
+                &format!("https://localhost:{}/ok", server.port),
+                limits(),
+                &cancel,
+                &Silent
+            ),
+            Err(FetchError::Rejected(ImageError::Download(_)))
+        ));
     }
+    #[test]
+    fn temporary_http_failures_allow_fallback_but_other_statuses_do_not() {
+        let server = Server::start();
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(
+                matches!(
+                    server.get(&format!("/status/{code}"), limits(), &Cancel::new()),
+                    Err(FetchError::TemporarilyUnavailable(_))
+                ),
+                "HTTP {code}"
+            );
+        }
+        for code in [401, 403, 410] {
+            assert!(
+                matches!(
+                    server.get(&format!("/status/{code}"), limits(), &Cancel::new()),
+                    Err(FetchError::Rejected(_))
+                ),
+                "HTTP {code}"
+            );
+        }
+    }
+
+    struct FailedDns;
+    impl reqwest::dns::Resolve for FailedDns {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async { Err(std::io::Error::other("test DNS unavailable").into()) })
+        }
+    }
+
+    #[test]
+    fn dns_outage_is_a_temporary_failure() {
+        let result = fetch(
+            reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(FailedDns)),
+            "https://unreachable.invalid/",
+            limits(),
+            &Cancel::new(),
+            &Silent,
+        );
+        assert!(
+            matches!(result, Err(FetchError::TemporarilyUnavailable(_))),
+            "{result:?}"
+        );
+    }
+
     #[test]
     fn idle_total_and_redirect_deadlines_include_headers() {
         let server = Server::start();
@@ -350,14 +431,14 @@ while True:
         for path in ["/headers", "/stall"] {
             let start = Instant::now();
             assert!(
-                matches!(server.get(path, FetchLimits { idle: Duration::from_millis(80), ..limits() }, &cancel), Err(ImageError::Download(reason)) if reason.contains("idle"))
+                matches!(server.get(path, FetchLimits { idle: Duration::from_millis(80), ..limits() }, &cancel), Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("idle"))
             );
             assert!(start.elapsed() < Duration::from_millis(500));
         }
         for path in ["/drip", "/slowredirect/4"] {
             let start = Instant::now();
             assert!(
-                matches!(server.get(path, FetchLimits { total: Duration::from_millis(130), idle: Duration::from_secs(1), ..limits() }, &cancel), Err(ImageError::Download(reason)) if reason.contains("deadline"))
+                matches!(server.get(path, FetchLimits { total: Duration::from_millis(130), idle: Duration::from_secs(1), ..limits() }, &cancel), Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("deadline"))
             );
             assert!(start.elapsed() < Duration::from_millis(400));
         }
@@ -390,7 +471,7 @@ while True:
         let start = Instant::now();
         assert!(matches!(
             server.get("/stall", limits(), &cancel),
-            Err(ImageError::Cancelled)
+            Err(FetchError::Rejected(ImageError::Cancelled))
         ));
         assert!(start.elapsed() < Duration::from_millis(500));
         thread.join().unwrap();
@@ -478,9 +559,12 @@ while True:
             );
             assert!(started.load(std::sync::atomic::Ordering::SeqCst));
             if cancelled {
-                assert!(matches!(result, Err(ImageError::Cancelled)));
+                assert!(matches!(
+                    result,
+                    Err(FetchError::Rejected(ImageError::Cancelled))
+                ));
             } else {
-                assert!(matches!(result, Err(ImageError::Download(_))));
+                assert!(matches!(result, Err(FetchError::TemporarilyUnavailable(_))));
             }
             thread.join().unwrap();
         }
