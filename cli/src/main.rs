@@ -72,6 +72,14 @@ fn run(a: args::Args) -> i32 {
         eprintln!("qsh: could not install signal handlers: {error}");
         return 1;
     }
+    let config = match qsh::paths::prepare_config() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("qsh: {error}");
+            log::error(&error.to_string());
+            return 1;
+        }
+    };
     // Determined once, here, rather than inside `interactive`: the trial
     // has to tell the server this size when it opens the shell channel,
     // before any attempt is even known to work, and a later fresh query
@@ -85,7 +93,7 @@ fn run(a: args::Args) -> i32 {
     // lock is held for the whole run: another `qsh` to the same host takes
     // the next slot instead of stealing this one's shell.
     let claim = sessions::claim(
-        &sessions::default_dir(),
+        &config.join("sessions"),
         &a.addresses[0].host,
         a.addresses[0].qsh_port,
     );
@@ -96,7 +104,7 @@ fn run(a: args::Args) -> i32 {
         transport::generate_keypair(),
         // The qsh server keys pinned so far -- not ssh's `known_hosts`,
         // which the ssh step reads for itself.
-        sshauth::known_hosts::KnownHosts::open(known_hosts_path()),
+        sshauth::known_hosts::KnownHosts::open(config.join("known_hosts")),
         Box::new(trust::UdpDiscovery),
         prompt::Tty::new(),
         known_hosts::KnownHosts::standard(),
@@ -1234,13 +1242,6 @@ fn set_stderr_aside(raw: &tty::RawMode) {
     if let Err(e) = result {
         log::warn(&format!("could not set stderr aside: {e}"));
     }
-}
-
-fn known_hosts_path() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("qsh")
-        .join("known_hosts")
 }
 
 #[cfg(test)]

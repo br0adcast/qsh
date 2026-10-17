@@ -209,12 +209,7 @@ impl Setup {
             known_hosts: &self.ssh_hosts,
             tty: &self.tty,
             background,
-            images: Arc::new(crate::releases::GitHubImages::new(
-                crate::releases::release_cache_root(
-                    std::env::var_os("XDG_CACHE_HOME").as_deref(),
-                    &dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
-                ),
-            )),
+            images: Arc::new(crate::releases::GitHubImages::new(crate::paths::cache_dir())),
         }
     }
 

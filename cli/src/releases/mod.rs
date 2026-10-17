@@ -14,13 +14,8 @@ use std::{
 };
 
 /// Release cache location follows XDG on every supported client OS.
-/// Other CLI paths, including logs, keep their own platform conventions.
 pub fn release_cache_root(xdg_cache_home: Option<&OsStr>, home: &Path) -> PathBuf {
-    match xdg_cache_home.filter(|path| !path.is_empty()) {
-        Some(path) => PathBuf::from(path),
-        None => home.join(".cache"),
-    }
-    .join("qsh")
+    crate::paths::unix_root(home, xdg_cache_home, ".cache")
 }
 
 const SUMS_LIMIT: usize = 1024 * 1024;
