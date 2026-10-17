@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ::connect::recovery_gate::{AddressId, AddressOutcome, RecoveryEpoch, RecoveryGate, SweepId};
+
 use crate::climb::Setup;
 use crate::{log, report};
 
@@ -15,7 +17,7 @@ const POLL: Duration = Duration::from_millis(20);
 
 pub struct Recovery {
     pub cancel: knock::Cancel,
-    ssh_needed: AtomicBool,
+    gate: Mutex<RecoveryGate>,
     retry_now: AtomicBool,
     revision: AtomicU64,
     ports: Mutex<Vec<Option<u16>>>,
@@ -23,10 +25,13 @@ pub struct Recovery {
 }
 
 impl Recovery {
-    pub fn new(addresses: usize) -> Self {
+    pub fn new(epoch: RecoveryEpoch, addresses: usize) -> Self {
         Self {
             cancel: knock::Cancel::new(),
-            ssh_needed: AtomicBool::new(false),
+            gate: Mutex::new(RecoveryGate::new(
+                epoch,
+                (0..addresses).map(AddressId).collect(),
+            )),
             retry_now: AtomicBool::new(false),
             revision: AtomicU64::new(0),
             ports: Mutex::new(vec![None; addresses]),
@@ -36,12 +41,45 @@ impl Recovery {
         }
     }
 
-    pub fn need_ssh(&self) {
-        self.ssh_needed.store(true, Ordering::SeqCst);
+    pub fn begin_sweep(&self, sweep: SweepId) {
+        self.gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_sweep(sweep);
+    }
+
+    /// Only complete, current QSH results may admit the independent SSH worker.
+    pub fn finish(
+        &self,
+        revision: u64,
+        epoch: RecoveryEpoch,
+        sweep: SweepId,
+        addr: AddressId,
+        outcome: AddressOutcome,
+    ) {
+        if self.interrupted(revision) {
+            return;
+        }
+        let decision = self
+            .gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(epoch, sweep, addr, outcome);
+        if decision == ::connect::recovery_gate::GateDecision::AllowSsh {
+            log::log("recovery: full QSH sweep failed; SSH permitted");
+        }
+    }
+
+    pub fn ssh_allowed(&self) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ssh_allowed()
     }
 
     pub fn retry_now(&self) {
-        self.need_ssh();
         self.retry_now.store(true, Ordering::SeqCst);
     }
 
@@ -111,7 +149,7 @@ impl Recovery {
         std::thread::Builder::new()
             .name("qsh-reconnect-ssh".into())
             .spawn(move || {
-                while !recovery.ssh_needed.load(Ordering::SeqCst) {
+                while !recovery.ssh_allowed() {
                     if recovery.cancel.is_cancelled() {
                         return;
                     }
@@ -125,7 +163,7 @@ impl Recovery {
                 loop {
                     recovery.retry_now.store(false, Ordering::SeqCst);
                     for &i in &order {
-                        if recovery.cancel.is_cancelled() {
+                        if !recovery.ssh_allowed() {
                             return;
                         }
                         let address = &addresses[i];
@@ -171,9 +209,50 @@ impl Recovery {
 mod tests {
     use super::*;
 
+    const EPOCH: RecoveryEpoch = RecoveryEpoch {
+        connection: 7,
+        network: 0,
+    };
+
+    #[test]
+    fn manual_retry_cannot_skip_a_pending_qsh_address() {
+        let epoch = ::connect::recovery_gate::RecoveryEpoch {
+            connection: 7,
+            network: 0,
+        };
+        let sweep = ::connect::recovery_gate::SweepId(1);
+        let recovery = Recovery::new(EPOCH, 2);
+        recovery.begin_sweep(sweep);
+        recovery.retry_now();
+        assert!(!recovery.ssh_allowed());
+        recovery.finish(
+            recovery.revision(),
+            epoch,
+            sweep,
+            ::connect::recovery_gate::AddressId(0),
+            ::connect::recovery_gate::AddressOutcome::Failed,
+        );
+        assert!(!recovery.ssh_allowed());
+    }
+
+    #[test]
+    fn an_endpoint_update_does_not_complete_an_interrupted_sweep() {
+        let recovery = Recovery::new(EPOCH, 2);
+        let sweep = SweepId(1);
+        recovery.begin_sweep(sweep);
+        let revision = recovery.revision();
+        recovery.finish(revision, EPOCH, sweep, AddressId(0), AddressOutcome::Failed);
+        recovery.ready(1, 60001);
+        recovery.finish(revision, EPOCH, sweep, AddressId(1), AddressOutcome::Failed);
+        assert!(
+            !recovery.ssh_allowed(),
+            "an interrupted handshake cannot complete a failed QSH sweep"
+        );
+    }
+
     #[test]
     fn an_ssh_result_changes_only_its_address_and_interrupts_udp() {
-        let r = Recovery::new(2);
+        let r = Recovery::new(EPOCH, 2);
         let before = r.revision();
         r.ready(1, 60001);
         assert_eq!(r.port(0), None);
@@ -189,7 +268,7 @@ mod tests {
 
     #[test]
     fn cancelling_wakes_both_waiters_without_their_deadlines() {
-        let r = Recovery::new(1);
+        let r = Recovery::new(EPOCH, 1);
         r.cancel.cancel();
         let started = Instant::now();
         assert!(!r.wait_ssh(100));
@@ -199,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_manual_retry_skips_the_ssh_pause() {
-        let r = Recovery::new(1);
+        let r = Recovery::new(EPOCH, 1);
         r.retry_now();
         let started = Instant::now();
         assert!(r.wait_ssh(100));
@@ -208,7 +287,7 @@ mod tests {
 
     #[test]
     fn udp_rounds_have_no_pause_after_a_slow_attempt() {
-        let r = Recovery::new(1);
+        let r = Recovery::new(EPOCH, 1);
         let started = Instant::now();
         assert!(r.wait_udp(started - Duration::from_secs(10), r.revision()));
         assert!(started.elapsed() < Duration::from_millis(100));

@@ -392,6 +392,10 @@ pub struct Climb<'a> {
     loud: Option<String>,
     recovery: Option<&'a Recovery>,
     revision: u64,
+    recovery_attempt: Option<(
+        ::connect::recovery_gate::RecoveryEpoch,
+        ::connect::recovery_gate::SweepId,
+    )>,
     bootstrap: Option<(usize, ssh::HostKeyInfo)>,
 }
 
@@ -422,6 +426,7 @@ impl<'a> Climb<'a> {
             loud: None,
             recovery: None,
             revision: 0,
+            recovery_attempt: None,
             bootstrap: None,
         }
     }
@@ -430,7 +435,13 @@ impl<'a> Climb<'a> {
 impl<'a> Climb<'a> {
     /// In recovery this ladder owns only UDP. The SSH worker publishes
     /// its results and never starts a second warm attachment.
-    pub fn recovering(mut self, recovery: &'a Recovery) -> Self {
+    pub fn recovering(
+        mut self,
+        recovery: &'a Recovery,
+        epoch: ::connect::recovery_gate::RecoveryEpoch,
+        sweep: ::connect::recovery_gate::SweepId,
+    ) -> Self {
+        self.recovery_attempt = Some((epoch, sweep));
         self.revision = recovery.revision();
         self.recovery = Some(recovery);
         self
@@ -745,14 +756,6 @@ impl<'a> Climb<'a> {
         outcome: Outcome,
         line: Option<String>,
     ) -> Action {
-        if let Some(recovery) = self.recovery {
-            if matches!(
-                outcome,
-                Outcome::Direct(DirectOutcome::NoAnswer(_) | DirectOutcome::Refused)
-            ) {
-                recovery.need_ssh();
-            }
-        }
         log::log(&format!("ladder: outcome {outcome:?}"));
         let next = ladder.on(outcome);
         if let Some(line) = line {
@@ -767,6 +770,37 @@ impl<'a> Climb<'a> {
     /// ladder and the line to say about it, if any. `Err` is an exit code,
     /// only at login, only when the keys could not be loaded.
     fn direct(
+        &mut self,
+        i: usize,
+        port: u16,
+        stage: Stage,
+        cancel: &knock::Cancel,
+    ) -> Result<(DirectOutcome, Option<String>), i32> {
+        use ::connect::recovery_gate::{AddressId, AddressOutcome};
+        let result = self.direct_attempt(i, port, stage, cancel);
+        // Cancellation or a new SSH endpoint can interrupt a handshake. That
+        // is not a completed failed address in the sweep that started it.
+        if !self.interrupted() {
+            if let (Some(recovery), Some((epoch, sweep)), Ok((outcome, _))) =
+                (self.recovery, self.recovery_attempt, &result)
+            {
+                let outcome = match outcome {
+                    DirectOutcome::Connected | DirectOutcome::SessionGone => {
+                        AddressOutcome::Recovered
+                    }
+                    DirectOutcome::KeyChanged => AddressOutcome::IdentityMismatch,
+                    DirectOutcome::NeedsPrompt | DirectOutcome::Declined => {
+                        AddressOutcome::NeedsUser
+                    }
+                    _ => AddressOutcome::Failed,
+                };
+                recovery.finish(self.revision, epoch, sweep, AddressId(i), outcome);
+            }
+        }
+        result
+    }
+
+    fn direct_attempt(
         &mut self,
         i: usize,
         port: u16,

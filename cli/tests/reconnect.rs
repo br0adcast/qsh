@@ -408,32 +408,110 @@ fn a_restarted_daemon_ends_the_run_with_13() {
     );
 }
 
+/// A foreign daemon is a failed path, and the original key is tried again
+/// when that same endpoint returns to the expected daemon.
 #[test]
-fn a_changed_server_key_during_recovery_ends_the_run_with_11() {
+fn a_changed_server_key_during_recovery_is_retryable_without_repinning() {
     let _serial = serialised();
-    let (mut daemon, key_path) = start_daemon();
+    let (daemon, key_path) = start_daemon();
+    let (foreign, _) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
     let config = tempfile::tempdir().unwrap();
-    let mut client = spawn_client(&daemon, &key_path, config.path());
+    let mut client = spawn_to(relay.port, &key_path, config.path());
     let screen = Screen::of(&client);
     answer_yes(&mut client, &screen, &daemon);
     mark_the_shell(&mut client, &screen, &daemon);
-    daemon.restart_with_new_key();
+    let pins = config.path().join("qsh/known_hosts");
+    let before = std::fs::read(&pins).unwrap();
+    relay.redirect(foreign.port);
     client.master.write_all(b"\x1dr").unwrap();
-    let mut exit = None;
     assert!(
-        wait_for(Duration::from_secs(35), || {
-            exit = client.child.try_wait().unwrap();
-            exit.is_some()
-        }),
-        "the asynchronous key diagnostic must still stop recovery: {}",
+        wait_for(Duration::from_secs(35), || verbose_log(config.path())
+            .contains("outcome Direct(KeyChanged)")),
+        "the foreign key must be diagnosed: {}",
         verbose_log(config.path())
     );
-    assert_eq!(exit.unwrap().code(), Some(11));
     assert!(
-        wait_until(|| screen.has("has changed!")),
-        "{}",
-        screen.text()
+        client.child.try_wait().unwrap().is_none(),
+        "a foreign daemon cannot end recovery"
     );
+    assert_eq!(std::fs::read(&pins).unwrap(), before);
+    relay.redirect(daemon.port);
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(20)),
+        "the same address must retry the expected key: {}",
+        verbose_log(config.path())
+    );
+    assert_eq!(std::fs::read(&pins).unwrap(), before);
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+/// Every QSH path must fail before SSH starts. A foreign first path must
+/// neither stop the run nor reach SSH while the second path still works.
+#[test]
+fn a_foreign_first_daemon_does_not_block_the_expected_second_path_or_enable_ssh() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let (foreign, _) = start_daemon();
+    let first = UdpRelay::start(daemon.port);
+    let second = UdpRelay::start(daemon.port);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let first_address = format!(
+        "127.0.0.1:{},ssh={}",
+        first.port,
+        listener.local_addr().unwrap().port()
+    );
+    let second_address = format!("127.0.0.1:{}", second.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_qsh(
+        &[
+            "-i",
+            key_path.to_str().unwrap(),
+            "--status",
+            "off",
+            &first_address,
+            &second_address,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    seed_recovery_binding(
+        config.path(),
+        daemon.port,
+        listener.local_addr().unwrap().port(),
+    );
+    let pins = config.path().join("qsh/known_hosts");
+    let key =
+        sshauth::discover::discover(([127, 0, 0, 1], daemon.port).into(), Duration::from_secs(1))
+            .unwrap();
+    sshauth::known_hosts::KnownHosts::open(pins.clone())
+        .pin("127.0.0.1", second.port, &key)
+        .unwrap();
+    let before = std::fs::read(&pins).unwrap();
+    first.redirect(foreign.port);
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || verbose_log(config.path())
+            .contains("reconnected at address 1")),
+        "the second path must recover after the first fails: {}",
+        verbose_log(config.path())
+    );
+    assert!(the_same_shell_answers(
+        &mut client,
+        &screen,
+        Duration::from_secs(10)
+    ));
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "SSH must not start when the second QSH address recovers"
+    );
+    assert!(!verbose_log(config.path()).contains("trying ssh"));
+    assert_eq!(std::fs::read(&pins).unwrap(), before);
+    assert!(client.child.try_wait().unwrap().is_none());
+    exit_cleanly(&mut client, &screen, &daemon);
 }
 
 /// A stalled SSH greeting must not suspend UDP recovery. The same shell

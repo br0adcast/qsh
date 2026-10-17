@@ -315,6 +315,9 @@ fn words(
         ),
         Reason::RefusedAfterSsh => REFUSED_AFTER_SSH.to_string(),
         Reason::NeedsPrompt => "needs a prompt".to_string(),
+        Reason::IdentityMismatch => {
+            "server identity does not match the current session".to_string()
+        }
     }
 }
 

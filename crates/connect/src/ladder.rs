@@ -1,8 +1,8 @@
 //! The ladder of one connection attempt over a list of addresses (spec §4.1):
 //! for each address, qsh directly; if that does not work and the address has
 //! SSH, bring the daemon up over SSH; then qsh again on the port the daemon
-//! reported. A changed server key or a person declining it ends the whole
-//! ladder; anything else moves on to the next address.
+//! reported. During login a changed server key or a person declining it ends
+//! the whole ladder. Recovery treats a mismatched key as a failed address.
 //!
 //! The same ladder also runs in the background, behind a live terminal, when
 //! a session is being reconnected (spec §5.2): nobody is asked anything
@@ -157,6 +157,8 @@ pub enum Reason {
     /// The host name did not resolve.
     Unresolved,
     Refused,
+    /// This address did not prove the existing session's server identity.
+    IdentityMismatch,
     Ssh(SshFailure),
     /// No answer on `port`, the one the daemon brought up over ssh reported.
     NoAnswerAfterSsh {
@@ -285,9 +287,7 @@ impl Ladder {
                     addr: self.at,
                     port: self.addrs[self.at].qsh_port,
                 }),
-                DirectOutcome::KeyChanged => {
-                    self.end(Action::GiveUp(GiveUp::KeyChanged { addr: self.at }))
-                }
+                DirectOutcome::KeyChanged => self.key_changed(),
                 DirectOutcome::Declined => {
                     self.not_in(
                         Mode::Background,
@@ -356,9 +356,7 @@ impl Ladder {
                     addr: self.at,
                     port,
                 }),
-                DirectOutcome::KeyChanged => {
-                    self.end(Action::GiveUp(GiveUp::KeyChanged { addr: self.at }))
-                }
+                DirectOutcome::KeyChanged => self.key_changed(),
                 DirectOutcome::Declined => {
                     self.not_in(
                         Mode::Background,
@@ -392,6 +390,15 @@ impl Ladder {
             (step, outcome) => {
                 panic!("an outcome of a different step: {outcome:?} while at {step:?}")
             }
+        }
+    }
+
+    fn key_changed(&mut self) -> Action {
+        if self.mode == Mode::Background {
+            self.reasons.push(Reason::IdentityMismatch);
+            self.next_address()
+        } else {
+            self.end(Action::GiveUp(GiveUp::KeyChanged { addr: self.at }))
         }
     }
 
@@ -459,6 +466,27 @@ mod tests {
     }
     fn s(o: SshOutcome) -> Outcome {
         Outcome::Ssh(o)
+    }
+
+    #[test]
+    fn a_background_identity_mismatch_tries_the_next_address() {
+        let mut ladder = Ladder::background(vec![with_ssh("first"), with_ssh("second")], 0);
+        assert_eq!(ladder.on(d(D::KeyChanged)), Action::TryDirect { addr: 1 });
+        assert_eq!(
+            ladder.on(d(D::Connected)),
+            Action::Connected {
+                addr: 1,
+                port: 60022
+            }
+        );
+    }
+
+    #[test]
+    fn a_background_identity_mismatch_after_ssh_tries_the_next_address() {
+        let mut ladder = Ladder::background(vec![with_ssh("first"), with_ssh("second")], 0);
+        assert_eq!(ladder.on(d(D::Refused)), Action::TrySsh { addr: 0 });
+        ladder.on(s(S::Ready { port: 60001 }));
+        assert_eq!(ladder.on(d(D::KeyChanged)), Action::TryDirect { addr: 1 });
     }
 
     #[test]
@@ -855,11 +883,21 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_key_ends_the_background_round_too() {
+    fn mismatched_background_keys_fail_only_their_addresses() {
         let mut l = Ladder::background(vec![direct_only("a"), direct_only("b")], 0);
+        assert_eq!(l.on(d(D::KeyChanged)), Action::TryDirect { addr: 1 });
         assert_eq!(
             l.on(d(D::KeyChanged)),
-            Action::GiveUp(GiveUp::KeyChanged { addr: 0 })
+            Action::GiveUp(GiveUp::AllFailed(vec![
+                Failure {
+                    addr: 0,
+                    reasons: vec![Reason::IdentityMismatch]
+                },
+                Failure {
+                    addr: 1,
+                    reasons: vec![Reason::IdentityMismatch]
+                },
+            ]))
         );
     }
 

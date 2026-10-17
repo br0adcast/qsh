@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ::connect::reconnect::RoundEnd;
+use ::connect::recovery_gate::{RecoveryEpoch, SweepId};
 use ::connect::Address;
 
 use crate::climb::{Climb, Climbed, Connected, Mode, Setup};
@@ -80,7 +81,11 @@ pub fn spawn_round(
     progress: Sender<UiEvent>,
 ) -> RoundTask {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let recovery = Arc::new(Recovery::new(addresses.len()));
+    let epoch = RecoveryEpoch {
+        connection: round,
+        network: 0,
+    };
+    let recovery = Arc::new(Recovery::new(epoch, addresses.len()));
     let worker = recovery.clone();
     std::thread::Builder::new()
         .name("qsh-reconnect".into())
@@ -95,6 +100,8 @@ pub fn spawn_round(
                 let started = Instant::now();
                 let revision = worker.revision();
                 udp_round += 1;
+                let sweep = SweepId(udp_round);
+                worker.begin_sweep(sweep);
                 crate::log::log(&format!("recovery: UDP round {udp_round}"));
                 let (tx, rx) = std::sync::mpsc::channel();
                 let mut climb = Climb::new(
@@ -110,7 +117,7 @@ pub fn spawn_round(
                     tx,
                     &rx,
                 )
-                .recovering(&worker);
+                .recovering(&worker, epoch, sweep);
                 let climbed = climb.run();
                 if matches!(
                     climbed,

@@ -435,6 +435,7 @@ pub fn wait_for_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
 pub struct UdpRelay {
     pub port: u16,
     cut: Arc<AtomicBool>,
+    upstream: UdpSocket,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -455,6 +456,7 @@ impl UdpRelay {
         let stop = Arc::new(AtomicBool::new(false));
         let client: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
 
+        let upstream = back.try_clone().expect("clone upstream");
         let forward = {
             let front = front.try_clone().expect("clone front");
             let back = back.try_clone().expect("clone back");
@@ -491,9 +493,17 @@ impl UdpRelay {
         UdpRelay {
             port,
             cut,
+            upstream,
             stop,
             threads: vec![forward, backward],
         }
+    }
+
+    /// Move this test endpoint to another daemon without replacing the relay.
+    pub fn redirect(&self, target_port: u16) {
+        self.upstream
+            .connect(("127.0.0.1", target_port))
+            .expect("redirect relay");
     }
 
     pub fn cut(&self) {
