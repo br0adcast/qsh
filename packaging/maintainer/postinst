@@ -1,0 +1,45 @@
+#!/bin/sh
+# Post-installation script for the `qshd` package.
+#
+# ONE file serves both formats -- dpkg runs it as the postinst, rpm embeds its
+# text as %post (see `post_install_script` in cli/Cargo.toml) -- and it can,
+# because everything it does is argument-independent. The two pass different
+# arguments (dpkg says "configure", rpm says "1" or "2"), so this script must
+# never branch on "$1": a `case "$1" in configure)` here would look correct on
+# Debian and silently do nothing on Fedora.
+#
+# The removal path is the opposite case and is NOT shared: it has to tell an
+# upgrade from a removal, which is exactly that forbidden branch. It lives in
+# four files in this directory -- `prerm`/`postrm` for dpkg and
+# `preun`/`postun` for rpm -- and `prerm` explains the split at length.
+set -e
+
+# The account the daemon's unprivileged workers run as. Created here rather
+# than owned by the package because a package cannot ship a user. Idempotent:
+# a reinstall, an upgrade, or an administrator who made the account by hand
+# all end in the same place.
+# --home-dir /nonexistent as well as --no-create-home: the latter only skips
+# creating the directory, it still writes a plausible-looking /home/qshd into
+# the passwd entry, and a path that looks real but is not gets created by a
+# well-meaning administrator sooner or later. /nonexistent is what Debian's own
+# `adduser --system` records, and it is a path nothing will mistake for a home.
+if ! getent passwd qshd >/dev/null; then
+    useradd --system --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --comment "qshd worker" qshd
+fi
+
+# The unit files have just appeared (an install) or just been replaced under a
+# possibly running service (an upgrade). Both are true whichever format ran
+# this, which is why the reload belongs in the shared file. Installing does not
+# enable or start anything -- `systemctl enable --now qshd` is the
+# administrator's decision to make.
+#
+# Guarded three ways so that a container, a chroot or an image build cannot be
+# made to fail by this line: /run/systemd/system exists only when systemd is
+# the running init, systemctl may not be installed at all, and `|| :` keeps a
+# failure from tripping `set -e` anyway.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || :
+fi
+
+exit 0

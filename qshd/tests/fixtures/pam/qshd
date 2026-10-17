@@ -1,0 +1,21 @@
+# The PAM stack the unit tests of `helper::server` run on, unless a test
+# points its own helper at a directory of its own.
+#
+# It exists so that the suite tests THIS code rather than the machine it
+# runs on. Without it a test's monitor would call pam_start("qshd", ...),
+# find no /etc/pam.d/qshd, and fall back to /etc/pam.d/other -- which on a
+# stock Ubuntu is @include common-account and @include common-session, so
+# every channel test would end up asking logind for a session and reading
+# /etc/shadow, unprivileged, and would pass or fail by the host's policy.
+#
+# pam_permit throughout, because none of those tests is about what a stack
+# decides; the tests that ARE (a denied account, the session's environment,
+# the open and close halves) write a stack of their own into a temporary
+# directory and point one helper at it.
+#
+# `auth` is here although nothing calls pam_authenticate: pam_setcred runs
+# the AUTH stack's setcred half, and a stack with no auth line at all would
+# have nothing to run.
+auth       required   pam_permit.so
+account    required   pam_permit.so
+session    required   pam_permit.so

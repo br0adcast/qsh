@@ -1,0 +1,44 @@
+[package]
+name = "transport"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The handshake and its hash only (spec §4.9). The raw split hands the two
+# transport keys over, and `chacha20poly1305` seals datagrams itself: snow's
+# transport state has no associated data.
+snow = { version = "0.9", features = ["risky-raw-split"] }
+chacha20poly1305 = "0.10"
+# Wipes the raw split's key copies once the ciphers hold them (the ciphers
+# wipe their own keys on drop). Already in the tree through chacha20poly1305.
+zeroize = { version = "1", default-features = false }
+rand = "0.8"
+# Keyed BLAKE2s for the return-address cookie (cookie.rs), as WireGuard's MAC.
+# The tests also hash the long reference ciphertexts with it (handshake.rs).
+blake2 = "0.10"
+# Socket buffer sizes (spec §4.12): set, and read back what the OS granted.
+socket2 = "0.6"
+# Diagnostics as records (`log::warn!` and the like): lifecycle notices
+# (cap-eviction, refusals, GC teardown) and the client's warnings. Whoever
+# links the crate decides where they go -- the `qsh` client's log file,
+# `qshd.log`, or nowhere.
+log = "0.4"
+# Optional dependency: needed only by the async drivers `driver_tokio`/
+# `shell_server` (feature `tokio-driver`). The sans-IO core itself does not
+# depend on tokio. `rt`/`sync` are needed by the PTY bridge in `shell_server`:
+# `spawn_blocking` (feature `rt`) and `mpsc` (feature `sync`).
+tokio = { version = "1", optional = true, features = ["net", "time", "macros", "rt", "sync"] }
+
+[features]
+# Enables `driver_tokio` -- a minimal async echo server built on top of the core.
+tokio-driver = ["dep:tokio"]
+# Exposes `transport::testnet`, the deterministic network simulator, and
+# `transport::test_peer`, real peers on loopback, to other crates' tests
+# (`qshd`, `cli`). The crate's own tests see them without this.
+testnet = []
+
+[dev-dependencies]
+# The lifecycle tests drive tokio's pausable clock (`start_paused` + `advance`),
+# so the test build needs `test-util`.
+tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "time", "sync", "net"] }

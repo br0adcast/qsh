@@ -1,0 +1,158 @@
+# The image that builds the `qshd` server package for the RHEL family, both
+# architectures. Driven by `packaging/build-server-packages.sh`, which
+# builds this image and then runs itself inside it.
+#
+# WHY A CONTAINER AT ALL, AND WHY AN OLD ONE: the same reason as
+# `Dockerfile.build-deb`, which says it at length. The system-mode daemon is
+# linked dynamically because NSS and PAM load modules at run time, and a
+# dynamically linked package inherits the glibc floor of the machine that
+# built it. Rocky Linux 8 is RHEL 8 rebuilt, and RHEL 8 is the oldest this
+# package promises to install on, so its libc and its Linux-PAM 1.3.1 are
+# what it is built against. The libc version as a number is written once
+# and only once -- QSHD_GLIBC_FLOOR below -- and this comment does not
+# repeat it: a floor restated in prose is a floor that drifts out of step
+# with the package, which is exactly what happened on the deb side.
+#
+# One consequence is worth naming: Linux-PAM 1.3.1 has no LIBPAM_1.4
+# version node at all, so an rpm built here CANNOT carry a symbol newer
+# than LIBPAM_1.0 -- the link would fail first. The deb image is on the
+# same footing, for its own reasons: Ubuntu 20.04 carries Linux-PAM 1.3.1
+# too. The version-node check (`scripts/check-pam-linkage.sh <binary>`)
+# runs over what each one packages anyway, because the point is the
+# shipped file and not the way the floor happened to be enforced.
+#
+# PINNED BY DIGEST, not by tag. A tag is a moving pointer: the same
+# `rockylinux/rockylinux:8` served a different image last month and will serve
+# another next month, and a glibc floor that rests on a moving pointer is
+# not a floor at all -- it is whatever was published most recently. The
+# digest is what makes the promise above reproducible. Moving it is a
+# deliberate edit, and the floor check is what catches it if the new image
+# carries a different libc.
+FROM rockylinux/rockylinux:8@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6
+
+# THE PROMISE, WRITTEN ONCE -- here, in the image that keeps it. Every
+# package this image produces is checked against it by
+# packaging/build-server-packages.sh, which reads this variable and
+# refuses a package whose recorded floor is higher. Nothing else may
+# restate the number, in prose or anywhere else: a floor written twice is
+# a floor that will disagree with itself.
+ENV QSHD_GLIBC_FLOOR=2.28
+
+# And the declaration is checked against the base it describes, so that a
+# base swapped without thinking fails here rather than in a package. The
+# aarch64 sysroot is checked the same way, further down, where it exists.
+RUN set -eu; \
+    have=$(ldd --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+$'); \
+    [ "$have" = "$QSHD_GLIBC_FLOOR" ] \
+        || { echo "this base carries glibc $have, but the image promises $QSHD_GLIBC_FLOOR" >&2; exit 1; }
+
+# `rpm-build` is here for one file: /usr/lib/rpm/find-requires. cargo-
+# generate-rpm's `--auto-req auto` uses it when it exists and falls back to
+# an ldd-based imitation when it does not, which would make the `Requires:`
+# line of a release depend on what happened to be installed on the build
+# machine. The build script passes `--auto-req find-requires` explicitly;
+# this line is what makes that request satisfiable.
+#
+# EPEL carries the aarch64 cross compiler. It is built with its sysroot at
+# /usr/aarch64-linux-gnu/sys-root, which is why the next step fills exactly
+# that directory and no --sysroot flag is needed anywhere afterwards.
+RUN dnf -y install epel-release \
+    && dnf -y install \
+        binutils-aarch64-linux-gnu \
+        cpio \
+        curl \
+        gcc \
+        gcc-aarch64-linux-gnu \
+        file \
+        pam-devel \
+        rpm-build \
+    && dnf clean all
+
+# The foreign target's libraries, taken from Rocky 8's OWN aarch64 packages
+# rather than from anywhere newer: this is what holds the arm64 package to
+# the same libc as the x86_64 one, and to libpam 1.3.1 -- the version
+# checked against QSHD_GLIBC_FLOOR by the self-test below, not restated
+# here. `--forcearch` tells dnf to
+# resolve $basearch as aarch64; nothing here is ever executed on this
+# machine, it is only linked against.
+#
+# `|| true` ON THE TRANSACTION, and the file list below instead of its exit
+# status. A handful of these packages have scriptlets, rpm runs a scriptlet
+# chrooted into the installroot, and the shell it would need there is an
+# aarch64 program this machine cannot execute -- so dnf reports those
+# packages as failed while their files are installed. A sysroot wants the
+# files; the scriptlets have nothing to configure in a directory that is
+# never booted. (Suppressing the scriptlets with `tsflags=noscripts`
+# instead sounds tidier and is worse: it takes `filesystem`'s %pretrans
+# with it, and without that the transaction genuinely fails.)
+#
+# The libgcc_s.so symlink is made by hand because rustc passes `-lgcc_s`
+# and nothing in this sysroot provides that name: Rocky's `libgcc` package
+# ships the runtime `libgcc_s.so.1` alone, and the development symlink
+# lives in the native `gcc` package, which has no business in a sysroot.
+RUN mkdir -p /usr/aarch64-linux-gnu/sys-root \
+    && { dnf -y --installroot=/usr/aarch64-linux-gnu/sys-root \
+        --forcearch=aarch64 --releasever=8 --nogpgcheck \
+        --setopt=install_weak_deps=False \
+        install glibc-devel libgcc pam-devel || true; } \
+    && dnf clean all --installroot=/usr/aarch64-linux-gnu/sys-root \
+    && rm -rf /usr/aarch64-linux-gnu/sys-root/var/lib/rpm \
+    && ln -sf libgcc_s.so.1 /usr/aarch64-linux-gnu/sys-root/usr/lib64/libgcc_s.so \
+    && for f in libc.so libc.so.6 libpam.so libpam.so.0 libgcc_s.so.1 crt1.o crti.o crtn.o; do \
+        [ -e "/usr/aarch64-linux-gnu/sys-root/usr/lib64/$f" ] \
+            || { echo "the aarch64 sysroot is missing usr/lib64/$f" >&2; exit 1; }; \
+       done
+
+# The image asserts its own cross toolchain rather than leaving a broken one
+# to be discovered three minutes into a release build: the sysroot must be
+# where the compiler looks for it, and a link that asks for both libraries
+# rustc asks for must produce an aarch64 ELF that needs libpam.
+RUN set -eu; \
+    sysroot=$(aarch64-linux-gnu-gcc -print-sysroot); \
+    [ "$sysroot" = /usr/aarch64-linux-gnu/sys-root ] \
+        || { echo "cross gcc looks for its sysroot in $sysroot, which this image does not fill" >&2; exit 1; }; \
+    sysglibc=$(ls "$sysroot"/usr/lib64/libc-*.so | sed 's|.*/libc-\(.*\)\.so$|\1|'); \
+    [ "$sysglibc" = "$QSHD_GLIBC_FLOOR" ] \
+        || { echo "the aarch64 sysroot carries glibc $sysglibc, not the $QSHD_GLIBC_FLOOR this image promises -- the arm package would have a floor of its own" >&2; exit 1; }; \
+    printf 'int main(void){return 0;}\n' > /tmp/probe.c; \
+    aarch64-linux-gnu-gcc -o /tmp/probe /tmp/probe.c -lpam -lgcc_s; \
+    readelf -d /tmp/probe | grep -q 'NEEDED.*libpam\.so\.0' \
+        || { echo "the cross link produced no libpam.so.0 dependency" >&2; exit 1; }; \
+    file /tmp/probe | grep -q 'ARM aarch64' \
+        || { echo "the cross link produced something other than an aarch64 ELF" >&2; exit 1; }; \
+    rm -f /tmp/probe /tmp/probe.c
+
+# Rust goes under /usr/local so that every uid can use it: the build script
+# runs the container as the invoking user, so that the packages and the
+# build tree it leaves behind on the bind mount are owned by that user and
+# not by root.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
+    # Both targets in one `rustup target add`, not two `--target` flags on
+    # rustup-init: that option takes a single value and reports a second
+    # one as an unexpected argument.
+    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+    && chmod -R a+rX /usr/local/rustup /usr/local/cargo
+
+# A step of its own so that changing the pin below does not fetch the
+# toolchain again. An exact version, for the same reason the base is a
+# digest: this tool decides what the package looks like -- `variants.qshd`,
+# `auto-req`, and the `target/release/` prefix that follows `--target` --
+# and a range would let a release be built by a tool nobody chose. (A bare
+# `cargo-generate-rpm@0.21` is not a pin but an error: cargo answers
+# "unexpected end of input while parsing minor version number".)
+RUN cargo install 'cargo-generate-rpm@=0.21.0' --locked \
+    && chmod -R a+rX /usr/local/cargo
+
+# The linker for the foreign target. Cargo reads this per target, so the
+# host build is unaffected, and a build script compiled for the host still
+# uses the host cc. No --sysroot: the compiler's own default is the
+# directory filled above.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    PKG_CONFIG_ALLOW_CROSS=1
+
+WORKDIR /work

@@ -1,0 +1,10 @@
+# The `auth` line is load-bearing -- do not remove it. qshd never calls
+# pam_authenticate (a signature proves the identity before PAM is reached),
+# but it does call pam_setcred(PAM_ESTABLISH_CRED), which runs the AUTH
+# stack's setcred half; Linux-PAM answers PAM_PERM_DENIED when there is no
+# auth section at all. A file of account and session lines alone therefore
+# refuses EVERY login, with "authentication failed" on the wire and the
+# real reason only in the daemon's log.
+auth     required  pam_permit.so
+account  include   common-account
+session  include   common-session

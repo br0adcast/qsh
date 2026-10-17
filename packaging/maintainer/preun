@@ -1,0 +1,24 @@
+#!/bin/sh
+# %preun for the `qshd` package -- rpm ONLY, named by rpm's convention and
+# wired up as `pre_uninstall_script` in cli/Cargo.toml. The dpkg counterpart is
+# `prerm` in this same directory, which carries the long explanation of why
+# these two are separate files rather than one; keep the pair in step.
+#
+# This is what rpm's own %systemd_preun macro expands to, written out because
+# cargo-generate-rpm embeds the text of a file and never expands macros.
+set -e
+
+# 0 means the package is going away for good; 1 or more means an upgrade, and
+# on an upgrade it is the OLD package's %preun that runs with the new one
+# already unpacked. Stopping here unconditionally would take the daemon down
+# on every single upgrade.
+if [ "$1" = 0 ]; then
+    # Same three guards as the dpkg side: systemd may not be the running init
+    # (a container, a chroot, an image build), systemctl may be absent, and a
+    # failure must not fail the transaction.
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl --no-reload disable --now qshd.service >/dev/null 2>&1 || :
+    fi
+fi
+
+exit 0

@@ -1,0 +1,14 @@
+[package]
+name = "knock"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Only for `addr::preferred_addr`: the one shared rule for which of a
+# resolver's answers to dial, so a knock and a direct login pick the same
+# address for the same host.
+sshauth = { path = "../sshauth" }
+# Already in the lock file (through tokio) at 0.6.x: a TCP socket whose fd
+# exists before `connect`, so it can be bound to a network first.
+socket2 = "0.6"

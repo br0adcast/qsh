@@ -1,0 +1,12 @@
+[package]
+name = "logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared log line format and rotating file sink for qsh and qshd"
+
+[dependencies]
+log = { version = "0.4", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"

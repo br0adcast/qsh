@@ -1,0 +1,11 @@
+[package]
+name = "prediction"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+terminal = { path = "../terminal" }
+unicode-width = "0.2"
+
+[dev-dependencies]

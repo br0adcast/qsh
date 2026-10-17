@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
+
+[workspace.package]
+edition = "2021"
+version = "0.5.0"
+license = "AGPL-3.0-only"
+
+# Tests build lightly optimized. The transport crate's network simulator
+# runs minutes of virtual traffic through real encryption, and unoptimized
+# it dominated every test run: its lib suite took 113 s on four threads and
+# 266 s on the one thread CI uses, against 19 s and 57 s here. The price is
+# a test build that no longer shares its dependencies with `cargo build`
+# (from a clean tree, 67 s became 275 s, once). Debug assertions and
+# overflow checks stay on: that is what makes this a test build.
+[profile.test]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true

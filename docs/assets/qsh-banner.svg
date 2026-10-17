@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title description">
+  <title id="title">qsh — your shell, across networks</title>
+  <desc id="description">A terminal session continues on the same server when its network changes from Wi-Fi to mobile data.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#101e31"/><stop offset="1" stop-color="#080f1c"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#263850" stroke-width="0.6" opacity="0.4"/>
+    </pattern>
+    <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+      <path d="M0 0L6 3L0 6" fill="none" stroke="#5eead4" stroke-width="1.3"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="300" rx="18" fill="url(#background)"/>
+  <rect width="1200" height="300" rx="18" fill="url(#grid)"/>
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, monospace">
+    <text x="48" y="64" fill="#5eead4" font-size="12" letter-spacing="3">ROAMING TERMINAL</text>
+    <text x="44" y="160" fill="#f1f5f9" font-size="92" font-weight="700" letter-spacing="-6">qsh</text>
+    <rect x="219" y="145" width="34" height="7" rx="2" fill="#5eead4"/>
+    <text x="48" y="205" fill="#d4e1ef" font-size="22">Your shell. Across networks.</text>
+    <text x="48" y="246" fill="#91a6be" font-size="13">Encrypted UDP · local echo · session recovery</text>
+    <rect x="595" y="68" width="156" height="58" rx="10" fill="#132337" stroke="#2f465f"/>
+    <circle cx="620" cy="97" r="5" fill="#91a6be"/>
+    <text x="637" y="102" fill="#b9c9db" font-size="14">WI-FI</text>
+    <rect x="595" y="177" width="156" height="58" rx="10" fill="#132c35" stroke="#5eead4"/>
+    <circle cx="620" cy="206" r="5" fill="#5eead4"/>
+    <text x="637" y="211" fill="#e2fff9" font-size="14">MOBILE</text>
+    <path d="M752 97H790Q806 97 806 113V134Q806 150 822 150H872" fill="none" stroke="#647b95" stroke-width="2" stroke-dasharray="5 6"/>
+    <path d="M752 206H790Q806 206 806 190V166Q806 150 822 150H872" fill="none" stroke="#5eead4" stroke-width="2" marker-end="url(#arrow)"/>
+    <rect x="888" y="78" width="256" height="145" rx="12" fill="#0b1525" stroke="#39546a"/>
+    <path d="M889 113H1143" stroke="#263b51"/>
+    <circle cx="905" cy="96" r="3" fill="#5eead4"/>
+    <text x="919" y="101" fill="#91a6be" font-size="11" letter-spacing="1">SAME SESSION</text>
+    <text x="908" y="150" fill="#dbe7f4" font-size="15">$ work continues</text>
+    <text x="908" y="186" fill="#5eead4" font-size="15">$</text>
+    <rect x="928" y="173" width="9" height="17" rx="1" fill="#5eead4"/>
+    <text x="888" y="250" fill="#91a6be" font-size="12">New address. Same shell.</text>
+  </g>
+</svg>

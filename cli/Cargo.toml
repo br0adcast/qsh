@@ -1,0 +1,170 @@
+[package]
+name = "qsh"
+description = "A terminal session that survives a network change"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qsh"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+bringup = { path = "../crates/bringup" }
+client = { path = "../crates/client" }
+connect = { path = "../crates/connect" }
+dirs = "6"
+hmac = "0.12"
+knock = { path = "../crates/knock" }
+log = "0.4"
+logging = { path = "../crates/logging" }
+libc = "0.2"
+nix = { version = "0.28", features = ["term", "signal"] }
+prediction = { path = "../crates/prediction" }
+rand = "0.8"
+render = { path = "../crates/render" }
+sha1 = "0.10"
+sha2 = "0.10"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-webpki-roots"] }
+flate2 = "1"
+tar = "=0.4.46"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+ssh = { path = "../crates/ssh" }
+sshauth = { path = "../crates/sshauth" }
+terminal = { path = "../crates/terminal" }
+transport = { path = "../crates/transport" }
+
+[dev-dependencies]
+tempfile = "3"
+# Only for building keys in tests (an encrypted key, a generated identity);
+# never used by the crate's real dependency graph. Pinned exactly, matching
+# `crates/sshauth`'s own pin, for the same reason: parsing/encoding key
+# material is security-relevant, and a version bump could silently change
+# what is accepted.
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "ed25519", "encryption"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# `tests/ladder.rs` includes bringup's sandbox (a private sshd, its home, the
+# shared daemon guard) by path; these are what it needs, as in
+# `crates/bringup`. `libc` and `base64` it takes from the normal dependencies.
+russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+qshd = { path = "../qshd" }
+
+# Two packages come out of this one crate, in the shape `openssh-client` and
+# `openssh-server` have. The base section below is the CLIENT package, `qsh`:
+# that is what a plain `cargo deb -p qsh` / `cargo generate-rpm -p cli`
+# produces. The SERVER package, `qshd`, is the `variants.qshd` section further
+# down, selected with `--variant qshd`; both tools layer a variant over the
+# base key by key, so the server only has to state what differs.
+[package.metadata.deb]
+name = "qsh"
+maintainer = "br0adcast <986942+br0adcast@users.noreply.github.com>"
+copyright = "2026, br0adcast"
+license-file = ["../LICENSE", "0"]
+extended-description = """
+A terminal session that survives a network change: client and server share \
+screen state over a custom UDP transport, so the address can change without \
+reconnecting and without losing input. This package is the client alone -- no \
+service, no configuration, no account, no dependencies. The daemon is the \
+separate `qshd` package."""
+section = "net"
+priority = "optional"
+# The client is statically linked against musl, so there is nothing to depend
+# on. Left to itself, cargo-deb would infer dependencies from ldd. The server
+# variant puts this back to `$auto`, because its dependencies are real.
+depends = ""
+assets = [
+    ["target/release/qsh", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/qsh/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/qsh/CHANGELOG.md", "644"],
+]
+
+# The server package. `cargo deb -p qsh --variant qshd --no-build` builds it;
+# every key not named here is inherited from the section above, which is why
+# `depends` has to be stated explicitly rather than merely left out.
+[package.metadata.deb.variants.qshd]
+name = "qshd"
+extended-description = """
+The daemon behind qsh: a terminal session that survives a network change. \
+This package carries the system-mode daemon, a systemd unit that installing \
+does not enable, a personal per-user unit, and the PAM service file the \
+daemon opens when it hands a session to a user. The `qsh` client is a \
+separate package."""
+# Unlike the client, the system-mode daemon links dynamically against glibc
+# and libpam -- account lookup (NSS) and PAM both load modules at run time,
+# which a static binary cannot do. `$auto` restores cargo-deb's own ldd-based
+# inference, which the base section turned off.
+depends = "$auto"
+assets = [
+    ["target/release/qshd", "usr/bin/", "755"],
+    ["../packaging/qshd-system.service", "usr/lib/systemd/system/qshd.service", "644"],
+    ["../packaging/qshd.service", "usr/lib/systemd/user/qshd.service", "644"],
+    ["../packaging/pam.d/qshd.debian", "etc/pam.d/qshd", "644"],
+    ["../README.md", "usr/share/doc/qshd/README.md", "644"],
+    ["../CHANGELOG.md", "usr/share/doc/qshd/CHANGELOG.md", "644"],
+]
+# An administrator's edits to the PAM stack must survive an upgrade.
+conf-files = ["/etc/pam.d/qshd"]
+# postinst creates the system account; postrm deliberately does not remove it.
+maintainer-scripts = "../packaging/maintainer"
+
+[package.metadata.generate-rpm]
+name = "qsh"
+license = "AGPL-3.0-only"
+summary = "A terminal session that survives a network change"
+# The client is statically linked (musl) -- there is nothing to depend on, and
+# letting rpm derive `Requires` would make the package's dependency list depend
+# on whether `rpm` happens to be installed on the machine doing the build (see
+# `depends = ""` in `[package.metadata.deb]` above, for the same reason on the
+# deb side). The server variant turns this back on.
+auto-req = "disabled"
+assets = [
+    { source = "target/release/qsh", dest = "/usr/bin/qsh", mode = "755" },
+    { source = "../README.md", dest = "/usr/share/doc/qsh/README.md", mode = "644", doc = true },
+    { source = "../CHANGELOG.md", dest = "/usr/share/doc/qsh/CHANGELOG.md", mode = "644", doc = true },
+    { source = "../LICENSE", dest = "/usr/share/doc/qsh/LICENSE", mode = "644", doc = true },
+]
+
+# The server package: `cargo generate-rpm -p cli --variant qshd`. The flag is
+# shorthand for `--metadata-overwrite=cli/Cargo.toml#package.metadata.generate-rpm.variants.qshd`,
+# and the overwrite is applied key by key over the section above.
+[package.metadata.generate-rpm.variants.qshd]
+name = "qshd"
+summary = "The daemon behind qsh, a terminal session that survives a network change"
+# Only "no" and "disabled" mean anything to cargo-generate-rpm in this key --
+# any other value falls through to whatever `--auto-req` says, whose default is
+# "auto". So this line reads as "stop disabling it", and the mode itself is the
+# command line's business. `auto` picks /usr/lib/rpm/find-requires when that
+# exists and an ldd-based fallback otherwise, so the release pipeline should
+# pass `--auto-req` explicitly if the two must not diverge.
+auto-req = "auto"
+assets = [
+    { source = "target/release/qshd", dest = "/usr/bin/qshd", mode = "755" },
+    { source = "../packaging/qshd-system.service", dest = "/usr/lib/systemd/system/qshd.service", mode = "644" },
+    { source = "../packaging/qshd.service", dest = "/usr/lib/systemd/user/qshd.service", mode = "644" },
+    # "noreplace", not a bare `true`: plain %config moves an edited file aside
+    # to .rpmsave and installs the packaged one over it, which is exactly the
+    # overwrite-on-upgrade this file must not suffer. %config(noreplace) keeps
+    # the administrator's copy and writes .rpmnew instead -- the behaviour
+    # `conf-files` gives on the deb side.
+    { source = "../packaging/pam.d/qshd.fedora", dest = "/etc/pam.d/qshd", mode = "644", config = "noreplace" },
+    { source = "../README.md", dest = "/usr/share/doc/qshd/README.md", mode = "644", doc = true },
+    { source = "../CHANGELOG.md", dest = "/usr/share/doc/qshd/CHANGELOG.md", mode = "644", doc = true },
+    { source = "../LICENSE", dest = "/usr/share/doc/qshd/LICENSE", mode = "644", doc = true },
+]
+# The same file dpkg runs as the postinst; it takes no arguments on purpose.
+post_install_script = "../packaging/maintainer/postinst"
+# The removal path cannot be shared with dpkg, because telling an upgrade from
+# a removal is exactly the branch on "$1" the postinst forbids itself: dpkg
+# passes words to prerm/postrm, rpm passes a count to %preun/%postun. So these
+# two are rpm's alone, named by rpm's convention. They sit in the same
+# directory as the dpkg scripts and still cannot leak into a .deb: cargo-deb
+# reads only the six names dpkg knows
+# (cargo-deb-3.8.0/src/deb/control.rs:109).
+pre_uninstall_script = "../packaging/maintainer/preun"
+post_uninstall_script = "../packaging/maintainer/postun"

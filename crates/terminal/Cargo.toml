@@ -1,0 +1,19 @@
+[package]
+name = "terminal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Mature terminal emulator (grid + VT parser). Version pinned exactly:
+# keep it aligned with the terminal API used by this workspace.
+alacritty_terminal = "=0.26.0"
+# The width `Term::input` measures characters with (the same crate and
+# version `alacritty_terminal` resolves to): a replay decides how to print a
+# character by it.
+unicode-width = "0.2.2"
+# The reverse byte search a model runs over every chunk it is fed (the same
+# crate `vte` already uses).
+memchr = "2.8.3"
+
+[dev-dependencies]

@@ -1,0 +1,31 @@
+[package]
+name = "bringup"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ssh = { path = "../ssh" }
+knock = { path = "../knock" }
+client = { path = "../client" }
+transport = { path = "../transport" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+sshauth = { path = "../sshauth" }
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "p256"] }
+# The private sshd and its helpers are shared with crates/ssh's tests
+# (included by path); these are what they need.
+russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tempfile = "3"
+qshd = { path = "../../qshd" }
+# `pidfd_open`/`pidfd_send_signal` in the shared daemon guard (qshd/tests/daemon_guard).
+libc = "0.2"

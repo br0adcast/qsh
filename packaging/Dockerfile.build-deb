@@ -1,0 +1,169 @@
+# The image that builds the `qshd` server package for Debian and Ubuntu,
+# both architectures. Driven by `packaging/build-server-packages.sh`, which
+# builds this image and then runs itself inside it.
+#
+# WHY A CONTAINER AT ALL, AND WHY AN OLD ONE. The system-mode daemon cannot
+# be linked statically: account lookup (NSS) and PAM both load modules at
+# run time, which a static binary has no loader for. A dynamically linked
+# package inherits the glibc floor of whatever machine built it -- build it
+# on a current runner and it refuses to install on anything older, with a
+# dependency line nobody notices until a user's `apt install` fails. So the
+# package is built on the oldest release it promises to install on, and
+# design §6.5 names that release: Ubuntu 20.04. This image is that release,
+# rather than a Debian carrying the same libc, and the reason is not
+# preference -- see below. What that libc IS, as a number, is written once
+# and only once, in QSHD_GLIBC_FLOOR below. This comment does not repeat it
+# on purpose: an earlier version of this paragraph named a glibc, the
+# package recorded a different one, and a reader had no way to tell which
+# was the promise.
+#
+# Linux-PAM 1.3.1 comes with it, which is the PAM floor as well -- §6.5
+# names that pair, Ubuntu 20.04 and RHEL 8, in one sentence: a
+# symbol newer than LIBPAM_1.0 cannot be linked here at all, the way it
+# cannot on Rocky 8. The version-node check still runs over what is
+# packaged, because the point is the shipped file and not the way the
+# floor happened to be enforced.
+#
+# WHY NOT DEBIAN 11, WHICH CARRIES THE SAME GLIBC. It cannot cross-link
+# arm64 any more, and this was measured rather than guessed:
+#
+#   - bullseye-security still publishes its INDEXES while its pool files
+#     are gone -- the Packages file names libc-dev-bin_2.31-13+deb11u14,
+#     and that .deb is 404 on both deb.debian.org and security.debian.org.
+#     So apt-get fails on every package that ever had a security update.
+#   - Building from archive.debian.org instead, which is complete, does
+#     not help: the `debian:bullseye` image already carries libc6
+#     2.31-13+deb11u14 from that security suite, the archive's newest
+#     arm64 libc6 is 2.31-13+deb11u11, and libc6 is Multi-Arch: same --
+#     the two architectures must be the identical version. apt answers
+#     "libc6:arm64 ... but it is not installable" and stops.
+#
+# Ubuntu 20.04 has no such gap: it is in ESM until 2030, and both
+# archives still serve it -- which is also why the sources below are
+# split by architecture.
+#
+# The portable release daemon is untouched by any of this: that one is musl-static, built without the `system` feature, and
+# is not what this image makes.
+#
+# NOT Debian oldstable, which is Debian 12: bookworm's libc produces a
+# package that Ubuntu 20.04 refuses -- while the rpm side, built on Rocky
+# 8, reaches RHEL 8 without trouble. One family keeping a promise the
+# other breaks is the defect this base avoids.
+#
+# PINNED BY DIGEST, not by tag. A tag is a moving pointer: the same
+# `ubuntu:20.04` served a different image last month and will serve
+# another next month, and a glibc floor that rests on a moving pointer is
+# not a floor at all -- it is whatever was published most recently. The
+# digest is what makes the promise above reproducible. Moving it is a
+# deliberate edit, and the floor check is what catches it if the new image
+# carries a different libc.
+FROM ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
+
+# THE PROMISE, WRITTEN ONCE -- here, in the image that keeps it. Every
+# package this image produces is checked against it by
+# packaging/build-server-packages.sh, which reads this variable and
+# refuses a package whose recorded floor is higher. Nothing else may
+# restate the number: a floor written twice is a floor that will disagree
+# with itself, which is how the bookworm base shipped a 2.34 package
+# under a comment that said 2.36.
+ENV QSHD_GLIBC_FLOOR=2.31
+
+# And the declaration is checked against the base it describes, so that a
+# base swapped without thinking fails here rather than in a package.
+RUN set -eu; \
+    have=$(ldd --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+$'); \
+    [ "$have" = "$QSHD_GLIBC_FLOOR" ] \
+        || { echo "this base carries glibc $have, but the image promises $QSHD_GLIBC_FLOOR" >&2; exit 1; }
+
+# Ubuntu keeps x86 on archive.ubuntu.com and every other architecture on
+# ports.ubuntu.com, so a multiarch build has to say which host serves
+# which: without the [arch=] qualifiers apt asks archive.ubuntu.com for
+# arm64 and is answered 404.
+#
+# And the edit is asserted, because a `sed` that matches nothing says
+# nothing. This one depends on the base writing its sources in the
+# one-line format; a base that moved to deb822 `.sources` files would
+# leave every line unqualified, apt would ask archive.ubuntu.com for
+# arm64, and the failure would surface later and elsewhere. So: no
+# unqualified line may remain anywhere apt reads, both architectures must
+# be named, and a `.sources` file is a refusal rather than a surprise.
+RUN set -eu; \
+    sed -i 's|^deb |deb [arch=amd64] |' /etc/apt/sources.list; \
+    printf '%s\n' \
+        'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal main' \
+        'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-updates main' \
+        'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main' \
+        >>/etc/apt/sources.list; \
+    ! ls /etc/apt/sources.list.d/*.sources >/dev/null 2>&1 \
+        || { echo "this base writes deb822 .sources files, which the [arch=] edit above does not touch" >&2; exit 1; }; \
+    unqualified=$(grep -rhE '^deb ' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -vE '^deb \[arch=' || true); \
+    [ -z "$unqualified" ] \
+        || { echo "apt sources left unqualified by architecture: $unqualified" >&2; exit 1; }; \
+    for a in amd64 arm64; do \
+        grep -qE "^deb \[arch=$a\] " /etc/apt/sources.list \
+            || { echo "no $a source line after the edit" >&2; exit 1; }; \
+    done
+
+# WHY CROSS-COMPILATION AND NOT EMULATION. Under qemu-user a release build
+# of this workspace costs roughly an order of magnitude more than a native
+# one, for a binary that is byte-for-byte what the cross toolchain produces.
+# Emulation is worth paying for once, in acceptance, where the point is to
+# run the package on the architecture it targets; paying for it per build
+# buys nothing. So arm64 is a second multiarch target of this same Ubuntu,
+# with Ubuntu's own cross compiler.
+#
+# `libpam0g-dev:arm64` is what makes `-lpam` resolvable for the foreign
+# target, and installing it drags in `libpam0g:arm64` and `libc6:arm64` --
+# which is also what lets `dpkg-shlibdeps` (cargo-deb's `$auto`) derive the
+# arm64 package's `Depends` line from the arm64 shared libraries rather than
+# refusing for want of them.
+#
+# `build-essential` brings `dpkg-dev`, and `dpkg-shlibdeps` with it; without
+# that, cargo-deb's `$auto` has nothing to ask and the server package would
+# ship with an empty `Depends`.
+ARG DEBIAN_FRONTEND=noninteractive
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        file \
+        gcc-aarch64-linux-gnu \
+        libpam0g-dev \
+        libpam0g-dev:arm64 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust goes under /usr/local so that every uid can use it: the build script
+# runs the container as the invoking user, so that the packages and the
+# build tree it leaves behind on the bind mount are owned by that user and
+# not by root.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
+    # Both targets in one `rustup target add`, not two `--target` flags on
+    # rustup-init: that option takes a single value and reports a second
+    # one as an unexpected argument.
+    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+    && chmod -R a+rX /usr/local/rustup /usr/local/cargo
+
+# A step of its own so that changing the pin below does not fetch the
+# toolchain again. An exact version, for the same reason the base is a
+# digest: cargo-deb decides what the package looks like -- `variants.qshd`
+# and the `target/release/` prefix that follows `--target` -- and a range
+# would let a release be built by a tool nobody chose. (A bare
+# `cargo-deb@3.8` is not a pin but an error: cargo answers "unexpected end
+# of input while parsing minor version number".)
+RUN cargo install 'cargo-deb@=3.8.0' --locked \
+    && chmod -R a+rX /usr/local/cargo
+
+# The linker for the foreign target. Cargo reads this per target, so the
+# host build is unaffected, and a build script compiled for the host still
+# uses the host cc.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    PKG_CONFIG_ALLOW_CROSS=1
+
+WORKDIR /work

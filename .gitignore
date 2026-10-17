@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+# The packages packaging/build-server-packages.sh leaves behind; the
+# release workflow fills the same directory in CI.
+/dist/
+
+# Local agent instructions and skill working artifacts
+/AGENTS_LOCAL.md
+/.agent-work/
+/.superpowers/
+/docs/superpowers/
+/.gstack/
+/graphify-out/

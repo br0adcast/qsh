@@ -1,0 +1,58 @@
+[package]
+name = "qshd"
+version = "0.5.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+dirs = "6"
+portable-pty = "0.9"
+daemonize = "0.5"
+nix = { version = "0.28", features = ["term", "user", "fs", "dir", "process", "signal"] }
+log = "0.4"
+logging = { path = "../crates/logging" }
+transport = { path = "../crates/transport", features = ["tokio-driver"] }
+sshauth = { path = "../crates/sshauth" }
+terminal = { path = "../crates/terminal" }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tempfile = "3"
+
+[features]
+# The system mode: the process split, and later the privileged helper.
+# OFF by default so the ordinary build -- and the statically linked musl
+# release binary -- never pulls in
+# anything that loads modules at runtime. The `system` build links Linux-PAM
+# (`#[link(name = "pam")]` in `helper::pam`, no crate), so building it needs
+# `libpam.so` -- `libpam0g-dev` on Debian and Ubuntu.
+system = ["nix/process", "nix/socket", "nix/signal", "nix/fs", "nix/poll", "nix/ioctl", "nix/uio"]
+# Lets QSHD_TEST_BUILD_LABELS name a build label for an optimized binary, so
+# the image upload can be measured with a release daemon (spec §11.1). OFF by
+# default and never enabled by `scripts/build-qshd-assets.sh`: a binary a
+# client installs has no such branch.
+test-build-labels = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "ed25519"] }
+# Only for `helper::server`'s own `Request::Verify` tests, to fabricate a
+# genuine signed proof with `signature::Signer::try_sign` the same way
+# `sshauth`'s own tests do -- pinned to the exact version `sshauth` uses so
+# the two never verify against subtly different trait definitions. A
+# dev-only dependency: it never enters the shipped build.
+signature = "=2.2.0"
+# `serve_system_split.rs` only: `pidfd_open`/`pidfd_getfd` (Linux 5.6+) have
+# no wrapper in `nix` 0.28, only raw syscall numbers here. Used to hold a
+# second, test-owned reference to the helper's seam socket alive across a
+# `SIGKILL` of the helper, so that test can isolate the parent-death-signal
+# path from the worker's own reader-thread EOF hook.
+libc = "0.2"

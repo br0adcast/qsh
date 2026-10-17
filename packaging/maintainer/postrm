@@ -1,0 +1,27 @@
+#!/bin/sh
+# Post-removal script for the `qshd` package -- dpkg ONLY. The rpm counterpart
+# is `postun` in this same directory; `prerm` explains why the removal path is
+# two files per format instead of one shared file.
+#
+# The stop and the disable happened in the prerm, while the unit file still
+# existed. All that is left here is telling systemd the files are gone.
+set -e
+
+case "$1" in
+    remove|purge)
+        # Guarded the same three ways as the prerm: no running systemd, no
+        # systemctl, or a failing systemctl must none of them fail the removal.
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl --system daemon-reload >/dev/null 2>&1 || :
+        fi
+        ;;
+esac
+
+# The system account `qshd` created by the postinst is NOT deleted, and the
+# reason belongs here so that the next editor does not "finish the job": it may
+# still own files -- anything a worker wrote while the daemon ran -- and
+# deleting the account would leave those files owned by a bare numeric uid,
+# which the next --system account created on that machine may well be handed.
+# This is the same choice openssh-server and friends make.
+
+exit 0

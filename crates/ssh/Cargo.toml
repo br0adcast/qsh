@@ -1,0 +1,27 @@
+[package]
+name = "ssh"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Pinned exactly: this is the core SSH implementation; a bump must be a decision, not a lock-file refresh. ring instead of
+# the default aws-lc-rs avoids a CMake dependency for cross compilation.
+russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "=3.0.1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+socket2 = "0.6"
+base64 = "0.22"
+bytes = "1"
+sha2 = "0.10"
+zeroize = "1"
+p256 = { version = "0.13", features = ["ecdsa"] }
+knock = { path = "../knock" }
+client = { path = "../client" }
+transport = { path = "../transport" }
+sshauth = { path = "../sshauth" }
+
+[dev-dependencies]
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "p256"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+tempfile = "3"

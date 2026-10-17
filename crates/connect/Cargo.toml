@@ -1,0 +1,8 @@
+[package]
+name = "connect"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+knock = { path = "../knock" }

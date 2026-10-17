@@ -1,0 +1,357 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default: this workflow only reads the repository (it
+# never publishes anything). Without an explicit top-level `permissions`,
+# a job with no `permissions` of its own falls back to the repository's
+# default token permissions -- "read and write" on every repo created
+# before February 2023 -- so `cargo install` and the build scripts of
+# hundreds of third-party crates would otherwise run with a token that can
+# push to this repository.
+permissions:
+  contents: read
+
+# A push to an open pull request supersedes the run already in flight for
+# it, so cancel that one instead of paying for both; a push to main never
+# cancels another push to main (there is no prior run in the same group to
+# race with in practice, and we don't want a queued main run dropped).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  macos:
+    name: macOS portable tests
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      HISTFILE: /dev/null
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Discovery tests
+        run: cargo test -p sshauth --lib --locked discover::tests
+      - name: Portable CLI connection tests
+        run: cargo test -p qsh --test connection_start --locked
+
+  check:
+    runs-on: ubuntu-latest
+    env:
+      HISTFILE: /dev/null
+    # The integration tests bring up real daemons; a hang there (or
+    # anywhere else in this job) would otherwise burn the default 360
+    # minutes before GitHub kills it.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      # v2.9.2, pinned by commit so a mutable tag can't change what CI runs.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      - name: Install nextest
+        run: |
+          mkdir -p "$RUNNER_TEMP/nextest"
+          archive="$RUNNER_TEMP/nextest.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$archive"
+          echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP/nextest"
+          echo "$RUNNER_TEMP/nextest" >> "$GITHUB_PATH"
+
+      # `libpam0g-dev` is here for `qshd/system`: that build links Linux-PAM
+      # (`#[link(name = "pam")]` in `helper::pam`, no crate), so without
+      # `libpam.so` the feature build below would fail to link, not just to
+      # compile.
+      # `binutils` is for `strip`: qshd/tests/transport_ensure_update.rs
+      # strips its copy of the debug qshd below MAX_UPDATE_SIZE.
+      - name: Install integration test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --features qshd/system -- -D warnings
+
+      # Each test gets its own process, isolating PAM's descriptor changes.
+      # nextest.toml keeps daemon port-selection suites serial while allowing
+      # independent tests to overlap. Root-only tests still run below in
+      # disposable containers; their ordinary-user skips are not coverage.
+      - name: Unit and integration tests
+        run: >-
+          cargo nextest run --profile ci --workspace --lib --bins --tests
+          --locked --features qshd/system
+
+      # nextest does not run doctests.
+      - name: Doc tests
+        run: cargo test --workspace --doc --locked
+
+  # The privileged tier. Everything `check` above cannot do: create and
+  # remove real accounts, overwrite `/etc/pam.d/qshd`, start a real
+  # `qshd serve --system` that forks a helper and drops a worker to another
+  # account. Those tests exist, they are the ones the system mode is
+  # dangerous without, and on a GitHub runner they do not run: each one
+  # looks at its machine, decides it may not touch it, prints a `SKIPPED`
+  # line to stderr and returns -- which libtest counts as a pass. Measured:
+  # without root, three of the end-to-end PAM tests report "3 passed" in
+  # 0.00 seconds having checked nothing. `scripts/no-silent-skips.sh` is
+  # what makes that impossible to mistake for a pass here.
+  container:
+    # `runs-on` and the image below are pinned to the SAME Ubuntu release on
+    # purpose. The test binaries are built on the runner and executed inside
+    # the container, so the container's glibc (and libpam) must not be older
+    # than the runner's; `ubuntu-latest` moving on first would break every
+    # run of this job with a loader error that says nothing about the code.
+    runs-on: ubuntu-24.04
+    # The suites themselves take about two minutes all told, measured in
+    # these same containers; the rest is the toolchain and the build.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # v2.9.2, pinned by commit so a mutable tag can't change what CI runs.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      # To LINK the `system` build (see the `check` job). The containers
+      # need libpam too, and already have it: `libpam0g` and the modules
+      # this tier's tests name (`pam_permit`, `pam_deny`, `pam_unix`,
+      # `pam_exec`) are in the `ubuntu:24.04` base image, as are `useradd`,
+      # `userdel` and `chage`. Verified by running these suites in exactly
+      # that image, not assumed.
+      # `jq` reads the build's JSON below. GitHub's Ubuntu images ship it,
+      # but a one-line insurance against an image that stops doing so is
+      # cheaper than a job that fails for want of a JSON parser.
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev jq
+
+      # Built on the runner rather than in the containers, so the cache
+      # applies and each container starts with nothing to do but run one
+      # binary. `--message-format=json` is how the executables are found:
+      # the file names carry a metadata hash, and picking "the newest
+      # `target/debug/deps/<name>-*`" would sooner or later pick a stale
+      # one left by another build.
+      - name: Build the test binaries
+        run: |
+          cargo test -p qshd --features system --locked --no-run \
+            --message-format=json > "$RUNNER_TEMP/build.json"
+
+      # `scripts/check-pam-linkage.sh` ran only by hand until now. Given a
+      # PATH it builds nothing and reads one already-built file: does it
+      # import a libpam symbol at a version node newer than LIBPAM_1.0, or
+      # name pam_start_confdir at all? Either would mean a daemon that does
+      # not start on Linux-PAM 1.3.1 -- Ubuntu 20.04, RHEL 8 -- which is a
+      # release blocker found at release time instead of here.
+      #
+      # The step above has just built exactly such a file (`CARGO_BIN_EXE_qshd`
+      # is why every test binary needs it), so this costs one `readelf` and
+      # one `nm` and no build at all. It is the whole of what the script's
+      # cheap check covers, and deliberately NOT the script's full tree run:
+      # that one builds qshd four ways in three cargo target directories the
+      # cache does not reach, which belongs in a job that has a reason to
+      # pay for it -- the packaging path, where
+      # `packaging/build-server-packages.sh` already calls this same script
+      # over each binary it is about to wrap.
+      - name: The shipped binary asks libpam for nothing newer than LIBPAM_1.0
+        run: scripts/check-pam-linkage.sh target/debug/qshd
+
+      # ONE BINARY PER FRESH CONTAINER, which is a requirement and not a
+      # convenience: these suites share account names and the machine's one
+      # `/etc/pam.d/qshd`, `install_service_file` has no inverse (a suite
+      # leaves behind whichever stack it installed last, often `pam_deny`),
+      # they share `/var/log/qshd/qshd.log`, and the mutex that makes them
+      # take turns is per test binary. A `container:` on this job would run
+      # every step in ONE container and give none of that.
+      #
+      # Per container:
+      #   --init          something must reap orphans, or a test mistakes a
+      #                   zombie for a live worker. Without it the test
+      #                   binary itself is pid 1 and reaps nothing.
+      #   --cap-add=SYS_PTRACE
+      #                   `serve_system_split` alone needs it: two of its
+      #                   tests call `pidfd_getfd`, which Docker's default
+      #                   seccomp profile refuses (`Operation not
+      #                   permitted`) the same way it refuses `ptrace`.
+      #                   Given to all of them because it costs nothing in a
+      #                   container that is thrown away.
+      #   -v ...:ro       the repository at its own absolute path: a test
+      #                   binary has `qshd`'s path baked in
+      #                   (`CARGO_BIN_EXE_qshd`). Read-only, because nothing
+      #                   here writes into the tree -- the daemons write to
+      #                   the container's `/tmp`, `/etc/pam.d` and
+      #                   `/var/log`.
+      #   no -i           nothing here reads stdin, and a container without
+      #                   it has none to read. NOT what keeps the daemon's
+      #                   stdin off a socket: `start_daemon_with` spawns
+      #                   every daemon with `.stdin(Stdio::null())` and has
+      #                   since before this tier existed, which is what stops
+      #                   `serve_system_split`'s search for the helper's two
+      #                   seam sockets from finding an inherited third.
+      #
+      # Every run is `--nocapture` (a skip line printed to stderr reaches
+      # the log no other way) at one thread (the account mutex is a
+      # fallback, not the plan, and libpam damages a process's descriptor
+      # table), goes to a file, and the file goes through
+      # `scripts/no-silent-skips.sh`.
+      - name: Run the root-gated suites, one binary per fresh container
+        run: |
+          set -uo pipefail
+          logs="$RUNNER_TEMP/tier"
+          mkdir -p "$logs"
+          failures=0
+
+          # The executable for one cargo target: `<kind>` tells the library
+          # test binary (`lib`) apart from the `qshd` binary's own (`bin`),
+          # which share a target name.
+          binary() {
+            jq -r --arg kind "$1" --arg name "$2" \
+              'select(.reason == "compiler-artifact" and .profile.test == true
+                      and .target.name == $name and (.target.kind | index($kind)))
+               | .executable' "$RUNNER_TEMP/build.json" | tail -n 1
+          }
+
+          # run_suite <kind> <target name> [--require NAME ...] [name of a test that may skip ...]
+          #
+          # Every suite runs even if an earlier one failed, and the step
+          # fails at the end: which of six binaries broke is the useful
+          # answer, and stopping at the first hides the other five. The
+          # `if` around the pipeline is what suspends `-e` for it (GitHub
+          # runs this script under `bash -e`), so a failing suite is
+          # counted rather than fatal on the spot.
+          #
+          # `bad` is per binary and never more than 1. A run whose tests
+          # failed AND whose log then failed the skip check is ONE broken
+          # binary, and adding to the total twice for it made the closing
+          # line say two binaries had broken when one had -- a number
+          # nobody could reconcile with the six groups above it.
+          run_suite() {
+            kind=$1; name=$2; shift 2
+            bin=$(binary "$kind" "$name")
+            if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+              echo "::error::no $kind test binary was built for $name"
+              failures=$((failures + 1))
+              return
+            fi
+            bad=0
+            echo "::group::$name"
+            # Merge the test's streams before Docker multiplexes them.
+            # Host-side 2>&1 alone can reorder libtest's result and a skip
+            # diagnostic, making a complete run look like a missing test.
+            if docker run --rm --init --cap-add=SYS_PTRACE \
+              -e QSHD_TEST_DISPOSABLE_HOST=1 \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
+              ubuntu:24.04 sh -c 'exec "$@" 2>&1' sh "$bin" --test-threads=1 --nocapture \
+              2>&1 | tee "$logs/$name.log"
+            then :; else
+              echo "::error::$name failed in its container"
+              bad=1
+            fi
+            # Run even when the tests failed: "which tests did not run at
+            # all" is a different answer from "which failed", and a broken
+            # run is exactly when both are worth having.
+            scripts/no-silent-skips.sh "$logs/$name.log" "$@" || bad=1
+            failures=$((failures + bad))
+            echo "::endgroup::"
+          }
+
+          # The five suites that are `#[cfg(feature = "system")]` at file
+          # scope. NOTHING in them may skip: they are the reason this job
+          # exists.
+          #
+          # Each also names, via --require, the one test whose disappearance
+          # would hollow the suite out to a pass that checks nothing. This is
+          # a different failure from a SKIPPED line or an #[ignore]: nothing
+          # here is skipped, refused, or filtered -- the test is not in the
+          # binary at all, so `N passed` just prints a smaller N and every
+          # test still there still says `ok`. Measured: a rename, or
+          # `#[cfg(any())]` standing in for a deletion, on any one of these
+          # five makes its suite report fewer passed and exit 0, unchanged
+          # from before this line existed. Deliberately not "every test in
+          # the suite" -- a list that has to be edited each time a test is
+          # added to a suite stops getting read -- see
+          # scripts/no-silent-skips.sh for what --require checks and why a
+          # plain `grep -q "test NAME ... ok"` does not work under
+          # --nocapture.
+          run_suite test serve_system_split \
+            --require the_worker_runs_as_its_configured_account
+          run_suite test system_mode_accounts \
+            --require two_accounts_each_get_their_own_shell
+          run_suite test system_mode_pam \
+            --require an_expired_account_is_refused
+          run_suite test system_mode_shell \
+            --require the_system_mode_serves_a_shell_over_the_seam
+          run_suite test authorized_keys_privilege \
+            --require the_effective_account_is_restored_even_when_the_read_fails
+
+          # The library tests, where the nine `skip_unless_root` tests in
+          # `helper/server.rs` live -- and four tests that must NOT run as
+          # root, each because root would make the very call they expect to
+          # fail succeed. Those four are named here, and they are not
+          # skipped everywhere: the `check` job above runs this same binary
+          # as an ordinary account, where all four do their work.
+          #
+          # `--ignored 46` is the one declared count in this job. Every one
+          # of the 46 is a body a parent test re-invokes in a process of its
+          # own (each says "runs only via ..." in its own reason), so they
+          # are run, through another door. The number is exact so that a
+          # 47th is somebody's decision rather than nobody's.
+          #
+          # One --require for this binary too, not the zero an earlier
+          # version of this comment said was enough. `qshd/src/serve.rs`
+          # carries about a dozen `#[test]` functions gated on `#[cfg(feature
+          # = "system")]` -- `the_system_flag_is_accepted_and_moves_the_host_key`
+          # and its neighbours, plus two more nested under `mod
+          # silent_helper` -- the same risk this task closes for the five
+          # suites above, just diluted among ~399 tests instead of living in
+          # a binary of its own. Renaming or deleting any one of them still
+          # moves `399 passed` to `398 passed`, unnoticed by anything else in
+          # this file: the binary AS A WHOLE is never at risk of the
+          # "compiles to nothing" failure the five suites were, since it
+          # always carries the crate's few hundred ordinary unit tests
+          # regardless of this feature -- but that is a claim about the
+          # whole binary, not about every test inside it, and saying only
+          # the first half used to read as though there were nothing here to
+          # guard at all.
+          #
+          # `the_system_flag_is_accepted_and_moves_the_host_key` is named
+          # below as one canary out of that dozen: the simplest of them (no
+          # PAM, no helper process, a synchronous parse-and-assert), and
+          # about as close to "why the --system flag exists at all" as a
+          # unit test gets. Naming the rest of the dozen here is the more
+          # thorough version of this fix and a reasonable follow-up, not done
+          # in this pass; the cost of leaving them unguarded is the same
+          # exposure this comment used to claim did not exist -- any of them
+          # could still vanish from a `399 passed` run unnoticed -- just
+          # smaller by the one test this line now does cover.
+          #
+          # The 40 named below are a separate matter and still get no
+          # --require: each is #[ignore]d here BY DESIGN and re-run as a
+          # child process by a parent test, so it never produces a `test
+          # NAME ... ok` line in THIS binary's own log at all -- a --require
+          # on one of them could never pass in this job.
+          run_suite lib qshd --ignored 46 \
+            --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
+            drop_worker_privileges_refuses_without_root \
+            own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
+            an_undeliverable_signal_is_reported_to_the_helper \
+            a_rotation_that_cannot_rename_is_reported_once_but_writes_keep_working
+
+          [ "$failures" -eq 0 ] || {
+            echo "::error::$failures of 6 test binaries failed, skipped a test or left one out"
+            exit 1
+          }

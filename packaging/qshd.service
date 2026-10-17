@@ -1,0 +1,18 @@
+# The personal unit: `systemctl --user enable --now qshd` runs the daemon as
+# one person, for that person alone. No --system, no privileged helper, no
+# account lookup -- whoever starts it is the only one who can get a session.
+# It is installed under /usr/lib/systemd/user/, and the `qshd` package also
+# carries a system-wide unit of the same name (qshd-system.service in this
+# directory, installed to /usr/lib/systemd/system/) which is the multi-user
+# one. Installing the package enables neither.
+[Unit]
+Description=qshd — a resilient terminal daemon
+Documentation=https://github.com/br0adcast/qsh
+
+[Service]
+ExecStart=/usr/bin/qshd serve --port 60022
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[package]
+name = "client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+terminal = { path = "../terminal" }
+prediction = { path = "../prediction" }
+transport = { path = "../transport" }

@@ -1,0 +1,29 @@
+#!/bin/sh
+# %postun for the `qshd` package -- rpm ONLY, wired up as
+# `post_uninstall_script` in cli/Cargo.toml. The dpkg counterpart is `postrm`
+# in this same directory; `prerm` explains why the removal path is two files
+# per format instead of one shared file.
+set -e
+
+# Unconditional, unlike the dpkg side, and that is rpm's own convention: this
+# is what %systemd_postun expands to. On a removal the unit files have just
+# been deleted; on an upgrade they have just been replaced under a possibly
+# running service. Either way systemd is holding a stale copy and should be
+# told.
+#
+# What this deliberately does NOT do is the `try-restart` that
+# %systemd_postun_with_restart would add on an upgrade: the worker holds every
+# session's state and every terminal's leader side, so a restart takes down
+# every session of every connected user at once (design §8.4). Upgrading a
+# package must not do that behind an administrator's back -- they restart when
+# they choose.
+#
+# Guarded the same three ways as the rest: no running systemd, no systemctl, or
+# a failing systemctl must none of them fail the transaction.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || :
+fi
+
+# The system account `qshd` is NOT deleted here either; see `postrm` for why.
+
+exit 0

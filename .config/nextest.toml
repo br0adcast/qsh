@@ -1,0 +1,16 @@
+# Keep the limit small: tests start real daemons and timing-sensitive peers.
+[profile.default]
+test-threads = 4
+retries = 0
+
+[profile.ci]
+fail-fast = false
+
+[test-groups]
+# These suites select an ephemeral UDP port, close the socket, then start
+# qshd on that port. Their in-process mutexes do not span nextest processes.
+daemon-ports = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '(package(qsh) | package(qshd) | package(bringup)) & kind(test)'
+test-group = 'daemon-ports'

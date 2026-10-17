@@ -1,0 +1,54 @@
+#!/bin/sh
+# Pre-removal script for the `qshd` package -- dpkg ONLY. The rpm counterpart
+# is `preun` in this same directory; the two must be kept in step.
+#
+# WHY THIS IS NOT THE SHARED FILE THE postinst IS. Creating the account is
+# argument-independent, so one file can serve both formats. Tearing down the
+# unit is not: it must happen on a removal and must NOT happen on an upgrade,
+# and that is precisely the branch the postinst forbids itself. The two
+# formats disagree about more than spelling:
+#
+#   dpkg  -- words, and the work is split across two scripts: prerm gets
+#            "remove" / "upgrade" / "deconfigure" / "failed-upgrade", postrm
+#            gets "remove" / "purge" / "upgrade" / ...
+#   rpm   -- a count, and the work is split across %preun and %postun: 0 means
+#            the package is going away, 1 or more means an upgrade.
+#
+# A single body would have to be right in four places at once, so there are
+# four files. cargo-deb reads only the six names dpkg knows
+# ("config", "preinst", "postinst", "prerm", "postrm", "templates" --
+# cargo-deb-3.8.0/src/deb/control.rs:109), which is why `preun` and `postun`
+# can sit in this directory without ever reaching a .deb.
+#
+# Do NOT collapse the case below into an unconditional stop. On an upgrade
+# dpkg runs the OLD package's prerm and then the new package's postinst; an
+# unconditional stop here would leave the daemon down after every upgrade,
+# and nobody would connect the two.
+set -e
+
+case "$1" in
+    remove)
+        # Stop and disable together, before the unit file is deleted --
+        # `disable` needs the file to still be there to find its [Install]
+        # section. --no-reload because the postrm reloads once, after the
+        # files are actually gone.
+        #
+        # Guarded three ways so that a container, a chroot or an image build
+        # cannot be made to fail by this line: /run/systemd/system exists only
+        # when systemd is the running init, systemctl may not be installed at
+        # all, and `|| :` keeps a failure from tripping `set -e` anyway.
+        #
+        # Only the system unit. The per-user unit is enabled by each person in
+        # their own ~/.config/systemd/user, which a package neither can nor
+        # should reach into.
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl --no-reload disable --now qshd.service >/dev/null 2>&1 || :
+        fi
+        ;;
+    upgrade|deconfigure|failed-upgrade)
+        # Nothing on purpose. The service keeps running across an upgrade; see
+        # the note in `postun` about why it is not restarted either.
+        ;;
+esac
+
+exit 0
