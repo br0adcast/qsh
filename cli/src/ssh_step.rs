@@ -60,7 +60,12 @@ pub enum HostKeyVerdict {
     NotAboutTheKey,
 }
 
-pub fn judge_host_key(err: &ssh::SshError, keys: &HostKeys, name: &str) -> HostKeyVerdict {
+pub fn judge_host_key(
+    err: &ssh::SshError,
+    keys: &HostKeys,
+    name: &str,
+    store: &KnownHosts,
+) -> HostKeyVerdict {
     let (info, changed) = match err {
         ssh::SshError::UnknownHostKey(i) => (i, false),
         ssh::SshError::HostKeyChanged(i) => (i, true),
@@ -68,22 +73,31 @@ pub fn judge_host_key(err: &ssh::SshError, keys: &HostKeys, name: &str) -> HostK
     };
     if keys.revoked.contains(&info.key) {
         return HostKeyVerdict::Refuse(format!(
-            "the ssh host key of {name} ({}) is marked @revoked in known_hosts",
-            info.fingerprint
+            "the ssh host key of {name} ({}) is marked @revoked in the configured known-hosts files: {}",
+            info.fingerprint, store_paths(store)
         ));
     }
     if changed {
-        return HostKeyVerdict::Refuse(changed_text(name, info));
+        return HostKeyVerdict::Refuse(changed_text(name, info, store));
     }
     HostKeyVerdict::Ask(info.clone())
 }
 
-fn changed_text(name: &str, info: &ssh::HostKeyInfo) -> String {
+fn changed_text(name: &str, info: &ssh::HostKeyInfo, store: &KnownHosts) -> String {
     format!(
         "WARNING: the ssh host key of {name} has changed (now {}); not using ssh there. \
-         If this is expected, remove the old key from ~/.ssh/known_hosts",
-        info.fingerprint
+         If this is expected, find and remove the old key in the configured known-hosts files: {}",
+        info.fingerprint,
+        store_paths(store)
     )
+}
+
+fn store_paths(store: &KnownHosts) -> String {
+    store
+        .files()
+        .map(|path| format!("\"{}\"", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn unknown_key_question(name: &str, info: &ssh::HostKeyInfo) -> String {
@@ -363,7 +377,7 @@ impl SshStep<'_> {
             Err(Attempted::Ssh(e)) => e,
             Err(other) => return Err(other.into_error()),
         };
-        let info = match judge_host_key(&first, &keys, &name) {
+        let info = match judge_host_key(&first, &keys, &name, self.known_hosts) {
             HostKeyVerdict::Refuse(why) => return Err(plain(why)),
             HostKeyVerdict::NotAboutTheKey => {
                 return Err(SshStepError::Failed(ssh_failure(
@@ -393,13 +407,17 @@ impl SshStep<'_> {
         // The second connection (and knock) is how `ssh::connect` works.
         match self.attempt(addr, route, client_pubkey, &keys, cancel) {
             Ok(ready) => Ok(ready),
-            Err(Attempted::Ssh(e)) => Err(match judge_host_key(&e, &keys, &name) {
-                HostKeyVerdict::Refuse(why) => plain(why),
-                HostKeyVerdict::Ask(info) => plain(changed_text(&name, &info)),
-                HostKeyVerdict::NotAboutTheKey => {
-                    SshStepError::Failed(ssh_failure(&e, cfg!(target_os = "macos")))
-                }
-            }),
+            Err(Attempted::Ssh(e)) => {
+                Err(match judge_host_key(&e, &keys, &name, self.known_hosts) {
+                    HostKeyVerdict::Refuse(why) => plain(why),
+                    HostKeyVerdict::Ask(info) => {
+                        plain(changed_text(&name, &info, self.known_hosts))
+                    }
+                    HostKeyVerdict::NotAboutTheKey => {
+                        SshStepError::Failed(ssh_failure(&e, cfg!(target_os = "macos")))
+                    }
+                })
+            }
             Err(other) => Err(other.into_error()),
         }
     }
@@ -589,7 +607,7 @@ mod tests {
     fn an_unknown_ssh_host_key_is_asked_about() {
         let e = ssh::SshError::UnknownHostKey(info(b"k"));
         assert!(matches!(
-            judge_host_key(&e, &HostKeys::default(), "h"),
+            judge_host_key(&e, &HostKeys::default(), "h", &KnownHosts::standard()),
             HostKeyVerdict::Ask(_)
         ));
     }
@@ -597,12 +615,19 @@ mod tests {
     #[test]
     fn a_changed_ssh_host_key_is_a_loud_failure() {
         let e = ssh::SshError::HostKeyChanged(info(b"k"));
-        match judge_host_key(&e, &HostKeys::default(), "[h]:2222") {
+        let store = KnownHosts::new(
+            "custom directory/known_hosts".into(),
+            Some("system directory/ssh_known_hosts".into()),
+        );
+        match judge_host_key(&e, &HostKeys::default(), "[h]:2222", &store) {
             HostKeyVerdict::Refuse(t) => {
                 assert!(
                     t.starts_with("WARNING: the ssh host key of [h]:2222 has changed"),
                     "{t}"
-                )
+                );
+                assert!(!t.contains("~/.ssh/known_hosts"), "{t}");
+                assert!(t.contains("custom directory/known_hosts"), "{t}");
+                assert!(t.contains("system directory/ssh_known_hosts"), "{t}");
             }
             _ => panic!("expected Refuse"),
         }
@@ -618,7 +643,7 @@ mod tests {
             ssh::SshError::UnknownHostKey(info(b"k")),
             ssh::SshError::HostKeyChanged(info(b"k")),
         ] {
-            match judge_host_key(&e, &keys, "h") {
+            match judge_host_key(&e, &keys, "h", &KnownHosts::standard()) {
                 HostKeyVerdict::Refuse(t) => assert!(t.contains("@revoked"), "{t}"),
                 _ => panic!("expected Refuse"),
             }
@@ -665,7 +690,7 @@ mod tests {
     fn other_errors_are_not_about_the_key() {
         let e = ssh::SshError::AuthFailed("no".into());
         assert!(matches!(
-            judge_host_key(&e, &HostKeys::default(), "h"),
+            judge_host_key(&e, &HostKeys::default(), "h", &KnownHosts::standard()),
             HostKeyVerdict::NotAboutTheKey
         ));
     }

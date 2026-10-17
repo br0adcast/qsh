@@ -27,6 +27,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sshauth::discover::DiscoveryError;
@@ -177,6 +178,7 @@ pub enum TrustError {
         port: u16,
         pinned: [u8; 32],
         offered: [u8; 32],
+        store: PathBuf,
     },
     /// The user said no.
     Refused,
@@ -196,6 +198,7 @@ impl fmt::Display for TrustError {
                 port,
                 pinned,
                 offered,
+                store,
             } => write!(
                 f,
                 "the server key for {host}:{port} has changed!\n  \
@@ -203,10 +206,11 @@ impl fmt::Display for TrustError {
                  If the server was reinstalled, or switched between qshd's personal and \
                  system mode (each keeps its own separate host key, so switching between \
                  them changes the fingerprint -- see docs/qshd-service.md), remove the \
-                 line for {host} from ~/.config/qsh/known_hosts and reconnect. If neither \
+                 line for {host} from \"{}\" and reconnect. If neither \
                  happened, someone is between you and the server.",
                 key_fingerprint(pinned),
-                key_fingerprint(offered)
+                key_fingerprint(offered),
+                store.display()
             ),
             TrustError::Refused => write!(f, "server key not confirmed -- connection canceled"),
             TrustError::Store(why) => write!(f, "known-hosts file unavailable: {why}"),
@@ -270,6 +274,7 @@ pub fn recovery_server_key(
                 port,
                 pinned: key,
                 offered: pinned,
+                store: hosts.path().to_owned(),
             })
         }
     };
@@ -345,8 +350,9 @@ pub fn after_silence(
     addr: SocketAddr,
     pinned: [u8; 32],
     discover: &dyn Discover,
+    hosts: &KnownHosts,
 ) -> AfterSilence {
-    after_silence_verdict(host, port, pinned, discover.key(addr))
+    after_silence_verdict(host, port, pinned, discover.key(addr), hosts)
 }
 
 /// The decision itself -- the pinned key against whatever discovery produced
@@ -356,6 +362,7 @@ fn after_silence_verdict(
     port: u16,
     pinned: [u8; 32],
     discovered: Result<[u8; 32], DiscoveryError>,
+    hosts: &KnownHosts,
 ) -> AfterSilence {
     match discovered {
         Ok(offered) if offered != pinned => AfterSilence::Changed(TrustError::KeyChanged {
@@ -363,6 +370,7 @@ fn after_silence_verdict(
             port,
             pinned,
             offered,
+            store: hosts.path().to_owned(),
         }),
         Ok(_) => AfterSilence::SameKey,
         Err(e) => AfterSilence::NoKey(e),
@@ -531,6 +539,7 @@ fn server_key_with_discovered(
             port,
             pinned,
             offered,
+            store: hosts.path().to_owned(),
         }),
         HostVerdict::Unknown => {
             let prompt = format!(
@@ -935,9 +944,14 @@ mod tests {
     #[test]
     fn silence_from_a_host_whose_key_changed_is_reported_as_a_changed_key() {
         let discovery = FakeDiscovery::answering([9u8; 32]);
-        let AfterSilence::Changed(err) =
-            after_silence("example.org", 60022, any_addr(), [7u8; 32], &discovery)
-        else {
+        let AfterSilence::Changed(err) = after_silence(
+            "example.org",
+            60022,
+            any_addr(),
+            [7u8; 32],
+            &discovery,
+            &KnownHosts::open(PathBuf::from(r"C:\Users\Example User\qsh\known_hosts")),
+        ) else {
             panic!("a different key is the explanation");
         };
 
@@ -953,7 +967,7 @@ mod tests {
             "and the offered one: {message}"
         );
         assert!(
-            message.contains("known_hosts"),
+            message.contains(r"C:\Users\Example User\qsh\known_hosts"),
             "and where to fix it: {message}"
         );
         assert!(
@@ -970,7 +984,14 @@ mod tests {
         let discovery = FakeDiscovery::answering([7u8; 32]);
         assert!(
             matches!(
-                after_silence("example.org", 60022, any_addr(), [7u8; 32], &discovery),
+                after_silence(
+                    "example.org",
+                    60022,
+                    any_addr(),
+                    [7u8; 32],
+                    &discovery,
+                    &KnownHosts::open(PathBuf::from(r"C:\Users\Example User\qsh\known_hosts"))
+                ),
                 AfterSilence::SameKey
             ),
             "the same key is not a changed key"
@@ -986,7 +1007,14 @@ mod tests {
         let discovery = FakeDiscovery::silent();
         assert!(
             matches!(
-                after_silence("example.org", 60022, any_addr(), [7u8; 32], &discovery),
+                after_silence(
+                    "example.org",
+                    60022,
+                    any_addr(),
+                    [7u8; 32],
+                    &discovery,
+                    &KnownHosts::open(PathBuf::from(r"C:\Users\Example User\qsh\known_hosts"))
+                ),
                 AfterSilence::NoKey(DiscoveryError::Silent { .. })
             ),
             "no answer is not evidence of a changed key"
@@ -1024,6 +1052,30 @@ mod tests {
             message.contains("system mode"),
             "and the host key's move between qshd's personal and system mode as a \
              possible innocent cause: {message}"
+        );
+    }
+
+    #[test]
+    fn changed_key_reports_the_store_used_for_discovery_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(&dir.path().join("Application Support"));
+        store.pin("example.org", 60022, &[7; 32]).unwrap();
+        let ask = recorder(true);
+        let initial = server_key_with_discovered("example.org", 60022, &store, &ask, Ok([9; 32]))
+            .unwrap_err();
+        let recovery = recovery_server_key("example.org", 60022, [9; 32], &store).unwrap_err();
+        for err in [initial, recovery] {
+            let message = err.to_string();
+            assert!(
+                message.contains(&store.path().display().to_string()),
+                "{message}"
+            );
+            assert!(!message.contains("~/.config/qsh/known_hosts"), "{message}");
+        }
+        assert!(ask.asked.lock().unwrap().is_empty());
+        assert_eq!(
+            store.check("example.org", 60022, &[7; 32]).unwrap(),
+            HostVerdict::Known
         );
     }
 

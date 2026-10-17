@@ -54,6 +54,11 @@ impl KnownHosts {
         &self.user
     }
 
+    /// All configured stores, in lookup order, for host-key diagnostics.
+    pub fn files(&self) -> impl Iterator<Item = &std::path::Path> {
+        std::iter::once(self.user.as_path()).chain(self.system.as_deref())
+    }
+
     pub fn standard() -> KnownHosts {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         KnownHosts::new(
