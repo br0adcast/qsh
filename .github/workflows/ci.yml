@@ -43,7 +43,7 @@ jobs:
       - name: Portable CLI tests
         run: |
           cargo test -p qsh --test connection_start --locked
-          cargo test -p qsh --lib --locked paths::tests
+          cargo test -p qsh --test paths --locked
 
   check:
     runs-on: ubuntu-latest
