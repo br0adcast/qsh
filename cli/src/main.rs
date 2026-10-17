@@ -7,19 +7,21 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use render::{ColorDepth, TermCaps};
 
 use ::connect::reconnect::{Event, Order, Phase, Reconnect, RoundEnd, Stop};
+use ::connect::recovery_gate::{AddressId, RecoveryEpoch};
 use ::connect::Address;
 use client::channel::{ChannelId, ChannelSession, SessionEvent};
 use client::qsh::QshSubstrate;
+use qsh::road_catalog::{BoundedResolver, RoadCatalog, RoadWork};
 use transport::driver_std::UseRoadOutcome;
 use transport::paths::{PathState, RoadInfo};
 use transport::shell_frame::{encode_record, REC_DATA, REC_ECHO_ACK};
@@ -194,7 +196,13 @@ fn run(a: args::Args) -> i32 {
     // keeps the port the daemon was actually reached on (spec §5.1).
     let mut addresses = setup.args().addresses.clone();
     addresses[addr].qsh_port = port;
-    let labels = set_roads(&attempt, remote, &addresses, addr);
+    let labels = labels(remote, &addresses, addr);
+    let road_epoch = RecoveryEpoch {
+        connection: 0,
+        network: 0,
+    };
+    let mut catalog = RoadCatalog::new(addresses.clone(), road_epoch);
+    catalog.seed(AddressId(addr), remote);
 
     // The trial's size is the shell's; `interactive` wants the terminal's.
     let Trial {
@@ -216,6 +224,11 @@ fn run(a: args::Args) -> i32 {
         at: addr,
         labels,
         roads_at: None,
+        catalog,
+        resolver: BoundedResolver::new(),
+        road_epoch,
+        road_origin: Instant::now(),
+        road_active: remote,
         keep: false,
         round: None,
         rounds: 0,
@@ -231,37 +244,8 @@ fn run(a: args::Args) -> i32 {
 /// the socket address it resolved to, and `host:port` as the person knows it.
 type Label = (usize, SocketAddr, String);
 
-/// Hands the live connection its roads: the other addresses named on the
-/// command line are roads to this same session (spec §5.1). Returns every
-/// road as the window names it.
-///
-/// Handed over once a client has been settled on -- at login and after
-/// every return: the session is already proven, so a road needs no
-/// handshake of its own -- one exchange of authentic packets is what
-/// verifies it. The address in use leads, on the port it was reached on
-/// (which the daemon may have reported instead of the one asked for); every
-/// other address keeps the qsh port this run knows it by.
-fn set_roads(
-    attempt: &connect::Attempt,
-    remote: SocketAddr,
-    addresses: &[Address],
-    live: usize,
-) -> Vec<Label> {
-    let labels = labels(remote, addresses, live);
-    if addresses.len() > 1 {
-        let roads = paths(&labels, live);
-        log::log(&format!("roads: {roads:?}"));
-        attempt.client.set_paths(roads);
-    }
-    labels
-}
-
-/// Every address that is a road, in command-line order: the one in use
-/// (`live`) at `remote`, every other one as it resolves, with the qsh port
-/// this run knows it by.
-///
-/// A name that will not resolve is not a road: it is dropped with a line in
-/// the log rather than failing a connection that already works.
+/// Initial labels use only numeric endpoints and the authenticated login road.
+/// Names remain in RoadCatalog and join asynchronously as DNS completes.
 fn labels(remote: SocketAddr, addresses: &[Address], live: usize) -> Vec<Label> {
     addresses
         .iter()
@@ -270,28 +254,14 @@ fn labels(remote: SocketAddr, addresses: &[Address], live: usize) -> Vec<Label> 
             let at = if i == live {
                 Some(remote)
             } else {
-                resolve(&a.host, a.qsh_port)
+                a.host
+                    .parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| SocketAddr::new(ip, a.qsh_port))
             };
             at.map(|at| (i, at, host_port(&a.host, a.qsh_port)))
         })
         .collect()
-}
-
-/// `host` as it resolves on `port`, or `None` with a line in the log.
-fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
-    match (host, port).to_socket_addrs() {
-        Ok(it) => {
-            let found = connect::preferred_addr(it);
-            if found.is_none() {
-                log::log(&format!("spare address {host}:{port} resolved to nothing"));
-            }
-            found
-        }
-        Err(e) => {
-            log::log(&format!("spare address {host}:{port} did not resolve: {e}"));
-            None
-        }
-    }
 }
 
 /// `host:port`, an IPv6 literal in brackets.
@@ -305,6 +275,7 @@ fn host_port(host: &str, port: u16) -> String {
 /// The address in use is on the list deliberately -- the table chooses from
 /// what it holds, so leaving it off would mean nothing to come back to when it
 /// revives.
+#[cfg(test)]
 fn paths(labels: &[Label], live: usize) -> Vec<SocketAddr> {
     let in_use = labels.iter().filter(|l| l.0 == live);
     let others = labels.iter().filter(|l| l.0 != live);
@@ -425,6 +396,11 @@ struct Links {
     labels: Vec<Label>,
     /// When the roads were last looked at; `None` makes the next turn look.
     roads_at: Option<i64>,
+    catalog: RoadCatalog,
+    resolver: BoundedResolver,
+    road_epoch: RecoveryEpoch,
+    road_origin: Instant,
+    road_active: SocketAddr,
     /// The person left with `Ctrl-] .`: the live link is let go quietly, so
     /// the session stays on the server.
     keep: bool,
@@ -511,6 +487,7 @@ impl Links {
     /// One turn of the loop: time passed, and the round under way may have
     /// an answer.
     fn turn(&mut self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
+        self.refresh_catalog();
         let mut actions = self.refresh_roads(sess, now_ms);
         actions.extend(self.on(Event::Tick, sess, now_ms));
         let Some(round) = &self.round else {
@@ -622,7 +599,12 @@ impl Links {
         log::log(&connect::features_line(attempt.client.features()));
         self.addresses[addr].qsh_port = port;
         self.at = addr;
-        self.labels = set_roads(&attempt, remote, &self.addresses, addr);
+        self.road_epoch.connection += 1;
+        self.resolver.cancel();
+        self.catalog = RoadCatalog::new(self.addresses.clone(), self.road_epoch);
+        self.catalog.seed(AddressId(addr), remote);
+        self.road_active = remote;
+        self.labels = labels(remote, &self.addresses, addr);
         self.roads_at = None;
         // Before the forwarder starts: the server's list of what it still
         // runs (`on_announced`) must find the session already reattaching.
@@ -638,6 +620,71 @@ impl Links {
         });
         actions.extend(self.on(Event::RoundOver(RoundEnd::Connected { addr }), sess, now_ms));
         actions
+    }
+
+    /// DNS and catalog scheduling run every loop turn, independently of UI
+    /// publication and background SSH rounds. No resolver call runs here.
+    fn refresh_catalog(&mut self) {
+        let now = self.road_origin.elapsed();
+        for result in self.resolver.poll(now) {
+            self.catalog
+                .resolved(result.epoch, result.request, result.address, result.result);
+        }
+        let urgent = if let Some(live) = &self.live {
+            let client = &live.attempt.client;
+            self.road_active = client.active_path().unwrap_or(self.road_active);
+            for (endpoint, sent) in client.path_probes() {
+                if let Some(sent) = sent.checked_duration_since(self.road_origin) {
+                    self.catalog.probed(endpoint, sent);
+                }
+            }
+            u64::from(client.stats().silent_secs) >= transport::PATH_DOWN_AFTER.as_secs()
+        } else {
+            true
+        };
+        for work in self.catalog.refresh(now, self.road_active, urgent) {
+            match work {
+                RoadWork::Resolve {
+                    request,
+                    address,
+                    host,
+                    port,
+                } => {
+                    if !self
+                        .resolver
+                        .submit(self.road_epoch, request, address, host, port, now)
+                    {
+                        self.catalog.deferred(request, address);
+                    }
+                }
+                RoadWork::Publish { paths } => {
+                    if let Some(live) = &self.live {
+                        live.attempt.client.set_paths(paths);
+                    }
+                }
+            }
+        }
+        self.labels = self
+            .catalog
+            .endpoints()
+            .into_iter()
+            .map(|(id, endpoint)| {
+                let address = &self.addresses[id.0];
+                (id.0, endpoint, host_port(&address.host, address.qsh_port))
+            })
+            .collect();
+        if !self
+            .labels
+            .iter()
+            .any(|(_, endpoint, _)| *endpoint == self.road_active)
+        {
+            let address = &self.addresses[self.at];
+            self.labels.push((
+                self.at,
+                self.road_active,
+                host_port(&address.host, address.qsh_port),
+            ));
+        }
     }
 
     /// Tells `Session` how the live connection's roads look, when it is time
@@ -1407,10 +1454,10 @@ mod tests {
         assert_eq!(list[0].ewma_ms, Some(41));
     }
 
-    /// A spare nobody can resolve is not a road -- and it must not take the
-    /// working ones down with it.
+    /// Initial labels omit unresolved names while preserving command-line IDs.
+    /// The catalog, tested separately, retains those names for later retries.
     #[test]
-    fn a_spare_that_will_not_resolve_is_dropped_rather_than_fatal() {
+    fn initial_labels_defer_names_without_blocking_working_roads() {
         let addresses = vec![
             address("box", 60022),
             address("no-such-host.invalid", 60022),

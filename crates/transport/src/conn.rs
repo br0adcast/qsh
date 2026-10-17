@@ -1556,8 +1556,21 @@ impl Connection {
     /// nothing.
     pub fn set_paths(&mut self, addrs: Vec<SocketAddr>) {
         let mut seen = HashSet::new();
-        self.paths
-            .set_paths(addrs.into_iter().filter(|a| seen.insert(*a)).collect());
+        // A UI candidate snapshot can race with an automatic move. Pin the
+        // actual peer here before applying the table's size limit. An empty
+        // list remains the explicit request to disable path checking.
+        let active = if addrs.is_empty() || !matches!(self.role, Role::Client) {
+            None
+        } else {
+            self.peer
+        };
+        self.paths.set_paths(
+            active
+                .into_iter()
+                .chain(addrs)
+                .filter(|a| seen.insert(*a))
+                .collect(),
+        );
     }
 
     /// Where the traffic is going right now.
@@ -1960,6 +1973,11 @@ impl Connection {
             }
         }
         view
+    }
+
+    /// Actual path-probe send times, using the transport's monotonic clock.
+    pub fn path_probes(&self) -> Vec<(SocketAddr, Instant)> {
+        self.paths.probe_times()
     }
 
     /// Whether the server said this handshake landed on the session this
@@ -5669,6 +5687,53 @@ mod tests {
             to_backup >= 1,
             "a backup road must be checked, or it could never be verified: {out:?}"
         );
+    }
+
+    #[test]
+    fn publishing_a_stale_candidate_group_keeps_the_current_active_path() {
+        let (mut client, _server, _caddr, _saddr) = established_pair();
+        let moved: SocketAddr = "192.0.2.100:60000".parse().unwrap();
+        client.set_peer(moved);
+        let candidates = (1..=8)
+            .map(|n| format!("192.0.2.{n}:60000").parse().unwrap())
+            .collect();
+        client.set_paths(candidates);
+        assert!(
+            client.paths.contains(moved),
+            "the driver may move between snapshot and SetPaths"
+        );
+        assert_eq!(client.roads(Instant::now()).len(), 8);
+        client.set_paths(Vec::new());
+        assert!(
+            client.roads(Instant::now()).is_empty(),
+            "empty still disables path checks"
+        );
+    }
+
+    #[test]
+    fn a_foreign_server_cannot_verify_a_path_that_later_returns_to_the_expected_peer() {
+        let (mut client, mut server, caddr, saddr) = established_pair();
+        let (_other_client, mut other_server, _, _) = established_pair();
+        let checked: SocketAddr = "192.0.2.9:60000".parse().unwrap();
+        client.set_paths(vec![saddr, checked]);
+        let now = Instant::now();
+        let probe = client
+            .on_timeout(now)
+            .into_iter()
+            .find(|d| d.to == checked)
+            .unwrap();
+        // The ordinary encrypted probe cannot open a session at another QSH.
+        let foreign = other_server.on_datagram(now, caddr, &probe.bytes);
+        for packet in foreign {
+            client.on_datagram(now, checked, &packet.bytes);
+        }
+        assert!(!client.paths.is_verified(checked));
+        let answer = server.on_datagram(now, caddr, &probe.bytes);
+        for packet in answer {
+            client.on_datagram(now + Duration::from_millis(10), checked, &packet.bytes);
+        }
+        assert!(client.paths.is_verified(checked));
+        assert_eq!(client.active_path(), Some(saddr));
     }
 
     /// Urgency means the liveness check went UNANSWERED, not that one is in

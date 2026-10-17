@@ -359,6 +359,12 @@ pub struct DriverSetup {
     pub stream_consumption: Vec<(u8, Consumption)>,
 }
 
+#[derive(Default)]
+struct RoadSnapshot {
+    roads: Vec<RoadInfo>,
+    probes: Vec<(SocketAddr, Instant)>,
+}
+
 /// Handle to the client driver. Owns the command channel to the thread, the
 /// shared latest statistics, and the thread handle. All methods take `&self`,
 /// so the type can be shared through `Arc`.
@@ -384,7 +390,7 @@ pub struct StdClient {
     /// The roads as the driver last published them. Shared for the same
     /// reason `active_path` is: only the driver thread may touch the
     /// connection.
-    roads: Arc<Mutex<Vec<RoadInfo>>>,
+    roads: Arc<Mutex<RoadSnapshot>>,
     /// The send gates of bounded producers (spec §4.7.3), refreshed by the
     /// driver thread after every pass and closed when it ends.
     gates: Arc<GateTable>,
@@ -438,7 +444,7 @@ impl StdClient {
         let features_thread = Arc::clone(&features);
         let active_path = Arc::new(Mutex::new(None));
         let active_path_thread = Arc::clone(&active_path);
-        let roads = Arc::new(Mutex::new(Vec::new()));
+        let roads = Arc::new(Mutex::new(RoadSnapshot::default()));
         let roads_thread = Arc::clone(&roads);
         let gates = Arc::new(GateTable::new());
         let gates_thread = Arc::clone(&gates);
@@ -532,7 +538,7 @@ impl StdClient {
             closed_gracefully: Arc::new(AtomicBool::new(false)),
             features: Arc::new(Mutex::new(None)),
             active_path: Arc::new(Mutex::new(None)),
-            roads: Arc::new(Mutex::new(Vec::new())),
+            roads: Arc::new(Mutex::new(RoadSnapshot::default())),
             gates: Arc::new(GateTable::new()),
             socket_buffers: Arc::new(Mutex::new(None)),
             last_send_error: Arc::new(Mutex::new(None)),
@@ -552,8 +558,8 @@ impl StdClient {
             .send(Command::SetDeathAfter(after));
     }
 
-    /// Tell the session which roads lead to the same server. A list of one
-    /// (or none) leaves everything exactly as it was.
+    /// Tell the session which roads lead to the same server. Nonempty updates
+    /// retain the actual active peer; an empty list disables path checking.
     pub fn set_paths(&self, addrs: Vec<SocketAddr>) {
         let _ = self
             .tx
@@ -570,7 +576,12 @@ impl StdClient {
     /// What the roads looked like at the driver's last publication. Empty
     /// until roads are handed in, and on a session that has none.
     pub fn roads(&self) -> Vec<RoadInfo> {
-        self.roads.lock().expect("roads mutex").clone()
+        self.roads.lock().expect("roads mutex").roads.clone()
+    }
+
+    /// Actual probe send times from the driver's last road publication.
+    pub fn path_probes(&self) -> Vec<(SocketAddr, Instant)> {
+        self.roads.lock().expect("roads mutex").probes.clone()
     }
 
     /// Whether the server said this connection landed on the session named
@@ -949,7 +960,7 @@ fn run_driver(
     closed_gracefully_flag: Arc<AtomicBool>,
     features_flag: Arc<Mutex<Option<Features>>>,
     active_path_flag: Arc<Mutex<Option<SocketAddr>>>,
-    roads_out: Arc<Mutex<Vec<RoadInfo>>>,
+    roads_out: Arc<Mutex<RoadSnapshot>>,
     gates: Arc<GateTable>,
     buffers_out: Arc<Mutex<Option<BufferReport>>>,
     last_send_error: Arc<Mutex<Option<SendFailure>>>,
@@ -1301,7 +1312,10 @@ fn run_driver(
             last_stats = cur;
             last_stats_at = now;
             *shared_stats.lock().expect("stats mutex") = cur;
-            *roads_out.lock().expect("roads mutex") = conn.roads(now);
+            *roads_out.lock().expect("roads mutex") = RoadSnapshot {
+                roads: conn.roads(now),
+                probes: conn.path_probes(),
+            };
             events.on_stats(cur);
         }
 
@@ -2836,7 +2850,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
-                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(RoadSnapshot::default())),
                 Arc::new(GateTable::new()),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3078,6 +3092,11 @@ mod tests {
             client.roads().len(),
             2,
             "both roads appear once the driver has published them"
+        );
+        assert_eq!(
+            client.path_probes().len(),
+            2,
+            "every published road actually sent a probe"
         );
         client.close();
     }

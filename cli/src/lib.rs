@@ -20,6 +20,7 @@ pub mod prompt;
 pub mod recovery;
 pub mod releases;
 pub mod report;
+pub mod road_catalog;
 pub mod session;
 pub mod sessions;
 pub mod signals;
