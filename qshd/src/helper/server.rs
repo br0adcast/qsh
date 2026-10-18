@@ -946,18 +946,19 @@ fn serve(
             .into_iter()
             .enumerate()
             .map(|(n, (login, account))| {
-                // No address: a login seeded here never came off a wire
-                // (see this function's `admitted`), so there is nothing to
-                // record as where it came from.
+                // Seeded logins are a test fixture (the daemon passes an
+                // empty `admitted`). Give that fixture a synthetic remote
+                // endpoint so channel tests reach their own PAM behavior.
+                #[cfg(test)]
+                let rhost = tests::PROOF_RHOST.to_string();
+                #[cfg(not(test))]
+                let rhost = String::new();
                 //
                 // An incarnation apiece all the same, from the same
                 // sequence `ensure_login` will go on with below: two
                 // entries sharing a number is the one thing the number
                 // exists to rule out, seeded or not.
-                (
-                    login,
-                    LoginState::provisional(account, String::new(), 1 + n as u64),
-                )
+                (login, LoginState::provisional(account, rhost, 1 + n as u64))
             })
             .collect(),
         monitors: HashMap::new(),
@@ -6312,7 +6313,7 @@ pub(crate) mod tests {
         let mut state = filled_state(account, 0);
         state.logins.insert(
             login,
-            LoginState::provisional(account.clone(), String::new(), 1),
+            LoginState::provisional(account.clone(), PROOF_RHOST.to_string(), 1),
         );
         state
     }
@@ -6530,7 +6531,8 @@ pub(crate) mod tests {
                 }
                 // The successful Verify settlement binds the login first,
                 // then overwrites the UID cache with the newly verified alias.
-                ensure_login(&mut state, other, second, String::new()).expect("second login");
+                ensure_login(&mut state, other, second, PROOF_RHOST.to_string())
+                    .expect("second login");
                 state.verified.insert(second.uid, second.clone());
                 observe(&mut state, 2, login);
                 observe(&mut state, 3, other);
@@ -8432,7 +8434,7 @@ pub(crate) mod tests {
     ) -> LoginState {
         LoginState {
             account: account.clone(),
-            rhost: String::new(),
+            rhost: PROOF_RHOST.to_string(),
             created_at,
             established,
             // One life, and the tests that care about telling two apart
@@ -10425,10 +10427,9 @@ pub(crate) mod tests {
 
     /// The address every [`proof`]-built request says it came from -- what
     /// a login admitted through one carries, and so what its session's
-    /// `PAM_RHOST` must be
-    /// (`the_stack_sees_the_account_service_terminal_and_address`). A
-    /// constant rather than a literal in two places, so the test cannot
-    /// drift from what the proof actually sends.
+    /// `PAM_RHOST` must contain its numeric IP
+    /// (`the_stack_sees_the_account_service_terminal_and_address`). Logs
+    /// retain this full endpoint.
     pub(crate) const PROOF_RHOST: &str = "203.0.113.7:2222";
 
     /// Build a proof for `login` over `hash` and `nonce`, signed with `key`,
@@ -14071,11 +14072,10 @@ pub(crate) mod tests {
     /// terminal the helper opened for the login's first channel, and the
     /// address the worker reported when the login proved itself.
     ///
-    /// `PAM_RHOST` decides nothing here and is believed by nobody (spec §9
-    /// `rhost-from-worker`) -- it is the worker's word -- but a stack that
-    /// consults it (`pam_access`, `pam_rhosts`) must at least be given what
-    /// arrived on `Request::Verify` rather than an empty string, which is
-    /// what looks LOCAL to `pam_access` and as a rule loosens its rules.
+    /// `PAM_RHOST` is still the worker's word (spec §9
+    /// `rhost-from-worker`), but a stack that consults it (`pam_access`,
+    /// `pam_rhosts`) must receive the reported numeric IP without the port.
+    /// An empty string looks LOCAL to `pam_access` and can loosen its rules.
     ///
     /// `pam_exec` puts all four in the script's environment, which is how a
     /// test with no privileges can read back what the modules were handed.
@@ -14129,7 +14129,7 @@ pub(crate) mod tests {
                 format!(
                     "{me}|qshd-test-items|{tty}|{rhost}",
                     me = h.me,
-                    rhost = PROOF_RHOST
+                    rhost = "203.0.113.7"
                 )
                 .as_str()
             ),

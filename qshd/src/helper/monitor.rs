@@ -79,6 +79,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -128,7 +129,7 @@ pub(super) struct MonitorPlan {
     /// terminal of its own that the session never hears about (spec §9
     /// `tty-first-channel`).
     pub(super) tty: String,
-    /// Where the client was when it logged in, for `PAM_RHOST`. Chosen by
+    /// Full source endpoint, converted to its numeric IP for `PAM_RHOST`. Chosen by
     /// the WORKER, so it is worth nothing as a fact: see
     /// `protocol::Request::Verify`'s own field, and spec §9
     /// `rhost-from-worker`.
@@ -656,6 +657,22 @@ fn set_interval_timer(every: Duration) {
     }
 }
 
+/// Translate the worker-reported endpoint only at the remote PAM boundary.
+/// The full endpoint stays with the helper for diagnostics. This validates
+/// its representation, not its truth: a compromised worker still chooses it.
+/// Never give PAM an empty/unknown origin, which some stacks treat as local.
+fn pam_origin(rhost: &str) -> Result<String, PamError> {
+    rhost
+        .parse::<SocketAddr>()
+        .map(|endpoint| endpoint.ip())
+        .or_else(|_| rhost.parse::<IpAddr>())
+        .map(|ip| ip.to_string())
+        .map_err(|_| PamError {
+            code: super::pam::PAM_SYSTEM_ERR,
+            what: "the client address is not a numeric IP or endpoint",
+        })
+}
+
 /// `pam_start` for this login, from the stack the plan names.
 ///
 /// Two functions, not one with a branch, and the test one is
@@ -667,32 +684,24 @@ fn set_interval_timer(every: Duration) {
 /// which is what actually checks it.
 #[cfg(not(test))]
 fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
-    Pam::start(
-        &plan.pam_service,
-        &plan.account.name,
-        &plan.tty,
-        &plan.rhost,
-    )
+    let origin = pam_origin(&plan.rhost)?;
+    Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin)
 }
 
 /// [`start_transaction`], for the tests: a stack in a directory of the
 /// test's own, so the PAM tests need no root and touch no `/etc/pam.d`.
 #[cfg(test)]
 fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
+    let origin = pam_origin(&plan.rhost)?;
     match &plan.pam_confdir {
         Some(dir) => Pam::start_confdir(
             dir,
             &plan.pam_service,
             &plan.account.name,
             &plan.tty,
-            &plan.rhost,
+            &origin,
         ),
-        None => Pam::start(
-            &plan.pam_service,
-            &plan.account.name,
-            &plan.tty,
-            &plan.rhost,
-        ),
+        None => Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin),
     }
 }
 
@@ -1533,6 +1542,179 @@ fn fork_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_account_name() -> String {
+        nix::unistd::User::from_uid(Uid::current())
+            .expect("passwd")
+            .expect("account")
+            .name
+    }
+
+    fn remote_transaction(
+        dir: &std::path::Path,
+        service: &str,
+        user: &str,
+        tty: &str,
+        rhost: &str,
+    ) -> Result<Pam, PamError> {
+        let account = super::super::account::lookup(user).expect("existing test account");
+        start_transaction(&MonitorPlan {
+            account,
+            login: [7; 16],
+            tty: tty.into(),
+            rhost: rhost.into(),
+            pam_service: service.into(),
+            pam_confdir: Some(dir.to_path_buf()),
+            become_account: |_, _, _| Ok(()),
+            fd_limit: 0,
+            session_budget: Duration::from_secs(1),
+            session_close_budget: Duration::from_secs(1),
+        })
+    }
+
+    /// Capture the actual module environment, including IPv6 scope removal.
+    #[test]
+    fn pam_rhost_is_the_numeric_ip_without_the_endpoint_port() {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+            "helper::monitor::tests::pam_rhost_is_the_numeric_ip_without_the_endpoint_port_body",
+        );
+        assert!(status.success(), "{status}:\n{stdout}\n{stderr}");
+    }
+
+    #[test]
+    #[ignore = "runs only via pam_rhost_is_the_numeric_ip_without_the_endpoint_port"]
+    fn pam_rhost_is_the_numeric_ip_without_the_endpoint_port_body() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = dir.path().join("seen");
+        let script = dir.path().join("record.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PAM_RHOST\" >> {}\n",
+                seen.display()
+            ),
+        )
+        .expect("write capture script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(
+            dir.path().join("qshd-test-rhost"),
+            format!("account required pam_exec.so {}\n", script.display()),
+        )
+        .expect("write stack");
+        let inputs = [
+            "203.0.113.7:2222",
+            "[2001:db8::7]:2222",
+            "[fe80::7%3]:2222",
+            "203.0.113.7",
+            "2001:db8::7",
+        ];
+        for endpoint in inputs {
+            let mut pam = remote_transaction(
+                dir.path(),
+                "qshd-test-rhost",
+                &current_account_name(),
+                "/dev/pts/7",
+                endpoint,
+            )
+            .expect("start");
+            pam.acct_mgmt().expect("capture module");
+        }
+        assert_eq!(
+            std::fs::read_to_string(seen).expect("capture"),
+            "203.0.113.7\n2001:db8::7\nfe80::7\n203.0.113.7\n2001:db8::7\n"
+        );
+    }
+
+    /// Both CIDR matches and their opposite fallbacks matter: a broken
+    /// origin can deny an allowed peer OR admit a denied peer.
+    #[test]
+    fn pam_access_matches_source_cidrs_with_explicit_fallbacks() {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+            "helper::monitor::tests::pam_access_matches_source_cidrs_with_explicit_fallbacks_body",
+        );
+        assert!(status.success(), "{status}:\n{stdout}\n{stderr}");
+    }
+
+    #[test]
+    #[ignore = "runs only via pam_access_matches_source_cidrs_with_explicit_fallbacks"]
+    fn pam_access_matches_source_cidrs_with_explicit_fallbacks_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let access = dir.path().join("access.conf");
+        std::fs::write(
+            dir.path().join("qshd-test-access"),
+            format!(
+                "account required pam_access.so nodefgroup noaudit accessfile={}\n",
+                access.display()
+            ),
+        )
+        .expect("write stack");
+        let me = current_account_name();
+        let mut results = Vec::new();
+        for (cidr, matching, outside) in [
+            ("203.0.113.0/24", "203.0.113.7:2222", "198.51.100.7:2222"),
+            (
+                "2001:db8:1::/48",
+                "[2001:db8:1::7]:2222",
+                "[2001:db8:2::7]:2222",
+            ),
+        ] {
+            for (rule, fallback, expected) in [("+", "-", true), ("-", "+", false)] {
+                std::fs::write(&access, format!("{rule}:ALL:{cidr}\n{fallback}:ALL:ALL\n"))
+                    .expect("write access policy");
+                for (endpoint, allowed) in [(matching, expected), (outside, !expected)] {
+                    let mut pam = remote_transaction(
+                        dir.path(),
+                        "qshd-test-access",
+                        &me,
+                        "/dev/pts/7",
+                        endpoint,
+                    )
+                    .expect("start");
+                    results.push((cidr, rule, endpoint, pam.acct_mgmt().is_ok(), allowed));
+                }
+            }
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, _, actual, expected)| actual == expected),
+            "CIDR verdicts (cidr, rule, endpoint, actual, expected): {results:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_pam_origins_are_refused_before_starting_the_stack() {
+        // No stack exists: the argument error must precede pam_start_confdir.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for origin in [
+            "",
+            "localhost",
+            "host.example:22",
+            "not-an-ip",
+            "203.0.113.7:bad",
+            "[2001:db8::7]",
+            "203.0.113.7\n",
+            "[fe80::7%eth0]:22",
+        ] {
+            let error = remote_transaction(
+                dir.path(),
+                "qshd-test-absent",
+                &current_account_name(),
+                "/dev/pts/7",
+                origin,
+            )
+            .expect_err("invalid remote must never become local");
+            assert_eq!(
+                (error.code, error.what),
+                (
+                    super::super::pam::PAM_SYSTEM_ERR,
+                    "the client address is not a numeric IP or endpoint"
+                ),
+                "origin {origin:?}"
+            );
+        }
+    }
 
     /// How long a test here waits on a seam for a message a monitor may or
     /// may not have sent. Both waits below are bounded by it, the opposite

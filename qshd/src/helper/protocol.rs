@@ -162,9 +162,11 @@ pub enum Request {
         login_id: LoginId,
         /// Where the client was when it logged in -- the source address the
         /// worker saw (`transport::probation`), kept with the login and
-        /// handed to its monitor for `PAM_RHOST` and for the log.
+        /// logged as a full endpoint. The monitor gives `PAM_RHOST` only
+        /// its numeric IP, without the port or IPv6 scope. Invalid or
+        /// empty origins refuse the remote PAM transaction before it starts.
         ///
-        /// **It is never checked and decides nothing.** The worker chooses
+        /// **Its truth is never checked.** The worker chooses
         /// it, and the worker is the process this whole split exists to
         /// distrust: a taken-over one can name any address it likes. So a
         /// PAM module that decides by `PAM_RHOST` (`pam_access`,

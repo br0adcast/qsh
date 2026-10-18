@@ -308,11 +308,11 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 46` is the one declared count in this job. Every one
-          # of the 46 is a body a parent test re-invokes in a process of its
+          # `--ignored 48` is the one declared count in this job. Every one
+          # of the 48 is a body a parent test re-invokes in a process of its
           # own (each says "runs only via ..." in its own reason), so they
           # are run, through another door. The number is exact so that a
-          # 47th is somebody's decision rather than nobody's.
+          # 49th is somebody's decision rather than nobody's.
           #
           # One --require for this binary too, not the zero an earlier
           # version of this comment said was enough. `qshd/src/serve.rs`
@@ -347,7 +347,7 @@ jobs:
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 46 \
+          run_suite lib qshd --ignored 48 \
             --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
