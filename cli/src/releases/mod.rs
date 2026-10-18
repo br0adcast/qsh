@@ -130,7 +130,13 @@ impl ImageSource for GitHubImages {
             Ok(sums) => sums,
             Err(FetchError::TemporarilyUnavailable(reason)) => {
                 let check = Budget::new(timing.verify, cancel);
-                let cache = cache::Cache::open(&self.cache_root, request, &check)?;
+                let Some(cache) = cache::optional(
+                    cache::Cache::open(&self.cache_root, request, &check),
+                    &check,
+                )?
+                else {
+                    return Err(ImageError::Download(reason));
+                };
                 return cache
                     .load(request, None, &check, timing.publish)?
                     .ok_or(ImageError::Download(reason));
@@ -144,11 +150,14 @@ impl ImageSource for GitHubImages {
         }
         let archive_sha = archive::expected_hash(&sums, &format!("{}.tar.gz", stem(request)))?;
         let check = Budget::new(timing.verify, cancel);
-        let cache = cache::Cache::open(&self.cache_root, request, &check)?;
-        if let Some(image) = cache.load(request, Some(&archive_sha), &check, timing.publish)? {
-            return Ok(image);
+        if let Some(cache) = cache::optional(
+            cache::Cache::open(&self.cache_root, request, &check),
+            &check,
+        )? {
+            if let Some(image) = cache.load(request, Some(&archive_sha), &check, timing.publish)? {
+                return Ok(image);
+            }
         }
-        drop(cache);
         // Once GitHub names a hash, a failed download must not use older data.
         Budget::new(timing.download, cancel).check()?;
         let bytes = self.transport.fetch(
@@ -169,8 +178,16 @@ impl ImageSource for GitHubImages {
         let check = Budget::new(timing.verify, cancel);
         let image = archive::verified_image(request, &bytes, &archive_sha, &check)?;
         let publication = Budget::new(timing.publish, cancel);
-        let cache = cache::Cache::open(&self.cache_root, request, &publication)?;
-        cache.publish(request, &bytes, &archive_sha, &image, &publication)?;
+        if let Some(cache) = cache::optional(
+            cache::Cache::open(&self.cache_root, request, &publication),
+            &publication,
+        )? {
+            cache::optional(
+                cache.publish(request, &bytes, &archive_sha, &image, &publication),
+                &publication,
+            )?;
+        }
+        publication.check()?;
         Ok(image)
     }
 }

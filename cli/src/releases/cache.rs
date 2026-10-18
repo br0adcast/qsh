@@ -34,18 +34,45 @@ struct Cached {
     object: PathBuf,
     repair: bool,
 }
+
+/// Storage is optional; cancellation, deadlines and verification are not.
+pub(super) enum CacheError {
+    Unavailable,
+    Required(ImageError),
+}
+impl From<ImageError> for CacheError {
+    fn from(error: ImageError) -> Self {
+        Self::Required(error)
+    }
+}
+fn unavailable(_: std::io::Error) -> CacheError {
+    CacheError::Unavailable
+}
+
+pub(super) fn optional<T>(
+    result: Result<T, CacheError>,
+    budget: &Budget<'_>,
+) -> Result<Option<T>, ImageError> {
+    // An I/O error must not hide cancellation or an expired local deadline.
+    budget.check()?;
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(CacheError::Unavailable) => Ok(None),
+        Err(CacheError::Required(error)) => Err(error),
+    }
+}
 fn failure(error: impl std::fmt::Display) -> ImageError {
     ImageError::Invalid(format!("release cache: {error}"))
 }
 
-fn directory(path: &Path) -> Result<(), ImageError> {
+fn directory(path: &Path) -> Result<(), CacheError> {
     match fs::create_dir(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(failure(error)),
+        Err(error) => return Err(unavailable(error)),
     }
-    if !fs::symlink_metadata(path).map_err(failure)?.is_dir() {
-        return Err(failure("expected a real directory"));
+    if !fs::symlink_metadata(path).map_err(unavailable)?.is_dir() {
+        return Err(CacheError::Unavailable);
     }
     Ok(())
 }
@@ -84,11 +111,11 @@ impl Cache {
         root: &Path,
         request: &ImageRequest,
         budget: &Budget<'_>,
-    ) -> Result<Self, ImageError> {
+    ) -> Result<Self, CacheError> {
         budget.check()?;
         // The caller owns the root (which may itself be an XDG symlink). Every
         // untrusted descendant is checked before it is used as a directory.
-        fs::create_dir_all(root).map_err(failure)?;
+        fs::create_dir_all(root).map_err(unavailable)?;
         let mut path = root.to_owned();
         for part in ["releases", &request.version, request.platform.target()] {
             path.push(part);
@@ -103,9 +130,9 @@ impl Cache {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path.join(".lock"))
-            .map_err(failure)?;
-        if !lock.metadata().map_err(failure)?.is_file() {
-            return Err(failure("invalid cache lock"));
+            .map_err(unavailable)?;
+        if !lock.metadata().map_err(unavailable)?.is_file() {
+            return Err(CacheError::Unavailable);
         }
         loop {
             budget.check()?;
@@ -115,7 +142,7 @@ impl Cache {
             }
             let error = std::io::Error::last_os_error();
             if error.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(failure(error));
+                return Err(unavailable(error));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -142,13 +169,16 @@ impl Cache {
         }
         if cached.repair {
             let publication = Budget::new(publication, budget.cancel);
-            atomic_file(&cached.object, "image", &cached.image.bytes, &publication)?;
-            atomic_file(
-                &cached.object,
-                "receipt.json",
-                &receipt_bytes(request, &cached.sha, &cached.image)?,
-                &publication,
-            )?;
+            let repair = (|| {
+                atomic_file(&cached.object, "image", &cached.image.bytes, &publication)?;
+                atomic_file(
+                    &cached.object,
+                    "receipt.json",
+                    &receipt_bytes(request, &cached.sha, &cached.image)?,
+                    &publication,
+                )
+            })();
+            optional(repair, &publication)?;
         }
         Ok(Some(cached.image))
     }
@@ -205,7 +235,7 @@ impl Cache {
         sha: &[u8; 32],
         image: &DaemonImage,
         budget: &Budget<'_>,
-    ) -> Result<(), ImageError> {
+    ) -> Result<(), CacheError> {
         budget.check()?;
         let objects = self.path.join("objects");
         let name = archive::hex(sha);
@@ -213,7 +243,7 @@ impl Cache {
         let staging = tempfile::Builder::new()
             .prefix(".release-")
             .tempdir_in(&objects)
-            .map_err(failure)?;
+            .map_err(unavailable)?;
         atomic_file(staging.path(), "archive", bytes, budget)?;
         atomic_file(staging.path(), "image", &image.bytes, budget)?;
         let receipt = receipt_bytes(request, sha, image)?;
@@ -221,22 +251,23 @@ impl Cache {
         budget.check()?;
         match fs::symlink_metadata(&target) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::rename(staging.path(), &target).map_err(failure)?;
+                fs::rename(staging.path(), &target).map_err(unavailable)?;
             }
             Ok(metadata) if metadata.is_dir() => {
                 // The same content-addressed generation may have been damaged.
                 // Readers hold the lock, so repair is coherent across processes.
                 for file in ["archive", "image", "receipt.json"] {
                     budget.check()?;
-                    fs::rename(staging.path().join(file), target.join(file)).map_err(failure)?;
+                    fs::rename(staging.path().join(file), target.join(file))
+                        .map_err(unavailable)?;
                 }
             }
-            Ok(_) => return Err(failure("object path is not a real directory")),
-            Err(error) => return Err(failure(error)),
+            Ok(_) => return Err(CacheError::Unavailable),
+            Err(error) => return Err(unavailable(error)),
         }
         File::open(&objects)
             .and_then(|file| file.sync_all())
-            .map_err(failure)?;
+            .map_err(unavailable)?;
         let current = serde_json::to_vec(&Current {
             archive_sha256: name,
         })
@@ -265,17 +296,18 @@ fn atomic_file(
     name: &str,
     bytes: &[u8],
     budget: &Budget<'_>,
-) -> Result<(), ImageError> {
-    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(failure)?;
+) -> Result<(), CacheError> {
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(unavailable)?;
     for chunk in bytes.chunks(64 * 1024) {
         budget.check()?;
-        file.write_all(chunk).map_err(failure)?;
+        file.write_all(chunk).map_err(unavailable)?;
     }
-    file.as_file().sync_all().map_err(failure)?;
+    file.as_file().sync_all().map_err(unavailable)?;
     budget.check()?;
-    file.persist(parent.join(name)).map_err(failure)?;
+    file.persist(parent.join(name))
+        .map_err(|error| unavailable(error.error))?;
     File::open(parent)
         .and_then(|file| file.sync_all())
-        .map_err(failure)?;
+        .map_err(unavailable)?;
     Ok(())
 }
