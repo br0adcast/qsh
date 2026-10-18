@@ -676,12 +676,13 @@ async fn open_channel(
                 ch,
                 bytes: data.to_vec(),
             }),
-            // stderr: a command without a PTY reports errors here, and the
-            // startup must see them to tell "empty" from "failed".
-            ChannelMsg::ExtendedData { data, .. } => events.on_channel(SubstrateEvent::Data {
-                ch,
-                bytes: data.to_vec(),
-            }),
+            ChannelMsg::ExtendedData { data, ext } => {
+                events.on_channel(SubstrateEvent::ExtendedData {
+                    ch,
+                    data_type: ext,
+                    bytes: data.to_vec(),
+                })
+            }
             ChannelMsg::ExitStatus { exit_status } => code = exit_status as i32,
             ChannelMsg::Close => break,
             _ => {}

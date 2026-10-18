@@ -55,6 +55,14 @@ pub enum SubstrateEvent {
         ch: ChannelId,
         bytes: Vec<u8>,
     },
+    /// SSH extended output. Type 1 is stderr; other types retain their identity.
+    /// Consumers must choose a stream policy explicitly. PTY process output is
+    /// already merged by the remote terminal driver and arrives as `Data`.
+    ExtendedData {
+        ch: ChannelId,
+        data_type: u32,
+        bytes: Vec<u8>,
+    },
     InputConsumed {
         ch: ChannelId,
         offset: u64,
@@ -79,6 +87,14 @@ pub enum SessionEvent {
     },
     Data {
         ch: ChannelId,
+        bytes: Vec<u8>,
+    },
+    /// SSH extended output. Type 1 is stderr; other types retain their identity.
+    /// Consumers must choose a stream policy explicitly. PTY process output is
+    /// already merged by the remote terminal driver and arrives as `Data`.
+    ExtendedData {
+        ch: ChannelId,
+        data_type: u32,
         bytes: Vec<u8>,
     },
     InputConsumed {
@@ -113,7 +129,7 @@ pub enum SessionEvent {
 /// independently, so output can arrive before the confirmation that makes
 /// it deliverable -- ordinarily for one packet's worth of jitter, but
 /// nothing here can force the far side to ever answer `Opened` or
-/// `Refused` at all. Past this many bytes of `Data` payload, further
+/// `Refused` at all. Past this many bytes of combined `Data`/`ExtendedData` payload, further
 /// output for a still-unconfirmed channel is dropped rather than held
 /// without bound.
 const MAX_BUFFERED_BEFORE_READY: usize = 64 * 1024;
@@ -127,11 +143,11 @@ const MAX_BUFFERED_BEFORE_READY: usize = 64 * 1024;
 enum ChannelState {
     Opening {
         request: OpenRequest,
-        /// `Data`/`InputConsumed` decoded before the far side confirmed
+        /// `Data`/`ExtendedData`/`InputConsumed` decoded before the far side confirmed
         /// this channel, held here and delivered, in order, right after
         /// `Ready` -- see [`MAX_BUFFERED_BEFORE_READY`] for the bound.
         buffered: Vec<SessionEvent>,
-        /// Running total of `buffered`'s `Data` payload bytes, kept
+        /// Running total of `buffered`'s ordinary and extended payload bytes, kept
         /// alongside it so the cap is a comparison, not a re-sum of the
         /// whole queue on every arrival.
         buffered_bytes: usize,
@@ -335,7 +351,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     }
 
     /// Appends `event` to a still-`Opening` channel's buffer, unless doing
-    /// so would push its buffered `Data` payload past
+    /// so would push its combined buffered output payload past
     /// [`MAX_BUFFERED_BEFORE_READY`] -- in which case `event` is dropped in
     /// silence, the same way [`Self::send`]/[`Self::resize`]/[`Self::close`]
     /// already drop a call this session cannot yet act on.
@@ -347,7 +363,9 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         }) = self.channels.get_mut(&ch)
         {
             let event_bytes = match &event {
-                SessionEvent::Data { bytes, .. } => bytes.len(),
+                SessionEvent::Data { bytes, .. } | SessionEvent::ExtendedData { bytes, .. } => {
+                    bytes.len()
+                }
                 _ => 0,
             };
             if *buffered_bytes + event_bytes > MAX_BUFFERED_BEFORE_READY {
@@ -399,6 +417,23 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                     // (a no-op for `Gone` or an unknown stream, same as
                     // every other call this session cannot yet act on).
                     self.buffer_before_ready(ch, SessionEvent::Data { ch, bytes });
+                    Vec::new()
+                }
+            }
+            SubstrateEvent::ExtendedData {
+                ch,
+                data_type,
+                bytes,
+            } => {
+                let event = SessionEvent::ExtendedData {
+                    ch,
+                    data_type,
+                    bytes,
+                };
+                if self.is_ready(ch) {
+                    vec![event]
+                } else {
+                    self.buffer_before_ready(ch, event);
                     Vec::new()
                 }
             }
@@ -605,6 +640,68 @@ mod tests {
                 bytes: b"later".to_vec()
             }]
         );
+    }
+
+    #[test]
+    fn extended_data_keeps_type_order_and_shared_pre_ready_limit() {
+        let (mut session, _) = session();
+        let ch = session.open_command(b"command", 0, 0).unwrap();
+        assert!(session
+            .on_event(SubstrateEvent::Data {
+                ch,
+                bytes: vec![b'a'; MAX_BUFFERED_BEFORE_READY - 1]
+            })
+            .is_empty());
+        assert!(session
+            .on_event(SubstrateEvent::ExtendedData {
+                ch,
+                data_type: 1,
+                bytes: b"b".to_vec()
+            })
+            .is_empty());
+        assert!(session
+            .on_event(SubstrateEvent::ExtendedData {
+                ch,
+                data_type: 77,
+                bytes: b"over".to_vec()
+            })
+            .is_empty());
+        let events = session.on_event(SubstrateEvent::Opened(ch));
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], SessionEvent::Ready(ch));
+        assert!(
+            matches!(&events[1], SessionEvent::Data { bytes, .. } if bytes.len() == MAX_BUFFERED_BEFORE_READY - 1)
+        );
+        assert_eq!(
+            events[2],
+            SessionEvent::ExtendedData {
+                ch,
+                data_type: 1,
+                bytes: b"b".to_vec()
+            }
+        );
+        assert_eq!(
+            session.on_event(SubstrateEvent::ExtendedData {
+                ch,
+                data_type: 77,
+                bytes: b"unknown-type".to_vec()
+            }),
+            vec![SessionEvent::ExtendedData {
+                ch,
+                data_type: 77,
+                bytes: b"unknown-type".to_vec()
+            }]
+        );
+        session.on_event(SubstrateEvent::Exit { ch, code: 0 });
+        for ch in [ch, 255] {
+            assert!(session
+                .on_event(SubstrateEvent::ExtendedData {
+                    ch,
+                    data_type: 1,
+                    bytes: b"late".to_vec()
+                })
+                .is_empty());
+        }
     }
 
     /// A channel stuck `Opening` -- the far side never answers `Opened` or

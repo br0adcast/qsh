@@ -25,6 +25,8 @@ pub struct FakeAuth {
     pub activity: Arc<ServerActivity>,
     /// Successive exec outputs, without running a shell or touching user state.
     pub exec_outputs: Vec<Vec<u8>>,
+    /// Omit exit-status for this zero-based exec request, then close normally.
+    pub exec_missing_status: Option<usize>,
     pub open_gate: Option<Arc<tokio::sync::Notify>>,
     pub auth_none_gate: Option<Arc<tokio::sync::Notify>>,
     pub publickey_offer_gate: Option<Arc<tokio::sync::Notify>>,
@@ -517,7 +519,9 @@ impl russh::server::Handler for Login {
         if let Some(output) = self.auth.exec_outputs.get(index) {
             session.channel_success(channel)?;
             session.data(channel, output.clone())?;
-            session.exit_status_request(channel, 0)?;
+            if self.auth.exec_missing_status != Some(index) {
+                session.exit_status_request(channel, 0)?;
+            }
             session.eof(channel)?;
             session.close(channel)?;
         } else {

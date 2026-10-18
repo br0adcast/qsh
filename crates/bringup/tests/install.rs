@@ -771,3 +771,151 @@ fn compatible_architecture_aliases_and_image_names_remain_compatible() {
         Err(BringUpError::UnsupportedPlatform(_))
     ));
 }
+
+#[test]
+fn stderr_warnings_do_not_corrupt_discovery_verification_or_readiness() {
+    let mut sb = Sandbox::start();
+    sb.fake_qshd(
+        &sb.home.path().join("bin/uname"),
+        "echo harmless-uname-warning >&2; exec /usr/bin/uname \"$@\"",
+    );
+    sb.fake_qshd(
+        &sb.home.path().join("bin/sha256sum"),
+        "echo harmless-hash-warning >&2; exec /usr/bin/sha256sum \"$@\"",
+    );
+    let mut bytes = b"#!/bin/sh\necho harmless-ready-warning >&2\n".to_vec();
+    bytes.extend_from_slice(SCRIPT);
+    let images = source(&bytes);
+    let consent = approval(true);
+    let ready = run(
+        &mut sb,
+        ask(),
+        hooks(images.clone(), consent.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(ready.ports, [60022]);
+    assert_eq!(ready.server_pubkey, [7; 32]);
+    assert_eq!(fs::read(final_path(&sb)).unwrap(), bytes);
+    assert_eq!(images.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(consent.offers.lock().unwrap().len(), 1);
+    assert_no_temporary(&sb);
+    run(
+        &mut sb,
+        ask(),
+        hooks(images.clone(), consent.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(images.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(consent.offers.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn stdout_warning_in_discovery_never_prompts_or_loads_an_image() {
+    let mut sb = Sandbox::start();
+    sb.fake_qshd(
+        &sb.home.path().join("bin/uname"),
+        "echo unexpected-stdout; exec /usr/bin/uname \"$@\"",
+    );
+    let images = source(SCRIPT);
+    let consent = approval(true);
+    let error = run(
+        &mut sb,
+        ask(),
+        hooks(images.clone(), consent.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
+    assert_eq!(images.calls.load(Ordering::SeqCst), 0);
+    assert!(consent.offers.lock().unwrap().is_empty());
+    assert_not_started(&sb);
+}
+
+#[test]
+fn readiness_requires_complete_utf8_stdout_and_successful_exit() {
+    for (prefix, suffix, bad_ready) in [
+        ("exec 1>&2\n", "", true),
+        ("echo denied >&2\n", "exit 17\n", false),
+        ("", "printf '\\377'\n", true),
+        ("", "head -c 65536 /dev/zero | tr '\\000' x\n", true),
+    ] {
+        let mut sb = Sandbox::start();
+        let bytes = [b"#!/bin/sh\n", prefix.as_bytes(), SCRIPT, suffix.as_bytes()].concat();
+        let error = run(
+            &mut sb,
+            bundled(),
+            hooks(source(&bytes), approval(true), Arc::default()),
+            &knock::Cancel::new(),
+        )
+        .unwrap_err();
+        if bad_ready {
+            assert!(matches!(error, BringUpError::BadReady(_)), "{error:?}");
+        } else {
+            assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
+            assert!(error.to_string().contains("denied"));
+            assert!(error.to_string().contains("17"));
+        }
+        assert_no_temporary(&sb);
+    }
+}
+
+#[test]
+fn stderr_only_lookup_failure_preserves_its_reason() {
+    let mut sb = Sandbox::start();
+    sb.fake_qshd(
+        &sb.home.path().join("bin/uname"),
+        "echo lookup-denied >&2; exit 19",
+    );
+    let images = source(SCRIPT);
+    let consent = approval(true);
+    let error = run(
+        &mut sb,
+        ask(),
+        hooks(images.clone(), consent.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
+    assert!(error.to_string().contains("lookup-denied"));
+    assert_eq!(images.calls.load(Ordering::SeqCst), 0);
+    assert!(consent.offers.lock().unwrap().is_empty());
+}
+
+#[test]
+fn checksum_stdout_with_an_extra_record_is_not_a_verified_image() {
+    let mut sb = Sandbox::start();
+    sb.fake_qshd(
+        &sb.home.path().join("bin/sha256sum"),
+        "/usr/bin/sha256sum; echo unexpected-record",
+    );
+    let error = run(
+        &mut sb,
+        bundled(),
+        hooks(source(SCRIPT), approval(true), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BringUpError::Verify(_)), "{error:?}");
+    assert_not_started(&sb);
+    assert_no_temporary(&sb);
+}
+
+#[test]
+fn partial_ready_then_timeout_is_not_success_and_keeps_stderr() {
+    let mut sb = Sandbox::start();
+    let bytes = [
+        b"#!/bin/sh\necho unfinished-ensure >&2\n".as_slice(),
+        SCRIPT,
+        b"exec sleep 2\n",
+    ]
+    .concat();
+    let mut hooks = hooks(source(&bytes), approval(true), Arc::default());
+    hooks.timing.ensure = std::time::Duration::from_millis(200);
+    let error = run(&mut sb, bundled(), hooks, &knock::Cancel::new()).unwrap_err();
+    assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
+    assert!(error.to_string().contains("did not finish"));
+    assert!(error.to_string().contains("stderr: unfinished-ensure"));
+    assert_no_temporary(&sb);
+}

@@ -1266,6 +1266,14 @@ fn on_wire(
             SessionEvent::Data { bytes, .. } => {
                 shell_bytes.extend(encode_record(REC_DATA, &bytes));
             }
+            // This console path consumes qsh, whose wire format has no SSH
+            // extended-data record. Never turn unexpected extensions into
+            // terminal control bytes, including an unknown SSH stream type.
+            SessionEvent::ExtendedData { data_type, .. } => {
+                log::warn(&format!(
+                    "unexpected SSH extended data type {data_type} on qsh channel"
+                ));
+            }
             SessionEvent::InputConsumed { offset, .. } => {
                 shell_bytes.extend(encode_record(REC_ECHO_ACK, &offset.to_be_bytes()));
             }

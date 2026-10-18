@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::{shell, BringUpError, Ready};
 
 /// How much of a failed command's output a person gets to read.
-pub(crate) const ERROR_TEXT_MAX: usize = 1000;
+pub(crate) const ERROR_TEXT_MAX: usize = crate::exec::MAX_DIAGNOSTIC;
 
 pub(crate) fn command(path: &str, name: &str, port: u16, client_pubkey: &[u8; 32]) -> String {
     format!(
@@ -43,8 +43,16 @@ pub(crate) fn parse(code: i32, out: &str) -> Result<Ready, BringUpError> {
         .and_then(|key| key.try_into().ok())
         .ok_or_else(|| bad("the server-pubkey line is not a 32-byte key"))?;
     let json = line_after(out, "TRANSPORT-READY ").ok_or_else(|| bad("no TRANSPORT-READY line"))?;
-    let body: ReadyBody = serde_json::from_str(json.trim())
-        .map_err(|e| bad(&format!("TRANSPORT-READY does not parse ({e})")))?;
+    let body: ReadyBody = serde_json::from_str(json.trim()).map_err(|error| {
+        // Displaying a serde data error can repeat the entire rejected string.
+        // Report its bounded location/category; the output excerpt follows.
+        bad(&format!(
+            "TRANSPORT-READY does not parse ({:?} at line {}, column {})",
+            error.classify(),
+            error.line(),
+            error.column()
+        ))
+    })?;
     if body.ports.is_empty() {
         return Err(bad("TRANSPORT-READY lists no ports"));
     }
@@ -68,12 +76,7 @@ pub(crate) fn excerpt(out: &str, code: i32) -> String {
     if text.is_empty() {
         return format!("exit code {code}");
     }
-    if text.chars().count() <= ERROR_TEXT_MAX {
-        return text.to_string();
-    }
-    let mut cut: String = text.chars().take(ERROR_TEXT_MAX).collect();
-    cut.push('…');
-    cut
+    crate::exec::escaped(text, ERROR_TEXT_MAX)
 }
 
 #[cfg(test)]
@@ -209,5 +212,32 @@ mod tests {
             parse(0, &ready_out("{nope")),
             Err(BringUpError::BadReady(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn failed_command_controls_cannot_reach_the_terminal() {
+        let error = super::parse(1, "\x1b[31mdenied\r\x07")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(error.contains("denied"));
+    }
+}
+
+#[cfg(test)]
+mod malformed_diagnostic_tests {
+    #[test]
+    fn rejected_json_values_cannot_expand_the_error_without_bound() {
+        let output = format!("server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {{\"version\":\"0.5.0\",\"ports\":\"{}\"}}\n", "x".repeat(8000));
+        let error = super::parse(0, &output).unwrap_err().to_string();
+        assert!(
+            error.chars().count() <= 1200,
+            "diagnostic has {} characters",
+            error.chars().count()
+        );
+        assert!(!error.chars().any(char::is_control));
     }
 }

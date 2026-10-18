@@ -24,7 +24,14 @@ pub struct Platform {
 
 impl Platform {
     pub fn from_uname(os: &str, arch: &str) -> Result<Self, BringUpError> {
-        let unsupported = || BringUpError::UnsupportedPlatform(format!("{os}/{arch}"));
+        let unsupported = || {
+            let os_budget = crate::exec::MAX_DIAGNOSTIC / 2;
+            BringUpError::UnsupportedPlatform(format!(
+                "{}/{}",
+                crate::exec::escaped(os, os_budget),
+                crate::exec::escaped(arch, crate::exec::MAX_DIAGNOSTIC - os_budget - 1)
+            ))
+        };
         Ok(Self {
             os: match os {
                 "Linux" => ServerOs::Linux,
