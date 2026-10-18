@@ -572,10 +572,22 @@ fn server_key_with_discovered(
             if !ask.ask(&prompt) {
                 return Err(TrustError::Refused);
             }
-            hosts
-                .pin(host, port, &offered)
-                .map_err(|e| TrustError::Store(e.to_string()))?;
-            Ok(offered)
+            // The prompt may outlive another process's first connection.
+            // Recheck and pin under the store's lock; consent to this offer
+            // must never replace a different key accepted in the meantime.
+            match hosts
+                .pin_if_absent(host, port, &offered)
+                .map_err(|e| TrustError::Store(e.to_string()))?
+            {
+                HostVerdict::Unknown | HostVerdict::Known => Ok(offered),
+                HostVerdict::Changed { pinned } => Err(TrustError::KeyChanged {
+                    host: host.to_string(),
+                    port,
+                    pinned,
+                    offered,
+                    store: hosts.path().to_owned(),
+                }),
+            }
         }
     }
 }
@@ -605,6 +617,69 @@ mod tests {
 
     fn hosts(dir: &std::path::Path) -> KnownHosts {
         KnownHosts::open(dir.join("known_hosts"))
+    }
+
+    struct PinDuringPrompt {
+        path: std::path::PathBuf,
+        key: [u8; 32],
+        answer: bool,
+    }
+
+    impl Confirm for PinDuringPrompt {
+        fn ask(&self, _: &str) -> bool {
+            // A separate store writes after discovery but before the answer,
+            // just as another process can while the user reads the prompt.
+            KnownHosts::open(self.path.clone())
+                .pin("example.org", 60022, &self.key)
+                .unwrap();
+            self.answer
+        }
+    }
+
+    #[test]
+    fn accepting_a_prompt_does_not_replace_a_concurrently_pinned_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        let ask = PinDuringPrompt {
+            path: store.path().to_owned(),
+            key: [2; 32],
+            answer: true,
+        };
+        let result = server_key_with_discovered("example.org", 60022, &store, &ask, Ok([1; 32]));
+        assert!(matches!(
+            result,
+            Err(TrustError::KeyChanged { host, port: 60022, pinned, offered, store: path })
+                if host == "example.org" && pinned == [2; 32] && offered == [1; 32]
+                    && path == store.path()
+        ));
+        assert_eq!(
+            store.check("example.org", 60022, &[2; 32]).unwrap(),
+            HostVerdict::Known
+        );
+    }
+
+    #[test]
+    fn a_prompt_accepts_the_same_concurrent_pin_and_preserves_it_on_refusal() {
+        for answer in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = hosts(dir.path());
+            let ask = PinDuringPrompt {
+                path: store.path().to_owned(),
+                key: [1; 32],
+                answer,
+            };
+            let result =
+                server_key_with_discovered("example.org", 60022, &store, &ask, Ok([1; 32]));
+            if answer {
+                assert_eq!(result.unwrap(), [1; 32]);
+            } else {
+                assert!(matches!(result, Err(TrustError::Refused)));
+            }
+            assert_eq!(
+                store.check("example.org", 60022, &[1; 32]).unwrap(),
+                HostVerdict::Known
+            );
+        }
     }
 
     #[test]
