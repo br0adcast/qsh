@@ -70,6 +70,7 @@ struct GateState {
     closed: bool,
     tail: u64,
     pending: u64,
+    metadata_blocked: bool,
 }
 
 /// One stream's gate. Shared (`Arc`) between whoever refreshes it and
@@ -90,9 +91,21 @@ impl SendGate {
                 closed: false,
                 tail: 0,
                 pending: 0,
+                metadata_blocked: false,
             }),
             changed: Condvar::new(),
         }
+    }
+
+    /// Hold new producer reads for metadata admission independently of byte
+    /// hysteresis. Does not prevent draining already charged output. Returns
+    /// whether the effective producer gate just opened.
+    pub fn set_metadata_blocked(&self, blocked: bool) -> bool {
+        let mut st = self.state.lock().expect("send gate");
+        let was_open = Self::effective_open(&st);
+        st.metadata_blocked = blocked;
+        self.recompute_bytes(&mut st);
+        self.notify_opened(&st, was_open)
     }
 
     pub fn kind(&self) -> GateKind {
@@ -102,13 +115,13 @@ impl SendGate {
     /// Open and not closed for good.
     pub fn is_open(&self) -> bool {
         let st = self.state.lock().expect("send gate");
-        st.open && !st.closed
+        Self::effective_open(&st)
     }
 
     /// Block until the gate opens (`true`) or closes for good (`false`).
     pub fn wait_open(&self) -> bool {
         let mut st = self.state.lock().expect("send gate");
-        while !st.open && !st.closed {
+        while (!st.open || st.metadata_blocked) && !st.closed {
             st = self.changed.wait(st).expect("send gate");
         }
         !st.closed
@@ -129,7 +142,7 @@ impl SendGate {
             if st.closed {
                 return GateWait::Closed;
             }
-            if st.open {
+            if Self::effective_open(&st) {
                 return GateWait::Open;
             }
             let now = Instant::now();
@@ -182,12 +195,9 @@ impl SendGate {
     pub fn force_open(&self) -> bool {
         let mut st = self.state.lock().expect("send gate");
         st.tail = 0;
-        let opened = !st.open && !st.closed;
+        let was_open = Self::effective_open(&st);
         st.open = true;
-        if opened {
-            self.changed.notify_all();
-        }
-        opened
+        self.notify_opened(&st, was_open)
     }
 
     /// Close for good and wake every waiter.
@@ -197,19 +207,32 @@ impl SendGate {
         self.changed.notify_all();
     }
 
-    fn recompute(&self, st: &mut GateState) -> bool {
+    fn effective_open(st: &GateState) -> bool {
+        st.open && !st.closed && !st.metadata_blocked
+    }
+
+    fn recompute_bytes(&self, st: &mut GateState) {
         let (high, low) = self.kind.marks();
-        let load = st.tail + st.pending;
+        let load = st.tail.saturating_add(st.pending);
         if st.open && load >= high {
             st.open = false;
-            false
         } else if !st.open && load <= low {
             st.open = true;
-            self.changed.notify_all();
-            !st.closed
-        } else {
-            false
         }
+    }
+
+    fn notify_opened(&self, st: &GateState, was_open: bool) -> bool {
+        let opened = !was_open && Self::effective_open(st);
+        if opened {
+            self.changed.notify_all();
+        }
+        opened
+    }
+
+    fn recompute(&self, st: &mut GateState) -> bool {
+        let was_open = Self::effective_open(st);
+        self.recompute_bytes(st);
+        self.notify_opened(st, was_open)
     }
 }
 
@@ -349,6 +372,57 @@ impl GateTable {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn metadata_release_wakes_idle_producer_but_keeps_pending_byte_hold() {
+        let gate = Arc::new(SendGate::new(GateKind::Pipe));
+        gate.admit(PIPE_HIGH);
+        gate.set_metadata_blocked(true);
+        assert!(!gate.set_metadata_blocked(false));
+        assert!(!gate.is_open());
+        gate.withdraw(PIPE_HIGH);
+        assert!(gate.is_open());
+        gate.set_metadata_blocked(true);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let other = gate.clone();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            other.wait_open_for(Duration::from_secs(2))
+        });
+        ready_rx.recv().unwrap();
+        assert!(gate.set_metadata_blocked(false));
+        assert_eq!(waiter.join().unwrap(), GateWait::Open);
+    }
+
+    #[test]
+    fn metadata_hold_does_not_open_pipe_early() {
+        let g = SendGate::new(GateKind::Pipe);
+        g.set_metadata_blocked(true);
+        assert!(!g.is_open());
+        assert_eq!(g.wait_open_for(Duration::ZERO), GateWait::TimedOut);
+        g.update(PIPE_HIGH);
+        g.set_metadata_blocked(false);
+        assert!(
+            !g.is_open(),
+            "metadata release cannot bypass byte hysteresis"
+        );
+        g.update(PIPE_LOW + 1);
+        assert!(!g.is_open());
+        g.update(PIPE_LOW);
+        assert!(g.is_open());
+        g.set_metadata_blocked(true);
+        assert!(
+            !g.force_open(),
+            "legacy force-open cannot remove a metadata hold"
+        );
+        assert!(!g.is_open());
+        g.set_metadata_blocked(false);
+        assert!(g.is_open());
+        g.close();
+        g.set_metadata_blocked(true);
+        g.set_metadata_blocked(false);
+        assert_eq!(g.wait_open_for(Duration::ZERO), GateWait::Closed);
+    }
 
     #[test]
     fn a_screen_gate_closes_at_128_kib_and_opens_again_at_32_kib() {

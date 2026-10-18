@@ -299,6 +299,15 @@ pub enum LinkState {
     Closed,
 }
 
+/// A bounded send did not take ownership of any bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendBlocked {
+    NotLive,
+    Desynced,
+    OffsetSpaceExhausted,
+    WouldBlock,
+}
+
 /// Event for the caller. Accumulates in an internal queue and is handed out
 /// in a batch by `poll_events`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1259,6 +1268,59 @@ impl Connection {
             .get(&stream_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Bytes a whole-record handoff can admit now without exceeding the local
+    /// unacked cap, negotiated credit or offset space. Does not create a stream.
+    /// The existing global hard cap remains an additional ceiling.
+    pub fn stream_write_room(&self, stream: u8, max_unacked: usize) -> usize {
+        if self.state != LinkState::Live {
+            return 0;
+        }
+        let cap = max_unacked.min(SEND_HARD_CAP);
+        if let Some(state) = self.streams.get(&stream) {
+            state.sender.write_room(cap)
+        } else {
+            let mut sender = StreamSender::new(stream);
+            sender.set_features(self.features);
+            sender.write_room(cap)
+        }
+    }
+
+    /// Atomically admit the complete slice before sender allocation. Err leaves
+    /// every byte with its caller: no stream creation, event, flush or partial
+    /// append. Producers retain their permit/charge until this returns Ok.
+    pub fn try_send_bounded(
+        &mut self,
+        now: Instant,
+        stream: u8,
+        bytes: &[u8],
+        max_unacked: usize,
+    ) -> Result<Vec<Datagram>, SendBlocked> {
+        if self.state != LinkState::Live {
+            return Err(SendBlocked::NotLive);
+        }
+        if let Some(state) = self.streams.get(&stream) {
+            if state.sender.is_desynced() {
+                return Err(SendBlocked::Desynced);
+            }
+            if bytes.len() as u64 > state.sender.offset_room() {
+                return Err(SendBlocked::OffsetSpaceExhausted);
+            }
+        }
+        if bytes.len() > self.stream_write_room(stream, max_unacked) {
+            return Err(SendBlocked::WouldBlock);
+        }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stream_mut(stream)
+            .sender
+            .push(bytes)
+            .map_err(|_| SendBlocked::OffsetSpaceExhausted)?;
+        let mut out = Vec::new();
+        self.flush_senders(now, &mut out);
+        Ok(out)
     }
 
     /// Queue bytes of stream `stream_id` for reliable sending. Before reaching
@@ -3540,6 +3602,223 @@ mod tests {
         assert_eq!(client.peer(), Some(saddr));
         assert_eq!(server.peer(), Some(caddr));
         (client, server, caddr, saddr)
+    }
+
+    #[test]
+    fn bounded_send_refuses_before_push() {
+        let (mut client, _, _, _) = established_pair();
+        let before = client.stream_progress(16);
+        assert_eq!(client.stream_write_room(16, 4), 4);
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 16, b"12345", 4),
+            Err(SendBlocked::WouldBlock)
+        ));
+        assert_eq!(client.stream_progress(16), before);
+        assert!(
+            !client.streams.contains_key(&16),
+            "a refused send must not create a stream"
+        );
+    }
+
+    #[test]
+    fn bounded_send_obeys_credit_and_local_tail() {
+        let (mut client, _, _, _) = established_pair();
+        let sender = &mut client.stream_mut(16).sender;
+        // Queue without pumping, so credit must include unsent bytes too.
+        sender
+            .push(&vec![0; STREAM_WINDOW as usize - 8196])
+            .unwrap();
+        let now = Instant::now();
+        let record = [0; 8197];
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize),
+            8196
+        );
+        let before = client.stream_progress(16);
+        assert!(matches!(
+            client.try_send_bounded(now, 16, &record, crate::send_gate::PIPE_HIGH as usize),
+            Err(SendBlocked::WouldBlock)
+        ));
+        assert_eq!(client.stream_progress(16), before);
+        client
+            .stream_mut(16)
+            .sender
+            .on_credit((STREAM_WINDOW + 1) as u32);
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize),
+            8196,
+            "local cap still applies"
+        );
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize + 1),
+            8197
+        );
+        assert!(client
+            .try_send_bounded(now, 16, &record, crate::send_gate::PIPE_HIGH as usize + 1)
+            .is_ok());
+        assert_eq!(client.stream_progress(16).queued, STREAM_WINDOW + 1);
+        assert_eq!(
+            client.stream_write_room(16, usize::MAX),
+            0,
+            "all negotiated credit is queued"
+        );
+        assert!(
+            client.stream_write_room(18, crate::send_gate::PIPE_HIGH as usize) >= record.len(),
+            "initial production credit fits a full framed reader chunk"
+        );
+
+        let (mut legacy, _, _, _) = handshake_with_features(Features::NONE, Features::NONE, false);
+        assert_eq!(legacy.stream_write_room(16, 7), 7);
+        assert!(legacy.try_send_bounded(now, 16, b"1234567", 7).is_ok());
+        assert_eq!(legacy.stream_write_room(16, 7), 0);
+        assert!(matches!(
+            legacy.try_send_bounded(now, 16, b"x", 7),
+            Err(SendBlocked::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn bounded_send_admits_whole_record_after_ack_and_credit_recovery() {
+        let (mut client, _, _, _) = established_pair();
+        let now = Instant::now();
+        let cap = crate::send_gate::PIPE_HIGH as usize;
+        let sender = &mut client.stream_mut(16).sender;
+        sender.push(&vec![0; cap - 8196]).unwrap();
+        sender.frames_to_send(now, Duration::from_secs(1));
+        assert!(sender.on_ack(1));
+        assert_eq!(
+            client.stream_write_room(16, cap),
+            8196,
+            "ACK alone does not return consumer credit"
+        );
+        client
+            .stream_mut(16)
+            .sender
+            .on_credit((STREAM_WINDOW + 1) as u32);
+        assert_eq!(client.stream_write_room(16, cap), 8197);
+        assert!(client.try_send_bounded(now, 16, &[0; 8197], cap).is_ok());
+        assert_eq!(client.stream_progress(16).unacked, cap as u64);
+    }
+
+    #[test]
+    fn bounded_send_rejects_nonlive_desynced_and_exhausted_without_mutation() {
+        let (mut client, _, _, _) = established_pair();
+        for state in [
+            LinkState::Connecting,
+            LinkState::PathDown,
+            LinkState::Closed,
+        ] {
+            client.state = state;
+            let count = client.streams.len();
+            assert_eq!(client.stream_write_room(16, 100), 0);
+            assert!(matches!(
+                client.try_send_bounded(Instant::now(), 16, b"x", 100),
+                Err(SendBlocked::NotLive)
+            ));
+            assert_eq!(client.streams.len(), count);
+        }
+        client.state = LinkState::Live;
+        client.stream_mut(16).sender.mark_desynced();
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 16, b"x", 100),
+            Err(SendBlocked::Desynced)
+        ));
+        assert_eq!(client.stream_progress(16).queued, 0);
+        client.stream_mut(17).sender = StreamSender::starting_at(17, OFFSET_LIMIT - 3);
+        assert_eq!(client.stream_write_room(17, 100), 3);
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 17, b"four", 100),
+            Err(SendBlocked::OffsetSpaceExhausted)
+        ));
+        assert_eq!(
+            client.stream_progress(17).queued,
+            u64::from(OFFSET_LIMIT - 3)
+        );
+        assert_eq!(
+            client.stream_write_room(18, usize::MAX),
+            STREAM_WINDOW as usize
+        );
+    }
+
+    #[test]
+    fn bounded_send_does_not_allocate_on_zero_room() {
+        let (mut client, _, _, _) = established_pair();
+        client.poll_events();
+        client
+            .stream_mut(16)
+            .sender
+            .push(&vec![0; STREAM_WINDOW as usize])
+            .unwrap();
+        let before = client.stream_progress(16);
+        let now = Instant::now();
+        let count = client.streams.len();
+        let allocated = allocation_probe::measure(|| {
+            for _ in 0..1000 {
+                assert!(matches!(
+                    client.try_send_bounded(now, 16, b"x", usize::MAX),
+                    Err(SendBlocked::WouldBlock)
+                ));
+                assert!(matches!(
+                    client.try_send_bounded(now, 17, b"x", 0),
+                    Err(SendBlocked::WouldBlock)
+                ));
+                assert_eq!(client.stream_write_room(17, 0), 0);
+            }
+        });
+        assert_eq!(allocated, 0);
+        assert_eq!(client.stream_progress(16), before);
+        assert_eq!(client.streams.len(), count);
+        assert!(client.poll_events().is_empty());
+    }
+
+    // Per-thread observation only; other transport tests use the unchanged
+    // System allocator. No production allocator or allocation policy changes.
+    mod allocation_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        thread_local! { static COUNT: Cell<Option<usize>> = const { Cell::new(None) }; }
+        struct Probe;
+        #[global_allocator]
+        static ALLOCATOR: Probe = Probe;
+        fn record() {
+            let _ = COUNT.try_with(|n| {
+                if let Some(count) = n.get() {
+                    n.set(Some(count + 1));
+                }
+            });
+        }
+        unsafe impl GlobalAlloc for Probe {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                record();
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+        pub fn measure(f: impl FnOnce()) -> usize {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    COUNT.with(|n| n.set(None));
+                }
+            }
+            COUNT.with(|n| {
+                assert!(n.get().is_none());
+                n.set(Some(0));
+            });
+            let _reset = Reset;
+            f();
+            COUNT.with(|n| n.get().unwrap())
+        }
     }
 
     fn collect_stream_data(events: &[Event]) -> Vec<u8> {
