@@ -143,6 +143,28 @@ impl Daemon {
         self.restart();
     }
 
+    /// Record real shell starts without changing the daemon's transport behavior.
+    pub fn track_shell_starts(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = self.home.path().join("tracked-shell");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'started\\n' >> '{}'\nexec /bin/sh \"$@\"\n",
+                self.home.path().join("shell-starts").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    pub fn shell_starts(&self) -> usize {
+        std::fs::read_to_string(self.home.path().join("shell-starts"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
     /// Everything the daemon has printed (stdout and stderr, interleaved by
     /// arrival) up to this moment. For diagnostics only.
     pub fn output_text(&self) -> String {
@@ -282,7 +304,12 @@ pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
 /// `qshd serve` on `port`, with the host key and `authorized_keys` in
 /// `home`, and everything it prints drained into the returned buffer.
 fn spawn_serve(home: &Path, port: u16) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>) {
-    let mut child = Command::new(qshd_path())
+    let mut command = Command::new(qshd_path());
+    let tracked_shell = home.join("tracked-shell");
+    if tracked_shell.exists() {
+        command.env("SHELL", tracked_shell);
+    }
+    let mut child = command
         .args([
             "serve",
             "--port",

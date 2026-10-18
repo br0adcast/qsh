@@ -166,6 +166,40 @@ impl Setup {
         }
     }
 
+    /// A consented replacement retains identity and credentials, but old workers
+    /// keep their own immutable token and cannot close or resume this session.
+    pub fn replacement(&self, token: [u8; 16]) -> Self {
+        Self {
+            args: self.args.clone(),
+            keypair: transport::handshake::Keypair {
+                private: self.keypair.private,
+                public: self.keypair.public,
+            },
+            pins: sshauth::known_hosts::KnownHosts::open(self.pins.path().to_owned()),
+            discovery: self.discovery.clone(),
+            tty: self.tty.clone(),
+            ssh_hosts: self.ssh_hosts.clone(),
+            agent: self.agent.clone(),
+            ssh_dir: self.ssh_dir.clone(),
+            token,
+            candidates: Mutex::new(self.cached_candidates()),
+            session_key: Mutex::new(self.server_identity().map(|s| s.qsh_key)),
+            weighed: Mutex::new(
+                self.weighed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            allowlisted: Mutex::new(
+                self.allowlisted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            trust_write: Mutex::new(None),
+        }
+    }
+
     pub fn args(&self) -> &Args {
         &self.args
     }
@@ -370,6 +404,7 @@ impl std::fmt::Debug for Loaded {
 }
 
 pub struct Climb<'a> {
+    fresh_session: bool,
     setup: &'a Setup,
     /// The addresses as this run knows them now: a port a daemon reported
     /// replaces the one on the command line (spec §5.1).
@@ -426,6 +461,7 @@ impl<'a> Climb<'a> {
             loud: None,
             recovery: None,
             revision: 0,
+            fresh_session: false,
             recovery_attempt: None,
             bootstrap: None,
         }
@@ -433,6 +469,12 @@ impl<'a> Climb<'a> {
 }
 
 impl<'a> Climb<'a> {
+    /// Only the foreground owner's explicit consent may enable a fresh shell.
+    pub fn allow_new_session(mut self, allow: bool) -> Self {
+        self.fresh_session = allow;
+        self
+    }
+
     /// In recovery this ladder owns only UDP. The SSH worker publishes
     /// its results and never starts a second warm attachment.
     pub fn recovering(
@@ -1085,9 +1127,9 @@ impl<'a> Climb<'a> {
         }
     }
 
-    /// A login that worked. In the background it must have landed in the
-    /// session the token names: a fresh one means the old one is gone, and
-    /// the fresh one is ended at once -- nobody is coming for it.
+    /// Recovery must land in the session the token names, unless the owner
+    /// obtained explicit consent for a replacement. A fresh probe without
+    /// that consent opens no shell and is closed before reporting loss.
     fn logged_in(
         &mut self,
         att: attempt::Attempt,
@@ -1102,7 +1144,10 @@ impl<'a> Climb<'a> {
                 None,
             );
         }
-        let outcome = landed(self.background(), att.client.resumed());
+        let outcome = landed(
+            self.background() && !self.fresh_session,
+            att.client.resumed(),
+        );
         if outcome == DirectOutcome::Connected {
             let mut slot = self
                 .setup
@@ -1315,10 +1360,14 @@ impl<'a> Climb<'a> {
         if let Ok(term) = std::env::var("TERM") {
             channel_session.announce_term(&term);
         }
-        let (verdict, opened_ch) =
-            settle_opening(&att, &mut channel_session, self.cols, self.rows, || {
-                self.interrupted()
-            });
+        let (verdict, opened_ch) = settle_opening(
+            &att,
+            &mut channel_session,
+            self.cols,
+            self.rows,
+            !self.background() || self.fresh_session,
+            || self.interrupted(),
+        );
         (
             verdict,
             att,
@@ -1499,8 +1548,8 @@ fn let_go(resumed: bool) -> LetGo {
 }
 
 /// Like [`attempt::Attempt::settle_with`], but the thing done on `Live` is
-/// always the same here: open the shell channel at `cols`x`rows` and
-/// remember what came back. Sending this the moment the link comes alive,
+/// to open the shell channel at `cols`x`rows` when a fresh shell is allowed,
+/// and remember what came back. Sending this the moment the link comes alive,
 /// rather than only once the whole attempt is judged `Working`, is what
 /// makes a working key's verdict fast: under the channel protocol a cold
 /// server answers nothing at all until asked for a channel, so without
@@ -1515,6 +1564,7 @@ fn settle_opening(
     channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
     cols: u16,
     rows: u16,
+    open_fresh: bool,
     interrupted: impl Fn() -> bool,
 ) -> (Verdict, Option<ChannelId>) {
     let mut opened_ch = None;
@@ -1524,7 +1574,10 @@ fn settle_opening(
             // them unprompted, and opening one here would ask for a stream it
             // still holds. Nothing is lost for the verdict either: that
             // announcement is itself the traffic this open exists to provoke.
-            if !att.client.resumed() {
+            // Recovery probes must not create a replacement shell before
+            // the owner asks. With no channel, authentication settles from
+            // the live link at the existing signature deadline instead.
+            if open_fresh && !att.client.resumed() {
                 opened_ch = channel_session.open_shell(cols, rows);
             }
         },

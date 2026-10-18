@@ -403,3 +403,63 @@ fn every_catalog_path_keeps_getting_probes_through_maximum_ssh_backoff() {
         );
     }
 }
+
+/// Consent to replace a shell cannot authorize a different QSH or SSH host.
+#[test]
+fn replacement_consent_preserves_identity_when_the_network_changes_at_the_question() {
+    let _serial = serialised();
+    let (mut daemon, key) = start_daemon();
+    let (foreign, _) = start_daemon();
+    let network = RecoveryNetwork::new(daemon.port);
+    let mut session = Session::start(&network, &key);
+    network.grant(session.home.path());
+    network.trust_foreign_ssh(session.home.path());
+    let pins = std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap();
+    let bindings = std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap();
+    daemon.track_shell_starts();
+    daemon.restart();
+    session.reconnect();
+    assert!(
+        wait_until(|| session.text().contains("Start a new session? [y/N]")),
+        "{}",
+        session.text()
+    );
+    assert_eq!(daemon.shell_starts(), 0);
+    network.switch_mapping([Some(foreign.port), Some(foreign.port)]);
+    network.switch_ssh(0, true);
+    network.switch_ssh(1, true);
+    session.client.master.write_all(b"yes\n").unwrap();
+    session.wait_log("next SSH round in 1 s; UDP keeps trying");
+    assert!(
+        network.foreign_connections() > 0,
+        "must encounter the changed SSH identity"
+    );
+    network.foreign_untouched();
+    assert_eq!(daemon.shell_starts(), 0);
+    assert_eq!(
+        std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap(),
+        pins
+    );
+    assert_eq!(
+        std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap(),
+        bindings
+    );
+    assert_eq!(session.text().matches("Key fingerprint").count(), 0);
+    assert!(!session.text().contains("Authorize SSH recovery"));
+    network.switch_mapping([Some(daemon.port), None]);
+    assert!(
+        wait_until(|| session.text().matches("\x1b[?1049h").count() == 2),
+        "{}",
+        session.log()
+    );
+    session
+        .client
+        .type_line("echo FRESH'AFTER'CHANGE-${TOPOLOGY_MARK:-fresh}");
+    assert!(
+        wait_until(|| session.text().contains("FRESHAFTERCHANGE-fresh")),
+        "{}",
+        session.text()
+    );
+    assert_eq!(daemon.shell_starts(), 1);
+    session.exit();
+}

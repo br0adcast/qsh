@@ -112,6 +112,7 @@ pub fn spawn_round(
         progress,
         epoch,
         recovery,
+        false,
     )
 }
 
@@ -127,10 +128,19 @@ pub fn spawn_catalog_round(
     epoch: RecoveryEpoch,
     membership: Vec<AddressId>,
     endpoints: Vec<(AddressId, SocketAddr)>,
+    fresh_session: bool,
 ) -> RoundTask {
     let recovery = Arc::new(Recovery::with_catalog(epoch, membership, endpoints));
     launch(
-        setup, addresses, first, size, round, progress, epoch, recovery,
+        setup,
+        addresses,
+        first,
+        size,
+        round,
+        progress,
+        epoch,
+        recovery,
+        fresh_session,
     )
 }
 
@@ -144,6 +154,7 @@ fn launch(
     progress: Sender<UiEvent>,
     epoch: RecoveryEpoch,
     recovery: Arc<Recovery>,
+    fresh_session: bool,
 ) -> RoundTask {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let owner_setup = setup.clone();
@@ -182,7 +193,8 @@ fn launch(
                     tx,
                     &rx,
                 )
-                .recovering(&worker, epoch, sweep);
+                .recovering(&worker, epoch, sweep)
+                .allow_new_session(fresh_session);
                 let climbed = climb.run();
                 if matches!(
                     climbed,
