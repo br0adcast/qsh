@@ -3,6 +3,9 @@
 #[path = "support/recovery_network.rs"]
 mod recovery_network;
 mod support;
+#[cfg(target_os = "linux")]
+#[path = "../../crates/bringup/tests/support_home/mod.rs"]
+mod support_home;
 
 use recovery_network::RecoveryNetwork;
 use std::{
@@ -461,5 +464,158 @@ fn replacement_consent_preserves_identity_when_the_network_changes_at_the_questi
         session.text()
     );
     assert_eq!(daemon.shell_starts(), 1);
+    session.exit();
+}
+
+/// Kill only the sandbox's qshd; its same first SSH target restarts it on
+/// the configured port. Closing the loss probe revokes its SSH enrollment;
+/// replacement must authenticate again without waiting on that obsolete hint.
+#[test]
+#[cfg(target_os = "linux")]
+fn replacement_after_same_target_ssh_restart_renews_auth_promptly() {
+    use support_home::{ssh_support, Sandbox};
+    if ssh_support::sshd_or_skip().is_none() {
+        return;
+    }
+    let _serial = serialised();
+    let home = tempfile::tempdir().unwrap();
+    let (key, public) = ssh_support::keygen_file("ed25519", home.path());
+    let mut sandbox = Sandbox::start_with(std::slice::from_ref(&public));
+    sandbox.cache_real_qshd(qshd::state::QSHD_VERSION);
+    std::fs::create_dir_all(sandbox.home.path().join(".ssh")).unwrap();
+    std::fs::write(sandbox.home.path().join(".ssh/authorized_keys"), &public).unwrap();
+    let original_daemon_port = free_udp_port();
+    let ready = bringup::bring_up(
+        sandbox.request(original_daemon_port),
+        Arc::new(knock::NoBind),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    let first_port = ready.port_for(original_daemon_port);
+    let second = UdpRelay::start(ready.port_for(original_daemon_port));
+    second.cut();
+    let ssh_port = sandbox.sshd.port;
+    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    std::fs::write(
+        home.path().join(".ssh/known_hosts"),
+        format!(
+            "[127.0.0.1]:{ssh_port} {}\n",
+            sandbox.sshd.host_public_key_line()
+        ),
+    )
+    .unwrap();
+    let pins = sshauth::known_hosts::KnownHosts::open(home.path().join("qsh/known_hosts"));
+    let expected = sshauth::discover::discover(
+        ([127, 0, 0, 1], ready.port_for(original_daemon_port)).into(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    for port in [first_port, second.port] {
+        pins.pin("127.0.0.1", port, &expected).unwrap();
+    }
+    let first_address = format!("127.0.0.1:{first_port},ssh={ssh_port}");
+    let second_address = format!("127.0.0.1:{}", second.port);
+    let client = spawn_qsh(
+        &[
+            "--verbose",
+            "--authorize-ssh",
+            "-i",
+            key.to_str().unwrap(),
+            &first_address,
+            &second_address,
+        ],
+        home.path(),
+    );
+    let output = Arc::new(Mutex::new(Vec::new()));
+    drain_into(client.master.try_clone().unwrap(), output.clone());
+    let mut session = Session {
+        client,
+        output,
+        home,
+    };
+    assert!(
+        wait_network(|| session.text().contains("Authorize SSH recovery")),
+        "{}\n{}",
+        session.text(),
+        session.log()
+    );
+    session.client.master.write_all(b"yes\n").unwrap();
+    session.client.type_line("export TOPOLOGY_MARK=retained");
+    session.shell("INITIAL");
+    let socket = sandbox.cache().join("control.sock");
+    let status_pid = || {
+        let qshd::control::ControlReply::Answered(line) =
+            qshd::control::client_request(&socket, &qshd::control::ControlRequest::Status).unwrap()
+        else {
+            panic!("fixture STATUS did not answer");
+        };
+        qshd::control::StatusResponse::from_line(&line).unwrap().pid
+    };
+    let fixture_pid = status_pid();
+    // SAFETY: pidfd_open has no pointer parameters; the returned descriptor is
+    // pinned to the process independently of subsequent PID reuse.
+    let pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, fixture_pid as libc::pid_t, 0) } as i32;
+    assert!(pidfd >= 0, "{}", std::io::Error::last_os_error());
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: successful pidfd_open returned a new descriptor owned by this test.
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd) };
+    assert_eq!(
+        status_pid(),
+        fixture_pid,
+        "pidfd must name this private fixture daemon"
+    );
+    // SAFETY: the verified pidfd refers only to this sandbox daemon; no siginfo
+    // is supplied and flags are zero. No personal process is signalled by PID.
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
+    );
+    let mut exited = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: exited points to one pollfd and pidfd remains live during polling.
+    assert_eq!(unsafe { libc::poll(&mut exited, 1, 5000) }, 1);
+    session.reconnect();
+    assert!(
+        wait_network(|| session.text().contains("Start a new session? [Y/n]")),
+        "{}\n{}",
+        session.text(),
+        session.log()
+    );
+    let accepted = Instant::now();
+    session.client.master.write_all(b"y\n").unwrap();
+    assert!(
+        wait_network(|| session.text().matches("\x1b[?1049h").count() == 2),
+        "{}\n{}",
+        session.text(),
+        session.log()
+    );
+    session
+        .client
+        .type_line("echo NEW'AFTER'SSH-${TOPOLOGY_MARK:-fresh}");
+    assert!(
+        wait_until(|| session.text().contains("NEWAFTERSSH-fresh")),
+        "{}\n{}",
+        session.text(),
+        session.log()
+    );
+    let elapsed = accepted.elapsed();
+    eprintln!("same-target SSH restart: accepted replacement usable in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "replacement reused stale SSH enrollment: {elapsed:?}\n{}",
+        session.log()
+    );
     session.exit();
 }

@@ -190,12 +190,10 @@ impl Setup {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             ),
-            allowlisted: Mutex::new(
-                self.allowlisted
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            ),
+            // Closing the old session (including a shell-free loss probe)
+            // removes its process key from the daemon's self-cleaning list.
+            // Only fresh SSH enrollment can restore this authentication path.
+            allowlisted: Mutex::new(HashSet::new()),
             trust_write: Mutex::new(None),
         }
     }
@@ -1592,6 +1590,89 @@ mod tests {
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
+
+    #[test]
+    fn replacement_without_signers_refuses_each_road_before_allowing_ssh() {
+        use ::connect::recovery_gate::{RecoveryEpoch, SweepId};
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir().unwrap();
+        let roads = [
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        ];
+        let args = crate::args::parse_args(
+            &roads
+                .iter()
+                .map(|r| r.local_addr().unwrap().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let old = Setup::new(
+            args,
+            transport::generate_keypair(),
+            sshauth::known_hosts::KnownHosts::open(home.path().join("known_hosts")),
+            Box::new(trust::UdpDiscovery),
+            Tty::at(home.path().join("no-tty")),
+            KnownHosts::new(home.path().join("ssh_known_hosts"), None),
+            None,
+            None,
+            [1; 16],
+        );
+        *old.session_key.lock().unwrap() = Some([7; 32]);
+        old.cache_candidates(&Loaded::default());
+        for road in &roads {
+            old.allowlist("127.0.0.1", road.local_addr().unwrap().port());
+        }
+        let setup = old.replacement([2; 16]);
+        let epoch = RecoveryEpoch {
+            connection: 2,
+            network: 1,
+        };
+        let sweep = SweepId(1);
+        let recovery = Recovery::new(epoch, roads.len());
+        recovery.begin_sweep(sweep);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut climb = Climb::new(
+            &setup,
+            setup.args.addresses.clone(),
+            0,
+            Mode::Background {
+                progress: tx.clone(),
+                round: 1,
+            },
+            80,
+            24,
+            tx,
+            &rx,
+        )
+        .recovering(&recovery, epoch, sweep)
+        .allow_new_session(true);
+        let started = Instant::now();
+        for (i, road) in roads.iter().enumerate() {
+            assert!(!recovery.ssh_allowed(), "SSH must wait for every road");
+            let (outcome, _) = climb
+                .direct(
+                    i,
+                    road.local_addr().unwrap().port(),
+                    Stage::First,
+                    &recovery.cancel,
+                )
+                .unwrap();
+            assert_eq!(outcome, DirectOutcome::Refused);
+        }
+        assert!(
+            recovery.ssh_allowed(),
+            "completed QSH refusals admit bound SSH"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stale enrollment waited for UDP"
+        );
+        assert_eq!(setup.server_identity(), old.server_identity());
+        assert_eq!(old.token, [1; 16]);
+        assert_eq!(setup.token, [2; 16]);
+    }
 
     #[test]
     fn no_key_at_all_is_a_refusal_with_nothing_offered_not_the_end() {
