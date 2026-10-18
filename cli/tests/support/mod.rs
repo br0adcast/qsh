@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
 use std::os::unix::process::CommandExt;
@@ -381,6 +382,21 @@ pub fn spawn_qsh_on(
     args: &[&str],
     config_home: &std::path::Path,
 ) -> (Client, std::os::fd::OwnedFd) {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    spawn_qsh_os_on(&args, config_home, None)
+}
+
+/// Runs OS arguments without changing path bytes, using the same PTY lifecycle.
+pub fn spawn_qsh_os(args: &[OsString], config_home: &Path) -> Client {
+    spawn_qsh_os_on(args, config_home, None).0
+}
+
+/// OS-aware PTY spawn, with an optional executable name for argv[0] tests.
+pub fn spawn_qsh_os_on(
+    args: &[OsString],
+    config_home: &Path,
+    argv0: Option<&OsStr>,
+) -> (Client, std::os::fd::OwnedFd) {
     let pty = nix::pty::openpty(
         Some(&nix::pty::Winsize {
             ws_row: 24,
@@ -394,6 +410,9 @@ pub fn spawn_qsh_on(
 
     let slave = pty.slave;
     let mut command = Command::new(env!("CARGO_BIN_EXE_qsh"));
+    if let Some(argv0) = argv0 {
+        command.arg0(argv0);
+    }
     command
         .args(args)
         .env_remove("SSH_AUTH_SOCK")

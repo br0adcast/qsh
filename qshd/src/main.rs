@@ -47,6 +47,7 @@
 //! removed -- replaced by the `transport-*`
 //! path above.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -130,21 +131,21 @@ fn help_text() -> String {
 // `transport-echo`/`transport-shell` -- each subcommand brings it up
 // itself.
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
 
     // A process a running daemon started by exec'ing its own replacement: it
     // IS the daemon already. Only this command reads the handover; any other
     // one drops a stray descriptor number so nothing it spawns inherits it.
-    if args.first().map(String::as_str) == Some("transport-resume") {
+    if args.first().map(OsString::as_os_str) == Some(OsStr::new("transport-resume")) {
         return run_transport_resume_command();
     }
     std::env::remove_var(handover::HANDOVER_FD_ENV);
 
-    match args.first().map(String::as_str) {
+    match args.first().map(|arg| argument_text(arg, 1)).transpose()? {
         Some("transport-echo") => run_transport_echo_command(&args),
         Some("transport-shell") => run_transport_shell_command(&args),
         Some("transport-ensure") => run_transport_ensure(&args),
-        Some("serve") => serve::run_serve_command(&args),
+        Some("serve") => serve::run_serve_command_os(&args),
         Some("self-check") => {
             print!("{}", state::SelfCheck::current().to_line());
             Ok(())
@@ -163,6 +164,12 @@ fn main() -> Result<()> {
             other
         ),
     }
+}
+
+fn argument_text(value: &OsStr, argument: usize) -> Result<&str> {
+    value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("argument {argument} must be valid UTF-8"))
 }
 
 /// Timeout for waiting until the old daemon releases the control
@@ -205,7 +212,7 @@ fn wait_for_daemon_release(sock_path: &Path, port: u16) -> Result<()> {
 /// key from a persistent file (or creates one if missing), and prints its
 /// public part as the line `server-pubkey: <base64>` -- the client reads
 /// it over SSH.
-fn run_transport_echo_command(args: &[String]) -> Result<()> {
+fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_echo_args(args)?;
 
     let cache_dir = default_cache_dir();
@@ -255,9 +262,10 @@ struct ParsedTransportEchoArgs {
 /// `parse_echo_args`, no external CLI libraries). `--client-pubkey` can
 /// repeat; each is the base64 of a client's 32-byte X25519 static key.
 /// `--server-key-file` overrides the path to the server Noise key file.
-fn parse_transport_echo_args(args: &[String]) -> Result<ParsedTransportEchoArgs> {
-    if args.first().map(String::as_str) != Some("transport-echo") {
-        bail!("expected command `transport-echo`, got: {:?}", args.first());
+fn parse_transport_echo_args(args: &[OsString]) -> Result<ParsedTransportEchoArgs> {
+    let command = args.first().map(|arg| argument_text(arg, 1)).transpose()?;
+    if command != Some("transport-echo") {
+        bail!("expected command `transport-echo`, got: {:?}", command);
     }
 
     let mut port: Option<u16> = None;
@@ -266,9 +274,10 @@ fn parse_transport_echo_args(args: &[String]) -> Result<ParsedTransportEchoArgs>
 
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        match argument_text(&args[i], i + 1)? {
             "--port" => {
                 let value = args.get(i + 1).context("--port requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 port = Some(value.parse().context("--port: expected a number 0-65535")?);
                 i += 2;
             }
@@ -276,6 +285,7 @@ fn parse_transport_echo_args(args: &[String]) -> Result<ParsedTransportEchoArgs>
                 let value = args
                     .get(i + 1)
                     .context("--client-pubkey requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 let raw = BASE64
                     .decode(value)
                     .context("--client-pubkey: expected valid base64")?;
@@ -316,7 +326,7 @@ fn parse_transport_echo_args(args: &[String]) -> Result<ParsedTransportEchoArgs>
 /// (`portable-pty` is blocking), and `serve_shell` is handed already-ready
 /// master-side reader/writer and a resize handle. Does not touch
 /// `transport-echo` -- it's a separate `match` arm in `main`.
-fn run_transport_shell_command(args: &[String]) -> Result<()> {
+fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_shell_args(args)?;
 
     let cache_dir = default_cache_dir();
@@ -384,12 +394,10 @@ struct ParsedTransportShellArgs {
 /// [`parse_transport_echo_args`]'s logic (the same flags: `--port`, a
 /// repeatable `--client-pubkey` as base64 of a 32-byte X25519 key,
 /// `--server-key-file`).
-fn parse_transport_shell_args(args: &[String]) -> Result<ParsedTransportShellArgs> {
-    if args.first().map(String::as_str) != Some("transport-shell") {
-        bail!(
-            "expected command `transport-shell`, got: {:?}",
-            args.first()
-        );
+fn parse_transport_shell_args(args: &[OsString]) -> Result<ParsedTransportShellArgs> {
+    let command = args.first().map(|arg| argument_text(arg, 1)).transpose()?;
+    if command != Some("transport-shell") {
+        bail!("expected command `transport-shell`, got: {:?}", command);
     }
 
     let mut port: Option<u16> = None;
@@ -398,9 +406,10 @@ fn parse_transport_shell_args(args: &[String]) -> Result<ParsedTransportShellArg
 
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        match argument_text(&args[i], i + 1)? {
             "--port" => {
                 let value = args.get(i + 1).context("--port requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 port = Some(value.parse().context("--port: expected a number 0-65535")?);
                 i += 2;
             }
@@ -408,6 +417,7 @@ fn parse_transport_shell_args(args: &[String]) -> Result<ParsedTransportShellArg
                 let value = args
                     .get(i + 1)
                     .context("--client-pubkey requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 let raw = BASE64
                     .decode(value)
                     .context("--client-pubkey: expected valid base64")?;
@@ -477,12 +487,10 @@ struct ParsedTransportEnsureArgs {
 /// a `--client-pubkey` shaped like (but not in count -- here there is
 /// exactly one key) the repeatable one from the `transport-*` commands,
 /// plus a REQUIRED `--name` (see [`ParsedTransportEnsureArgs`]).
-fn parse_transport_ensure_args(args: &[String]) -> Result<ParsedTransportEnsureArgs> {
-    if args.first().map(String::as_str) != Some("transport-ensure") {
-        bail!(
-            "expected command `transport-ensure`, got: {:?}",
-            args.first()
-        );
+fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsureArgs> {
+    let command = args.first().map(|arg| argument_text(arg, 1)).transpose()?;
+    if command != Some("transport-ensure") {
+        bail!("expected command `transport-ensure`, got: {:?}", command);
     }
 
     let mut name: Option<String> = None;
@@ -492,19 +500,22 @@ fn parse_transport_ensure_args(args: &[String]) -> Result<ParsedTransportEnsureA
 
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
+        match argument_text(&args[i], i + 1)? {
             "--name" => {
                 let value = args.get(i + 1).context("--name requires a value")?;
-                name = Some(value.clone());
+                let value = argument_text(value, i + 2)?;
+                name = Some(value.to_owned());
                 i += 2;
             }
             "--port" => {
                 let value = args.get(i + 1).context("--port requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 port = Some(value.parse().context("--port: expected a number 0-65535")?);
                 i += 2;
             }
             "--default-port" => {
                 let value = args.get(i + 1).context("--default-port requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 default_port = Some(
                     value
                         .parse()
@@ -516,6 +527,7 @@ fn parse_transport_ensure_args(args: &[String]) -> Result<ParsedTransportEnsureA
                 let value = args
                     .get(i + 1)
                     .context("--client-pubkey requires a value")?;
+                let value = argument_text(value, i + 2)?;
                 let raw = BASE64
                     .decode(value)
                     .context("--client-pubkey: expected valid base64")?;
@@ -631,7 +643,7 @@ fn write_transport_ready(
 ///    `--client-pubkey` alone ([`transport_daemon::build_server_allowlist`]
 ///    -- there is no on-disk set to union with anymore), prints ready in the
 ///    parent, and daemonizes.
-fn run_transport_ensure(args: &[String]) -> Result<()> {
+fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
 
     let cache_dir = default_cache_dir();
@@ -1153,8 +1165,95 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    fn args(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    #[cfg(unix)]
+    #[test]
+    fn transport_os_paths_preserve_bytes_and_existing_option_boundaries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        fn path(command: &str, args: &[OsString]) -> anyhow::Result<Option<std::path::PathBuf>> {
+            match command {
+                "transport-echo" => Ok(parse_transport_echo_args(args)?.server_key_file),
+                _ => Ok(parse_transport_shell_args(args)?.server_key_file),
+            }
+        }
+        for command in ["transport-echo", "transport-shell"] {
+            for value in [
+                OsString::from_vec(b"key-\xff".to_vec()),
+                "--help".into(),
+                "--".into(),
+            ] {
+                let argv = [
+                    command.into(),
+                    "--port".into(),
+                    "0".into(),
+                    "--server-key-file".into(),
+                    value.clone(),
+                ];
+                assert_eq!(path(command, &argv).unwrap(), Some(value.into()));
+            }
+            let missing = [command.into(), "--server-key-file".into()];
+            assert_eq!(
+                path(command, &missing).unwrap_err().to_string(),
+                "--server-key-file requires a value"
+            );
+            for trailing in [vec![], vec![OsString::from_vec(vec![0xff])]] {
+                let mut argv = vec![command.into(), "--".into()];
+                argv.extend(trailing);
+                assert_eq!(
+                    path(command, &argv).unwrap_err().to_string(),
+                    "unknown argument: --"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_text_values_require_utf8_at_the_consumed_position() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for command in ["transport-echo", "transport-shell", "transport-ensure"] {
+            for flag in ["--port", "--client-pubkey"] {
+                let argv = [command.into(), flag.into(), OsString::from_vec(vec![0xff])];
+                let error = match command {
+                    "transport-echo" => parse_transport_echo_args(&argv).err(),
+                    "transport-shell" => parse_transport_shell_args(&argv).err(),
+                    _ => parse_transport_ensure_args(&argv).err(),
+                }
+                .unwrap();
+                assert_eq!(error.to_string(), "argument 3 must be valid UTF-8");
+            }
+        }
+        for flag in ["--name", "--default-port"] {
+            let argv = [
+                "transport-ensure".into(),
+                flag.into(),
+                OsString::from_vec(vec![0xff]),
+            ];
+            assert_eq!(
+                parse_transport_ensure_args(&argv)
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "argument 3 must be valid UTF-8"
+            );
+        }
+        let argv = [
+            "transport-ensure".into(),
+            "--".into(),
+            OsString::from_vec(vec![0xff]),
+        ];
+        assert_eq!(
+            parse_transport_ensure_args(&argv)
+                .err()
+                .unwrap()
+                .to_string(),
+            "unknown argument: --"
+        );
+    }
+
+    fn args(items: &[&str]) -> Vec<std::ffi::OsString> {
+        items.iter().map(std::ffi::OsString::from).collect()
     }
 
     #[test]
