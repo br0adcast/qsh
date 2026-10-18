@@ -404,7 +404,10 @@ impl SshStep<'_> {
         if !self.background || cancel.is_cancelled() {
             return Err(SshStepError::NeedsPrompt);
         }
-        let mut keys = self.known_hosts.lookup(&addr.host, route.port);
+        let mut keys = self
+            .known_hosts
+            .lookup(&addr.host, route.port)
+            .map_err(|error| plain(error.to_string()))?;
         keys.known
             .retain(|key| bound_keys.contains(key) && !keys.revoked.contains(key));
         if keys.known.is_empty() {
@@ -424,7 +427,10 @@ impl SshStep<'_> {
         cancel: &knock::Cancel,
     ) -> Result<bringup::IdentifiedReady, SshStepError> {
         let name = entry_name(&addr.host, route.port);
-        let mut keys = self.known_hosts.lookup(&addr.host, route.port);
+        let mut keys = self
+            .known_hosts
+            .lookup(&addr.host, route.port)
+            .map_err(|error| plain(error.to_string()))?;
         let first = match self.attempt(addr, route, client_pubkey, &keys, cancel) {
             Ok(ready) => return Ok(ready),
             Err(Attempted::Ssh(e)) => e,
@@ -534,6 +540,68 @@ mod tests {
     use super::test_support as support_home;
 
     #[test]
+    fn unreadable_stores_stop_foreground_and_background_before_ssh() {
+        for background in [false, true] {
+            for system_fails in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let user = home.path().join("known_hosts");
+                let system = home.path().join("ssh_known_hosts");
+                let failed = if system_fails { &system } else { &user };
+                std::fs::create_dir(failed).unwrap();
+                // A trusted key cannot make an unavailable revocation store safe.
+                let readable = if system_fails { &user } else { &system };
+                std::fs::write(readable, "host.invalid ssh-ed25519 AQID\n").unwrap();
+                let known = KnownHosts::new(user.clone(), Some(system.clone()));
+                let tty = Tty::at(home.path().join("no-tty"));
+                let step = SshStep {
+                    login: "test",
+                    identity: None,
+                    no_password: true,
+                    agent: None,
+                    ssh_dir: None,
+                    known_hosts: &known,
+                    tty: &tty,
+                    background,
+                    images: Arc::new(crate::releases::GitHubImages::new(
+                        home.path().join("cache"),
+                    )),
+                };
+                let route = ::connect::SshRoute {
+                    port: 22,
+                    knock: vec![],
+                };
+                let addr = ::connect::Address {
+                    host: "host.invalid".into(),
+                    qsh_port: 60022,
+                    ssh: Some(route.clone()),
+                };
+                let started = std::cell::Cell::new(false);
+                let cancel = knock::Cancel::new();
+                let error = if background {
+                    step.run_bound_observed(
+                        &addr,
+                        &route,
+                        [7; 32],
+                        &[vec![1, 2, 3]],
+                        &cancel,
+                        || started.set(true),
+                    )
+                    .unwrap_err()
+                } else {
+                    step.run_inner(&addr, &route, [7; 32], &cancel).unwrap_err()
+                };
+                assert!(
+                    !started.get(),
+                    "unreadable trust store must prevent SSH activity"
+                );
+                let message = format!("{error:?}");
+                assert!(message.contains(&failed.display().to_string()), "{message}");
+                assert!(message.contains("Is a directory"), "{message}");
+            }
+        }
+    }
+
+    #[test]
     fn background_missing_daemon_never_calls_image_source() {
         struct Spy(std::sync::atomic::AtomicUsize);
         impl bringup::ImageSource for Spy {
@@ -601,7 +669,7 @@ mod tests {
                 &addr,
                 &route,
                 [7; 32],
-                &known.lookup("127.0.0.1", sb.sshd.port).known,
+                &known.lookup("127.0.0.1", sb.sshd.port).unwrap().known,
                 &knock::Cancel::new()
             ),
             Err(SshStepError::NeedsPrompt)

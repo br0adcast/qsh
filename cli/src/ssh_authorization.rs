@@ -87,10 +87,13 @@ fn authorize_endpoint(
     permit: &TrustWritePermit,
     cancel: &knock::Cancel,
 ) -> Result<(), AuthorizationError> {
+    let keys = setup
+        .ssh_hosts()
+        .lookup(&endpoint.host, endpoint.port)
+        .map_err(|error| AuthorizationError::Verification(error.to_string()))?;
     let mut params = setup
-        .ssh_verification_params(endpoint)
+        .ssh_verification_params(endpoint, &keys)
         .ok_or(AuthorizationError::NoEndpoint)?;
-    let keys = setup.ssh_hosts().lookup(&endpoint.host, endpoint.port);
     let info = match ssh::verify_host(params.clone(), Arc::new(knock::NoBind), cancel) {
         Ok(info) => info,
         Err(error) => {
@@ -153,6 +156,10 @@ pub fn offer_binding(
     {
         return Ok(());
     }
+    setup
+        .ssh_hosts()
+        .lookup(&endpoint.host, endpoint.port)
+        .map_err(|error| AuthorizationError::Verification(error.to_string()))?;
     let question = crate::report::ssh_authorization(server, endpoint, info);
     if !setup
         .tty()
@@ -163,7 +170,10 @@ pub fn offer_binding(
     }
     check(cancel, permit)?;
     // Re-read after consent: a key revoked while the prompt was open is refused.
-    let keys = setup.ssh_hosts().lookup(&endpoint.host, endpoint.port);
+    let keys = setup
+        .ssh_hosts()
+        .lookup(&endpoint.host, endpoint.port)
+        .map_err(|error| AuthorizationError::Verification(error.to_string()))?;
     if !keys.known.contains(&info.key) || keys.revoked.contains(&info.key) {
         return Err(AuthorizationError::Verification(
             "SSH host key is no longer trusted in known_hosts".into(),

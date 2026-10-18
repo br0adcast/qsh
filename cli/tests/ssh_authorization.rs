@@ -79,6 +79,45 @@ fn enter_defaults_to_no_for_binding_consent() {
 fn store_write_error_leaves_the_qsh_shell_usable() {
     authorize(b"yes\n", false, true);
 }
+#[test]
+fn unreadable_ssh_store_prevents_explicit_authorization_probes() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let home = tempfile::tempdir().unwrap();
+    let ssh = fake::Server::start();
+    let path = home.path().join(".ssh/known_hosts");
+    std::fs::create_dir_all(&path).unwrap();
+    let peer_key = sshauth::discover::discover(
+        ([127, 0, 0, 1], daemon.port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    sshauth::known_hosts::KnownHosts::open(home.path().join("qsh/known_hosts"))
+        .pin("127.0.0.1", daemon.port, &peer_key)
+        .unwrap();
+    let address = format!("127.0.0.1:{},ssh={}", daemon.port, ssh.port);
+    let mut client = spawn_qsh(
+        &["--authorize-ssh", "-i", key.to_str().unwrap(), &address],
+        home.path(),
+    );
+    let output = screen(&client);
+    wait(&output, "could not read SSH known-hosts file");
+    let shown = text(&output);
+    assert!(shown.contains(&path.display().to_string()), "{shown}");
+    assert!(shown.contains("Is a directory"), "{shown}");
+    assert!(!shown.contains("The authenticity of host"), "{shown}");
+    assert!(!shown.contains("Authorize SSH recovery"), "{shown}");
+    live(&mut client, &output);
+    ssh.untouched();
+    assert_eq!(
+        ssh.activity
+            .connections
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(!home.path().join("qsh/ssh_bindings.json").exists());
+}
+
 fn authorize(answer: &[u8], accept: bool, store_error: bool) {
     let _serial = serialised();
     let (daemon, key) = start_daemon();
