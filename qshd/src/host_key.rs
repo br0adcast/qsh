@@ -429,6 +429,9 @@ mod tests {
             ])
             .env(CHILD, "1")
             .current_dir(dir.path())
+            // The parent owns the only libtest summary in strict CI logs.
+            // Panic diagnostics still reach stderr if this child fails.
+            .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + WAIT;
