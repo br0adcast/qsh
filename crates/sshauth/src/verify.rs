@@ -40,8 +40,7 @@ impl AuthorizedKeysVerifier {
 }
 
 /// Whether `key` is listed in an `authorized_keys` file already read into
-/// `text`. OpenSSH stops at the first line naming a key and applies
-/// whatever that line says, so we do too: a bare line authorizes the key, a
+/// `text`. qsh uses the first line naming a key: a bare line authorizes it, a
 /// line carrying options (`command=`/`from=`/`restrict`/...) refuses it
 /// outright, and neither case keeps scanning for a laxer line further down
 /// the file -- a key must not become more permissive than its first, most
@@ -50,10 +49,10 @@ impl AuthorizedKeysVerifier {
 /// Lines are walked ourselves (not via `AuthorizedKeys`'s iterator) because
 /// a line that fails to parse still needs to be checked for this key's own
 /// base64 blob, and the iterator throws the raw line away on a parse error.
-/// The normalization below (strip a trailing `#` comment, trim trailing
-/// whitespace, skip blank lines) mirrors `AuthorizedKeys`'s own
-/// `next_line_trimmed`, so `line.parse::<Entry>()` sees exactly what the
-/// crate's iterator would have handed it.
+/// Only whole-line comments are skipped. A `#` inside an option's quoted
+/// value is part of the option, so both the parser and the fallback must
+/// see the complete line. Truncating it could hide a restricted key from
+/// the fallback and let a later bare listing authorize it.
 ///
 /// Taking already-read text rather than a path is what lets this be the
 /// ONE parser both modes share: the personal mode ([`AuthorizedKeysVerifier`],
@@ -66,8 +65,8 @@ pub fn key_is_listed(text: &str, key: &PublicKey) -> Result<bool, AuthError> {
     let key_blob = key_blob(key)?;
 
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim_end();
-        if line.is_empty() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
         match line.parse::<Entry>() {
@@ -387,10 +386,8 @@ mod tests {
         );
     }
 
-    /// OpenSSH stops at the first line naming a key. A restricted line
-    /// followed later by a bare line for the same key must stay refused --
-    /// otherwise this verifier would be more permissive than the sshd
-    /// semantics its file format borrows from. This variant has a trailing
+    /// qsh refuses a key whose first listing carries options, even if a
+    /// later bare line lists the same key. This variant has a trailing
     /// comment on the restricted line, so ssh-key's own parser recognizes
     /// it as an entry with populated `config_opts` -- exercising the
     /// `Ok(entry) if key matches` branch of `is_authorized`. The no-comment
@@ -440,6 +437,44 @@ mod tests {
             Err(AuthError::KeyNotAuthorized),
             "an unparseable line naming this key must block a later bare line for it"
         );
+    }
+
+    #[test]
+    fn hashes_in_options_do_not_allow_a_later_bare_listing() {
+        let k = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        for options in [
+            "command=\"echo #x\"",
+            "command=\"#x\"",
+            "restrict,command=\"echo #x\",no-pty",
+            "environment=\"NAME=#value\"",
+        ] {
+            for comment in ["", " restricted-copy"] {
+                let restricted = format!("{options} {openssh}{comment}\n");
+                assert!(!key_is_listed(&restricted, k.public_key()).unwrap());
+                let text = format!("{restricted}{openssh} spare-copy\n");
+                assert!(
+                    !key_is_listed(&text, k.public_key()).unwrap(),
+                    "a hash inside {options} must not hide the restricted listing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_comments_and_unrelated_restricted_keys_do_not_block_a_bare_key() {
+        let k = key();
+        let other = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        let unrelated = other.public_key().to_openssh().unwrap();
+        let text = format!(
+            "  # restrict {openssh}\n\t# {openssh}\n\n\
+             command=\"echo #x\" {unrelated}\n\
+             {openssh} user # trailing comment\n"
+        );
+        assert!(key_is_listed(&text, k.public_key()).unwrap());
+        assert!(!key_is_listed(&format!(" # {openssh}\n"), k.public_key()).unwrap());
+        assert!(!key_is_listed(&text, other.public_key()).unwrap());
     }
 
     #[test]
