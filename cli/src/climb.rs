@@ -295,6 +295,7 @@ impl Setup {
     pub(crate) fn ssh_verification_params(
         &self,
         endpoint: &::connect::server_identity::SshEndpoint,
+        keys: &crate::known_hosts::HostKeys,
     ) -> Option<ssh::SshParams> {
         let address = self.args.addresses.iter().find(|a| {
             a.host == endpoint.host && a.ssh.as_ref().is_some_and(|s| s.port == endpoint.port)
@@ -303,7 +304,7 @@ impl Setup {
             host: endpoint.host.clone(),
             port: endpoint.port,
             username: self.args.login.clone(),
-            known_host_keys: self.ssh_hosts.lookup(&endpoint.host, endpoint.port).known,
+            known_host_keys: keys.known.clone(),
             connect_timeout: crate::ssh_step::SSH_CONNECT_TIMEOUT,
             keepalive_interval: std::time::Duration::from_secs(15),
             compression: false,

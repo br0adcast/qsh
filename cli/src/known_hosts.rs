@@ -18,6 +18,30 @@ pub struct KnownHosts {
     system: Option<PathBuf>,
 }
 
+/// A configured trust store could not be read; never treat it as empty.
+#[derive(Debug)]
+pub struct ReadError {
+    pub path: PathBuf,
+    pub source: io::Error,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not read SSH known-hosts file \"{}\": {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HostKeys {
     pub known: Vec<Vec<u8>>,
@@ -68,12 +92,19 @@ impl KnownHosts {
         )
     }
 
-    pub fn lookup(&self, host: &str, port: u16) -> HostKeys {
+    pub fn lookup(&self, host: &str, port: u16) -> Result<HostKeys, ReadError> {
         let name = entry_name(host, port).to_ascii_lowercase();
         let mut out = HostKeys::default();
-        for file in std::iter::once(&self.user).chain(self.system.as_ref()) {
-            let Ok(bytes) = std::fs::read(file) else {
-                continue;
+        for file in self.files() {
+            let bytes = match std::fs::read(file) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(ReadError {
+                        path: file.to_owned(),
+                        source,
+                    })
+                }
             };
             for line_bytes in bytes.split(|&b| b == b'\n') {
                 let Ok(line) = std::str::from_utf8(line_bytes) else {
@@ -97,7 +128,7 @@ impl KnownHosts {
         }
         let revoked = &out.revoked;
         out.known.retain(|k| !revoked.contains(k));
-        out
+        Ok(out)
     }
 
     pub fn add(&self, host: &str, port: u16, key_type: &str, wire: &[u8]) -> std::io::Result<()> {
@@ -273,41 +304,96 @@ mod tests {
     }
 
     #[test]
+    fn missing_optional_stores_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = KnownHosts::new(dir.path().join("user"), Some(dir.path().join("system")));
+        assert_eq!(kh.lookup("h", 22).unwrap(), HostKeys::default());
+    }
+
+    #[test]
+    fn permission_errors_preserve_path_and_source_for_either_store() {
+        use std::os::unix::fs::PermissionsExt;
+        for system_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let user = dir.path().join("user");
+            let system = dir.path().join("system");
+            std::fs::write(&user, line("h", K1)).unwrap();
+            std::fs::write(&system, format!("@revoked {}", line("h", K1))).unwrap();
+            let failed = if system_fails { &system } else { &user };
+            std::fs::set_permissions(failed, std::fs::Permissions::from_mode(0o0)).unwrap();
+            let kh = KnownHosts::new(user.clone(), Some(system.clone()));
+            let error = kh.lookup("h", 22).unwrap_err();
+            assert_eq!(&error.path, failed);
+            assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains(&failed.display().to_string()));
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(!error.to_string().contains(&B64.encode(K1)));
+        }
+    }
+
+    #[test]
+    fn io_failure_is_not_an_absent_optional_store() {
+        // A symlink loop deterministically fails read with ELOOP, without permissions or env changes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        let kh = KnownHosts::new(path.clone(), None);
+        let error = kh.lookup("h", 22).unwrap_err();
+        assert_eq!(error.path, path);
+        assert_eq!(error.source.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
     fn a_plain_name_matches_port_22_only() {
         let (_d, kh) = store(&line("host.example", K1));
-        assert_eq!(kh.lookup("host.example", 22).known, vec![K1.to_vec()]);
-        assert!(kh.lookup("host.example", 2222).known.is_empty());
+        assert_eq!(
+            kh.lookup("host.example", 22).unwrap().known,
+            vec![K1.to_vec()]
+        );
+        assert!(kh.lookup("host.example", 2222).unwrap().known.is_empty());
     }
 
     #[test]
     fn another_port_uses_the_bracket_form() {
         let (_d, kh) = store(&line("[host.example]:2222", K1));
-        assert_eq!(kh.lookup("host.example", 2222).known, vec![K1.to_vec()]);
-        assert!(kh.lookup("host.example", 22).known.is_empty());
+        assert_eq!(
+            kh.lookup("host.example", 2222).unwrap().known,
+            vec![K1.to_vec()]
+        );
+        assert!(kh.lookup("host.example", 22).unwrap().known.is_empty());
     }
 
     #[test]
     fn hashed_entries_match() {
         let text = line(&hashed("[host.example]:2222", b"0123456789abcdefghij"), K1);
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("host.example", 2222).known, vec![K1.to_vec()]);
-        assert!(kh.lookup("other.example", 2222).known.is_empty());
+        assert_eq!(
+            kh.lookup("host.example", 2222).unwrap().known,
+            vec![K1.to_vec()]
+        );
+        assert!(kh.lookup("other.example", 2222).unwrap().known.is_empty());
     }
 
     #[test]
     fn wildcards_and_negation_work_like_openssh() {
         let text = line("*.example,!bad.example", K1);
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("good.example", 22).known, vec![K1.to_vec()]);
-        assert!(kh.lookup("bad.example", 22).known.is_empty());
+        assert_eq!(
+            kh.lookup("good.example", 22).unwrap().known,
+            vec![K1.to_vec()]
+        );
+        assert!(kh.lookup("bad.example", 22).unwrap().known.is_empty());
         let (_d, kh) = store(&line("h?st", K1));
-        assert_eq!(kh.lookup("host", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("host", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
     fn names_compare_without_case() {
         let (_d, kh) = store(&line("Host.Example", K1));
-        assert_eq!(kh.lookup("host.EXAMPLE", 22).known, vec![K1.to_vec()]);
+        assert_eq!(
+            kh.lookup("host.EXAMPLE", 22).unwrap().known,
+            vec![K1.to_vec()]
+        );
     }
 
     #[test]
@@ -316,7 +402,7 @@ mod tests {
             + &line("h", K2)
             + &format!("@revoked h ssh-ed25519 {}\n", B64.encode(K1));
         let (_d, kh) = store(&text);
-        let keys = kh.lookup("h", 22);
+        let keys = kh.lookup("h", 22).unwrap();
         assert_eq!(keys.known, vec![K2.to_vec()]);
         assert_eq!(keys.revoked, vec![K1.to_vec()]);
     }
@@ -325,7 +411,7 @@ mod tests {
     fn cert_authority_lines_are_skipped() {
         let text = format!("@cert-authority *.example ssh-ed25519 {}\n", B64.encode(K1));
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("a.example", 22), HostKeys::default());
+        assert_eq!(kh.lookup("a.example", 22).unwrap(), HostKeys::default());
     }
 
     #[test]
@@ -333,7 +419,7 @@ mod tests {
         let text =
             "garbage\nh ssh-ed25519 !!!notbase64\n# comment\n\n".to_string() + &line("h", K1);
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("h", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
@@ -342,14 +428,17 @@ mod tests {
         let system = dir.path().join("ssh_known_hosts");
         std::fs::write(&system, line("h", K2)).unwrap();
         let kh = KnownHosts::new(dir.path().join("missing"), Some(system));
-        assert_eq!(kh.lookup("h", 22).known, vec![K2.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K2.to_vec()]);
     }
 
     #[test]
     fn a_new_key_is_appended_and_found() {
         let (d, kh) = store("h ssh-ed25519 AAAA"); // no trailing newline
         kh.add("new.example", 2222, "ssh-ed25519", K1).unwrap();
-        assert_eq!(kh.lookup("new.example", 2222).known, vec![K1.to_vec()]);
+        assert_eq!(
+            kh.lookup("new.example", 2222).unwrap().known,
+            vec![K1.to_vec()]
+        );
         let text = std::fs::read_to_string(d.path().join("known_hosts")).unwrap();
         assert!(
             text.starts_with("h ssh-ed25519 AAAA\n[new.example]:2222 ssh-ed25519 "),
@@ -402,7 +491,7 @@ mod tests {
             .extend_from_slice(format!("@revoked h ssh-ed25519 {}\n", B64.encode(K2)).as_bytes());
         std::fs::write(&path, content).unwrap();
         let kh = KnownHosts::new(path, None);
-        let keys = kh.lookup("h", 22);
+        let keys = kh.lookup("h", 22).unwrap();
         assert_eq!(keys.known, vec![K1.to_vec()]);
         assert_eq!(keys.revoked, vec![K2.to_vec()]);
     }
@@ -411,7 +500,7 @@ mod tests {
     fn the_same_key_twice_appears_once() {
         let text = line("h", K1) + &line("h", K1);
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("h", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
@@ -422,7 +511,7 @@ mod tests {
         let user_path = dir.path().join("known_hosts");
         std::fs::write(&user_path, line("h", K1)).unwrap();
         let kh = KnownHosts::new(user_path, Some(system));
-        assert_eq!(kh.lookup("h", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
@@ -437,7 +526,7 @@ mod tests {
         let user_path = dir.path().join("known_hosts");
         std::fs::write(&user_path, line("h", K1)).unwrap();
         let kh = KnownHosts::new(user_path, Some(system));
-        let keys = kh.lookup("h", 22);
+        let keys = kh.lookup("h", 22).unwrap();
         assert!(keys.known.is_empty());
         assert_eq!(keys.revoked, vec![K1.to_vec()]);
     }
@@ -447,7 +536,7 @@ mod tests {
         // OpenSSH allows tabs as separators and anything after the base64 as comment
         let text = "h\tssh-ed25519\t".to_string() + &B64.encode(K1) + " this is a comment\n";
         let (_d, kh) = store(&text);
-        assert_eq!(kh.lookup("h", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
@@ -458,7 +547,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let kh = KnownHosts::new(path, None);
         // The \r becomes part of the patterns after splitting on \n, but trim() removes it
-        assert_eq!(kh.lookup("h", 22).known, vec![K1.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
@@ -466,7 +555,7 @@ mod tests {
         let text = format!("@unknown h ssh-ed25519 {}\n", B64.encode(K1)) + &line("h", K2);
         let (_d, kh) = store(&text);
         // Only K2 from the second line is found
-        assert_eq!(kh.lookup("h", 22).known, vec![K2.to_vec()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K2.to_vec()]);
     }
 
     #[test]
@@ -474,7 +563,10 @@ mod tests {
         let text = line(&hashed("[host.example]:2222", b"0123456789abcdefghij"), K1);
         let (_d, kh) = store(&text);
         // lookup lowercases the search name internally
-        assert_eq!(kh.lookup("HOST.EXAMPLE", 2222).known, vec![K1.to_vec()]);
+        assert_eq!(
+            kh.lookup("HOST.EXAMPLE", 2222).unwrap().known,
+            vec![K1.to_vec()]
+        );
     }
 
     #[test]
@@ -484,8 +576,11 @@ mod tests {
         let h2 = hashed("[other.example]:2222", salt);
         let text = format!("{},!{} ssh-ed25519 {}\n", h2, h1, B64.encode(K1));
         let (_d, kh) = store(&text);
-        assert!(kh.lookup("host.example", 2222).known.is_empty());
-        assert_eq!(kh.lookup("other.example", 2222).known, vec![K1.to_vec()]);
+        assert!(kh.lookup("host.example", 2222).unwrap().known.is_empty());
+        assert_eq!(
+            kh.lookup("other.example", 2222).unwrap().known,
+            vec![K1.to_vec()]
+        );
     }
 
     #[test]
