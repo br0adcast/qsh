@@ -814,7 +814,7 @@ fn a_lost_session_leaves_the_alternate_screen_before_saying_so() {
     daemon.restart();
     client.master.write_all(b"\x1dr").expect("type ctrl-] r");
     assert!(
-        wait_until(|| screen.has("Start a new session? [y/N]")),
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
         "{}",
         screen.text()
     );

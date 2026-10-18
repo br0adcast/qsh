@@ -457,7 +457,7 @@ fn accepting_session_loss_starts_a_new_shell() {
     daemon.restart();
     client.master.write_all(b"\x1dr").unwrap();
     assert!(
-        wait_until(|| screen.has("Start a new session? [y/N]")),
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
         "{}",
         screen.text()
     );
@@ -512,7 +512,7 @@ fn accepting_session_loss_starts_a_new_shell() {
     daemon.restart();
     client.master.write_all(b"\x1dr").unwrap();
     assert!(
-        wait_until(|| screen.text().matches("Start a new session? [y/N]").count() == 2),
+        wait_until(|| screen.text().matches("Start a new session? [Y/n]").count() == 2),
         "{}",
         screen.text()
     );
@@ -571,7 +571,7 @@ fn refuse_session_loss(reply: &[u8], expected: i32) {
     daemon.restart();
     client.master.write_all(b"\x1dr").unwrap();
     assert!(
-        wait_until(|| screen.has("Start a new session? [y/N]")),
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
         "{}",
         screen.text()
     );
@@ -600,11 +600,6 @@ fn refuse_session_loss(reply: &[u8], expected: i32) {
 #[test]
 fn declining_session_loss_ends_the_run_with_13() {
     refuse_session_loss(b"no\n", 13);
-}
-
-#[test]
-fn enter_after_session_loss_defaults_to_no() {
-    refuse_session_loss(b"\n", 13);
 }
 
 #[test]
@@ -933,4 +928,146 @@ fn leaving_while_reconnecting_is_quick_and_keeps_the_session() {
         "leaving_mid_round: exit 1 {left_after:?} after Ctrl-] .; whole test {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn enter_after_session_loss_starts_a_new_shell() {
+    let _serial = serialised();
+    let (mut daemon, key) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client(&daemon, &key, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    daemon.restart();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_until(|| screen.has("Start a new session?")),
+        "{}",
+        screen.text()
+    );
+    client.master.write_all(b"\n").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
+        "Enter must accept: {}",
+        screen.text()
+    );
+    client.type_line("echo DEFAULT'YES'-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("DEFAULTYES-42")),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.has("Start a new session? [Y/n]"));
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn replacement_starts_at_the_road_that_confirmed_loss() {
+    let _serial = serialised();
+    let (mut daemon, key) = start_daemon();
+    let first = UdpRelay::start(daemon.port);
+    let second = UdpRelay::start(daemon.port);
+    second.cut();
+    let config = tempfile::tempdir().unwrap();
+    let expected =
+        sshauth::discover::discover(([127, 0, 0, 1], daemon.port).into(), Duration::from_secs(1))
+            .unwrap();
+    let pins = sshauth::known_hosts::KnownHosts::open(config.path().join("qsh/known_hosts"));
+    for port in [first.port, second.port] {
+        pins.pin("127.0.0.1", port, &expected).unwrap();
+    }
+    let mut client = spawn_qsh(
+        &[
+            "--verbose",
+            "-i",
+            key.to_str().unwrap(),
+            &format!("127.0.0.1:{}", first.port),
+            &format!("127.0.0.1:{}", second.port),
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    mark_the_shell(&mut client, &screen, &daemon);
+    first.cut();
+    daemon.restart();
+    second.restore();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(30), || screen
+            .has("Start a new session?")),
+        "{}",
+        verbose_log(config.path())
+    );
+    let accepted = Instant::now();
+    client.master.write_all(b"y\n").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(15), || screen
+            .text()
+            .matches("\x1b[?1049h")
+            .count()
+            == 2),
+        "replacement must eventually use the confirmed road; {}",
+        verbose_log(config.path())
+    );
+    client.type_line("echo QUICK'FRESH'-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("QUICKFRESH-42")),
+        "{}",
+        screen.text()
+    );
+    let usable_after = accepted.elapsed();
+    eprintln!("accepted replacement usable in {usable_after:?}");
+    assert!(
+        usable_after < Duration::from_secs(3),
+        "replacement must prefer the confirmed road, was {usable_after:?}; {}",
+        verbose_log(config.path())
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn missing_shell_on_authenticated_resume_offers_replacement() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    let pid_path = config.path().join("test-shell-pid");
+    client.type_line(&format!("printf '%s' \"$$\" > '{}'", pid_path.display()));
+    assert!(wait_until(
+        || std::fs::read_to_string(&pid_path).is_ok_and(|s| !s.is_empty())
+    ));
+    let pid =
+        nix::unistd::Pid::from_raw(std::fs::read_to_string(&pid_path).unwrap().parse().unwrap());
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    assert!(wait_until(|| matches!(
+        nix::sys::signal::kill(pid, None),
+        Err(nix::errno::Errno::ESRCH)
+    )));
+    relay.restore();
+    assert!(
+        wait_until(|| screen.has("Start a new session?")),
+        "authenticated missing shell must offer a replacement: {}",
+        screen.text()
+    );
+    assert!(screen.has("the shell on the server ended while the link was down"));
+    client.master.write_all(b"y\n").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
+        "{}",
+        screen.text()
+    );
+    client.type_line("echo AFTER'MISSING'SHELL-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("AFTERMISSINGSHELL-42")),
+        "{}",
+        screen.text()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
 }

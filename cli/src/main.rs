@@ -190,9 +190,9 @@ fn run(a: args::Args) -> i32 {
             epoch,
             resolver,
         );
-        let lost = code == 13 && links.stopped;
+        let lost = links.replacement_at.is_some();
         addresses = links.addresses.clone();
-        let first = links.at;
+        let first = links.replacement_at.unwrap_or(links.at);
         epoch = RecoveryEpoch {
             connection: links.road_epoch.connection + 1,
             network: links.road_epoch.network,
@@ -209,7 +209,7 @@ fn run(a: args::Args) -> i32 {
         }
         discard_terminal_input();
         let accepted =
-            prompt::Tty::new().confirm_cancellable("Start a new session?", &knock::Cancel::new());
+            prompt::Tty::new().confirm_replacement("Start a new session?", &knock::Cancel::new());
         if signals::termination_requested() {
             return 130;
         }
@@ -359,6 +359,7 @@ fn connected_session(
         round_line: None,
         farewell: None,
         stopped: false,
+        replacement_at: None,
         tx: tx.clone(),
     };
     interactive(setup, links, (cols, rows), tx, rx)
@@ -574,9 +575,12 @@ struct Links {
     /// The line that ended the run (`Order::Stop`), for once the terminal is
     /// restored.
     farewell: Option<String>,
-    /// The run ended on `Order::Stop`: the session is gone or not ours to
-    /// trust, so there is nothing kept to tell the person about.
+    /// The session or tracked shell is unavailable, or its key changed:
+    /// there is no kept shell to report on the way out.
     stopped: bool,
+    /// Explicit lifecycle evidence that the tracked shell is unavailable,
+    /// and the authenticated road to prefer if replacement is accepted.
+    replacement_at: Option<usize>,
     /// The main loop's own channel: where rounds say how they go, and where
     /// every connection's forwarder delivers.
     tx: Sender<UiEvent>,
@@ -669,6 +673,18 @@ impl Links {
                 }
             }
         };
+        if let Round::Failed {
+            end: RoundEnd::SessionGone { addr },
+            ..
+        } = &ended
+        {
+            // Keep the road that just authenticated the expected server, rather
+            // than paying the old live road's timeout again after consent.
+            if let Some(endpoint) = round.endpoint(*addr) {
+                self.addresses[*addr].qsh_port = endpoint.port();
+                self.catalog.seed(AddressId(*addr), endpoint);
+            }
+        }
         self.round = None;
         match ended {
             Round::Connected { connected, events } => {
@@ -722,6 +738,9 @@ impl Links {
                 actions
             }
             Order::Stop(stop) => {
+                if let Stop::SessionGone { addr } = stop {
+                    self.replacement_at = Some(addr);
+                }
                 let (code, line) = match stop {
                     Stop::KeyChanged { .. } => (11, self.round_line.take()),
                     Stop::SessionGone { addr } => (
@@ -1091,6 +1110,10 @@ fn apply_actions(
             Action::Exit(c) => return Some(c),
             // Printed after the terminal is restored, not here in raw mode.
             Action::Notice(text) => notices.push(text),
+            Action::ShellUnavailable => {
+                links.replacement_at = Some(links.at);
+                links.stopped = true;
+            }
             Action::Reconnect => {
                 queue.extend(links.on(Event::Now, sess, now_ms));
             }

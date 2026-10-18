@@ -53,6 +53,11 @@ impl RoundTask {
         Ok(round)
     }
 
+    /// Read only after consuming a generation-validated authenticated result.
+    pub fn endpoint(&self, address: usize) -> Option<SocketAddr> {
+        self.recovery.endpoint(address)
+    }
+
     pub fn update_endpoints(&self, epoch: RecoveryEpoch, endpoints: Vec<(AddressId, SocketAddr)>) {
         self.recovery.update_endpoints(epoch, endpoints);
     }

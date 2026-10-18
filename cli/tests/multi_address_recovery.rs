@@ -420,7 +420,7 @@ fn replacement_consent_preserves_identity_when_the_network_changes_at_the_questi
     daemon.restart();
     session.reconnect();
     assert!(
-        wait_until(|| session.text().contains("Start a new session? [y/N]")),
+        wait_until(|| session.text().contains("Start a new session? [Y/n]")),
         "{}",
         session.text()
     );

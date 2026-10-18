@@ -66,7 +66,16 @@ impl Tty {
         self.confirm_with_default(question, cancel, false)
     }
 
-    /// Installation alone defaults to yes on Enter; EOF still refuses.
+    /// Session replacement defaults to Yes on Enter; EOF and no terminal refuse.
+    pub fn confirm_replacement(
+        &self,
+        question: &str,
+        cancel: &knock::Cancel,
+    ) -> Result<bool, ssh::SshError> {
+        self.confirm_with_default(question, cancel, true)
+    }
+
+    /// Installation defaults to yes on Enter; EOF still refuses.
     pub fn confirm_install(
         &self,
         question: &str,
@@ -273,7 +282,7 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn only_installation_accepts_enter_and_eof_still_refuses() {
+    fn installation_default_does_not_change_trust_confirmation() {
         let _serialize = crate::tty::SIGNAL_TESTS
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -304,6 +313,32 @@ mod tests {
             Tty::new().confirm_install("Install?", &cancel),
             Err(ssh::SshError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn replacement_accepts_enter_but_not_eof_or_missing_terminal() {
+        let _serialize = crate::tty::SIGNAL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (input, expected) in [
+            (&b"\n"[..], true),
+            (&b"n\n"[..], false),
+            (&b"\x04"[..], false),
+            (&b"Y\n"[..], true),
+        ] {
+            let pty = nix::pty::openpty(None, None).unwrap();
+            let tty = Tty::at(nix::unistd::ttyname(&pty.slave).unwrap());
+            let mut master = File::from(pty.master);
+            master.write_all(input).unwrap();
+            assert_eq!(
+                tty.confirm_replacement("Replace?", &knock::Cancel::new())
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(!Tty::at("/nonexistent/qsh-test-tty")
+            .confirm_replacement("Replace?", &knock::Cancel::new())
+            .unwrap());
     }
 
     #[test]

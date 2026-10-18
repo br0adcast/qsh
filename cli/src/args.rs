@@ -104,7 +104,7 @@ back or you leave. Ctrl-] r starts a round at once, and over a link that
 still works it lets that link go first. The status line says what is going
 on; with --status off, a plate on the top row does. After the expected server
 confirms session loss, qsh restores the terminal and asks whether to start a
-new session. The default is No; only yes or y starts a fresh shell.
+new session. The default is Yes; Enter, yes, or y starts a fresh shell.
 
 Every run is logged to ~/.cache/qsh/log on Linux and macOS (or
 $XDG_CACHE_HOME/qsh/log), one line per record: the time in UTC, the process

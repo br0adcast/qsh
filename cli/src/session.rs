@@ -114,6 +114,9 @@ pub enum Action {
     SendChannel { ch: ChannelId, bytes: Vec<u8> },
     /// A new size for a channel.
     ResizeChannel { ch: ChannelId, cols: u16, rows: u16 },
+    /// The authenticated resumed inventory no longer contains the tracked shell.
+    /// The owner may offer replacement after restoring the terminal.
+    ShellUnavailable,
     /// Leave with this exit code.
     Exit(i32),
     /// The person asked to reconnect now (`Ctrl-] r`).
@@ -507,8 +510,11 @@ impl Session {
                     resize_all(self)
                 }
                 _ => {
-                    let mut actions = vec![Action::Notice(status::shell_ended_text())];
-                    actions.extend(self.leave(1));
+                    let mut actions = vec![
+                        Action::Notice(status::shell_ended_text()),
+                        Action::ShellUnavailable,
+                    ];
+                    actions.extend(self.leave(13));
                     actions
                 }
             };
@@ -1920,7 +1926,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_that_ended_while_away_ends_the_run() {
+    fn a_shell_missing_after_authenticated_resume_requests_replacement() {
         let mut s = ready_session();
         let _ = s.on_link_gone(0);
         let _ = s.on_reattached(10);
@@ -1929,7 +1935,8 @@ mod tests {
             a.contains(&Action::Notice(status::shell_ended_text())),
             "{a:?}"
         );
-        assert!(a.contains(&Action::Exit(1)), "{a:?}");
+        assert!(a.contains(&Action::ShellUnavailable), "{a:?}");
+        assert!(a.contains(&Action::Exit(13)), "{a:?}");
     }
 
     #[test]
