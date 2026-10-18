@@ -251,11 +251,15 @@ jobs:
               return
             fi
             bad=0
+            # Only the library's IPv6 PAM policy fixture needs to add a
+            # documentation address inside its disposable network namespace.
+            network_caps=()
+            if [ "$kind" = lib ]; then network_caps=(--cap-add=NET_ADMIN); fi
             echo "::group::$name"
             # Merge the test's streams before Docker multiplexes them.
             # Host-side 2>&1 alone can reorder libtest's result and a skip
             # diagnostic, making a complete run look like a missing test.
-            if docker run --rm --init --cap-add=SYS_PTRACE \
+            if docker run --rm --init --cap-add=SYS_PTRACE "${network_caps[@]}" \
               -e QSHD_TEST_DISPOSABLE_HOST=1 \
               -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
               ubuntu:24.04 sh -c 'exec "$@" 2>&1' sh "$bin" --test-threads=1 --nocapture \
@@ -349,6 +353,8 @@ jobs:
           # on one of them could never pass in this job.
           run_suite lib qshd --ignored 48 \
             --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
+            --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \
+            --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
             an_undeliverable_signal_is_reported_to_the_helper \

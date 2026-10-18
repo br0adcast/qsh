@@ -1626,19 +1626,157 @@ mod tests {
         );
     }
 
-    /// Both CIDR matches and their opposite fallbacks matter: a broken
-    /// origin can deny an allowed peer OR admit a denied peer.
-    #[test]
-    fn pam_access_matches_source_cidrs_with_explicit_fallbacks() {
-        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+    /// Linux-PAM 1.5.3 resolves CIDR network tokens with NULL getaddrinfo
+    /// hints. glibc implicitly applies AI_ADDRCONFIG there, so even numeric
+    /// IPv6 needs a configured address other than ::1. Probe that real call.
+    fn pam_access_can_resolve_ipv6() -> bool {
+        let network = CString::new("2001:db8:1::").expect("numeric network");
+        let mut addresses = std::ptr::null_mut();
+        // SAFETY: the input is terminated, output points to a live local,
+        // and any returned list is released with the matching libc function.
+        let result = unsafe {
+            nix::libc::getaddrinfo(
+                network.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut addresses,
+            )
+        };
+        if !addresses.is_null() {
+            unsafe { nix::libc::freeaddrinfo(addresses) };
+        }
+        result == 0
+    }
+
+    /// Only constructed after this fixture successfully added its address.
+    /// A preexisting address is never owned or removed by the fixture.
+    struct DisposableIpv6Address {
+        socket: OwnedFd,
+        request: Ipv6AddressRequest,
+    }
+
+    // Linux's `struct in6_ifreq`, used by SIOCSIFADDR/SIOCDIFADDR.
+    #[repr(C)]
+    struct Ipv6AddressRequest {
+        address: nix::libc::in6_addr,
+        prefix_len: u32,
+        interface_index: nix::libc::c_int,
+    }
+
+    impl DisposableIpv6Address {
+        fn add() -> Self {
+            use std::os::fd::FromRawFd as _;
+            assert!(
+                Uid::effective().is_root()
+                    && std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() == Ok("1"),
+                "IPv6 setup is restricted to an explicitly disposable root container"
+            );
+            // SAFETY: socket returns an owned descriptor or -1; it is
+            // adopted exactly once, only after checking the result.
+            let fd = unsafe {
+                nix::libc::socket(
+                    nix::libc::AF_INET6,
+                    nix::libc::SOCK_DGRAM | nix::libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            assert!(fd >= 0, "IPv6 socket: {}", std::io::Error::last_os_error());
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let interface = CString::new("lo").expect("interface name");
+            let index = unsafe { nix::libc::if_nametoindex(interface.as_ptr()) };
+            assert_ne!(index, 0, "the disposable namespace must have loopback");
+            let request = Ipv6AddressRequest {
+                address: nix::libc::in6_addr {
+                    s6_addr: "2001:db8::42"
+                        .parse::<std::net::Ipv6Addr>()
+                        .expect("fixture IP")
+                        .octets(),
+                },
+                prefix_len: 128,
+                interface_index: index as nix::libc::c_int,
+            };
+            // SAFETY: request has Linux in6_ifreq's layout and remains live
+            // throughout the ioctl. This socket belongs to this namespace.
+            let result =
+                unsafe { nix::libc::ioctl(socket.as_raw_fd(), nix::libc::SIOCSIFADDR, &request) };
+            assert_eq!(
+                result,
+                0,
+                "add disposable IPv6 address (requires container NET_ADMIN): {}",
+                std::io::Error::last_os_error()
+            );
+            Self { socket, request }
+        }
+    }
+
+    impl Drop for DisposableIpv6Address {
+        fn drop(&mut self) {
+            // SAFETY: this is the exact request that succeeded in add(),
+            // and the descriptor and request are still owned by this guard.
+            let result = unsafe {
+                nix::libc::ioctl(
+                    self.socket.as_raw_fd(),
+                    nix::libc::SIOCDIFADDR,
+                    &self.request,
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "remove fixture-owned IPv6 address: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn assert_pam_access_cidr_family(family: &str) {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated_with_env(
             "helper::monitor::tests::pam_access_matches_source_cidrs_with_explicit_fallbacks_body",
+            &[("QSHD_TEST_PAM_ACCESS_FAMILY", std::ffi::OsStr::new(family))],
         );
         assert!(status.success(), "{status}:\n{stdout}\n{stderr}");
     }
 
+    /// Both CIDR matches and their opposite fallbacks matter: a broken
+    /// origin can deny an allowed peer OR admit a denied peer.
     #[test]
-    #[ignore = "runs only via pam_access_matches_source_cidrs_with_explicit_fallbacks"]
+    fn pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks() {
+        assert_pam_access_cidr_family("ipv4");
+    }
+
+    #[test]
+    fn pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks() {
+        let _address = if pam_access_can_resolve_ipv6() {
+            None
+        } else if Uid::effective().is_root()
+            && std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() == Ok("1")
+        {
+            Some(DisposableIpv6Address::add())
+        } else {
+            eprintln!(
+                "SKIPPED pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks: \
+                Linux-PAM's AI_ADDRCONFIG requires a configured IPv6 address other than ::1; \
+                CI runs this test in an explicitly disposable root container with NET_ADMIN"
+            );
+            return;
+        };
+        assert_pam_access_cidr_family("ipv6");
+    }
+
+    #[test]
+    #[ignore = "runs only via the pam_access IPv4 and IPv6 CIDR wrappers"]
     fn pam_access_matches_source_cidrs_with_explicit_fallbacks_body() {
+        let family =
+            std::env::var("QSHD_TEST_PAM_ACCESS_FAMILY").expect("family selected by wrapper");
+        let (cidr, matching, outside) = match family.as_str() {
+            "ipv4" => ("203.0.113.0/24", "203.0.113.7:2222", "198.51.100.7:2222"),
+            "ipv6" => (
+                "2001:db8:1::/48",
+                "[2001:db8:1::7]:2222",
+                "[2001:db8:2::7]:2222",
+            ),
+            other => panic!("unexpected CIDR fixture family: {other}"),
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let access = dir.path().join("access.conf");
         std::fs::write(
@@ -1651,28 +1789,14 @@ mod tests {
         .expect("write stack");
         let me = current_account_name();
         let mut results = Vec::new();
-        for (cidr, matching, outside) in [
-            ("203.0.113.0/24", "203.0.113.7:2222", "198.51.100.7:2222"),
-            (
-                "2001:db8:1::/48",
-                "[2001:db8:1::7]:2222",
-                "[2001:db8:2::7]:2222",
-            ),
-        ] {
-            for (rule, fallback, expected) in [("+", "-", true), ("-", "+", false)] {
-                std::fs::write(&access, format!("{rule}:ALL:{cidr}\n{fallback}:ALL:ALL\n"))
-                    .expect("write access policy");
-                for (endpoint, allowed) in [(matching, expected), (outside, !expected)] {
-                    let mut pam = remote_transaction(
-                        dir.path(),
-                        "qshd-test-access",
-                        &me,
-                        "/dev/pts/7",
-                        endpoint,
-                    )
-                    .expect("start");
-                    results.push((cidr, rule, endpoint, pam.acct_mgmt().is_ok(), allowed));
-                }
+        for (rule, fallback, expected) in [("+", "-", true), ("-", "+", false)] {
+            std::fs::write(&access, format!("{rule}:ALL:{cidr}\n{fallback}:ALL:ALL\n"))
+                .expect("write access policy");
+            for (endpoint, allowed) in [(matching, expected), (outside, !expected)] {
+                let mut pam =
+                    remote_transaction(dir.path(), "qshd-test-access", &me, "/dev/pts/7", endpoint)
+                        .expect("start");
+                results.push((cidr, rule, endpoint, pam.acct_mgmt().is_ok(), allowed));
             }
         }
         assert!(
