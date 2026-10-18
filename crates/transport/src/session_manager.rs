@@ -84,7 +84,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,7 +98,7 @@ use crate::conn::{
     AcceptOutcome, AuthPolicy, Connection, ConnectionConfig, Consumption, Datagram, Event,
     LinkState, Msg2Inputs, Role, StreamClass,
 };
-use crate::cookie::{CookieCheck, Verdict};
+use crate::cookie::{source_group_key, CookieCheck, Verdict};
 use crate::dgram_queue::{dgram_queue, probation_dgram_queue, DgramRx, DgramTx, DGRAM_QUEUE_BYTES};
 use crate::handshake_payload::{Msg1Payload, StartKind};
 use crate::probation::{
@@ -1001,8 +1001,8 @@ enum AcceptDecision {
 
 /// One connection in probation, as the router tracks it.
 struct ProbationSeat {
-    /// Where its handshake came from: what the per-source cap counts.
-    source: IpAddr,
+    /// Canonical source group, shared with the cookie rate limiter.
+    source: [u8; 16],
     /// The login its handshake named. Unproven, so it binds nothing -- it
     /// only tells the removers of a retained session that a proof for that
     /// session's login may already be with the verifier.
@@ -1182,7 +1182,7 @@ impl Router {
     /// TWO caps, and both must pass. The global [`MAX_PROBATION`] bounds what
     /// the table costs; [`MAX_PROBATION_PER_SOURCE`] is what makes it
     /// hostile-proof, because a global cap alone is exhaustible by ONE
-    /// unauthenticated address -- and a full table is a lockout: every
+    /// unauthenticated source group -- and a full table is a lockout: every
     /// signature client's sign-in, and every warm reattach after a network
     /// change, has to pass through here.
     ///
@@ -1197,14 +1197,18 @@ impl Router {
         // holds at most `MAX_PROBATION` entries, so the scan is trivial, and a
         // parallel counter would be one more thing to keep exactly in step
         // with every removal (a leak there would lock a source out for good).
-        let ip = src.ip();
-        let from_this_source = self.probation.values().filter(|s| s.source == ip).count();
+        let source = source_group_key(src.ip());
+        let from_this_source = self
+            .probation
+            .values()
+            .filter(|s| s.source == source)
+            .count();
         if from_this_source >= MAX_PROBATION_PER_SOURCE {
             log::warn!("per-source probation cap reached, dropping an unauthenticated handshake");
             return false;
         }
         self.probation
-            .insert(session_id, ProbationSeat { source: ip, login });
+            .insert(session_id, ProbationSeat { source, login });
         true
     }
 
@@ -4141,6 +4145,7 @@ mod tests {
     };
     use rand::Rng;
     use std::collections::HashSet;
+    use std::net::IpAddr;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
@@ -12930,6 +12935,140 @@ mod tests {
             );
             id += 1;
         }
+    }
+
+    /// Documentation addresses only: vary all host segments, the port, and
+    /// the scope ID without sending any packets.
+    fn probation_v6_src(prefix: u16, host: u16) -> SocketAddr {
+        std::net::SocketAddrV6::new(
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, prefix, host, host, host, host),
+            40000 + host,
+            0,
+            u32::from(host),
+        )
+        .into()
+    }
+
+    #[test]
+    fn probation_source_groups_share_one_ipv6_64_quota() {
+        let mut router = Router::new();
+        for host in 0..(MAX_PROBATION_PER_SOURCE * 2) as u16 {
+            assert_eq!(
+                router.admit_probation(u64::from(host), probation_v6_src(1, host), [0; 16]),
+                usize::from(host) < MAX_PROBATION_PER_SOURCE,
+                "host bits, ports, and scope IDs must not create a new quota"
+            );
+        }
+        assert_eq!(router.probation.len(), MAX_PROBATION_PER_SOURCE);
+        for host in 0..MAX_PROBATION_PER_SOURCE as u16 {
+            assert!(router.admit_probation(
+                1000 + u64::from(host),
+                probation_v6_src(2, host),
+                [0; 16],
+            ));
+        }
+        assert_eq!(router.probation.len(), MAX_PROBATION_PER_SOURCE * 2);
+    }
+
+    #[test]
+    fn probation_source_groups_share_ipv4_and_mapped_quota() {
+        for mapped_first in [false, true] {
+            let mut router = Router::new();
+            let ip = std::net::Ipv4Addr::new(192, 0, 2, 1);
+            for id in 0..(MAX_PROBATION_PER_SOURCE * 2) as u64 {
+                let source = if (id % 2 == 0) == mapped_first {
+                    IpAddr::V6(ip.to_ipv6_mapped())
+                } else {
+                    IpAddr::V4(ip)
+                };
+                assert_eq!(
+                    router.admit_probation(id, SocketAddr::new(source, 40000 + id as u16), [0; 16]),
+                    id < MAX_PROBATION_PER_SOURCE as u64,
+                    "both address forms must spend the same quota"
+                );
+            }
+            assert_eq!(router.probation.len(), MAX_PROBATION_PER_SOURCE);
+            for host in [2, 3] {
+                let other = std::net::Ipv4Addr::new(192, 0, 2, host);
+                let source = if host == 2 {
+                    IpAddr::V4(other)
+                } else {
+                    IpAddr::V6(other.to_ipv6_mapped())
+                };
+                for seat in 0..MAX_PROBATION_PER_SOURCE as u64 {
+                    assert!(router.admit_probation(
+                        u64::from(host) * 1000 + seat,
+                        SocketAddr::new(source, 40000 + seat as u16),
+                        [0; 16],
+                    ));
+                }
+            }
+            assert_eq!(router.probation.len(), MAX_PROBATION_PER_SOURCE * 3);
+        }
+    }
+
+    #[test]
+    fn probation_source_groups_keep_compatible_ipv6_in_its_native_prefix() {
+        let mut router = Router::new();
+        for id in 0..MAX_PROBATION_PER_SOURCE as u64 {
+            let source = format!("[::192.0.2.{}]:40000", id + 1).parse().unwrap();
+            assert!(router.admit_probation(id, source, [0; 16]));
+        }
+        assert!(!router.admit_probation(100, "[::198.51.100.1]:40001".parse().unwrap(), [0; 16]));
+        // IPv4-compatible addresses belong to ::/64, not the IPv4 host's
+        // group. Only IPv4-mapped addresses are normalized to IPv4.
+        assert!(router.admit_probation(101, "192.0.2.1:40000".parse().unwrap(), [0; 16]));
+        assert!(router.admit_probation(102, "[::ffff:192.0.2.1]:40000".parse().unwrap(), [0; 16]));
+    }
+
+    #[test]
+    fn probation_source_groups_still_obey_the_global_cap() {
+        let mut router = Router::new();
+        for id in 0..=MAX_PROBATION {
+            let prefix = (id / MAX_PROBATION_PER_SOURCE) as u16;
+            let host = (id % MAX_PROBATION_PER_SOURCE) as u16;
+            assert_eq!(
+                router.admit_probation(id as u64, probation_v6_src(prefix, host), [0; 16]),
+                id < MAX_PROBATION,
+            );
+        }
+        assert_eq!(router.probation.len(), MAX_PROBATION);
+        assert!(
+            router.probation.contains_key(&0),
+            "no existing seat is evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn probation_source_groups_reclaim_removed_and_expired_seats() {
+        let rig = SignatureRig::new().await;
+        let mut router = Router::new();
+        for id in 0..MAX_PROBATION_PER_SOURCE as u64 {
+            assert!(router.admit_probation(id, probation_v6_src(1, id as u16), [0; 16]));
+        }
+        let replacement = MAX_PROBATION_PER_SOURCE as u64;
+        let source = probation_v6_src(1, 100);
+        assert!(!router.admit_probation(replacement, source, [0; 16]));
+
+        router.probation.remove(&0).expect("existing seat");
+        assert!(router.admit_probation(replacement, source, [0; 16]));
+        assert!(!router.admit_probation(replacement + 1, probation_v6_src(1, 101), [0; 16]));
+
+        // The same completion the probation task sends after its deadline.
+        // Drive the manager seam directly instead of waiting for a timer.
+        SessionManager::on_probation_ended(
+            &rig.ctx(),
+            &mut router,
+            ProbationEnded {
+                session_id: replacement,
+                nonce: [0; AUTH_NONCE_LEN],
+                proven: None,
+            },
+        )
+        .await;
+        assert_eq!(router.probation.len(), MAX_PROBATION_PER_SOURCE - 1);
+        assert!(router.admit_probation(replacement + 1, probation_v6_src(1, 101), [0; 16]));
+        assert!(!router.admit_probation(replacement + 2, probation_v6_src(1, 102), [0; 16]));
     }
 
     // ---- The return-address check under load (spec §4.16) -----------------
