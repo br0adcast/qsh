@@ -2,6 +2,7 @@
 //! testable without a process: parsing is the one place where a mistake
 //! greets the user before anything else does.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -164,6 +165,9 @@ pub struct Args {
 /// it. Exit code 2 is the caller's job -- see `main`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ArgError {
+    InvalidUtf8 {
+        argument: usize,
+    },
     NoHost,
     AuthorizationNeedsSsh,
     MissingValue(String),
@@ -202,6 +206,9 @@ pub enum ArgError {
 impl fmt::Display for ArgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ArgError::InvalidUtf8 { argument } => {
+                write!(f, "argument {argument} must be valid UTF-8")
+            }
             ArgError::AuthorizationNeedsSsh => write!(f, "--authorize-ssh requires an SSH address"),
             ArgError::NoHost => write!(f, "no server address given"),
             ArgError::MissingValue(flag) => write!(f, "option {flag} needs a value"),
@@ -260,6 +267,17 @@ struct Written {
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
+    parse_args_os(&argv.iter().map(OsString::from).collect::<Vec<_>>())
+}
+
+fn argument_text((index, value): (usize, &OsString)) -> Result<&str, ArgError> {
+    value.to_str().ok_or(ArgError::InvalidUtf8 {
+        argument: index + 1,
+    })
+}
+
+/// Parse OS arguments, preserving identity paths and validating consumed text.
+pub fn parse_args_os(argv: &[OsString]) -> Result<Args, ArgError> {
     let mut raws: Vec<String> = Vec::new();
     let mut port: Option<u16> = None;
     let mut login_flag: Option<String> = None;
@@ -274,41 +292,43 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
     let mut history = 10_000;
     let mut verbose = false;
 
-    let mut it = argv.iter();
+    let mut it = argv.iter().enumerate();
     while let Some(arg) = it.next() {
-        match arg.as_str() {
+        match argument_text(arg)? {
             "-h" | "--help" => return Err(ArgError::HelpRequested),
             "-V" | "--version" => return Err(ArgError::VersionRequested),
             "--verbose" => verbose = true,
             "--authorize-ssh" => authorize_ssh = true,
             "--no-password" => no_password = true,
             "-l" => {
-                let v = it.next().ok_or(ArgError::MissingValue("-l".into()))?;
-                login_flag = Some(v.clone());
+                let v = argument_text(it.next().ok_or(ArgError::MissingValue("-l".into()))?)?;
+                login_flag = Some(v.to_owned());
             }
             "-p" | "--port" => {
-                let v = it
-                    .next()
-                    .ok_or(ArgError::MissingValue("-p/--port".into()))?;
+                let v = argument_text(
+                    it.next()
+                        .ok_or(ArgError::MissingValue("-p/--port".into()))?,
+                )?;
                 port = Some(parse_port(v)?);
             }
             "--ssh" => ssh_flag = Some(DEFAULT_SSH_PORT),
             "--knock" => {
-                let v = it.next().ok_or(ArgError::MissingValue("--knock".into()))?;
+                let v = argument_text(it.next().ok_or(ArgError::MissingValue("--knock".into()))?)?;
                 knock_flag =
                     Some(knock_spec::parse(v).map_err(|what| ArgError::BadKnock { what })?);
             }
             "-i" | "--identity" => {
-                let v = it
+                let (_, v) = it
                     .next()
                     .ok_or(ArgError::MissingValue("-i/--identity".into()))?;
                 identity = Some(PathBuf::from(v));
             }
             "--predict" => {
-                let v = it
-                    .next()
-                    .ok_or(ArgError::MissingValue("--predict".into()))?;
-                predict = match v.as_str() {
+                let v = argument_text(
+                    it.next()
+                        .ok_or(ArgError::MissingValue("--predict".into()))?,
+                )?;
+                predict = match v {
                     "adaptive" => PredictMode::Adaptive,
                     "always" => PredictMode::Always,
                     "never" => PredictMode::Never,
@@ -316,26 +336,27 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
                 };
             }
             "--escape" => {
-                let v = it.next().ok_or(ArgError::MissingValue("--escape".into()))?;
+                let v = argument_text(it.next().ok_or(ArgError::MissingValue("--escape".into()))?)?;
                 escape = crate::escape::parse_prefix(v).map_err(ArgError::BadEscape)?;
             }
             "--status" => {
-                let v = it.next().ok_or(ArgError::MissingValue("--status".into()))?;
-                status_line = match v.as_str() {
+                let v = argument_text(it.next().ok_or(ArgError::MissingValue("--status".into()))?)?;
+                status_line = match v {
                     "on" => true,
                     "off" => false,
                     other => return Err(ArgError::BadStatus(other.to_string())),
                 };
             }
             "--history" => {
-                let v = it
-                    .next()
-                    .ok_or(ArgError::MissingValue("--history".into()))?;
+                let v = argument_text(
+                    it.next()
+                        .ok_or(ArgError::MissingValue("--history".into()))?,
+                )?;
                 history = v
                     .parse::<usize>()
-                    .map_err(|_| ArgError::BadHistory(v.clone()))?;
+                    .map_err(|_| ArgError::BadHistory(v.to_owned()))?;
                 if history > i32::MAX as usize {
-                    return Err(ArgError::BadHistory(v.clone()));
+                    return Err(ArgError::BadHistory(v.to_owned()));
                 }
             }
             other => {
@@ -618,6 +639,89 @@ fn parse_port(v: &str) -> Result<u16, ArgError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn os_text_arguments_report_the_consumed_position_without_the_value() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = std::ffi::OsString::from_vec(b"\x1b[31msecret\n\xff".to_vec());
+        for prefix in [
+            vec![],
+            vec!["-l"],
+            vec!["-p"],
+            vec!["--port"],
+            vec!["--knock"],
+            vec!["--predict"],
+            vec!["--escape"],
+            vec!["--status"],
+            vec!["--history"],
+        ] {
+            let mut args: Vec<std::ffi::OsString> = prefix.into_iter().map(Into::into).collect();
+            args.push(invalid.clone());
+            assert_eq!(
+                parse_args_os(&args).unwrap_err().to_string(),
+                format!("argument {} must be valid UTF-8", args.len())
+            );
+        }
+        for invalid in [b"--bad-\xff".as_slice(), b"alice@host-\xff", b"--ssh=\xff"] {
+            let args = [std::ffi::OsString::from_vec(invalid.to_vec())];
+            assert_eq!(
+                parse_args_os(&args).unwrap_err().to_string(),
+                "argument 1 must be valid UTF-8"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_values_preserve_os_paths_and_option_boundaries() {
+        use std::os::unix::ffi::OsStringExt;
+        for flag in ["-i", "--identity"] {
+            for path in [
+                std::ffi::OsString::from_vec(b"identity-\xff".to_vec()),
+                "--help".into(),
+                "--".into(),
+            ] {
+                let parsed =
+                    parse_args_os(&[flag.into(), path.clone(), "alice@example.org".into()])
+                        .unwrap();
+                assert_eq!(parsed.identity, Some(PathBuf::from(path)));
+            }
+            assert!(matches!(
+                parse_args_os(&[flag.into()]),
+                Err(ArgError::MissingValue(_))
+            ));
+        }
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            parse_args_os(&["--".into(), invalid.clone()]).unwrap_err(),
+            ArgError::UnknownFlag("--".into())
+        );
+        assert_eq!(
+            parse_args_os(&["--".into()]).unwrap_err(),
+            ArgError::UnknownFlag("--".into())
+        );
+        assert_eq!(
+            parse_args_os(&["--help".into(), invalid.clone()]).unwrap_err(),
+            ArgError::HelpRequested
+        );
+        assert_eq!(
+            parse_args_os(&["--version".into(), invalid]).unwrap_err(),
+            ArgError::VersionRequested
+        );
+        let parsed = parse_args_os(&[
+            "-l".into(),
+            "flag-user".into(),
+            "named@example.org".into(),
+            "-i".into(),
+            "first".into(),
+            "--identity".into(),
+            "second".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.login, "named");
+        assert_eq!(parsed.identity, Some(PathBuf::from("second")));
+    }
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()

@@ -7,6 +7,7 @@
 //! `docs/qshd-service.md`), it keeps a permanent host key, and it decides who
 //! may come in by checking an SSH signature against `authorized_keys`.
 
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -74,6 +75,17 @@ fn home() -> Result<PathBuf> {
 
 /// Parse `serve`'s arguments (the first element is the subcommand itself).
 pub fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
+    parse_serve_args_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
+}
+
+fn argument_text((index, value): (usize, &OsString)) -> Result<&str> {
+    value
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("argument {} must be valid UTF-8", index + 1))
+}
+
+/// Parse OS arguments without converting filesystem paths to text.
+pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
     let mut port = None;
     let mut authorized_keys = None;
     let mut host_key = None;
@@ -90,24 +102,25 @@ pub fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
     let mut permit_root = false;
     #[cfg_attr(not(feature = "system"), allow(unused_mut))]
     let mut authorized_keys_template = None;
-    let mut rest = args.iter().skip(1);
+    let mut rest = args.iter().enumerate().skip(1);
     while let Some(flag) = rest.next() {
+        let flag = argument_text(flag)?;
         let mut value = || {
             rest.next()
-                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("flag {flag} needs a value"))
         };
-        match flag.as_str() {
+        match flag {
             "--port" => {
-                let parsed_port: u16 =
-                    value()?.parse().context("port must be a number 1..65535")?;
+                let parsed_port: u16 = argument_text(value()?)?
+                    .parse()
+                    .context("port must be a number 1..65535")?;
                 if parsed_port == 0 {
                     bail!("port must be a number 1..65535, got 0");
                 }
                 port = Some(parsed_port);
             }
-            "--authorized-keys" => authorized_keys = Some(PathBuf::from(value()?)),
-            "--host-key" => host_key = Some(PathBuf::from(value()?)),
+            "--authorized-keys" => authorized_keys = Some(PathBuf::from(value()?.1)),
+            "--host-key" => host_key = Some(PathBuf::from(value()?.1)),
             "--system" => {
                 #[cfg(feature = "system")]
                 {
@@ -124,7 +137,7 @@ pub fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
             "--worker-user" => {
                 #[cfg(feature = "system")]
                 {
-                    worker_user = Some(value()?);
+                    worker_user = Some(argument_text(value()?)?.to_owned());
                 }
                 #[cfg(not(feature = "system"))]
                 {
@@ -150,7 +163,7 @@ pub fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
             "--authorized-keys-template" => {
                 #[cfg(feature = "system")]
                 {
-                    authorized_keys_template = Some(value()?);
+                    authorized_keys_template = Some(argument_text(value()?)?.to_owned());
                 }
                 #[cfg(not(feature = "system"))]
                 {
@@ -362,7 +375,12 @@ fn refuse_without_pam_service(pam_d: &Path, service: &str) -> anyhow::Result<()>
 /// SSH login must return; `serve` is started by systemd or launchd, which
 /// expect to keep the process).
 pub fn run_serve_command(args: &[String]) -> Result<()> {
-    let parsed = parse_serve_args(args)?;
+    run_serve_command_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
+}
+
+/// OS-aware entrypoint; parsing still precedes all startup side effects.
+pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
+    let parsed = parse_serve_args_os(args)?;
 
     // First, before this process opens a single descriptor of its own: in
     // the system mode the helper's channels rely on 0, 1 and 2 being taken
@@ -714,6 +732,68 @@ fn refuse_the_allowlist_path(auth: &ServerAuth) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_os_paths_preserve_bytes_and_existing_option_boundaries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        for value in [
+            OsString::from_vec(b"path-\xff".to_vec()),
+            "--help".into(),
+            "--".into(),
+        ] {
+            let parsed = parse_serve_args_os(&[
+                "serve".into(),
+                "--host-key".into(),
+                value.clone(),
+                "--authorized-keys".into(),
+                value.clone(),
+            ])
+            .unwrap();
+            assert_eq!(parsed.host_key, PathBuf::from(&value));
+            assert_eq!(parsed.authorized_keys, Some(PathBuf::from(value)));
+        }
+        for flag in ["--host-key", "--authorized-keys"] {
+            assert_eq!(
+                parse_serve_args_os(&["serve".into(), flag.into()])
+                    .unwrap_err()
+                    .to_string(),
+                format!("flag {flag} needs a value")
+            );
+        }
+        for trailing in [vec![], vec![OsString::from_vec(vec![0xff])]] {
+            let mut argv = vec!["serve".into(), "--".into()];
+            argv.extend(trailing);
+            assert_eq!(
+                parse_serve_args_os(&argv).unwrap_err().to_string(),
+                "unknown flag --"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_text_values_and_flags_require_utf8_without_weakening_feature_checks() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            parse_serve_args_os(&["serve".into(), invalid.clone()])
+                .unwrap_err()
+                .to_string(),
+            "argument 2 must be valid UTF-8"
+        );
+        for flag in ["--port", "--worker-user", "--authorized-keys-template"] {
+            let error =
+                parse_serve_args_os(&["serve".into(), flag.into(), invalid.clone()]).unwrap_err();
+            if flag != "--port" && !cfg!(feature = "system") {
+                assert!(error.to_string().contains("built without the system mode"));
+            } else {
+                assert_eq!(error.to_string(), "argument 3 must be valid UTF-8");
+            }
+        }
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

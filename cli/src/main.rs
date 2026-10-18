@@ -47,8 +47,8 @@ const ROADS_WINDOW_MS: i64 = 500;
 const ROADS_LINE_MS: i64 = 1000;
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let parsed = match args::parse_args(&argv) {
+    let argv: Vec<_> = std::env::args_os().skip(1).collect();
+    let parsed = match args::parse_args_os(&argv) {
         Ok(a) => a,
         Err(args::ArgError::HelpRequested) => {
             print!("{}", args::USAGE);
