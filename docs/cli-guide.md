@@ -72,6 +72,23 @@ SSH independently uses `~/.ssh/known_hosts`, including hashed entries,
 ones are refused. Trusting an SSH key does not implicitly trust a different qsh
 server key.
 
+Background SSH recovery additionally needs an explicit association between the
+QSH server key, account, SSH endpoint, and SSH host key. After an initial SSH
+bootstrap succeeds over QSH, a separate question offers to save that association.
+Its default is No; declining leaves the current shell usable. An ordinary direct
+QSH login does not probe SSH or create associations. To configure recovery after
+a direct login, run `qsh --authorize-ssh user@server.example.org,ssh`. At least one
+SSH-enabled address is required. Setup shows both fingerprints and the endpoint
+before asking for consent, and verifies SSH host keys without authenticating a
+user or starting a daemon. Each endpoint is authorized separately.
+
+Associations are stored in `ssh_bindings.json` beside QSH `known_hosts`. Existing
+QSH pins and SSH known-host entries are never imported as recovery grants. A
+missing grant or an unreadable/corrupt binding store disables SSH recovery;
+a setup or storage error leaves an established QSH session usable. Recovery
+intersects explicit grants with the current SSH `known_hosts` keys before login.
+Removed or revoked SSH keys cannot authenticate, even when an association remains.
+
 Encryption does not conceal network addresses, volume, or timing. It cannot
 protect either endpoint after that machine is compromised. The full threat model
 and wire format are in [the protocol specification](protocol.md).
@@ -248,6 +265,7 @@ A daemon that no longer has the session, for example after restart, causes exit
 | `-p, --port N` | Default qsh UDP port; an explicit `host:port` takes precedence. |
 | `-i, --identity PATH` | The only identity for direct qsh authentication; first choice for SSH. |
 | `--ssh[=N]` | Enable SSH for addresses without their own override. |
+| `--authorize-ssh` | After QSH login, explicitly configure SSH recovery for the authenticated QSH server. |
 | `--knock STEPS` | Shared pre-SSH knock sequence. |
 | `--no-password` | Do not ask for passwords or passphrases. |
 | `--predict adaptive\|always\|never` | Local input prediction; default `adaptive`. |

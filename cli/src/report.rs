@@ -323,6 +323,22 @@ pub fn install_declined() -> String {
     "qsh: daemon installation was declined".into()
 }
 
+/// Separate recovery consent names both independently verified identities.
+pub fn ssh_authorization(
+    server: &::connect::server_identity::ServerIdentity,
+    endpoint: &::connect::server_identity::SshEndpoint,
+    ssh: &ssh::HostKeyInfo,
+) -> String {
+    format!(
+        "QSH server {} (account {})\nSSH host {}:{} ({})\nAuthorize SSH recovery for this QSH server?",
+        key_fingerprint(&server.qsh_key),
+        printable(&server.username),
+        printable(&endpoint.host),
+        endpoint.port,
+        printable(&ssh.fingerprint),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

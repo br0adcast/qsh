@@ -44,6 +44,14 @@ pub struct Ready {
     pub warning: Option<String>,
 }
 
+/// Daemon readiness and the verified SSH identity of the same connection
+/// that performed its lookup, installation, and startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifiedReady {
+    pub ready: Ready,
+    pub ssh_host_key: ssh::HostKeyInfo,
+}
+
 impl Ready {
     /// The port to reach the daemon on: the one asked for if the daemon
     /// listens there, else the first one it does listen on.
@@ -151,6 +159,18 @@ pub fn bring_up_with(
     bind: std::sync::Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
 ) -> Result<Ready, BringUpError> {
+    bring_up_identified(req, policy, hooks, bind, cancel).map(|identified| identified.ready)
+}
+
+/// Brings up a daemon and returns the verified host key of that SSH login.
+/// Uses the same policy and cleanup as `bring_up_with`.
+pub fn bring_up_identified(
+    req: BringUpRequest,
+    policy: InstallPolicy,
+    hooks: BringUpHooks,
+    bind: std::sync::Arc<dyn knock::SocketBind>,
+    cancel: &knock::Cancel,
+) -> Result<IdentifiedReady, BringUpError> {
     install::bring_up(req, policy, hooks, bind, cancel)
 }
 

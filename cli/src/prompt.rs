@@ -87,7 +87,7 @@ impl Tty {
         let Some(mut terminal) = self.open() else {
             return Ok(false);
         };
-        let suffix = if accept_empty { "[Y/n]" } else { "(yes/no)?" };
+        let suffix = if accept_empty { "[Y/n]" } else { "[y/N]" };
         let _ = write!(terminal, "{question} {suffix} ");
         let _ = terminal.flush();
         let mut answer = Vec::new();
@@ -128,7 +128,7 @@ impl Tty {
                 .to_ascii_lowercase()
                 .as_str()
             {
-                "" if accept_empty => return Ok(true),
+                "" => return Ok(accept_empty),
                 "yes" | "y" => return Ok(true),
                 "no" | "n" => return Ok(false),
                 _ => {}

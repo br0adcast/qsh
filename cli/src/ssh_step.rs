@@ -309,9 +309,9 @@ impl SshStep<'_> {
         client_pubkey: [u8; 32],
         keys: &HostKeys,
         cancel: &knock::Cancel,
-    ) -> Result<bringup::Ready, Attempted> {
+    ) -> Result<bringup::IdentifiedReady, Attempted> {
         let prompter = self.prompter();
-        let result = bringup::bring_up_with(
+        let result = bringup::bring_up_identified(
             self.request(addr, route, client_pubkey, keys, prompter.answers.clone()),
             if self.background {
                 bringup::InstallPolicy::ExistingOnly
@@ -355,12 +355,50 @@ impl SshStep<'_> {
         client_pubkey: [u8; 32],
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
+        self.run_identified(addr, route, client_pubkey, cancel)
+            .map(|identified| identified.ready)
+    }
+
+    /// Foreground bootstrap, retaining the key checked by its actual login.
+    /// A background caller must supply explicit bindings through `run_bound`.
+    pub fn run_identified(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        cancel: &knock::Cancel,
+    ) -> Result<bringup::IdentifiedReady, SshStepError> {
         if self.background {
-            return self.run_inner(addr, route, client_pubkey, cancel);
+            return Err(SshStepError::NeedsPrompt);
         }
         crate::signals::with_termination_cancel(cancel, || {
             self.run_inner(addr, route, client_pubkey, cancel)
         })
+    }
+
+    /// Background bringup permits only the intersection of explicit binding
+    /// keys and freshly read OpenSSH trust, with revocations taking precedence.
+    /// The restricted keys reach the real login's KEX before user authentication.
+    pub fn run_bound(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        bound_keys: &[Vec<u8>],
+        cancel: &knock::Cancel,
+    ) -> Result<bringup::Ready, SshStepError> {
+        if !self.background || cancel.is_cancelled() {
+            return Err(SshStepError::NeedsPrompt);
+        }
+        let mut keys = self.known_hosts.lookup(&addr.host, route.port);
+        keys.known
+            .retain(|key| bound_keys.contains(key) && !keys.revoked.contains(key));
+        if keys.known.is_empty() {
+            return Err(SshStepError::NeedsPrompt);
+        }
+        self.attempt(addr, route, client_pubkey, &keys, cancel)
+            .map(|identified| identified.ready)
+            .map_err(Attempted::into_error)
     }
 
     fn run_inner(
@@ -369,7 +407,7 @@ impl SshStep<'_> {
         route: &::connect::SshRoute,
         client_pubkey: [u8; 32],
         cancel: &knock::Cancel,
-    ) -> Result<bringup::Ready, SshStepError> {
+    ) -> Result<bringup::IdentifiedReady, SshStepError> {
         let name = entry_name(&addr.host, route.port);
         let mut keys = self.known_hosts.lookup(&addr.host, route.port);
         let first = match self.attempt(addr, route, client_pubkey, &keys, cancel) {
@@ -533,7 +571,13 @@ mod tests {
             ssh: Some(route.clone()),
         };
         assert_eq!(
-            step.run(&addr, &route, [7; 32], &knock::Cancel::new()),
+            step.run_bound(
+                &addr,
+                &route,
+                [7; 32],
+                &known.lookup("127.0.0.1", sb.sshd.port).known,
+                &knock::Cancel::new()
+            ),
             Err(SshStepError::NeedsPrompt)
         );
         assert_eq!(source.0.load(Ordering::SeqCst), 0);

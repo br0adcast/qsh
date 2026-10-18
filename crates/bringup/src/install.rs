@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ensure, exec, locate, shell, BringUpError, BringUpHooks, BringUpObserver, BringUpProgress,
-    BringUpRequest, BringUpStage, DaemonImage, ImageError, ImageRequest, InstallOffer,
-    InstallPolicy, Ready, ServerOs,
+    BringUpRequest, BringUpStage, DaemonImage, IdentifiedReady, ImageError, ImageRequest,
+    InstallOffer, InstallPolicy, ServerOs,
 };
 
 const MAX_IMAGE: u64 = 32 * 1024 * 1024;
@@ -233,7 +233,7 @@ pub(crate) fn bring_up(
     hooks: BringUpHooks,
     bind: Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
-) -> Result<Ready, BringUpError> {
+) -> Result<IdentifiedReady, BringUpError> {
     check_cancel(cancel)?;
     if let InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version } =
         &policy
@@ -331,7 +331,10 @@ pub(crate) fn bring_up(
     let ready = ensure::parse(output.code, &output.text)?;
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
-    Ok(ready)
+    Ok(IdentifiedReady {
+        ready,
+        ssh_host_key: session.conn.server_host_key(),
+    })
 }
 
 fn validate_image(

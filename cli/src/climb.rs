@@ -132,6 +132,7 @@ pub struct Setup {
     /// Endpoints where SSH installed this process's key, including the
     /// initial login. Warm recovery must retain that way of authenticating.
     allowlisted: Mutex<HashSet<(String, u16)>>,
+    trust_write: Mutex<Option<crate::ssh_bindings::TrustWritePermit>>,
 }
 
 impl Setup {
@@ -161,6 +162,7 @@ impl Setup {
             session_key: Mutex::new(None),
             weighed: Mutex::new(HashSet::new()),
             allowlisted: Mutex::new(HashSet::new()),
+            trust_write: Mutex::new(None),
         }
     }
 
@@ -173,15 +175,94 @@ impl Setup {
         address: &::connect::Address,
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
-        self.ssh_step(true).run(
-            address,
-            address
-                .ssh
-                .as_ref()
-                .expect("SSH recovery only visits SSH addresses"),
-            self.keypair.public,
-            cancel,
-        )
+        let Some(server) = self.server_identity() else {
+            return Err(SshStepError::NeedsPrompt);
+        };
+        let route = address
+            .ssh
+            .as_ref()
+            .expect("SSH recovery only visits SSH addresses");
+        let endpoint = ::connect::server_identity::SshEndpoint {
+            host: address.host.clone(),
+            port: route.port,
+        };
+        let keys = self
+            .ssh_bindings()
+            .allowed(&server, &endpoint)
+            .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
+        self.ssh_step(true)
+            .run_bound(address, route, self.keypair.public, &keys, cancel)
+    }
+
+    /// The authenticated QSH peer; SSH readiness never changes this identity.
+    pub fn server_identity(&self) -> Option<::connect::server_identity::ServerIdentity> {
+        self.session_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|qsh_key| ::connect::server_identity::ServerIdentity {
+                qsh_key,
+                username: self.args.login.clone(),
+            })
+    }
+
+    /// Begin explicit foreground setup for the controller's current epoch.
+    /// The setup retains a clone so epoch changes can invalidate a writer
+    /// even while it is waiting for a filesystem lock. A live QSH path alone
+    /// does not invalidate foreground setup.
+    pub fn begin_ssh_authorization(
+        &self,
+        epoch: ::connect::recovery_gate::RecoveryEpoch,
+    ) -> crate::ssh_bindings::TrustWritePermit {
+        let mut active = self.trust_write.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = active.take() {
+            previous.invalidate();
+        }
+        let permit = crate::ssh_bindings::TrustWritePermit::new(epoch);
+        *active = Some(permit.clone());
+        permit
+    }
+
+    /// Call before cancelling setup or changing its connection/network epoch.
+    pub fn invalidate_ssh_authorization(&self) {
+        if let Some(permit) = self
+            .trust_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            permit.invalidate();
+        }
+    }
+
+    pub(crate) fn ssh_bindings(&self) -> crate::ssh_bindings::SshBindings {
+        crate::ssh_bindings::SshBindings::open(self.pins.path().with_file_name("ssh_bindings.json"))
+    }
+
+    pub(crate) fn ssh_hosts(&self) -> &KnownHosts {
+        &self.ssh_hosts
+    }
+    pub(crate) fn tty(&self) -> &Tty {
+        &self.tty
+    }
+
+    pub(crate) fn ssh_verification_params(
+        &self,
+        endpoint: &::connect::server_identity::SshEndpoint,
+    ) -> Option<ssh::SshParams> {
+        let address = self.args.addresses.iter().find(|a| {
+            a.host == endpoint.host && a.ssh.as_ref().is_some_and(|s| s.port == endpoint.port)
+        })?;
+        Some(ssh::SshParams {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            username: self.args.login.clone(),
+            known_host_keys: self.ssh_hosts.lookup(&endpoint.host, endpoint.port).known,
+            connect_timeout: crate::ssh_step::SSH_CONNECT_TIMEOUT,
+            keepalive_interval: std::time::Duration::from_secs(15),
+            compression: false,
+            tcp_nodelay: true,
+            knock: address.ssh.as_ref()?.knock.clone(),
+        })
     }
 
     fn allowlist(&self, host: &str, port: u16) {
@@ -311,6 +392,7 @@ pub struct Climb<'a> {
     loud: Option<String>,
     recovery: Option<&'a Recovery>,
     revision: u64,
+    bootstrap: Option<(usize, ssh::HostKeyInfo)>,
 }
 
 impl<'a> Climb<'a> {
@@ -340,6 +422,7 @@ impl<'a> Climb<'a> {
             loud: None,
             recovery: None,
             revision: 0,
+            bootstrap: None,
         }
     }
 }
@@ -425,7 +508,7 @@ impl<'a> Climb<'a> {
                         .expect("the ladder asks for ssh only where there is one");
                     self.progress(host);
                     self.say(&report::trying_ssh(host, route));
-                    let result = self.setup.ssh_step(self.background()).run(
+                    let result = self.setup.ssh_step(self.background()).run_identified(
                         &addrs[addr],
                         route,
                         self.setup.keypair.public,
@@ -435,7 +518,9 @@ impl<'a> Climb<'a> {
                         return Climbed::Exit(130);
                     }
                     match result {
-                        Ok(ready) => {
+                        Ok(identified) => {
+                            self.bootstrap = Some((addr, identified.ssh_host_key));
+                            let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
                             self.setup.allowlist(host, port);
                             self.say(&report::qshd_ready(host, addrs[addr].qsh_port, port));
@@ -487,6 +572,34 @@ impl<'a> Climb<'a> {
                         .connected
                         .take()
                         .expect("a Connected action follows a login");
+                    if !self.background() {
+                        if let Some((bootstrap_addr, info)) = self.bootstrap.take() {
+                            if bootstrap_addr == addr {
+                                if let Some(server) = self.setup.server_identity() {
+                                    let endpoint = ::connect::server_identity::SshEndpoint {
+                                        host: addrs[addr].host.clone(),
+                                        port: addrs[addr]
+                                            .ssh
+                                            .as_ref()
+                                            .expect("bootstrap used SSH")
+                                            .port,
+                                    };
+                                    let permit = self.setup.begin_ssh_authorization(
+                                        ::connect::recovery_gate::RecoveryEpoch {
+                                            connection: 0,
+                                            network: 0,
+                                        },
+                                    );
+                                    if let Err(error) = crate::ssh_authorization::offer_binding(
+                                        &server, &endpoint, &info, self.setup, &permit, cancel,
+                                    ) {
+                                        eprintln!("qsh: {error}; QSH session remains connected");
+                                    }
+                                    self.setup.invalidate_ssh_authorization();
+                                }
+                            }
+                        }
+                    }
                     return Climbed::Connected(Connected {
                         attempt,
                         trial,
@@ -1605,5 +1718,90 @@ mod tests {
             Some("typed"),
             "the terminal answers when asking is allowed, or this proves nothing"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/recovery_ssh.rs"]
+mod authorization_server;
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn stale_epoch_or_cancelled_host_consent_cannot_append_ssh_trust() {
+        for change_epoch in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            let ssh = authorization_server::Server::start();
+            let args =
+                crate::args::parse_args(&[format!("fixture@127.0.0.1,ssh={}", ssh.port)]).unwrap();
+            let pty = nix::pty::openpty(None, None).unwrap();
+            let tty = Tty::at(nix::unistd::ttyname(&pty.slave).unwrap());
+            let mut master = std::fs::File::from(pty.master);
+            let hosts = home.path().join("ssh_known_hosts");
+            let setup = Setup::new(
+                args,
+                transport::generate_keypair(),
+                sshauth::known_hosts::KnownHosts::open(home.path().join("known_hosts")),
+                Box::new(trust::UdpDiscovery),
+                tty,
+                KnownHosts::new(hosts.clone(), None),
+                None,
+                None,
+                [1; 16],
+            );
+            *setup.session_key.lock().unwrap() = Some([7; 32]);
+            let server = setup.server_identity().unwrap();
+            let endpoints = [::connect::server_identity::SshEndpoint {
+                host: "127.0.0.1".into(),
+                port: ssh.port,
+            }];
+            let permit = setup.begin_ssh_authorization(::connect::recovery_gate::RecoveryEpoch {
+                connection: 1,
+                network: 1,
+            });
+            let cancel = knock::Cancel::new();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    crate::ssh_authorization::authorize_ssh(
+                        &server, &endpoints, &setup, &permit, &cancel,
+                    )
+                });
+                let mut shown = String::new();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !shown.contains("Are you sure you want to continue connecting") {
+                    assert!(Instant::now() < deadline, "no host consent: {shown}");
+                    let mut fd = libc::pollfd {
+                        fd: master.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if unsafe { libc::poll(&mut fd, 1, 20) } > 0 {
+                        let mut bytes = [0; 2048];
+                        let n = master.read(&mut bytes).unwrap();
+                        shown.push_str(&String::from_utf8_lossy(&bytes[..n]));
+                    }
+                }
+                if change_epoch {
+                    setup.invalidate_ssh_authorization();
+                } else {
+                    cancel.cancel();
+                }
+                master.write_all(b"yes\nyes\n").unwrap();
+                assert!(matches!(
+                    worker.join().unwrap(),
+                    Err(crate::ssh_authorization::AuthorizationError::Cancelled)
+                ));
+            });
+            assert!(!hosts.exists(), "stale consent appended SSH host trust");
+            assert!(!home.path().join("ssh_bindings.json").exists());
+            ssh.untouched();
+        }
     }
 }

@@ -100,6 +100,11 @@ fn answer_yes(client: &mut Client) {
     client.master.write_all(b"yes\n").expect("answer");
 }
 
+fn decline_recovery_binding(client: &mut Client, screen: &mut Screen) {
+    assert!(screen.next("Authorize SSH recovery"), "{}", screen.text());
+    client.master.write_all(b"no\n").unwrap();
+}
+
 /// The shell is live and runs what is typed, then leaves with code 0. The
 /// marker is split by quotes so the echo of the typed line cannot match it.
 fn a_shell_answers_and_exits_cleanly(client: &mut Client, screen: &mut Screen, context: &str) {
@@ -503,6 +508,7 @@ fn ssh_brings_qshd_up_and_qsh_logs_in_with_the_process_key() {
         screen.text()
     );
     answer_yes(&mut client);
+    decline_recovery_binding(&mut client, &mut screen);
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
 
     assert!(
@@ -582,6 +588,7 @@ fn a_daemon_on_another_port_is_reached_on_its_own_port() {
         );
     }
     answer_yes(&mut client);
+    decline_recovery_binding(&mut client, &mut screen);
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
     assert!(
         !screen.text().contains("The authenticity of host"),
@@ -621,9 +628,14 @@ fn ssh_recovery_hands_a_new_port_to_udp_and_keeps_the_shell() {
     )
     .unwrap();
     let address = format!("127.0.0.1:{},ssh={sshd}", relay.port);
-    let mut client = spawn_qsh(&["-i", key.to_str().unwrap(), &address], home.path());
+    let mut client = spawn_qsh(
+        &["--authorize-ssh", "-i", key.to_str().unwrap(), &address],
+        home.path(),
+    );
     let mut screen = Screen::of(&client);
     assert!(screen.next("Key fingerprint"), "{}", screen.text());
+    answer_yes(&mut client);
+    assert!(screen.next("Authorize SSH recovery"), "{}", screen.text());
     answer_yes(&mut client);
     client.type_line("export PORT_MARK=kept");
     client.type_line("echo PORT'READY'");
@@ -721,6 +733,7 @@ fn a_refusal_over_qsh_goes_to_ssh_and_the_process_key_logs_in() {
         screen.text(),
         sb.sshd.log()
     );
+    decline_recovery_binding(&mut client, &mut screen);
     client.type_line("export WARM_MARK=retained");
     client.type_line("echo WARM'READY'");
     assert!(screen.next("WARMREADY"));

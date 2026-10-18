@@ -137,6 +137,37 @@ fn run(a: args::Args) -> i32 {
         Climbed::Failed { .. } => unreachable!("only a background round ends as Failed"),
     };
     drop(climb);
+    if setup.args().authorize_ssh {
+        let server = setup
+            .server_identity()
+            .expect("successful QSH login establishes identity");
+        let mut endpoints = Vec::new();
+        for address in &setup.args().addresses {
+            if let Some(route) = &address.ssh {
+                let endpoint = ::connect::server_identity::SshEndpoint {
+                    host: address.host.clone(),
+                    port: route.port,
+                };
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+        let permit = setup.begin_ssh_authorization(::connect::recovery_gate::RecoveryEpoch {
+            connection: 0,
+            network: 0,
+        });
+        let cancel = knock::Cancel::new();
+        if let Err(error) =
+            qsh::ssh_authorization::authorize_ssh(&server, &endpoints, &setup, &permit, &cancel)
+        {
+            eprintln!("qsh: {error}; QSH session remains connected");
+        }
+        setup.invalidate_ssh_authorization();
+        if signals::termination_requested() {
+            return 130;
+        }
+    }
     let (tx, rx) = mpsc::channel::<UiEvent>();
     background::forward(0, link_rx, tx.clone());
     let Connected {

@@ -60,6 +60,7 @@ Options:
     --knock STEPS         knock before ssh for every address that has ssh
                           and no knock setting of its own
     -i, --identity PATH   qsh signs with this key only; ssh tries it first
+    --authorize-ssh       explicitly authorize SSH recovery for this QSH server
     --no-password         never ask for a password or a passphrase
     --predict MODE        adaptive | always | never (default adaptive)
     --escape ^X|none      the prefix key for the commands below (default
@@ -146,6 +147,8 @@ pub struct Args {
     pub identity: Option<PathBuf>,
     /// `--no-password`: never ask for a password or a passphrase.
     pub no_password: bool,
+    /// Explicit foreground setup of SSH recovery bindings.
+    pub authorize_ssh: bool,
     pub predict: PredictMode,
     /// `--escape`: the key that starts a client command.
     pub escape: crate::escape::Prefix,
@@ -160,6 +163,7 @@ pub struct Args {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ArgError {
     NoHost,
+    AuthorizationNeedsSsh,
     MissingValue(String),
     BadPort(String),
     BadPredict(String),
@@ -196,6 +200,7 @@ pub enum ArgError {
 impl fmt::Display for ArgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ArgError::AuthorizationNeedsSsh => write!(f, "--authorize-ssh requires an SSH address"),
             ArgError::NoHost => write!(f, "no server address given"),
             ArgError::MissingValue(flag) => write!(f, "option {flag} needs a value"),
             ArgError::BadPort(v) => write!(f, "port must be a number 1..65535, got {v:?}"),
@@ -259,6 +264,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
     let mut ssh_flag: Option<u16> = None;
     let mut knock_flag: Option<Vec<knock::KnockStep>> = None;
     let mut no_password = false;
+    let mut authorize_ssh = false;
     let mut identity = None;
     let mut predict = PredictMode::Adaptive;
     let mut escape = crate::escape::DEFAULT_PREFIX;
@@ -272,6 +278,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
             "-h" | "--help" => return Err(ArgError::HelpRequested),
             "-V" | "--version" => return Err(ArgError::VersionRequested),
             "--verbose" => verbose = true,
+            "--authorize-ssh" => authorize_ssh = true,
             "--no-password" => no_password = true,
             "-l" => {
                 let v = it.next().ok_or(ArgError::MissingValue("-l".into()))?;
@@ -378,11 +385,16 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
         .map(|(i, w)| resolve(i + 1, w, port, ssh_flag, knock_flag.as_deref()))
         .collect::<Result<Vec<_>, _>>()?;
 
+    if authorize_ssh && !addresses.iter().any(|a| a.ssh.is_some()) {
+        return Err(ArgError::AuthorizationNeedsSsh);
+    }
+
     Ok(Args {
         login,
         addresses,
         identity,
         no_password,
+        authorize_ssh,
         predict,
         escape,
         status_line,
