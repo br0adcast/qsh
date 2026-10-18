@@ -13769,12 +13769,16 @@ pub(crate) mod tests {
         // other process is what the monitor exists to prevent (spec 3.3).
         // pam_exec forks and execs the script from the process that called
         // into PAM, so the script's $PPID is that process.
+        // Publish each complete PID atomically: existence is what the close
+        // wait observes, and shell redirection creates a file before writing.
         let script = dir.path().join("record-session.sh");
         write_script(
             &script,
             &format!(
-                "if [ \"$PAM_TYPE\" = open_session ]; then echo $PPID > {m}; \
-                 else echo $PPID > {m}.closed; fi",
+                "if [ \"$PAM_TYPE\" = open_session ]; then marker={m}; \
+                 else marker={m}.closed; fi\n\
+                 pending=$(mktemp \"$marker.XXXXXX\") || exit $?\n\
+                 printf '%s\\n' \"$PPID\" > \"$pending\" && mv \"$pending\" \"$marker\"",
                 m = marker.display()
             ),
         );
