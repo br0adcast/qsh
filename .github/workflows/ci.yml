@@ -94,6 +94,10 @@ jobs:
       # independent tests to overlap. Root-only tests still run below in
       # disposable containers; their ordinary-user skips are not coverage.
       - name: Unit and integration tests
+        # The workspace build supplies this before tests start. Shared bringup
+        # fixtures must not replace it with their standalone feature build.
+        env:
+          QSH_TEST_QSHD: ${{ github.workspace }}/target/debug/qshd
         run: >-
           cargo nextest run --profile ci --workspace --lib --bins --tests
           --locked --features qshd/system

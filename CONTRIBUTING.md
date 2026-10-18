@@ -27,10 +27,18 @@ this section.**
   (CI pins version 0.9.148), then run the same ordinary-user test commands as CI:
 
   ```sh
-  cargo nextest run --profile ci --workspace --lib --bins --tests --locked \
-    --features qshd/system
+  QSH_TEST_QSHD="$PWD/target/debug/qshd" \
+    cargo nextest run --profile ci --workspace --lib --bins --tests --locked \
+      --features qshd/system
   cargo test --workspace --doc --locked
   ```
+
+  Run this from the workspace root. The explicit `QSH_TEST_QSHD` path makes
+  shared bringup fixtures use the daemon produced by this workspace build,
+  without rebuilding it with different features during the test run. If you
+  change the Cargo target directory or build profile, set the matching absolute
+  executable path. An invalid override fails without a build fallback. Omit the
+  override for standalone bringup tests that should build a fresh daemon.
 
   Nextest runs each test in its own process, including tests that exercise PAM
   and change process-wide descriptor state. `.config/nextest.toml` limits
