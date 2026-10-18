@@ -1235,9 +1235,7 @@ fn on_wire(
                 // unless they went looking in the log. A notice, printed
                 // once the terminal is restored: stderr is set aside while
                 // raw mode is on.
-                actions.push(Action::Notice(format!(
-                    "qsh: server refused the shell channel: {reason}"
-                )));
+                actions.push(Action::Notice(qsh::report::channel_refused(&reason)));
                 log::log(&format!("channel refused by server: {reason}"));
                 actions.extend(sess.on_channel_exit(ch, 1, now_ms()));
             }
