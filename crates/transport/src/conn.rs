@@ -3530,7 +3530,7 @@ impl Connection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::handshake::generate_keypair;
     use crate::handshake_payload::{encode_msg1_without_tail, StartKind};
@@ -3773,7 +3773,7 @@ mod tests {
 
     // Per-thread observation only; other transport tests use the unchanged
     // System allocator. No production allocator or allocation policy changes.
-    mod allocation_probe {
+    pub(crate) mod allocation_probe {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
         thread_local! { static COUNT: Cell<Option<usize>> = const { Cell::new(None) }; }

@@ -10,7 +10,8 @@ pub const LIFECYCLE_BYTES: usize = 256;
 pub const GEOMETRY_BYTES: usize = 27;
 pub const OUTPUT_GAP_BYTES: usize = 14;
 /// Declared allowance for an internal final delivery marker. Integration must
-/// assert the eventual marker representation fits, before feature activation.
+/// assert the marker representation fits; the producer lifecycle test measures
+/// the fixed DeliveryMarker and complete retained wrapper separately.
 pub const DELIVERY_MARKER_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +43,7 @@ struct BudgetState {
     scope: WaitKey,
     ordinary: Usage,
     lifecycle: Usage,
-    waiter: bool,
+    waiter: Option<(EntryClass, usize)>,
     notification_pending: bool,
 }
 #[derive(Default)]
@@ -99,7 +100,7 @@ impl TimelineBudget {
                     },
                     ordinary: Usage::default(),
                     lifecycle: Usage::default(),
-                    waiter: false,
+                    waiter: None,
                     notification_pending: false,
                 }),
                 notify: Box::new(notify),
@@ -130,6 +131,18 @@ impl TimelineBudget {
         instance: ChannelInstance,
         generation: u64,
     ) -> WaitRegistration {
+        self.register_waiter_for(instance, generation, EntryClass::Ordinary, GEOMETRY_BYTES)
+    }
+
+    /// The same coalesced waiter also services a fixed lifecycle checkpoint.
+    /// A producer has at most one active admission dependency at a time.
+    pub(crate) fn register_waiter_for(
+        &self,
+        instance: ChannelInstance,
+        generation: u64,
+        class: EntryClass,
+        bytes: usize,
+    ) -> WaitRegistration {
         let mut state = self.inner.state.lock().expect("timeline budget");
         if state.scope
             != (WaitKey {
@@ -140,11 +153,11 @@ impl TimelineBudget {
             return WaitRegistration::Retired;
         }
         state.notification_pending = false;
-        if state.has_room(EntryClass::Ordinary, GEOMETRY_BYTES) {
-            state.waiter = false;
+        if state.has_room(class, bytes) {
+            state.waiter = None;
             WaitRegistration::Ready
         } else {
-            state.waiter = true;
+            state.waiter = Some((class, bytes));
             WaitRegistration::Waiting
         }
     }
@@ -163,7 +176,7 @@ impl TimelineBudget {
         }
         let pending = std::mem::take(&mut state.notification_pending);
         if pending {
-            state.waiter = false;
+            state.waiter = None;
         }
         pending
     }
@@ -176,16 +189,25 @@ impl TimelineBudget {
             return false;
         }
         state.scope.generation = generation;
-        state.waiter = false;
+        state.waiter = None;
         state.notification_pending = false;
         true
     }
 
     #[cfg(test)]
-    fn usage(&self, class: EntryClass) -> (usize, usize) {
+    pub(crate) fn usage(&self, class: EntryClass) -> (usize, usize) {
         let state = self.inner.state.lock().expect("timeline budget");
         let usage = state.usage(class);
         (usage.entries, usage.bytes)
+    }
+}
+
+impl TimelinePermit {
+    /// The same admission state, not a new budget for the receiving queue.
+    pub fn budget(&self) -> TimelineBudget {
+        TimelineBudget {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -196,9 +218,10 @@ impl Drop for TimelinePermit {
             let usage = state.usage_mut(self.class);
             usage.entries -= 1;
             usage.bytes -= self.bytes;
-            if state.waiter
-                && !state.notification_pending
-                && state.has_room(EntryClass::Ordinary, GEOMETRY_BYTES)
+            if !state.notification_pending
+                && state
+                    .waiter
+                    .is_some_and(|(class, bytes)| state.has_room(class, bytes))
             {
                 state.notification_pending = true;
                 Some(state.scope)

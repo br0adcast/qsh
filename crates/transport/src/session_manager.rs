@@ -334,19 +334,89 @@ pub struct StreamData {
     pub data: Vec<u8>,
 }
 
+/// Context ordered before the input delivered by this attachment. Backend owners
+/// keep the last event they processed, never a mutable bridge-side latest value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentContext {
+    pub generation: u64,
+    pub session_id: u64,
+    pub features: crate::Features,
+}
+impl AttachmentContext {
+    fn for_connection(conn: &Connection, generation: u64) -> Self {
+        Self {
+            generation,
+            session_id: conn.session_id(),
+            features: conn.features(),
+        }
+    }
+    pub fn has_geometry(self) -> bool {
+        self.features.contains(crate::Features::CHANNEL_GEOMETRY)
+    }
+}
+
+/// A fixed final output position; the surrounding emission identifies its
+/// instance and attachment. Exactly one marker exists per ended instance.
+#[derive(Clone, Copy, Debug)]
+pub struct DeliveryMarker {
+    pub token: u64,
+}
+
+/// Channel records stay typed until the bridge admits their complete encoding.
+/// Metadata permits move with the record, and are never cloned at queue moves.
+pub enum ChannelOutput {
+    Data(Vec<u8>),
+    Geometry(
+        crate::channel_geometry::GeometryRecord,
+        crate::channel_timeline::TimelinePermit,
+    ),
+    EchoAck(u64, crate::channel_timeline::TimelinePermit),
+    DeliveryMarker(DeliveryMarker, crate::channel_timeline::TimelinePermit),
+}
+impl ChannelOutput {
+    pub fn framed_len(&self) -> usize {
+        match self {
+            Self::Data(bytes) => 5 + bytes.len(),
+            Self::Geometry(..) => 27,
+            Self::EchoAck(..) => 13,
+            Self::DeliveryMarker(..) => crate::channel_timeline::DELIVERY_MARKER_BYTES,
+        }
+    }
+}
+
+/// Pending bytes belong to the original instance's gate, even after its stream
+/// number is reused. Dropping an unsent emission withdraws once; successful
+/// bridge admission transfers the charge atomically to that Connection tail.
+pub struct OutputCharge {
+    gate: Arc<SendGate>,
+    bytes: u64,
+}
+impl OutputCharge {
+    pub fn transfer(mut self, tail: u64) -> bool {
+        let opened = self.gate.transfer(self.bytes, tail);
+        self.bytes = 0;
+        opened
+    }
+}
+impl Drop for OutputCharge {
+    fn drop(&mut self) {
+        self.gate.withdraw(self.bytes);
+    }
+}
+
 /// What the manager delivers to a backend over its [`SessionIo`].
 pub enum SessionInbound {
     /// Freshly delivered in-order stream bytes.
     Data(StreamData),
     /// The connection reached `Live` for the FIRST time (a cue to start
     /// writing to the tty). Sent once per session.
-    Live,
+    Live(AttachmentContext),
     /// The session was reattached by a NEW client connection (a warm reconnect
     /// on the same token): the backend must reset its per-connection state
     /// (echo_ack / tty / control buffers). The persistent bridge emits this
     /// into the SAME `io` when it swaps in the new `Connection`, so the backend
     /// (and, later, its PTYs) keep running across the reattach.
-    ResumeReset,
+    ResumeReset(AttachmentContext),
     /// Repaint the current screen (a hot-roam resync after a long absence: the
     /// server dropped its output backlog and the client just returned). Unlike
     /// `ResumeReset`, this must NOT reset per-connection echo/tty/input
@@ -357,34 +427,86 @@ pub enum SessionInbound {
     /// screen gates: a screen channel that dropped output behind the closed
     /// gate repaints now.
     Writable { stream: u8 },
+    /// One coalesced metadata-capacity wake; stale scopes cannot resume work.
+    OutputReady {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        generation: u64,
+    },
     /// Everything the backend had sent on `stream` when it asked
     /// ([`SessionIo::notify_delivered`]) has been acknowledged by the peer --
     /// or will never be: a warm reattach brought a connection that holds
     /// none of it. `token` is the one the backend asked with, so it can tell
     /// an answer to an earlier request on the same stream from this one.
-    Delivered { stream: u8, token: u64 },
+    /// Geometry-profile owners additionally match the delivery generation.
+    Delivered {
+        stream: u8,
+        token: u64,
+        generation: u64,
+    },
 }
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    ChannelOutput {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        output: ChannelOutput,
+        charge: OutputCharge,
+        /// A single pre-reserved gap slot accompanies the first checkpoint.
+        /// The bridge takes ownership even if it discards that Screen record;
+        /// subsequent gap work uses this same instance budget, never free metadata.
+        gap_reserve: Option<crate::channel_timeline::TimelinePermit>,
+    },
+    /// A final control record whose permit survives the outbound queue. Stage 4
+    /// admits it on CONTROL_STREAM only for its current instance/attachment.
+    ChannelExit {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        code: i32,
+        permit: crate::channel_timeline::TimelinePermit,
+    },
+    ResumeBarrier {
+        generation: u64,
+    },
+    /// End only the originating attempt; a late old-generation failure cannot
+    /// close a replacement connection. At most one diagnostic per attempt.
+    ProtocolFailure {
+        origin: AttachmentContext,
+        code: Option<crate::channel_geometry::ProtocolErrorCode>,
+    },
     /// Bytes for a stream.
     Data(StreamData),
     /// Whether this stream's backlog may be dropped after a long absence and
     /// rebuilt from scratch afterwards. A backend declares this when it opens
     /// a stream; a connection that never hears about a stream falls back to
     /// the old protocol's rule (see [`Connection::is_bulk_output_stream`]).
-    Resyncable { stream_id: u8, resyncable: bool },
+    Resyncable {
+        stream_id: u8,
+        resyncable: bool,
+    },
     /// This stream's class for the fairness rule and the congestion window
     /// (spec §4.8). Kept by the bridge and declared again to every
     /// connection a warm reattach brings.
-    StreamClass { stream_id: u8, class: StreamClass },
+    StreamClass {
+        stream_id: u8,
+        class: StreamClass,
+    },
     /// Say [`SessionInbound::Delivered`], with `token`, once everything sent
     /// on this stream so far is acknowledged.
-    NotifyDelivered { stream_id: u8, token: u64 },
+    NotifyDelivered {
+        stream_id: u8,
+        token: u64,
+    },
     /// The backend took `n` bytes of `stream_id` (spec §4.10.3): only a
     /// backend whose [`SessionBackend::consumption`] is `Explicit` sends it,
     /// and only such a backend's are counted.
-    Consumed { stream_id: u8, n: usize },
+    Consumed {
+        stream_id: u8,
+        n: usize,
+    },
 }
 
 /// The router's own token for one device (see [`Router`]'s `backends` map):
@@ -459,6 +581,57 @@ impl SessionIo {
                 gate.withdraw(n);
             }
         }
+    }
+
+    pub(crate) fn send_channel_output(
+        &self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        gate: Arc<SendGate>,
+        output: ChannelOutput,
+        gap_reserve: Option<crate::channel_timeline::TimelinePermit>,
+    ) {
+        let bytes = output.framed_len() as u64;
+        gate.admit(bytes);
+        let _ = self.outbound.send(SessionOutbound::ChannelOutput {
+            stream,
+            instance,
+            origin,
+            output,
+            charge: OutputCharge { gate, bytes },
+            gap_reserve,
+        });
+    }
+    pub(crate) fn send_channel_exit(
+        &self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        code: i32,
+        permit: crate::channel_timeline::TimelinePermit,
+    ) {
+        let _ = self.outbound.send(SessionOutbound::ChannelExit {
+            stream,
+            instance,
+            origin,
+            code,
+            permit,
+        });
+    }
+    pub(crate) fn resume_barrier(&self, generation: u64) {
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ResumeBarrier { generation });
+    }
+    pub(crate) fn protocol_failure(
+        &self,
+        origin: AttachmentContext,
+        code: Option<crate::channel_geometry::ProtocolErrorCode>,
+    ) {
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ProtocolFailure { origin, code });
     }
 
     /// Tell the connection whether `stream_id`'s backlog may be dropped
@@ -2812,7 +2985,8 @@ fn apply_control(
     // proven peer's cap on out-of-order data replaces probation's.
     adopt_connection(conn, classes);
     *parked = false;
-    link.hand_over(conn, now, SessionInbound::ResumeReset, out);
+    let context = AttachmentContext::for_connection(conn, link.ledger.generation());
+    link.hand_over(conn, now, SessionInbound::ResumeReset(context), out);
     // Then whatever the new peer had already sent before it was bound here --
     // after the reset, never before it.
     for sd in early {
@@ -3053,7 +3227,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let mut out: Vec<Datagram> = Vec::new();
     if start.saw_live {
         first_live_sent = true;
-        link.hand_over(&mut conn, now, SessionInbound::Live, &mut out);
+        let context = AttachmentContext::for_connection(&conn, link.ledger.generation());
+        link.hand_over(&mut conn, now, SessionInbound::Live(context), &mut out);
     }
     for sd in start.early {
         link.hand_over(&mut conn, now, SessionInbound::Data(sd), &mut out);
@@ -3141,6 +3316,33 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             Wakeup::Dgram(None) => break,
             // Nothing of its own: the timers run after every wake-up, below.
             Wakeup::Timeout => {}
+            Wakeup::Backend(Some(
+                SessionOutbound::ChannelOutput { .. }
+                | SessionOutbound::ChannelExit { .. }
+                | SessionOutbound::ResumeBarrier { .. },
+            )) => {
+                // Inactive Stage 3 checkpoint. No geometry feature is negotiated
+                // yet; fail explicitly instead of pretending a raw passthrough
+                // supplies Stage 4 retention, barriers or checked admission.
+                log::error!("channel geometry bridge is not implemented");
+                out.extend(conn.close(now));
+            }
+            Wakeup::Backend(Some(SessionOutbound::ProtocolFailure { origin, code })) => {
+                if origin.session_id == conn.session_id()
+                    && origin.generation == link.ledger.generation()
+                {
+                    if let Some(code) = code {
+                        out.extend(conn.send(
+                            now,
+                            crate::channel::CONTROL_STREAM,
+                            &crate::channel::encode_server(
+                                &crate::channel::ServerRecord::ProtocolError { code },
+                            ),
+                        ));
+                    }
+                    out.extend(conn.close(now));
+                }
+            }
             Wakeup::Backend(Some(SessionOutbound::Data(sd))) => {
                 writable.extend(take_backend_data(
                     &mut conn, &gates, parked, now, sd, &mut out,
@@ -3334,7 +3536,11 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             link.hand_over(
                 &mut conn,
                 now,
-                SessionInbound::Delivered { stream, token },
+                SessionInbound::Delivered {
+                    stream,
+                    token,
+                    generation: link.ledger.generation(),
+                },
                 &mut out,
             );
         }
@@ -3409,7 +3615,8 @@ fn drain_events(
             Event::StateChanged(LinkState::Live) => {
                 if !*first_live_sent {
                     *first_live_sent = true;
-                    link.hand_over(conn, now, SessionInbound::Live, out);
+                    let context = AttachmentContext::for_connection(conn, link.ledger.generation());
+                    link.hand_over(conn, now, SessionInbound::Live(context), out);
                 }
             }
             Event::StateChanged(LinkState::Closed) => {
@@ -4777,7 +4984,7 @@ mod tests {
                         SessionInbound::Data(StreamData { stream_id: 0, data }) => {
                             io.send(0, data);
                         }
-                        SessionInbound::ResumeReset => {
+                        SessionInbound::ResumeReset(_) => {
                             logins.lock().unwrap().push(io.login());
                         }
                         _ => {}
@@ -8664,7 +8871,7 @@ mod tests {
         assert_eq!(data_len(&rx.try_recv().expect("A's second")), 3000);
         let handed = link.inbound.room().await;
         link.took(&mut conn, now, handed, &mut out);
-        assert!(matches!(rx.try_recv(), Ok(SessionInbound::ResumeReset)));
+        assert!(matches!(rx.try_recv(), Ok(SessionInbound::ResumeReset(_))));
         let handed = link.inbound.room().await;
         link.took(&mut conn, now, handed, &mut out);
         assert_eq!(unconsumed_of(&conn, 20), 0, "B's own bytes credit B");
@@ -9482,6 +9689,20 @@ mod tests {
         out
     }
 
+    #[tokio::test]
+    async fn inactive_geometry_bridge_fails_closed_instead_of_acknowledging_barrier() {
+        let (heard_tx, _heard_rx) = mpsc::unbounded_channel();
+        let mut rig = delivery_rig(Arc::new(InboundKindsBackend(heard_tx)), |_| {}).await;
+        rig.backend_sends(SessionOutbound::ResumeBarrier { generation: 0 });
+        rig.run(Duration::from_millis(100)).await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.graceful);
+        assert_eq!(rig.client.state(), LinkState::Closed);
+    }
+
     /// Review, Important 2, at the bridge: `NotifyDelivered` is answered
     /// only once the client has acknowledged everything sent on the stream
     /// before it -- not when the bytes merely went out.
@@ -9802,8 +10023,8 @@ mod tests {
                                 Some(SessionInbound::Data(StreamData { data, .. })) => {
                                     log.extend_from_slice(&data);
                                 }
-                                Some(SessionInbound::Live) => log.extend_from_slice(b"<live>"),
-                                Some(SessionInbound::ResumeReset) => {
+                                Some(SessionInbound::Live(_)) => log.extend_from_slice(b"<live>"),
+                                Some(SessionInbound::ResumeReset(_)) => {
                                     log.extend_from_slice(b"<reset>");
                                 }
                                 Some(SessionInbound::Repaint) => {
@@ -9815,6 +10036,7 @@ mod tests {
                                 Some(SessionInbound::Delivered { .. }) => {
                                     log.extend_from_slice(b"<delivered>");
                                 }
+                                Some(SessionInbound::OutputReady { .. }) => log.extend_from_slice(b"<output-ready>"),
                                 None => return,
                             }
                         }
@@ -14652,7 +14874,10 @@ mod tests {
             "the Attach taken on the datagram arm declares the classes again too"
         );
         assert!(!parked);
-        assert!(matches!(in_rx.try_recv(), Ok(SessionInbound::ResumeReset)));
+        assert!(matches!(
+            in_rx.try_recv(),
+            Ok(SessionInbound::ResumeReset(_))
+        ));
         let data: Vec<u8> = conn
             .poll_events()
             .into_iter()
@@ -14843,11 +15068,12 @@ mod tests {
                 while let Some(ev) = io.recv().await {
                     let kind = match ev {
                         SessionInbound::Data(_) => "data",
-                        SessionInbound::Live => "live",
-                        SessionInbound::ResumeReset => "resume-reset",
+                        SessionInbound::Live(_) => "live",
+                        SessionInbound::ResumeReset(_) => "resume-reset",
                         SessionInbound::Repaint => "repaint",
                         SessionInbound::Writable { .. } => "writable",
                         SessionInbound::Delivered { .. } => "delivered",
+                        SessionInbound::OutputReady { .. } => "output-ready",
                     };
                     let _ = tx.send(kind);
                 }

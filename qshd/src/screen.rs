@@ -20,7 +20,7 @@ use crate::screen_budget::{ResizeReservation, ScreenBudget, ScreenLease};
 use std::sync::Arc;
 use terminal::{Frame, TerminalCore, TerminalOptions};
 use terminal_size::TerminalSize;
-use transport::shell_server::{PreparedScreenResize, SessionScreen};
+use transport::shell_server::{PreparedScreenResize, ScreenPreparationError, SessionScreen};
 
 /// A shell session's screen: the emulator that follows the output.
 pub struct PtyScreen {
@@ -82,8 +82,11 @@ impl SessionScreen for PtyScreen {
     fn prepare_resize(
         &mut self,
         size: TerminalSize,
-    ) -> Result<Box<dyn PreparedScreenResize + '_>, String> {
-        let reservation = self.lease.prepare(size)?;
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError> {
+        let reservation = self
+            .lease
+            .prepare(size)
+            .map_err(ScreenPreparationError::ResourceLimit)?;
         Ok(Box::new(ScreenResize {
             term: &mut self.term,
             reservation,

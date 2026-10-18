@@ -94,6 +94,21 @@ pub trait ResizeHandle: Send {
     fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String>;
 }
 
+/// Preparation failed before any PTY or model mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenPreparationError {
+    ResourceLimit(String),
+    PreparationFailed(String),
+}
+
+impl std::fmt::Display for ScreenPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceLimit(detail) | Self::PreparationFailed(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// A model resize reserved before PTY ioctl; cancellation leaves it unchanged.
 pub trait PreparedScreenResize: Send {
     fn commit(self: Box<Self>);
@@ -125,7 +140,7 @@ pub trait SessionScreen: Send {
     fn prepare_resize(
         &mut self,
         size: TerminalSize,
-    ) -> Result<Box<dyn PreparedScreenResize + '_>, String>;
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError>;
 
     /// Bytes that rebuild the current screen from scratch: content, cursor
     /// and modes. An empty answer means "nothing to say" and puts nothing on
@@ -163,7 +178,7 @@ impl SessionScreen for NoScreen {
     fn prepare_resize(
         &mut self,
         _size: TerminalSize,
-    ) -> Result<Box<dyn PreparedScreenResize + '_>, String> {
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError> {
         Ok(Box::new(EmptyResize))
     }
     fn repaint(&mut self) -> Vec<u8> {
@@ -183,6 +198,12 @@ enum Wakeup {
     Timeout,
     PtyOut(Option<Vec<u8>>),
     AckTick,
+}
+
+fn legacy_shell_config(mut cfg: ConnectionConfig) -> ConnectionConfig {
+    cfg.features =
+        crate::Features::from_bits(cfg.features.bits() & !crate::Features::CHANNEL_GEOMETRY.bits());
+    cfg
 }
 
 /// Serve a single interactive shell on socket `socket` with config `cfg`
@@ -222,6 +243,7 @@ pub async fn serve_shell(
     writer: Box<dyn Write + Send>,
     resize: Box<dyn ResizeHandle>,
 ) {
+    let cfg = legacy_shell_config(cfg);
     // The PTY bridge: two blocking tasks + two channels. The PTY reader puts
     // chunks into `pty_out`, the PTY writer pulls chunks from `pty_in`.
     let (pty_out_tx, mut pty_out_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
@@ -558,6 +580,19 @@ mod tests {
             Err("ioctl failed".into())
         }
     }
+    #[test]
+    fn legacy_shell_cannot_advertise_channel_geometry() {
+        let cfg = super::legacy_shell_config(ConnectionConfig {
+            features: crate::Features::SUPPORTED | crate::Features::CHANNEL_GEOMETRY,
+            role: Role::Server,
+            local_static_priv: [7; 32],
+            remote_static_pub: None,
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        assert!(!cfg.features.contains(crate::Features::CHANNEL_GEOMETRY));
+        assert!(cfg.features.contains(crate::Features::SUPPORTED));
+    }
+
     #[test]
     fn failed_legacy_ioctl_is_not_reported_as_applied() {
         let mut buf = record(2, 2);

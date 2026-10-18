@@ -15,7 +15,7 @@
 //! Doing the same per channel here would mean a growing number of `select!`
 //! arms as channels come and go, so instead every channel's reader task
 //! shares ONE output channel, tagging each chunk with the stream it came
-//! from (`(u8, Option<Vec<u8>>)`; a `None` chunk marks that one channel's
+//! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that one channel's
 //! process ending, not the session's). Input stays one UNbounded channel PER
 //! channel, same as `serve_shell` and for the same reason: a synchronous
 //! send from the async loop must never block it (see that module's docs for
@@ -117,8 +117,17 @@ use crate::channel::{
 // keep it out of a non-test build so it doesn't sit there unused.
 #[cfg(test)]
 use crate::channel::FIRST_CHANNEL_STREAM;
+use crate::channel_geometry::{
+    ChannelInstance, GeometryOutcome, GeometryRecord, ProtocolErrorCode, ResizeRefusal,
+    ResizeRequestId,
+};
+use crate::channel_timeline::{
+    EntryClass, TimelineBudget, TimelinePermit, WaitRegistration, DELIVERY_MARKER_BYTES,
+    GEOMETRY_BYTES,
+};
 use crate::conn::StreamClass;
 use crate::send_gate::{GateKind, SendGate};
+use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
 use crate::shell_frame::{encode_record, RawRecord, RecordDeframer, REC_DATA, REC_ECHO_ACK};
 use crate::shell_server::{ResizeHandle, SessionScreen};
@@ -737,10 +746,30 @@ struct PendingExit {
     /// client closed and opened again -- must not release this one.
     instance: u64,
     code: i32,
+    geometry: GeometryRecord,
+    gate: Arc<SendGate>,
+    final_marker: DeliveryMarker,
+    producer: ProducerState,
+}
+impl PendingExit {
+    fn reset(&mut self, origin: AttachmentContext) {
+        self.producer
+            .timeline
+            .reset_attachment(self.geometry.instance, origin.generation);
+        self.producer.origin = origin;
+        self.geometry.request_id = 0;
+        self.geometry.outcome = GeometryOutcome::Established;
+    }
+}
+impl Drop for PendingExit {
+    fn drop(&mut self) {
+        self.gate.close();
+    }
 }
 
 /// One open channel, as the runner keeps track of it.
 struct Channel {
+    producer: ProducerState,
     /// Sends keystrokes to this channel's process. Unbounded: a synchronous
     /// send from the loop must never block it (see `shell_server`'s module
     /// docs for the full reasoning, which applies verbatim here, once per
@@ -774,6 +803,289 @@ struct Channel {
     wait: Box<dyn ChannelWait>,
 }
 
+/// The runner's ordered attachment scope and one coalescing capacity signal.
+#[derive(Default)]
+struct ProducerContext {
+    attachment: AttachmentContext,
+    ready: Arc<tokio::sync::Notify>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResizeIntent {
+    instance: ChannelInstance,
+    request_id: ResizeRequestId,
+    cols: u16,
+    rows: u16,
+    origin: AttachmentContext,
+}
+struct ProducerState {
+    origin: AttachmentContext,
+    timeline: TimelineBudget,
+    deferred: Option<ResizeIntent>,
+    last_request: Option<ResizeIntent>,
+    last_outcome: Option<GeometryRecord>,
+    failed: bool,
+    checkpoint_due: bool,
+    data_since_checkpoint: bool,
+    queued_data: std::collections::VecDeque<Vec<u8>>,
+    eof: bool,
+    final_marker: Option<TimelinePermit>,
+    exit_permit: Option<TimelinePermit>,
+    // Reserved now so Stage 4 can serialize a gap without borrowing request capacity.
+    gap_reserve: Option<TimelinePermit>,
+}
+impl ProducerState {
+    fn new(instance: ChannelInstance, context: &ProducerContext) -> Self {
+        let ready = context.ready.clone();
+        let timeline = TimelineBudget::new(instance, context.attachment.generation, move |_| {
+            ready.notify_one()
+        });
+        let final_marker = timeline.try_reserve(EntryClass::Lifecycle, DELIVERY_MARKER_BYTES);
+        let exit_permit = timeline.try_reserve(EntryClass::Lifecycle, 10);
+        let gap_permit = timeline
+            .try_reserve(EntryClass::Lifecycle, 14)
+            .expect("fixed lifecycle reserve");
+        Self {
+            origin: context.attachment,
+            timeline,
+            deferred: None,
+            last_request: None,
+            last_outcome: None,
+            failed: false,
+            checkpoint_due: false,
+            data_since_checkpoint: false,
+            queued_data: Default::default(),
+            eof: false,
+            final_marker,
+            exit_permit,
+            gap_reserve: Some(gap_permit),
+        }
+    }
+}
+fn fail_resize(io: &SessionIo, ch: &mut Channel, code: Option<ProtocolErrorCode>) -> bool {
+    if !ch.producer.failed {
+        ch.producer.failed = true;
+        ch.producer.deferred = None;
+        io.protocol_failure(ch.producer.origin, code);
+    }
+    false
+}
+fn current_geometry(ch: &Channel) -> GeometryRecord {
+    ch.producer.last_outcome.unwrap_or(GeometryRecord {
+        instance: ChannelInstance::new(ch.instance).expect("nonzero channel instance"),
+        request_id: 0,
+        outcome: GeometryOutcome::Established,
+        cols: ch.request.cols,
+        rows: ch.request.rows,
+    })
+}
+fn emit_geometry(io: &SessionIo, ch: &mut Channel, record: GeometryRecord, permit: TimelinePermit) {
+    let gap_reserve = ch.producer.gap_reserve.take();
+    io.send_channel_output(
+        ch.request.stream,
+        record.instance,
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::Geometry(record, permit),
+        gap_reserve,
+    );
+    ch.producer.data_since_checkpoint = false;
+}
+fn emit_data(io: &SessionIo, ch: &mut Channel, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    ch.producer.data_since_checkpoint = true;
+    if ch.producer.origin.has_geometry() {
+        io.send_channel_output(
+            ch.request.stream,
+            ChannelInstance::new(ch.instance).unwrap(),
+            ch.producer.origin,
+            ch.gate.clone(),
+            ChannelOutput::Data(bytes.to_vec()),
+            None,
+        );
+    } else {
+        // Temporary inactive-checkpoint seam; removed with protocol activation.
+        io.send(ch.request.stream, encode_record(REC_DATA, bytes));
+    }
+}
+fn emit_ack(io: &SessionIo, ch: &mut Channel) {
+    if ch.producer.origin.has_geometry() {
+        let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) else {
+            return;
+        };
+        io.send_channel_output(
+            ch.request.stream,
+            ChannelInstance::new(ch.instance).unwrap(),
+            ch.producer.origin,
+            ch.gate.clone(),
+            ChannelOutput::EchoAck(ch.input_consumed, permit),
+            None,
+        );
+    } else {
+        io.send(
+            ch.request.stream,
+            encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
+        );
+    }
+    ch.last_acked = ch.input_consumed;
+}
+fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bool {
+    if ch.producer.failed {
+        return false;
+    }
+    if ch.producer.eof {
+        return fail_resize(io, ch, None);
+    }
+    if request.instance.get() != ch.instance || request.origin != ch.producer.origin {
+        return fail_resize(io, ch, None);
+    }
+    if let Some(deferred) = ch.producer.deferred {
+        if deferred == request {
+            return true;
+        }
+        return fail_resize(io, ch, Some(ProtocolErrorCode::ResizePipelineOverflow));
+    }
+    if ch.producer.last_request == Some(request) {
+        return true;
+    }
+    let expected = ch
+        .producer
+        .last_request
+        .map_or(Some(1), |r| r.request_id.get().checked_add(1));
+    if expected != Some(request.request_id.get()) {
+        return fail_resize(io, ch, None);
+    }
+    let permit = if ch.producer.checkpoint_due {
+        None
+    } else {
+        ch.producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, GEOMETRY_BYTES)
+    };
+    let Some(permit) = permit else {
+        ch.producer.deferred = Some(request);
+        ch.gate.set_metadata_blocked(true);
+        if !ch.producer.checkpoint_due
+            && ch
+                .producer
+                .timeline
+                .register_waiter_and_recheck(request.instance, request.origin.generation)
+                == WaitRegistration::Ready
+        {
+            ch.producer.deferred = None;
+            return process_resize(io, ch, request);
+        }
+        return true;
+    };
+    // The complete outcome is owned before validation, preparation or ioctl.
+    let previous = (ch.request.cols, ch.request.rows);
+    let result = if previous.0 == 0 || previous.1 == 0 {
+        Err(ResizeRefusal::NoPty)
+    } else {
+        TerminalSize::new(request.cols, request.rows)
+            .map_err(|_| ResizeRefusal::InvalidSize)
+            .and_then(|size| resize_channel(ch, size))
+    };
+    let record = GeometryRecord {
+        instance: request.instance,
+        request_id: request.request_id.get(),
+        outcome: match result {
+            Ok(()) => GeometryOutcome::Applied,
+            Err(reason) => GeometryOutcome::Refused(reason),
+        },
+        cols: ch.request.cols,
+        rows: ch.request.rows,
+    };
+    ch.producer.last_request = Some(request);
+    ch.producer.last_outcome = Some(record);
+    ch.gate.set_metadata_blocked(false);
+    if ch.screened && !ch.gate.is_open() {
+        ch.stale = true; // the fixed last_outcome is the Screen replacement
+        drop(permit);
+    } else {
+        emit_geometry(io, ch, record, permit);
+        if ch.screened && result.is_ok() && previous != (record.cols, record.rows) {
+            let bytes = ch.screen.repaint();
+            emit_data(io, ch, &bytes);
+            emit_ack(io, ch);
+            ch.stale = false;
+        }
+    }
+    true
+}
+fn reset_producer(ch: &mut Channel, origin: AttachmentContext) {
+    ch.producer.timeline.reset_attachment(
+        ChannelInstance::new(ch.instance).unwrap(),
+        origin.generation,
+    );
+    ch.producer.origin = origin;
+    ch.producer.deferred = None;
+    ch.producer.last_request = None;
+    ch.producer.last_outcome = None;
+    ch.producer.failed = false;
+    ch.gate.set_metadata_blocked(ch.producer.checkpoint_due);
+}
+/// A missing lifecycle slot holds only one current checkpoint and bounded
+/// reader overshoot. Ordinary resize results cannot consume this allowance.
+fn checkpoint(io: &SessionIo, ch: &mut Channel) -> bool {
+    if !ch.producer.origin.has_geometry() {
+        return true;
+    }
+    let instance = ChannelInstance::new(ch.instance).unwrap();
+    let class = if ch.producer.data_since_checkpoint {
+        EntryClass::Ordinary
+    } else {
+        EntryClass::Lifecycle
+    };
+    loop {
+        if let Some(permit) = ch.producer.timeline.try_reserve(class, GEOMETRY_BYTES) {
+            emit_geometry(io, ch, current_geometry(ch), permit);
+            // Every checkpoint caller must finish the hold before admitting
+            // newer output or a resize. Repaint can win the runner select
+            // before the capacity notification that resumes this producer.
+            while let Some(bytes) = ch.producer.queued_data.pop_front() {
+                emit_data(io, ch, &bytes);
+            }
+            ch.producer.checkpoint_due = false;
+            ch.gate.set_metadata_blocked(ch.producer.deferred.is_some());
+            return true;
+        }
+        ch.producer.checkpoint_due = true;
+        ch.gate.set_metadata_blocked(true);
+        match ch.producer.timeline.register_waiter_for(
+            instance,
+            ch.producer.origin.generation,
+            class,
+            GEOMETRY_BYTES,
+        ) {
+            WaitRegistration::Ready => continue,
+            _ => return false,
+        }
+    }
+}
+fn resume_producer(io: &SessionIo, ch: &mut Channel) {
+    if ch.producer.failed {
+        return;
+    }
+    let checkpoint_was_due = ch.producer.checkpoint_due;
+    if checkpoint_was_due && !checkpoint(io, ch) {
+        return;
+    }
+    if checkpoint_was_due && ch.screened && ch.stale {
+        let bytes = ch.screen.repaint();
+        emit_data(io, ch, &bytes);
+        emit_ack(io, ch);
+        ch.stale = false;
+    }
+    if let Some(request) = ch.producer.deferred.take() {
+        process_resize(io, ch, request);
+    }
+    if ch.screened && ch.stale && ch.gate.is_open() {
+        repaint_stale(io, ch.request.stream, ch);
+    }
+}
+
 /// What woke the runner loop.
 enum Wakeup {
     /// An inbound session event (`None` = the manager dropped the io,
@@ -781,15 +1093,111 @@ enum Wakeup {
     Inbound(Option<SessionInbound>),
     /// Output tagged with which channel produced it (`None` chunk = that
     /// channel's reader hit EOF, i.e. its process ended).
-    ChannelOut(Option<(u8, Option<Vec<u8>>)>),
+    ChannelOut(Option<(u8, u64, Option<Vec<u8>>)>),
     /// The short echo_ack flush timer, as in `serve_shell`.
     AckTick,
+    OutputReady,
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
     Reply(DaemonReply),
     /// This session's update task ended.
     Update(UpdateTaskEnd),
+}
+
+fn reset_attachment_outputs(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    exits: &mut HashMap<u8, PendingExit>,
+    context: AttachmentContext,
+) {
+    for ch in channels.values_mut() {
+        // These bounded reader chunks use geometry already established in the
+        // old timeline. A capacity-blocked repaint checkpoint did not resize
+        // that model. Transfer the bytes under their old origin before closing
+        // that producer scope; Stage 4 supplies the new attachment bootstrap.
+        while let Some(bytes) = ch.producer.queued_data.pop_front() {
+            emit_data(io, ch, &bytes);
+        }
+        reset_producer(ch, context);
+        ch.input_consumed = 0;
+        ch.last_acked = 0;
+        // The same rule `open_channel` uses: ask the channel's
+        // OWN screen model, not `ch.request.screen` (what the
+        // client originally asked for) -- see
+        // `SessionScreen::has_screen`'s own doc for why the two
+        // can disagree.
+        io.set_stream_resyncable(ch.request.stream, ch.screen.has_screen());
+    }
+    for pending in exits.values_mut() {
+        pending.reset(context);
+    }
+    // The barrier cannot wait for producer/metadata gates. All old runner
+    // emissions precede it; current Channels/checkpoints follow it.
+    if context.has_geometry() {
+        io.resume_barrier(context.generation);
+    }
+    let mut live: Vec<OpenRequest> = channels.values().map(|ch| ch.request.clone()).collect();
+    live.sort_by_key(|req| req.stream);
+    io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
+    // The new client's screens are empty until this repaints
+    // them -- see this module's own docs above ("Repaint and the
+    // live-channel list") for the fuller rationale.
+    repaint_all(io, channels);
+}
+
+fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
+    let code = pending.code;
+    forget_channel_stream(io, stream);
+    let permit = pending.producer.exit_permit.take().expect("one final Exit");
+    if pending.producer.origin.has_geometry() {
+        io.send_channel_exit(
+            stream,
+            pending.geometry.instance,
+            pending.producer.origin,
+            code,
+            permit,
+        );
+    } else {
+        drop(permit);
+        io.send(
+            CONTROL_STREAM,
+            encode_server(&ServerRecord::Exit { stream, code }),
+        );
+    }
+}
+
+async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
+    let geometry = current_geometry(&ch);
+    let final_marker = DeliveryMarker { token: ch.instance };
+    drop(ch.input_tx);
+    let code = tokio::task::spawn_blocking(move || ch.wait.wait())
+        .await
+        .unwrap_or(-1);
+    if ch.producer.origin.has_geometry() {
+        io.send_channel_output(
+            ch.request.stream,
+            geometry.instance,
+            ch.producer.origin,
+            ch.gate.clone(),
+            ChannelOutput::DeliveryMarker(
+                final_marker,
+                ch.producer.final_marker.take().expect("one final marker"),
+            ),
+            None,
+        );
+    } else {
+        forget_channel_stream(io, ch.request.stream);
+        io.notify_delivered(ch.request.stream, ch.instance);
+    }
+    PendingExit {
+        instance: ch.instance,
+        code,
+        geometry,
+        gate: ch.gate,
+        final_marker,
+        producer: ch.producer,
+    }
 }
 
 /// [`run_channel_session_with`] with nobody behind it speaking for the
@@ -823,7 +1231,8 @@ pub async fn run_channel_session_with(
     let mut exits: HashMap<u8, PendingExit> = HashMap::new();
     // Numbers every channel opened, so a delivery answer names the channel
     // it was asked for (see `PendingExit`).
-    let mut next_instance: u64 = 0;
+    let mut next_instance: u64 = 1;
+    let mut producer = ProducerContext::default();
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
     // Staged geometry codecs are not advertised yet. An unsupported request
@@ -838,7 +1247,8 @@ pub async fn run_channel_session_with(
 
     // Every open channel's reader bridge task sends into this ONE shared
     // channel, tagged with its stream -- see the module docs for why.
-    let (chan_out_tx, mut chan_out_rx) = mpsc::channel::<(u8, Option<Vec<u8>>)>(CHANNEL_CAPACITY);
+    let (chan_out_tx, mut chan_out_rx) =
+        mpsc::channel::<(u8, u64, Option<Vec<u8>>)>(CHANNEL_CAPACITY);
 
     // Short echo_ack flush timer -- as in `serve_shell`, but swept over every
     // open channel each tick rather than a single counter.
@@ -850,6 +1260,7 @@ pub async fn run_channel_session_with(
             ev = io.recv() => Wakeup::Inbound(ev),
             c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
             _ = ack_tick.tick() => Wakeup::AckTick,
+            _ = producer.ready.notified() => Wakeup::OutputReady,
             signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
             reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
             end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
@@ -882,8 +1293,13 @@ pub async fn run_channel_session_with(
                             raw,
                             &mut term,
                             &mut update,
+                            &producer,
                         ) {
                             unsupported_control = true;
+                            for ch in channels.values_mut() {
+                                ch.producer.failed = true;
+                                ch.producer.deferred = None;
+                            }
                             break;
                         }
                     }
@@ -910,13 +1326,15 @@ pub async fn run_channel_session_with(
                     io.consumed(stream_id, n);
                 }
             }
-            Wakeup::Inbound(Some(SessionInbound::Live)) => {
+            Wakeup::Inbound(Some(SessionInbound::Live(context))) => {
+                producer.attachment = context;
                 // A cold start: nothing is running yet from the client's
                 // point of view, so nothing is announced. Sending an empty
                 // `ServerRecord::Channels` here would be indistinguishable
                 // from a server that forgot to answer.
             }
-            Wakeup::Inbound(Some(SessionInbound::ResumeReset)) => {
+            Wakeup::Inbound(Some(SessionInbound::ResumeReset(context))) => {
+                producer.attachment = context;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
                 control_buf = RecordDeframer::for_control();
@@ -935,24 +1353,7 @@ pub async fn run_channel_session_with(
                 // screen model would then stop getting the desync/resync
                 // treatment after this reattach, and the next long absence
                 // would replay its full backlog instead of a single repaint.
-                for ch in channels.values_mut() {
-                    ch.input_consumed = 0;
-                    ch.last_acked = 0;
-                    // The same rule `open_channel` uses: ask the channel's
-                    // OWN screen model, not `ch.request.screen` (what the
-                    // client originally asked for) -- see
-                    // `SessionScreen::has_screen`'s own doc for why the two
-                    // can disagree.
-                    io.set_stream_resyncable(ch.request.stream, ch.screen.has_screen());
-                }
-                let mut live: Vec<OpenRequest> =
-                    channels.values().map(|ch| ch.request.clone()).collect();
-                live.sort_by_key(|req| req.stream);
-                io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
-                // The new client's screens are empty until this repaints
-                // them -- see this module's own docs above ("Repaint and the
-                // live-channel list") for the fuller rationale.
-                repaint_all(&io, &mut channels);
+                reset_attachment_outputs(&io, &mut channels, &mut exits, context);
             }
             Wakeup::Inbound(Some(SessionInbound::Repaint)) => {
                 // A hot-roam resync: the client's picture is stale, and the
@@ -974,21 +1375,56 @@ pub async fn run_channel_session_with(
             // An ended channel's output is delivered: its `Exit` now, unless
             // the client closed the channel (or opened the number again)
             // meanwhile.
-            Wakeup::Inbound(Some(SessionInbound::Delivered { stream, token })) => {
+            Wakeup::Inbound(Some(SessionInbound::Delivered {
+                stream,
+                token,
+                generation,
+            })) => {
                 // An answer to an earlier channel's request on this number
                 // -- one the client closed, then opened again -- is not this
                 // channel's.
-                if exits.get(&stream).is_some_and(|e| e.instance == token) {
-                    let code = exits.remove(&stream).expect("just found").code;
-                    io.send(
-                        CONTROL_STREAM,
-                        encode_server(&ServerRecord::Exit { stream, code }),
-                    );
+                if exits.get(&stream).is_some_and(|e| {
+                    e.instance == token
+                        && e.final_marker.token == token
+                        && (!e.producer.origin.has_geometry()
+                            || e.producer.origin.generation == generation)
+                }) {
+                    let mut pending = exits.remove(&stream).expect("just found");
+                    send_pending_exit(&io, stream, &mut pending);
+                }
+            }
+            Wakeup::Inbound(Some(SessionInbound::OutputReady {
+                stream,
+                instance,
+                generation,
+            })) => {
+                if let Some(ch) = channels.get_mut(&stream) {
+                    if ch.instance == instance.get()
+                        && ch.producer.origin.generation == generation
+                        && ch.producer.timeline.take_notification(instance, generation)
+                    {
+                        resume_producer(&io, ch);
+                    }
+                }
+            }
+            Wakeup::OutputReady => {
+                for ch in channels.values_mut() {
+                    let instance = ChannelInstance::new(ch.instance).unwrap();
+                    if ch
+                        .producer
+                        .timeline
+                        .take_notification(instance, ch.producer.origin.generation)
+                    {
+                        resume_producer(&io, ch);
+                    }
                 }
             }
             Wakeup::Inbound(None) => break,
-            Wakeup::ChannelOut(Some((stream, Some(chunk)))) => {
-                if let Some(ch) = channels.get_mut(&stream) {
+            Wakeup::ChannelOut(Some((stream, instance, Some(chunk)))) => {
+                if let Some(ch) = channels
+                    .get_mut(&stream)
+                    .filter(|ch| ch.instance == instance)
+                {
                     // The model sees every byte the process wrote, sent or not.
                     ch.screen.absorb(&chunk);
                     forward_output(&io, stream, ch, &chunk);
@@ -996,42 +1432,18 @@ pub async fn run_channel_session_with(
                 // Else: output for a channel that already closed -- nobody
                 // is listening for it any more.
             }
-            Wakeup::ChannelOut(Some((stream, None))) => {
-                // The channel's reader hit EOF (its process ended). Every
-                // `Some(chunk)` this same reader task sent earlier is already
-                // ahead of this `None` in the shared (FIFO) output channel
-                // and has already been handled by an earlier loop iteration.
-                // The `Exit` waits until the channel's stream is delivered
-                // (see the module docs): the order of `io.send` calls is not
-                // the order the client hears them in.
-                if let Some(mut ch) = channels.remove(&stream) {
-                    // What it dropped behind its gate ends in a last frame
-                    // the client would otherwise never see. Behind a shut
-                    // gate too: one screenful.
+            Wakeup::ChannelOut(Some((stream, instance, None))) => {
+                if let Some(ch) = channels
+                    .get_mut(&stream)
+                    .filter(|ch| ch.instance == instance)
+                {
+                    ch.producer.eof = true;
+                    // Lifecycle termination wins over an unexecuted intent.
+                    ch.producer.deferred = None;
                     if ch.stale {
-                        repaint_stale(&io, stream, &mut ch);
+                        repaint_stale(&io, stream, ch);
                     }
-                    forget_channel_stream(&io, stream);
-                    // `-1` only if the blocking task itself panicked --
-                    // `ch.wait.wait()` never returning a real exit code is
-                    // not a reason to withhold the `Exit` the client is
-                    // owed for a channel it opened.
-                    let wait = ch.wait;
-                    let code = tokio::task::spawn_blocking(move || wait.wait())
-                        .await
-                        .unwrap_or(-1);
-                    io.notify_delivered(stream, ch.instance);
-                    exits.insert(
-                        stream,
-                        PendingExit {
-                            instance: ch.instance,
-                            code,
-                        },
-                    );
                 }
-                // Else: the channel was already closed by the client (a
-                // `Close` record) before its EOF made it through -- nothing
-                // left to report.
             }
             Wakeup::ChannelOut(None) => {
                 // The loop keeps its own clone of `chan_out_tx` for its whole
@@ -1072,6 +1484,20 @@ pub async fn run_channel_session_with(
             Wakeup::Reply(reply) => update.on_reply(&io, reply),
             Wakeup::Update(end) => update.on_task_end(&io, end),
         }
+        let finished: Vec<_> = channels
+            .iter()
+            .filter_map(|(&stream, ch)| {
+                (ch.producer.eof
+                    && !ch.producer.checkpoint_due
+                    && ch.producer.queued_data.is_empty())
+                .then_some(stream)
+            })
+            .collect();
+        for stream in finished {
+            let ch = channels.remove(&stream).expect("finished channel");
+            let pending = finish_channel(&io, ch).await;
+            exits.insert(stream, pending);
+        }
     }
 
     // The manager tore the session down (`io.recv()` returned `None`), but
@@ -1107,12 +1533,13 @@ pub async fn run_channel_session_with(
 /// needed to avoid asking a line protocol like `tmux -C` to repaint, which
 /// would corrupt the conversation.
 fn repaint_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
-    for (stream, ch) in channels.iter_mut() {
-        let bytes = ch.screen.repaint();
-        if !bytes.is_empty() {
-            io.send(*stream, encode_record(REC_DATA, &bytes));
+    for ch in channels.values_mut() {
+        if !checkpoint(io, ch) {
+            ch.stale = ch.screened;
+            continue;
         }
-        // A repaint covers whatever was dropped before it.
+        let bytes = ch.screen.repaint();
+        emit_data(io, ch, &bytes);
         ch.stale = false;
     }
 }
@@ -1125,6 +1552,12 @@ fn repaint_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
 /// and the channel is stale; the first chunk after the gate reopens goes out
 /// as one repaint (the model already holds it).
 fn forward_output(io: &SessionIo, stream: u8, ch: &mut Channel, chunk: &[u8]) {
+    if ch.producer.checkpoint_due && !ch.screened {
+        // The reader already observed its gate. At most the bounded shared
+        // reader queue plus one current read per channel can overshoot a hold.
+        ch.producer.queued_data.push_back(chunk.to_vec());
+        return;
+    }
     if ch.screened {
         if !ch.gate.is_open() {
             ch.stale = true;
@@ -1135,18 +1568,14 @@ fn forward_output(io: &SessionIo, stream: u8, ch: &mut Channel, chunk: &[u8]) {
             return;
         }
     }
-    io.send(stream, encode_record(REC_DATA, chunk));
+    emit_data(io, ch, chunk);
     send_echo_ack_if_moved(io, stream, ch);
 }
 
 /// The echo ack, when input was consumed since the last one.
-fn send_echo_ack_if_moved(io: &SessionIo, stream: u8, ch: &mut Channel) {
+fn send_echo_ack_if_moved(io: &SessionIo, _stream: u8, ch: &mut Channel) {
     if ch.input_consumed != ch.last_acked {
-        io.send(
-            stream,
-            encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
-        );
-        ch.last_acked = ch.input_consumed;
+        emit_ack(io, ch);
     }
 }
 
@@ -1154,16 +1583,14 @@ fn send_echo_ack_if_moved(io: &SessionIo, stream: u8, ch: &mut Channel) {
 /// consumed -- unconditionally: the dropped output may have carried a
 /// keystroke's echo, and the next ack would otherwise wait for the next
 /// keystroke, the client's prediction hanging unconfirmed until then.
-fn repaint_stale(io: &SessionIo, stream: u8, ch: &mut Channel) {
-    let bytes = ch.screen.repaint();
-    if !bytes.is_empty() {
-        io.send(stream, encode_record(REC_DATA, &bytes));
+fn repaint_stale(io: &SessionIo, _stream: u8, ch: &mut Channel) {
+    if !checkpoint(io, ch) {
+        ch.stale = true;
+        return;
     }
-    io.send(
-        stream,
-        encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
-    );
-    ch.last_acked = ch.input_consumed;
+    let bytes = ch.screen.repaint();
+    emit_data(io, ch, &bytes);
+    emit_ack(io, ch);
     ch.stale = false;
 }
 
@@ -1183,21 +1610,47 @@ fn apply_control_record(
     exits: &mut HashMap<u8, PendingExit>,
     next_instance: &mut u64,
     spawner: &Arc<dyn ChannelSpawner>,
-    chan_out_tx: &mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     raw: RawRecord,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
+    context: &ProducerContext,
 ) -> bool {
     match decode_client(&raw) {
-        Ok(ClientRecord::ResizeRequest { .. }) => {
-            log::warn!("correlated resize received without channel-geometry support; application input stopped");
-            return false;
+        Ok(ClientRecord::ResizeRequest {
+            stream,
+            instance,
+            request_id,
+            cols,
+            rows,
+        }) => {
+            if !context.attachment.has_geometry() {
+                log::warn!("correlated resize received without channel-geometry support; application input stopped");
+                return false;
+            }
+            let Some(ch) = channels.get_mut(&stream) else {
+                io.protocol_failure(context.attachment, None);
+                return false;
+            };
+            return process_resize(
+                io,
+                ch,
+                ResizeIntent {
+                    instance,
+                    request_id,
+                    cols,
+                    rows,
+                    origin: context.attachment,
+                },
+            );
         }
         Ok(ClientRecord::Open(req)) => {
             // A client opens a number it considers free: whatever ended on
             // it before, it is not waiting for that `Exit` any more, and it
             // must not end the new channel.
-            exits.remove(&req.stream);
+            if exits.remove(&req.stream).is_some() {
+                forget_channel_stream(io, req.stream);
+            }
             if update.restarting() {
                 // Its process would outlive the drain and become a child of
                 // the new binary, which never waits for it.
@@ -1205,7 +1658,11 @@ fn apply_control_record(
             } else {
                 // Numbered whether or not it opens: only uniqueness matters.
                 let instance = *next_instance;
-                *next_instance += 1;
+                let Some(next) = next_instance.checked_add(1) else {
+                    io.protocol_failure(context.attachment, None);
+                    return false;
+                };
+                *next_instance = next;
                 open_channel(
                     io,
                     channels,
@@ -1214,6 +1671,7 @@ fn apply_control_record(
                     req,
                     term.as_deref(),
                     instance,
+                    context,
                 )
             }
         }
@@ -1225,6 +1683,10 @@ fn apply_control_record(
             *term = Some(name);
         }
         Ok(ClientRecord::Resize { stream, cols, rows }) => {
+            if context.attachment.has_geometry() {
+                io.protocol_failure(context.attachment, None);
+                return false;
+            }
             if let Some(ch) = channels.get_mut(&stream) {
                 // No-PTY is an OPEN classification and cannot be changed by
                 // a resize. Invalid geometry never reaches model or ioctl.
@@ -1232,7 +1694,7 @@ fn apply_control_record(
                     if let Ok(size) = TerminalSize::new(cols, rows) {
                         let result = resize_channel(ch, size);
                         if let Err(reason) = result {
-                            log::warn!(target: "transport", "channel resize refused: {reason}");
+                            log::warn!(target: "transport", "channel resize refused: {reason:?}");
                         }
                     }
                 }
@@ -1244,7 +1706,9 @@ fn apply_control_record(
         Ok(ClientRecord::Close { stream }) => {
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
-            exits.remove(&stream);
+            if exits.remove(&stream).is_some() {
+                forget_channel_stream(io, stream);
+            }
             // Removing the entry frees the slot for a future OPEN and drops
             // its resize/screen handles. The reader bridge task, if still
             // blocked inside the process's own I/O, is left to end on its
@@ -1279,6 +1743,9 @@ fn apply_control_record(
         Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
         Err(ChannelCodecError::UnknownKind(_)) => {}
         Err(ChannelCodecError::Malformed) if raw.kind == crate::channel::REC_RESIZE_REQUEST => {
+            if context.attachment.has_geometry() {
+                io.protocol_failure(context.attachment, None);
+            }
             log::warn!("malformed correlated resize; application input stopped");
             return false;
         }
@@ -1296,9 +1763,21 @@ fn apply_control_record(
 
 /// All fallible steps precede model/request mutation. A failed ioctl drops
 /// the reservation, releasing provisional storage without changing the model.
-fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), String> {
-    let prepared = ch.screen.prepare_resize(size)?;
-    ch.resize.try_resize(size.cols(), size.rows())?;
+fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), ResizeRefusal> {
+    if (ch.request.cols, ch.request.rows) == (size.cols(), size.rows()) {
+        return Ok(());
+    }
+    let prepared = ch.screen.prepare_resize(size).map_err(|e| match e {
+        crate::shell_server::ScreenPreparationError::ResourceLimit(_) => {
+            ResizeRefusal::ResourceLimit
+        }
+        crate::shell_server::ScreenPreparationError::PreparationFailed(_) => {
+            ResizeRefusal::ScreenPreparationFailed
+        }
+    })?;
+    ch.resize
+        .try_resize(size.cols(), size.rows())
+        .map_err(|_| ResizeRefusal::PtyResizeFailed)?;
     prepared.commit();
     ch.request.cols = size.cols();
     ch.request.rows = size.rows();
@@ -1309,14 +1788,16 @@ fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), String> {
 /// otherwise ask `spawner` to spawn it, wire up its bridge tasks, declare its
 /// recoverability to the connection, and answer `OPENED`/`REFUSED` on
 /// [`CONTROL_STREAM`].
+#[allow(clippy::too_many_arguments)] // Runner dependencies plus scoped producer identity.
 fn open_channel(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
     spawner: &Arc<dyn ChannelSpawner>,
-    chan_out_tx: &mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     req: OpenRequest,
     term: Option<&str>,
     instance: u64,
+    context: &ProducerContext,
 ) {
     let stream = req.stream;
     if channels.contains_key(&stream) {
@@ -1394,7 +1875,7 @@ fn open_channel(
     // A blocking task: the reader blocks in `read`, and a line channel's also
     // on its gate -- never on the runtime's own threads.
     tokio::task::spawn_blocking(move || {
-        channel_reader_loop(stream, reader, reader_out, reader_gate)
+        channel_reader_loop(stream, instance, reader, reader_out, reader_gate)
     });
     let reporter = io.consumption_reporter();
     tokio::task::spawn_blocking(move || channel_writer_loop(stream, input_rx, writer, reporter));
@@ -1402,6 +1883,10 @@ fn open_channel(
     channels.insert(
         stream,
         Channel {
+            producer: ProducerState::new(
+                ChannelInstance::new(instance).expect("nonzero channel instance"),
+                context,
+            ),
             input_tx,
             resize,
             screen,
@@ -1427,6 +1912,7 @@ fn open_channel(
         CONTROL_STREAM,
         encode_server(&ServerRecord::Opened { stream }),
     );
+    checkpoint(io, channels.get_mut(&stream).expect("opened channel"));
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
@@ -1448,8 +1934,9 @@ fn refuse(io: &SessionIo, stream: u8, reason: String) {
 /// nothing, once the gate closes for good: the channel is gone then.
 fn channel_reader_loop(
     stream: u8,
+    instance: u64,
     mut reader: Box<dyn Read + Send>,
-    tx: mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    tx: mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     gate: Option<Arc<SendGate>>,
 ) {
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -1463,11 +1950,14 @@ fn channel_reader_loop(
         }
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
-                let _ = tx.blocking_send((stream, None));
+                let _ = tx.blocking_send((stream, instance, None));
                 return;
             }
             Ok(n) => {
-                if tx.blocking_send((stream, Some(buf[..n].to_vec()))).is_err() {
+                if tx
+                    .blocking_send((stream, instance, Some(buf[..n].to_vec())))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1611,7 +2101,10 @@ pub(crate) mod tests {
         fn prepare_resize(
             &mut self,
             size: TerminalSize,
-        ) -> Result<Box<dyn crate::shell_server::PreparedScreenResize + '_>, String> {
+        ) -> Result<
+            Box<dyn crate::shell_server::PreparedScreenResize + '_>,
+            crate::shell_server::ScreenPreparationError,
+        > {
             let _ = size;
             Ok(Box::new(FakePreparedResize))
         }
@@ -1939,6 +2432,743 @@ pub(crate) mod tests {
         }
     }
 
+    // These tests observe the actual producer transaction and owned outbound
+    // records. No bridge passthrough or remote delivery guarantee is assumed.
+    struct ResizeRig {
+        io: SessionIo,
+        _inbound: mpsc::Sender<SessionInbound>,
+        outbound: mpsc::UnboundedReceiver<SessionOutbound>,
+        channel: Channel,
+        geometry: Arc<Mutex<(u16, u16)>>,
+        pending: Arc<AtomicUsize>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl ResizeRig {
+        fn new(prepare_fails: bool, ioctl_fails: bool) -> Self {
+            let (io, inbound, outbound) = SessionIo::test_pair();
+            let geometry = Arc::new(Mutex::new((80, 24)));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(vec![]));
+            let (input_tx, _) = mpsc::unbounded_channel();
+            let producer = ProducerContext {
+                attachment: AttachmentContext {
+                    generation: 1,
+                    session_id: 11,
+                    features: crate::Features::CHANNEL_GEOMETRY,
+                },
+                ..ProducerContext::default()
+            };
+            let channel = Channel {
+                input_tx,
+                resize: Box::new(TransactionPty {
+                    fail: ioctl_fails,
+                    events: events.clone(),
+                }),
+                screen: Box::new(TransactionScreen {
+                    geometry: geometry.clone(),
+                    pending: pending.clone(),
+                    fail: prepare_fails,
+                    events: events.clone(),
+                }),
+                input_consumed: 0,
+                last_acked: 0,
+                gate: Arc::new(SendGate::new(GateKind::Pipe)),
+                screened: false,
+                stale: false,
+                instance: 1,
+                request: OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: vec![],
+                },
+                wait: Box::new(FakeWait {
+                    stream: 16,
+                    code: 0,
+                    killed: Arc::default(),
+                    waited: Arc::default(),
+                }),
+                producer: ProducerState::new(ChannelInstance::new(1).unwrap(), &producer),
+            };
+            Self {
+                io,
+                _inbound: inbound,
+                outbound,
+                channel,
+                geometry,
+                pending,
+                events,
+            }
+        }
+        fn intent(&self, id: u64, cols: u16, rows: u16) -> ResizeIntent {
+            ResizeIntent {
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(id).unwrap(),
+                cols,
+                rows,
+                origin: self.channel.producer.origin,
+            }
+        }
+        fn resize(&mut self, id: u64, cols: u16, rows: u16) -> bool {
+            let request = self.intent(id, cols, rows);
+            process_resize(&self.io, &mut self.channel, request)
+        }
+        fn next_geometry(&mut self) -> GeometryRecord {
+            match self.outbound.try_recv().expect("one correlated outcome") {
+                SessionOutbound::ChannelOutput {
+                    stream: 16,
+                    instance,
+                    origin,
+                    output: ChannelOutput::Geometry(record, _),
+                    ..
+                } => {
+                    assert_eq!(instance.get(), 1);
+                    assert_eq!(origin.generation, 1);
+                    record
+                }
+                _ => panic!("resize returns geometry, never OPEN refusal or Exit"),
+            }
+        }
+        fn assert_geometry(&self, cols: u16, rows: u16) {
+            assert_eq!(*self.geometry.lock().unwrap(), (cols, rows));
+            assert_eq!(
+                (self.channel.request.cols, self.channel.request.rows),
+                (cols, rows)
+            );
+            assert_eq!(self.pending.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn resize_refusal_preserves_all_geometry() {
+        let mut rig = ResizeRig::new(true, false);
+        assert!(rig.resize(1, 100, 30));
+        rig.assert_geometry(80, 24);
+        assert_eq!(*rig.events.lock().unwrap(), vec!["prepare"]);
+        assert_eq!(
+            rig.next_geometry().outcome,
+            GeometryOutcome::Refused(ResizeRefusal::ResourceLimit)
+        );
+    }
+    #[test]
+    fn resize_ioctl_failure_releases_preparation() {
+        let mut rig = ResizeRig::new(false, true);
+        assert!(rig.resize(1, 100, 30));
+        rig.assert_geometry(80, 24);
+        assert_eq!(*rig.events.lock().unwrap(), vec!["prepare", "ioctl"]);
+        assert_eq!(
+            rig.next_geometry().outcome,
+            GeometryOutcome::Refused(ResizeRefusal::PtyResizeFailed)
+        );
+    }
+    #[test]
+    fn resize_success_orders_geometry_before_data() {
+        let mut rig = ResizeRig::new(false, false);
+        forward_output(&rig.io, 16, &mut rig.channel, b"old");
+        assert!(rig.resize(1, 100, 30));
+        forward_output(&rig.io, 16, &mut rig.channel, b"new");
+        rig.assert_geometry(100, 30);
+        assert_eq!(
+            *rig.events.lock().unwrap(),
+            vec!["prepare", "ioctl", "commit"]
+        );
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput { output:ChannelOutput::Data(ref b), .. } if b==b"old")
+        );
+        let record = rig.next_geometry();
+        assert_eq!((record.request_id, record.cols, record.rows), (1, 100, 30));
+        assert_eq!(record.outcome, GeometryOutcome::Applied);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput { output:ChannelOutput::Data(ref b), .. } if b==b"new")
+        );
+    }
+    #[test]
+    fn resize_outcome_reserved_before_effect() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.events.lock().unwrap().is_empty());
+        rig.assert_geometry(80, 24);
+        assert!(rig.outbound.try_recv().is_err());
+        drop(held);
+        resume_producer(&rig.io, &mut rig.channel);
+        rig.assert_geometry(100, 30);
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+    }
+    #[test]
+    fn one_deferred_resize_waits_without_failure() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.channel.producer.deferred.is_some());
+        assert!(!rig.channel.gate.is_open());
+        assert!(!rig.channel.producer.failed);
+        drop(held);
+        assert!(rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+        resume_producer(&rig.io, &mut rig.channel);
+        assert!(rig.channel.producer.deferred.is_none());
+        assert!(rig.channel.gate.is_open());
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+    }
+    #[test]
+    fn second_distinct_deferred_resize_fails_once() {
+        let mut rig = ResizeRig::new(false, false);
+        let _held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(!rig.resize(2, 101, 31));
+        assert!(!rig.resize(3, 102, 32));
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ProtocolFailure {
+                code: Some(ProtocolErrorCode::ResizePipelineOverflow),
+                ..
+            }
+        ));
+        assert!(rig.outbound.try_recv().is_err());
+    }
+    #[test]
+    fn duplicate_deferred_resize_allocates_nothing() {
+        let mut rig = ResizeRig::new(false, false);
+        let _held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        let allocated = crate::conn::tests::allocation_probe::measure(|| {
+            for _ in 0..1000 {
+                assert!(rig.resize(1, 100, 30));
+            }
+        });
+        assert_eq!(allocated, 0);
+        assert!(rig.outbound.try_recv().is_err());
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Ordinary),
+            (1, 8192)
+        );
+    }
+    #[test]
+    fn reset_cancels_unexecuted_deferred_resize() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        let origin = AttachmentContext {
+            generation: 2,
+            session_id: 12,
+            ..rig.channel.producer.origin
+        };
+        reset_producer(&mut rig.channel, origin);
+        drop(held);
+        resume_producer(&rig.io, &mut rig.channel);
+        assert!(rig.channel.producer.deferred.is_none());
+        assert!(rig.events.lock().unwrap().is_empty());
+        rig.assert_geometry(80, 24);
+        assert!(!rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+    }
+    #[test]
+    fn first_checkpoint_transfers_single_gap_reserve_with_shared_budget() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let first = rig.outbound.try_recv().unwrap();
+        let shared = match &first {
+            SessionOutbound::ChannelOutput {
+                gap_reserve: Some(gap),
+                ..
+            } => gap.budget(),
+            _ => panic!("first checkpoint must transfer its reserved gap slot"),
+        };
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let second = rig.outbound.try_recv().unwrap();
+        assert!(matches!(
+            &second,
+            SessionOutbound::ChannelOutput {
+                gap_reserve: None,
+                ..
+            }
+        ));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (5, 110));
+        drop(first); // cancellation releases exactly checkpoint + gap
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (3, 69));
+        drop(second);
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (2, 42));
+    }
+
+    #[tokio::test]
+    async fn typed_exit_keeps_reservation_until_bridge_handoff_or_drop() {
+        let rig = ResizeRig::new(false, false);
+        let timeline = rig.channel.producer.timeline.clone();
+        let mut outbound = rig.outbound;
+        let mut pending = finish_channel(&rig.io, rig.channel).await;
+        let _marker = outbound.try_recv().unwrap();
+        send_pending_exit(&rig.io, 16, &mut pending);
+        assert!(matches!(
+            outbound.try_recv().unwrap(),
+            SessionOutbound::StreamClass {
+                stream_id: 16,
+                class: StreamClass::Interactive
+            }
+        ));
+        let exit = outbound.try_recv().unwrap();
+        assert!(
+            matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:0,..} if instance.get()==1 && origin.generation==1)
+        );
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 56));
+        drop(exit);
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (2, 46));
+    }
+
+    #[test]
+    fn lifecycle_inventory_keeps_gap_and_final_state_reserved() {
+        let rig = ResizeRig::new(false, false);
+        let budget = &rig.channel.producer.timeline;
+        // Marker 32, Exit 10, gap 14 remain reserved independently of requests.
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (3, 56));
+        let mut checkpoints = Vec::new();
+        for _ in 0..5 {
+            checkpoints.push(budget.try_reserve(EntryClass::Lifecycle, 27).unwrap());
+        }
+        assert!(budget.try_reserve(EntryClass::Lifecycle, 27).is_none());
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 191));
+        assert_eq!(std::mem::size_of::<DeliveryMarker>(), 8);
+        assert!(std::mem::size_of::<DeliveryMarker>() <= DELIVERY_MARKER_BYTES);
+        // Entry count bounds retained wrappers separately from wire-byte costs.
+        assert!(std::mem::size_of::<ChannelOutput>() <= 64);
+        assert!(std::mem::size_of::<crate::session_manager::OutputCharge>() <= 24);
+        assert!(std::mem::size_of::<SessionOutbound>() <= 160);
+    }
+
+    #[tokio::test]
+    async fn eof_retains_typed_marker_and_gate_until_delivery() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let gate = io.send_gate(16, GateKind::Pipe);
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 1,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        spawner.end_channel(16);
+        let marker = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match outbound.recv().await.unwrap() {
+                    SessionOutbound::ChannelOutput {
+                        output: ChannelOutput::DeliveryMarker(marker, _),
+                        ..
+                    } => break Some(marker),
+                    SessionOutbound::NotifyDelivered { .. } => break None,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let open_before_delivery = gate.is_open();
+        if let Some(marker) = marker {
+            inbound
+                .send(SessionInbound::Delivered {
+                    stream: 16,
+                    token: marker.token,
+                    generation: 1,
+                })
+                .await
+                .unwrap();
+        }
+        drop(inbound);
+        runner.await.unwrap();
+        assert!(marker.is_some(), "EOF needs a typed final-position marker");
+        assert!(open_before_delivery, "PendingExit must retain the gate");
+    }
+    #[test]
+    fn correlated_same_size_resize_applies_without_preparation_or_repaint() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(rig.resize(1, 80, 24));
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+        assert!(rig.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn resize_rejects_bad_identity_and_replays_exact_duplicate_without_effect() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(rig.resize(1, 100, 30));
+        let _ = rig.next_geometry();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.outbound.try_recv().is_err());
+        assert_eq!(
+            *rig.events.lock().unwrap(),
+            vec!["prepare", "ioctl", "commit"]
+        );
+        assert!(!rig.resize(1, 101, 30));
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ProtocolFailure { code: None, .. }
+        ));
+        for (instance, id) in [(2, 1), (1, 2)] {
+            let mut rig = ResizeRig::new(false, false);
+            let request = ResizeIntent {
+                instance: ChannelInstance::new(instance).unwrap(),
+                ..rig.intent(id, 100, 30)
+            };
+            assert!(!process_resize(&rig.io, &mut rig.channel, request));
+            rig.assert_geometry(80, 24);
+            assert!(rig.events.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn invalid_size_and_no_pty_use_reserved_refusals() {
+        for no_pty in [false, true] {
+            let mut rig = ResizeRig::new(false, false);
+            if no_pty {
+                rig.channel.request.cols = 0;
+            }
+            assert!(rig.resize(1, 0, 30));
+            assert!(rig.events.lock().unwrap().is_empty());
+            let geometry = rig.next_geometry();
+            assert_eq!(
+                geometry.outcome,
+                GeometryOutcome::Refused(if no_pty {
+                    ResizeRefusal::NoPty
+                } else {
+                    ResizeRefusal::InvalidSize
+                })
+            );
+            assert_eq!(geometry.cols, if no_pty { 0 } else { 80 });
+        }
+    }
+    #[test]
+    fn no_screen_checkpoint_after_data_uses_ordinary_capacity() {
+        let mut rig = ResizeRig::new(false, false);
+        forward_output(&rig.io, 16, &mut rig.channel, b"before");
+        let _data = rig.outbound.try_recv().unwrap();
+        let lifecycle = rig.channel.producer.timeline.usage(EntryClass::Lifecycle);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Ordinary),
+            (1, 27)
+        );
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Lifecycle),
+            lifecycle
+        );
+    }
+    #[test]
+    fn lifecycle_saturation_holds_bounded_data_until_capacity_wakes() {
+        let mut rig = ResizeRig::new(false, false);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, 27)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"held");
+        assert!(!rig.channel.gate.is_open());
+        assert!(rig.outbound.try_recv().is_err());
+        drop(held.pop());
+        assert!(rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+        resume_producer(&rig.io, &mut rig.channel);
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Established);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput{output:ChannelOutput::Data(ref bytes),..} if bytes==b"held")
+        );
+        assert!(rig.channel.producer.queued_data.is_empty());
+    }
+    #[test]
+    fn repaint_capacity_wake_preserves_data_first_order() {
+        assert_repaint_capacity_wake_order(false);
+    }
+    #[test]
+    fn repaint_capacity_wake_preserves_resize_first_order() {
+        assert_repaint_capacity_wake_order(true);
+    }
+    fn assert_repaint_capacity_wake_order(resize_first: bool) {
+        let mut rig = ResizeRig::new(false, false);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, GEOMETRY_BYTES)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"older");
+        drop(held.pop());
+        let mut channels = HashMap::from([(16, rig.channel)]);
+        // Repaint wins the runner select before the pending OutputReady wake.
+        repaint_all(&rig.io, &mut channels);
+        let ch = channels.get_mut(&16).unwrap();
+        if !resize_first {
+            forward_output(&rig.io, 16, ch, b"newer");
+        }
+        let request = ResizeIntent {
+            instance: ChannelInstance::new(ch.instance).unwrap(),
+            origin: ch.producer.origin,
+            request_id: ResizeRequestId::new(1).unwrap(),
+            cols: 100,
+            rows: 30,
+        };
+        assert!(process_resize(&rig.io, ch, request));
+        if resize_first {
+            forward_output(&rig.io, 16, ch, b"newer");
+        }
+        // The delayed wake must not replay those bytes under changed geometry.
+        resume_producer(&rig.io, ch);
+        let mut owned = Vec::new();
+        while let Ok(message) = rig.outbound.try_recv() {
+            owned.push(message);
+        }
+        let data: Vec<_> = owned
+            .iter()
+            .filter_map(|message| match message {
+                SessionOutbound::ChannelOutput {
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data, vec![b"older".as_slice(), b"newer".as_slice()]);
+        assert!(matches!(
+            &owned[0],
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::Geometry(_, _),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &owned[if resize_first { 2 } else { 3 }],
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::Geometry(
+                    GeometryRecord {
+                        outcome: GeometryOutcome::Applied,
+                        cols: 100,
+                        rows: 30,
+                        ..
+                    },
+                    _
+                ),
+                ..
+            }
+        ));
+        assert_eq!(owned.len(), 4);
+        assert!(ch.producer.queued_data.is_empty());
+        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 191));
+        // Both DATA charges remain owned after the queue entries are drained.
+        ch.gate.update(crate::send_gate::PIPE_HIGH);
+        ch.gate.update(crate::send_gate::PIPE_LOW);
+        assert!(!ch.gate.is_open());
+    }
+    #[test]
+    fn screen_resize_outputs_checkpoint_then_authoritative_repaint() {
+        let mut rig = ResizeRig::new(false, false);
+        rig.channel.screened = true;
+        rig.channel.screen = Box::new(FakeScreen {
+            stream: 16,
+            repaints: Arc::default(),
+        });
+        assert!(rig.resize(1, 100, 30));
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput{output:ChannelOutput::Data(ref bytes),..} if bytes==b"REPAINT")
+        );
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::EchoAck(0, _),
+                ..
+            }
+        ));
+    }
+    #[tokio::test]
+    async fn coalesced_resize_records_each_admit_before_effect_and_fail_once() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 1,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        let mut bytes = Vec::new();
+        for id in 1..=135 {
+            bytes.extend(encode_client(&ClientRecord::ResizeRequest {
+                stream: 16,
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(id).unwrap(),
+                cols: 80 + id as u16,
+                rows: 24,
+            }));
+        }
+        let n = bytes.len();
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: bytes,
+            }))
+            .await
+            .unwrap();
+        let mut owned = Vec::new();
+        let mut failures = 0;
+        let mut outcomes = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                let message=outbound.recv().await.unwrap();
+                let finished=matches!(&message,SessionOutbound::Consumed{stream_id:CONTROL_STREAM,n:bytes} if *bytes==n);
+                match &message {
+                    SessionOutbound::ProtocolFailure{code:Some(ProtocolErrorCode::ResizePipelineOverflow),..}=>failures+=1,
+                    SessionOutbound::ChannelOutput{output:ChannelOutput::Geometry(g,_),..} if g.request_id>0=>outcomes+=1,
+                    _=>{}
+                }
+                owned.push(message); // keep permits while the entire batch runs
+                if finished {break;}
+            }
+        }).await.unwrap();
+        drop(inbound);
+        spawner.end_channel(16);
+        runner.await.unwrap();
+        assert_eq!(outcomes, 128);
+        assert_eq!(failures, 1);
+        assert_eq!(spawner.sizes.lock().unwrap().len(), 128);
+    }
+    #[test]
+    fn reset_flushes_already_read_bytes_in_old_scope_before_barrier() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let initial = rig.outbound.try_recv().unwrap();
+        let ordinary = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, 27)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"old read");
+        let origin = AttachmentContext {
+            generation: 2,
+            session_id: 12,
+            ..rig.channel.producer.origin
+        };
+        let mut channels = HashMap::from([(16, rig.channel)]);
+        reset_attachment_outputs(&rig.io, &mut channels, &mut HashMap::new(), origin);
+        let gate = channels[&16].gate.clone();
+        let mut visible = vec![(1, b"geometry".to_vec())];
+        let mut owned = vec![initial];
+        while let Ok(message) = rig.outbound.try_recv() {
+            match &message {
+                SessionOutbound::ChannelOutput {
+                    origin,
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } => visible.push((origin.generation, bytes.clone())),
+                SessionOutbound::ResumeBarrier { generation } => {
+                    visible.push((*generation, b"barrier".to_vec()))
+                }
+                SessionOutbound::ChannelOutput {
+                    output: ChannelOutput::Geometry(..),
+                    ..
+                } => panic!("new boundary is still capacity blocked"),
+                _ => {}
+            }
+            owned.push(message);
+        }
+        assert_eq!(
+            visible,
+            vec![
+                (1, b"geometry".to_vec()),
+                (1, b"old read".to_vec()),
+                (2, b"barrier".to_vec())
+            ]
+        );
+        assert!(channels[&16].producer.queued_data.is_empty());
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
+            (8, 191)
+        );
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Ordinary),
+            (1, 8192)
+        );
+        gate.update(crate::send_gate::PIPE_HIGH);
+        gate.update(crate::send_gate::PIPE_LOW);
+        gate.set_metadata_blocked(false);
+        assert!(
+            !gate.is_open(),
+            "queued DATA and geometry still own framed pending bytes"
+        );
+        drop(owned);
+        assert!(
+            gate.is_open(),
+            "dropping owned output releases the pending charge exactly once"
+        );
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
+            (6, 150)
+        );
+        drop(ordinary);
+    }
     // Transactions are observed independently of the implementation: a pending
     // resource and a model frame stay unchanged when either admission or PTY fails.
     struct TransactionScreen {
@@ -1970,10 +3200,15 @@ pub(crate) mod tests {
         fn prepare_resize(
             &mut self,
             size: TerminalSize,
-        ) -> Result<Box<dyn crate::shell_server::PreparedScreenResize + '_>, String> {
+        ) -> Result<
+            Box<dyn crate::shell_server::PreparedScreenResize + '_>,
+            crate::shell_server::ScreenPreparationError,
+        > {
             self.events.lock().unwrap().push("prepare");
             if self.fail {
-                return Err("budget refused".into());
+                return Err(crate::shell_server::ScreenPreparationError::ResourceLimit(
+                    "budget refused".into(),
+                ));
             }
             self.pending.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(TransactionResize { screen: self, size }))
@@ -1992,6 +3227,43 @@ pub(crate) mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn same_size_resize_has_no_ioctl() {
+        let spawner = FakeSpawner::new();
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut channels = HashMap::new();
+        open_channel(
+            &io,
+            &mut channels,
+            &dyn_spawner,
+            &tx,
+            OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: vec![],
+            },
+            None,
+            1,
+            &ProducerContext::default(),
+        );
+        let result = resize_channel(
+            channels.get_mut(&16).unwrap(),
+            TerminalSize::new(80, 24).unwrap(),
+        );
+        spawner.end_channel(16);
+        drop(channels);
+        assert!(result.is_ok());
+        assert!(
+            spawner.sizes.lock().unwrap().is_empty(),
+            "equal geometry must not invoke ioctl"
+        );
     }
 
     #[tokio::test]
@@ -2021,6 +3293,7 @@ pub(crate) mod tests {
                 },
                 None,
                 1,
+                &ProducerContext::default(),
             );
             let geometry = Arc::new(Mutex::new((2, 1)));
             let pending = Arc::new(AtomicUsize::new(0));
@@ -2080,6 +3353,7 @@ pub(crate) mod tests {
                 request.clone(),
                 None,
                 1,
+                &ProducerContext::default(),
             );
             assert_eq!(channels[&16].request, request);
             let raw = crate::shell_frame::RecordDeframer::for_control().push(&encode_client(
@@ -2100,6 +3374,7 @@ pub(crate) mod tests {
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
+                    &ProducerContext::default(),
                 );
             }
             assert_eq!(channels[&16].request, request);
@@ -2132,6 +3407,7 @@ pub(crate) mod tests {
             request.clone(),
             None,
             1,
+            &ProducerContext::default(),
         );
         let events = Arc::new(Mutex::new(vec![]));
         channels.get_mut(&16).unwrap().screen = Box::new(TransactionScreen {
@@ -2158,6 +3434,7 @@ pub(crate) mod tests {
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
+                    &ProducerContext::default(),
                 );
             }
         }
@@ -2191,6 +3468,7 @@ pub(crate) mod tests {
                 },
                 None,
                 1,
+                &ProducerContext::default(),
             );
         }
         assert!(
@@ -2236,7 +3514,10 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
-            inbound.send(SessionInbound::ResumeReset).await.unwrap();
+            inbound
+                .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+                .await
+                .unwrap();
             let event = open(18, ChannelKind::Shell, false);
             let SessionInbound::Data(ref data) = event else {
                 unreachable!()
@@ -2362,7 +3643,10 @@ pub(crate) mod tests {
             }))
             .await
             .unwrap();
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
         assert_eq!(
             next_control(&mut outbound).await,
             ServerRecord::Channels(Vec::new())
@@ -2392,7 +3676,10 @@ pub(crate) mod tests {
         let spawner = FakeSpawner::new();
         let (io, inbound, mut outbound) = SessionIo::test_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
         assert_eq!(
             next_control(&mut outbound).await,
             ServerRecord::Channels(Vec::new())
@@ -3146,7 +4433,10 @@ pub(crate) mod tests {
             b"hello from the shell"
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
 
         match next_control(&mut outbound).await {
             ServerRecord::Channels(list) => {
@@ -3259,7 +4549,10 @@ pub(crate) mod tests {
         let (io, inbound, mut outbound) = SessionIo::test_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
-        inbound.send(SessionInbound::Live).await.unwrap();
+        inbound
+            .send(SessionInbound::Live(AttachmentContext::default()))
+            .await
+            .unwrap();
         inbound
             .send(open(16, ChannelKind::Shell, false))
             .await
@@ -3458,7 +4751,10 @@ pub(crate) mod tests {
             ServerRecord::Opened { stream: 17 }
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
 
         match next_control(&mut outbound).await {
             ServerRecord::Channels(list) => {
@@ -3528,7 +4824,10 @@ pub(crate) mod tests {
         // Everything above already drained the two OPEN-time declarations as
         // a side effect of `next_control`/`next_channel_data` skipping past
         // them -- what is collected below can only be fresh ones.
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
 
         let mut redeclared = collect_declarations(&mut outbound, 2).await;
         redeclared.sort_by_key(|(stream, _)| *stream);
@@ -3571,7 +4870,10 @@ pub(crate) mod tests {
             b"hello from the shell"
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
 
         let redeclared = collect_declarations(&mut outbound, 1).await;
         assert_eq!(
@@ -4526,7 +5828,10 @@ pub(crate) mod tests {
         spawner.feed(16, b"dropped");
         let _ = records_within(&mut outbound, 16, std::time::Duration::from_millis(200)).await;
         let _ = gate.force_open();
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .await
+            .unwrap();
         assert_eq!(next_channel_data(&mut outbound, 16).await, b"REPAINT");
         spawner.feed(16, b"live");
         assert_eq!(next_channel_data(&mut outbound, 16).await, b"live");
@@ -4765,6 +6070,7 @@ pub(crate) mod tests {
                     if let Some(inbound) = weak.upgrade() {
                         let _ = inbound
                             .send(SessionInbound::Delivered {
+                                generation: 0,
                                 stream: stream_id,
                                 token,
                             })
@@ -4888,6 +6194,7 @@ pub(crate) mod tests {
         );
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: token_for(&requests, 16),
             })
@@ -4936,6 +6243,7 @@ pub(crate) mod tests {
         );
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: token_for(&requests, 16),
             })
@@ -4989,6 +6297,7 @@ pub(crate) mod tests {
         for stream in [16, 17] {
             inbound
                 .send(SessionInbound::Delivered {
+                    generation: 0,
                     stream,
                     token: token_for(&requests, stream),
                 })
@@ -5040,6 +6349,7 @@ pub(crate) mod tests {
         assert_ne!(earlier, later, "each channel asks with its own token");
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: earlier,
             })
@@ -5048,6 +6358,7 @@ pub(crate) mod tests {
         assert_no_control(&mut outbound).await;
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: later,
             })

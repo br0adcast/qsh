@@ -334,6 +334,26 @@ mod tests {
     }
 
     #[test]
+    fn screen_budget_default_resize_refusal_preserves_geometry() {
+        use transport::shell_server::SessionScreen;
+        let budget = Arc::new(ScreenBudget::new(BudgetLimits::default()));
+        let mut screen =
+            crate::screen::PtyScreen::try_new(size(512, 255), 1, budget.clone()).unwrap();
+        let before = budget.used();
+        let frame = screen.frame();
+        let error = match screen.prepare_resize(size(512, 256)) {
+            Ok(_) => panic!("default owner budget must refuse resize"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            transport::shell_server::ScreenPreparationError::ResourceLimit(_)
+        ));
+        assert_eq!(budget.used(), before);
+        assert_eq!(screen.frame(), frame);
+    }
+
+    #[test]
     fn screen_budget_source_qualified_width_and_mixed_scratch_formulas() {
         let envelope = ScreenEnvelope {
             max_cols: 80,
@@ -771,7 +791,9 @@ mod lifecycle_tests {
         );
         sessions[0]
             .0
-            .send(SessionInbound::ResumeReset)
+            .send(SessionInbound::ResumeReset(
+                transport::session_manager::AttachmentContext::default(),
+            ))
             .await
             .unwrap();
         assert!(
