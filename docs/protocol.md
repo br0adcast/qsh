@@ -807,15 +807,17 @@ Its bounds, all of them real numbers in the code:
 | Constant | Value | What it bounds |
 |---|---|---|
 | `MAX_PROBATION` | 128 | unproven connections at once, all sources |
-| `MAX_PROBATION_PER_SOURCE` | 16 | how many of those one source IP may hold |
+| `MAX_PROBATION_PER_SOURCE` | 16 | how many of those one source group may hold |
 | `AUTH_RECORD_MAX` | 8 KiB | the record-reassembly buffer |
 | `EARLY_DATA_MAX` | 64 KiB | pre-proof stream data held for replay |
 | `PROBATION_UNDELIVERED_MAX` | 64 KiB | out-of-order stream data held, all streams together |
 | `AUTH_DEADLINE` | 5 s | how long a slot may be held |
 
 Over the cap, a handshake is dropped in silence: there is nothing to evict,
-because nothing there belongs to anyone yet. The per-source cap is keyed by
-IP, not by `SocketAddr`, because a flooder varies its source port for free.
+because nothing there belongs to anyone yet. The per-source cap uses the
+cookie rate limiter's source groups (§2.7):
+one IPv4 host (including its IPv4-mapped IPv6 form), or one native IPv6 /64.
+Ports, IPv6 host bits and scope IDs do not create extra budgets.
 It exists because the global cap alone is exhaustible by one address, and a
 full table is a lockout — every sign-in and every warm reattach passes
 through it.
@@ -873,7 +875,7 @@ reaches it. Two keys address it:
   backends:  token ---> BackendEntry { session_id, client_key,
                                        last_msg1_body, msg2, state, ... }
   sessions:  session_id ---> channel to the task that owns the Connection
-  probation: session_id ---> the source IP it came from, and the token
+  probation: session_id ---> its canonical source group, and the token
                              its msg1 named
 ```
 
@@ -2327,7 +2329,7 @@ route and a note of the token it named, and nothing else (what it can make
 the daemon send, and to where, is in §9.6), and the code that
 reattaches, replaces and evicts sessions is not reachable from where it
 stands. It also bounds what an unproven peer can cost in memory and slots:
-128 concurrent probations, 16 per source IP, 8 KiB of record buffer,
+128 concurrent probations, 16 per source group, 8 KiB of record buffer,
 64 KiB of early data and 64 KiB of out-of-order data each, for at most 5
 seconds. A session's datagram route — the queue between the socket loop and
 its bridge or probation — holds at most 1 MiB, each datagram costing its
@@ -2365,18 +2367,19 @@ What it does not do:
   repeated — and amounts to one more GC pass for a dead session, or an
   eviction moved onto another retained session. Nothing can be ended or
   taken over this way.
-- **the per-source cap is per IP.** Clients behind one NAT share one budget
-  of 16 — which is why the number is not smaller.
-- **the table itself is a resource four real addresses can exhaust, with
+- **the per-source cap is per IPv4 host or native IPv6 /64.** Clients behind
+  one NAT or within one IPv6 /64 share one budget of 16 — which is why the
+  number is not smaller.
+- **the table itself is a resource four real source groups can exhaust, with
   a forged flood's help.** `MAX_PROBATION` = 128 across all sources,
-  `MAX_PROBATION_PER_SOURCE` = 16: eight source IPs that receive at their
+  `MAX_PROBATION_PER_SOURCE` = 16: eight source groups that receive at their
   addresses, sending handshakes fast enough to claim their sixteen slots
   each, occupy the whole table between them. Forged ones cannot get past
   the cookie once the daemon is under load, but they can hold the half of
   the table the load threshold leaves them: load begins only above 64 seats,
   so a forged flood slow enough to stay under the handshake rate — about 13
   msg1s a second, one per seat per 5 s — keeps 65 seats taken, and four
-  real addresses take the other 63. Every `HandshakeInit` past the cap is
+  real source groups take the other 63. Every `HandshakeInit` past the cap is
   dropped in silence (§3.4). Under load a client built before the
   return-address check is refused whatever the table holds (§2.7): the
   price of the defence.

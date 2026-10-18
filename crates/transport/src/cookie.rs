@@ -299,7 +299,7 @@ impl ProvenRate {
             self.swept_at = now;
         }
         let full = self.budgets.len() >= PROVEN_RATE_SOURCES;
-        match self.budgets.entry(rate_key(ip)) {
+        match self.budgets.entry(source_group_key(ip)) {
             Entry::Occupied(mut e) => {
                 let b = e.get_mut();
                 let left = (b.left + now.saturating_duration_since(b.at)).min(PROVEN_BUCKET);
@@ -323,12 +323,12 @@ impl ProvenRate {
     }
 }
 
-/// Whose budget a proven handshake from `ip` spends: an IPv4 address's (in
-/// either form), or an IPv6 address's /64 -- what one host is handed, so it
-/// cannot spread its handshakes over 2^64 budgets. WireGuard keys its limiter
+/// Shared source group for cookie rate budgets and probation quotas:
+/// one IPv4 host (including its mapped IPv6 form), or one native IPv6 /64.
+/// A host cannot spread its handshakes over 2^64 budgets. WireGuard keys its limiter
 /// the same way. The IPv4-mapped range is taken out first: as a /64 it would
 /// be one budget for every IPv4 address.
-fn rate_key(ip: IpAddr) -> [u8; 16] {
+pub(crate) fn source_group_key(ip: IpAddr) -> [u8; 16] {
     let v6 = match ip {
         IpAddr::V4(v4) => return v4.to_ipv6_mapped().octets(),
         IpAddr::V6(v6) => v6,

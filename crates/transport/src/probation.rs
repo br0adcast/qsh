@@ -86,8 +86,9 @@ pub const MAX_PROBATION: usize = 128;
 /// How many of [`MAX_PROBATION`]'s slots a SINGLE source may hold at once, so
 /// no one address can fill the table and shut everybody else out.
 ///
-/// Keyed by IP rather than by full `SocketAddr`: a flooder varies its source
-/// port for free, and a budget per port would therefore bound nothing at all.
+/// Keyed by the same source group as the cookie rate limiter: one IPv4 host
+/// (including its mapped IPv6 form), or one native IPv6 /64. Source ports and
+/// IPv6 host bits cannot create extra budgets.
 /// The price of that choice is that clients sharing one NAT share one budget,
 /// which is why the number is not tiny.
 ///
