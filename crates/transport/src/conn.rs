@@ -308,6 +308,14 @@ pub enum SendBlocked {
     WouldBlock,
 }
 
+// One current owner/frontier and one coalesced loss flag per u8 stream.
+// Reuse replaces the owner; repeated discards cannot erase an earlier loss.
+struct TrackedChannelOutput {
+    instance: crate::channel_geometry::ChannelInstance,
+    continuity_end: u64,
+    lost: bool,
+}
+
 /// Event for the caller. Accumulates in an internal queue and is handed out
 /// in a batch by `poll_events`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -601,6 +609,7 @@ pub struct Connection {
     /// Bounded by the stream-number space (256 entries); a reused number
     /// overwrites its predecessor's declaration.
     stream_resyncable: BTreeMap<u8, bool>,
+    channel_output: BTreeMap<u8, TrackedChannelOutput>,
     /// What the session layer declared about each stream's class (spec
     /// §4.8). A stream nobody declared is `Interactive`. Bounded by the
     /// stream-number space.
@@ -874,6 +883,7 @@ impl Connection {
             data_since_ack: 0,
             events: Vec::new(),
             stream_resyncable: BTreeMap::new(),
+            channel_output: BTreeMap::new(),
             stream_class: BTreeMap::new(),
             default_consumption: Consumption::OnDelivery,
             stream_consumption: BTreeMap::new(),
@@ -1142,6 +1152,81 @@ impl Connection {
         }
     }
 
+    /// Register the current typed owner without carrying a predecessor's loss.
+    pub(crate) fn declare_channel_output(
+        &mut self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+    ) {
+        if self
+            .channel_output
+            .get(&stream)
+            .is_none_or(|state| state.instance != instance)
+        {
+            self.channel_output.insert(
+                stream,
+                TrackedChannelOutput {
+                    instance,
+                    continuity_end: 0,
+                    lost: false,
+                },
+            );
+        }
+    }
+
+    /// Called after successful DATA admission or a warning disclosing prior DATA loss.
+    pub(crate) fn track_channel_continuity_end(
+        &mut self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        continuity_end: u64,
+    ) {
+        self.declare_channel_output(stream, instance);
+        self.channel_output.get_mut(&stream).unwrap().continuity_end = continuity_end;
+    }
+
+    /// Coalesced DATA loss or an unconfirmed warning about earlier DATA loss,
+    /// classified against ACK state at discard time.
+    /// Taking observations clears flags, never the current continuity frontier.
+    pub(crate) fn take_discarded_output(
+        &mut self,
+    ) -> Vec<(u8, crate::channel_geometry::ChannelInstance)> {
+        self.channel_output
+            .iter_mut()
+            .filter_map(|(&stream, state)| {
+                std::mem::take(&mut state.lost).then_some((stream, state.instance))
+            })
+            .collect()
+    }
+
+    /// The model has ended: this stream can no longer regenerate a snapshot.
+    /// If a discard already happened, arm its existing Reset exactly once.
+    pub(crate) fn retain_stream_output(&mut self, stream: u8) -> bool {
+        self.set_stream_resyncable(stream, false);
+        if let Some(state) = self.streams.get_mut(&stream) {
+            if state.sender.is_desynced() {
+                state.sender.begin_resync();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn discard_stream_output(&mut self, stream: u8) {
+        let sender = &mut self.stream_mut(stream).sender;
+        if sender.is_desynced() {
+            return;
+        }
+        let queued = sender.queued_total();
+        let acknowledged = queued - sender.unacked_len() as u64;
+        sender.mark_desynced();
+        if let Some(state) = self.channel_output.get_mut(&stream) {
+            state.lost |= state.continuity_end > acknowledged && state.continuity_end <= queued;
+            state.continuity_end = 0;
+        }
+        self.cc.forget_stream(stream);
+    }
+
     /// Declare whether `stream_id`'s backlog may be dropped after a long
     /// absence. Called by the session layer when it opens a stream whose
     /// recoverability it knows.
@@ -1287,6 +1372,18 @@ impl Connection {
         }
     }
 
+    /// Distinguish permanent framing exhaustion from recoverable credit pressure.
+    pub(crate) fn stream_offset_room(&self, stream: u8) -> u64 {
+        self.streams.get(&stream).map_or_else(
+            || {
+                let mut sender = StreamSender::new(stream);
+                sender.set_features(self.features);
+                sender.offset_room()
+            },
+            |state| state.sender.offset_room(),
+        )
+    }
+
     /// Atomically admit the complete slice before sender allocation. Err leaves
     /// every byte with its caller: no stream creation, event, flush or partial
     /// append. Producers retain their permit/charge until this returns Ok.
@@ -1351,10 +1448,8 @@ impl Connection {
             return;
         }
         if matches!(self.role, Role::Server) && self.is_bulk_output_stream(stream_id) {
-            let sender = &mut self.stream_mut(stream_id).sender;
-            sender.mark_desynced();
-            sender.begin_resync();
-            self.cc.forget_stream(stream_id);
+            self.discard_stream_output(stream_id);
+            self.stream_mut(stream_id).sender.begin_resync();
             self.events.push(Event::OutputResync);
         } else if self.over_cap_reported.insert(stream_id) {
             self.events.push(Event::SendBufferOverCap { stream_id });
@@ -1454,11 +1549,7 @@ impl Connection {
                 .filter(|stream_id| self.is_bulk_output_stream(*stream_id))
                 .collect();
             for stream_id in desyncable {
-                let st = self.stream_mut(stream_id);
-                if !st.sender.is_desynced() {
-                    st.sender.mark_desynced();
-                    self.cc.forget_stream(stream_id);
-                }
+                self.discard_stream_output(stream_id);
             }
         }
         // Control before data (spec §4.8): on a slow uplink a PING behind a
@@ -3506,6 +3597,12 @@ impl Connection {
         self.ping_unanswered
     }
 
+    #[cfg(test)]
+    pub(crate) fn limit_channel_offset_for_test(&mut self, stream: u8, remaining: u32) {
+        self.stream_mut(stream).sender =
+            StreamSender::starting_at(stream, crate::reliability::OFFSET_LIMIT - remaining);
+    }
+
     /// Test-only shortcut: fabricate a server-side desync+resync on stream 0
     /// directly, without waiting out `RESYNC_AFTER` via `on_timeout`. Arms a
     /// `Reset` that goes out with the next `send`/`flush_senders`.
@@ -3602,6 +3699,62 @@ pub(crate) mod tests {
         assert_eq!(client.peer(), Some(saddr));
         assert_eq!(server.peer(), Some(caddr));
         (client, server, caddr, saddr)
+    }
+
+    #[test]
+    fn geometry_discard_observation_uses_real_ack_frontier_and_instance() {
+        let (_, mut server, _, _) = established_pair();
+        let instance = crate::channel_geometry::ChannelInstance::new(1).unwrap();
+        server.stream_mut(16).sender.push(b"data+metadata").unwrap();
+        server.track_channel_continuity_end(16, instance, 5);
+        server
+            .stream_mut(16)
+            .sender
+            .frames_to_send(Instant::now(), Duration::from_millis(200));
+        assert!(server.stream_mut(16).sender.on_ack(5));
+        server.discard_stream_output(16);
+        assert!(
+            server.take_discarded_output().is_empty(),
+            "metadata-only loss"
+        );
+        server.retain_stream_output(16);
+        server.stream_mut(16).sender.push(b"new DATA").unwrap();
+        server.track_channel_continuity_end(16, instance, server.stream_progress(16).queued);
+        server.discard_stream_output(16);
+        assert_eq!(server.take_discarded_output(), vec![(16, instance)]);
+        assert!(server.take_discarded_output().is_empty());
+        server.retain_stream_output(16);
+        server
+            .stream_mut(16)
+            .sender
+            .push(b"old owner DATA")
+            .unwrap();
+        server.track_channel_continuity_end(16, instance, server.stream_progress(16).queued);
+        server.discard_stream_output(16);
+        let newer = crate::channel_geometry::ChannelInstance::new(2).unwrap();
+        server.declare_channel_output(16, newer);
+        assert!(
+            server.take_discarded_output().is_empty(),
+            "replacement cannot inherit lost predecessor DATA"
+        );
+        assert_eq!(server.channel_output.len(), 1);
+    }
+    #[test]
+    fn geometry_sealing_desynced_eof_arms_one_reset_and_preserves_output() {
+        let (_, mut server, _, _) = established_pair();
+        server.set_stream_resyncable(16, true);
+        server.stream_mut(16).sender.push(b"final").unwrap();
+        server.discard_stream_output(16);
+        assert!(server.retain_stream_output(16));
+        assert!(!server.stream_mut(16).sender.is_desynced());
+        assert!(!server.is_bulk_output_stream(16));
+        assert!(
+            !server.retain_stream_output(16),
+            "one Reset for the discarded tail"
+        );
+        assert!(server
+            .try_send_bounded(Instant::now(), 16, b"retained", 1024)
+            .is_ok());
     }
 
     #[test]

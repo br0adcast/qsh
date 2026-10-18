@@ -9,6 +9,8 @@ pub const LIFECYCLE_ENTRIES: usize = 8;
 pub const LIFECYCLE_BYTES: usize = 256;
 pub const GEOMETRY_BYTES: usize = 27;
 pub const OUTPUT_GAP_BYTES: usize = 14;
+/// One retained bridge allowance covers its fixed gap and bootstrap states.
+pub const BRIDGE_LIFECYCLE_BYTES: usize = OUTPUT_GAP_BYTES + GEOMETRY_BYTES;
 /// Declared allowance for an internal final delivery marker. Integration must
 /// assert the marker representation fits; the producer lifecycle test measures
 /// the fixed DeliveryMarker and complete retained wrapper separately.
@@ -160,6 +162,23 @@ impl TimelineBudget {
             state.waiter = Some((class, bytes));
             WaitRegistration::Waiting
         }
+    }
+
+    /// Coalesce bridge progress with the same latch as permit availability.
+    /// The bridge delivers the scoped OutputReady event; no second event queue.
+    pub(crate) fn mark_output_ready(&self, instance: ChannelInstance, generation: u64) -> bool {
+        let mut state = self.inner.state.lock().expect("timeline budget");
+        if state.scope
+            != (WaitKey {
+                instance,
+                generation,
+            })
+            || state.notification_pending
+        {
+            return false;
+        }
+        state.notification_pending = true;
+        true
     }
 
     /// Consume exactly the notification for this attachment. An old callback

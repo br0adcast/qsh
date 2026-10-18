@@ -82,6 +82,9 @@
 //! task over an UNbounded channel (a synchronous, non-blocking send), and the
 //! session task -- not the router -- pays any backpressure to the backend.
 
+#[path = "channel_bridge.rs"]
+mod channel_bridge;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -423,6 +426,8 @@ pub enum SessionInbound {
     /// accounting -- a hot-roam resync continues on the SAME connection, so
     /// `input_consumed`/echo_ack stay valid; only the screen needs repainting.
     Repaint,
+    /// Ordered hot-reset cutover, without resetting input/request correlation.
+    RepaintCutover { generation: u64, sequence: u64 },
     /// Stream `stream`'s send gate just opened (spec §4.7.2) -- sent only for
     /// screen gates: a screen channel that dropped output behind the closed
     /// gate repaints now.
@@ -448,15 +453,24 @@ pub enum SessionInbound {
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    RepaintBarrier {
+        generation: u64,
+        sequence: u64,
+    },
+    ChannelClosed {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+    },
     ChannelOutput {
         stream: u8,
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
         output: ChannelOutput,
         charge: OutputCharge,
-        /// A single pre-reserved gap slot accompanies the first checkpoint.
+        /// One pre-reserved 41-byte gap/bootstrap allowance accompanies the first checkpoint.
         /// The bridge takes ownership even if it discards that Screen record;
-        /// subsequent gap work uses this same instance budget, never free metadata.
+        /// both fixed states reuse it; pending byte charges still track each actual record.
         gap_reserve: Option<crate::channel_timeline::TimelinePermit>,
     },
     /// A final control record whose permit survives the outbound queue. Stage 4
@@ -603,6 +617,20 @@ impl SessionIo {
             gap_reserve,
         });
     }
+    pub(crate) fn channel_closed(
+        &self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+    ) {
+        if origin.has_geometry() {
+            let _ = self.outbound.send(SessionOutbound::ChannelClosed {
+                stream,
+                instance,
+                origin,
+            });
+        }
+    }
     pub(crate) fn send_channel_exit(
         &self,
         stream: u8,
@@ -617,6 +645,12 @@ impl SessionIo {
             origin,
             code,
             permit,
+        });
+    }
+    pub(crate) fn repaint_barrier(&self, generation: u64, sequence: u64) {
+        let _ = self.outbound.send(SessionOutbound::RepaintBarrier {
+            generation,
+            sequence,
         });
     }
     pub(crate) fn resume_barrier(&self, generation: u64) {
@@ -2976,7 +3010,9 @@ fn apply_control(
     // that were never drained to the backend (review Important 1, fix round
     // 1: two `Attach`es applied back to back on one `on_routed_datagram`
     // turn skip `drain_events` between them).
+    link.channel_output.observe_discards(conn);
     link.ledger.carry();
+    link.channel_output.attach(conn, link.ledger.generation());
     *conn = *new_conn;
     // The new connection has heard none of this session's declarations of
     // class; recoverability the backend declares again on `ResumeReset`.
@@ -3058,6 +3094,8 @@ enum Wakeup {
     Dgram(Option<(SocketAddr, Vec<u8>)>),
     /// A core timer fired.
     Timeout,
+    /// One coalesced continuation after a finite channel-output drain turn.
+    Drain,
     /// The backend produced an outbound message -- data or a declaration
     /// (`None` = backend finished).
     Backend(Option<SessionOutbound>),
@@ -3217,6 +3255,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // Streams the backend waits to hear are delivered, in the order it
     // asked (see `take_delivered`).
     let mut awaiting_delivery: Vec<(u8, u64)> = Vec::new();
+    let mut drain_pending = false;
     // A proven connection: probation's cap does not follow it here.
     adopt_connection(&mut conn, &classes);
 
@@ -3283,6 +3322,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
                     _ = timer => Wakeup::Timeout,
                     o = backend_out_rx.recv() => Wakeup::Backend(o),
+                    _ = std::future::ready(()), if drain_pending => Wakeup::Drain,
                     // Room in the backend's queue for what waits (spec
                     // §4.10.2): the bridge never stands on its backend.
                     h = link.inbound.room(), if link.inbound.has_pending() => Wakeup::Room(h),
@@ -3315,17 +3355,21 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             // The manager dropped the datagram channel -- shut the backend down.
             Wakeup::Dgram(None) => break,
             // Nothing of its own: the timers run after every wake-up, below.
-            Wakeup::Timeout => {}
+            Wakeup::Timeout | Wakeup::Drain => {}
             Wakeup::Backend(Some(
-                SessionOutbound::ChannelOutput { .. }
+                message @ (SessionOutbound::ChannelOutput { .. }
                 | SessionOutbound::ChannelExit { .. }
-                | SessionOutbound::ResumeBarrier { .. },
+                | SessionOutbound::ChannelClosed { .. }
+                | SessionOutbound::ResumeBarrier { .. }
+                | SessionOutbound::RepaintBarrier { .. }),
             )) => {
-                // Inactive Stage 3 checkpoint. No geometry feature is negotiated
-                // yet; fail explicitly instead of pretending a raw passthrough
-                // supplies Stage 4 retention, barriers or checked admission.
-                log::error!("channel geometry bridge is not implemented");
-                out.extend(conn.close(now));
+                if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                    link.channel_output.push(message);
+                    link.channel_output.seal_ended(&mut conn);
+                } else {
+                    log::error!("typed channel output without negotiated geometry profile");
+                    out.extend(conn.close(now));
+                }
             }
             Wakeup::Backend(Some(SessionOutbound::ProtocolFailure { origin, code })) => {
                 if origin.session_id == conn.session_id()
@@ -3356,6 +3400,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 resyncable,
             })) => {
                 conn.set_stream_resyncable(stream_id, resyncable);
+                link.channel_output.declare(stream_id, resyncable);
             }
             // Like a recoverability declaration, metadata on `conn`, and
             // always applied; kept by the bridge as well (see `declare_class`).
@@ -3442,7 +3487,15 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         out.extend(conn.on_timeout_if_due(now));
         // Delivered bytes go to the backend -- and what it is counted as
         // taking may send a CREDIT -- before this turn's datagrams go out.
-        let closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        let mut closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        // A hot Reset changes framing before any queued channel bytes may be
+        // admitted. Its event must reach the typed owner before this drain.
+        drain_pending = link.channel_output.drain(&mut conn, now, parked, &mut out);
+        // Typed admission can discover permanent offset exhaustion. Observe its
+        // abandonment in this turn so parking never waits for another event.
+        if matches!(closed, CloseKind::None) && conn.state() == LinkState::Closed {
+            closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        }
         send_all(&socket, &out).await;
         out.clear();
         // Past the per-session cap the bridge waits for its backend, as
@@ -3520,7 +3573,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // wakes it -- no timers, and a producer behind a closed gate sends
         // nothing -- until a reattach. A screen gate that just opened tells
         // its channel, which repaints if it dropped output.
-        writable.extend(refresh_gates(&gates, &conn, parked));
+        if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+            link.channel_output.refresh(&conn, parked);
+            // Geometry pipes retain pending bytes and frozen tails while parked.
+            writable.extend(gates.refresh(|stream| conn.stream_progress(stream).unacked));
+        } else {
+            writable.extend(refresh_gates(&gates, &conn, parked));
+        }
+        for event in link.channel_output.notifications() {
+            link.hand_over(&mut conn, now, event, &mut out);
+        }
         for stream in writable {
             link.hand_over(
                 &mut conn,
@@ -3593,6 +3655,7 @@ fn drain_events(
 ) -> CloseKind {
     let mut closed = false;
     let mut exhausted = false;
+    link.channel_output.observe_discards(conn);
     for ev in conn.poll_events() {
         match ev {
             Event::StreamData { stream_id, data } => {
@@ -3627,7 +3690,13 @@ fn drain_events(
                 // the client just returned -- tell the backend to repaint the
                 // current screen, WITHOUT resetting per-connection echo/tty
                 // accounting (unlike `ResumeReset`; see `SessionInbound::Repaint`).
-                link.hand_over(conn, now, SessionInbound::Repaint, out);
+                if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                    if !link.channel_output.hot_reset() {
+                        exhausted = true;
+                    }
+                } else {
+                    link.hand_over(conn, now, SessionInbound::Repaint, out);
+                }
             }
             Event::OffsetSpaceExhausted { stream_id } => {
                 log::warn!(
@@ -4239,6 +4308,7 @@ thread_local! {
 struct BackendLink {
     inbound: Inbound,
     ledger: ConsumptionLedger,
+    channel_output: channel_bridge::ChannelBridge,
 }
 
 impl BackendLink {
@@ -4246,6 +4316,7 @@ impl BackendLink {
         BackendLink {
             inbound: Inbound::new(tx),
             ledger: ConsumptionLedger::new(consumption),
+            channel_output: channel_bridge::ChannelBridge::default(),
         }
     }
 
@@ -9690,7 +9761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_geometry_bridge_fails_closed_instead_of_acknowledging_barrier() {
+    async fn unnegotiated_geometry_output_fails_closed() {
         let (heard_tx, _heard_rx) = mpsc::unbounded_channel();
         let mut rig = delivery_rig(Arc::new(InboundKindsBackend(heard_tx)), |_| {}).await;
         rig.backend_sends(SessionOutbound::ResumeBarrier { generation: 0 });
@@ -10027,7 +10098,7 @@ mod tests {
                                 Some(SessionInbound::ResumeReset(_)) => {
                                     log.extend_from_slice(b"<reset>");
                                 }
-                                Some(SessionInbound::Repaint) => {
+                                Some(SessionInbound::Repaint | SessionInbound::RepaintCutover { .. }) => {
                                     log.extend_from_slice(b"<repaint>");
                                 }
                                 Some(SessionInbound::Writable { .. }) => {
@@ -14672,7 +14743,7 @@ mod tests {
     }
 
     /// The same, with both ends offering and allowing `features`.
-    fn accepted_connection_with(
+    pub(super) fn accepted_connection_with(
         server_kp: &crate::handshake::Keypair,
         token: [u8; 16],
         peer: SocketAddr,
@@ -15070,7 +15141,9 @@ mod tests {
                         SessionInbound::Data(_) => "data",
                         SessionInbound::Live(_) => "live",
                         SessionInbound::ResumeReset(_) => "resume-reset",
-                        SessionInbound::Repaint => "repaint",
+                        SessionInbound::Repaint | SessionInbound::RepaintCutover { .. } => {
+                            "repaint"
+                        }
                         SessionInbound::Writable { .. } => "writable",
                         SessionInbound::Delivered { .. } => "delivered",
                         SessionInbound::OutputReady { .. } => "output-ready",

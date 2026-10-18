@@ -710,6 +710,11 @@ async fn join_update(task: &mut Option<tokio::task::JoinHandle<UpdateTaskEnd>>) 
 async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
     let mut reaps = Vec::new();
     for (stream, ch) in channels.drain() {
+        io.channel_closed(
+            stream,
+            ChannelInstance::new(ch.instance).unwrap(),
+            ch.producer.origin,
+        );
         forget_channel_stream(io, stream);
         let Channel {
             input_tx, mut wait, ..
@@ -727,7 +732,8 @@ async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
 
 /// A channel is gone -- its process ended, the client closed it, or the
 /// runner reaped it -- and its stream number is free for another. What the
-/// channel had on the stream goes with it: its send gate is closed for good,
+/// channel still owns in the typed bridge survives until handoff or explicit
+/// teardown. Its registered send gate is closed for good,
 /// which wakes a line channel's reader waiting on it (it then ends instead
 /// of reading on), and its class goes back to interactive, every stream's
 /// default. The bridge declares every class it kept again after a warm
@@ -830,7 +836,7 @@ struct ProducerState {
     eof: bool,
     final_marker: Option<TimelinePermit>,
     exit_permit: Option<TimelinePermit>,
-    // Reserved now so Stage 4 can serialize a gap without borrowing request capacity.
+    // One fixed allowance for bridge gap/bootstrap, independent of requests.
     gap_reserve: Option<TimelinePermit>,
 }
 impl ProducerState {
@@ -842,7 +848,10 @@ impl ProducerState {
         let final_marker = timeline.try_reserve(EntryClass::Lifecycle, DELIVERY_MARKER_BYTES);
         let exit_permit = timeline.try_reserve(EntryClass::Lifecycle, 10);
         let gap_permit = timeline
-            .try_reserve(EntryClass::Lifecycle, 14)
+            .try_reserve(
+                EntryClass::Lifecycle,
+                crate::channel_timeline::BRIDGE_LIFECYCLE_BYTES,
+            )
             .expect("fixed lifecycle reserve");
         Self {
             origin: context.attachment,
@@ -1355,6 +1364,15 @@ pub async fn run_channel_session_with(
                 // would replay its full backlog instead of a single repaint.
                 reset_attachment_outputs(&io, &mut channels, &mut exits, context);
             }
+            Wakeup::Inbound(Some(SessionInbound::RepaintCutover {
+                generation,
+                sequence,
+            })) => {
+                if generation == producer.attachment.generation {
+                    io.repaint_barrier(generation, sequence);
+                    repaint_all(&io, &mut channels);
+                }
+            }
             Wakeup::Inbound(Some(SessionInbound::Repaint)) => {
                 // A hot-roam resync: the client's picture is stale, and the
                 // model is what is left to fix it (see this module's own
@@ -1440,7 +1458,8 @@ pub async fn run_channel_session_with(
                     ch.producer.eof = true;
                     // Lifecycle termination wins over an unexecuted intent.
                     ch.producer.deferred = None;
-                    if ch.stale {
+                    if ch.stale || (ch.screened && ch.producer.origin.has_geometry()) {
+                        // The model cannot repaint once EOF moves to PendingExit.
                         repaint_stale(&io, stream, ch);
                     }
                 }
@@ -1648,7 +1667,12 @@ fn apply_control_record(
             // A client opens a number it considers free: whatever ended on
             // it before, it is not waiting for that `Exit` any more, and it
             // must not end the new channel.
-            if exits.remove(&req.stream).is_some() {
+            if let Some(pending) = exits.remove(&req.stream) {
+                io.channel_closed(
+                    req.stream,
+                    pending.geometry.instance,
+                    pending.producer.origin,
+                );
                 forget_channel_stream(io, req.stream);
             }
             if update.restarting() {
@@ -1706,7 +1730,8 @@ fn apply_control_record(
         Ok(ClientRecord::Close { stream }) => {
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
-            if exits.remove(&stream).is_some() {
+            if let Some(pending) = exits.remove(&stream) {
+                io.channel_closed(stream, pending.geometry.instance, pending.producer.origin);
                 forget_channel_stream(io, stream);
             }
             // Removing the entry frees the slot for a future OPEN and drops
@@ -1728,6 +1753,11 @@ fn apply_control_record(
             // follows: the client already knows it closed the channel, and
             // a record after its own CLOSE would only be confusing.
             if let Some(ch) = channels.remove(&stream) {
+                io.channel_closed(
+                    stream,
+                    ChannelInstance::new(ch.instance).unwrap(),
+                    ch.producer.origin,
+                );
                 forget_channel_stream(io, stream);
                 let Channel {
                     input_tx, mut wait, ..
@@ -2142,7 +2172,7 @@ pub(crate) mod tests {
         /// When set, every `spawn` refuses with this reason.
         refuse: Mutex<Option<String>>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
-        sizes: Arc<Mutex<Vec<(u8, u16, u16)>>>,
+        pub(crate) sizes: Arc<Mutex<Vec<(u8, u16, u16)>>>,
         repaints: Arc<Mutex<Vec<u8>>>,
         /// One sender per opened channel: it feeds the channel's process
         /// output ([`FakeSpawner::feed`]), and dropping it ends the process,
@@ -2212,7 +2242,7 @@ pub(crate) mod tests {
         }
 
         /// Ends the process behind `stream`, so its reader reports EOF.
-        fn end_channel(&self, stream: u8) {
+        pub(crate) fn end_channel(&self, stream: u8) {
             self.enders.lock().unwrap().retain(|(s, _)| *s != stream);
         }
 
@@ -2719,7 +2749,7 @@ pub(crate) mod tests {
                 ..
             }
         ));
-        assert_eq!(shared.usage(EntryClass::Lifecycle), (5, 110));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (5, 137));
         drop(first); // cancellation releases exactly checkpoint + gap
         assert_eq!(shared.usage(EntryClass::Lifecycle), (3, 69));
         drop(second);
@@ -2745,23 +2775,23 @@ pub(crate) mod tests {
         assert!(
             matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:0,..} if instance.get()==1 && origin.generation==1)
         );
-        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 56));
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 83));
         drop(exit);
-        assert_eq!(timeline.usage(EntryClass::Lifecycle), (2, 46));
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (2, 73));
     }
 
     #[test]
     fn lifecycle_inventory_keeps_gap_and_final_state_reserved() {
         let rig = ResizeRig::new(false, false);
         let budget = &rig.channel.producer.timeline;
-        // Marker 32, Exit 10, gap 14 remain reserved independently of requests.
-        assert_eq!(budget.usage(EntryClass::Lifecycle), (3, 56));
+        // Marker 32, Exit 10, gap/bootstrap 41 remain reserved independently of requests.
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (3, 83));
         let mut checkpoints = Vec::new();
         for _ in 0..5 {
             checkpoints.push(budget.try_reserve(EntryClass::Lifecycle, 27).unwrap());
         }
         assert!(budget.try_reserve(EntryClass::Lifecycle, 27).is_none());
-        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 191));
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 218));
         assert_eq!(std::mem::size_of::<DeliveryMarker>(), 8);
         assert!(std::mem::size_of::<DeliveryMarker>() <= DELIVERY_MARKER_BYTES);
         // Entry count bounds retained wrappers separately from wire-byte costs.
@@ -3001,7 +3031,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(owned.len(), 4);
         assert!(ch.producer.queued_data.is_empty());
-        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 191));
+        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 218));
         // Both DATA charges remain owned after the queue entries are drained.
         ch.gate.update(crate::send_gate::PIPE_HIGH);
         ch.gate.update(crate::send_gate::PIPE_LOW);
@@ -3083,6 +3113,159 @@ pub(crate) mod tests {
         assert_eq!(failures, 1);
         assert_eq!(spawner.sizes.lock().unwrap().len(), 128);
     }
+    #[tokio::test]
+    async fn geometry_screen_eof_owns_final_snapshot_before_marker() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 0,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        let open = encode_client(&ClientRecord::Open(OpenRequest {
+            stream: 16,
+            kind: crate::channel::ChannelKind::Shell,
+            cols: 80,
+            rows: 24,
+            screen: true,
+            command: Vec::new(),
+        }));
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: open,
+            }))
+            .await
+            .unwrap();
+        while !matches!(outbound.recv().await.unwrap(),SessionOutbound::ChannelOutput {output:ChannelOutput::Data(ref bytes),..} if bytes==b"hello from the shell")
+        {
+        }
+        spawner.end_channel(16);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                if let SessionOutbound::ChannelOutput { output, .. } =
+                    outbound.recv().await.unwrap()
+                {
+                    match output {
+                        ChannelOutput::Geometry(..) => seen.push("geometry"),
+                        ChannelOutput::Data(data) => {
+                            assert_eq!(data, b"REPAINT");
+                            seen.push("snapshot");
+                        }
+                        ChannelOutput::EchoAck(..) => seen.push("ack"),
+                        ChannelOutput::DeliveryMarker(..) => {
+                            seen.push("marker");
+                            break seen;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(inbound);
+        runner.await.unwrap();
+        assert_eq!(seen, vec!["geometry", "snapshot", "ack", "marker"]);
+    }
+    #[tokio::test]
+    async fn complete_old_resize_precedes_resume_reset() {
+        assert_correlated_resize_reset_order(false).await;
+    }
+    #[tokio::test]
+    async fn partial_old_resize_never_crosses_reset() {
+        assert_correlated_resize_reset_order(true).await;
+    }
+    async fn assert_correlated_resize_reset_order(partial: bool) {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        let old = AttachmentContext {
+            generation: 1,
+            session_id: 11,
+            features: crate::Features::CHANNEL_GEOMETRY,
+        };
+        inbound.send(SessionInbound::Live(old)).await.unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        let request = |cols| {
+            encode_client(&ClientRecord::ResizeRequest {
+                stream: 16,
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(1).unwrap(),
+                cols,
+                rows: 30,
+            })
+        };
+        let mut bytes = request(100);
+        if partial {
+            bytes.truncate(bytes.len() - 1);
+        }
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: bytes,
+            }))
+            .await
+            .unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext {
+                generation: 2,
+                session_id: 12,
+                ..old
+            }))
+            .await
+            .unwrap();
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: request(120),
+            }))
+            .await
+            .unwrap();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                match outbound.recv().await.unwrap() {
+                    SessionOutbound::ResumeBarrier { generation } => seen.push((generation, 0, 0)),
+                    SessionOutbound::ChannelOutput {
+                        origin,
+                        output: ChannelOutput::Geometry(g, _),
+                        ..
+                    } => {
+                        if g.request_id > 0 {
+                            seen.push((origin.generation, g.request_id, g.cols));
+                        }
+                        if origin.generation == 2 && g.request_id == 1 {
+                            break seen;
+                        }
+                    }
+                    SessionOutbound::ProtocolFailure { .. } => {
+                        panic!("reset must start fresh framing and request scope")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(inbound);
+        spawner.end_channel(16);
+        runner.await.unwrap();
+        if partial {
+            assert_eq!(seen, vec![(2, 0, 0), (2, 1, 120)]);
+            assert_eq!(*spawner.sizes.lock().unwrap(), vec![(16, 120, 30)]);
+        } else {
+            assert_eq!(seen, vec![(1, 1, 100), (2, 0, 0), (2, 1, 120)]);
+            assert_eq!(
+                *spawner.sizes.lock().unwrap(),
+                vec![(16, 100, 30), (16, 120, 30)]
+            );
+        }
+    }
     #[test]
     fn reset_flushes_already_read_bytes_in_old_scope_before_barrier() {
         let mut rig = ResizeRig::new(false, false);
@@ -3145,7 +3328,7 @@ pub(crate) mod tests {
         assert!(channels[&16].producer.queued_data.is_empty());
         assert_eq!(
             channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
-            (8, 191)
+            (8, 218)
         );
         assert_eq!(
             channels[&16].producer.timeline.usage(EntryClass::Ordinary),
