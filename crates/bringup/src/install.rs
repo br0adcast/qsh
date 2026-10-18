@@ -35,7 +35,7 @@ impl Session {
     ) -> Result<exec::Output, BringUpError> {
         self.stream += 1;
         exec::run(
-            &mut self.sub,
+            &mut self.sub.with_cancel(cancel),
             &self.events,
             self.stream,
             what,

@@ -28,7 +28,7 @@ const PROBE_IDLE: Duration = Duration::from_secs(30);
 pub(crate) const PROBE_URGENT: Duration = Duration::from_secs(1);
 
 /// How long a check waits for its answer before the road counts as failed.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How many checks may be in flight to one road at once -- a bound kept as
 /// defense, not one this crate's own call pattern can reach. Checks to a road
@@ -393,6 +393,15 @@ impl PathTable {
             .find(|p| p.addr == addr)
             .and_then(|p| p.in_flight.last())
             .map(|(token, _)| *token)
+    }
+
+    /// Actual probe send times, for a caller rotating a bounded candidate set.
+    /// An unanswered or answered probe both prove the endpoint had its turn.
+    pub fn probe_times(&self) -> Vec<(SocketAddr, Instant)> {
+        self.paths
+            .iter()
+            .filter_map(|p| p.last_probe.map(|sent| (p.addr, sent)))
+            .collect()
     }
 
     /// Everything the table knows, as of `now`. Pure: no clock of its own,

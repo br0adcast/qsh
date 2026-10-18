@@ -26,6 +26,8 @@ pub struct FakeAuth {
     /// Successive exec outputs, without running a shell or touching user state.
     pub exec_outputs: Vec<Vec<u8>>,
     pub open_gate: Option<Arc<tokio::sync::Notify>>,
+    pub auth_none_gate: Option<Arc<tokio::sync::Notify>>,
+    pub publickey_offer_gate: Option<Arc<tokio::sync::Notify>>,
     pub read_delay: Duration,
     pub sftp: Option<SftpBehavior>,
     pub sftp_channels: Arc<SftpChannels>,
@@ -410,6 +412,9 @@ impl russh::server::Handler for Login {
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
         }
+        if let Some(gate) = &self.auth.auth_none_gate {
+            gate.notified().await;
+        }
         Ok(self.reject())
     }
 
@@ -433,6 +438,9 @@ impl russh::server::Handler for Login {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
             return Err(hang_up());
+        }
+        if let Some(gate) = &self.auth.publickey_offer_gate {
+            gate.notified().await;
         }
         if self.auth.accept_any_key || self.is_partial_key(key) {
             return Ok(Auth::Accept);

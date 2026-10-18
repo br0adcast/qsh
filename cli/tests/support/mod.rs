@@ -11,7 +11,7 @@ use std::net::UdpSocket;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -435,6 +435,8 @@ pub fn wait_for_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
 pub struct UdpRelay {
     pub port: u16,
     cut: Arc<AtomicBool>,
+    upstream: UdpSocket,
+    received: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -455,16 +457,20 @@ impl UdpRelay {
         let stop = Arc::new(AtomicBool::new(false));
         let client: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
 
+        let received = Arc::new(AtomicUsize::new(0));
+        let upstream = back.try_clone().expect("clone upstream");
         let forward = {
             let front = front.try_clone().expect("clone front");
             let back = back.try_clone().expect("clone back");
             let (cut, stop, client) = (cut.clone(), stop.clone(), client.clone());
+            let received = received.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 while !stop.load(Ordering::SeqCst) {
                     let Ok((n, from)) = front.recv_from(&mut buf) else {
                         continue;
                     };
+                    received.fetch_add(1, Ordering::SeqCst);
                     *client.lock().unwrap_or_else(|p| p.into_inner()) = Some(from);
                     if !cut.load(Ordering::SeqCst) {
                         let _ = back.send(&buf[..n]);
@@ -491,9 +497,24 @@ impl UdpRelay {
         UdpRelay {
             port,
             cut,
+            upstream,
+            received,
             stop,
             threads: vec![forward, backward],
         }
+    }
+
+    /// Client datagrams observed, including those dropped by a cut. Encrypted
+    /// path probes cannot be distinguished from other authenticated traffic.
+    pub fn received(&self) -> usize {
+        self.received.load(Ordering::SeqCst)
+    }
+
+    /// Move this test endpoint to another daemon without replacing the relay.
+    pub fn redirect(&self, target_port: u16) {
+        self.upstream
+            .connect(("127.0.0.1", target_port))
+            .expect("redirect relay");
     }
 
     pub fn cut(&self) {

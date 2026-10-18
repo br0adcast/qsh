@@ -744,12 +744,32 @@ fn a_refusal_over_qsh_goes_to_ssh_and_the_process_key_logs_in() {
         "the process key must recover without repeating SSH: {}",
         log_text()
     );
-    client.type_line("echo WARM$WARM_MARK");
+    // The reconnect log precedes the channel announcement. Input in that
+    // gap is dropped, so retry the same-shell probe within wait_until's
+    // existing deadline. Ctrl-U clears a partially delivered command; the
+    // backslash avoids unmatched quotes if its beginning was dropped.
+    let mut next_probe = std::time::Instant::now();
+    let mut marker_end = None;
     assert!(
-        screen.next("WARMretained"),
+        wait_until(|| {
+            let now = std::time::Instant::now();
+            if now >= next_probe {
+                client.master.write_all(b"\x15").expect("type ctrl-u");
+                client.type_line("echo WA\\RM$WARM_MARK");
+                next_probe = now + std::time::Duration::from_secs(1);
+            }
+            let text = screen.text();
+            marker_end = text
+                .get(screen.from..)
+                .unwrap_or("")
+                .find("WARMretained")
+                .map(|at| screen.from + at + "WARMretained".len());
+            marker_end.is_some()
+        }),
         "the same shell must survive: {}",
         screen.text()
     );
+    screen.from = marker_end.expect("the same shell answered");
     assert_eq!(
         log_text().matches("trying ssh:").count(),
         1,

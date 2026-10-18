@@ -9,7 +9,7 @@ use std::time::Duration;
 use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKey};
+use russh::keys::{HashAlg, PublicKey};
 use russh::{MethodKind, MethodSet};
 
 use crate::{
@@ -97,6 +97,7 @@ pub(crate) struct Login<'a, H: russh::client::Handler> {
     pub host: &'a str,
     pub step_timeout: Duration,
     pub clock: PromptClock,
+    pub cancel: knock::Cancel,
     pub ended: Arc<EndSlot>,
 }
 
@@ -106,18 +107,22 @@ struct Wait {
     host: String,
     step_timeout: Duration,
     clock: PromptClock,
+    cancel: knock::Cancel,
 }
 
 impl Wait {
     async fn on<T>(&self, fut: impl std::future::Future<Output = T>) -> Result<T, SshError> {
-        with_step_timeout(fut, self.step_timeout, &self.clock)
-            .await
-            .ok_or_else(|| {
-                SshError::Connect(format!(
-                    "{} did not answer the login within {:?}",
-                    self.host, self.step_timeout
-                ))
-            })
+        crate::with_cancel(
+            with_step_timeout(fut, self.step_timeout, &self.clock),
+            &self.cancel,
+        )
+        .await?
+        .ok_or_else(|| {
+            SshError::Connect(format!(
+                "{} did not answer the login within {:?}",
+                self.host, self.step_timeout
+            ))
+        })
     }
 }
 
@@ -180,6 +185,7 @@ async fn ask_for_methods<H: russh::client::Handler>(
         host: login.host.to_string(),
         step_timeout: login.step_timeout,
         clock: login.clock.clone(),
+        cancel: login.cancel.clone(),
     };
     answered(
         wait.on(login.handle.authenticate_none(login.username))
@@ -353,6 +359,7 @@ async fn run_method<H: russh::client::Handler>(
         host: login.host.to_string(),
         step_timeout: login.step_timeout,
         clock: login.clock.clone(),
+        cancel: login.cancel.clone(),
     };
     let attempt = match method {
         AuthMethod::Password(password) => {
@@ -384,7 +391,10 @@ async fn run_method<H: russh::client::Handler>(
                     username,
                     public,
                     None,
-                    &mut SignerBridge(signer),
+                    &mut GuardedSigner {
+                        signer: &mut SignerBridge(signer),
+                        cancel: &wait.cancel,
+                    },
                 ))
                 .await?;
             signed(sent)?
@@ -530,13 +540,23 @@ async fn offer_private_key<H: russh::client::Handler>(
     let Some(hash) = hash_for(login, wait, key.public_key()).await? else {
         return Ok(Attempt::Gone);
     };
+    // The built-in private-key method signs again inside russh's session
+    // task after PK_OK, outside our cancellation checks. Keep that action in
+    // the same guarded signer path as platform, encrypted-file and agent keys.
+    let public = key.public_key().clone();
+    let mut signer = PrivateSigner(key);
     let sent = wait
-        .on(login.handle.authenticate_publickey(
+        .on(login.handle.authenticate_publickey_with(
             login.username,
-            PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            public,
+            hash,
+            &mut GuardedSigner {
+                signer: &mut signer,
+                cancel: &wait.cancel,
+            },
         ))
         .await?;
-    answered(sent)
+    signed(sent)
 }
 
 /// An encrypted key file: offered by its public half, the passphrase asked
@@ -568,7 +588,10 @@ async fn offer_locked_key<H: russh::client::Handler>(
             login.username,
             public.clone(),
             hash,
-            &mut signer,
+            &mut GuardedSigner {
+                signer: &mut signer,
+                cancel: &wait.cancel,
+            },
         ))
         .await?;
     let attempt = signed(sent)?;
@@ -621,9 +644,15 @@ async fn offer_agent_keys<H: russh::client::Handler>(
             failed: None,
         };
         let sent = wait
-            .on(login
-                .handle
-                .authenticate_publickey_with(login.username, key, hash, &mut signer))
+            .on(login.handle.authenticate_publickey_with(
+                login.username,
+                key,
+                hash,
+                &mut GuardedSigner {
+                    signer: &mut signer,
+                    cancel: &wait.cancel,
+                },
+            ))
             .await?;
         let attempt = signed(sent)?;
         if let Some(why) = signer.failed {
@@ -654,7 +683,54 @@ fn signed(sent: Result<AuthResult, SignError>) -> Result<Attempt, SshError> {
     match sent {
         Ok(result) => Ok(outcome(result)),
         Err(SignError::Dropped) => Ok(Attempt::Gone),
+        Err(SignError::Cancelled) => Err(SshError::Cancelled),
         Err(SignError::Signer(reason)) => Err(SshError::AuthFailed(reason)),
+    }
+}
+
+/// russh sends the signed userauth request after this future returns. A
+/// synchronous signer/prompt may block the executor, so cancellation must be
+/// checked again before releasing its signature to that dispatcher.
+struct GuardedSigner<'a, S> {
+    signer: &'a mut S,
+    cancel: &'a knock::Cancel,
+}
+impl<S: russh::Signer<Error = SignError> + Send> russh::Signer for GuardedSigner<'_, S> {
+    type Error = SignError;
+    fn auth_sign(
+        &mut self,
+        key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        to_sign: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
+        let key = key.clone();
+        async move {
+            if self.cancel.is_cancelled() {
+                return Err(SignError::Cancelled);
+            }
+            let result = self.signer.auth_sign(&key, hash_alg, to_sign).await;
+            if self.cancel.is_cancelled() {
+                return Err(SignError::Cancelled);
+            }
+            result
+        }
+    }
+}
+
+struct PrivateSigner(russh::keys::PrivateKey);
+impl russh::Signer for PrivateSigner {
+    type Error = SignError;
+    fn auth_sign(
+        &mut self,
+        _key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        to_sign: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
+        std::future::ready(
+            keyfile::sign_with_hash_alg(&self.0, hash_alg, &to_sign)
+                .map(|blob| keyfile::append_signature(to_sign, &blob))
+                .map_err(SignError::Signer),
+        )
     }
 }
 
@@ -664,6 +740,7 @@ struct SignerBridge(Arc<dyn ExternalSigner>);
 
 #[derive(Debug)]
 pub(crate) enum SignError {
+    Cancelled,
     /// russh could not hand the request or the signature to its session:
     /// the session is gone. Why -- the server's goodbye or a lost network --
     /// is read from the handler (see `ended`).

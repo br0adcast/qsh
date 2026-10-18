@@ -392,6 +392,10 @@ pub struct Climb<'a> {
     loud: Option<String>,
     recovery: Option<&'a Recovery>,
     revision: u64,
+    recovery_attempt: Option<(
+        ::connect::recovery_gate::RecoveryEpoch,
+        ::connect::recovery_gate::SweepId,
+    )>,
     bootstrap: Option<(usize, ssh::HostKeyInfo)>,
 }
 
@@ -422,6 +426,7 @@ impl<'a> Climb<'a> {
             loud: None,
             recovery: None,
             revision: 0,
+            recovery_attempt: None,
             bootstrap: None,
         }
     }
@@ -430,7 +435,13 @@ impl<'a> Climb<'a> {
 impl<'a> Climb<'a> {
     /// In recovery this ladder owns only UDP. The SSH worker publishes
     /// its results and never starts a second warm attachment.
-    pub fn recovering(mut self, recovery: &'a Recovery) -> Self {
+    pub fn recovering(
+        mut self,
+        recovery: &'a Recovery,
+        epoch: ::connect::recovery_gate::RecoveryEpoch,
+        sweep: ::connect::recovery_gate::SweepId,
+    ) -> Self {
+        self.recovery_attempt = Some((epoch, sweep));
         self.revision = recovery.revision();
         self.recovery = Some(recovery);
         self
@@ -443,6 +454,9 @@ impl<'a> Climb<'a> {
 
     pub fn run(&mut self) -> Climbed {
         let cancel = knock::Cancel::new();
+        if let Some(recovery) = self.recovery {
+            return self.run_cancellable(&recovery.cancel);
+        }
         if self.background() {
             return self.run_cancellable(&cancel);
         }
@@ -745,14 +759,6 @@ impl<'a> Climb<'a> {
         outcome: Outcome,
         line: Option<String>,
     ) -> Action {
-        if let Some(recovery) = self.recovery {
-            if matches!(
-                outcome,
-                Outcome::Direct(DirectOutcome::NoAnswer(_) | DirectOutcome::Refused)
-            ) {
-                recovery.need_ssh();
-            }
-        }
         log::log(&format!("ladder: outcome {outcome:?}"));
         let next = ladder.on(outcome);
         if let Some(line) = line {
@@ -773,6 +779,37 @@ impl<'a> Climb<'a> {
         stage: Stage,
         cancel: &knock::Cancel,
     ) -> Result<(DirectOutcome, Option<String>), i32> {
+        use ::connect::recovery_gate::{AddressId, AddressOutcome};
+        let result = self.direct_attempt(i, port, stage, cancel);
+        // Cancellation or a new SSH endpoint can interrupt a handshake. That
+        // is not a completed failed address in the sweep that started it.
+        if !self.interrupted() {
+            if let (Some(recovery), Some((epoch, sweep)), Ok((outcome, _))) =
+                (self.recovery, self.recovery_attempt, &result)
+            {
+                let outcome = match outcome {
+                    DirectOutcome::Connected | DirectOutcome::SessionGone => {
+                        AddressOutcome::Recovered
+                    }
+                    DirectOutcome::KeyChanged => AddressOutcome::IdentityMismatch,
+                    DirectOutcome::NeedsPrompt | DirectOutcome::Declined => {
+                        AddressOutcome::NeedsUser
+                    }
+                    _ => AddressOutcome::Failed,
+                };
+                recovery.finish(self.revision, epoch, sweep, AddressId(i), outcome);
+            }
+        }
+        result
+    }
+
+    fn direct_attempt(
+        &mut self,
+        i: usize,
+        port: u16,
+        stage: Stage,
+        cancel: &knock::Cancel,
+    ) -> Result<(DirectOutcome, Option<String>), i32> {
         let host = self.addrs[i].host.clone();
         self.progress(&host);
         log::log(&format!(
@@ -782,7 +819,21 @@ impl<'a> Climb<'a> {
         // dual-stack resolver puts the AAAA record first. See
         // `connect::preferred_addr`.
         // `Err(None)`: the resolver answered with no address at all.
-        let resolved = if self.background() {
+        let resolved = if let Some(recovery) = self.recovery.filter(|r| r.catalog_managed()) {
+            let started = std::time::Instant::now();
+            loop {
+                if self.interrupted() || cancel.is_cancelled() {
+                    break Err(None);
+                }
+                if let Some(endpoint) = recovery.endpoint(i) {
+                    break Ok(endpoint);
+                }
+                if started.elapsed() >= crate::road_catalog::DNS_TIMEOUT {
+                    break Err(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        } else if self.background() {
             match (host.as_str(), port).to_socket_addrs() {
                 Ok(it) => attempt::preferred_addr(it).ok_or(None),
                 Err(error) => Err(Some(error.to_string())),
@@ -819,7 +870,7 @@ impl<'a> Climb<'a> {
         };
         let diagnostic = self
             .recovery
-            .map(|r| r.discovery(i, self.setup.discovery.clone()));
+            .map(|r| r.discovery(i, self.revision, self.setup.discovery.clone()));
         let foreground_discovery = trust::ForegroundDiscovery(self.setup.discovery.as_ref());
         let discovery: &dyn trust::Discover = diagnostic
             .as_ref()
@@ -1044,6 +1095,13 @@ impl<'a> Climb<'a> {
         sockaddr: SocketAddr,
         key: [u8; 32],
     ) -> (DirectOutcome, Option<String>) {
+        if self.interrupted() {
+            self.forget(&att);
+            return (
+                DirectOutcome::NoAnswer(NoAnswerWhy::Silent { waited_secs: 0 }),
+                None,
+            );
+        }
         let outcome = landed(self.background(), att.client.resumed());
         if outcome == DirectOutcome::Connected {
             let mut slot = self
@@ -1092,7 +1150,7 @@ impl<'a> Climb<'a> {
         }
         let diagnostic = self
             .recovery
-            .map(|r| r.discovery(i, self.setup.discovery.clone()));
+            .map(|r| r.discovery(i, self.revision, self.setup.discovery.clone()));
         let foreground_discovery = trust::ForegroundDiscovery(self.setup.discovery.as_ref());
         let discovery: &dyn trust::Discover = diagnostic
             .as_ref()
@@ -1167,6 +1225,11 @@ impl<'a> Climb<'a> {
     /// pinned without asking, with one line. A key pinned there in the
     /// meantime -- another `qsh` -- is left as it is.
     fn proved(&self, host: &str, port: u16, server: &trust::ServerKey) {
+        // Recovery publication is owned by the main loop after stamp validation.
+        // A late handshake must never write trust from its worker thread.
+        if self.recovery.is_some() || self.interrupted() {
+            return;
+        }
         let trust::KeySource::Neighbour { of } = &server.source else {
             return;
         };
@@ -1219,7 +1282,9 @@ impl<'a> Climb<'a> {
             self.tx.clone(),
             self.setup.token,
         );
-        if !self.background() {
+        if let Some((epoch, sweep)) = self.recovery_attempt {
+            att.probe_port_refusal_stamped(sockaddr, epoch, sweep.0);
+        } else {
             att.probe_port_refusal(sockaddr);
         }
         // The one substrate this run's session ever uses: `ChannelSession`

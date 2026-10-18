@@ -60,6 +60,8 @@ pub enum UiEvent {
     StreamReset,
     /// The link changed state.
     Link(LinkState),
+    /// An owner-provided network notification; the CLI installs no OS watcher.
+    NetworkChanged,
     /// Fresh transport statistics (the round trip drives prediction).
     Stats(Stats),
     /// The local terminal changed size (SIGWINCH, already measured).
@@ -346,7 +348,10 @@ impl Session {
             // share; a call landing here regardless has nothing to do.
             //
             // `FromLink` is the same kind of thing: `main` unwraps it.
-            UiEvent::Wire { .. } | UiEvent::WireReset(_) | UiEvent::FromLink { .. } => Vec::new(),
+            UiEvent::Wire { .. }
+            | UiEvent::WireReset(_)
+            | UiEvent::FromLink { .. }
+            | UiEvent::NetworkChanged => Vec::new(),
             // Progress of a reconnect round shows only while the link is
             // gone; a late message from the background thread after the
             // return must not paint over a live session.

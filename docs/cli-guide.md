@@ -221,25 +221,56 @@ returns to the live screen; switching paths without a reset does not clear it.
 
 ## Recovery and session limits
 
-Short outages are handled by the transport. After three seconds of silence the
-status turns red; after 45 seconds the transport gives up the connection. The
-client then tries to recover the same server session, starting with the last
-working address.
+The silence counter measures how long it has been since authenticated traffic
+arrived from the server. An idle shell still exchanges transport traffic; silence
+is a connectivity signal, not a count of time since you last typed. After three
+seconds of silence the status turns red. An authenticated spare path can carry
+the live connection without opening another server session (the hot path).
+The client keeps probing every configured path, including paths outside the
+transport's eight active slots, while connected and while recovering.
+
+Without an explicit network refusal, the transport retains its 45-second
+silence deadline. A closed UDP port can accelerate recovery when the operating
+system reports the refusal, after every candidate path has had an authenticated
+probe window and no verified alternative remains. Firewalls and networks that
+suppress ICMP still recover using the ordinary deadlines.
+
+When the live connection ends, qsh attempts a warm resume with the previous
+session token and expected QSH server key, starting at the last working address.
+Every allowed QSH address in the current network generation gets an attempt
+before the first SSH round is admitted. A failed or silent first address cannot
+exclude the remaining addresses. DNS and key discovery have bounded waits;
+their answers are candidates and never replace the expected server key.
 
 | Recovery path | Behavior |
 | --- | --- |
-| UDP | No increasing round delay. Handshake packets repeat every 500 ms; an immediately failing round cannot restart sooner than one second after its start. |
-| SSH | Independent knock/login/startup rounds with delays of 1, 2, 4, 8, 16, then 30 seconds. |
+| UDP | Handshake packets repeat every 500 ms. Fast rounds start at least one second apart; a long round adds no extra pause. |
+| SSH | Independent knock/login/startup rounds with delays of 1, 2, 4, 8, 16, then at most 30 seconds. UDP attempts continue during SSH and every pause. |
 
-A separate changed-key check retains its five-second wait without holding up the
-next UDP attempt. SSH delivers the reported port and process-key authorization
-to UDP recovery rather than opening a competing qsh connection. Successful UDP
-recovery cancels SSH work. `Ctrl-] r` removes a pending SSH delay without starting
-a duplicate login already in flight.
+SSH can authorize the client's process key and report the daemon's current UDP
+port. It does not carry terminal traffic or create a competing qsh connection.
+Successful QSH recovery cancels further SSH authentication and commands; late
+results cannot change the active path or server key. `Ctrl-] r` removes a pending
+SSH delay without starting a duplicate login already in flight.
 
-Background recovery asks no questions. Unknown keys, passwords, or passphrases
-require starting the client again; skipped steps are explained in the log.
-The initial foreground connection still uses the sequential address ladder.
+Background SSH requires an explicit binding between the expected QSH server,
+account, SSH hostname/port, and SSH host key. An entry in ordinary OpenSSH
+`known_hosts` alone does not grant that permission. The bound key must also
+remain trusted there, and `@revoked` entries still block it. A direct QSH login
+creates no SSH binding automatically. Use `--authorize-ssh` during a foreground
+login to review both fingerprints and grant the selected pair.
+
+Background recovery asks no questions and never installs or updates qshd.
+Missing bindings or credentials leave QSH recovery running; skipped SSH steps
+are explained in the log. Explicit foreground setup can provide the missing
+permission. The initial foreground connection retains its sequential address
+ladder and strict handling of conflicting QSH keys.
+
+A foreign QSH key or rejected SSH login fails that path for the attempt. It does
+not replace trust, end background recovery, or permanently ban the address.
+Retries continue across network A → B → A, so the original server can return at
+the same address without deleting trust records or restarting the client. Old
+DNS, discovery, UDP, and SSH results cannot authorize work in a newer generation.
 
 The transport retransmits unacknowledged input while it can recover. After ten
 seconds without a link, the server stops retaining unlimited output and repaints
@@ -253,9 +284,12 @@ beyond these bounds; qsh alone does not promise it.
 
 Leaving with `Ctrl-] .` keeps the server session. Running the same command returns
 to it; the first address is the local session-record key, so reordering addresses
-can select a different session. A changed server key ends recovery with exit 11.
-A daemon that no longer has the session, for example after restart, causes exit
-13. Start qsh again to create a new session in that case.
+can select a different session. A key conflict during foreground login exits
+with code 11. During recovery, a foreign server is retried as a failed path while
+the expected key remains unchanged. When the expected server authenticates but
+confirms that the old session no longer exists, for example after a daemon
+restart, qsh exits with code 13. Start qsh again to create a new session in that
+case.
 
 ## Options and exit codes
 
@@ -285,7 +319,7 @@ exit is returned as its own exit code. Client-generated failures use:
 | 1 | Trust or installation declined, session startup failure, or leaving with Ctrl-] . while retaining the session. |
 | 2 | Invalid command line. |
 | 10 | Authentication keys could not be loaded. |
-| 11 | A server key changed, or supplied addresses have conflicting server keys. |
+| 11 | A server key changed during foreground login, or supplied addresses have conflicting server keys. |
 | 12 | All addresses failed during login. |
 | 13 | Recovery found that the server session no longer exists. |
 | 130 | An interrupted operation, such as cancelling an installation with Ctrl-C. |

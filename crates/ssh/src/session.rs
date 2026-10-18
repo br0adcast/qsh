@@ -21,7 +21,7 @@ const WATCHDOG: std::time::Duration = std::time::Duration::from_millis(500);
 
 enum Command {
     Upload(crate::sftp::Upload),
-    Open(OpenRequest, OwnedSemaphorePermit),
+    Open(OpenRequest, OwnedSemaphorePermit, knock::Cancel),
     Term(Arc<QueuedTerm>),
     Send(ChannelId, QueuedData),
     Resize(ChannelId, u16, u16),
@@ -110,12 +110,26 @@ impl Commands {
 /// The channels' side of the connection, for `ChannelSession`.
 pub struct SshSubstrate {
     commands: Commands,
+    cancel: knock::Cancel,
+}
+
+impl SshSubstrate {
+    /// Use an explicit cancellation scope for commands on this connection.
+    /// The default scope is the token supplied to `connect`. A separate scope
+    /// permits owner-authorized cleanup after that original scope is cancelled.
+    pub fn with_cancel(&self, cancel: &knock::Cancel) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            cancel: cancel.clone(),
+        }
+    }
 }
 
 impl ChannelSubstrate for SshSubstrate {
     fn open(&mut self, req: &OpenRequest) {
         if let Some(permit) = self.commands.reserve(req.command.len()) {
-            self.commands.send(Command::Open(req.clone(), permit));
+            self.commands
+                .send(Command::Open(req.clone(), permit, self.cancel.clone()));
         }
     }
     fn announce_term(&mut self, term: &str) {
@@ -296,7 +310,13 @@ pub fn connect(
                 connection.close();
                 return Err(SshError::Cancelled);
             }
-            Ok((connection, SshSubstrate { commands }))
+            Ok((
+                connection,
+                SshSubstrate {
+                    commands,
+                    cancel: cancel.clone(),
+                },
+            ))
         }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(SshError::Protocol(
@@ -335,8 +355,12 @@ async fn write_channel(
     mut queue: mpsc::Receiver<Write>,
     credits: Arc<WriteCredits>,
     stop: Arc<Stop>,
+    cancel: knock::Cancel,
 ) {
     while let Some(w) = queue.recv().await {
+        if action_cancelled(&stop, &cancel) {
+            return;
+        }
         match w {
             Write::Data(data) => {
                 let QueuedData { bytes, _permit } = data;
@@ -365,6 +389,12 @@ struct RunLimits {
     budget: Arc<Semaphore>,
     credits: Arc<WriteCredits>,
     request_timeout: std::time::Duration,
+}
+
+/// The generation token stays authoritative after authentication, including
+/// workers waiting for a remote channel-open response.
+fn action_cancelled(stop: &Stop, cancel: &knock::Cancel) -> bool {
+    cancel.is_cancelled() || stop.reason.lock().unwrap().is_some()
 }
 
 async fn run(
@@ -402,33 +432,35 @@ async fn run(
                 close_once.close(reason);
                 return;
             }
-            cmd = rx.recv() => match cmd {
-                None => {
-                    let bye = handle.disconnect(russh::Disconnect::ByApplication, "", "en");
-                    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, bye).await;
-                    close_once.close("closed by the client".into());
-                    return;
-                }
-                Some(Command::Term(t)) => term = t,
-                Some(Command::Upload(upload)) => {
-                    tokio::spawn(upload.run(Arc::clone(&handle), Arc::clone(&credits), Arc::clone(&stop)));
-                }
-                Some(Command::Open(req, permit)) => {
-                    tokio::spawn(open_channel(
-                        Arc::clone(&handle),
-                        Opening { req, term: term.clone(), permit },
-                        Arc::clone(&events),
-                        Arc::clone(&writers),
-                        RunLimits { stop: Arc::clone(&stop), budget: Arc::clone(&budget), credits: Arc::clone(&credits), request_timeout },
-                    ));
-                }
-                Some(Command::Send(ch, data)) => route(&writers, ch, Write::Data(data), &stop),
-                Some(Command::Resize(ch, cols, rows)) => route(&writers, ch, Write::Resize(cols, rows), &stop),
-                Some(Command::Close(ch)) => {
-                    let queue = writers.lock().unwrap().remove(&ch);
-                    if let Some(queue) = queue {
-                        if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(Write::Close) {
-                            stop.resource_limit("the SSH channel write queue is full");
+            cmd = rx.recv() => {
+                match cmd {
+                    None => {
+                        let bye = handle.disconnect(russh::Disconnect::ByApplication, "", "en");
+                        let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, bye).await;
+                        close_once.close("closed by the client".into());
+                        return;
+                    }
+                    Some(Command::Term(t)) => term = t,
+                    Some(Command::Upload(upload)) => {
+                        tokio::spawn(upload.run(Arc::clone(&handle), Arc::clone(&credits), Arc::clone(&stop)));
+                    }
+                    Some(Command::Open(req, permit, cancel)) => {
+                        tokio::spawn(open_channel(
+                            Arc::clone(&handle),
+                            Opening { req, term: term.clone(), permit, cancel },
+                            Arc::clone(&events),
+                            Arc::clone(&writers),
+                            RunLimits { stop: Arc::clone(&stop), budget: Arc::clone(&budget), credits: Arc::clone(&credits), request_timeout },
+                        ));
+                    }
+                    Some(Command::Send(ch, data)) => route(&writers, ch, Write::Data(data), &stop),
+                    Some(Command::Resize(ch, cols, rows)) => route(&writers, ch, Write::Resize(cols, rows), &stop),
+                    Some(Command::Close(ch)) => {
+                        let queue = writers.lock().unwrap().remove(&ch);
+                        if let Some(queue) = queue {
+                            if let Err(mpsc::error::TrySendError::Full(_)) = queue.try_send(Write::Close) {
+                                stop.resource_limit("the SSH channel write queue is full");
+                            }
                         }
                     }
                 }
@@ -494,6 +526,7 @@ struct Opening {
     req: OpenRequest,
     term: Arc<QueuedTerm>,
     permit: OwnedSemaphorePermit,
+    cancel: knock::Cancel,
 }
 
 /// Opens one channel, then reads it until it closes: one `Opened` or
@@ -509,6 +542,7 @@ async fn open_channel(
         mut req,
         term,
         permit,
+        cancel,
     } = opening;
     let RunLimits {
         stop,
@@ -516,10 +550,14 @@ async fn open_channel(
         credits,
         request_timeout,
     } = limits;
-    if stop.reason.lock().unwrap().is_some() {
+    let ch = req.stream;
+    if action_cancelled(&stop, &cancel) {
+        events.on_channel(SubstrateEvent::Refused {
+            ch,
+            reason: SshError::Cancelled.to_string(),
+        });
         return;
     }
-    let ch = req.stream;
     let channel = match handle.channel_open_session().await {
         Ok(c) => c,
         Err(e) => {
@@ -530,6 +568,14 @@ async fn open_channel(
             return;
         }
     };
+    if action_cancelled(&stop, &cancel) {
+        let _ = tokio::time::timeout(request_timeout, channel.close()).await;
+        events.on_channel(SubstrateEvent::Refused {
+            ch,
+            reason: SshError::Cancelled.to_string(),
+        });
+        return;
+    }
     let pty = req.cols > 0 && req.rows > 0;
     let mut control_permits = vec![permit];
     if pty {
@@ -540,41 +586,57 @@ async fn open_channel(
         };
         control_permits.push(copy);
     }
-    let requested = async {
-        if pty {
-            // Command PTYs carry machine-readable replies (notably tmux
-            // control mode). Kernel echo can interleave input with those
-            // replies, even in the middle of a protocol marker. Match qshd's
-            // command PTYs while preserving interactive shell defaults.
-            let modes: &[(russh::Pty, u32)] = match req.kind {
-                ChannelKind::Command => &[(russh::Pty::ECHO, 0), (russh::Pty::ECHONL, 0)],
-                ChannelKind::Shell => &[],
-            };
-            channel
-                .request_pty(
-                    false,
-                    &term.value,
-                    req.cols.into(),
-                    req.rows.into(),
-                    0,
-                    0,
-                    modes,
-                )
-                .await?;
-        }
-        match req.kind {
-            ChannelKind::Shell => channel.request_shell(false).await,
-            ChannelKind::Command => channel.exec(false, std::mem::take(&mut req.command)).await,
-        }
-    }
-    .await;
+    let requested = crate::with_cancel(
+        async {
+            if action_cancelled(&stop, &cancel) {
+                return Err(russh::Error::Disconnect);
+            }
+            if pty {
+                // Command PTYs carry machine-readable replies (notably tmux
+                // control mode). Kernel echo can interleave input with those
+                // replies, even in the middle of a protocol marker. Match qshd's
+                // command PTYs while preserving interactive shell defaults.
+                let modes: &[(russh::Pty, u32)] = match req.kind {
+                    ChannelKind::Command => &[(russh::Pty::ECHO, 0), (russh::Pty::ECHONL, 0)],
+                    ChannelKind::Shell => &[],
+                };
+                channel
+                    .request_pty(
+                        false,
+                        &term.value,
+                        req.cols.into(),
+                        req.rows.into(),
+                        0,
+                        0,
+                        modes,
+                    )
+                    .await?;
+            }
+            // PTY enqueueing can yield; recheck before the next remote action.
+            if action_cancelled(&stop, &cancel) {
+                return Err(russh::Error::Disconnect);
+            }
+            match req.kind {
+                ChannelKind::Shell => channel.request_shell(false).await,
+                ChannelKind::Command => channel.exec(false, std::mem::take(&mut req.command)).await,
+            }
+        },
+        &cancel,
+    )
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
     // Exec and PTY requests retain owned Vec/String values in russh's FIFO. A
     // keepalive reply (success OR failure) proves those requests were
     // written. This barrier is bounded; it adds no RTT to channel data.
     if let Err(error) = requested {
         credits.hold_until_close(control_permits);
         let reason = error.to_string();
-        stop.request(reason.clone());
+        if cancel.is_cancelled() {
+            let _ = tokio::time::timeout(request_timeout, channel.close()).await;
+        } else {
+            stop.request(reason.clone());
+        }
         events.on_channel(SubstrateEvent::Refused { ch, reason });
         return;
     }
@@ -598,7 +660,13 @@ async fn open_channel(
     // channel queue and prevent it from processing that very ping reply.
     let (mut read, write) = channel.split();
     let (queue, queued) = mpsc::channel(MAX_QUEUED_COMMANDS);
-    tokio::spawn(write_channel(write, queued, credits, Arc::clone(&stop)));
+    tokio::spawn(write_channel(
+        write,
+        queued,
+        credits,
+        Arc::clone(&stop),
+        cancel,
+    ));
     writers.lock().unwrap().insert(ch, queue.clone());
     events.on_channel(SubstrateEvent::Opened(ch));
     let mut code = -1;
@@ -744,6 +812,7 @@ mod tests {
             host: &params.host,
             step_timeout: params.connect_timeout,
             clock: crate::auth::PromptClock::default(),
+            cancel: knock::Cancel::new(),
             ended,
         };
         crate::auth::authenticate(
@@ -782,12 +851,14 @@ mod tests {
                 first_rx,
                 Arc::clone(&credits),
                 Arc::clone(&commands.stop),
+                knock::Cancel::new(),
             ));
             tokio::spawn(write_channel(
                 write_second,
                 second_rx,
                 Arc::clone(&credits),
                 Arc::clone(&commands.stop),
+                knock::Cancel::new(),
             ));
             tokio::spawn(flush_credits(
                 Arc::clone(&handle),
@@ -797,7 +868,10 @@ mod tests {
             ));
             let budget = Arc::clone(&commands.bytes);
             let stop = Arc::clone(&commands.stop);
-            let mut sub = SshSubstrate { commands };
+            let mut sub = SshSubstrate {
+                commands,
+                cancel: knock::Cancel::new(),
+            };
             gate.blocked.store(true, Ordering::SeqCst);
             for (index, channel) in [16, 17, 16, 17].into_iter().enumerate() {
                 sub.send(channel, &vec![b'x'; 256 * 1024]);
@@ -899,6 +973,7 @@ mod tests {
                     _permit: Some(term_permit),
                 }),
                 permit: command_permit,
+                cancel: knock::Cancel::new(),
             };
             gate.allowed_writes.store(1, Ordering::SeqCst);
             gate.blocked.store(true, Ordering::SeqCst);
@@ -1040,7 +1115,10 @@ mod tests {
         let (commands, mut pending) = commands();
         let budget = Arc::clone(&commands.bytes);
         let stop = Arc::clone(&commands.stop);
-        let mut sub = SshSubstrate { commands };
+        let mut sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
         sub.send(16, &vec![b'x'; 1024 * 1024]);
         let Command::Send(ch, data) = pending.try_recv().unwrap() else {
             panic!("expected data")
@@ -1067,7 +1145,10 @@ mod tests {
     fn control_commands_are_bounded_and_report_overflow() {
         let (commands, pending) = commands();
         let stop = Arc::clone(&commands.stop);
-        let mut sub = SshSubstrate { commands };
+        let mut sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
         for _ in 0..257 {
             sub.resize(16, 80, 24);
         }
@@ -1092,7 +1173,10 @@ mod tests {
             )
             .unwrap(),
         };
-        let mut sub = SshSubstrate { commands };
+        let mut sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
         for _ in 0..256 {
             sub.resize(16, 80, 24);
         }
@@ -1116,7 +1200,10 @@ mod tests {
     fn command_payloads_share_the_outgoing_byte_limit() {
         let (commands, pending) = commands();
         let stop = Arc::clone(&commands.stop);
-        let mut sub = SshSubstrate { commands };
+        let mut sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
         sub.open(&OpenRequest {
             stream: 16,
             kind: ChannelKind::Command,
@@ -1138,7 +1225,10 @@ mod tests {
     #[test]
     fn queued_ssh_bytes_are_bounded() {
         let (commands, mut rx) = commands();
-        let mut sub = SshSubstrate { commands };
+        let mut sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
         let chunk = vec![b'x'; 64 * 1024];
         for _ in 0..80 {
             sub.send(16, &chunk);

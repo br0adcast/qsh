@@ -42,6 +42,7 @@ jobs:
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Portable CLI tests
         run: |
+          cargo test -p qsh --test recovery_port_probe --locked
           cargo test -p qsh --test connection_start --locked
           cargo test -p qsh --test paths --locked
 
