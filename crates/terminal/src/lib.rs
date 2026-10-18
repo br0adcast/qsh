@@ -309,19 +309,17 @@ impl TerminalCore {
     /// Feeds bytes to the parser: printable characters land in the grid,
     /// while control sequences move the cursor and change modes.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // In vte 0.15, `advance` takes the whole slice at once, not byte by byte.
-        match &mut self.replay {
-            None => self.parser.advance(&mut self.term, bytes),
-            Some(replay) => {
+        for bytes in bytes.chunks(4096) {
+            if let Some(replay) = &mut self.replay {
                 replay.pending.push(bytes);
-                self.parser.advance(
-                    &mut tracking::Tracking {
-                        term: &mut self.term,
-                        tracked: &mut replay.tracked,
-                    },
-                    bytes,
-                );
             }
+            self.parser.advance(
+                &mut tracking::Tracking {
+                    term: &mut self.term,
+                    tracked: self.replay.as_mut().map(|replay| &mut replay.tracked),
+                },
+                bytes,
+            );
         }
     }
 
@@ -368,7 +366,7 @@ impl TerminalCore {
         if self.parser.sync_timeout().sync_timeout().is_some() {
             self.parser.stop_sync(&mut tracking::Tracking {
                 term: &mut self.term,
-                tracked: &mut replay.tracked,
+                tracked: Some(&mut replay.tracked),
             });
         }
         Some(replay::write(
@@ -1319,5 +1317,200 @@ mod tests {
         assert!(!t.frame().cursor_visible);
         t.feed(b"\x1b[?25h");
         assert!(t.frame().cursor_visible);
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line};
+
+    #[test]
+    fn combining_payload_is_bounded_on_both_screens_and_replay() {
+        for replay in [false, true] {
+            let mut t = TerminalCore::with_options(
+                TerminalSize::new(2, 1).unwrap(),
+                TerminalOptions {
+                    history_lines: 0,
+                    replay,
+                },
+            );
+            for switch in [b"".as_slice(), b"\x1b[?1049h".as_slice()] {
+                t.feed(switch);
+                t.feed("界".as_bytes());
+                for _ in 0..100_000 {
+                    t.feed("\u{301}".as_bytes());
+                }
+                t.feed("\u{302}".as_bytes());
+                assert_eq!(
+                    t.term.grid()[Line(0)][Column(0)].zerowidth().unwrap().len(),
+                    16
+                );
+                if replay {
+                    let mut other = TerminalCore::with_replay(2, 1);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(t.snapshot(), other.snapshot());
+                    t.feed(b"\x1b[3b");
+                    other.feed(b"\x1b[3b");
+                    assert_eq!(t.snapshot(), other.snapshot());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combining_replay_preserves_cursor_saved_cursor_and_rep() {
+        for alternate in [false, true] {
+            for initial in ["abcd", "ab界", "界界"] {
+                for cursor in [
+                    "",
+                    "\x1b[1;2H",
+                    "\x1b[1;4H",
+                    "\x1b[?7l",
+                    "\x1b[2;2r\x1b[?6h",
+                ] {
+                    let mut t = TerminalCore::with_replay(4, 2);
+                    if alternate {
+                        t.feed(b"\x1b[?1049h");
+                    }
+                    t.feed(initial.as_bytes());
+                    t.feed(cursor.as_bytes());
+                    t.feed(b"\x1b7");
+                    t.feed("\u{301}".repeat(16).as_bytes());
+                    t.feed("\u{302}".as_bytes());
+                    let mut other = TerminalCore::with_replay(4, 2);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(t.snapshot(), other.snapshot(), "{initial:?} {cursor:?}");
+                    for bytes in [
+                        b"\x1b[3b".as_slice(),
+                        b"\x1b8",
+                        "z\u{303}".as_bytes(),
+                        b"\x1b[2b",
+                    ] {
+                        t.feed(bytes);
+                        other.feed(bytes);
+                        assert_eq!(
+                            t.snapshot(),
+                            other.snapshot(),
+                            "{initial:?} {cursor:?} {bytes:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_combining_replay_preserves_wrapped_saturated_last_column() {
+        let mut t = TerminalCore::with_replay(4, 2);
+        t.feed(b"abcd");
+        t.feed("\u{301}".repeat(16).as_bytes());
+        t.feed(b"x");
+        t.feed("\u{301}".repeat(16).as_bytes());
+        t.feed("\u{302}".as_bytes());
+        let mut other = TerminalCore::with_replay(4, 2);
+        other.feed(&t.replay().unwrap());
+        assert_eq!(t.snapshot(), other.snapshot());
+        for bytes in [b"\x1b[3b".as_slice(), b"yz", b"\x1b[2b"] {
+            t.feed(bytes);
+            other.feed(bytes);
+            assert_eq!(t.snapshot(), other.snapshot());
+        }
+    }
+
+    #[test]
+    fn dropped_combining_last_column_target_does_not_rewrite_cells() {
+        for alternate in [false, true] {
+            for wrapped in [false, true] {
+                for wrap_enabled in [false, true] {
+                    let mut t = TerminalCore::with_replay(4, 2);
+                    if alternate {
+                        t.feed(b"\x1b[?1049h");
+                    }
+                    t.feed(b"abcd");
+                    t.feed("\u{301}".repeat(16).as_bytes());
+                    if wrapped {
+                        t.feed(b"x\x1b[1;4H\x1b[?7l");
+                        // Refused wide input sets pending wrap without
+                        // replacing the wrapped last-column cell.
+                        t.feed("界".as_bytes());
+                    }
+                    t.feed("\u{302}".as_bytes());
+                    t.feed(b"\x1b[2;2H\x1b7\x1b[2;3H");
+                    t.feed(if wrap_enabled {
+                        b"\x1b[?7h"
+                    } else {
+                        b"\x1b[?7l"
+                    });
+                    let mut other = TerminalCore::with_replay(4, 2);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(
+                        t.snapshot(),
+                        other.snapshot(),
+                        "alt={alternate} wrapped={wrapped} wrap={wrap_enabled}"
+                    );
+                    for bytes in [
+                        b"\x1b[3b".as_slice(),
+                        b"\x1b8",
+                        "z界".as_bytes(),
+                        b"\x1b[2b",
+                    ] {
+                        t.feed(bytes);
+                        other.feed(bytes);
+                        assert_eq!(t.snapshot(), other.snapshot());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combining_caps_apply_to_split_utf8_and_synchronized_update_flush() {
+        let mut t = TerminalCore::with_replay(2, 1);
+        t.feed(b"\x1b[?2026h");
+        t.feed(b"a");
+        for byte in "\u{301}".repeat(100_000).as_bytes() {
+            t.feed(&[*byte]);
+        }
+        let replay = t.replay().unwrap(); // stop_sync flushes the buffered input.
+        assert_eq!(
+            t.term.grid()[Line(0)][Column(0)].zerowidth().unwrap().len(),
+            16
+        );
+        let mut other = TerminalCore::with_replay(2, 1);
+        other.feed(&replay);
+        assert_eq!(t.snapshot(), other.snapshot());
+    }
+
+    #[test]
+    fn hyperlink_boundaries_and_malformed_chunks() {
+        for (id, uri_len, accepted) in [
+            ("id=x", 4095, true),
+            ("id=x", 4096, false),
+            ("", 4077, true),
+            ("", 4078, false),
+        ] {
+            let mut t = TerminalCore::new(2, 1);
+            let bytes = format!("\x1b]8;{id};{}\x07", "u".repeat(uri_len));
+            for byte in bytes.as_bytes() {
+                t.feed(&[*byte]);
+            }
+            let link = t.term.grid().cursor.template.hyperlink();
+            assert_eq!(link.is_some(), accepted, "{id} {uri_len}");
+            if let Some(link) = link {
+                assert!(link.id().len() + link.uri().len() <= 4096);
+            }
+            t.feed(b"\x1b]8;id=bad;\xff\x07");
+            t.feed(b"\x1b]8;;\x07");
+            assert!(t.term.grid().cursor.template.hyperlink().is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_hyperlink_clears_the_pen() {
+        let mut t = TerminalCore::new(2, 1);
+        t.feed(b"\x1b]8;id=ok;ok\x07");
+        t.feed(format!("\x1b]8;id=x;{}\x07", "u".repeat(4096)).as_bytes());
+        assert!(t.term.grid().cursor.template.hyperlink().is_none());
     }
 }
