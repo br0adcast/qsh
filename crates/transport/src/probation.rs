@@ -45,8 +45,11 @@ use crate::session_manager::{send_all, StreamData};
 /// unproven peer can create, so they must never be able to crowd out -- let
 /// alone evict -- a real backend. Over the cap a handshake is dropped
 /// silently: there is nothing to evict, because nothing here belongs to
-/// anyone yet. Generous relative to the deadline (each entry lives at most
-/// [`AUTH_DEADLINE`]) so a burst of honest reconnects still gets through.
+/// anyone yet. Generous relative to the
+/// [`AUTH_DEADLINE`] budget for starting verification so a burst of honest
+/// reconnects still gets through. Already-dispatched blocking verification
+/// may keep its entry longer, bounded in concurrency by
+/// [`MAX_CONCURRENT_VERIFIES`].
 ///
 /// On its own this is a bound on COST, not a defense against a hostile
 /// flood: slots free at only about `MAX_PROBATION / AUTH_DEADLINE` per
@@ -59,8 +62,8 @@ use crate::session_manager::{send_all, StreamData};
 /// Raised from 32 to 128 (slice 2c task 9): 32 was sized for one person's
 /// own machine. On a machine shared by a dozen people behind one NAT, the
 /// per-source cap used to hit everyone at once long before the table itself
-/// ever filled. Each entry lives no longer than [`AUTH_DEADLINE`] and costs
-/// only tens of bytes.
+/// ever filled. An entry awaiting its proof or a verification permit lives
+/// no longer than [`AUTH_DEADLINE`]; dispatched verification may finish later.
 ///
 /// A flood still exhausts probation first, not the helper's own nonce table
 /// (256 entries, swept every 30 s) -- but the margin that rests on narrowed
@@ -436,6 +439,13 @@ enum Step {
 /// `Connection` throughout: it is handed on only by the `Proved` path, so a
 /// peer that never proves itself has no way to reach a backend.
 pub(crate) async fn run_probation(p: Probation) {
+    run_probation_with_clock(p, Instant::now).await;
+}
+
+// Only authentication uses this clock; Connection retains its own transport
+// clock. Tests can cross the auth deadline while keeping socket readiness and
+// transport timers under independent control.
+async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) {
     let Probation {
         socket,
         mut conn,
@@ -452,13 +462,19 @@ pub(crate) async fn run_probation(p: Probation) {
     } = p;
     hold_for_probation(&mut conn);
     let session_id = conn.session_id();
-    let mut gate = AuthGate::new(verifier, conn.handshake_hash(), nonce, Instant::now());
+    let mut gate = AuthGate::new(verifier, conn.handshake_hash(), nonce, auth_now());
     let mut start = BridgeStart::default();
     let mut early_cost = 0usize;
 
     // `accept` already queued HandshakeDone + StateChanged(Live): take those
     // in before waiting on anything.
-    let mut step = drain(&mut conn, &mut gate, &mut start, &mut early_cost);
+    let mut step = drain(
+        &mut conn,
+        &mut gate,
+        &mut start,
+        &mut early_cost,
+        auth_now(),
+    );
     loop {
         match step {
             // A record waiting to be verified comes first: its verdict
@@ -472,7 +488,15 @@ pub(crate) async fn run_probation(p: Probation) {
                 // would otherwise wait for a ride or `ACK_DELAY` that no
                 // loop serves until then (spec §4.11).
                 send_all(&socket, &conn.answer_now()).await;
-                step = verify_off_task(&mut gate, record, &verify_permits, msg1.token, src).await;
+                step = verify_off_task(
+                    &mut gate,
+                    record,
+                    &verify_permits,
+                    msg1.token,
+                    src,
+                    &auth_now,
+                )
+                .await;
                 continue;
             }
             Step::Waiting => {}
@@ -481,25 +505,28 @@ pub(crate) async fn run_probation(p: Probation) {
         }
         // Never sleep past the gate's deadline, or a silent peer would linger
         // until the connection's own liveness timeout noticed it.
-        let deadline = match conn.next_timeout() {
-            Some(t) => t.min(gate.deadline()),
-            None => gate.deadline(),
+        let auth_wait = gate.deadline().saturating_duration_since(auth_now());
+        let dur = conn.next_timeout().map_or(auth_wait, |t| {
+            t.saturating_duration_since(Instant::now()).min(auth_wait)
+        });
+        let incoming = tokio::select! {
+            d = dgram_rx.recv() => Some(d),
+            _ = tokio::time::sleep(dur) => None,
         };
-        let dur = deadline.saturating_duration_since(Instant::now());
+        // Readiness must never extend authentication: both arms can be ready
+        // together, and the datagram arm may win after the absolute deadline.
+        if gate.expired(auth_now()) {
+            log::warn!("session refused: authentication deadline expired");
+            return end(&ended_tx, session_id, nonce, None);
+        }
         let mut reply: Vec<Datagram> = Vec::new();
-        tokio::select! {
-            d = dgram_rx.recv() => match d {
-                Some((from, bytes)) => reply.extend(conn.on_datagram(Instant::now(), from, &bytes)),
-                // The manager dropped the route (shutdown, or this entry was
-                // superseded): nothing more can arrive.
-                None => return end(&ended_tx, session_id, nonce, None),
-            },
-            _ = tokio::time::sleep(dur) => {
-                if gate.expired(Instant::now()) {
-                    log::warn!("session refused: no authentication record arrived in time");
-                    return end(&ended_tx, session_id, nonce, None);
-                }
+        match incoming {
+            Some(Some((from, bytes))) => {
+                reply.extend(conn.on_datagram(Instant::now(), from, &bytes));
             }
+            // The manager dropped the route (shutdown, or supersession).
+            Some(None) => return end(&ended_tx, session_id, nonce, None),
+            None => {}
         }
         // Timers after every wake-up (spec §4.1), the datagram arm included.
         reply.extend(conn.on_timeout_if_due(Instant::now()));
@@ -510,7 +537,13 @@ pub(crate) async fn run_probation(p: Probation) {
         // for a ride (spec §4.11) goes before verifying (the `Verify` arm
         // above), or at its deadline, which `next_timeout` above includes.
         send_all(&socket, &reply).await;
-        step = drain(&mut conn, &mut gate, &mut start, &mut early_cost);
+        step = drain(
+            &mut conn,
+            &mut gate,
+            &mut start,
+            &mut early_cost,
+            auth_now(),
+        );
     }
 
     let proven = match step {
@@ -553,6 +586,7 @@ async fn verify_off_task(
     permits: &Arc<Semaphore>,
     login: [u8; 16],
     src: SocketAddr,
+    auth_now: &impl Fn() -> Instant,
 ) -> Step {
     // Four permits bound how many proofs may be in flight, not how many
     // people may sign in at once: the fifth waits its turn briefly instead
@@ -560,22 +594,37 @@ async fn verify_off_task(
     // immediate refusal -- and it does not retry it. Bounded, because on a
     // wedged helper this task must not be held open for as long as the
     // helper is stuck. See VERIFY_PERMIT_WAIT.
-    let permit =
-        match tokio::time::timeout(VERIFY_PERMIT_WAIT, Arc::clone(permits).acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => {
-                // The semaphore itself was closed -- never happens in this
-                // program (nothing ever calls `close` on it), but naming it
-                // separately from a timed-out wait keeps the log honest if
-                // that ever changes.
-                log::warn!("session refused: the verification permit semaphore is closed");
-                return Step::Refused;
-            }
-            Err(_) => {
+    // The ACK send above may have yielded after the record was drained.
+    // Waiting for capacity is still pre-authentication, not a started proof.
+    if gate.expired(auth_now()) {
+        log::warn!("session refused: authentication deadline expired");
+        return Step::Refused;
+    }
+    let wait = VERIFY_PERMIT_WAIT.min(gate.deadline().saturating_duration_since(auth_now()));
+    let permit = match tokio::time::timeout(wait, Arc::clone(permits).acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            // The semaphore itself was closed -- never happens in this
+            // program (nothing ever calls `close` on it), but naming it
+            // separately from a timed-out wait keeps the log honest if
+            // that ever changes.
+            log::warn!("session refused: the verification permit semaphore is closed");
+            return Step::Refused;
+        }
+        Err(_) => {
+            if gate.expired(auth_now()) {
+                log::warn!("session refused: authentication deadline expired");
+            } else {
                 log::warn!("session refused: too many proofs are being verified at once");
-                return Step::Refused;
             }
-        };
+            return Step::Refused;
+        }
+    };
+    // An available permit can win even when its timeout is already ready.
+    if gate.expired(auth_now()) {
+        log::warn!("session refused: authentication deadline expired");
+        return Step::Refused;
+    }
     let verifier = Arc::clone(&gate.verifier);
     let hash = gate.hash;
     // Where this handshake came from, for a verifier that records it (the
@@ -583,6 +632,9 @@ async fn verify_off_task(
     // here, from the address this process itself received the datagram
     // from, rather than anywhere the client can reach.
     let rhost = src.to_string();
+    // Once dispatched, a PAM/file verification may finish after the arrival
+    // deadline. Keep its permit and await the real verdict rather than abandon
+    // blocking work or turn a successfully verified login into a timeout.
     let verdict = tokio::task::spawn_blocking(move || {
         // Held for exactly as long as the call it pays for.
         let _permit = permit;
@@ -639,7 +691,13 @@ fn drain(
     gate: &mut AuthGate,
     start: &mut BridgeStart,
     early_cost: &mut usize,
+    now: Instant,
 ) -> Step {
+    // Includes the first drain and the drain after the async transport reply.
+    if gate.expired(now) {
+        log::warn!("session refused: authentication deadline expired");
+        return Step::Refused;
+    }
     let mut closed = false;
     let mut to_verify = None;
     for ev in conn.poll_events() {
@@ -702,6 +760,7 @@ mod tests {
     use crate::handshake_payload::{encode_msg1, AuthMethod, StartKind};
     use crate::reliability::StreamFrame;
     use crate::wire::{parse as parse_wire_frame, Frame as WireFrame};
+    use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -778,7 +837,7 @@ mod tests {
         start: &mut BridgeStart,
         early_cost: &mut usize,
     ) -> Step {
-        match drain(conn, gate, start, early_cost) {
+        match drain(conn, gate, start, early_cost, Instant::now()) {
             Step::Verify(record) => {
                 let verifier = Arc::clone(&gate.verifier);
                 let hash = gate.hash;
@@ -908,7 +967,7 @@ mod tests {
         let mut start = BridgeStart::default();
         assert!(
             matches!(
-                drain(&mut conn, &mut gate, &mut start, &mut 0),
+                drain(&mut conn, &mut gate, &mut start, &mut 0, Instant::now()),
                 Step::Refused
             ),
             "past the cap the connection is refused, not buffered further"
@@ -929,7 +988,7 @@ mod tests {
         let mut first = seeded(vec![data(0, &half)]);
         assert!(
             matches!(
-                drain(&mut first, &mut gate, &mut start, &mut cost),
+                drain(&mut first, &mut gate, &mut start, &mut cost, Instant::now()),
                 Step::Waiting
             ),
             "half the cap on its own is under it"
@@ -942,7 +1001,13 @@ mod tests {
         let mut second = seeded(vec![data(0, &half)]);
         assert!(
             matches!(
-                drain(&mut second, &mut gate, &mut start, &mut cost),
+                drain(
+                    &mut second,
+                    &mut gate,
+                    &mut start,
+                    &mut cost,
+                    Instant::now()
+                ),
                 Step::Refused
             ),
             "the second half is charged on top of the first, not instead of it"
@@ -969,7 +1034,7 @@ mod tests {
         let mut start = BridgeStart::default();
         assert!(
             matches!(
-                drain(&mut conn, &mut gate, &mut start, &mut 0),
+                drain(&mut conn, &mut gate, &mut start, &mut 0, Instant::now()),
                 Step::Refused
             ),
             "a peer is charged for what it makes the server hold, not just for what it sent"
@@ -1433,6 +1498,308 @@ mod tests {
         }
         let held = proven.conn.undelivered_cost_for_test();
         assert!(held <= PROBATION_UNDELIVERED_MAX, "{held}");
+    }
+
+    /// The clock advances while the future is held between polls. The real
+    /// Tokio timer is still pending, so only the queued datagram can wake it:
+    /// accepting the proof cannot hide behind a randomly selected timer arm.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_proof_at_the_auth_deadline_is_refused() {
+        let nonce = [0x36; AUTH_NONCE_LEN];
+        let (mut client, fixture) = accepted_signature_pair(nonce);
+        let Fixture {
+            conn,
+            client_key,
+            msg1,
+            msg1_body,
+            out,
+            src,
+        } = fixture;
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (route, dgram_rx) = dgram_queue();
+        let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let clock = std::sync::Mutex::new(Instant::now());
+        let now = || *clock.lock().unwrap();
+        let p = Probation {
+            socket,
+            conn,
+            verifier: Arc::new(FakeVerifier {
+                expected: b"good".to_vec(),
+                attempts: Arc::clone(&attempts),
+            }),
+            dgram_rx,
+            client_key,
+            msg1,
+            msg1_body,
+            out,
+            src,
+            ended_tx,
+            nonce,
+            verify_permits: test_permits(),
+        };
+        let mut task = std::pin::pin!(run_probation_with_clock(p, now));
+        std::future::poll_fn(|cx| {
+            assert!(task.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        for dg in client.send(Instant::now(), AUTH_STREAM, &good_record()) {
+            assert!(route.send(src, dg.bytes));
+        }
+        *clock.lock().unwrap() += AUTH_DEADLINE;
+        tokio::time::timeout(Duration::from_secs(1), task.as_mut())
+            .await
+            .expect("ready input ends probation immediately");
+        let ended = ended_rx.recv().await.expect("one outcome");
+        assert!(
+            ended.proven.is_none(),
+            "a queued late proof must be refused"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(ended.nonce, nonce);
+        assert!(ended_rx.try_recv().is_err());
+        assert!(
+            !route.send(src, vec![0]),
+            "the expired receiver was dropped"
+        );
+    }
+
+    fn gate_with_record(now: Instant, attempts: &Arc<AtomicUsize>) -> (AuthGate, AuthRecord) {
+        let mut gate = AuthGate::new(
+            Arc::new(FakeVerifier {
+                expected: b"good".to_vec(),
+                attempts: Arc::clone(attempts),
+            }),
+            [0; 32],
+            [0; AUTH_NONCE_LEN],
+            now,
+        );
+        let Fed::Verify(record) = gate.feed(&good_record()).unwrap() else {
+            panic!("complete proof");
+        };
+        (gate, record)
+    }
+
+    #[tokio::test]
+    async fn an_expired_proof_does_not_start_verification() {
+        let start = Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (mut gate, record) = gate_with_record(start, &attempts);
+        let permits = Arc::new(Semaphore::new(1));
+        let step = verify_off_task(
+            &mut gate,
+            record,
+            &permits,
+            [0; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            &|| start + AUTH_DEADLINE,
+        )
+        .await;
+        assert!(matches!(step, Step::Refused));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_permit_released_at_the_deadline_cannot_start_verification() {
+        let start = Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (mut gate, record) = gate_with_record(start, &attempts);
+        let permits = Arc::new(Semaphore::new(1));
+        let held = permits.clone().acquire_owned().await.unwrap();
+        let clock = std::sync::Mutex::new(start);
+        let now = || *clock.lock().unwrap();
+        let mut task = std::pin::pin!(verify_off_task(
+            &mut gate,
+            record,
+            &permits,
+            [0; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            &now
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(task.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        *clock.lock().unwrap() += AUTH_DEADLINE;
+        drop(held);
+        assert!(matches!(task.await, Step::Refused));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verification_permit_wait_is_bounded_by_the_auth_deadline() {
+        let start = Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (mut gate, record) = gate_with_record(start, &attempts);
+        let permits = Arc::new(Semaphore::new(0));
+        let remaining = Duration::from_millis(10);
+        let clock = std::sync::Mutex::new(start + AUTH_DEADLINE - remaining);
+        let now = || *clock.lock().unwrap();
+        let mut task = std::pin::pin!(verify_off_task(
+            &mut gate,
+            record,
+            &permits,
+            [0; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            &now
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(task.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        *clock.lock().unwrap() += remaining;
+        tokio::time::advance(remaining).await;
+        std::future::poll_fn(|cx| {
+            assert!(
+                matches!(
+                    task.as_mut().poll(cx),
+                    std::task::Poll::Ready(Step::Refused)
+                ),
+                "auth expiry bounds the permit wait, even before VERIFY_PERMIT_WAIT"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_partial_proof_completed_after_the_deadline_is_not_drained() {
+        let now = Instant::now();
+        let mut gate = AuthGate::new(accepting_good(), [0; 32], [0; AUTH_NONCE_LEN], now);
+        let record = good_record();
+        let mid = record.len() / 2;
+        let mut start = BridgeStart::default();
+        let mut cost = 0;
+        let mut conn = seeded(vec![data(AUTH_STREAM, &record[..mid])]);
+        assert!(matches!(
+            drain(&mut conn, &mut gate, &mut start, &mut cost, now),
+            Step::Waiting
+        ));
+        let mut conn = seeded(vec![data(AUTH_STREAM, &record[mid..])]);
+        assert!(matches!(
+            drain(
+                &mut conn,
+                &mut gate,
+                &mut start,
+                &mut cost,
+                now + AUTH_DEADLINE
+            ),
+            Step::Refused
+        ));
+        assert_eq!(
+            gate.pending,
+            record[..mid],
+            "expired events were not consumed"
+        );
+        assert!(!gate.verifying);
+    }
+
+    #[tokio::test]
+    async fn a_timely_proof_still_verifies() {
+        let start = Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (mut gate, record) = gate_with_record(start, &attempts);
+        let permits = Arc::new(Semaphore::new(1));
+        let step = verify_off_task(
+            &mut gate,
+            record,
+            &permits,
+            [0; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            &|| start + AUTH_DEADLINE - Duration::from_nanos(1),
+        )
+        .await;
+        assert!(matches!(step, Step::Proved));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    struct SignalledVerifier {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl AuthVerifier for SignalledVerifier {
+        fn verify(
+            &self,
+            _hash: &[u8; 32],
+            _record: &AuthRecord,
+            _login: [u8; 16],
+            _rhost: &str,
+        ) -> Result<Principal, AuthError> {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            self.released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release the verifier");
+            Ok(Principal {
+                uid: 1000,
+                name: "test".into(),
+                identity: "signalled".into(),
+                incarnation: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_started_before_expiry_may_finish_after_it() {
+        let start = Instant::now();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut gate = AuthGate::new(
+            Arc::new(SignalledVerifier {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                released: std::sync::Mutex::new(release_rx),
+            }),
+            [0; 32],
+            [0; AUTH_NONCE_LEN],
+            start,
+        );
+        let Fed::Verify(record) = gate.feed(&good_record()).unwrap() else {
+            panic!("proof");
+        };
+        let permits = Arc::new(Semaphore::new(1));
+        let clock = std::sync::Mutex::new(start);
+        let now = || *clock.lock().unwrap();
+        let mut task = std::pin::pin!(verify_off_task(
+            &mut gate,
+            record,
+            &permits,
+            [0; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            &now
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(task.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "running verification owns its permit"
+        );
+        *clock.lock().unwrap() += AUTH_DEADLINE;
+        release_tx.send(()).unwrap();
+        assert!(matches!(task.await, Step::Proved));
+        assert_eq!(permits.available_permits(), 1);
     }
 
     /// A record that parses and that [`accepting_good`] admits.

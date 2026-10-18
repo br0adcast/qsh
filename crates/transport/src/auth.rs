@@ -10,7 +10,9 @@
 use std::fmt;
 use std::time::Duration;
 
-/// How long a connection may stay unauthenticated before the server drops it.
+/// How long a client has to deliver its proof and the server to dispatch its
+/// verification, including any wait for verification capacity. A blocking
+/// verification already dispatched may finish after this deadline.
 /// Short on purpose: an unauthenticated connection costs the server a routing
 /// entry and a task, and a real client signs within one round trip.
 ///
