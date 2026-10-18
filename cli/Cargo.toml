@@ -37,6 +37,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 ssh = { path = "../crates/ssh" }
 sshauth = { path = "../crates/sshauth" }
+terminal-size = { path = "../crates/terminal-size" }
 terminal = { path = "../crates/terminal" }
 transport = { path = "../crates/transport" }
 unicode-width = "0.2.2"

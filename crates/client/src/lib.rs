@@ -40,10 +40,14 @@ impl ShellState {
         pref: prediction::DisplayPreference,
         predict_overwrite: bool,
     ) -> Self {
+        let size = terminal_size::TerminalSize::for_viewport(cols, rows);
         let mut prediction = prediction::PredictionEngine::new(pref);
         prediction.set_predict_overwrite(predict_overwrite);
         ShellState {
-            terminal: terminal::TerminalCore::new(cols, rows),
+            terminal: terminal::TerminalCore::with_options(
+                size,
+                terminal::TerminalOptions::default(),
+            ),
             prediction,
             deframer: ShellDeframer::new(),
             input_bytes_sent: 0,
@@ -135,7 +139,8 @@ impl ShellState {
     /// Return the overlaid frame at the new size (raw, without overlay, while
     /// in history -- for the same reason as in `on_stream0`).
     pub fn resize_frame(&mut self, cols: u16, rows: u16, now_ms: i64) -> terminal::Frame {
-        self.terminal.resize(cols, rows);
+        self.terminal
+            .resize_to(terminal_size::TerminalSize::for_viewport(cols, rows));
         let auth = self.terminal.frame();
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);

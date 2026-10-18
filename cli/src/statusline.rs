@@ -89,7 +89,7 @@ pub fn scroll_part(offset: usize, total: usize) -> String {
 /// Exactly `cols` cells, all reversed. The right part ends one column before
 /// the edge; the left part is dropped when it does not fit beside it.
 pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Vec<Cell> {
-    let cols = cols as usize;
+    let cols = usize::from(terminal_size::ViewportSize::new(cols, 0).cols());
     let plain = Cell {
         ch: ' ',
         fg: Color::Default,
@@ -100,7 +100,7 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     if cols == 0 {
         return cells;
     }
-    let right: Vec<char> = right.chars().collect();
+    let right = text_cells(right, true);
     // The right part ends one column before the edge when it fits with that
     // margin; otherwise it starts at column 0 and is cut at the edge.
     let (start, shown) = if right.len() < cols {
@@ -108,24 +108,32 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     } else {
         (0, cols)
     };
-    for (i, ch) in right.iter().take(shown).enumerate() {
-        cells[start + i].ch = *ch;
+    for (i, source) in right.iter().take(shown).enumerate() {
+        cells[start + i].ch = source.ch;
+        cells[start + i].flags |= source.flags;
     }
     if alarm {
         for cell in &mut cells {
             if colour {
                 cell.fg = Color::Indexed(15);
                 cell.bg = Color::Indexed(1);
-                cell.flags = 0;
+                cell.flags &= terminal::FLAG_WIDE | terminal::FLAG_WIDE_SPACER;
             } else {
-                cell.flags = FLAG_REVERSE | FLAG_BOLD;
+                cell.flags |= FLAG_REVERSE | FLAG_BOLD;
             }
         }
     }
-    let left: Vec<char> = left.chars().collect();
+    let left = text_cells(left, true);
     if !left.is_empty() && left.len() + 1 + shown < cols {
-        for (i, ch) in left.iter().enumerate() {
-            cells[i].ch = *ch;
+        for (i, source) in left.iter().enumerate() {
+            cells[i].ch = source.ch;
+            cells[i].flags |= source.flags;
+        }
+    }
+    if let Some(last) = cells.last_mut() {
+        if last.flags & terminal::FLAG_WIDE != 0 {
+            last.ch = ' ';
+            last.flags &= !terminal::FLAG_WIDE;
         }
     }
     cells

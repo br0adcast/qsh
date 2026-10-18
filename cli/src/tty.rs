@@ -665,17 +665,15 @@ impl Drop for EchoOff {
     }
 }
 
-/// The terminal's size as `(cols, rows)`, or `None` when there is no usable
-/// size to report: either `fd` is not a terminal at all (`qsh` redirected
-/// into a pipe reaches this), or it is one that answers `0x0` -- which a
-/// pty whose size has never been set does, and which is no more usable as a
-/// screen size than no answer at all. The caller falls back to a default
-/// either way, so the two need not be told apart.
+/// The physical terminal extent as `(cols, rows)`, including successful
+/// zero-sized readings. Callers retain logical geometry and suppress paint
+/// and RESIZE while either physical dimension is zero. `None` means the
+/// ioctl failed (for example, a pipe), rather than an empty display.
 pub fn window_size(fd: RawFd) -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: `ws` is a valid, correctly sized winsize for the whole call.
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
-    if rc != 0 || ws.ws_col == 0 || ws.ws_row == 0 {
+    if rc != 0 {
         return None;
     }
     Some((ws.ws_col, ws.ws_row))
@@ -1190,6 +1188,20 @@ mod tests {
         };
         let pty = openpty(Some(&size), None).expect("openpty");
         assert_eq!(window_size(pty.slave.as_raw_fd()), Some((80, 24)));
+    }
+
+    #[test]
+    fn successful_zero_extent_is_not_an_ioctl_failure() {
+        for (ws_col, ws_row) in [(0, 0), (0, 24), (80, 0)] {
+            let size = nix::pty::Winsize {
+                ws_row,
+                ws_col,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty = openpty(Some(&size), None).expect("openpty");
+            assert_eq!(window_size(pty.slave.as_raw_fd()), Some((ws_col, ws_row)));
+        }
     }
 
     /// Something that is not a terminal has no size, and that is not a crash

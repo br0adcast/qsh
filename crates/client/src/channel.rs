@@ -228,6 +228,14 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         if command.len() > MAX_COMMAND_LEN {
             return None;
         }
+        // Zero OPEN dimensions retain their no-PTY meaning. Nonzero local
+        // dimensions use the same adapter as the shell model.
+        let (cols, rows) = if cols != 0 && rows != 0 {
+            let size = terminal_size::TerminalSize::for_viewport(cols, rows);
+            (size.cols(), size.rows())
+        } else {
+            (cols, rows)
+        };
         let ch = self.free_stream()?;
         let req = OpenRequest {
             stream: ch,
@@ -290,7 +298,15 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
 
     /// A no-op unless `ch` is `Ready`, for the same reason as [`Self::send`].
     pub fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
         if let Some(ChannelState::Ready(req)) = self.channels.get_mut(&ch) {
+            if req.cols == 0 || req.rows == 0 {
+                return;
+            }
+            let size = terminal_size::TerminalSize::for_viewport(cols, rows);
+            let (cols, rows) = (size.cols(), size.rows());
             req.cols = cols;
             req.rows = rows;
             self.substrate.resize(ch, cols, rows);
@@ -557,6 +573,26 @@ mod tests {
         let sub = FakeSubstrate::default();
         let opens = sub.opens.clone();
         (ChannelSession::new(sub), opens)
+    }
+
+    #[test]
+    fn local_shell_adapts_open_and_resize_but_never_sends_zero_resize() {
+        let substrate = FakeSubstrate::default();
+        let opens = substrate.opens.clone();
+        let calls = substrate.calls.clone();
+        let mut s = ChannelSession::new(substrate);
+        let ch = s.open_shell(1, 2).unwrap();
+        let req = opens.lock().unwrap()[0].clone();
+        assert_eq!((req.cols, req.rows), (2, 2));
+        s.on_event(SubstrateEvent::Opened(ch));
+        calls.lock().unwrap().clear();
+        s.resize(ch, 0, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        s.resize(ch, 1, 65535);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[format!("resize {ch} 2x256")]
+        );
     }
 
     /// The session reports a channel usable only once the far side has

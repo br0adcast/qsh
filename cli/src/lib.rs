@@ -34,4 +34,5 @@ pub mod statusline;
 pub mod ticker;
 pub mod trust;
 pub mod tty;
+pub mod viewport;
 pub mod window;

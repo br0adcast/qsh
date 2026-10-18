@@ -174,7 +174,10 @@ fn run(a: args::Args) -> i32 {
     }
     let mut connected = connected;
     let mut events = link_rx;
-    let mut terminal_size = (cols, rows);
+    let mut display = DisplaySize {
+        physical: (cols, rows),
+        logical: (shell_cols, shell_rows),
+    };
     let mut addresses = setup.args().addresses.clone();
     let mut epoch = RecoveryEpoch {
         connection: 0,
@@ -186,7 +189,7 @@ fn run(a: args::Args) -> i32 {
             setup.clone(),
             connected,
             events,
-            terminal_size,
+            &mut display,
             addresses,
             epoch,
             resolver,
@@ -226,9 +229,14 @@ fn run(a: args::Args) -> i32 {
             }
         };
         setup = Arc::new(setup.replacement(token));
-        terminal_size = tty::window_size(std::io::stdout().as_raw_fd()).unwrap_or(terminal_size);
-        let shell_size =
-            session::shell_size(terminal_size.0, terminal_size.1, setup.args().status_line);
+        if let Some(physical) = tty::window_size(std::io::stdout().as_raw_fd()) {
+            display.physical = physical;
+            if physical.0 != 0 && physical.1 != 0 {
+                display.logical =
+                    session::shell_size(physical.0, physical.1, setup.args().status_line);
+            }
+        }
+        let shell_size = display.logical;
         let start_round = |epoch, catalog: &RoadCatalog| {
             let (progress, _) = mpsc::channel();
             background::spawn_catalog_round(
@@ -288,12 +296,17 @@ fn run(a: args::Args) -> i32 {
     }
 }
 
+struct DisplaySize {
+    physical: (u16, u16),
+    logical: (u16, u16),
+}
+
 /// Everything before this point uses the restored controlling terminal.
 fn connected_session(
     setup: Arc<Setup>,
     connected: Connected,
     events: Receiver<UiEvent>,
-    (cols, rows): (u16, u16),
+    display: &mut DisplaySize,
     mut addresses: Vec<Address>,
     road_epoch: RecoveryEpoch,
     resolver: BoundedResolver,
@@ -363,7 +376,7 @@ fn connected_session(
         replacement_at: None,
         tx: tx.clone(),
     };
-    interactive(setup, links, (cols, rows), tx, rx)
+    interactive(setup, links, display, tx, rx)
 }
 
 /// Keep the same bounded resolver pool across shell lifetimes, including the
@@ -1284,7 +1297,7 @@ fn on_wire(
 fn interactive(
     setup: Arc<Setup>,
     mut links: Links,
-    (cols, rows): (u16, u16),
+    display: &mut DisplaySize,
     tx: mpsc::Sender<UiEvent>,
     rx: mpsc::Receiver<UiEvent>,
 ) -> (i32, Links) {
@@ -1342,7 +1355,14 @@ fn interactive(
         },
         several: a.addresses.len() > 1,
     };
-    let mut sess = Session::new(cols, rows, caps, a.predict, chrome);
+    let mut sess = Session::new_with_logical_size(
+        display.physical,
+        terminal_size::TerminalSize::new(display.logical.0, display.logical.1)
+            .expect("adapted shell size"),
+        caps,
+        a.predict,
+        chrome,
+    );
     sess.set_history_limit(a.history);
     // The climb's trial already opened the shell channel, the moment the link
     // came alive, so its `Opened` confirmation could flip the verdict fast
@@ -1405,7 +1425,7 @@ fn interactive(
         }
         let mut events = Vec::new();
         if pending.resized {
-            let (c, r) = tty::window_size(out_fd).unwrap_or((cols, rows));
+            let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
             events.push(UiEvent::Resized { cols: c, rows: r });
         }
         if pending.resumed {
@@ -1593,6 +1613,8 @@ fn interactive(
     for notice in &notices {
         eprintln!("{notice}");
     }
+    display.physical = sess.physical_size();
+    display.logical = sess.size();
     (code, links)
 }
 

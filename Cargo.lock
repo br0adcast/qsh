@@ -470,6 +470,7 @@ version = "0.5.0"
 dependencies = [
  "prediction",
  "terminal",
+ "terminal-size",
  "transport",
 ]
 
@@ -2304,6 +2305,7 @@ dependencies = [
  "tar",
  "tempfile",
  "terminal",
+ "terminal-size",
  "tokio",
  "transport",
  "unicode-width",

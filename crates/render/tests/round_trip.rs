@@ -984,3 +984,27 @@ fn an_orphan_spacer_is_drawn_when_its_row_moves_onto_other_text() {
     }
     assert_same_screen_except(&shown, &frame, 0, 2..3);
 }
+
+#[test]
+fn cropped_viewport_never_scrolls_the_physical_terminal() {
+    let mut src = TerminalCore::new(20, 3);
+    let mut dst = TerminalCore::new(20, 5);
+    let mut r = Renderer::new(TermCaps::truecolor());
+    r.set_physical_scroll_eligible(false);
+    for i in 0..4 {
+        src.feed(format!("line{i}\r\n").as_bytes());
+        let frame = src.frame();
+        let bytes = r.render(&frame);
+        assert!(!bytes.contains(&b'\n'), "cropped view must use row diffs");
+        dst.feed(&bytes);
+        let actual = dst.frame();
+        for row in 0..3 {
+            for col in 0..20 {
+                assert_eq!(
+                    visible(actual.cell(row, col)),
+                    visible(frame.cell(row, col))
+                );
+            }
+        }
+    }
+}

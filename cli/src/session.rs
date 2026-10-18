@@ -149,11 +149,13 @@ pub struct Chrome {
 /// The shell's size in a terminal of `cols` x `rows`: one row fewer when the
 /// status line is shown. A terminal under two rows has no line (spec §8.1).
 pub fn shell_size(cols: u16, rows: u16, line: bool) -> (u16, u16) {
-    if line && rows >= 2 {
-        (cols, rows - 1)
-    } else {
-        (cols, rows)
+    if cols == 0 || rows == 0 {
+        return (80, 24);
     }
+    let viewport = terminal_size::ViewportSize::new(cols, rows);
+    let shell_rows = viewport.rows() - u16::from(line && viewport.rows() >= 2);
+    let size = terminal_size::TerminalSize::for_viewport(viewport.cols(), shell_rows);
+    (size.cols(), size.rows())
 }
 
 /// A window over the frame.
@@ -218,6 +220,11 @@ pub struct Session {
     /// The TERMINAL's current size; the shell's is [`Session::size`].
     cols: u16,
     rows: u16,
+    /// Actual physical extent; zero suppresses paint/RESIZE and a taller
+    /// terminal disables physical-scroll shortcuts.
+    raw_cols: u16,
+    raw_rows: u16,
+    logical_size: terminal_size::TerminalSize,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
     pending_size: Option<(u16, u16)>,
@@ -277,12 +284,31 @@ impl Session {
         predict: PredictMode,
         chrome: Chrome,
     ) -> Session {
+        let (shell_cols, shell_rows) = shell_size(cols, rows, chrome.line);
+        Self::new_with_logical_size(
+            (cols, rows),
+            terminal_size::TerminalSize::new(shell_cols, shell_rows).expect("adapted shell size"),
+            caps,
+            predict,
+            chrome,
+        )
+    }
+
+    /// Start with the exact logical size already used to open the channel.
+    /// In particular, an empty physical display retains the preceding size.
+    pub fn new_with_logical_size(
+        (cols, rows): (u16, u16),
+        size: terminal_size::TerminalSize,
+        caps: TermCaps,
+        predict: PredictMode,
+        chrome: Chrome,
+    ) -> Self {
         let pref = match predict {
             PredictMode::Adaptive => DisplayPreference::Adaptive,
             PredictMode::Always => DisplayPreference::Always,
             PredictMode::Never => DisplayPreference::Never,
         };
-        let (shell_cols, shell_rows) = shell_size(cols, rows, chrome.line);
+        let (shell_cols, shell_rows) = (size.cols(), size.rows());
         Session {
             // `predict_overwrite` stays off: predicting
             // an overwrite is the prediction most often wrong on screen.
@@ -290,8 +316,12 @@ impl Session {
             renderer: Renderer::new(caps),
             rtt_ms: 0,
             last_frame: None,
-            cols,
-            rows,
+            cols: terminal_size::ViewportSize::new(cols, rows).cols(),
+            rows: terminal_size::ViewportSize::new(cols, rows).rows(),
+            raw_cols: cols,
+            raw_rows: rows,
+            logical_size: terminal_size::TerminalSize::new(shell_cols, shell_rows)
+                .expect("adapted shell size"),
             pending_size: None,
             resize_due_ms: 0,
             lost_since_ms: None,
@@ -392,9 +422,14 @@ impl Session {
         }
     }
 
-    /// The shell's size: the terminal minus the status line when it is shown.
+    /// The raw physical extent, including an empty display.
+    pub fn physical_size(&self) -> (u16, u16) {
+        (self.raw_cols, self.raw_rows)
+    }
+
+    /// The validated logical shell size, retained through empty displays.
     pub fn size(&self) -> (u16, u16) {
-        shell_size(self.cols, self.rows, self.line_shown)
+        (self.logical_size.cols(), self.logical_size.rows())
     }
 
     pub fn set_history_limit(&mut self, lines: usize) {
@@ -517,6 +552,9 @@ impl Session {
         let resize_all = |s: &mut Session| {
             // The size goes out now, so a debounced one has nothing left to do.
             s.pending_size = None;
+            if s.raw_cols == 0 || s.raw_rows == 0 {
+                return Vec::new();
+            }
             live.iter()
                 .map(|&ch| Action::ResizeChannel { ch, cols, rows })
                 .collect::<Vec<_>>()
@@ -662,7 +700,16 @@ impl Session {
             return self.on_history_input(input, now_ms);
         }
         let shift = u16::from(self.line_on() && self.shell_mouse);
-        let input = self.mouse.apply(&input, shift);
+        let shell_rows = self
+            .rows
+            .saturating_sub(shift)
+            .min(self.logical_size.rows());
+        let input = self.mouse.apply_bounded(
+            &input,
+            shift,
+            self.cols.min(self.logical_size.cols()),
+            shell_rows,
+        );
         if input.is_empty() {
             return Vec::new();
         }
@@ -869,8 +916,11 @@ impl Session {
         let before = self.size();
         self.line_shown = !self.line_shown;
         self.refresh_line(now_ms);
-        if self.size() == before {
-            // A terminal too short for the line either way.
+        if self.raw_cols == 0
+            || self.raw_rows == 0
+            || shell_size(self.cols, self.rows, self.line_shown) == before
+        {
+            // An empty display or unchanged logical geometry.
             return self.repaint(now_ms);
         }
         self.apply_shell_size(now_ms)
@@ -967,8 +1017,11 @@ impl Session {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, now_ms: i64) -> Vec<Action> {
-        self.cols = cols;
-        self.rows = rows;
+        self.raw_cols = cols;
+        self.raw_rows = rows;
+        let viewport = terminal_size::ViewportSize::new(cols, rows);
+        self.cols = viewport.cols();
+        self.rows = viewport.rows();
         self.apply_shell_size(now_ms)
     }
 
@@ -977,7 +1030,15 @@ impl Session {
     /// is on their own screen, not on the server. The server hears once the
     /// size holds still (`due_resize`).
     fn apply_shell_size(&mut self, now_ms: i64) -> Vec<Action> {
-        let (cols, rows) = self.size();
+        if self.raw_cols == 0 || self.raw_rows == 0 {
+            self.pending_size = None;
+            self.renderer.invalidate();
+            self.last_frame = None;
+            return Vec::new();
+        }
+        let (cols, rows) = shell_size(self.cols, self.rows, self.line_shown);
+        self.logical_size =
+            terminal_size::TerminalSize::new(cols, rows).expect("adapted shell size");
         let frame = self.shell.resize_frame(cols, rows, now_ms);
         self.pending_size = Some((cols, rows));
         self.resize_due_ms = now_ms + RESIZE_QUIET_MS;
@@ -1120,6 +1181,9 @@ impl Session {
     /// draw. `last_frame` is `None` right after `renderer.invalidate()`, so
     /// an invalidated renderer always goes through regardless of content.
     fn paint_at(&mut self, frame: &terminal::Frame, now_ms: i64) -> Vec<Action> {
+        if self.raw_cols == 0 || self.raw_rows == 0 {
+            return Vec::new();
+        }
         let mut history = self.history_frame.clone();
         if let Some(h) = &mut history {
             if h.cols != frame.cols || h.rows != frame.rows {
@@ -1133,6 +1197,11 @@ impl Session {
             h.app_keypad = false;
         }
         let frame = history.as_ref().unwrap_or(frame);
+        let projected = crate::viewport::project(
+            frame,
+            terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on())),
+        );
+        let frame = &projected;
         self.shell_mouse = frame.mouse_tracking != MouseTracking::Off;
         // The hidden-status alarm replaces the entire top row on a copy; it
         // must also remain visible while local scrollback is being inspected.
@@ -1176,6 +1245,8 @@ impl Session {
         if self.last_frame.as_ref() == Some(&shown) {
             return Vec::new();
         }
+        self.renderer
+            .set_physical_scroll_eligible(shown.rows == self.raw_rows);
         let bytes = self.renderer.render(&shown);
         self.last_frame = Some(shown);
         if bytes.is_empty() {
@@ -1227,6 +1298,276 @@ fn seconds_until(until_ms: i64, now_ms: i64) -> u64 {
 mod tests {
     use super::*;
     use render::TermCaps;
+
+    #[test]
+    fn physical_extents_have_bounded_coherent_logical_sizes() {
+        for (cols, rows, expected) in [(1, 1, (2, 1)), (1, 2, (2, 1)), (65535, 65535, (512, 256))] {
+            let mut s = Session::new(
+                cols,
+                rows,
+                TermCaps::truecolor(),
+                PredictMode::Never,
+                Chrome {
+                    line: true,
+                    ..plain()
+                },
+            );
+            assert_eq!(s.size(), expected);
+            let actions = s.on_link(LinkState::Live, 0);
+            assert!(actions.contains(&Action::OpenShell {
+                cols: expected.0,
+                rows: expected.1
+            }));
+            assert_eq!(
+                (s.shell.frame(0, 0).cols, s.shell.frame(0, 0).rows),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn empty_physical_extent_retains_size_without_paint_or_resize() {
+        let mut s = ready_session();
+        let before = s.size();
+        assert!(s.on_resize(0, 0, 10).is_empty());
+        assert_eq!(s.size(), before);
+        assert!(s
+            .on_tick(1000)
+            .iter()
+            .all(|a| !matches!(a, Action::Write(_) | Action::ResizeChannel { .. })));
+        let s = Session::new(0, 0, TermCaps::truecolor(), PredictMode::Never, plain());
+        assert_eq!(s.size(), (80, 24));
+    }
+
+    #[test]
+    fn one_column_projection_hides_clipped_wide_glyphs_and_cursor() {
+        for glyph in ['界', '😀'] {
+            let mut s = Session::new(1, 2, TermCaps::truecolor(), PredictMode::Never, plain());
+            let mut f = terminal::Frame::blank(2, 2);
+            f.cells[0].ch = glyph;
+            f.cells[0].flags = terminal::FLAG_WIDE;
+            f.cells[1].flags = terminal::FLAG_WIDE_SPACER;
+            f.cursor_col = 1;
+            s.paint_at(&f, 0);
+            let shown = s.last_frame.unwrap();
+            assert_eq!((shown.cols, shown.rows), (1, 2));
+            assert_eq!(shown.cells[0], terminal::Cell::blank());
+            assert!(!shown.cursor_visible);
+        }
+    }
+
+    #[test]
+    fn status_toggle_recomputes_one_size_and_zero_notifications_keep_it() {
+        let mut s = ready_session();
+        s.on_resize(1, 2, 10);
+        assert_eq!(s.size(), (2, 2));
+        s.toggle_line(20);
+        assert_eq!(s.size(), (2, 1));
+        assert_eq!(
+            (s.shell.frame(20, 0).cols, s.shell.frame(20, 0).rows),
+            s.size()
+        );
+        assert!(s.due_resize(1000).contains(&Action::ResizeChannel {
+            ch: 16,
+            cols: 2,
+            rows: 1
+        }));
+        let f = s.last_frame.as_ref().unwrap();
+        assert_eq!((f.cols, f.rows), (1, 2));
+        s.on_resize(0, 2, 1010);
+        s.toggle_line(1020);
+        assert_eq!(s.size(), (2, 1));
+        assert!(s.due_resize(2000).is_empty());
+        s.on_resize(1, 2, 2010);
+        assert_eq!(s.size(), (2, 2));
+    }
+
+    #[test]
+    fn replacement_with_empty_display_keeps_the_open_channels_logical_size() {
+        let size = terminal_size::TerminalSize::new(42, 7).unwrap();
+        let mut s = Session::new_with_logical_size(
+            (0, 0),
+            size,
+            TermCaps::truecolor(),
+            PredictMode::Never,
+            Chrome {
+                line: true,
+                ..plain()
+            },
+        );
+        assert_eq!(s.physical_size(), (0, 0));
+        assert_eq!(s.size(), (42, 7));
+        assert_eq!(
+            (s.shell.frame(0, 0).cols, s.shell.frame(0, 0).rows),
+            (42, 7)
+        );
+        assert!(s.repaint(0).is_empty());
+        assert!(s
+            .on_link(LinkState::Live, 0)
+            .contains(&Action::OpenShell { cols: 42, rows: 7 }));
+    }
+
+    #[test]
+    fn empty_viewport_suppresses_warm_reattach_resize() {
+        let mut s = ready_session();
+        s.on_resize(0, 0, 10);
+        s.on_link_gone(20);
+        s.on_reattached(30);
+        assert!(s
+            .on_announced(&[16], 40)
+            .iter()
+            .all(|a| !matches!(a, Action::ResizeChannel { .. })));
+    }
+
+    #[test]
+    fn physical_size_transitions_clear_exterior_without_large_frames() {
+        let mut s = ready_session();
+        for (cols, rows) in [(65535, 65535), (1, 1), (80, 24)] {
+            let actions = s.on_resize(cols, rows, 10);
+            assert!(actions.iter().any(
+                |a| matches!(a, Action::Write(bytes) if bytes.windows(4).any(|w| w == b"\x1b[2J"))
+            ));
+            let f = s.last_frame.as_ref().unwrap();
+            assert!(f.cols <= 512 && f.rows <= 257 && f.cells.len() <= 512 * 257);
+        }
+    }
+
+    // An independent physical sink: unlike TerminalCore this accepts width one.
+    // It checks emitted addressing and printable Unicode widths, including
+    // delayed right-margin wrap, without reusing projection/model geometry.
+    fn assert_physical_output(bytes: &[u8], width: usize, height: usize) {
+        use unicode_width::UnicodeWidthChar;
+        let text = std::str::from_utf8(bytes).unwrap();
+        let mut chars = text.chars().peekable();
+        let (mut x, mut y) = (0, 0);
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\x1b' => {
+                    if chars.next() == Some('[') {
+                        let mut args = String::new();
+                        let final_ch = loop {
+                            let ch = chars.next().expect("terminated CSI");
+                            if ('@'..='~').contains(&ch) {
+                                break ch;
+                            }
+                            args.push(ch);
+                        };
+                        if final_ch == 'H' || final_ch == 'f' {
+                            let mut coordinates = args
+                                .split(';')
+                                .map(|s| s.parse::<usize>().unwrap_or(1).max(1) - 1);
+                            y = coordinates.next().unwrap_or(0);
+                            x = coordinates.next().unwrap_or(0);
+                            assert!(
+                                x < width && y < height,
+                                "address ({x},{y}) outside {width}x{height}"
+                            );
+                        }
+                    }
+                }
+                '\r' => x = 0,
+                '\n' => {
+                    y += 1;
+                    assert!(y < height, "unexpected physical scroll");
+                }
+                ch if !ch.is_control() => {
+                    let advance = ch.width().unwrap_or(0);
+                    if advance > 0 {
+                        if x == width {
+                            x = 0;
+                            y += 1;
+                        }
+                        assert!(
+                            y < height && x + advance <= width,
+                            "glyph {ch:?} crosses physical edge at ({x},{y})"
+                        );
+                        x += advance;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn one_column_sink_accepts_shell_status_help_and_recovery_output() {
+        for height in [1, 2] {
+            for line in [false, true] {
+                let mut s = Session::new(
+                    1,
+                    height,
+                    TermCaps::truecolor(),
+                    PredictMode::Never,
+                    Chrome { line, ..plain() },
+                );
+                for mode in 0..4 {
+                    s.window = match mode {
+                        1 => Some(Open::Help),
+                        3 => Some(Open::Roads(Roads::new())),
+                        _ => None,
+                    };
+                    if mode >= 2 {
+                        s.recovery_view = Some(recovery_view());
+                    }
+                    for glyph in ['x', '界', '😀'] {
+                        let mut f = terminal::Frame::blank(2, s.size().1);
+                        f.cells[0].ch = glyph;
+                        if glyph != 'x' {
+                            f.cells[0].flags = terminal::FLAG_WIDE;
+                            f.cells[1].flags = terminal::FLAG_WIDE_SPACER;
+                        }
+                        f.cursor_col = 1;
+                        s.renderer.invalidate();
+                        s.last_frame = None;
+                        for action in s.paint_at(&f, mode) {
+                            if let Action::Write(bytes) = action {
+                                assert_physical_output(&bytes, 1, height as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_chrome_respects_physical_cell_widths() {
+        for width in 1..=20 {
+            let shell = terminal::Frame::blank(width, 7);
+            let line = statusline::line(width, "", "界😀reconnecting", true, true);
+            let help = window::help_box("界😀", width, 7, plain().glyphs);
+            let recovery = window::recovery_box(
+                &["界😀recovery details".into()],
+                &Roads::new(),
+                width,
+                7,
+                plain().glyphs,
+            );
+            let rows = [Row {
+                label: "界😀server".into(),
+                in_use: true,
+                value: "42 ms".into(),
+                dot: window::Dot::InUse,
+                can_switch: false,
+            }];
+            let roads = window::roads_box(&rows, &Roads::new(), width, 7, plain().glyphs);
+            let frames = [
+                overlay::compose(&shell, Some(&line), None, None),
+                overlay::compose(&shell, None, Some("界😀reconnecting"), None),
+                overlay::compose(&shell, None, None, help.as_ref()),
+                overlay::compose(&shell, None, None, recovery.as_ref()),
+                overlay::compose(&shell, None, None, roads.as_ref()),
+            ];
+            for frame in frames {
+                let mut renderer = Renderer::new(TermCaps::truecolor());
+                assert_physical_output(
+                    &renderer.render(&frame),
+                    width as usize,
+                    frame.rows as usize,
+                );
+            }
+        }
+    }
 
     /// The chrome the older tests were written against: the default prefix,
     /// no status line, one address.

@@ -19,9 +19,16 @@ pub fn compose(
     plate: Option<&str>,
     boxed: Option<&Boxed>,
 ) -> Frame {
+    let shell = crate::viewport::project(
+        shell,
+        terminal_size::ViewportSize::new(
+            shell.cols,
+            terminal_size::MAX_VIEWPORT_ROWS - u16::from(line.is_some()),
+        ),
+    );
     let mut out = match plate {
-        Some(text) => status::overlay(shell, text),
-        None => shell.clone(),
+        Some(text) => status::overlay(&shell, text),
+        None => shell,
     };
     if let Some(line) = line {
         let cols = usize::from(out.cols);
@@ -40,7 +47,8 @@ pub fn compose(
         paint_box(&mut out, boxed);
         out.cursor_visible = false;
     }
-    out
+    let size = terminal_size::ViewportSize::new(out.cols, out.rows);
+    crate::viewport::project(&out, size)
 }
 
 /// Puts `boxed`'s cells over `frame`, clipped at its edges. A wide glyph
@@ -91,6 +99,19 @@ fn paint_box(frame: &mut Frame, boxed: &Boxed) {
 mod tests {
     use super::*;
     use terminal::{Cell, Frame};
+
+    #[test]
+    fn chrome_keeps_presentation_bounded_and_cannot_emit_half_a_glyph() {
+        let shell = Frame::blank(65535, 65535);
+        let out = compose(&shell, Some(&[]), None, None);
+        assert_eq!((out.cols, out.rows, out.cells.len()), (512, 257, 512 * 257));
+        let shell = Frame::blank(1, 1);
+        let mut wide = Cell::blank();
+        wide.ch = '界';
+        wide.flags = FLAG_WIDE;
+        let out = compose(&shell, Some(&[wide]), None, None);
+        assert_eq!(out.cells[0], Cell::blank());
+    }
 
     #[test]
     fn the_line_sits_above_the_shell_and_the_cursor_moves_with_it() {
