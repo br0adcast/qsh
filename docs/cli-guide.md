@@ -191,9 +191,16 @@ Press `Ctrl-]`, then one key:
 | `?` | Show help. |
 | `Ctrl-]` | Send one literal `Ctrl-]` to the remote application. |
 
-Other keys after the prefix are swallowed, including complete arrow/Alt
-sequences. `--escape ^X` changes the prefix; `--escape ^b` selects Ctrl-B.
+Other keys after the prefix are swallowed, including complete arrow and mouse
+sequences. Esc cancels the pending command without swallowing the next ordinary
+key. Alt-letter after the prefix has the same bytes as Esc then that letter, so
+the letter is sent to the remote application. Bracketed-paste contents never
+execute local prefix commands, even when a marker arrives across multiple reads.
+
+`--escape ^X` changes the prefix; `--escape ^b` selects Ctrl-B.
 Avoid `^[` and `^M` unless you intend to intercept Escape or Enter.
+With `^[`, the history command `Esc [` is also the beginning of a paste marker;
+it waits for another byte to distinguish the command from a paste.
 `--escape none` disables the prefix; leave using the shell's `exit`, a signal,
 or by closing the terminal.
 
