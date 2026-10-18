@@ -92,11 +92,12 @@ fn run(a: args::Args) -> i32 {
     // the trial opens the shell channel at, and the one `Session` keeps.
     let (shell_cols, shell_rows) = session::shell_size(cols, rows, a.status_line);
 
-    // Which session on this host this run is coming back to. The claim's
-    // lock is held for the whole run: another `qsh` to the same host takes
+    // Which session for this login and endpoint this run is coming back to.
+    // The lock is held for the whole run: another `qsh` using that tuple takes
     // the next slot instead of stealing this one's shell.
     let mut claim = sessions::claim(
         &config.join("sessions"),
+        &a.login,
         &a.addresses[0].host,
         a.addresses[0].qsh_port,
     );

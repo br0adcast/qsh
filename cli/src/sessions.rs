@@ -1,16 +1,16 @@
-//! Which session on a host this run should claim.
+//! Which session for a login and endpoint this run should claim.
 //!
 //! The transport identifies a session by a 16-byte token the client chooses.
 //! A token kept only in memory means every launch is a new shell: the old
 //! session stays on the server (routable for a day) with no way back into it.
 //! Keeping the token on disk is what turns a reconnect into a return.
 //!
-//! One token is not enough, though. Two terminals open to the same host must
-//! not both claim the same session -- a warm reattach repoints the server's
-//! session at the newer connection, so the second terminal would silently
-//! steal the first one's shell. So a host has SLOTS: slot 0, slot 1, and so
-//! on, each with its own token, and a run takes the lowest slot no live
-//! process is holding.
+//! One token is not enough, though. Two terminals using the same login and
+//! endpoint must not both claim the same session -- a warm reattach repoints
+//! the server's session at the newer connection, so the second terminal would
+//! silently steal the first one's shell. Each login/endpoint has SLOTS: slot 0,
+//! slot 1, and so on, each with its own token. A run takes the lowest slot no
+//! live process is holding.
 //!
 //! "Holding" is an exclusive `flock` on the slot's file, which the kernel
 //! releases when the process dies however it dies -- there is no stale lock
@@ -18,15 +18,15 @@
 //! whose token file exists is exactly the case this module exists for: the
 //! session someone left behind, waiting to be returned to.
 
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-/// How many slots one host may have. Past this the run gives up on resuming
-/// and takes a fresh token that is never written down -- a terminal is not
-/// something a person opens sixteen of to the same host, and an unbounded
+/// How many slots one login/endpoint may have. Past this the run gives up on
+/// resuming and takes a fresh token that is never written down. An unbounded
 /// scan would turn a stuck lock into a hang.
 const MAX_SLOTS: usize = 16;
 
@@ -54,13 +54,15 @@ impl Claim {
     }
 }
 
-/// Claim a session slot for `host`:`port` under `dir`.
+/// Claim a session slot for `login` at `host`:`port` under `dir`.
+///
+/// Legacy host-only records have no login attribution and are never claimed.
 ///
 /// Never fails in a way the caller has to handle: a store that cannot be
 /// created or read gives a fresh random token, which is exactly the old
 /// behavior -- a new session every launch. Resuming is a convenience, and
 /// losing it must not stop someone connecting.
-pub fn claim(dir: &Path, host: &str, port: u16) -> Claim {
+pub fn claim(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
     if std::fs::create_dir_all(dir).is_err() {
         return Claim {
             token: fresh_token(),
@@ -71,7 +73,7 @@ pub fn claim(dir: &Path, host: &str, port: u16) -> Claim {
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
 
     for slot in 0..MAX_SLOTS {
-        let path = dir.join(slot_name(host, port, slot));
+        let path = dir.join(slot_name(login, host, port, slot));
         let Ok(mut file) = OpenOptions::new()
             .read(true)
             .write(true)
@@ -125,21 +127,18 @@ pub fn default_dir() -> PathBuf {
     crate::paths::config_dir().join("sessions")
 }
 
-/// A slot's file name. The host goes in verbatim except for characters that
-/// have meaning in a path -- a host is user input, and `../` in a file name
-/// would write wherever it liked.
-fn slot_name(host: &str, port: u16, slot: usize) -> String {
-    let safe: String = host
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{safe}_{port}_{slot}")
+/// A versioned, bounded filename for the exact login/host/port tuple.
+/// Length framing keeps delimiters and path characters unambiguous without
+/// normalizing host aliases or allowing user input to escape the directory.
+fn slot_name(login: &str, host: &str, port: u16, slot: usize) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"qsh/session-slot/v2\0");
+    for text in [login, host] {
+        hash.update((text.len() as u64).to_be_bytes());
+        hash.update(text.as_bytes());
+    }
+    hash.update(port.to_be_bytes());
+    format!("v2-{:x}-{slot}", hash.finalize())
 }
 
 fn fresh_token() -> [u8; 16] {
@@ -176,20 +175,236 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_login_resumes_its_own_token_on_the_same_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = claim(dir.path(), "alice", "example.org", 60000).token;
+        let bob = claim(dir.path(), "bob", "example.org", 60000).token;
+        assert_ne!(
+            alice, bob,
+            "a different login must not inherit a detached session"
+        );
+        assert_eq!(
+            claim(dir.path(), "alice", "example.org", 60000).token,
+            alice
+        );
+        assert_eq!(claim(dir.path(), "bob", "example.org", 60000).token, bob);
+    }
+
+    #[test]
+    fn logins_hold_independent_numbered_slots_across_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = claim(dir.path(), "alice", "example.org", 60000);
+        let bob = claim(dir.path(), "bob", "example.org", 60000);
+        let alice_second = claim(dir.path(), "alice", "example.org", 60000);
+        for (login, slot, token) in [
+            ("alice", 0, alice.token),
+            ("bob", 0, bob.token),
+            ("alice", 1, alice_second.token),
+        ] {
+            let path = dir
+                .path()
+                .join(slot_name(login, "example.org", 60000, slot));
+            assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), hex(&token));
+            assert_lock_from_subprocess(&path, false);
+        }
+        drop(alice);
+        assert_lock_from_subprocess(
+            &dir.path().join(slot_name("alice", "example.org", 60000, 0)),
+            true,
+        );
+        assert_lock_from_subprocess(
+            &dir.path().join(slot_name("bob", "example.org", 60000, 0)),
+            false,
+        );
+        drop((bob, alice_second));
+    }
+
+    #[test]
+    fn replacement_preserves_each_logins_token_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut alice = claim(dir.path(), "alice", "example.org", 60000);
+        let mut bob = claim(dir.path(), "bob", "example.org", 60000);
+        let bob_original = bob.token;
+        let alice_replacement = alice.replace_token().unwrap();
+        let alice_path = dir.path().join(slot_name("alice", "example.org", 60000, 0));
+        let bob_path = dir.path().join(slot_name("bob", "example.org", 60000, 0));
+        assert_eq!(
+            std::fs::read_to_string(&bob_path).unwrap().trim(),
+            hex(&bob_original)
+        );
+        assert_lock_from_subprocess(&alice_path, false);
+        assert_lock_from_subprocess(&bob_path, false);
+        let bob_replacement = bob.replace_token().unwrap();
+        assert_ne!(bob_replacement, bob_original);
+        assert_eq!(
+            std::fs::read_to_string(&alice_path).unwrap().trim(),
+            hex(&alice_replacement)
+        );
+        assert_lock_from_subprocess(&alice_path, false);
+        assert_lock_from_subprocess(&bob_path, false);
+        drop((alice, bob));
+        assert_eq!(
+            claim(dir.path(), "alice", "example.org", 60000).token,
+            alice_replacement
+        );
+        assert_eq!(
+            claim(dir.path(), "bob", "example.org", 60000).token,
+            bob_replacement
+        );
+    }
+
+    fn assert_lock_from_subprocess(path: &Path, available: bool) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sessions::tests::lock_probe_subprocess",
+                "--nocapture",
+            ])
+            .env("QSH_TEST_SLOT_LOCK_PATH", path)
+            .env("QSH_TEST_SLOT_LOCK_AVAILABLE", available.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "lock probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn lock_probe_subprocess() {
+        let Some(path) = std::env::var_os("QSH_TEST_SLOT_LOCK_PATH") else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let expected = std::env::var("QSH_TEST_SLOT_LOCK_AVAILABLE").unwrap() == "true";
+        assert_eq!(lock_exclusive(&file), expected);
+    }
+
+    #[test]
+    fn legacy_records_are_never_claimed_or_changed_even_when_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.org_60000_0");
+        let contents = "0123456789abcdef0123456789abcdef\n";
+        std::fs::write(&path, contents).unwrap();
+        let legacy_token = parse_token(contents.trim()).unwrap();
+        for locked in [false, true] {
+            let legacy = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            if locked {
+                assert!(lock_exclusive(&legacy));
+            }
+            let alice = claim(dir.path(), "alice", "example.org", 60000);
+            let bob = claim(dir.path(), "bob", "example.org", 60000);
+            assert_ne!(alice.token, legacy_token);
+            assert_ne!(bob.token, legacy_token);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_lock_from_subprocess(&path, !locked);
+            drop((alice, bob, legacy));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        assert_lock_from_subprocess(&path, true);
+    }
+
+    #[test]
+    fn slot_names_have_a_stable_versioned_format() {
+        // Independently calculated SHA-256 of the specified framed tuple.
+        let expected = "v2-b7b360904ec6958a055c0b82ca6d8072a9d9086822a71c5366d1b8aeb494a109-0";
+        assert_eq!(slot_name("alice", "example.org", 60000, 0), expected);
+        assert_eq!(slot_name("alice", "example.org", 60000, 0), expected);
+    }
+
+    #[test]
+    fn tuple_framing_preserves_exact_names_without_path_or_length_collisions() {
+        let tuples = [
+            ("alice", "example.org", 60000),
+            ("bob", "example.org", 60000),
+            ("alice", "EXAMPLE.org", 60000),
+            ("alice", "example.org.", 60000),
+            ("alice", "example.org", 60001),
+            ("alice", "other.example", 60000),
+            ("a/b", "::1", 60000),
+            ("a_b", "::1", 60000),
+            ("a/b", "__1", 60000),
+            ("a/b", "0:0:0:0:0:0:0:1", 60000),
+            ("a:b", "c", 60000),
+            ("a", "b:c", 60000),
+            ("ab", "c", 60000),
+            ("a", "bc", 60000),
+            ("../用户", "../../etc/passwd", 60000),
+            (".._用户", ".._.._etc_passwd", 60000),
+        ];
+        let mut names = std::collections::HashSet::new();
+        for (login, host, port) in tuples {
+            let name = slot_name(login, host, port, 0);
+            assert_eq!(Path::new(&name).components().count(), 1);
+            assert_eq!(name.len(), 69);
+            assert!(
+                names.insert(name),
+                "tuple collision for {login:?}, {host:?}, {port}"
+            );
+        }
+        let long = "用户/".repeat(1000);
+        let name = slot_name(&long, &long, 60000, 15);
+        assert_eq!(name.len(), 70);
+        let dir = tempfile::tempdir().unwrap();
+        let first = claim(dir.path(), &long, &long, 60000).token;
+        assert_eq!(claim(dir.path(), &long, &long, 60000).token, first);
+    }
+
+    #[test]
+    fn exhausting_one_login_does_not_consume_anothers_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let claims: Vec<_> = (0..16)
+            .map(|_| claim(dir.path(), "alice", "example.org", 60000))
+            .collect();
+        let overflow = claim(dir.path(), "alice", "example.org", 60000);
+        assert!(overflow._lock.is_none());
+        let bob = claim(dir.path(), "bob", "example.org", 60000);
+        assert!(bob._lock.is_some());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 17);
+        drop((claims, overflow, bob));
+    }
+
+    #[test]
+    fn an_unavailable_store_still_returns_a_fresh_unlocked_token() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let first = claim(file.path(), "alice", "example.org", 60000);
+        let second = claim(file.path(), "alice", "example.org", 60000);
+        assert!(first._lock.is_none());
+        assert!(second._lock.is_none());
+        assert_ne!(first.token, second.token);
+    }
+
+    #[test]
     fn replacing_a_token_keeps_the_claim_and_persists_only_its_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let mut first = claim(dir.path(), "example.org", 60000);
+        let mut first = claim(dir.path(), "alice", "example.org", 60000);
         let original = first.token;
-        let second = claim(dir.path(), "example.org", 60000);
+        let second = claim(dir.path(), "alice", "example.org", 60000);
         let second_token = second.token;
         let replacement = first.replace_token().unwrap();
         assert_ne!(replacement, original);
         assert_ne!(replacement, second.token);
         drop(first);
-        assert_eq!(claim(dir.path(), "example.org", 60000).token, replacement);
+        assert_eq!(
+            claim(dir.path(), "alice", "example.org", 60000).token,
+            replacement
+        );
         drop(second);
-        let held = claim(dir.path(), "example.org", 60000);
-        assert_eq!(claim(dir.path(), "example.org", 60000).token, second_token);
+        let held = claim(dir.path(), "alice", "example.org", 60000);
+        assert_eq!(
+            claim(dir.path(), "alice", "example.org", 60000).token,
+            second_token
+        );
         drop(held);
     }
 
@@ -198,9 +413,9 @@ mod tests {
     #[test]
     fn the_same_host_gets_the_same_token_next_time() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let first = claim(dir.path(), "example.org", 60000).token;
+        let first = claim(dir.path(), "alice", "example.org", 60000).token;
         // The first run ends: its lock goes with it.
-        let second = claim(dir.path(), "example.org", 60000).token;
+        let second = claim(dir.path(), "alice", "example.org", 60000).token;
         assert_eq!(
             first, second,
             "a slot nobody holds is the session to return to"
@@ -213,8 +428,8 @@ mod tests {
     #[test]
     fn a_second_run_while_the_first_holds_its_slot_gets_another_token() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let first = claim(dir.path(), "example.org", 60000);
-        let second = claim(dir.path(), "example.org", 60000);
+        let first = claim(dir.path(), "alice", "example.org", 60000);
+        let second = claim(dir.path(), "alice", "example.org", 60000);
         assert_ne!(
             first.token, second.token,
             "a held slot is someone's live session, not a free one"
@@ -222,7 +437,7 @@ mod tests {
         // And the second slot is itself resumable once released.
         let second_token = second.token;
         drop(second);
-        let again = claim(dir.path(), "example.org", 60000);
+        let again = claim(dir.path(), "alice", "example.org", 60000);
         assert_ne!(again.token, first.token, "the first slot is still held");
         assert_eq!(
             again.token, second_token,
@@ -235,25 +450,12 @@ mod tests {
     #[test]
     fn hosts_and_ports_do_not_share_a_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let a = claim(dir.path(), "example.org", 60000).token;
-        let b = claim(dir.path(), "example.org", 60022).token;
-        let c = claim(dir.path(), "other.example", 60000).token;
+        let a = claim(dir.path(), "alice", "example.org", 60000).token;
+        let b = claim(dir.path(), "alice", "example.org", 60022).token;
+        let c = claim(dir.path(), "alice", "other.example", 60000).token;
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
-    }
-
-    /// A host name is user input and ends up in a file name. Anything that
-    /// could climb out of the store directory is replaced rather than
-    /// escaped, so there is nothing to get wrong twice.
-    #[test]
-    fn a_host_name_cannot_escape_the_store_directory() {
-        let name = slot_name("../../etc/passwd", 60000, 0);
-        assert!(
-            !name.contains('/'),
-            "a slot file name must stay a file name, got {name:?}"
-        );
-        assert_eq!(name, ".._.._etc_passwd_60000_0");
     }
 
     /// A token file someone truncated, edited or filled with junk must not
@@ -261,9 +463,9 @@ mod tests {
     #[test]
     fn a_damaged_token_file_is_replaced_rather_than_trusted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(slot_name("example.org", 60000, 0));
+        let path = dir.path().join(slot_name("alice", "example.org", 60000, 0));
         std::fs::write(&path, "not a token at all\n").expect("write");
-        let claimed = claim(dir.path(), "example.org", 60000);
+        let claimed = claim(dir.path(), "alice", "example.org", 60000);
         assert_ne!(claimed.token, [0u8; 16]);
         drop(claimed);
         let text = std::fs::read_to_string(&path).expect("read");
@@ -276,10 +478,10 @@ mod tests {
     fn the_store_keeps_its_files_to_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("sessions");
-        let claimed = claim(&store, "example.org", 60000);
+        let claimed = claim(&store, "alice", "example.org", 60000);
         drop(claimed);
         let dir_mode = std::fs::metadata(&store).expect("dir").permissions().mode() & 0o777;
-        let file_mode = std::fs::metadata(store.join(slot_name("example.org", 60000, 0)))
+        let file_mode = std::fs::metadata(store.join(slot_name("alice", "example.org", 60000, 0)))
             .expect("file")
             .permissions()
             .mode()

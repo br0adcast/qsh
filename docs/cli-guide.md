@@ -310,10 +310,21 @@ at most sixteen live and retained sessions together. tmux provides persistence
 beyond these bounds; qsh alone does not promise it.
 
 Leaving with `Ctrl-] .` keeps the server session. Running the same command returns
-to it; the first address is the local session-record key, so reordering addresses
-can select a different session. A key conflict during foreground login exits
-with code 11. During recovery, a foreign server is retried as a failed path while
-the expected key remains unchanged. When the expected server authenticates but
+to it. Local session records are scoped by the effective login, the first
+configured host's exact spelling, and its QSH port. Different logins have separate
+tokens and numbered locks. Reordering addresses, changing the login or port, or
+using another spelling or alias for the host can select a different session;
+qsh does not resolve or normalize host names when choosing a local record.
+
+The login-scoped storage format uses `v2-<hash>-<slot>` filenames. Older host-only
+records remain untouched and are never automatically imported or claimed: they
+contain no trustworthy login attribution. After upgrading from that format, qsh
+starts with a fresh local record and cannot automatically resume a detached
+session through its old record. This transition does not terminate the old
+server session.
+
+A key conflict during foreground login exits with code 11. During recovery, a
+foreign server is retried as a failed path while the expected key remains unchanged. When the expected server authenticates but
 confirms that the old session no longer exists, for example after a daemon
 restart, or an authenticated resume no longer lists the tracked shell, qsh restores the terminal, explains the loss, and asks
 `Start a new session? [Y/n]`. Enter, `yes`, or `y` starts a fresh shell
