@@ -91,7 +91,7 @@ use super::channel;
 use super::config::HelperConfig;
 #[cfg(test)]
 use super::config::PAM_SERVICE;
-use super::monitor::{run_monitor, MonitorPlan};
+use super::monitor::{self, run_monitor, MonitorPlan};
 use super::pending::{Pending, PendingTable, PendingWhat};
 use super::protocol::{
     decode, encode, AuthRequest, AuthResponse, ChannelId, MonitorEvent, MonitorRequest, Nonce,
@@ -435,6 +435,7 @@ struct AccountSwitches {
     /// How a channel's child becomes the account it runs as: called between
     /// `fork` and `exec`, so it must not allocate -- see the module's docs.
     become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
+    session_group_ops: monitor::SessionGroupOps,
 }
 
 impl AccountSwitches {
@@ -446,6 +447,7 @@ impl AccountSwitches {
         lookup: account::lookup,
         read_keys: authorized::read_for,
         become_account,
+        session_group_ops: monitor::SessionGroupOps::REAL,
     };
 }
 
@@ -1063,9 +1065,7 @@ fn serve(
         // about to be free.
         serve_ready_monitors(seams, &mut state, &ready_monitors);
         if channel_ready {
-            if let Next::Stop =
-                serve_channel_seam(&channels, &mut state, &config, switches.become_account)
-            {
+            if let Next::Stop = serve_channel_seam(&channels, &mut state, &config, switches) {
                 break;
             }
         }
@@ -1171,7 +1171,7 @@ fn serve_channel_seam(
     sock: &UnixStream,
     state: &mut LoopState,
     config: &HelperConfig,
-    become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
+    switches: AccountSwitches,
 ) -> Next {
     let message = match channel::recv(sock) {
         Ok(Some((bytes, _fd))) => bytes,
@@ -1364,15 +1364,7 @@ fn serve_channel_seam(
                 );
                 return Next::Continue;
             }
-            match open_channel(
-                sock,
-                state,
-                &account,
-                login,
-                config,
-                &launch,
-                become_account,
-            ) {
+            match open_channel(sock, state, &account, login, config, &launch, switches) {
                 Ok(master) => {
                     // The id is taken from the instant the shell is ASKED
                     // for, not from the instant the monitor reports it --
@@ -2081,8 +2073,8 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[LoginI
                 StartupReport::Failed(nix::Error::from_raw(errno)),
             ),
             Ok(MonitorEvent::Exited { id, code }) => report_exit(seams.channels, state, id, code),
-            // The login's PAM stack refused it, so no session was opened and
-            // no shell forked. The real reason is written down HERE, in the
+            // Login session setup failed before any shell was forked.
+            // The real reason is written down HERE, in the
             // one process that has a log (a monitor may not write to it --
             // see `monitor`'s module docs), and the worker is told only the
             // shared `REFUSED_REASON`: which check refused a login is
@@ -2098,7 +2090,7 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[LoginI
                 crate::log::warn(
                     "helper",
                     &format!(
-                        "the PAM stack refused login {:02x}{:02x}.. at channel {id}: \
+                        "login session setup failed {:02x}{:02x}.. at channel {id}: \
                      {why}; refusing the channel and ending the login",
                         login[0], login[1]
                     ),
@@ -3153,7 +3145,7 @@ fn open_channel(
     login: LoginId,
     config: &HelperConfig,
     launch: &Launch<'_>,
-    become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
+    switches: AccountSwitches,
 ) -> anyhow::Result<OwnedFd> {
     use nix::pty::{openpty, Winsize};
 
@@ -3214,7 +3206,8 @@ fn open_channel(
             pam_service: config.pam_service.clone(),
             #[cfg(test)]
             pam_confdir: config.pam_confdir.clone(),
-            become_account,
+            become_account: switches.become_account,
+            session_group_ops: switches.session_group_ops,
             fd_limit: max_open_descriptors(),
             // The monitor's share of this channel's own budget. The session
             // it is about to open opens INSIDE this `Open`, so a stack that
@@ -4117,9 +4110,8 @@ fn check_supplementary_groups(expected: &[Gid], buffer: &mut [Gid]) -> nix::Resu
     // then panic, HERE, between `fork` and `exec`, where a panic unwinds a
     // forked copy of the test harness and ends the child with 101 -- the
     // worker would see `Opened` followed by `Exited(101)` and never learn
-    // why. Unreachable today (`getgrouplist` always returns at least the
-    // primary group, so `expected` is never empty), and refused rather than
-    // trusted to stay that way.
+    // why. PAM may deliberately leave an empty supplementary list. Reject
+    // unexpected nonempty groups before slicing this zero-length buffer.
     if count as usize > buffer.len() {
         return Err(Errno::EPERM);
     }
@@ -5743,6 +5735,10 @@ pub(crate) mod tests {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
         become_account: keep_identity,
+        session_group_ops: monitor::SessionGroupOps {
+            install: |_| Ok(()),
+            capture: monitor::SessionGroupOps::REAL.capture,
+        },
     };
 
     /// A helper that starts out with `account` admitted under
@@ -6149,7 +6145,15 @@ pub(crate) mod tests {
             become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
         ) {
             super::channel::send(&self.worker, &encode(req).expect("encode"), None).expect("send");
-            serve_channel_seam(&self.helper, state, config, become_account);
+            serve_channel_seam(
+                &self.helper,
+                state,
+                config,
+                AccountSwitches {
+                    become_account,
+                    ..UNPRIVILEGED
+                },
+            );
         }
 
         /// The loop's own pending pass, run until nothing is pending: the
@@ -7239,12 +7243,7 @@ pub(crate) mod tests {
         super::channel::send(&seam.worker, &forged, None).expect("send");
         assert!(
             matches!(
-                serve_channel_seam(
-                    &seam.helper,
-                    &mut state,
-                    &config,
-                    UNPRIVILEGED.become_account
-                ),
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED),
                 Next::Stop
             ),
             "a malformed request still stops the helper"
@@ -12958,6 +12957,7 @@ pub(crate) mod tests {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
         become_account: become_account_wrong_gid,
+        session_group_ops: monitor::SessionGroupOps::REAL,
     };
 
     /// A test `become_account` that keeps the permitted capability set across
@@ -12978,6 +12978,7 @@ pub(crate) mod tests {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
         become_account: become_account_keeping_caps,
+        session_group_ops: monitor::SessionGroupOps::REAL,
     };
 
     /// A test `become_account` that sets an EMPTY supplementary list instead
@@ -12991,6 +12992,7 @@ pub(crate) mod tests {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
         become_account: become_account_empty_groups,
+        session_group_ops: monitor::SessionGroupOps::REAL,
     };
 
     /// `give_terminal` leaves the slave at mode exactly 0620, owned by the
@@ -13115,6 +13117,228 @@ pub(crate) mod tests {
         let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
         assert_admits(&h.auth, &key, &h.me);
         h
+    }
+
+    fn disposable_group_fixture(test: &str) -> Option<String> {
+        if !running_as_root() || std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED {test}: real PAM credential tests require a disposable root container"
+            );
+            return None;
+        }
+        let module = std::env::var("QSHD_TEST_PAM_GROUP_MODULE")
+            .expect("disposable tier supplies PAM fixture");
+        assert!(Path::new(&module).is_file(), "missing PAM fixture {module}");
+        Some(module)
+    }
+
+    /// Only monitors and their children mutate identity, never this libtest process.
+    fn refused_group_session(
+        module: &str,
+        options: &str,
+        switches: AccountSwitches,
+        child_failure: bool,
+    ) -> Vec<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let record = dir.path().join("phases");
+        let marker = dir.path().join("shell-ran");
+        let stack = ["auth", "account", "session"]
+            .map(|kind| {
+                format!(
+                    "{kind} required {module} record={} gid=61002 {options}\n",
+                    record.display()
+                )
+            })
+            .concat();
+        write_stack(dir.path(), "qshd-test-groups", &stack);
+        let config = HelperConfig {
+            pam_service: "qshd-test-groups".into(),
+            pam_confdir: Some(dir.path().to_path_buf()),
+            ..test_config()
+        };
+        let account = nobody_with_shell("/bin/sh");
+        let h = helper_for(account.clone(), config, switches);
+        channel::send(
+            &h.channels,
+            &encode(&open_for(
+                1,
+                &account,
+                &format!("touch {}", marker.display()),
+            ))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let (answer, fd) = next_response(&h.channels);
+        assert!(
+            matches!(&answer, Response::Failed { id: 1, reason }
+            if if child_failure { reason.contains("EPERM") } else { reason == REFUSED_REASON }),
+            "{answer:?}"
+        );
+        assert!(fd.is_none());
+        h.stop();
+        assert!(
+            !marker.exists(),
+            "refused session must never execute a shell"
+        );
+        std::fs::read_to_string(record)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn recorded_phases(records: &[String]) -> Vec<&str> {
+        let pids: Vec<_> = records
+            .iter()
+            .map(|r| r.split_whitespace().next().unwrap())
+            .collect();
+        assert!(
+            pids.windows(2).all(|pair| pair[0] == pair[1]),
+            "same monitor performs cleanup"
+        );
+        records
+            .iter()
+            .map(|r| r.split_whitespace().nth(1).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn baseline_group_failure_never_enters_pam() {
+        let Some(module) = disposable_group_fixture("baseline_group_failure_never_enters_pam")
+        else {
+            return;
+        };
+        for ops in [
+            monitor::SessionGroupOps {
+                install: |_| Err(Errno::EPERM),
+                ..monitor::SessionGroupOps::REAL
+            },
+            monitor::SessionGroupOps {
+                capture: || Ok(vec![Gid::from_raw(61001)]),
+                ..monitor::SessionGroupOps::REAL
+            },
+            monitor::SessionGroupOps {
+                capture: || Err(Errno::EIO),
+                ..monitor::SessionGroupOps::REAL
+            },
+        ] {
+            let records = refused_group_session(
+                &module,
+                "",
+                AccountSwitches {
+                    session_group_ops: ops,
+                    ..AccountSwitches::REAL
+                },
+                false,
+            );
+            assert!(
+                records.is_empty(),
+                "baseline failure must not start PAM: {records:?}"
+            );
+        }
+    }
+
+    fn fail_capture_after_baseline() -> nix::Result<Vec<Gid>> {
+        // Each fresh monitor inherits zero from the unchanged test process.
+        static CAPTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            (monitor::SessionGroupOps::REAL.capture)()
+        } else {
+            Err(Errno::EIO)
+        }
+    }
+
+    #[test]
+    fn post_open_group_capture_failure_closes_the_session() {
+        let Some(module) =
+            disposable_group_fixture("post_open_group_capture_failure_closes_the_session")
+        else {
+            return;
+        };
+        let records = refused_group_session(
+            &module,
+            "phase=open",
+            AccountSwitches {
+                session_group_ops: monitor::SessionGroupOps {
+                    capture: fail_capture_after_baseline,
+                    ..monitor::SessionGroupOps::REAL
+                },
+                ..AccountSwitches::REAL
+            },
+            false,
+        );
+        assert_eq!(
+            recorded_phases(&records),
+            ["account", "establish", "open", "close", "delete", "end"]
+        );
+    }
+
+    #[test]
+    fn failed_establish_does_not_close_an_unopened_session() {
+        let Some(module) =
+            disposable_group_fixture("failed_establish_does_not_close_an_unopened_session")
+        else {
+            return;
+        };
+        let records =
+            refused_group_session(&module, "fail=establish", AccountSwitches::REAL, false);
+        assert_eq!(recorded_phases(&records), ["account", "establish", "end"]);
+    }
+
+    #[test]
+    fn failed_session_open_deletes_established_credentials() {
+        let Some(module) =
+            disposable_group_fixture("failed_session_open_deletes_established_credentials")
+        else {
+            return;
+        };
+        let records = refused_group_session(&module, "fail=open", AccountSwitches::REAL, false);
+        assert_eq!(
+            recorded_phases(&records),
+            ["account", "establish", "open", "delete", "end"]
+        );
+    }
+
+    fn become_account_with_nss_groups(uid: Uid, gid: Gid, _groups: &[Gid]) -> nix::Result<()> {
+        // nobody's NSS baseline in this disposable fixture is its primary gid alone.
+        become_account(uid, gid, &[gid])
+    }
+
+    #[test]
+    fn child_rejects_nss_groups_in_place_of_pam_groups() {
+        let Some(module) =
+            disposable_group_fixture("child_rejects_nss_groups_in_place_of_pam_groups")
+        else {
+            return;
+        };
+        assert_eq!(nobody().groups, vec![nobody().gid]);
+        let records = refused_group_session(
+            &module,
+            "",
+            AccountSwitches {
+                become_account: become_account_with_nss_groups,
+                ..AccountSwitches::REAL
+            },
+            true,
+        );
+        assert_eq!(
+            recorded_phases(&records),
+            ["account", "establish", "open", "close", "delete", "end"]
+        );
+    }
+
+    #[test]
+    fn empty_expected_groups_reject_nonempty_actual_groups() {
+        let actual = nix::unistd::getgroups().unwrap();
+        // No privileged mutation in this process: the runner supplies its groups.
+        if actual.is_empty() {
+            eprintln!("SKIPPED empty_expected_groups_reject_nonempty_actual_groups: runner has no supplementary groups");
+            return;
+        }
+        assert_eq!(check_supplementary_groups(&[], &mut []), Err(Errno::EPERM));
     }
 
     /// A stack that admits everything, for a control on the same harness.

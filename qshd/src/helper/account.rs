@@ -26,8 +26,9 @@ pub struct Account {
     pub name: String,
     pub home: PathBuf,
     pub shell: PathBuf,
-    /// Supplementary groups, including the primary one, in the order
-    /// `getgrouplist` returned them.
+    /// NSS/authorization baseline, including the primary group, in the order
+    /// `getgrouplist` returned them. PAM session credentials are monitor-local
+    /// and must not change this authorization context.
     pub groups: Vec<Gid>,
 }
 

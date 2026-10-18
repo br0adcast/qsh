@@ -100,6 +100,76 @@ use super::server::{
     shell_basename, StartupReport, CLOSE_GRACE_PERIOD, REAP_INTERVAL, STARTUP_REPORT_TIMEOUT,
 };
 
+/// Supplementary-group operations confined to each login's monitor.
+/// Production always uses REAL; function pointers let tests exercise syscall failures.
+#[derive(Clone, Copy)]
+pub(super) struct SessionGroupOps {
+    pub(super) install: fn(&[Gid]) -> nix::Result<()>,
+    pub(super) capture: fn() -> nix::Result<Vec<Gid>>,
+}
+
+impl SessionGroupOps {
+    pub(super) const REAL: Self = Self {
+        install: nix::unistd::setgroups,
+        capture: capture_supplementary_groups,
+    };
+}
+
+fn allocate_groups(count: usize) -> nix::Result<Vec<Gid>> {
+    let mut groups = Vec::new();
+    groups
+        .try_reserve_exact(count)
+        .map_err(|_| nix::errno::Errno::ENOMEM)?;
+    groups.resize(count, Gid::from_raw(0));
+    Ok(groups)
+}
+
+/// Take one bounded kernel snapshot. A changed count is an error, never a retry
+/// or an empty-list fallback. No NSS reconstruction is valid after PAM.
+fn capture_supplementary_groups() -> nix::Result<Vec<Gid>> {
+    // SAFETY: sysconf takes a constant and returns a value, touching no pointers.
+    let limit = unsafe { nix::libc::sysconf(nix::libc::_SC_NGROUPS_MAX) };
+    capture_groups_with(
+        limit,
+        |buffer| {
+            // SAFETY: buffer has the validated, representable length passed to getgroups.
+            // A zero length is its count query and writes nothing.
+            let count = unsafe {
+                nix::libc::getgroups(
+                    buffer.len() as nix::libc::c_int,
+                    buffer.as_mut_ptr().cast::<nix::libc::gid_t>(),
+                )
+            };
+            if count < 0 {
+                Err(nix::errno::Errno::last())
+            } else {
+                Ok(count as i64)
+            }
+        },
+        allocate_groups,
+    )
+}
+
+fn capture_groups_with(
+    limit: nix::libc::c_long,
+    mut read: impl FnMut(&mut [Gid]) -> nix::Result<i64>,
+    allocate: fn(usize) -> nix::Result<Vec<Gid>>,
+) -> nix::Result<Vec<Gid>> {
+    use nix::errno::Errno::EINVAL;
+    if limit <= 0 || limit > nix::libc::c_int::MAX as nix::libc::c_long {
+        return Err(EINVAL);
+    }
+    let count = usize::try_from(read(&mut [])?).map_err(|_| EINVAL)?;
+    if count > limit as usize {
+        return Err(EINVAL);
+    }
+    let mut groups = allocate(count)?;
+    if groups.len() != count || read(&mut groups)? != count as i64 {
+        return Err(EINVAL);
+    }
+    Ok(groups)
+}
+
 /// The errno a channel is refused with when its shell could not even be
 /// prepared -- a command or a home path with a NUL in it, a pipe the kernel
 /// would not open. Nothing about those is an errno of its own, and the
@@ -148,6 +218,7 @@ pub(super) struct MonitorPlan {
     /// rest of this plan, because the tests of this crate run a helper
     /// unprivileged and need a drop that changes nothing.
     pub(super) become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
+    pub(super) session_group_ops: SessionGroupOps,
     /// How far a descriptor sweep may have to walk
     /// (`server::max_open_descriptors`), read by the helper before the fork:
     /// `getrlimit` is a libc call, and the sweep runs before this process
@@ -243,14 +314,8 @@ struct Session {
     /// Whether `pam_setcred(PAM_ESTABLISH_CRED)` returned success, and so
     /// whether there is anything for `PAM_DELETE_CRED` to take down.
     ///
-    /// NOT pinned by a test: no stock module records a `pam_setcred` call
-    /// (`pam_exec`'s own `pam_sm_setcred` returns `PAM_IGNORE` without
-    /// running anything, and `PAM_TYPE` has no `setcred` value), so removing
-    /// this guard -- deleting credentials that were never established --
-    /// leaves the whole suite green. This is reasoning, not coverage: treat
-    /// it as load-bearing when you edit it. Its sibling
-    /// [`Session::session_open`] IS pinned, by
-    /// `credentials_are_established_before_the_session_opens`.
+    /// The real fixture records establish/delete and failed establishment,
+    /// including the absence of cleanup for credentials never established.
     cred_established: bool,
     /// Whether `pam_open_session` returned success, and so whether there is
     /// a session for `pam_close_session` to close. A close of a session
@@ -261,6 +326,8 @@ struct Session {
     /// [`merge_env`]). Read once, here, because a shell's environment has
     /// to be complete before the fork that runs it.
     env: Vec<CString>,
+    /// Exact kernel snapshot after the complete PAM opening sequence.
+    groups: Vec<Gid>,
 }
 
 impl Session {
@@ -279,6 +346,16 @@ impl Session {
         // this function, including the `close` on the refusal path, and
         // disarmed by its own `Drop` however this returns.
         let _deadline = SessionDeadline::armed(plan.session_budget);
+        (plan.session_group_ops.install)(&plan.account.groups)
+            .map_err(|e| sanitized_detail(&format!("install account supplementary groups: {e}")))?;
+        let mut baseline = (plan.session_group_ops.capture)()
+            .map_err(|e| sanitized_detail(&format!("read account supplementary groups: {e}")))?;
+        let mut expected = plan.account.groups.clone();
+        baseline.sort_unstable_by_key(|g| g.as_raw());
+        expected.sort_unstable_by_key(|g| g.as_raw());
+        if baseline != expected {
+            return Err("verify account supplementary groups: group list mismatch".into());
+        }
         let pam = match start_transaction(plan) {
             Ok(pam) => pam,
             // Nothing started: no handle to read messages from, nothing to
@@ -290,9 +367,22 @@ impl Session {
             cred_established: false,
             session_open: false,
             env: Vec::new(),
+            groups: Vec::new(),
         };
         match session.open() {
-            Ok(()) => Ok(session),
+            Ok(()) => match (plan.session_group_ops.capture)() {
+                Ok(groups) => {
+                    session.groups = groups;
+                    session.env = session.pam.env_list();
+                    Ok(session)
+                }
+                Err(e) => {
+                    let why =
+                        sanitized_detail(&format!("capture PAM session supplementary groups: {e}"));
+                    session.close();
+                    Err(why)
+                }
+            },
             Err(e) => {
                 let why = session.refusal_detail(&e);
                 session.close();
@@ -324,7 +414,6 @@ impl Session {
         self.cred_established = true;
         self.pam.open_session()?;
         self.session_open = true;
-        self.env = self.pam.env_list();
         Ok(())
     }
 
@@ -887,9 +976,9 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     // anywhere in there has already reparented this process, whenever in
     // that window it happened. This is a child of a `fork`, so nothing here
     // inherited the helper's own registration; and unlike a shell, a
-    // monitor never changes its credentials (only `fork_shell`'s child
-    // does, after its own fork), so nothing clears this one afterwards and
-    // it needs no second arming. `a_monitor_dies_with_its_helper` pins the
+    // monitor changes supplementary groups only, which does not clear
+    // the parent-death signal. Its uid and primary gid remain unchanged,
+    // so it needs no second arming. `a_monitor_dies_with_its_helper` pins the
     // effect.
     //
     // A failure is fatal, and silently: this process may not write to the
@@ -1071,9 +1160,9 @@ fn serve_request(
                         *session = Some(opened);
                     }
                     Err(why) => {
-                        // Nothing was opened, so nothing is closed, and
-                        // this login gets no shell -- not now and not
-                        // later. The monitor ENDS: a login whose account
+                        // Session::begin has already cleaned up any opened
+                        // PAM state. This login gets no shell, now or later.
+                        // The monitor ENDS: a login whose account
                         // stack refused it must not be left with a process
                         // that could still fork a shell outside any
                         // session, and the helper turns the loss of a
@@ -1096,7 +1185,15 @@ fn serve_request(
                 // plausible-looking default.
                 return false;
             };
-            match fork_shell(plan, &open.env, slave, term.as_deref(), shell, &command) {
+            match fork_shell(
+                plan,
+                &open.env,
+                &open.groups,
+                slave,
+                term.as_deref(),
+                shell,
+                &command,
+            ) {
                 Ok((pid, report)) => shells.push(Shell {
                     id,
                     pid,
@@ -1349,6 +1446,7 @@ fn tell(seam: &UnixStream, event: &MonitorEvent) {
 fn fork_shell(
     plan: &MonitorPlan,
     session_env: &[CString],
+    session_groups: &[Gid],
     slave: OwnedFd,
     term: Option<&str>,
     login: bool,
@@ -1381,9 +1479,9 @@ fn fork_shell(
     let c_home =
         CString::new(account.home.as_os_str().as_bytes()).map_err(|_| PREPARATION_REFUSED)?;
     let chdir_warning = super::server::chdir_warning_bytes(account.home.as_os_str().as_bytes());
-    let mut expected_groups: Vec<Gid> = account.groups.clone();
+    let mut expected_groups: Vec<Gid> = session_groups.to_vec();
     expected_groups.sort_unstable_by_key(|g| g.as_raw());
-    let mut groups_buffer: Vec<Gid> = vec![Gid::from_raw(0); account.groups.len()];
+    let mut groups_buffer: Vec<Gid> = vec![Gid::from_raw(0); session_groups.len()];
     let argv_ptrs: Vec<*const c_char> = c_argv
         .iter()
         .map(|a| a.as_ptr())
@@ -1405,7 +1503,7 @@ fn fork_shell(
     let become_account = plan.become_account;
     let uid = account.uid;
     let gid = account.gid;
-    let groups = &account.groups;
+    let groups = session_groups;
 
     // SAFETY: this monitor is single-threaded -- it is a child of the
     // single-threaded helper and starts no thread of its own -- so no other
@@ -1550,6 +1648,89 @@ mod tests {
             .name
     }
 
+    #[test]
+    fn bounded_group_capture_rejects_invalid_limit_and_count() {
+        use nix::errno::Errno::EINVAL;
+        let mut limits = vec![-1, 0];
+        if let Some(excessive) = (nix::libc::c_int::MAX as nix::libc::c_long).checked_add(1) {
+            limits.push(excessive);
+        }
+        for limit in limits {
+            assert_eq!(
+                capture_groups_with(
+                    limit,
+                    |_| panic!("invalid limit must not query"),
+                    allocate_groups
+                ),
+                Err(EINVAL)
+            );
+        }
+        for count in [-1, 5, i64::MAX] {
+            assert_eq!(
+                capture_groups_with(4, |_| Ok(count), allocate_groups),
+                Err(EINVAL)
+            );
+        }
+        assert_eq!(
+            capture_groups_with(4, |_| Err(nix::errno::Errno::EIO), allocate_groups),
+            Err(nix::errno::Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn bounded_group_capture_rejects_second_read_failure_or_count_change() {
+        use nix::errno::Errno::{EINVAL, EIO};
+        for result in [Err(EIO), Ok(0), Ok(2)] {
+            let mut reads = 0;
+            assert_eq!(
+                capture_groups_with(
+                    4,
+                    |_| {
+                        reads += 1;
+                        if reads == 1 {
+                            Ok(1)
+                        } else {
+                            result
+                        }
+                    },
+                    allocate_groups
+                ),
+                Err(if result.is_err() { EIO } else { EINVAL })
+            );
+            assert_eq!(reads, 2, "no unbounded retry");
+        }
+    }
+
+    #[test]
+    fn bounded_group_capture_maps_allocation_failure_and_preserves_empty() {
+        use nix::errno::Errno::ENOMEM;
+        assert_eq!(
+            capture_groups_with(4, |_| Ok(1), |_| Err(ENOMEM)),
+            Err(ENOMEM)
+        );
+        assert_eq!(allocate_groups(usize::MAX), Err(ENOMEM));
+        assert_eq!(
+            capture_groups_with(4, |_| Ok(0), allocate_groups),
+            Ok(vec![])
+        );
+        let mut reads = 0;
+        assert_eq!(
+            capture_groups_with(
+                4,
+                |out| {
+                    reads += 1;
+                    if reads == 2 {
+                        out.copy_from_slice(&[Gid::from_raw(0), Gid::from_raw(42)]);
+                    }
+                    Ok(2)
+                },
+                allocate_groups
+            ),
+            Ok(vec![Gid::from_raw(0), Gid::from_raw(42)])
+        );
+        assert_eq!(capture_supplementary_groups(), nix::unistd::getgroups());
+    }
+
     fn remote_transaction(
         dir: &std::path::Path,
         service: &str,
@@ -1566,6 +1747,7 @@ mod tests {
             pam_service: service.into(),
             pam_confdir: Some(dir.to_path_buf()),
             become_account: |_, _, _| Ok(()),
+            session_group_ops: SessionGroupOps::REAL,
             fd_limit: 0,
             session_budget: Duration::from_secs(1),
             session_close_budget: Duration::from_secs(1),

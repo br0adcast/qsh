@@ -96,7 +96,7 @@ fn who_am_i_answer(account: &str) -> String {
 /// The needle the helper writes when a login's account stack refuses it
 /// (`qshd/src/helper/server.rs`). The wire carries only the shared
 /// `REFUSED_REASON`, so the log is the only place the real verdict appears.
-const PAM_REFUSAL: &str = "the PAM stack refused login";
+const PAM_REFUSAL: &str = "login session setup failed";
 
 /// An expired account is refused -- and the SAME account got in a moment
 /// earlier, which is what makes this about expiry rather than about a key
@@ -296,6 +296,342 @@ fn a_session_is_closed_when_the_login_ends() {
 
             daemon.child.kill().expect("stopping the daemon");
             daemon.child.wait().expect("reaping the daemon");
+        },
+    );
+}
+
+const SENTINEL_GROUP: u32 = 61001;
+const PAM_GROUP: u32 = 61002;
+const GROUP_REPORT: &str = r#"awk '/^(Uid|Gid|Groups|CapEff|CapPrm):/ {printf "qshd-proc-%s=[", $1; for(i=2;i<=NF;i++)printf "%s%s",i==2?"":" ",$i; print "]"}' /proc/self/status"#;
+
+fn fixture_stack(record: &std::path::Path, options: &str) -> String {
+    let module = std::env::var("QSHD_TEST_PAM_GROUP_MODULE")
+        .expect("disposable tier must provide the built PAM group fixture");
+    assert!(
+        std::path::Path::new(&module).is_file(),
+        "missing fixture {module}"
+    );
+    ["auth", "account", "session"]
+        .map(|kind| {
+            format!(
+                "{kind} required {module} record={} {options}\n",
+                record.display()
+            )
+        })
+        .concat()
+}
+
+fn proc_values(output: &str, name: &str) -> Vec<u32> {
+    let prefix = format!("qshd-proc-{name}:=[");
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("missing executed process report {name}: {output:?}"));
+    line.trim_end_matches(']')
+        .split_whitespace()
+        .map(|n| n.parse().expect("numeric proc field"))
+        .collect()
+}
+
+fn group_regression(test: &str, baseline_only: bool) {
+    common::on_a_disposable_host(test, WHAT_THESE_TESTS_DO, || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let account = common::TestAccount::create("qshd-test-groups", "/bin/sh");
+        let baseline = nix::unistd::getgrouplist(
+            &std::ffi::CString::new(account.name.clone()).unwrap(),
+            nix::unistd::User::from_uid(account.uid)
+                .unwrap()
+                .unwrap()
+                .gid,
+        )
+        .unwrap();
+        assert!(!baseline
+            .iter()
+            .any(|g| [SENTINEL_GROUP, PAM_GROUP].contains(&g.as_raw())));
+        common::install_service_file("auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n");
+        let (_daemon, server_pub, port) = common::start_daemon_with_groups(
+            dir.path(),
+            &["--authorized-keys-template", "%h/.ssh/authorized_keys"],
+            Some(vec![nix::unistd::Gid::from_raw(SENTINEL_GROUP)]),
+        );
+        let positive = common::run_one_command_in_a_shell(
+            port,
+            server_pub,
+            &account.key,
+            &account.name,
+            WHO_AM_I,
+        );
+        assert!(
+            positive.contains(&who_am_i_answer(&account.name)),
+            "positive control: {positive}"
+        );
+        let record = dir.path().join("phases");
+        common::install_service_file(&fixture_stack(&record, &format!("gid={PAM_GROUP}")));
+        let output = common::run_one_command_in_a_shell(
+            port,
+            server_pub,
+            &account.key,
+            &account.name,
+            GROUP_REPORT,
+        );
+        let records = std::fs::read_to_string(&record).expect("module records");
+        if baseline_only {
+            let first = records.lines().next().expect("account record");
+            let before = first
+                .split("before=")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            let mut actual: Vec<u32> = before
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|g| g.parse().unwrap())
+                .collect();
+            let mut expected: Vec<_> = baseline.iter().map(|g| g.as_raw()).collect();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                actual, expected,
+                "PAM must start with exactly the admitted NSS baseline"
+            );
+        } else {
+            let groups = proc_values(&output, "Groups");
+            assert!(
+                groups.contains(&PAM_GROUP),
+                "PAM-established group missing from actual child: {groups:?}"
+            );
+            assert!(!groups.contains(&SENTINEL_GROUP));
+            for group in baseline {
+                assert!(groups.contains(&group.as_raw()));
+            }
+        }
+    });
+}
+
+#[test]
+fn pam_receives_only_the_account_group_baseline() {
+    group_regression("pam_receives_only_the_account_group_baseline", true);
+}
+
+#[test]
+fn shell_keeps_groups_established_by_pam() {
+    group_regression("shell_keeps_groups_established_by_pam", false);
+}
+
+fn group_case(
+    test: &str,
+    options: &str,
+    check: impl FnOnce(&common::TestAccount, &str, &std::path::Path),
+) {
+    common::on_a_disposable_host(test, WHAT_THESE_TESTS_DO, || {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let account = common::TestAccount::create("qshd-test-groups", "/bin/sh");
+        let record = dir.path().join("phases");
+        common::install_service_file(&fixture_stack(&record, options));
+        let (_daemon, pubkey, port) = common::start_daemon_for_accounts(dir.path());
+        let output = common::run_one_command_in_a_shell(
+            port,
+            pubkey,
+            &account.key,
+            &account.name,
+            GROUP_REPORT,
+        );
+        check(&account, &output, &record);
+    });
+}
+
+#[test]
+fn pam_can_remove_all_supplementary_groups() {
+    for options in [
+        "phase=open action=empty",
+        "phase=open action=replace gid=61002",
+    ] {
+        group_case(
+            "pam_can_remove_all_supplementary_groups",
+            options,
+            |account, output, _| {
+                let expected = if options.ends_with("empty") {
+                    vec![]
+                } else {
+                    vec![PAM_GROUP]
+                };
+                assert_eq!(proc_values(output, "Groups"), expected);
+                assert!(proc_values(output, "Uid")
+                    .iter()
+                    .all(|uid| *uid == account.uid.as_raw()));
+                let gid = nix::unistd::User::from_uid(account.uid)
+                    .unwrap()
+                    .unwrap()
+                    .gid
+                    .as_raw();
+                assert!(proc_values(output, "Gid")
+                    .iter()
+                    .all(|actual| *actual == gid));
+            },
+        );
+    }
+}
+
+#[test]
+fn pam_can_explicitly_grant_numeric_group_zero() {
+    group_case(
+        "pam_can_explicitly_grant_numeric_group_zero",
+        "phase=open gid=0",
+        |account, output, _| {
+            assert!(proc_values(output, "Groups").contains(&0));
+            assert!(proc_values(output, "Uid")
+                .iter()
+                .all(|uid| *uid == account.uid.as_raw() && *uid != 0));
+            assert_eq!(proc_values(output, "CapEff"), vec![0]);
+            assert_eq!(proc_values(output, "CapPrm"), vec![0]);
+        },
+    );
+}
+
+fn phase_records(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn pam_group_teardown_uses_the_opening_monitor() {
+    group_case(
+        "pam_group_teardown_uses_the_opening_monitor",
+        "phase=open gid=61002",
+        |_, output, record| {
+            assert!(proc_values(output, "Groups").contains(&PAM_GROUP));
+            assert!(common::wait_until(|| phase_records(record)
+                .iter()
+                .any(|line| line.contains(" end "))));
+            let records = phase_records(record);
+            let phases: Vec<_> = records
+                .iter()
+                .map(|line| line.split_whitespace().nth(1).unwrap())
+                .collect();
+            assert_eq!(
+                phases,
+                ["account", "establish", "open", "close", "delete", "end"]
+            );
+            let pid = records[0].split_whitespace().next().unwrap();
+            assert!(records
+                .iter()
+                .all(|line| line.split_whitespace().next() == Some(pid)));
+            assert!(
+                records[3].contains("children=none"),
+                "all shells must be reaped before PAM close: {:?}",
+                records[3]
+            );
+            let opened_groups = records[2].split("after=").nth(1).unwrap();
+            for line in &records[3..] {
+                assert_eq!(
+                    line.split("before=")
+                        .nth(1)
+                        .unwrap()
+                        .split(' ')
+                        .next()
+                        .unwrap(),
+                    opened_groups
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn pam_groups_are_isolated_between_logins() {
+    common::on_a_disposable_host(
+        "pam_groups_are_isolated_between_logins",
+        WHAT_THESE_TESTS_DO,
+        || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let account = common::TestAccount::create("qshd-test-groups", "/bin/sh");
+            let record = dir.path().join("phases");
+            common::install_service_file(&fixture_stack(&record, "gid=61002"));
+            let (daemon, pubkey, port) = common::start_daemon_with_groups(
+                dir.path(),
+                &["--authorized-keys-template", "%h/.ssh/authorized_keys"],
+                Some(vec![nix::unistd::Gid::from_raw(SENTINEL_GROUP)]),
+            );
+            let helper_status = || {
+                std::fs::read_to_string(format!("/proc/{}/status", daemon.child.id()))
+                    .unwrap()
+                    .lines()
+                    .find(|line| line.starts_with("Groups:"))
+                    .unwrap()
+                    .to_owned()
+            };
+            let original = helper_status();
+            let first = common::Session::connect(port, pubkey, &account.key, &account.name);
+            first.open_shell();
+            let a = proc_values(&first.run_in_shell(GROUP_REPORT), "Groups");
+            common::install_service_file(&fixture_stack(&dir.path().join("other"), "gid=61003"));
+            let second = common::Session::connect(port, pubkey, &account.key, &account.name);
+            second.open_shell();
+            let b = proc_values(&second.run_in_shell(GROUP_REPORT), "Groups");
+            assert!(a.contains(&61002) && !a.contains(&61003) && !a.contains(&SENTINEL_GROUP));
+            assert!(b.contains(&61003) && !b.contains(&61002) && !b.contains(&SENTINEL_GROUP));
+            first.disconnect_gracefully();
+            common::install_service_file("auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n");
+            let clean = common::run_one_command_in_a_shell(
+                port,
+                pubkey,
+                &account.key,
+                &account.name,
+                GROUP_REPORT,
+            );
+            assert!(proc_values(&clean, "Groups")
+                .iter()
+                .all(|g| ![61002, 61003, SENTINEL_GROUP].contains(g)));
+            assert_eq!(
+                helper_status(),
+                original,
+                "the shared helper retains its own identity"
+            );
+            second.disconnect_gracefully();
+        },
+    );
+}
+
+#[test]
+fn pam_session_open_groups_reach_every_channel() {
+    common::on_a_disposable_host(
+        "pam_session_open_groups_reach_every_channel",
+        WHAT_THESE_TESTS_DO,
+        || {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+            let account = common::TestAccount::create("qshd-test-groups", "/bin/sh");
+            let record = dir.path().join("phases");
+            common::install_service_file(&fixture_stack(
+                &record,
+                "phase=open action=replace gid=61002",
+            ));
+            let (_daemon, pubkey, port) = common::start_daemon_for_accounts(dir.path());
+            let session = common::Session::connect(port, pubkey, &account.key, &account.name);
+            session.open_shell();
+            let a = proc_values(&session.run_in_shell(GROUP_REPORT), "Groups");
+            let second = dir.path().join("second-channel");
+            session.run_another_command(&format!("{GROUP_REPORT} > {}", second.display()));
+            let b = proc_values(&std::fs::read_to_string(second).unwrap(), "Groups");
+            assert_eq!(a, vec![PAM_GROUP]);
+            assert_eq!(b, a);
+            let records = phase_records(&record);
+            assert_eq!(
+                records.iter().filter(|r| r.contains(" establish ")).count(),
+                1
+            );
+            assert_eq!(records.iter().filter(|r| r.contains(" open ")).count(), 1);
+            assert!(
+                !records.iter().any(|r| r.contains(" close ")),
+                "live first shell keeps session open"
+            );
+            session.disconnect_gracefully();
         },
     );
 }

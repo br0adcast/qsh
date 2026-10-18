@@ -358,9 +358,9 @@ pub enum MonitorEvent {
     /// The shell exited, with this code -- signalled exits reported the way
     /// a shell reports them, as 128 plus the signal number.
     Exited { id: ChannelId, code: i32 },
-    /// The login's PAM stack refused it, so no session was opened and no
-    /// shell was forked: the account is locked or expired, the session
-    /// stack failed, or the transaction could not be set up at all.
+    /// Login session setup failed before any shell was forked: the account
+    /// or session stack refused, the transaction could not start, or group
+    /// installation/capture failed. Any opened PAM session was torn down.
     ///
     /// Separate from [`MonitorEvent::Failed`], which carries an `errno` the
     /// helper names on the wire, because a refusal must reach the worker as
