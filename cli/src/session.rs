@@ -1834,6 +1834,35 @@ mod tests {
         assert!(!a.iter().any(|x| matches!(x, Action::Exit(_))));
     }
 
+    #[test]
+    fn bracketed_paste_sends_prefix_commands_to_the_shell_without_local_actions() {
+        for key in [0x1d, 0x02, 0x1b] {
+            let mut bytes = b"\x1b[200~".to_vec();
+            for command in b".shr?[" {
+                bytes.extend([key, *command]);
+            }
+            bytes.extend_from_slice(b"\x1b[201~");
+            for cut in 0..=bytes.len() {
+                let mut chrome = plain();
+                chrome.prefix = Prefix::Key(key);
+                let mut s = Session::new(20, 5, TermCaps::truecolor(), PredictMode::Never, chrome);
+                s.on_link(LinkState::Live, 0);
+                s.on_channel_ready(16, 0);
+                let mut actions = s.handle(UiEvent::Stdin(bytes[..cut].to_vec()), 0);
+                actions.extend(s.handle(UiEvent::Stdin(bytes[cut..].to_vec()), 1));
+                assert_eq!(sent(&actions), bytes, "cut {cut}, prefix {key}");
+                // Sending input may also repaint the existing frame.
+                assert!(actions
+                    .iter()
+                    .all(|a| matches!(a, Action::SendChannel { .. } | Action::Write(_))));
+                assert!(!s.window_open());
+                assert!(s.history_frame.is_none());
+                assert!(!s.line_shown);
+                assert_eq!(s.size(), (20, 5));
+            }
+        }
+    }
+
     /// The two halves may arrive in separate reads -- they usually do, since
     /// the user types them as two keystrokes.
     #[test]
