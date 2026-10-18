@@ -173,6 +173,14 @@ pub fn qshd_warning(host: &str, warning: &str) -> String {
     format!("qsh: {host}: qshd: {}", printable(warning))
 }
 
+/// A channel refusal is remote text printed after the local terminal is restored.
+pub fn channel_refused(reason: &str) -> String {
+    format!(
+        "qsh: server refused the shell channel: {}",
+        printable(reason)
+    )
+}
+
 /// Spec §4a rule 1: two addresses of one command line have different keys
 /// pinned, found before anything is tried. `a` and `b` are `host:port`;
 /// `known_hosts` is the file to edit. The second line puts the two
@@ -377,6 +385,34 @@ mod tests {
         );
         assert_eq!(printable("one\ntwo\r\tthree"), "one two  three");
         assert_eq!(printable("plain, ünïcode — ok"), "plain, ünïcode — ok");
+    }
+
+    #[test]
+    fn channel_refusal_preserves_readable_text_and_cannot_forge_lines() {
+        assert_eq!(
+            channel_refused("shell not found"),
+            "qsh: server refused the shell channel: shell not found"
+        );
+        assert_eq!(
+            channel_refused("access denied — résumé 中文"),
+            "qsh: server refused the shell channel: access denied — résumé 中文"
+        );
+        assert_eq!(
+            channel_refused("one\ntwo\rthree\tfour\x1b]0;title\x07\u{9b}2J\0\x08\x7f"),
+            "qsh: server refused the shell channel: one two three four?]0;title??2J???"
+        );
+    }
+
+    #[test]
+    fn channel_refusal_neutralizes_all_non_whitespace_c0_del_and_c1_controls() {
+        for code in (0..9).chain(11..13).chain(14..32).chain(127..160) {
+            let control = char::from_u32(code).unwrap();
+            assert_eq!(
+                channel_refused(&format!("left{control}right")),
+                "qsh: server refused the shell channel: left?right",
+                "control U+{code:04X} reached the diagnostic"
+            );
+        }
     }
 
     #[test]

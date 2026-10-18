@@ -737,23 +737,24 @@ mod tests {
         );
     }
 
-    /// A refusal surfaces the server's reason unchanged: it was written for
-    /// the person who will read it.
+    /// A refusal preserves the original reason; terminal-safe formatting belongs
+    /// to the presentation layer, not this machine-level event.
     #[test]
     fn a_refusal_carries_the_servers_reason() {
         let (mut s, _) = session();
         let ch = s
             .open_shell(80, 24)
             .expect("a fresh session always has a free stream");
+        let reason = "shell not found\x1b]0;test title\x07\nretry — résumé";
         let events = s.on_event(SubstrateEvent::Refused {
             ch,
-            reason: "shell not found".to_string(),
+            reason: reason.to_string(),
         });
         assert_eq!(
             events,
             vec![SessionEvent::Refused {
                 ch,
-                reason: "shell not found".to_string()
+                reason: reason.to_string()
             }]
         );
         assert!(!s.is_ready(ch), "a refused channel is not usable");
