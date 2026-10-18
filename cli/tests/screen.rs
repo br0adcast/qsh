@@ -791,8 +791,8 @@ fn leaving_with_ctrl_bracket_dot_leaves_the_alternate_screen_first() {
     eprintln!("alt_screen_leave: whole test {:?}", started.elapsed());
 }
 
-/// A session the server no longer has (exit 13): the switch back comes
-/// before the line that says so.
+/// Confirmed session loss restores the screen before its explanation/question;
+/// declining the replacement then exits 13.
 #[test]
 fn a_lost_session_leaves_the_alternate_screen_before_saying_so() {
     let _serial = serialised();
@@ -813,6 +813,15 @@ fn a_lost_session_leaves_the_alternate_screen_before_saying_so() {
 
     daemon.restart();
     client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
+        "{}",
+        screen.text()
+    );
+    let back = drawn_on_the_alternate_screen(&screen);
+    let question = screen.text().find("Start a new session?").unwrap();
+    assert!(back < question, "the question follows terminal restoration");
+    client.master.write_all(b"no\n").unwrap();
     let status = wait_for_exit(&mut client.child).unwrap_or_else(|| {
         panic!(
             "a session the server no longer has must end the run; client saw: {}",

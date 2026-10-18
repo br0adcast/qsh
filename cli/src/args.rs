@@ -102,7 +102,9 @@ address that would need a question is skipped. A round that gets nowhere is
 tried again after 1, 2, 4, 8, 16, then every 30 s, until the session is
 back or you leave. Ctrl-] r starts a round at once, and over a link that
 still works it lets that link go first. The status line says what is going
-on; with --status off, a plate on the top row does.
+on; with --status off, a plate on the top row does. After the expected server
+confirms session loss, qsh restores the terminal and asks whether to start a
+new session. The default is Yes; Enter, yes, or y starts a fresh shell.
 
 Every run is logged to ~/.cache/qsh/log on Linux and macOS (or
 $XDG_CACHE_HOME/qsh/log), one line per record: the time in UTC, the process
@@ -116,7 +118,7 @@ Exit codes (when the shell on the server exits, qsh exits with its code):
     10   the keys to log in with could not be loaded
     11   the qsh server's key has changed (at login or on a reconnect)
     12   every address failed (each one is listed with why)
-    13   the session is gone from the server (its daemon restarted)
+    13   the server session is gone and a new session was not confirmed
 ";
 
 /// Printed by `--version`. The source link is not decoration: section 13 of

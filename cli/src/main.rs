@@ -6,7 +6,7 @@
 //! and a question printed over a frame ruins both.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -95,13 +95,13 @@ fn run(a: args::Args) -> i32 {
     // Which session on this host this run is coming back to. The claim's
     // lock is held for the whole run: another `qsh` to the same host takes
     // the next slot instead of stealing this one's shell.
-    let claim = sessions::claim(
+    let mut claim = sessions::claim(
         &config.join("sessions"),
         &a.addresses[0].host,
         a.addresses[0].qsh_port,
     );
 
-    let setup = Arc::new(Setup::new(
+    let mut setup = Arc::new(Setup::new(
         a,
         // The one Noise static key of this process (spec §4.2).
         transport::generate_keypair(),
@@ -171,8 +171,134 @@ fn run(a: args::Args) -> i32 {
             return 130;
         }
     }
+    let mut connected = connected;
+    let mut events = link_rx;
+    let mut terminal_size = (cols, rows);
+    let mut addresses = setup.args().addresses.clone();
+    let mut epoch = RecoveryEpoch {
+        connection: 0,
+        network: 0,
+    };
+    let mut resolver = BoundedResolver::new();
+    loop {
+        let (code, links) = connected_session(
+            setup.clone(),
+            connected,
+            events,
+            terminal_size,
+            addresses,
+            epoch,
+            resolver,
+        );
+        let lost = links.replacement_at.is_some();
+        addresses = links.addresses.clone();
+        let first = links.replacement_at.unwrap_or(links.at);
+        epoch = RecoveryEpoch {
+            connection: links.road_epoch.connection + 1,
+            network: links.road_epoch.network,
+        };
+        let active = links.road_active;
+        let mut catalog = RoadCatalog::new(addresses.clone(), epoch);
+        for (id, endpoint) in links.catalog.endpoints() {
+            catalog.seed(id, endpoint);
+        }
+        // Cancels workers and invalidates their authorization before any question.
+        resolver = links.leave();
+        if !lost {
+            return code;
+        }
+        discard_terminal_input();
+        let accepted =
+            prompt::Tty::new().confirm_replacement("Start a new session?", &knock::Cancel::new());
+        if signals::termination_requested() {
+            return 130;
+        }
+        if !matches!(accepted, Ok(true)) {
+            return 13;
+        }
+        discard_terminal_input();
+        let token = match claim.replace_token() {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("qsh: could not save the replacement session: {error}");
+                return 1;
+            }
+        };
+        setup = Arc::new(setup.replacement(token));
+        terminal_size = tty::window_size(std::io::stdout().as_raw_fd()).unwrap_or(terminal_size);
+        let shell_size =
+            session::shell_size(terminal_size.0, terminal_size.1, setup.args().status_line);
+        let start_round = |epoch, catalog: &RoadCatalog| {
+            let (progress, _) = mpsc::channel();
+            background::spawn_catalog_round(
+                setup.clone(),
+                addresses.clone(),
+                first,
+                shell_size,
+                1,
+                progress,
+                epoch,
+                catalog.address_ids(),
+                catalog.endpoints(),
+                true,
+            )
+        };
+        let mut task = start_round(epoch, &catalog);
+        eprintln!("qsh: starting a new session");
+        let started = Instant::now();
+        loop {
+            resolve_roads(
+                &mut catalog,
+                &mut resolver,
+                epoch,
+                started.elapsed(),
+                active,
+                true,
+            );
+            task.update_endpoints(epoch, catalog.endpoints());
+            if signals::termination_requested() {
+                return 130;
+            }
+            match task.try_recv() {
+                Ok(Round::Connected {
+                    connected: fresh,
+                    events: fresh_events,
+                }) => {
+                    connected = fresh;
+                    events = fresh_events;
+                    break;
+                }
+                Ok(Round::Failed { .. }) | Err(TryRecvError::Disconnected) => {
+                    // A DNS revision can invalidate a queued result. It remains
+                    // a failed path, rather than a refusal of the accepted choice.
+                    drop(task);
+                    epoch.connection += 1;
+                    resolver.cancel();
+                    catalog.reset(epoch);
+                    task = start_round(epoch, &catalog);
+                }
+                Err(TryRecvError::Empty) => std::thread::sleep(TICK),
+            }
+        }
+        // Stop the replacement recovery before the live session takes ownership.
+        drop(task);
+        resolver.cancel();
+        epoch.connection += 1;
+    }
+}
+
+/// Everything before this point uses the restored controlling terminal.
+fn connected_session(
+    setup: Arc<Setup>,
+    connected: Connected,
+    events: Receiver<UiEvent>,
+    (cols, rows): (u16, u16),
+    mut addresses: Vec<Address>,
+    road_epoch: RecoveryEpoch,
+    resolver: BoundedResolver,
+) -> (i32, Links) {
     let (tx, rx) = mpsc::channel::<UiEvent>();
-    background::forward(0, link_rx, tx.clone());
+    background::forward(0, events, tx.clone());
     let Connected {
         attempt,
         trial,
@@ -195,13 +321,8 @@ fn run(a: args::Args) -> i32 {
 
     // The addresses as this run knows them from now on: the one logged in at
     // keeps the port the daemon was actually reached on (spec §5.1).
-    let mut addresses = setup.args().addresses.clone();
     addresses[addr].qsh_port = port;
     let labels = labels(remote, &addresses, addr);
-    let road_epoch = RecoveryEpoch {
-        connection: 0,
-        network: 0,
-    };
     let mut catalog = RoadCatalog::new(addresses.clone(), road_epoch);
     catalog.seed(AddressId(addr), remote);
 
@@ -226,7 +347,7 @@ fn run(a: args::Args) -> i32 {
         labels,
         roads_at: None,
         catalog,
-        resolver: BoundedResolver::new(),
+        resolver,
         road_epoch,
         road_origin: Instant::now(),
         road_active: remote,
@@ -238,9 +359,42 @@ fn run(a: args::Args) -> i32 {
         round_line: None,
         farewell: None,
         stopped: false,
+        replacement_at: None,
         tx: tx.clone(),
     };
     interactive(setup, links, (cols, rows), tx, rx)
+}
+
+/// Keep the same bounded resolver pool across shell lifetimes, including the
+/// restored-terminal wait for an accepted replacement. DNS never grants trust.
+fn resolve_roads(
+    catalog: &mut RoadCatalog,
+    resolver: &mut BoundedResolver,
+    epoch: RecoveryEpoch,
+    now: Duration,
+    active: SocketAddr,
+    urgent: bool,
+) -> Option<Vec<SocketAddr>> {
+    for result in resolver.poll(now) {
+        catalog.resolved(result.epoch, result.request, result.address, result.result);
+    }
+    let mut publish = None;
+    for work in catalog.refresh(now, active, urgent) {
+        match work {
+            RoadWork::Resolve {
+                request,
+                address,
+                host,
+                port,
+            } => {
+                if !resolver.submit(epoch, request, address, host, port, now) {
+                    catalog.deferred(request, address);
+                }
+            }
+            RoadWork::Publish { paths } => publish = Some(paths),
+        }
+    }
+    publish
 }
 
 /// A road as the window names it: the address's index on the command line,
@@ -421,9 +575,12 @@ struct Links {
     /// The line that ended the run (`Order::Stop`), for once the terminal is
     /// restored.
     farewell: Option<String>,
-    /// The run ended on `Order::Stop`: the session is gone or not ours to
-    /// trust, so there is nothing kept to tell the person about.
+    /// The session or tracked shell is unavailable, or its key changed:
+    /// there is no kept shell to report on the way out.
     stopped: bool,
+    /// Explicit lifecycle evidence that the tracked shell is unavailable,
+    /// and the authenticated road to prefer if replacement is accepted.
+    replacement_at: Option<usize>,
     /// The main loop's own channel: where rounds say how they go, and where
     /// every connection's forwarder delivers.
     tx: Sender<UiEvent>,
@@ -516,6 +673,18 @@ impl Links {
                 }
             }
         };
+        if let Round::Failed {
+            end: RoundEnd::SessionGone { addr },
+            ..
+        } = &ended
+        {
+            // Keep the road that just authenticated the expected server, rather
+            // than paying the old live road's timeout again after consent.
+            if let Some(endpoint) = round.endpoint(*addr) {
+                self.addresses[*addr].qsh_port = endpoint.port();
+                self.catalog.seed(AddressId(*addr), endpoint);
+            }
+        }
         self.round = None;
         match ended {
             Round::Connected { connected, events } => {
@@ -564,10 +733,14 @@ impl Links {
                     self.road_epoch,
                     self.catalog.address_ids(),
                     self.catalog.endpoints(),
+                    false,
                 ));
                 actions
             }
             Order::Stop(stop) => {
+                if let Stop::SessionGone { addr } = stop {
+                    self.replacement_at = Some(addr);
+                }
                 let (code, line) = match stop {
                     Stop::KeyChanged { .. } => (11, self.round_line.take()),
                     Stop::SessionGone { addr } => (
@@ -639,10 +812,6 @@ impl Links {
     /// publication and background SSH rounds. No resolver call runs here.
     fn refresh_catalog(&mut self) {
         let now = self.road_origin.elapsed();
-        for result in self.resolver.poll(now) {
-            self.catalog
-                .resolved(result.epoch, result.request, result.address, result.result);
-        }
         let urgent = if let Some(live) = &self.live {
             let client = &live.attempt.client;
             self.road_active = client.active_path().unwrap_or(self.road_active);
@@ -655,26 +824,16 @@ impl Links {
         } else {
             true
         };
-        for work in self.catalog.refresh(now, self.road_active, urgent) {
-            match work {
-                RoadWork::Resolve {
-                    request,
-                    address,
-                    host,
-                    port,
-                } => {
-                    if !self
-                        .resolver
-                        .submit(self.road_epoch, request, address, host, port, now)
-                    {
-                        self.catalog.deferred(request, address);
-                    }
-                }
-                RoadWork::Publish { paths } => {
-                    if let Some(live) = &self.live {
-                        live.attempt.client.set_paths(paths);
-                    }
-                }
+        if let Some(paths) = resolve_roads(
+            &mut self.catalog,
+            &mut self.resolver,
+            self.road_epoch,
+            now,
+            self.road_active,
+            urgent,
+        ) {
+            if let Some(live) = &self.live {
+                live.attempt.client.set_paths(paths);
             }
         }
         if let Some(round) = &self.round {
@@ -865,8 +1024,9 @@ impl Links {
     /// the round's thread with it. A round whose answer is already waiting
     /// holds a live connection into the session: it is let go quietly, not
     /// dropped -- dropping it could send `Close` while "kept" is printed.
-    fn leave(self) {
+    fn leave(mut self) -> BoundedResolver {
         self.setup.invalidate_ssh_authorization();
+        self.resolver.cancel();
         let host = self.addresses[self.at].host.as_str();
         if let Some(Ok(Round::Connected { connected, .. })) =
             self.round.as_ref().map(background::RoundTask::try_recv)
@@ -894,7 +1054,7 @@ impl Links {
                     log::log("leaving; letting the link go, the session stays");
                     eprintln!("{}", status::left_kept_notice(host));
                     live.attempt.detach();
-                    return;
+                    return self.resolver;
                 }
                 if let Some(notice) = status::kept_session_notice(host, closed, graceful) {
                     eprintln!("{notice}");
@@ -909,6 +1069,7 @@ impl Links {
             }
             None => {}
         }
+        self.resolver
     }
 }
 
@@ -949,6 +1110,10 @@ fn apply_actions(
             Action::Exit(c) => return Some(c),
             // Printed after the terminal is restored, not here in raw mode.
             Action::Notice(text) => notices.push(text),
+            Action::ShellUnavailable => {
+                links.replacement_at = Some(links.at);
+                links.stopped = true;
+            }
             Action::Reconnect => {
                 queue.extend(links.on(Event::Now, sess, now_ms));
             }
@@ -1078,7 +1243,7 @@ fn interactive(
     (cols, rows): (u16, u16),
     tx: mpsc::Sender<UiEvent>,
     rx: mpsc::Receiver<UiEvent>,
-) -> i32 {
+) -> (i32, Links) {
     let out_fd = std::io::stdout().as_raw_fd();
 
     // Signal handlers first: they ask the user nothing, so the ordering
@@ -1089,7 +1254,7 @@ fn interactive(
     // translation.
     if let Err(e) = signals::install() {
         eprintln!("qsh: could not install signal handlers: {e}");
-        return 1;
+        return (1, links);
     }
 
     tty::RawMode::install_panic_hook();
@@ -1097,7 +1262,7 @@ fn interactive(
         Ok(r) => r,
         Err(e) => {
             eprintln!("qsh: terminal unavailable: {e}");
-            return 1;
+            return (1, links);
         }
     };
     // From here until `restore` nothing may write to the terminal but the
@@ -1160,27 +1325,7 @@ fn interactive(
         sess.assume_channel_opening();
     }
 
-    // stdin is read on its own thread: a blocking read is the only way to get
-    // bytes the moment they arrive, and the loop must stay free to paint.
-    let input_tx = tx.clone();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if input_tx.send(UiEvent::Stdin(buf[..n].to_vec())).is_err() {
-                        break;
-                    }
-                }
-                // A signal interrupted the read; the loop will look at the
-                // flags and we go back to reading.
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
+    let input = InputReader::start(tx.clone());
 
     let started = std::time::Instant::now();
     // The one clock of the run: `Session`'s, and the reconnect automaton's
@@ -1399,12 +1544,72 @@ fn interactive(
     // in raw mode for no reason. Restoring costs nothing and cannot fail in
     // a way that would stop the close. It switches back to the terminal's
     // own screen, so every line printed from here on stays there.
+    input.stop();
     raw.restore();
     for notice in &notices {
         eprintln!("{notice}");
     }
-    links.leave();
-    code
+    (code, links)
+}
+
+/// The input reader has one owner per interactive shell. Joining before cooked
+/// mode prevents it from stealing a prompt reply or feeding a later session.
+struct InputReader {
+    cancel: knock::Cancel,
+    thread: std::thread::JoinHandle<()>,
+}
+impl InputReader {
+    fn start(tx: Sender<UiEvent>) -> Self {
+        let cancel = knock::Cancel::new();
+        let stopped = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            let stdin_fd = std::io::stdin().as_raw_fd();
+            let mut buf = [0u8; 4096];
+            while !stopped.is_cancelled() {
+                let mut fd = libc::pollfd {
+                    fd: stdin_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: stdin remains open and fd points to one valid pollfd.
+                if unsafe { libc::poll(&mut fd, 1, 20) } <= 0 {
+                    continue;
+                }
+                if stopped.is_cancelled() {
+                    break;
+                }
+                // Read the descriptor directly: Rust's buffered stdin can retain
+                // keystrokes beyond a terminal flush between sessions.
+                // SAFETY: stdin_fd is live and buf is writable for its full length.
+                let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n == 0 {
+                    break;
+                }
+                if n < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if tx.send(UiEvent::Stdin(buf[..n as usize].to_vec())).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { cancel, thread }
+    }
+    fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.thread.join();
+    }
+}
+
+fn discard_terminal_input() {
+    // SAFETY: this only discards pending input on this run's terminal; the input
+    // reader has stopped and the next session has not started reading yet.
+    unsafe {
+        libc::tcflush(std::io::stdin().as_raw_fd(), libc::TCIFLUSH);
+    }
 }
 
 /// Points stderr into the log while `raw` lasts (or, failing that, at

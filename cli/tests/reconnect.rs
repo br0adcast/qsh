@@ -135,6 +135,7 @@ fn the_same_shell_answers(client: &mut Client, screen: &Screen, within: Duration
         client.master.write_all(b"\x15").expect("type ctrl-u");
         client.type_line("echo MA\\RK$QSH_MARK");
         if wait_for(Duration::from_secs(1), || screen.has("MARKkept")) {
+            assert!(!screen.has("Start a new session?"));
             return true;
         }
     }
@@ -417,52 +418,198 @@ fn refusal_on_one_road_keeps_the_authenticated_alternative_and_shell() {
     exit_cleanly(&mut client, &screen, &daemon);
 }
 
-/// A daemon that restarted has no session to return to: the reconnect ends
-/// the run with code 13 and says why, once the terminal is restored.
+/// Consent after authenticated loss starts a fresh, usable shell in this run.
 #[test]
-fn a_restarted_daemon_ends_the_run_with_13() {
+fn accepting_session_loss_starts_a_new_shell() {
     let _serial = serialised();
-    let started = Instant::now();
     let (mut daemon, key_path) = start_daemon();
-    let config = tempfile::tempdir().expect("tempdir");
+    let config = tempfile::tempdir().unwrap();
     let mut client = spawn_client(&daemon, &key_path, config.path());
     let screen = Screen::of(&client);
-
     answer_yes(&mut client, &screen, &daemon);
     mark_the_shell(&mut client, &screen, &daemon);
-
-    daemon.restart();
-    let pressed = Instant::now();
-    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
-    let status = wait_for_exit(&mut client.child).unwrap_or_else(|| {
-        panic!(
-            "a session the server no longer has must end the run; top row: {:?}\n\
-             client saw: {}\ndaemon: {}",
-            screen.top(),
-            screen.text(),
-            daemon.output_text()
-        )
-    });
-    let ended_after = pressed.elapsed();
-    let says =
-        "the session on 127.0.0.1 is no longer on the server (the daemon restarted or ended it)";
-    assert!(
-        wait_until(|| screen.has(says)),
-        "the reason must be printed on the way out; client saw: {}\ndaemon: {}",
-        screen.text(),
-        daemon.output_text()
-    );
+    let size = libc::winsize {
+        ws_col: 100,
+        ws_row: 30,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the PTY master is live and size points to a valid winsize.
     assert_eq!(
-        status.code(),
-        Some(13),
-        "a session gone with its daemon is exit 13; client saw: {}\ndaemon: {}",
-        screen.text(),
-        daemon.output_text()
+        unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(&client.master),
+                libc::TIOCSWINSZ,
+                &size,
+            )
+        },
+        0
     );
-    eprintln!(
-        "restarted_daemon: exit 13 {ended_after:?} after Ctrl-] r; whole test {:?}",
-        started.elapsed()
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            client.type_line("echo OLD'SIZE'$(stty size)");
+            wait_for(Duration::from_millis(100), || screen.has("OLDSIZE29 100"))
+        }),
+        "{}",
+        screen.text()
     );
+    daemon.track_shell_starts();
+    daemon.restart();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
+        "{}",
+        screen.text()
+    );
+    assert!(client.child.try_wait().unwrap().is_none());
+    assert_eq!(daemon.shell_starts(), 0, "no shell may open before consent");
+    let flags = nix::sys::termios::tcgetattr(&client.master)
+        .unwrap()
+        .local_flags;
+    assert!(
+        flags.contains(nix::sys::termios::LocalFlags::ECHO | nix::sys::termios::LocalFlags::ICANON)
+    );
+    let tokens = || {
+        std::fs::read_dir(config.path().join("qsh/sessions"))
+            .unwrap()
+            .map(|file| std::fs::read(file.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let old_tokens = tokens();
+    client
+        .master
+        .write_all(b"yes\necho LEAK'ED'REPLY\n")
+        .unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
+        "{}",
+        screen.text()
+    );
+    assert_eq!(daemon.shell_starts(), 1);
+    assert_ne!(tokens(), old_tokens);
+
+    client.type_line("echo NEW'RE'PLY-${QSH_MARK:-fresh}");
+    assert!(
+        wait_until(|| screen.has("NEWREPLY-fresh")),
+        "{}",
+        screen.text()
+    );
+    client.type_line("echo NEW'SIZE'$(stty size)");
+    assert!(
+        wait_until(|| screen.has("NEWSIZE29 100")),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.has("NEWREPLY-kept"));
+    assert!(!screen.has("LEAKEDREPLY"));
+    client.type_line("export REPLACEMENT_MARK=retained");
+    client.type_line("echo SAVE'D'REPLACEMENT");
+    assert!(
+        wait_until(|| screen.has("SAVEDREPLACEMENT")),
+        "{}",
+        screen.text()
+    );
+    daemon.restart();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("Start a new session? [Y/n]").count() == 2),
+        "{}",
+        screen.text()
+    );
+    assert_eq!(daemon.shell_starts(), 1);
+    client.master.write_all(b"yes\n").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 3),
+        "{}",
+        screen.text()
+    );
+    client.type_line("export REPLACEMENT_MARK=twice");
+    client.type_line("echo SECO'ND'-$REPLACEMENT_MARK");
+    assert!(
+        wait_until(|| screen.has("SECOND-twice")),
+        "{}",
+        screen.text()
+    );
+    client.master.write_all(b"\x1d.").unwrap();
+    assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(1));
+    let mut resumed = spawn_client(&daemon, &key_path, config.path());
+    let resumed_screen = Screen::of(&resumed);
+    resumed.type_line("echo RESU'MED'-$REPLACEMENT_MARK");
+    assert!(
+        wait_until(|| resumed_screen.has("RESUMED-twice")),
+        "{}",
+        resumed_screen.text()
+    );
+    assert_eq!(daemon.shell_starts(), 2);
+    assert!(!resumed_screen.has("Start a new session?"));
+    exit_cleanly(&mut resumed, &resumed_screen, &daemon);
+}
+
+#[test]
+fn a_normal_shell_exit_with_13_does_not_offer_replacement() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client(&daemon, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    client.type_line("exit 13");
+    assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(13));
+    assert!(!screen.has("Start a new session?"));
+}
+
+fn refuse_session_loss(reply: &[u8], expected: i32) {
+    let _serial = serialised();
+    let (mut daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client(&daemon, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    daemon.track_shell_starts();
+    daemon.restart();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
+        "{}",
+        screen.text()
+    );
+    let flags = nix::sys::termios::tcgetattr(&client.master)
+        .unwrap()
+        .local_flags;
+    assert!(
+        flags.contains(nix::sys::termios::LocalFlags::ECHO | nix::sys::termios::LocalFlags::ICANON)
+    );
+    assert_eq!(daemon.shell_starts(), 0);
+    let asked = screen.text();
+    assert!(asked.rfind("\x1b[?1049l").unwrap() < asked.find("Start a new session?").unwrap());
+    let pressed = Instant::now();
+    client.master.write_all(reply).unwrap();
+    assert_eq!(
+        wait_for_exit(&mut client.child).unwrap().code(),
+        Some(expected),
+        "{}",
+        screen.text()
+    );
+    assert!(pressed.elapsed() < Duration::from_secs(3));
+    assert_eq!(daemon.shell_starts(), 0);
+    assert!(screen.has("the session on 127.0.0.1 is no longer on the server"));
+}
+
+#[test]
+fn declining_session_loss_ends_the_run_with_13() {
+    refuse_session_loss(b"no\n", 13);
+}
+
+#[test]
+fn eof_after_session_loss_refuses_a_new_shell() {
+    refuse_session_loss(b"\x04", 13);
+}
+
+#[test]
+fn ctrl_c_cancels_the_loss_question_with_a_restored_terminal() {
+    refuse_session_loss(b"\x03", 130);
 }
 
 /// A foreign daemon is a failed path, and the original key is tried again
@@ -781,4 +928,146 @@ fn leaving_while_reconnecting_is_quick_and_keeps_the_session() {
         "leaving_mid_round: exit 1 {left_after:?} after Ctrl-] .; whole test {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn enter_after_session_loss_starts_a_new_shell() {
+    let _serial = serialised();
+    let (mut daemon, key) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client(&daemon, &key, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    daemon.restart();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_until(|| screen.has("Start a new session?")),
+        "{}",
+        screen.text()
+    );
+    client.master.write_all(b"\n").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
+        "Enter must accept: {}",
+        screen.text()
+    );
+    client.type_line("echo DEFAULT'YES'-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("DEFAULTYES-42")),
+        "{}",
+        screen.text()
+    );
+    assert!(screen.has("Start a new session? [Y/n]"));
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn replacement_starts_at_the_road_that_confirmed_loss() {
+    let _serial = serialised();
+    let (mut daemon, key) = start_daemon();
+    let first = UdpRelay::start(daemon.port);
+    let second = UdpRelay::start(daemon.port);
+    second.cut();
+    let config = tempfile::tempdir().unwrap();
+    let expected =
+        sshauth::discover::discover(([127, 0, 0, 1], daemon.port).into(), Duration::from_secs(1))
+            .unwrap();
+    let pins = sshauth::known_hosts::KnownHosts::open(config.path().join("qsh/known_hosts"));
+    for port in [first.port, second.port] {
+        pins.pin("127.0.0.1", port, &expected).unwrap();
+    }
+    let mut client = spawn_qsh(
+        &[
+            "--verbose",
+            "-i",
+            key.to_str().unwrap(),
+            &format!("127.0.0.1:{}", first.port),
+            &format!("127.0.0.1:{}", second.port),
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    mark_the_shell(&mut client, &screen, &daemon);
+    first.cut();
+    daemon.restart();
+    second.restore();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(30), || screen
+            .has("Start a new session?")),
+        "{}",
+        verbose_log(config.path())
+    );
+    let accepted = Instant::now();
+    client.master.write_all(b"y\n").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(15), || screen
+            .text()
+            .matches("\x1b[?1049h")
+            .count()
+            == 2),
+        "replacement must eventually use the confirmed road; {}",
+        verbose_log(config.path())
+    );
+    client.type_line("echo QUICK'FRESH'-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("QUICKFRESH-42")),
+        "{}",
+        screen.text()
+    );
+    let usable_after = accepted.elapsed();
+    eprintln!("accepted replacement usable in {usable_after:?}");
+    assert!(
+        usable_after < Duration::from_secs(3),
+        "replacement must prefer the confirmed road, was {usable_after:?}; {}",
+        verbose_log(config.path())
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn missing_shell_on_authenticated_resume_offers_replacement() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    let pid_path = config.path().join("test-shell-pid");
+    client.type_line(&format!("printf '%s' \"$$\" > '{}'", pid_path.display()));
+    assert!(wait_until(
+        || std::fs::read_to_string(&pid_path).is_ok_and(|s| !s.is_empty())
+    ));
+    let pid =
+        nix::unistd::Pid::from_raw(std::fs::read_to_string(&pid_path).unwrap().parse().unwrap());
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+    assert!(wait_until(|| matches!(
+        nix::sys::signal::kill(pid, None),
+        Err(nix::errno::Errno::ESRCH)
+    )));
+    relay.restore();
+    assert!(
+        wait_until(|| screen.has("Start a new session?")),
+        "authenticated missing shell must offer a replacement: {}",
+        screen.text()
+    );
+    assert!(screen.has("the shell on the server ended while the link was down"));
+    client.master.write_all(b"y\n").unwrap();
+    assert!(
+        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
+        "{}",
+        screen.text()
+    );
+    client.type_line("echo AFTER'MISSING'SHELL-$((6*7))");
+    assert!(
+        wait_until(|| screen.has("AFTERMISSINGSHELL-42")),
+        "{}",
+        screen.text()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
 }

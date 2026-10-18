@@ -39,6 +39,21 @@ pub struct Claim {
     _lock: Option<File>,
 }
 
+impl Claim {
+    /// Replace only this run's token, retaining its exclusive slot lock.
+    pub fn replace_token(&mut self) -> std::io::Result<[u8; 16]> {
+        let token = fresh_token();
+        if let Some(file) = &mut self._lock {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(format!("{}\n", hex(&token)).as_bytes())?;
+            file.flush()?;
+        }
+        self.token = token;
+        Ok(token)
+    }
+}
+
 /// Claim a session slot for `host`:`port` under `dir`.
 ///
 /// Never fails in a way the caller has to handle: a store that cannot be
@@ -159,6 +174,24 @@ fn lock_exclusive(file: &File) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_a_token_keeps_the_claim_and_persists_only_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = claim(dir.path(), "example.org", 60000);
+        let original = first.token;
+        let second = claim(dir.path(), "example.org", 60000);
+        let second_token = second.token;
+        let replacement = first.replace_token().unwrap();
+        assert_ne!(replacement, original);
+        assert_ne!(replacement, second.token);
+        drop(first);
+        assert_eq!(claim(dir.path(), "example.org", 60000).token, replacement);
+        drop(second);
+        let held = claim(dir.path(), "example.org", 60000);
+        assert_eq!(claim(dir.path(), "example.org", 60000).token, second_token);
+        drop(held);
+    }
 
     /// The whole point: the token a run is given is the one the previous run
     /// left behind, so the server hands back the same session.

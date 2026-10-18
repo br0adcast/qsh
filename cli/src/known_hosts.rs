@@ -12,6 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 
+#[derive(Clone)]
 pub struct KnownHosts {
     user: PathBuf,
     system: Option<PathBuf>,

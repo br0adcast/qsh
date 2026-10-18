@@ -166,6 +166,38 @@ impl Setup {
         }
     }
 
+    /// A consented replacement retains identity and credentials, but old workers
+    /// keep their own immutable token and cannot close or resume this session.
+    pub fn replacement(&self, token: [u8; 16]) -> Self {
+        Self {
+            args: self.args.clone(),
+            keypair: transport::handshake::Keypair {
+                private: self.keypair.private,
+                public: self.keypair.public,
+            },
+            pins: sshauth::known_hosts::KnownHosts::open(self.pins.path().to_owned()),
+            discovery: self.discovery.clone(),
+            tty: self.tty.clone(),
+            ssh_hosts: self.ssh_hosts.clone(),
+            agent: self.agent.clone(),
+            ssh_dir: self.ssh_dir.clone(),
+            token,
+            candidates: Mutex::new(self.cached_candidates()),
+            session_key: Mutex::new(self.server_identity().map(|s| s.qsh_key)),
+            weighed: Mutex::new(
+                self.weighed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            ),
+            // Closing the old session (including a shell-free loss probe)
+            // removes its process key from the daemon's self-cleaning list.
+            // Only fresh SSH enrollment can restore this authentication path.
+            allowlisted: Mutex::new(HashSet::new()),
+            trust_write: Mutex::new(None),
+        }
+    }
+
     pub fn args(&self) -> &Args {
         &self.args
     }
@@ -370,6 +402,7 @@ impl std::fmt::Debug for Loaded {
 }
 
 pub struct Climb<'a> {
+    fresh_session: bool,
     setup: &'a Setup,
     /// The addresses as this run knows them now: a port a daemon reported
     /// replaces the one on the command line (spec §5.1).
@@ -426,6 +459,7 @@ impl<'a> Climb<'a> {
             loud: None,
             recovery: None,
             revision: 0,
+            fresh_session: false,
             recovery_attempt: None,
             bootstrap: None,
         }
@@ -433,6 +467,12 @@ impl<'a> Climb<'a> {
 }
 
 impl<'a> Climb<'a> {
+    /// Only the foreground owner's explicit consent may enable a fresh shell.
+    pub fn allow_new_session(mut self, allow: bool) -> Self {
+        self.fresh_session = allow;
+        self
+    }
+
     /// In recovery this ladder owns only UDP. The SSH worker publishes
     /// its results and never starts a second warm attachment.
     pub fn recovering(
@@ -1085,9 +1125,9 @@ impl<'a> Climb<'a> {
         }
     }
 
-    /// A login that worked. In the background it must have landed in the
-    /// session the token names: a fresh one means the old one is gone, and
-    /// the fresh one is ended at once -- nobody is coming for it.
+    /// Recovery must land in the session the token names, unless the owner
+    /// obtained explicit consent for a replacement. A fresh probe without
+    /// that consent opens no shell and is closed before reporting loss.
     fn logged_in(
         &mut self,
         att: attempt::Attempt,
@@ -1102,7 +1142,10 @@ impl<'a> Climb<'a> {
                 None,
             );
         }
-        let outcome = landed(self.background(), att.client.resumed());
+        let outcome = landed(
+            self.background() && !self.fresh_session,
+            att.client.resumed(),
+        );
         if outcome == DirectOutcome::Connected {
             let mut slot = self
                 .setup
@@ -1315,10 +1358,14 @@ impl<'a> Climb<'a> {
         if let Ok(term) = std::env::var("TERM") {
             channel_session.announce_term(&term);
         }
-        let (verdict, opened_ch) =
-            settle_opening(&att, &mut channel_session, self.cols, self.rows, || {
-                self.interrupted()
-            });
+        let (verdict, opened_ch) = settle_opening(
+            &att,
+            &mut channel_session,
+            self.cols,
+            self.rows,
+            !self.background() || self.fresh_session,
+            || self.interrupted(),
+        );
         (
             verdict,
             att,
@@ -1499,8 +1546,8 @@ fn let_go(resumed: bool) -> LetGo {
 }
 
 /// Like [`attempt::Attempt::settle_with`], but the thing done on `Live` is
-/// always the same here: open the shell channel at `cols`x`rows` and
-/// remember what came back. Sending this the moment the link comes alive,
+/// to open the shell channel at `cols`x`rows` when a fresh shell is allowed,
+/// and remember what came back. Sending this the moment the link comes alive,
 /// rather than only once the whole attempt is judged `Working`, is what
 /// makes a working key's verdict fast: under the channel protocol a cold
 /// server answers nothing at all until asked for a channel, so without
@@ -1515,6 +1562,7 @@ fn settle_opening(
     channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
     cols: u16,
     rows: u16,
+    open_fresh: bool,
     interrupted: impl Fn() -> bool,
 ) -> (Verdict, Option<ChannelId>) {
     let mut opened_ch = None;
@@ -1524,7 +1572,10 @@ fn settle_opening(
             // them unprompted, and opening one here would ask for a stream it
             // still holds. Nothing is lost for the verdict either: that
             // announcement is itself the traffic this open exists to provoke.
-            if !att.client.resumed() {
+            // Recovery probes must not create a replacement shell before
+            // the owner asks. With no channel, authentication settles from
+            // the live link at the existing signature deadline instead.
+            if open_fresh && !att.client.resumed() {
                 opened_ch = channel_session.open_shell(cols, rows);
             }
         },
@@ -1539,6 +1590,89 @@ mod tests {
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
+
+    #[test]
+    fn replacement_without_signers_refuses_each_road_before_allowing_ssh() {
+        use ::connect::recovery_gate::{RecoveryEpoch, SweepId};
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::tempdir().unwrap();
+        let roads = [
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        ];
+        let args = crate::args::parse_args(
+            &roads
+                .iter()
+                .map(|r| r.local_addr().unwrap().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let old = Setup::new(
+            args,
+            transport::generate_keypair(),
+            sshauth::known_hosts::KnownHosts::open(home.path().join("known_hosts")),
+            Box::new(trust::UdpDiscovery),
+            Tty::at(home.path().join("no-tty")),
+            KnownHosts::new(home.path().join("ssh_known_hosts"), None),
+            None,
+            None,
+            [1; 16],
+        );
+        *old.session_key.lock().unwrap() = Some([7; 32]);
+        old.cache_candidates(&Loaded::default());
+        for road in &roads {
+            old.allowlist("127.0.0.1", road.local_addr().unwrap().port());
+        }
+        let setup = old.replacement([2; 16]);
+        let epoch = RecoveryEpoch {
+            connection: 2,
+            network: 1,
+        };
+        let sweep = SweepId(1);
+        let recovery = Recovery::new(epoch, roads.len());
+        recovery.begin_sweep(sweep);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut climb = Climb::new(
+            &setup,
+            setup.args.addresses.clone(),
+            0,
+            Mode::Background {
+                progress: tx.clone(),
+                round: 1,
+            },
+            80,
+            24,
+            tx,
+            &rx,
+        )
+        .recovering(&recovery, epoch, sweep)
+        .allow_new_session(true);
+        let started = Instant::now();
+        for (i, road) in roads.iter().enumerate() {
+            assert!(!recovery.ssh_allowed(), "SSH must wait for every road");
+            let (outcome, _) = climb
+                .direct(
+                    i,
+                    road.local_addr().unwrap().port(),
+                    Stage::First,
+                    &recovery.cancel,
+                )
+                .unwrap();
+            assert_eq!(outcome, DirectOutcome::Refused);
+        }
+        assert!(
+            recovery.ssh_allowed(),
+            "completed QSH refusals admit bound SSH"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stale enrollment waited for UDP"
+        );
+        assert_eq!(setup.server_identity(), old.server_identity());
+        assert_eq!(old.token, [1; 16]);
+        assert_eq!(setup.token, [2; 16]);
+    }
 
     #[test]
     fn no_key_at_all_is_a_refusal_with_nothing_offered_not_the_end() {

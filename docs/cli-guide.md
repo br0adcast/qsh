@@ -288,8 +288,15 @@ can select a different session. A key conflict during foreground login exits
 with code 11. During recovery, a foreign server is retried as a failed path while
 the expected key remains unchanged. When the expected server authenticates but
 confirms that the old session no longer exists, for example after a daemon
-restart, qsh exits with code 13. Start qsh again to create a new session in that
-case.
+restart, or an authenticated resume no longer lists the tracked shell, qsh restores the terminal, explains the loss, and asks
+`Start a new session? [Y/n]`. Enter, `yes`, or `y` starts a fresh shell
+in the same invocation. `no`, EOF, or no controlling terminal exits with
+code 13; Ctrl-C cancels with code 130. The new shell uses the same locked local
+session slot with a new persisted resume token, so detach and resume work as
+usual. Consent preserves the expected server identity and SSH recovery bindings;
+a changed endpoint continues retrying without another trust question. Replacement
+first tries the authenticated road that confirmed the loss, then the other
+configured roads if needed.
 
 ## Options and exit codes
 
@@ -321,7 +328,7 @@ exit is returned as its own exit code. Client-generated failures use:
 | 10 | Authentication keys could not be loaded. |
 | 11 | A server key changed during foreground login, or supplied addresses have conflicting server keys. |
 | 12 | All addresses failed during login. |
-| 13 | Recovery found that the server session no longer exists. |
+| 13 | Recovery confirmed session loss and a replacement was declined or could not be confirmed. |
 | 130 | An interrupted operation, such as cancelling an installation with Ctrl-C. |
 
 ### Prediction
