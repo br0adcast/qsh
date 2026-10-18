@@ -79,6 +79,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -128,7 +129,7 @@ pub(super) struct MonitorPlan {
     /// terminal of its own that the session never hears about (spec §9
     /// `tty-first-channel`).
     pub(super) tty: String,
-    /// Where the client was when it logged in, for `PAM_RHOST`. Chosen by
+    /// Full source endpoint, converted to its numeric IP for `PAM_RHOST`. Chosen by
     /// the WORKER, so it is worth nothing as a fact: see
     /// `protocol::Request::Verify`'s own field, and spec §9
     /// `rhost-from-worker`.
@@ -656,6 +657,22 @@ fn set_interval_timer(every: Duration) {
     }
 }
 
+/// Translate the worker-reported endpoint only at the remote PAM boundary.
+/// The full endpoint stays with the helper for diagnostics. This validates
+/// its representation, not its truth: a compromised worker still chooses it.
+/// Never give PAM an empty/unknown origin, which some stacks treat as local.
+fn pam_origin(rhost: &str) -> Result<String, PamError> {
+    rhost
+        .parse::<SocketAddr>()
+        .map(|endpoint| endpoint.ip())
+        .or_else(|_| rhost.parse::<IpAddr>())
+        .map(|ip| ip.to_string())
+        .map_err(|_| PamError {
+            code: super::pam::PAM_SYSTEM_ERR,
+            what: "the client address is not a numeric IP or endpoint",
+        })
+}
+
 /// `pam_start` for this login, from the stack the plan names.
 ///
 /// Two functions, not one with a branch, and the test one is
@@ -667,32 +684,24 @@ fn set_interval_timer(every: Duration) {
 /// which is what actually checks it.
 #[cfg(not(test))]
 fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
-    Pam::start(
-        &plan.pam_service,
-        &plan.account.name,
-        &plan.tty,
-        &plan.rhost,
-    )
+    let origin = pam_origin(&plan.rhost)?;
+    Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin)
 }
 
 /// [`start_transaction`], for the tests: a stack in a directory of the
 /// test's own, so the PAM tests need no root and touch no `/etc/pam.d`.
 #[cfg(test)]
 fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
+    let origin = pam_origin(&plan.rhost)?;
     match &plan.pam_confdir {
         Some(dir) => Pam::start_confdir(
             dir,
             &plan.pam_service,
             &plan.account.name,
             &plan.tty,
-            &plan.rhost,
+            &origin,
         ),
-        None => Pam::start(
-            &plan.pam_service,
-            &plan.account.name,
-            &plan.tty,
-            &plan.rhost,
-        ),
+        None => Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin),
     }
 }
 
@@ -1533,6 +1542,303 @@ fn fork_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn current_account_name() -> String {
+        nix::unistd::User::from_uid(Uid::current())
+            .expect("passwd")
+            .expect("account")
+            .name
+    }
+
+    fn remote_transaction(
+        dir: &std::path::Path,
+        service: &str,
+        user: &str,
+        tty: &str,
+        rhost: &str,
+    ) -> Result<Pam, PamError> {
+        let account = super::super::account::lookup(user).expect("existing test account");
+        start_transaction(&MonitorPlan {
+            account,
+            login: [7; 16],
+            tty: tty.into(),
+            rhost: rhost.into(),
+            pam_service: service.into(),
+            pam_confdir: Some(dir.to_path_buf()),
+            become_account: |_, _, _| Ok(()),
+            fd_limit: 0,
+            session_budget: Duration::from_secs(1),
+            session_close_budget: Duration::from_secs(1),
+        })
+    }
+
+    /// Capture the actual module environment, including IPv6 scope removal.
+    #[test]
+    fn pam_rhost_is_the_numeric_ip_without_the_endpoint_port() {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+            "helper::monitor::tests::pam_rhost_is_the_numeric_ip_without_the_endpoint_port_body",
+        );
+        assert!(status.success(), "{status}:\n{stdout}\n{stderr}");
+    }
+
+    #[test]
+    #[ignore = "runs only via pam_rhost_is_the_numeric_ip_without_the_endpoint_port"]
+    fn pam_rhost_is_the_numeric_ip_without_the_endpoint_port_body() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = dir.path().join("seen");
+        let script = dir.path().join("record.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PAM_RHOST\" >> {}\n",
+                seen.display()
+            ),
+        )
+        .expect("write capture script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::write(
+            dir.path().join("qshd-test-rhost"),
+            format!("account required pam_exec.so {}\n", script.display()),
+        )
+        .expect("write stack");
+        let inputs = [
+            "203.0.113.7:2222",
+            "[2001:db8::7]:2222",
+            "[fe80::7%3]:2222",
+            "203.0.113.7",
+            "2001:db8::7",
+        ];
+        for endpoint in inputs {
+            let mut pam = remote_transaction(
+                dir.path(),
+                "qshd-test-rhost",
+                &current_account_name(),
+                "/dev/pts/7",
+                endpoint,
+            )
+            .expect("start");
+            pam.acct_mgmt().expect("capture module");
+        }
+        assert_eq!(
+            std::fs::read_to_string(seen).expect("capture"),
+            "203.0.113.7\n2001:db8::7\nfe80::7\n203.0.113.7\n2001:db8::7\n"
+        );
+    }
+
+    /// Linux-PAM 1.5.3 resolves CIDR network tokens with NULL getaddrinfo
+    /// hints. glibc implicitly applies AI_ADDRCONFIG there, so even numeric
+    /// IPv6 needs a configured address other than ::1. Probe that real call.
+    fn pam_access_can_resolve_ipv6() -> bool {
+        let network = CString::new("2001:db8:1::").expect("numeric network");
+        let mut addresses = std::ptr::null_mut();
+        // SAFETY: the input is terminated, output points to a live local,
+        // and any returned list is released with the matching libc function.
+        let result = unsafe {
+            nix::libc::getaddrinfo(
+                network.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut addresses,
+            )
+        };
+        if !addresses.is_null() {
+            unsafe { nix::libc::freeaddrinfo(addresses) };
+        }
+        result == 0
+    }
+
+    /// Only constructed after this fixture successfully added its address.
+    /// A preexisting address is never owned or removed by the fixture.
+    struct DisposableIpv6Address {
+        socket: OwnedFd,
+        request: Ipv6AddressRequest,
+    }
+
+    // Linux's `struct in6_ifreq`, used by SIOCSIFADDR/SIOCDIFADDR.
+    #[repr(C)]
+    struct Ipv6AddressRequest {
+        address: nix::libc::in6_addr,
+        prefix_len: u32,
+        interface_index: nix::libc::c_int,
+    }
+
+    impl DisposableIpv6Address {
+        fn add() -> Self {
+            use std::os::fd::FromRawFd as _;
+            assert!(
+                Uid::effective().is_root()
+                    && std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() == Ok("1"),
+                "IPv6 setup is restricted to an explicitly disposable root container"
+            );
+            // SAFETY: socket returns an owned descriptor or -1; it is
+            // adopted exactly once, only after checking the result.
+            let fd = unsafe {
+                nix::libc::socket(
+                    nix::libc::AF_INET6,
+                    nix::libc::SOCK_DGRAM | nix::libc::SOCK_CLOEXEC,
+                    0,
+                )
+            };
+            assert!(fd >= 0, "IPv6 socket: {}", std::io::Error::last_os_error());
+            let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+            let interface = CString::new("lo").expect("interface name");
+            let index = unsafe { nix::libc::if_nametoindex(interface.as_ptr()) };
+            assert_ne!(index, 0, "the disposable namespace must have loopback");
+            let request = Ipv6AddressRequest {
+                address: nix::libc::in6_addr {
+                    s6_addr: "2001:db8::42"
+                        .parse::<std::net::Ipv6Addr>()
+                        .expect("fixture IP")
+                        .octets(),
+                },
+                prefix_len: 128,
+                interface_index: index as nix::libc::c_int,
+            };
+            // SAFETY: request has Linux in6_ifreq's layout and remains live
+            // throughout the ioctl. This socket belongs to this namespace.
+            let result =
+                unsafe { nix::libc::ioctl(socket.as_raw_fd(), nix::libc::SIOCSIFADDR, &request) };
+            assert_eq!(
+                result,
+                0,
+                "add disposable IPv6 address (requires container NET_ADMIN): {}",
+                std::io::Error::last_os_error()
+            );
+            Self { socket, request }
+        }
+    }
+
+    impl Drop for DisposableIpv6Address {
+        fn drop(&mut self) {
+            // SAFETY: this is the exact request that succeeded in add(),
+            // and the descriptor and request are still owned by this guard.
+            let result = unsafe {
+                nix::libc::ioctl(
+                    self.socket.as_raw_fd(),
+                    nix::libc::SIOCDIFADDR,
+                    &self.request,
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "remove fixture-owned IPv6 address: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn assert_pam_access_cidr_family(family: &str) {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated_with_env(
+            "helper::monitor::tests::pam_access_matches_source_cidrs_with_explicit_fallbacks_body",
+            &[("QSHD_TEST_PAM_ACCESS_FAMILY", std::ffi::OsStr::new(family))],
+        );
+        assert!(status.success(), "{status}:\n{stdout}\n{stderr}");
+    }
+
+    /// Both CIDR matches and their opposite fallbacks matter: a broken
+    /// origin can deny an allowed peer OR admit a denied peer.
+    #[test]
+    fn pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks() {
+        assert_pam_access_cidr_family("ipv4");
+    }
+
+    #[test]
+    fn pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks() {
+        let _address = if pam_access_can_resolve_ipv6() {
+            None
+        } else if Uid::effective().is_root()
+            && std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() == Ok("1")
+        {
+            Some(DisposableIpv6Address::add())
+        } else {
+            eprintln!(
+                "SKIPPED pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks: \
+                Linux-PAM's AI_ADDRCONFIG requires a configured IPv6 address other than ::1; \
+                CI runs this test in an explicitly disposable root container with NET_ADMIN"
+            );
+            return;
+        };
+        assert_pam_access_cidr_family("ipv6");
+    }
+
+    #[test]
+    #[ignore = "runs only via the pam_access IPv4 and IPv6 CIDR wrappers"]
+    fn pam_access_matches_source_cidrs_with_explicit_fallbacks_body() {
+        let family =
+            std::env::var("QSHD_TEST_PAM_ACCESS_FAMILY").expect("family selected by wrapper");
+        let (cidr, matching, outside) = match family.as_str() {
+            "ipv4" => ("203.0.113.0/24", "203.0.113.7:2222", "198.51.100.7:2222"),
+            "ipv6" => (
+                "2001:db8:1::/48",
+                "[2001:db8:1::7]:2222",
+                "[2001:db8:2::7]:2222",
+            ),
+            other => panic!("unexpected CIDR fixture family: {other}"),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let access = dir.path().join("access.conf");
+        std::fs::write(
+            dir.path().join("qshd-test-access"),
+            format!(
+                "account required pam_access.so nodefgroup noaudit accessfile={}\n",
+                access.display()
+            ),
+        )
+        .expect("write stack");
+        let me = current_account_name();
+        let mut results = Vec::new();
+        for (rule, fallback, expected) in [("+", "-", true), ("-", "+", false)] {
+            std::fs::write(&access, format!("{rule}:ALL:{cidr}\n{fallback}:ALL:ALL\n"))
+                .expect("write access policy");
+            for (endpoint, allowed) in [(matching, expected), (outside, !expected)] {
+                let mut pam =
+                    remote_transaction(dir.path(), "qshd-test-access", &me, "/dev/pts/7", endpoint)
+                        .expect("start");
+                results.push((cidr, rule, endpoint, pam.acct_mgmt().is_ok(), allowed));
+            }
+        }
+        assert!(
+            results
+                .iter()
+                .all(|(_, _, _, actual, expected)| actual == expected),
+            "CIDR verdicts (cidr, rule, endpoint, actual, expected): {results:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_pam_origins_are_refused_before_starting_the_stack() {
+        // No stack exists: the argument error must precede pam_start_confdir.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for origin in [
+            "",
+            "localhost",
+            "host.example:22",
+            "not-an-ip",
+            "203.0.113.7:bad",
+            "[2001:db8::7]",
+            "203.0.113.7\n",
+            "[fe80::7%eth0]:22",
+        ] {
+            let error = remote_transaction(
+                dir.path(),
+                "qshd-test-absent",
+                &current_account_name(),
+                "/dev/pts/7",
+                origin,
+            )
+            .expect_err("invalid remote must never become local");
+            assert_eq!(
+                (error.code, error.what),
+                (
+                    super::super::pam::PAM_SYSTEM_ERR,
+                    "the client address is not a numeric IP or endpoint"
+                ),
+                "origin {origin:?}"
+            );
+        }
+    }
 
     /// How long a test here waits on a seam for a message a monitor may or
     /// may not have sent. Both waits below are bounded by it, the opposite

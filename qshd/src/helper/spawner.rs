@@ -2129,7 +2129,7 @@ pub(crate) mod tests {
 
     use super::super::server::tests::{
         helper_trusting, helper_trusting_a_slow_database, join_within, running_as_root, TestHelper,
-        SLOW_LOOKUP,
+        PROOF_RHOST, SLOW_LOOKUP,
     };
     use super::super::server::MAX_OUTSTANDING_NONCES;
 
@@ -2298,7 +2298,12 @@ pub(crate) mod tests {
         let hash = [7u8; 32];
         let nonce = auth.issue().expect("the helper issues a nonce");
         let owner = auth
-            .verify(&hash, &record_for(&key, &me, &hash, nonce), any_login(), "")
+            .verify(
+                &hash,
+                &record_for(&key, &me, &hash, nonce),
+                any_login(),
+                PROOF_RHOST,
+            )
             .expect("the helper admits this test's own account");
         Worker {
             spawner: Arc::new(HelperChannelSpawner::new(channels).expect("spawner")),
@@ -3361,7 +3366,12 @@ pub(crate) mod tests {
         let nonce = auth.issue().expect("the helper issues a nonce");
         let login: LoginId = [9u8; 16];
         let owner = auth
-            .verify(&hash, &record_for(&key, &me, &hash, nonce), login, "")
+            .verify(
+                &hash,
+                &record_for(&key, &me, &hash, nonce),
+                login,
+                PROOF_RHOST,
+            )
             .expect("the helper admits this test's own account");
         let spawner = Arc::new(HelperChannelSpawner::new(channels).expect("spawner"));
 
