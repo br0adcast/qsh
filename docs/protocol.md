@@ -993,12 +993,27 @@ would only delay the repair.
 
 For a later run of `qsh` to return to the shell an earlier one left behind,
 the token has to survive the process. `cli/src/sessions.rs` keeps it in
-`~/.config/qsh/sessions` as numbered slots per `host:port` (`MAX_SLOTS` =
-16, directory `0700`, files `0600`). A run takes the lowest slot no live
-process holds, where "holds" is an exclusive `flock` — released by the
-kernel however the process dies, so there is no stale lock and no pid file.
-Two terminals to the same host therefore get different tokens and cannot
-steal each other's session.
+`~/.config/qsh/sessions` (or `$XDG_CONFIG_HOME/qsh/sessions`) as numbered
+slots per effective login, exact first configured host text, and QSH port
+(`MAX_SLOTS` = 16 per tuple, directory `0700`, files `0600`). There is no DNS
+resolution, case normalization, or alias merging in this local key. A run takes
+the lowest slot no live process holds, where "holds" is an exclusive `flock` —
+released by the kernel however the process dies, so there is no stale lock and
+no pid file. Two terminals using the same tuple get different tokens; different
+logins have independent tokens and locks, each starting at slot zero.
+
+Filenames are `v2-<lowercase SHA-256 hex>-<slot>`. The hash input is
+`b"qsh/session-slot/v2\0"`, followed by the login's UTF-8 byte length as a
+big-endian `u64` and its bytes, the host's UTF-8 byte length as a big-endian
+`u64` and its bytes, and the QSH port as a big-endian `u16`. The decimal slot
+number is appended separately. Framing prevents ambiguous tuple concatenation,
+and hashing gives bounded filenames without path characters or sanitizer
+collisions. This is a local storage format, independent of the wire protocol.
+
+Legacy host-only records remain untouched and are never automatically imported
+or claimed because they have no trustworthy login attribution. The new client
+therefore cannot automatically resume a detached session through an old record;
+it creates a fresh login-scoped record without terminating that server session.
 
 The console client always announces `Warm` (`cli/src/connect.rs`): asking to
 resume costs nothing when there is nothing to resume, whereas asking cold
