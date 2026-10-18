@@ -1496,7 +1496,9 @@ impl Connection {
                 candidates.push(self.next_ping_at());
             }
         }
-        candidates.push(self.death_base() + self.death_after());
+        if let Some(deadline) = self.death_base().checked_add(self.death_after()) {
+            candidates.push(deadline);
+        }
         if matches!(self.state, LinkState::Live) {
             candidates.push(self.last_recv_ordinary + PATH_DOWN_AFTER);
         }
@@ -1853,6 +1855,8 @@ impl Connection {
     /// transport one. The console client keeps the default and treats a dead
     /// link as the cue to retry its address ladder in the background. A client that would
     /// rather wait out a long outage on the same connection can set it long.
+    /// If its deadline is outside `Instant`'s representable range, no death
+    /// wake-up is scheduled; the connection's other timers still run.
     pub fn set_death_after(&mut self, after: Duration) {
         self.death_after_override = Some(after);
     }
@@ -4148,6 +4152,119 @@ mod tests {
             matches!(patient.state, LinkState::Closed),
             "past its own deadline even a patient client gives up"
         );
+    }
+
+    #[test]
+    fn death_deadline_max_preserves_ping_and_path_timers() {
+        let (client, server, _, _) = established_pair();
+        for mut conn in [client, server] {
+            let start = conn.handshake_at;
+            let ping_at = conn.next_timeout().unwrap();
+            conn.set_death_after(Duration::MAX);
+            assert_eq!(conn.next_timeout(), Some(ping_at));
+            assert!(!conn.on_timeout_if_due(ping_at).is_empty());
+            assert_eq!(conn.state(), LinkState::Live);
+
+            conn.on_timeout(start + PATH_DOWN_AFTER);
+            assert_eq!(conn.state(), LinkState::PathDown);
+            let later = start + Duration::from_secs(600);
+            assert!(!conn.on_timeout_if_due(later).is_empty());
+            assert_eq!(conn.state(), LinkState::PathDown);
+            assert!(conn.next_timeout().is_some_and(|deadline| deadline > later));
+        }
+    }
+
+    #[test]
+    fn death_deadline_ordinary_duration_closes_at_the_exact_boundary() {
+        let (client, server, _, _) = established_pair();
+        for mut conn in [client, server] {
+            let start = conn.handshake_at;
+            let duration = Duration::from_millis(500);
+            let deadline = start + duration;
+            conn.set_death_after(duration);
+            assert_eq!(conn.next_timeout(), Some(deadline));
+            conn.on_timeout(deadline - Duration::from_nanos(1));
+            assert_eq!(conn.state(), LinkState::Live);
+            conn.on_timeout_if_due(deadline);
+            assert_eq!(conn.state(), LinkState::Closed);
+            assert_eq!(conn.next_timeout(), None);
+            assert!(!conn.closed_gracefully());
+        }
+    }
+
+    #[test]
+    fn death_deadline_max_preserves_retransmission_and_probe_deadlines() {
+        let (mut client, mut server, _, server_addr) = established_pair();
+        let start = server.handshake_at;
+        let first = server.send(start, 16, b"retained");
+        assert!(!first.is_empty());
+        let retransmit_at = start + server.rto();
+        server.set_death_after(Duration::MAX);
+        assert_eq!(server.next_timeout(), Some(retransmit_at));
+        let resent = server.on_timeout_if_due(retransmit_at);
+        assert!(resent
+            .iter()
+            .filter_map(|packet| client.peek_frames(&packet.bytes))
+            .flatten()
+            .any(|frame| matches!(frame, StreamFrame::Data { stream_id: 16, data, .. } if data == b"retained")));
+
+        let spare = addr("192.0.2.2:41000");
+        client.set_paths(vec![server_addr, spare]);
+        client.set_death_after(Duration::MAX);
+        assert_eq!(client.next_timeout(), Some(start));
+        let probes = client.on_timeout_if_due(start);
+        assert!(probes.iter().any(|packet| packet.to == spare
+            && server
+                .peek_frames(&packet.bytes)
+                .is_some_and(|frames| frames
+                    .iter()
+                    .any(|frame| matches!(frame, StreamFrame::PathProbe { .. })))));
+        assert_eq!(client.state(), LinkState::Live);
+        assert!(client
+            .next_timeout()
+            .is_some_and(|deadline| deadline > start));
+    }
+
+    #[test]
+    fn death_deadline_at_instant_limit_is_distinct_from_overflow() {
+        let (client, server, _, _) = established_pair();
+        let origin = client.handshake_at;
+        // Discover this platform's actual Instant limit, not an assumed Unix
+        // timespec or macOS representation. Only the fixture uses this search.
+        let mut fits = Duration::ZERO;
+        let mut overflows = Duration::MAX;
+        assert!(origin.checked_add(overflows).is_none());
+        while overflows - fits > Duration::from_nanos(1) {
+            let candidate = fits + (overflows - fits) / 2;
+            if origin.checked_add(candidate).is_some() {
+                fits = candidate;
+            } else {
+                overflows = candidate;
+            }
+        }
+        let limit = origin.checked_add(fits).unwrap();
+        let start = limit - Duration::from_secs(60);
+        for (mut conn, duration) in [
+            (client, Duration::from_secs(60)),
+            (server, Duration::from_secs(60) + Duration::from_nanos(1)),
+        ] {
+            // Keep the independent fixed-interval timers representable; this
+            // tests the configurable death candidate, not all Instant callers.
+            conn.handshake_at = start;
+            conn.last_recv_auth = start;
+            conn.last_recv_ordinary = start;
+            conn.set_death_after(duration);
+            assert_eq!(conn.next_timeout(), Some(start + PING_INTERVAL));
+            assert_eq!(conn.state(), LinkState::Live);
+            if duration == Duration::from_secs(60) {
+                conn.on_timeout(limit);
+                assert_eq!(conn.state(), LinkState::Closed);
+            } else {
+                assert!(!conn.on_timeout_if_due(start + PING_INTERVAL).is_empty());
+                assert_eq!(conn.state(), LinkState::Live);
+                assert!(conn.next_timeout().is_some());
+            }
+        }
     }
 
     /// Once the path has been down a while, PINGs slow down. At the lively
