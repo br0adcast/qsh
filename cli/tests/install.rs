@@ -107,9 +107,12 @@ fn accept_installs_and_opens_shell() {
     assert!(screen.text().contains(server_target));
     assert!(screen.text().contains(image_path(&sb).to_str().unwrap()));
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("Key fingerprint");
-    client.master.write_all(b"yes\n").unwrap();
     screen.wait("Authorize SSH recovery");
+    assert!(
+        !screen.text().contains("Key fingerprint"),
+        "{}",
+        screen.text()
+    );
     client.master.write_all(b"no\n").unwrap();
     client.type_line("echo INSTALL_'OK'");
     screen.wait("INSTALL_OK");
@@ -141,9 +144,12 @@ fn enter_accepts_installation_and_opens_shell() {
     screen.wait("[Y/n]");
     assert!(screen.text().contains("  Source    GitHub Releases"));
     client.master.write_all(b"\n").unwrap();
-    screen.wait("Key fingerprint");
-    client.master.write_all(b"yes\n").unwrap();
     screen.wait("Authorize SSH recovery");
+    assert!(
+        !screen.text().contains("Key fingerprint"),
+        "{}",
+        screen.text()
+    );
     client.master.write_all(b"no\n").unwrap();
     client.type_line("echo INSTALL_'OK'");
     screen.wait("INSTALL_OK");

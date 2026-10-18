@@ -530,7 +530,7 @@ impl Attempted {
 
 #[cfg(test)]
 #[path = "../../crates/bringup/tests/support_home/mod.rs"]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

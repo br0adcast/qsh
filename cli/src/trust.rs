@@ -6,12 +6,14 @@
 //! reaching a socket, so all of it is under test: those two read a terminal
 //! and a network, and a test cannot.
 //!
-//! Discovery does NOT run once a key is pinned: it answers anyone who asks,
-//! and doing it on every launch would announce to a bystander that qsh lives
-//! here. There is exactly one exception, and it is on a failure path the
-//! user is about to be told about anyway -- a connection made with a pinned
-//! key that never got anywhere. A server whose static key has changed cannot
-//! complete a Noise IK handshake against the old one, and the transport
+//! Ordinary direct login skips discovery once a key is pinned: it answers
+//! anyone who asks, and doing it on every launch would announce to a bystander
+//! that qsh lives here. Foreground SSH bootstrap separately compares discovery
+//! with the key returned by that verified login, scoped to its exact endpoint;
+//! discovery does not grant trust in that path. The other exception is a
+//! failure path the user is about to be told about anyway -- a connection made
+//! with a pinned key that never got anywhere. A server whose static key has
+//! changed cannot complete a Noise IK handshake against the old one, and the transport
 //! reports that as silence, which is also what a stopped daemon looks like.
 //! [`after_silence`] asks once, then, so the two are told apart:
 //! a changed key must produce a loud, explicit refusal naming both
@@ -21,9 +23,11 @@
 //! one key (spec §4a): an address with nothing pinned is tried with the key
 //! pinned for a neighbour on the line, and [`after_neighbour_silence`] is
 //! the same one question on the same kind of failure path -- that handshake
-//! never got anywhere. A key is pinned without asking only when a completed
-//! handshake proved the server holds it ([`remember_proven`]); what a key
-//! request offers proves nothing, and is never pinned that way.
+//! never got anywhere. A neighbour's key is pinned without asking only when a
+//! completed handshake proved the server holds it ([`remember_proven`]); what a key
+//! request offers proves nothing, and is never pinned that way. An SSH
+//! bootstrap key is instead pinned atomically by `ssh_server_key` after its
+//! discovery comparison; a Noise handshake must still prove possession.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -200,6 +204,13 @@ pub enum TrustError {
         offered: [u8; 32],
         store: PathBuf,
     },
+    /// SSH bootstrap, discovery or the current session named different daemons.
+    BootstrapMismatch {
+        host: String,
+        port: u16,
+        expected: [u8; 32],
+        offered: [u8; 32],
+    },
     /// The user said no.
     Refused,
     /// The known-hosts file could not be read or written.
@@ -232,6 +243,13 @@ impl fmt::Display for TrustError {
                 key_fingerprint(offered),
                 store.display()
             ),
+            TrustError::BootstrapMismatch { host, port, expected, offered } => write!(
+                f,
+                "the daemon key for {host}:{port} does not match the expected key!\n  \
+                 expected: {}\n  offered: {}\n\n\
+                 SSH bootstrap, QSH discovery, and the current session must identify the same daemon.",
+                key_fingerprint(expected), key_fingerprint(offered)
+            ),
             TrustError::Refused => write!(f, "server key not confirmed -- connection canceled"),
             TrustError::Store(why) => write!(f, "known-hosts file unavailable: {why}"),
         }
@@ -249,6 +267,9 @@ pub enum KeySource {
     Pinned,
     /// Learned by discovery, shown to the user, and pinned just now.
     Discovered,
+    /// Returned by the verified SSH login for this exact endpoint and compared
+    /// with discovery. Noise still proves possession of the private key.
+    SshBootstrap,
     /// Nothing is pinned for this address, and this is the key pinned for
     /// another address of the same command line -- `of`, as `host:port`.
     /// Every address on one command line is a road to one daemon (spec §4a),
@@ -292,13 +313,75 @@ pub fn recovery_server_key(
             return Err(TrustError::KeyChanged {
                 host: host.into(),
                 port,
-                pinned: key,
-                offered: pinned,
+                pinned,
+                offered: key,
                 store: hosts.path().to_owned(),
             })
         }
     };
     Ok(ServerKey { key, source })
+}
+
+/// Require one daemon identity without treating a mismatch as permission
+/// to remove a stored pin. Used for SSH/discovery and SSH/session comparisons.
+pub(crate) fn check_bootstrap_key(
+    host: &str,
+    port: u16,
+    expected: [u8; 32],
+    offered: [u8; 32],
+) -> Result<(), TrustError> {
+    if expected != offered {
+        return Err(TrustError::BootstrapMismatch {
+            host: host.into(),
+            port,
+            expected,
+            offered,
+        });
+    }
+    Ok(())
+}
+
+/// The successful foreground SSH login reported this key for this endpoint.
+/// Existing pins are checked first; discovery only compares with that identity.
+/// Atomic pinning refuses another process's conflicting pin. Callers must bind
+/// this grant to the SSH attempt's exact address and reported port, and must
+/// still complete Noise authentication before using the daemon.
+pub(crate) fn ssh_server_key(
+    host: &str,
+    port: u16,
+    addr: SocketAddr,
+    expected: [u8; 32],
+    hosts: &KnownHosts,
+    neighbours: &[(String, u16)],
+    discover: &dyn Discover,
+) -> Result<ServerKey, TrustError> {
+    // Also fail closed on unreadable stores before reaching discovery.
+    recovery_server_key(host, port, expected, hosts)?;
+    if let Some((_, neighbour)) = neighbour_key(host, port, neighbours, hosts)? {
+        check_bootstrap_key(host, port, neighbour, expected)?;
+    }
+    let offered = discover.key(addr).map_err(|reason| TrustError::NoAnswer {
+        host: host.into(),
+        port,
+        reason,
+    })?;
+    check_bootstrap_key(host, port, expected, offered)?;
+    if let HostVerdict::Changed { pinned } = hosts
+        .pin_if_absent(host, port, &expected)
+        .map_err(|error| TrustError::Store(error.to_string()))?
+    {
+        return Err(TrustError::KeyChanged {
+            host: host.into(),
+            port,
+            pinned,
+            offered: expected,
+            store: hosts.path().to_owned(),
+        });
+    }
+    Ok(ServerKey {
+        key: expected,
+        source: KeySource::SshBootstrap,
+    })
 }
 
 /// The server's static key: from the store if it is pinned; otherwise the
@@ -735,11 +818,8 @@ mod tests {
         store.pin("host", 60001, &[2; 32]).unwrap();
         assert!(matches!(
             recovery_server_key("host", 60001, [1; 32], &store),
-            Err(TrustError::KeyChanged {
-                pinned: [1, ..],
-                offered: [2, ..],
-                ..
-            })
+            Err(TrustError::KeyChanged { pinned, offered, .. })
+                if pinned == [2; 32] && offered == [1; 32]
         ));
         assert_eq!(
             store.check("host", 60001, &[2; 32]).unwrap(),
@@ -1285,6 +1365,209 @@ mod tests {
         assert!(
             !message.contains("did not answer"),
             "the daemon DID answer -- the message must not claim it stayed silent: {message}"
+        );
+    }
+    #[test]
+    fn ssh_bootstrap_matching_discovery_pins_without_a_trust_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        let discovery = FakeDiscovery::answering([7; 32]);
+        let key = ssh_server_key(
+            "example.org",
+            60022,
+            any_addr(),
+            [7; 32],
+            &store,
+            &[],
+            &discovery,
+        )
+        .unwrap();
+        assert_eq!(key.key, [7; 32]);
+        assert_eq!(key.source, KeySource::SshBootstrap);
+        assert_eq!(
+            store.check("example.org", 60022, &[7; 32]).unwrap(),
+            HostVerdict::Known
+        );
+        assert_eq!(discovery.calls(), 1);
+    }
+
+    #[test]
+    fn ssh_bootstrap_discovery_mismatch_cannot_establish_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        let error = ssh_server_key(
+            "example.org",
+            60022,
+            any_addr(),
+            [7; 32],
+            &store,
+            &[],
+            &FakeDiscovery::answering([9; 32]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, TrustError::BootstrapMismatch { expected, offered, .. } if expected == [7; 32] && offered == [9; 32])
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&key_fingerprint(&[7; 32]))
+                && message.contains(&key_fingerprint(&[9; 32]))
+        );
+        assert!(
+            !message.contains("remove") && !message.contains("known_hosts"),
+            "{message}"
+        );
+        assert_eq!(
+            store.check("example.org", 60022, &[9; 32]).unwrap(),
+            HostVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn ssh_bootstrap_checks_existing_pins_before_discovery() {
+        for pinned in [[7; 32], [9; 32]] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = hosts(dir.path());
+            store.pin("example.org", 60022, &pinned).unwrap();
+            let original = std::fs::read(store.path()).unwrap();
+            let discovery = FakeDiscovery::answering([7; 32]);
+            let result = ssh_server_key(
+                "example.org",
+                60022,
+                any_addr(),
+                [7; 32],
+                &store,
+                &[],
+                &discovery,
+            );
+            if pinned == [7; 32] {
+                assert_eq!(result.unwrap().key, [7; 32]);
+                assert_eq!(discovery.calls(), 1);
+            } else {
+                assert!(
+                    matches!(result, Err(TrustError::KeyChanged { pinned: stored, offered, .. }) if stored == [9; 32] && offered == [7; 32])
+                );
+                assert_eq!(
+                    discovery.calls(),
+                    0,
+                    "a conflicting pin refuses before discovery"
+                );
+            }
+            assert_eq!(std::fs::read(store.path()).unwrap(), original);
+        }
+    }
+
+    struct PinDuringDiscovery {
+        path: PathBuf,
+        pinned: [u8; 32],
+    }
+    impl Discover for PinDuringDiscovery {
+        fn key(&self, _: SocketAddr) -> Result<[u8; 32], DiscoveryError> {
+            KnownHosts::open(self.path.clone())
+                .pin("example.org", 60022, &self.pinned)
+                .unwrap();
+            Ok([7; 32])
+        }
+    }
+
+    #[test]
+    fn ssh_bootstrap_never_overwrites_a_concurrent_pin() {
+        for pinned in [[7; 32], [9; 32]] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = hosts(dir.path());
+            let discovery = PinDuringDiscovery {
+                path: store.path().to_owned(),
+                pinned,
+            };
+            let result = ssh_server_key(
+                "example.org",
+                60022,
+                any_addr(),
+                [7; 32],
+                &store,
+                &[],
+                &discovery,
+            );
+            if pinned == [7; 32] {
+                assert_eq!(result.unwrap().key, [7; 32]);
+            } else {
+                assert!(matches!(result, Err(TrustError::KeyChanged { .. })));
+            }
+            assert_eq!(
+                store.check("example.org", 60022, &pinned).unwrap(),
+                HostVerdict::Known
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_bootstrap_preserves_neighbour_coherence_and_store_read_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        store.pin("neighbour", 60023, &[9; 32]).unwrap();
+        let discovery = FakeDiscovery::answering([7; 32]);
+        let result = ssh_server_key(
+            "example.org",
+            60022,
+            any_addr(),
+            [7; 32],
+            &store,
+            &[("neighbour".into(), 60023)],
+            &discovery,
+        );
+        assert!(matches!(result, Err(TrustError::BootstrapMismatch { .. })));
+        assert_eq!(discovery.calls(), 0);
+        assert_eq!(
+            store.check("example.org", 60022, &[7; 32]).unwrap(),
+            HostVerdict::Unknown
+        );
+        std::fs::remove_file(store.path()).unwrap();
+        std::fs::create_dir(store.path()).unwrap();
+        let result = ssh_server_key(
+            "example.org",
+            60022,
+            any_addr(),
+            [7; 32],
+            &store,
+            &[],
+            &discovery,
+        );
+        assert!(matches!(result, Err(TrustError::Store(_))));
+        assert_eq!(discovery.calls(), 0);
+    }
+
+    #[test]
+    fn ssh_bootstrap_requires_an_answer_even_with_a_matching_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        store.pin("example.org", 60022, &[7; 32]).unwrap();
+        assert!(matches!(
+            ssh_server_key(
+                "example.org",
+                60022,
+                any_addr(),
+                [7; 32],
+                &store,
+                &[],
+                &FakeDiscovery::silent()
+            ),
+            Err(TrustError::NoAnswer { .. })
+        ));
+        assert!(matches!(
+            ssh_server_key(
+                "example.org",
+                60022,
+                any_addr(),
+                [7; 32],
+                &store,
+                &[],
+                &FakeDiscovery::answering([9; 32])
+            ),
+            Err(TrustError::BootstrapMismatch { .. })
+        ));
+        assert_eq!(
+            store.check("example.org", 60022, &[7; 32]).unwrap(),
+            HostVerdict::Known
         );
     }
 }

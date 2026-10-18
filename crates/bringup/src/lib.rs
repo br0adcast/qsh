@@ -33,7 +33,8 @@ pub struct BringUpRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
-    /// Reported over SSH for comparison only; Noise still authenticates the daemon.
+    /// Reported by the verified SSH login for endpoint identity binding.
+    /// Noise must still prove that the daemon holds the corresponding private key.
     pub server_pubkey: [u8; 32],
     /// Where the daemon actually listens (`TRANSPORT-READY`, qshd >= this slice).
     pub ports: Vec<u16>,
@@ -151,7 +152,8 @@ pub fn bring_up(
 
 /// Brings up a daemon with caller-supplied installation policy on one SSH login.
 /// Blocking; caller-owned approval and image loading must honor cancellation.
-/// The connection is closed on every outcome. SSH does not establish Noise trust.
+/// The connection is closed on every outcome. SSH reports the intended daemon
+/// identity; callers must still authenticate the daemon through Noise.
 pub fn bring_up_with(
     req: BringUpRequest,
     policy: InstallPolicy,
