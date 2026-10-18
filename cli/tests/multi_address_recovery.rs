@@ -62,6 +62,11 @@ impl Session {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
     }
+    fn frame(&self) -> terminal::Frame {
+        let mut model = terminal::TerminalCore::new(80, 24);
+        model.feed(&self.output.lock().unwrap());
+        model.frame()
+    }
     fn log(&self) -> String {
         std::fs::read_to_string(self.home.path().join("qsh/log")).unwrap_or_default()
     }
@@ -124,6 +129,27 @@ fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
         wait_network(|| network.ssh_connections() > 0),
         "SSH never admitted: {}",
         session.log()
+    );
+    assert!(
+        wait_until(|| {
+            let frame = session.frame();
+            let top: String = (0..80).map(|col| frame.cell(0, col).ch).collect();
+            let active = |protocol: &str| {
+                top.match_indices(protocol).any(|(col, _)| {
+                    (col..col + protocol.len())
+                        .all(|c| frame.cell(0, c as u16).fg == terminal::Color::Indexed(15))
+                })
+            };
+            top.starts_with(" Ctrl-] ? ")
+                && top.ends_with("reconnecting: 127.0.0.1 [QSH/SSH], 127.0.0.1 [QSH/SSH]")
+                && active("QSH")
+                && active("SSH")
+                && (0..80).all(|col| frame.cell(0, col).bg == terminal::Color::Indexed(1))
+        }),
+        "concurrent protocol attempts must occupy a fully red row: {:?}",
+        (0..80)
+            .map(|col| session.frame().cell(0, col).ch)
+            .collect::<String>()
     );
     let during_ssh = network.probes();
     assert!(

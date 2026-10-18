@@ -272,6 +272,29 @@ Retries continue across network A → B → A, so the original server can return
 the same address without deleting trust records or restarting the client. Old
 DNS, discovery, UDP, and SSH results cannot authorize work in a newer generation.
 
+During an outage the entire top row turns red, including while viewing local
+scrollback or hiding the normal status line. Its fixed text lists every configured
+hostname in command-line order, without ports, for example
+`reconnecting: host-a [QSH/SSH], host-b [QSH]`. Protocol labels
+are bright white while being tried and gray otherwise; hostnames remain gray.
+Warm probes can check several paths at once. New QSH handshakes currently try
+addresses in sequence. Gray labels indicate no current attempt; recovery can
+try eligible targets again. SSH can finish starting the daemon before QSH
+finishes checking whether the original session still exists.
+Monochrome terminals use
+bold versus regular reverse video. The text stays in place as activity changes.
+The help hint stays in its usual left-hand columns; recovery text ends at the
+rightmost terminal cell, with at least one space separating it from the hint.
+Very narrow rows omit the hint to leave room for clipped recovery text.
+Overflow is clipped with an ellipsis, without rotating the text.
+
+`Ctrl-] s` opens read-only recovery details. Use the arrow keys to scroll through
+elapsed outage time and all configured addresses, including unresolved names
+and aliases of the same socket. Details show available QSH endpoints and effective
+ports, configured SSH hosts and ports, and resolving, queued, or retry states.
+QSH continues while SSH is active or waiting to retry. The details close when the
+session returns.
+
 The transport retransmits unacknowledged input while it can recover. After ten
 seconds without a link, the server stops retaining unlimited output and repaints
 its current screen on return. Output that scrolled away during the outage may

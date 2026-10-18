@@ -20,6 +20,10 @@ struct State {
     ports: Vec<Option<u16>>,
     ssh: Option<(u64, knock::Cancel)>,
     next_ssh: u64,
+    qsh_activity: Option<(u64, SweepId, QshActivity)>,
+    observed_sweep: Option<SweepId>,
+    ssh_activity: Option<(u64, AddressId)>,
+    ssh_retry_at: Option<Instant>,
 }
 
 struct SshAttempt {
@@ -27,6 +31,22 @@ struct SshAttempt {
     revision: u64,
     attempt: u64,
     cancel: knock::Cancel,
+}
+
+/// Observation only: none of these fields participates in recovery decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    pub qsh: Option<QshActivity>,
+    pub ssh: Option<AddressId>,
+    pub ssh_retry_at: Option<Instant>,
+    pub ssh_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QshActivity {
+    pub address: AddressId,
+    /// None while resolving; never substitute another protocol's DNS result.
+    pub endpoint: Option<SocketAddr>,
 }
 
 pub struct Recovery {
@@ -39,6 +59,7 @@ pub struct Recovery {
 
 impl State {
     fn cancel_ssh(&mut self) {
+        self.ssh_activity = None;
         if let Some((_, cancel)) = self.ssh.take() {
             cancel.cancel();
         }
@@ -46,6 +67,8 @@ impl State {
     fn changed(&mut self, epoch: RecoveryEpoch) {
         self.cancel_ssh();
         self.revision += 1;
+        self.qsh_activity = None;
+        self.observed_sweep = None;
         self.gate.reset(epoch);
     }
 }
@@ -62,6 +85,10 @@ impl Recovery {
                 ports: vec![None; addresses],
                 ssh: None,
                 next_ssh: 0,
+                qsh_activity: None,
+                observed_sweep: None,
+                ssh_activity: None,
+                ssh_retry_at: None,
             }),
             retry_now: AtomicBool::new(false),
             diagnostics: (0..addresses)
@@ -130,6 +157,8 @@ impl Recovery {
         setup.invalidate_ssh_authorization();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel.cancel();
+        state.qsh_activity = None;
+        state.ssh_retry_at = None;
         state.cancel_ssh();
         for diagnostic in &self.diagnostics {
             diagnostic.invalidate();
@@ -137,11 +166,10 @@ impl Recovery {
     }
 
     pub fn begin_sweep(&self, sweep: SweepId) {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .gate
-            .begin_sweep(sweep);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.gate.begin_sweep(sweep);
+        state.observed_sweep = Some(sweep);
+        state.qsh_activity = None;
     }
 
     pub fn finish(
@@ -156,10 +184,76 @@ impl Recovery {
         if self.cancel.is_cancelled() || state.revision != revision {
             return;
         }
+        if epoch == self.epoch
+            && state
+                .qsh_activity
+                .as_ref()
+                .is_some_and(|(r, s, q)| *r == revision && *s == sweep && q.address == addr)
+        {
+            state.qsh_activity = None;
+        }
         match state.gate.finish(epoch, sweep, addr, outcome) {
             GateDecision::AllowSsh => log::log("recovery: full QSH sweep failed; SSH permitted"),
             GateDecision::Recovered => state.cancel_ssh(),
             _ => {}
+        }
+    }
+
+    pub fn activity(&self) -> Activity {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let running = !self.cancel.is_cancelled();
+        Activity {
+            qsh: running
+                .then(|| state.qsh_activity.as_ref().map(|(_, _, q)| q.clone()))
+                .flatten(),
+            ssh: running
+                .then(|| state.ssh_activity.map(|(_, id)| id))
+                .flatten(),
+            ssh_retry_at: running.then_some(state.ssh_retry_at).flatten(),
+            ssh_allowed: running && state.gate.ssh_allowed(),
+        }
+    }
+
+    pub fn observe_qsh(
+        &self,
+        revision: u64,
+        sweep: SweepId,
+        address: AddressId,
+        endpoint: Option<SocketAddr>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.revision != revision
+            || state.observed_sweep != Some(sweep)
+        {
+            return;
+        }
+        state.qsh_activity = Some((revision, sweep, QshActivity { address, endpoint }));
+    }
+
+    fn observe_ssh(&self, attempt: &SshAttempt, address: AddressId) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.cancel.is_cancelled()
+            && !attempt.cancel.is_cancelled()
+            && state.revision == attempt.revision
+            && attempt.epoch == self.epoch
+            && state
+                .ssh
+                .as_ref()
+                .is_some_and(|(id, _)| *id == attempt.attempt)
+        {
+            state.ssh_activity = Some((attempt.attempt, address));
+            state.ssh_retry_at = None;
+        }
+    }
+
+    fn finish_ssh(&self, attempt: &SshAttempt) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .ssh_activity
+            .is_some_and(|(id, _)| id == attempt.attempt)
+        {
+            state.ssh_activity = None;
         }
     }
 
@@ -247,12 +341,20 @@ impl Recovery {
     }
     fn wait_ssh(&self, failed: u32) -> bool {
         let until = Instant::now() + ::connect::reconnect::pause_after(failed);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ssh_retry_at = Some(until);
         while Instant::now() < until && !self.cancel.is_cancelled() {
             if self.retry_now.swap(false, Ordering::SeqCst) {
                 break;
             }
             std::thread::sleep(POLL);
         }
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ssh_retry_at = None;
         !self.cancel.is_cancelled()
     }
 
@@ -291,7 +393,9 @@ impl Recovery {
                         log::shown(&report::trying_ssh(&address.host, route));
                         // All SSH auth and remote exec operations use this generation's
                         // token. Reset, QSH success and owner cancellation revoke it.
-                        match setup.bring_up(address, &attempt.cancel) {
+                        match setup.bring_up_observed(address, &attempt.cancel, || {
+                            recovery.observe_ssh(&attempt, AddressId(i))
+                        }) {
                             Ok(ready) => {
                                 let port = ready.port_for(address.qsh_port);
                                 if recovery.publish_ready(&attempt, i, port) {
@@ -310,6 +414,7 @@ impl Recovery {
                             )),
                             Err(why) => log::log(&format!("recovery: ssh address {i}: {why:?}")),
                         }
+                        recovery.finish_ssh(&attempt);
                     }
                     rounds = rounds.saturating_add(1);
                     log::log(&format!(
@@ -376,6 +481,67 @@ mod tests {
         }
         let attempt = r.begin_ssh().unwrap();
         assert!(r.publish_ready(&attempt, addr, port));
+    }
+
+    #[test]
+    fn a_completed_new_sweep_cannot_be_replaced_by_old_progress() {
+        let r = Recovery::new(EPOCH, 1);
+        r.begin_sweep(SweepId(1));
+        r.observe_qsh(r.revision(), SweepId(1), AddressId(0), None);
+        r.begin_sweep(SweepId(2));
+        r.observe_qsh(r.revision(), SweepId(2), AddressId(0), None);
+        r.finish(
+            r.revision(),
+            EPOCH,
+            SweepId(2),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        r.observe_qsh(r.revision(), SweepId(1), AddressId(0), None);
+        assert!(
+            r.activity().qsh.is_none(),
+            "a delayed old sweep cannot look active"
+        );
+    }
+
+    #[test]
+    fn activity_is_concurrent_and_rejects_stale_completion() {
+        let r = Recovery::new(EPOCH, 2);
+        r.begin_sweep(SweepId(1));
+        for i in 0..2 {
+            r.finish(
+                r.revision(),
+                EPOCH,
+                SweepId(1),
+                AddressId(i),
+                AddressOutcome::Failed,
+            );
+        }
+        let old = r.begin_ssh().unwrap();
+        r.observe_ssh(&old, AddressId(1));
+        let rev = r.revision();
+        r.begin_sweep(SweepId(2));
+        r.observe_qsh(
+            rev,
+            SweepId(2),
+            AddressId(0),
+            Some("127.0.0.1:60000".parse().unwrap()),
+        );
+        let view = r.activity();
+        assert_eq!(view.qsh.unwrap().address, AddressId(0));
+        assert_eq!(view.ssh, Some(AddressId(1)));
+        let newer = r.begin_ssh().unwrap();
+        r.observe_ssh(&newer, AddressId(0));
+        r.finish_ssh(&old);
+        assert_eq!(r.activity().ssh, Some(AddressId(0)));
+        r.update_endpoints(
+            EPOCH,
+            vec![(AddressId(0), "127.0.0.2:60000".parse().unwrap())],
+        );
+        r.observe_qsh(rev, SweepId(2), AddressId(0), None);
+        r.observe_ssh(&old, AddressId(1));
+        assert!(r.activity().qsh.is_none());
+        assert!(r.activity().ssh.is_none());
     }
 
     #[test]

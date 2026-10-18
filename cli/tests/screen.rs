@@ -136,7 +136,8 @@ impl Screen {
     /// Whether the last character of the line's right part -- one column
     /// before the edge -- is on the alarm's red background.
     fn line_is_red(&self) -> bool {
-        self.frame().cell(0, COLS - 2).bg == Color::Indexed(1)
+        let frame = self.frame();
+        (0..COLS).all(|col| frame.cell(0, col).bg == Color::Indexed(1))
     }
 
     /// For failure messages: the screen as rows.
@@ -162,14 +163,6 @@ fn wait_for(within: Duration, mut probe: impl FnMut() -> bool) -> bool {
 fn ends_with_latency(text: &str) -> bool {
     text.trim_end()
         .strip_suffix(" ms")
-        .and_then(|head| head.rsplit(' ').next())
-        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// Whether `text` ends with a silence under a minute: `... 7 s`.
-fn ends_with_silence(text: &str) -> bool {
-    text.trim_end()
-        .strip_suffix(" s")
         .and_then(|head| head.rsplit(' ').next())
         .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
@@ -607,9 +600,11 @@ fn a_silent_link_turns_the_line_red_and_the_reconnect_is_named() {
     let cut = Instant::now();
     assert!(
         wait_for(Duration::from_secs(10), || {
-            ends_with_silence(&screen.top()) && screen.line_is_red()
+            screen.top().starts_with(LINE_HINT)
+                && screen.top().ends_with("reconnecting: 127.0.0.1 [QSH]")
+                && screen.line_is_red()
         }),
-        "a silent link shows how long it has been silent, on red; top row: {:?}",
+        "a silent link shows QSH recovery activity across a red row; top row: {:?}",
         screen.top()
     );
     let red_after = cut.elapsed();
@@ -617,7 +612,9 @@ fn a_silent_link_turns_the_line_red_and_the_reconnect_is_named() {
     client.master.write_all(b"\x1dr").expect("type ctrl-] r");
     assert!(
         wait_until(|| {
-            screen.top().contains("reconnecting to 127.0.0.1") && screen.line_is_red()
+            screen.top().starts_with(LINE_HINT)
+                && screen.top().ends_with("reconnecting: 127.0.0.1 [QSH]")
+                && screen.line_is_red()
         }),
         "a reconnect names the address it tries, on red; top row: {:?}",
         screen.top()

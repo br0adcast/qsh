@@ -652,6 +652,7 @@ impl Links {
         self.refresh_catalog();
         let accelerate = self.poll_refusal();
         let mut actions = self.refresh_roads(sess, now_ms);
+        actions.extend(self.refresh_recovery_status(sess, now_ms));
         if accelerate {
             log::log("recovery: refused live port after complete QSH path sweep");
             actions.extend(self.on(Event::Now, sess, now_ms));
@@ -940,6 +941,42 @@ impl Links {
             .map(|road| road.addr)
             .collect();
         window.ready(now, active, &self.catalog.endpoints(), &verified)
+    }
+
+    /// Observe current work only; the complete catalog remains the source of
+    /// logical names even when transport probes rotate through eight sockets.
+    fn refresh_recovery_status(&self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
+        let outage = self.round.is_some()
+            || self.live.is_none()
+            || self.live.as_ref().is_some_and(|l| {
+                u64::from(l.attempt.client.stats().silent_secs)
+                    >= transport::PATH_DOWN_AFTER.as_secs()
+            });
+        let view = outage.then(|| {
+            let activity = self.round.as_ref().map(background::RoundTask::activity);
+            let warm: Vec<_> = self
+                .live
+                .as_ref()
+                .map(|live| {
+                    let table = live.attempt.client.roads();
+                    live.attempt
+                        .client
+                        .path_probes()
+                        .into_iter()
+                        .filter(|(endpoint, _)| table.iter().any(|r| r.addr == *endpoint))
+                        .collect()
+                })
+                .unwrap_or_default();
+            qsh::recovery_status::View::build(
+                &self.addresses,
+                &self.catalog.endpoints(),
+                &self.catalog.resolving(),
+                &warm,
+                activity.as_ref(),
+                Instant::now(),
+            )
+        });
+        sess.handle(UiEvent::RecoveryStatus { view }, now_ms)
     }
 
     /// Tells `Session` how the live connection's roads look, when it is time

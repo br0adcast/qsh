@@ -39,6 +39,7 @@ ssh = { path = "../crates/ssh" }
 sshauth = { path = "../crates/sshauth" }
 terminal = { path = "../crates/terminal" }
 transport = { path = "../crates/transport" }
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3"

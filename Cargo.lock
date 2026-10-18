@@ -2305,6 +2305,7 @@ dependencies = [
  "terminal",
  "tokio",
  "transport",
+ "unicode-width",
 ]
 
 [[package]]

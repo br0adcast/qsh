@@ -207,6 +207,15 @@ impl Setup {
         address: &::connect::Address,
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
+        self.bring_up_observed(address, cancel, || {})
+    }
+
+    pub(crate) fn bring_up_observed(
+        &self,
+        address: &::connect::Address,
+        cancel: &knock::Cancel,
+        started: impl FnOnce(),
+    ) -> Result<bringup::Ready, SshStepError> {
         let Some(server) = self.server_identity() else {
             return Err(SshStepError::NeedsPrompt);
         };
@@ -222,8 +231,14 @@ impl Setup {
             .ssh_bindings()
             .allowed(&server, &endpoint)
             .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
-        self.ssh_step(true)
-            .run_bound(address, route, self.keypair.public, &keys, cancel)
+        self.ssh_step(true).run_bound_observed(
+            address,
+            route,
+            self.keypair.public,
+            &keys,
+            cancel,
+            started,
+        )
     }
 
     /// The authenticated QSH peer; SSH readiness never changes this identity.
@@ -820,6 +835,9 @@ impl<'a> Climb<'a> {
         cancel: &knock::Cancel,
     ) -> Result<(DirectOutcome, Option<String>), i32> {
         use ::connect::recovery_gate::{AddressId, AddressOutcome};
+        if let (Some(recovery), Some((_, sweep))) = (self.recovery, self.recovery_attempt) {
+            recovery.observe_qsh(self.revision, sweep, AddressId(i), None);
+        }
         let result = self.direct_attempt(i, port, stage, cancel);
         // Cancellation or a new SSH endpoint can interrupt a handshake. That
         // is not a completed failed address in the sweep that started it.
@@ -902,6 +920,14 @@ impl<'a> Climb<'a> {
             }
         };
 
+        if let (Some(recovery), Some((_, sweep))) = (self.recovery, self.recovery_attempt) {
+            recovery.observe_qsh(
+                self.revision,
+                sweep,
+                ::connect::recovery_gate::AddressId(i),
+                Some(sockaddr),
+            );
+        }
         let background = self.background();
         let ask: &dyn trust::Confirm = if background {
             &NoQuestions

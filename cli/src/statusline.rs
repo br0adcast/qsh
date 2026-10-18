@@ -111,10 +111,8 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     for (i, ch) in right.iter().take(shown).enumerate() {
         cells[start + i].ch = *ch;
     }
-    if alarm && shown > 0 {
-        let from = start.saturating_sub(1);
-        let to = (start + shown + 1).min(cols);
-        for cell in &mut cells[from..to] {
+    if alarm {
+        for cell in &mut cells {
             if colour {
                 cell.fg = Color::Indexed(15);
                 cell.bg = Color::Indexed(1);
@@ -132,6 +130,117 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     }
     cells
 }
+/// Display cells, including wide spacers. Zero-width characters cannot be
+/// represented by Cell; omit them rather than allocating phantom columns.
+pub(crate) fn text_cells(text: &str, utf8: bool) -> Vec<Cell> {
+    use unicode_width::UnicodeWidthChar;
+    let mut cells = Vec::new();
+    for ch in text.chars() {
+        let ch = if ch.is_control() || (!utf8 && !ch.is_ascii()) {
+            '?'
+        } else {
+            ch
+        };
+        let width = ch.width().unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+        let mut cell = Cell {
+            ch,
+            ..Cell::blank()
+        };
+        if width == 2 {
+            cell.flags = terminal::FLAG_WIDE;
+        }
+        cells.push(cell);
+        if width == 2 {
+            cells.push(Cell {
+                flags: terminal::FLAG_WIDE_SPACER,
+                ..Cell::blank()
+            });
+        }
+    }
+    cells
+}
+
+/// Fixed left-aligned activity row: no pagination, no wrapping, and every
+/// column (including padding) retains the outage alarm.
+pub fn recovery_line(cols: u16, text: &str, colour: bool, utf8: bool) -> Vec<Cell> {
+    recovery_spans(cols, &[(text.to_string(), true)], colour, utf8)
+}
+
+/// The usual left help slot, then recovery text anchored to the exact right
+/// edge. Tiny rows omit the hint so at least the clipped recovery fits.
+pub fn recovery_row(
+    cols: u16,
+    left: &str,
+    spans: &[(String, bool)],
+    colour: bool,
+    utf8: bool,
+) -> Vec<Cell> {
+    let width = usize::from(cols);
+    let left_width = text_cells(left, utf8).len();
+    let ellipsis_width = if utf8 { 1 } else { 3 };
+    let reserved = if left_width > 0 && left_width + 1 + ellipsis_width <= width {
+        left_width + 1
+    } else {
+        0
+    };
+    let text_width: usize = spans.iter().map(|(s, _)| text_cells(s, utf8).len()).sum();
+    let gap = (width - reserved).saturating_sub(text_width);
+    let mut row = Vec::with_capacity(spans.len() + 2);
+    if reserved > 0 {
+        row.push((format!("{left} "), false));
+    }
+    row.push((" ".repeat(gap), false));
+    row.extend_from_slice(spans);
+    recovery_spans(cols, &row, colour, utf8)
+}
+
+pub fn recovery_spans(cols: u16, spans: &[(String, bool)], colour: bool, utf8: bool) -> Vec<Cell> {
+    let width = usize::from(cols);
+    let mut cells: Vec<_> = spans
+        .iter()
+        .flat_map(|(text, active)| {
+            text_cells(text, utf8)
+                .into_iter()
+                .map(|cell| (cell, *active))
+        })
+        .collect();
+    if cells.len() > width {
+        let suffix = if utf8 { "…" } else { "..." };
+        let suffix: Vec<_> = text_cells(suffix, utf8)
+            .into_iter()
+            .take(width)
+            .map(|c| (c, false))
+            .collect();
+        cells.truncate(width - suffix.len());
+        if cells
+            .last()
+            .is_some_and(|(c, _)| c.flags & terminal::FLAG_WIDE != 0)
+        {
+            *cells.last_mut().unwrap() = (Cell::blank(), false);
+        }
+        cells.extend(suffix);
+    }
+    cells.resize(width, (Cell::blank(), false));
+    cells
+        .into_iter()
+        .map(|(mut cell, active)| {
+            if colour {
+                cell.fg = Color::Indexed(if active { 15 } else { 7 });
+                cell.bg = Color::Indexed(1);
+            } else {
+                cell.flags |= FLAG_REVERSE;
+                if active {
+                    cell.flags |= FLAG_BOLD;
+                }
+            }
+            cell
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,13 +316,110 @@ mod tests {
     }
 
     #[test]
+    fn the_entire_alarm_row_including_padding_has_alarm_style() {
+        for colour in [false, true] {
+            let cells = line(40, " Ctrl-] ? ", "lost", true, colour);
+            assert!(cells.iter().all(|c| if colour {
+                c.bg == Color::Indexed(1)
+            } else {
+                c.flags & FLAG_BOLD != 0
+            }));
+        }
+    }
+
+    #[test]
+    fn recovery_spans_change_only_brightness_not_text_or_positions() {
+        let spans = vec![
+            ("QSH".into(), true),
+            ("/".into(), false),
+            ("SSH".into(), false),
+        ];
+        let colour = recovery_spans(12, &spans, true, true);
+        assert_eq!(text(&colour), "QSH/SSH     ");
+        assert!(colour.iter().all(|c| c.bg == Color::Indexed(1)));
+        assert!(colour[..3].iter().all(|c| c.fg == Color::Indexed(15)));
+        assert!(colour[3..].iter().all(|c| c.fg == Color::Indexed(7)));
+        let mono = recovery_spans(12, &spans, false, true);
+        assert!(mono.iter().all(|c| c.flags & FLAG_REVERSE != 0));
+        assert!(mono[..3].iter().all(|c| c.flags & FLAG_BOLD != 0));
+        assert!(mono[3..].iter().all(|c| c.flags & FLAG_BOLD == 0));
+    }
+
+    #[test]
+    fn recovery_row_anchors_text_at_the_right_edge_after_a_fixed_hint() {
+        let spans = vec![("界 [QSH]".into(), true)];
+        for width in [18, 30] {
+            let row = recovery_row(width, " help ", &spans, true, true);
+            assert_eq!(text(&row[..6]), " help ");
+            assert_eq!(row[usize::from(width) - 8].ch, '界');
+            assert_eq!(row.last().unwrap().ch, ']');
+            assert!(row.iter().all(|c| c.bg == Color::Indexed(1)));
+        }
+        let disabled = recovery_row(12, "", &spans, false, true);
+        assert_eq!(disabled[4].ch, '界');
+        assert_eq!(disabled.last().unwrap().ch, ']');
+        assert!(disabled.iter().all(|c| c.flags & FLAG_REVERSE != 0));
+    }
+
+    #[test]
+    fn recovery_row_clips_only_within_the_available_area() {
+        let spans = vec![("host.example [QSH]".into(), true)];
+        assert_eq!(
+            text(&recovery_row(12, " help ", &spans, true, true)),
+            " help  host…"
+        );
+        assert_eq!(
+            text(&recovery_row(12, " help ", &spans, true, false)),
+            " help  ho..."
+        );
+        assert_eq!(
+            text(&recovery_row(6, " help ", &spans, true, true)),
+            "host.…"
+        );
+        assert_eq!(
+            text(&recovery_row(8, " help ", &spans, true, false)),
+            "host...."
+        );
+        assert_eq!(
+            text(&recovery_row(9, " help ", &spans, true, false)),
+            "host.e..."
+        );
+        assert!(recovery_row(0, " help ", &spans, true, true).is_empty());
+        let wide = vec![("界界界".into(), true)];
+        let clipped = recovery_row(4, "", &wide, true, true);
+        assert_eq!(clipped[2].ch, ' ');
+        assert_eq!(clipped[3].ch, '…', "clipping keeps the exact right anchor");
+        let idle = recovery_row(12, " help ", &[(spans[0].0.clone(), false)], true, true);
+        assert_eq!(
+            text(&idle),
+            text(&recovery_row(12, " help ", &spans, true, true))
+        );
+    }
+
+    #[test]
+    fn recovery_text_clips_by_cells_with_an_ellipsis() {
+        let row = recovery_line(8, "QSH: 界界", true, true);
+        assert_eq!(row.len(), 8);
+        assert_eq!(row[5].ch, '界');
+        assert_ne!(row[5].flags & terminal::FLAG_WIDE, 0);
+        assert_ne!(row[6].flags & terminal::FLAG_WIDE_SPACER, 0);
+        assert_eq!(row[7].ch, '…');
+        assert_eq!(
+            text(&recovery_line(8, "QSH: host:60000", true, false)),
+            "QSH: ..."
+        );
+        assert_eq!(recovery_line(0, "QSH: x", true, true).len(), 0);
+        assert_eq!(text(&recovery_line(1, "QSH: x", true, true)), "…");
+    }
+
+    #[test]
     fn an_alarm_is_red_with_colour() {
         let cells = line(20, "", "7 s", true, true);
         let start = 20 - 1 - 3;
         assert_eq!(cells[start].bg, Color::Indexed(1));
         assert_eq!(cells[start].fg, Color::Indexed(15));
         assert_eq!(cells[start].flags & FLAG_REVERSE, 0);
-        assert_eq!(cells[0].bg, Color::Default);
+        assert_eq!(cells[0].bg, Color::Indexed(1));
     }
 
     #[test]
