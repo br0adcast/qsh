@@ -2465,3 +2465,6 @@ same reason.
 - **Neither end is defended against its own host.** Someone who controls the
   server can read every session on it; someone who controls your machine can
   read your key, your tokens and your terminal. Nothing here changes that.
+
+Terminal geometry, admission refusals, payload caps and qualified storage bounds
+are documented in [Terminal resource policy](terminal-resources.md).

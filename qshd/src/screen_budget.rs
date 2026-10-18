@@ -68,9 +68,9 @@ impl BackingSlots {
 
 /// Historical maxima, never current logical grid size or measured capacity.
 ///
-/// Bounds qualify alacritty_terminal 0.26.0 and rustc 1.98.1's alloc/Vec
+/// Bounds qualify alacritty_terminal 0.26.0 and the qualified Rust releases' alloc/Vec
 /// growth and collect implementation, using ordinary Global/System allocation.
-/// Requalify storage behavior when upgrading either; these are not RSS limits.
+/// See docs/terminal-resources.md; requalify storage behavior on upgrades; these are not RSS limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreenEnvelope {
     max_cols: u16,
@@ -827,3 +827,6 @@ mod lifecycle_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod allocation_bounds;

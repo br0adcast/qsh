@@ -56,3 +56,5 @@ signature = "=2.2.0"
 # `SIGKILL` of the helper, so that test can isolate the parent-death-signal
 # path from the worker's own reader-thread EOF hook.
 libc = "0.2"
+# Source-qualified allocation observer uses the actual upstream heap element layouts.
+alacritty_terminal = "=0.26.0"

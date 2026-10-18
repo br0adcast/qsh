@@ -131,3 +131,6 @@ pub(crate) mod test_support {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
+
+#[cfg(all(test, feature = "system"))]
+mod test_allocator;
