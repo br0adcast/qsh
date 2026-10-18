@@ -66,9 +66,8 @@
 //! (a warm reattach) resets every channel's echo_ack accounting and publishes
 //! one atomic lifecycle snapshot before replay. The geometry profile separates
 //! active channels from draining EOF owners and retains exact OPEN classification;
-//! only ordered GEOMETRY confirms a size. The temporary inactive legacy route
-//! still emits `Channels` and is removed at Stage 6 activation. Neither snapshot
-//! is sent on `Live` (a cold start), where no retained channels are expected.
+//! only ordered GEOMETRY confirms a size. The snapshot
+//! is not sent on `Live` (a cold start), where no retained channels are expected.
 //!
 //! **Send gates (spec §4.7.2).** Every channel takes a gate on its stream
 //! when it opens, and gives it up when it goes. A channel with a screen
@@ -129,7 +128,7 @@ use crate::conn::StreamClass;
 use crate::send_gate::{GateKind, SendGate};
 use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
-use crate::shell_frame::{encode_record, RawRecord, RecordDeframer, REC_DATA, REC_ECHO_ACK};
+use crate::shell_frame::{RawRecord, RecordDeframer};
 use crate::shell_server::{ResizeHandle, SessionScreen};
 
 /// Buffer size for a single channel read. Matches `shell_server::CHUNK_SIZE`.
@@ -905,39 +904,27 @@ fn emit_data(io: &SessionIo, ch: &mut Channel, bytes: &[u8]) {
         return;
     }
     ch.producer.data_since_checkpoint = true;
-    if ch.producer.origin.has_geometry() {
-        io.send_channel_output(
-            ch.request.stream,
-            ChannelInstance::new(ch.instance).unwrap(),
-            ch.producer.origin,
-            ch.gate.clone(),
-            ChannelOutput::Data(bytes.to_vec()),
-            None,
-        );
-    } else {
-        // Temporary inactive-checkpoint seam; removed with protocol activation.
-        io.send(ch.request.stream, encode_record(REC_DATA, bytes));
-    }
+    io.send_channel_output(
+        ch.request.stream,
+        ChannelInstance::new(ch.instance).unwrap(),
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::Data(bytes.to_vec()),
+        None,
+    );
 }
 fn emit_ack(io: &SessionIo, ch: &mut Channel) {
-    if ch.producer.origin.has_geometry() {
-        let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) else {
-            return;
-        };
-        io.send_channel_output(
-            ch.request.stream,
-            ChannelInstance::new(ch.instance).unwrap(),
-            ch.producer.origin,
-            ch.gate.clone(),
-            ChannelOutput::EchoAck(ch.input_consumed, permit),
-            None,
-        );
-    } else {
-        io.send(
-            ch.request.stream,
-            encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
-        );
-    }
+    let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) else {
+        return;
+    };
+    io.send_channel_output(
+        ch.request.stream,
+        ChannelInstance::new(ch.instance).unwrap(),
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::EchoAck(ch.input_consumed, permit),
+        None,
+    );
     ch.last_acked = ch.input_consumed;
 }
 fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bool {
@@ -1039,9 +1026,6 @@ fn reset_producer(ch: &mut Channel, origin: AttachmentContext) {
 /// A missing lifecycle slot holds only one current checkpoint and bounded
 /// reader overshoot. Ordinary resize results cannot consume this allowance.
 fn checkpoint(io: &SessionIo, ch: &mut Channel) -> bool {
-    if !ch.producer.origin.has_geometry() {
-        return true;
-    }
     let instance = ChannelInstance::new(ch.instance).unwrap();
     let class = if ch.producer.data_since_checkpoint {
         EntryClass::Ordinary
@@ -1144,41 +1128,32 @@ fn reset_attachment_outputs(
     }
     // The barrier cannot wait for producer/metadata gates. Its snapshot is
     // published in one replaceable mailbox, never copied into the output FIFO.
-    if context.has_geometry() {
-        io.publish_resume_snapshot(context, || {
-            use crate::channel::{
-                ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification,
-            };
-            let mut active = Vec::with_capacity(channels.len());
-            let mut draining = Vec::with_capacity(exits.len() + channels.len());
-            for (&stream, ch) in channels.iter() {
-                let instance = ChannelInstance::new(ch.instance).expect("channel instance");
-                if ch.producer.eof {
-                    draining.push(DrainingChannel {
-                        stream,
-                        instance,
-                        open: OpenClassification::from_open(&ch.request),
-                    });
-                } else {
-                    active.push(ActiveChannel {
-                        instance,
-                        request: ch.request.clone(),
-                    });
-                }
+    io.publish_resume_snapshot(context, || {
+        use crate::channel::{ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification};
+        let mut active = Vec::with_capacity(channels.len());
+        let mut draining = Vec::with_capacity(exits.len() + channels.len());
+        for (&stream, ch) in channels.iter() {
+            let instance = ChannelInstance::new(ch.instance).expect("channel instance");
+            if ch.producer.eof {
+                draining.push(DrainingChannel {
+                    stream,
+                    instance,
+                    open: OpenClassification::from_open(&ch.request),
+                });
+            } else {
+                active.push(ActiveChannel {
+                    instance,
+                    request: ch.request.clone(),
+                });
             }
-            draining.extend(exits.iter().map(|(&stream, pending)| DrainingChannel {
-                stream,
-                instance: pending.geometry.instance,
-                open: pending.open,
-            }));
-            ChannelSnapshot::new(active, draining)
-        });
-    } else {
-        // Removed with Stage 6 activation; not a released compatibility mode.
-        let mut live: Vec<OpenRequest> = channels.values().map(|ch| ch.request.clone()).collect();
-        live.sort_by_key(|req| req.stream);
-        io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
-    }
+        }
+        draining.extend(exits.iter().map(|(&stream, pending)| DrainingChannel {
+            stream,
+            instance: pending.geometry.instance,
+            open: pending.open,
+        }));
+        ChannelSnapshot::new(active, draining)
+    });
     // The new client's screens are empty until this repaints
     // them -- see this module's own docs above ("Repaint and the
     // live-channel list") for the fuller rationale.
@@ -1189,24 +1164,16 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
     let code = pending.code;
     forget_channel_stream(io, stream);
     let permit = pending.producer.exit_permit.take().expect("one final Exit");
-    if pending.producer.origin.has_geometry() {
-        io.send_channel_exit(
-            crate::channel::DrainingChannel {
-                stream,
-                instance: pending.geometry.instance,
-                open: pending.open,
-            },
-            pending.producer.origin,
-            code,
-            permit,
-        );
-    } else {
-        drop(permit);
-        io.send(
-            CONTROL_STREAM,
-            encode_server(&ServerRecord::Exit { stream, code }),
-        );
-    }
+    io.send_channel_exit(
+        crate::channel::DrainingChannel {
+            stream,
+            instance: pending.geometry.instance,
+            open: pending.open,
+        },
+        pending.producer.origin,
+        code,
+        permit,
+    );
 }
 
 async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
@@ -1217,22 +1184,17 @@ async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
     let code = tokio::task::spawn_blocking(move || ch.wait.wait())
         .await
         .unwrap_or(-1);
-    if ch.producer.origin.has_geometry() {
-        io.send_channel_output(
-            ch.request.stream,
-            geometry.instance,
-            ch.producer.origin,
-            ch.gate.clone(),
-            ChannelOutput::DeliveryMarker(
-                final_marker,
-                ch.producer.final_marker.take().expect("one final marker"),
-            ),
-            None,
-        );
-    } else {
-        forget_channel_stream(io, ch.request.stream);
-        io.notify_delivered(ch.request.stream, ch.instance);
-    }
+    io.send_channel_output(
+        ch.request.stream,
+        geometry.instance,
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::DeliveryMarker(
+            final_marker,
+            ch.producer.final_marker.take().expect("one final marker"),
+        ),
+        None,
+    );
     PendingExit {
         instance: ch.instance,
         code,
@@ -1279,9 +1241,7 @@ pub async fn run_channel_session_with(
     let mut producer = ProducerContext::default();
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
-    // Staged geometry codecs are not advertised yet. An unsupported request
-    // stops application input for this attachment; lifecycle closure is wired
-    // with the confirmed-geometry runner before feature activation.
+    // A protocol failure stops further application input for this attachment.
     let mut unsupported_control = false;
     // The client's terminal type, once it says: every channel opened after
     // that is spawned with it. `None` until then, and for a client that
@@ -1313,6 +1273,11 @@ pub async fn run_channel_session_with(
         match wakeup {
             Wakeup::Inbound(Some(SessionInbound::Data(StreamData { stream_id, data }))) => {
                 let n = data.len();
+                if !producer.attachment.has_geometry() {
+                    io.consumed(stream_id, n);
+                    io.protocol_failure(producer.attachment, None);
+                    break;
+                }
                 if unsupported_control {
                     io.consumed(stream_id, n);
                     continue;
@@ -1371,13 +1336,18 @@ pub async fn run_channel_session_with(
                 }
             }
             Wakeup::Inbound(Some(SessionInbound::Live(context))) => {
+                if !context.has_geometry() {
+                    io.protocol_failure(context, None);
+                    break;
+                }
                 producer.attachment = context;
-                // A cold start: nothing is running yet from the client's
-                // point of view, so nothing is announced. Sending an empty
-                // `ServerRecord::Channels` here would be indistinguishable
-                // from a server that forgot to answer.
+                // A cold attachment has no retained lifecycle inventory.
             }
             Wakeup::Inbound(Some(SessionInbound::ResumeReset(context))) => {
+                if !context.has_geometry() {
+                    io.protocol_failure(context, None);
+                    break;
+                }
                 producer.attachment = context;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
@@ -1439,8 +1409,7 @@ pub async fn run_channel_session_with(
                 if exits.get(&stream).is_some_and(|e| {
                     e.instance == token
                         && e.final_marker.token == token
-                        && (!e.producer.origin.has_geometry()
-                            || e.producer.origin.generation == generation)
+                        && e.producer.origin.generation == generation
                 }) {
                     let mut pending = exits.remove(&stream).expect("just found");
                     send_pending_exit(&io, stream, &mut pending);
@@ -1493,7 +1462,7 @@ pub async fn run_channel_session_with(
                     ch.producer.eof = true;
                     // Lifecycle termination wins over an unexecuted intent.
                     ch.producer.deferred = None;
-                    if ch.stale || (ch.screened && ch.producer.origin.has_geometry()) {
+                    if ch.stale || ch.screened {
                         // The model cannot repaint once EOF moves to PendingExit.
                         repaint_stale(&io, stream, ch);
                     }
@@ -1746,27 +1715,7 @@ fn apply_control_record(
             // suggesting it had.
             *term = Some(name);
         }
-        Ok(ClientRecord::Resize { stream, cols, rows }) => {
-            if context.attachment.has_geometry() {
-                io.protocol_failure(context.attachment, None);
-                return false;
-            }
-            if let Some(ch) = channels.get_mut(&stream) {
-                // No-PTY is an OPEN classification and cannot be changed by
-                // a resize. Invalid geometry never reaches model or ioctl.
-                if ch.request.cols != 0 && ch.request.rows != 0 {
-                    if let Ok(size) = TerminalSize::new(cols, rows) {
-                        let result = resize_channel(ch, size);
-                        if let Err(reason) = result {
-                            log::warn!(target: "transport", "channel resize refused: {reason:?}");
-                        }
-                    }
-                }
-            }
-            // A resize for a channel that isn't open (yet, or any more) has
-            // nothing to apply to -- ignored for the same reason stray data
-            // is.
-        }
+
         Ok(ClientRecord::Close { stream }) => {
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
@@ -1812,7 +1761,9 @@ fn apply_control_record(
         Ok(ClientRecord::AboutRequest) => update.about(),
         Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
         Err(ChannelCodecError::UnknownKind(_)) => {}
-        Err(ChannelCodecError::Malformed) if raw.kind == crate::channel::REC_RESIZE_REQUEST => {
+        Err(ChannelCodecError::Malformed)
+            if matches!(raw.kind, 0x11 | crate::channel::REC_RESIZE_REQUEST) =>
+        {
             if context.attachment.has_geometry() {
                 io.protocol_failure(context.attachment, None);
             }
@@ -2075,13 +2026,108 @@ pub(crate) mod tests {
     };
     use crate::send_gate::{GateKind, GateWait};
     use crate::session_manager::{SessionInbound, SessionIo, SessionOutbound, StreamData};
-    use crate::shell_frame::{RecordDeframer, ShellDeframer, ShellRecord, CONTROL_RECORD_MAX};
+    use crate::shell_frame::{
+        encode_record, RecordDeframer, ShellDeframer, ShellRecord, CONTROL_RECORD_MAX,
+    };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
+
+    fn channel_context() -> AttachmentContext {
+        AttachmentContext {
+            features: crate::Features::CHANNEL_GEOMETRY,
+            ..AttachmentContext::default()
+        }
+    }
+    fn channel_producer() -> ProducerContext {
+        ProducerContext {
+            attachment: channel_context(),
+            ..ProducerContext::default()
+        }
+    }
+    fn established_checkpoint() -> ShellRecord {
+        ShellRecord::Geometry(GeometryRecord {
+            instance: ChannelInstance::new(1).unwrap(),
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols: 80,
+            rows: 24,
+        })
+    }
+    fn shell_record(output: ChannelOutput) -> Option<ShellRecord> {
+        match output {
+            ChannelOutput::Data(bytes) => Some(ShellRecord::Data(bytes)),
+            ChannelOutput::EchoAck(offset, _) => Some(ShellRecord::EchoAck(offset)),
+            ChannelOutput::Geometry(record, _) => Some(ShellRecord::Geometry(record)),
+            ChannelOutput::DeliveryMarker(..) => None,
+        }
+    }
+    fn delivery_marker(msg: &SessionOutbound) -> Option<(u8, u64, u64)> {
+        match msg {
+            SessionOutbound::ChannelOutput {
+                stream,
+                origin,
+                output: ChannelOutput::DeliveryMarker(marker, _),
+                ..
+            } => Some((*stream, marker.token, origin.generation)),
+            _ => None,
+        }
+    }
+    type Fixture = (
+        SessionIo,
+        mpsc::Sender<SessionInbound>,
+        mpsc::UnboundedReceiver<SessionOutbound>,
+    );
+    fn channel_pair() -> Fixture {
+        let fixture = SessionIo::test_pair();
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    fn channel_pair_for(principal: Principal, login: LoginId) -> Fixture {
+        let fixture = SessionIo::test_pair_for(principal, login);
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    fn channel_pair_with_gates() -> (
+        SessionIo,
+        mpsc::Sender<SessionInbound>,
+        mpsc::UnboundedReceiver<SessionOutbound>,
+        Arc<crate::send_gate::GateTable>,
+    ) {
+        let fixture = SessionIo::test_pair_with_gates();
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    async fn next_snapshot(
+        rx: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+        read: &impl Fn(u64) -> Option<crate::channel::ChannelSnapshot>,
+    ) -> ServerRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let SessionOutbound::ResumeBarrier { generation } =
+                    rx.recv().await.expect("runner alive")
+                {
+                    return ServerRecord::ChannelSnapshot(
+                        read(generation).expect("matching snapshot mailbox"),
+                    );
+                }
+            }
+        })
+        .await
+        .expect("snapshot before deadline")
+    }
 
     /// A channel's "process", standing in for a pseudo-terminal: it emits
     /// `greeting` once, then whatever the test feeds it, one read per chunk,
@@ -2402,6 +2448,9 @@ pub(crate) mod tests {
                 .expect("the runner must answer within five seconds")
                 .expect("the runner must not drop its outbound channel");
             let msg = match msg {
+                SessionOutbound::ChannelExit { stream, code, .. } => {
+                    return ServerRecord::Exit { stream, code }
+                }
                 SessionOutbound::ChannelOpened { stream, .. } => {
                     return ServerRecord::Opened { stream }
                 }
@@ -2528,7 +2577,7 @@ pub(crate) mod tests {
     }
     impl ResizeRig {
         fn new(prepare_fails: bool, ioctl_fails: bool) -> Self {
-            let (io, inbound, outbound) = SessionIo::test_pair();
+            let (io, inbound, outbound) = channel_pair();
             let geometry = Arc::new(Mutex::new((80, 24)));
             let pending = Arc::new(AtomicUsize::new(0));
             let events = Arc::new(Mutex::new(vec![]));
@@ -2539,7 +2588,7 @@ pub(crate) mod tests {
                     session_id: 11,
                     features: crate::Features::CHANNEL_GEOMETRY,
                 },
-                ..ProducerContext::default()
+                ..channel_producer()
             };
             let channel = Channel {
                 input_tx,
@@ -2854,9 +2903,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn stage6_activation_runner_refuses_open_before_geometry_profile() {
+        for live in [false, true] {
+            let spawner = FakeSpawner::new();
+            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+            if live {
+                inbound
+                    .send(SessionInbound::Live(AttachmentContext::default()))
+                    .await
+                    .unwrap();
+            }
+            let _ = inbound.send(open(16, ChannelKind::Shell, false)).await;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let msg = outbound.recv().await;
+                    if matches!(msg, Some(SessionOutbound::Consumed { .. })) {
+                        continue;
+                    }
+                    break msg;
+                }
+            })
+            .await;
+            drop(inbound);
+            runner.await.unwrap();
+            spawner.end_channel(16);
+            assert!(
+                spawner.owners.lock().unwrap().is_empty(),
+                "missing profile must never spawn"
+            );
+            assert!(
+                matches!(reply, Ok(Some(SessionOutbound::ProtocolFailure { .. }))),
+                "explicit scoped failure"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn eof_retains_typed_marker_and_gate_until_delivery() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let gate = io.send_gate(16, GateKind::Pipe);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -3114,7 +3200,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn coalesced_resize_records_each_admit_before_effect_and_fail_once() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(SessionInbound::Live(AttachmentContext {
@@ -3169,7 +3255,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn geometry_screen_eof_owns_final_snapshot_before_marker() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(SessionInbound::Live(AttachmentContext {
@@ -3235,7 +3321,7 @@ pub(crate) mod tests {
     }
     async fn assert_correlated_resize_reset_order(partial: bool) {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let old = AttachmentContext {
             generation: 1,
@@ -3469,7 +3555,7 @@ pub(crate) mod tests {
     async fn same_size_resize_has_no_ioctl() {
         let spawner = FakeSpawner::new();
         let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
-        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (io, _inbound, _outbound) = channel_pair();
         let (tx, _rx) = mpsc::channel(8);
         let mut channels = HashMap::new();
         open_channel(
@@ -3487,7 +3573,7 @@ pub(crate) mod tests {
             },
             None,
             1,
-            &ProducerContext::default(),
+            &channel_producer(),
         );
         let result = resize_channel(
             channels.get_mut(&16).unwrap(),
@@ -3511,7 +3597,7 @@ pub(crate) mod tests {
         ] {
             let spawner = FakeSpawner::new();
             let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
-            let (io, _inbound, _outbound) = SessionIo::test_pair();
+            let (io, _inbound, _outbound) = channel_pair();
             let (tx, _rx) = mpsc::channel(8);
             let mut channels = HashMap::new();
             open_channel(
@@ -3529,7 +3615,7 @@ pub(crate) mod tests {
                 },
                 None,
                 1,
-                &ProducerContext::default(),
+                &channel_producer(),
             );
             let geometry = Arc::new(Mutex::new((2, 1)));
             let pending = Arc::new(AtomicUsize::new(0));
@@ -3558,7 +3644,7 @@ pub(crate) mod tests {
             assert_eq!(
                 (ch.request.cols, ch.request.rows),
                 expected,
-                "Channels must report committed geometry"
+                "lifecycle metadata must report committed geometry"
             );
             spawner.end_channel(16);
             drop(channels);
@@ -3570,7 +3656,7 @@ pub(crate) mod tests {
         for (cols, rows) in [(0, 0), (0, 700), (900, 0)] {
             let spawner = FakeSpawner::new();
             let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
-            let (io, _inbound, _outbound) = SessionIo::test_pair();
+            let (io, _inbound, _outbound) = channel_pair();
             let (tx, _rx) = mpsc::channel(8);
             let mut channels = HashMap::new();
             let request = OpenRequest {
@@ -3589,11 +3675,13 @@ pub(crate) mod tests {
                 request.clone(),
                 None,
                 1,
-                &ProducerContext::default(),
+                &channel_producer(),
             );
             assert_eq!(channels[&16].request, request);
             let raw = crate::shell_frame::RecordDeframer::for_control().push(&encode_client(
-                &ClientRecord::Resize {
+                &ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(1).unwrap(),
                     stream: 16,
                     cols: 2,
                     rows: 1,
@@ -3610,7 +3698,7 @@ pub(crate) mod tests {
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
-                    &ProducerContext::default(),
+                    &channel_producer(),
                 );
             }
             assert_eq!(channels[&16].request, request);
@@ -3624,7 +3712,7 @@ pub(crate) mod tests {
     async fn invalid_resize_never_reaches_model_or_pty() {
         let spawner = FakeSpawner::new();
         let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
-        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (io, _inbound, _outbound) = channel_pair();
         let (tx, _rx) = mpsc::channel(8);
         let mut channels = HashMap::new();
         let request = OpenRequest {
@@ -3643,7 +3731,7 @@ pub(crate) mod tests {
             request.clone(),
             None,
             1,
-            &ProducerContext::default(),
+            &channel_producer(),
         );
         let events = Arc::new(Mutex::new(vec![]));
         channels.get_mut(&16).unwrap().screen = Box::new(TransactionScreen {
@@ -3652,9 +3740,14 @@ pub(crate) mod tests {
             fail: false,
             events: events.clone(),
         });
-        for (cols, rows) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)] {
+        for (index, (cols, rows)) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)]
+            .into_iter()
+            .enumerate()
+        {
             for record in
-                RecordDeframer::for_control().push(&encode_client(&ClientRecord::Resize {
+                RecordDeframer::for_control().push(&encode_client(&ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(index as u64 + 1).unwrap(),
                     stream: 16,
                     cols,
                     rows,
@@ -3670,7 +3763,7 @@ pub(crate) mod tests {
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
-                    &ProducerContext::default(),
+                    &channel_producer(),
                 );
             }
         }
@@ -3685,7 +3778,7 @@ pub(crate) mod tests {
     async fn invalid_nonzero_open_never_calls_spawner() {
         let spawner = FakeSpawner::new();
         *spawner.refuse.lock().unwrap() = Some("spy must not run".into());
-        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (io, _inbound, _outbound) = channel_pair();
         let (tx, _rx) = mpsc::channel(1);
         let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
         for (cols, rows) in [(1, 1), (513, 1), (2, 257), (u16::MAX, u16::MAX)] {
@@ -3704,7 +3797,7 @@ pub(crate) mod tests {
                 },
                 None,
                 1,
-                &ProducerContext::default(),
+                &channel_producer(),
             );
         }
         assert!(
@@ -3714,13 +3807,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_geometry_control_stops_suffix_until_attachment_reset() {
-        let valid = vec![
-            16, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 80, 0, 24,
-        ];
-        for payload in [valid, vec![]] {
+    async fn retired_or_malformed_resize_stops_suffix_until_attachment_reset() {
+        for (kind, payload) in [
+            (0x11, vec![16, 0, 80, 0, 24]),
+            (0x11, vec![]),
+            (0x16, vec![]),
+        ] {
             let spawner = FakeSpawner::new();
-            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let (io, inbound, mut outbound) = channel_pair();
             let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
             let SessionInbound::Data(prefix) = open(16, ChannelKind::Shell, false) else {
                 unreachable!()
@@ -3730,7 +3824,7 @@ pub(crate) mod tests {
             };
             let bytes = [
                 prefix.data,
-                crate::shell_frame::encode_record(0x16, &payload),
+                crate::shell_frame::encode_record(kind, &payload),
                 suffix.data,
             ]
             .concat();
@@ -3751,7 +3845,7 @@ pub(crate) mod tests {
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
             inbound
-                .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+                .send(SessionInbound::ResumeReset(channel_context()))
                 .await
                 .unwrap();
             let event = open(18, ChannelKind::Shell, false);
@@ -3776,7 +3870,7 @@ pub(crate) mod tests {
             assert_eq!(
                 before_reset,
                 vec![16],
-                "no application input after unsupported geometry"
+                "no application input after retired/malformed resize"
             );
             assert_eq!(after_reset, vec![16, 18]);
             assert!(spawner.sizes.lock().unwrap().is_empty());
@@ -3787,7 +3881,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn control_records_are_taken_once_applied() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let record = open(16, ChannelKind::Shell, false);
         let SessionInbound::Data(ref sd) = record else {
@@ -3811,7 +3905,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_control_record_past_the_limit_is_dropped_whole_and_reported() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let payload_len = CONTROL_RECORD_MAX + 1;
         // An unknown record kind -- not 0x10 (OPEN): zeros under OPEN could
@@ -3867,7 +3961,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_starts_the_control_stream_afresh() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let mut cut = vec![0x10];
         cut.extend_from_slice(&100u32.to_be_bytes());
@@ -3880,12 +3975,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
         assert_eq!(
-            next_control(&mut outbound).await,
-            ServerRecord::Channels(Vec::new())
+            next_snapshot(&mut outbound, &snapshots).await,
+            ServerRecord::ChannelSnapshot(
+                crate::channel::ChannelSnapshot::new(vec![], vec![]).unwrap()
+            )
         );
         inbound
             .send(open(16, ChannelKind::Shell, false))
@@ -3910,15 +4007,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_renews_the_controls_record_cap() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
         assert_eq!(
-            next_control(&mut outbound).await,
-            ServerRecord::Channels(Vec::new())
+            next_snapshot(&mut outbound, &snapshots).await,
+            ServerRecord::ChannelSnapshot(
+                crate::channel::ChannelSnapshot::new(vec![], vec![]).unwrap()
+            )
         );
 
         let payload_len = CONTROL_RECORD_MAX + 1;
@@ -3951,7 +4051,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_channels_input_is_taken_once_its_process_has_it() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         open_a_shell_channel(&inbound, &mut outbound).await;
         spawner.hold_writes(true);
@@ -3980,7 +4080,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn input_the_runner_drops_is_reported_at_once() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(SessionInbound::Data(StreamData {
@@ -4002,7 +4102,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn input_left_in_a_closed_channels_queue_is_reported() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         open_a_shell_channel(&inbound, &mut outbound).await;
         spawner.hold_writes(true);
@@ -4044,6 +4144,14 @@ pub(crate) mod tests {
                 .await
                 .expect("the channel must produce output within five seconds")
                 .expect("the runner must not drop its outbound channel");
+            let msg = match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id,
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } if id == stream => return bytes,
+                other => other,
+            };
             let SessionOutbound::Data(sd) = msg else {
                 continue;
             };
@@ -4100,7 +4208,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn opening_a_channel_declares_whether_its_backlog_is_recoverable() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4137,7 +4245,7 @@ pub(crate) mod tests {
     ) {
         let spawner = FakeSpawner::new();
         *spawner.force_no_screen.lock().unwrap() = true;
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4164,7 +4272,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_opened_channel_carries_bytes_both_ways() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4215,7 +4323,7 @@ pub(crate) mod tests {
             identity: "SHA256:alice".to_string(),
             incarnation: 0,
         };
-        let (io, inbound, mut outbound) = SessionIo::test_pair_for(alice.clone(), [0u8; 16]);
+        let (io, inbound, mut outbound) = channel_pair_for(alice.clone(), [0u8; 16]);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4241,7 +4349,7 @@ pub(crate) mod tests {
     /// each its own PAM session.
     #[tokio::test]
     async fn a_channel_carries_the_login_that_asked_for_it() {
-        let (io, inbound, mut outbound) = SessionIo::test_pair_for(
+        let (io, inbound, mut outbound) = channel_pair_for(
             Principal {
                 uid: 1000,
                 name: "alice".into(),
@@ -4270,7 +4378,7 @@ pub(crate) mod tests {
     async fn a_refused_channel_reports_why_and_stays_closed() {
         let spawner = FakeSpawner::new();
         *spawner.refuse.lock().unwrap() = Some("shell not found".to_string());
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4308,7 +4416,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn opening_past_the_cap_is_refused_without_disturbing_the_rest() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         for n in 0..MAX_CHANNELS {
@@ -4360,7 +4468,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_closed_channel_frees_its_slot() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         for n in 0..MAX_CHANNELS {
@@ -4407,7 +4515,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reopening_a_stream_that_is_already_open_is_refused() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4462,7 +4570,7 @@ pub(crate) mod tests {
     async fn a_finished_channel_reports_its_exit_code() {
         let mut spawner = FakeSpawner::new();
         Arc::get_mut(&mut spawner).unwrap().exit_code = 130;
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
@@ -4500,7 +4608,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn one_channel_ending_leaves_the_others_running() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
@@ -4557,7 +4665,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_resize_applies_to_one_channel_only() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4580,7 +4688,9 @@ pub(crate) mod tests {
         inbound
             .send(SessionInbound::Data(StreamData {
                 stream_id: CONTROL_STREAM,
-                data: encode_client(&ClientRecord::Resize {
+                data: encode_client(&ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(1).unwrap(),
                     stream: 16,
                     cols: 120,
                     rows: 40,
@@ -4607,7 +4717,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_repaint_reaches_only_the_channels_that_asked_for_a_screen() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4653,7 +4763,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_announces_the_live_channels_first() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4670,12 +4781,18 @@ pub(crate) mod tests {
         );
 
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
 
-        match next_control(&mut outbound).await {
-            ServerRecord::Channels(list) => {
+        match next_snapshot(&mut outbound, &snapshots).await {
+            ServerRecord::ChannelSnapshot(snapshot) => {
+                assert!(snapshot.draining().is_empty());
+                let list: Vec<_> = snapshot
+                    .active()
+                    .iter()
+                    .map(|entry| &entry.request)
+                    .collect();
                 assert_eq!(list.len(), 1, "one channel is running, one is announced");
                 assert_eq!(list[0].stream, 16);
                 assert_eq!(list[0].kind, ChannelKind::Shell);
@@ -4697,7 +4814,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_terminal_type_reaches_the_spawner_of_every_later_channel() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         // A channel opened before the announcement: nothing to pass on.
@@ -4747,7 +4864,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_refused_terminal_type_leaves_the_spawner_with_none() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4782,11 +4899,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_cold_start_sends_no_channel_list() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
-            .send(SessionInbound::Live(AttachmentContext::default()))
+            .send(SessionInbound::Live(channel_context()))
             .await
             .unwrap();
         inbound
@@ -4815,7 +4932,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_still_running_channel_is_killed_and_waited_when_the_session_ends() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4853,7 +4970,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_closed_channel_is_killed_and_waited_even_though_its_process_is_still_running() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4914,7 +5031,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_channel_that_goes_away_puts_its_stream_back_in_the_interactive_class() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
+        let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(open(16, ChannelKind::Shell, false))
@@ -4957,13 +5075,14 @@ pub(crate) mod tests {
     }
 
     /// A warm reattach announces EVERY live channel, not just the first --
-    /// the whole reason `ServerRecord::Channels` is a list, and each entry
+    /// the atomic snapshot preserves a bounded list, and each entry
     /// keeps its own identity, kind, geometry and screen flag rather than
     /// collapsing into a count.
     #[tokio::test]
     async fn a_warm_reattach_announces_every_live_channel_with_its_own_details() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -4988,12 +5107,18 @@ pub(crate) mod tests {
         );
 
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
 
-        match next_control(&mut outbound).await {
-            ServerRecord::Channels(list) => {
+        match next_snapshot(&mut outbound, &snapshots).await {
+            ServerRecord::ChannelSnapshot(snapshot) => {
+                assert!(snapshot.draining().is_empty());
+                let list: Vec<_> = snapshot
+                    .active()
+                    .iter()
+                    .map(|entry| &entry.request)
+                    .collect();
                 assert_eq!(list.len(), 2, "both live channels are announced");
                 assert_eq!(list[0].stream, 16);
                 assert_eq!(list[0].kind, ChannelKind::Shell);
@@ -5033,7 +5158,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resume_reset_redeclares_every_live_channels_recoverability() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -5061,7 +5186,7 @@ pub(crate) mod tests {
         // a side effect of `next_control`/`next_channel_data` skipping past
         // them -- what is collected below can only be fresh ones.
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
 
@@ -5090,7 +5215,7 @@ pub(crate) mod tests {
     async fn resume_reset_redeclares_off_the_actual_screen_model_not_the_request() {
         let spawner = FakeSpawner::new();
         *spawner.force_no_screen.lock().unwrap() = true;
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -5107,7 +5232,7 @@ pub(crate) mod tests {
         );
 
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
 
@@ -5313,7 +5438,7 @@ pub(crate) mod tests {
     /// the session carries on: the next request is answered as usual.
     #[tokio::test]
     async fn a_session_without_a_daemon_behind_it_leaves_about_unanswered() {
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, FakeSpawner::new()));
         inbound
             .send(control(ClientRecord::AboutRequest))
@@ -5335,7 +5460,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_about_request_is_answered_with_what_the_daemon_says() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5359,7 +5484,7 @@ pub(crate) mod tests {
     async fn a_refused_offer_is_answered_and_stray_image_bytes_are_dropped() {
         let daemon = FakeDaemon::new();
         *daemon.answer.lock().unwrap() = Some(UpdateAnswer::Managed);
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5396,7 +5521,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_accepted_image_is_written_verified_and_restarted() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5448,13 +5573,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_second_offer_while_one_is_in_flight_gets_in_progress() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
             with_daemon(&daemon),
         ));
-        let (io2, inbound2, mut outbound2) = SessionIo::test_pair();
+        let (io2, inbound2, mut outbound2) = channel_pair();
         let runner2 = tokio::spawn(run_channel_session_with(
             io2,
             FakeSpawner::new(),
@@ -5487,7 +5612,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_stalled_transfer_is_rejected_and_frees_the_slot() {
         let daemon = FakeDaemon::with_stall(std::time::Duration::from_millis(200));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5521,7 +5646,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_session_that_ends_mid_transfer_drops_its_transfer() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5547,7 +5672,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn update_bytes_are_taken_once_the_image_has_them() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5577,7 +5702,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn update_bytes_nobody_writes_are_reported_too() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5617,8 +5742,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_restart_announcement_reaches_every_session() {
         let daemon = FakeDaemon::new();
-        let (io1, inbound1, mut outbound1) = SessionIo::test_pair();
-        let (io2, inbound2, mut outbound2) = SessionIo::test_pair();
+        let (io1, inbound1, mut outbound1) = channel_pair();
+        let (io2, inbound2, mut outbound2) = channel_pair();
         let r1 = tokio::spawn(run_channel_session_with(
             io1,
             FakeSpawner::new(),
@@ -5658,7 +5783,7 @@ pub(crate) mod tests {
     async fn draining_ends_and_reaps_every_channel_then_says_so() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -5689,7 +5814,7 @@ pub(crate) mod tests {
     async fn a_session_that_only_sees_the_drain_reaps_but_does_not_confirm() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -5720,6 +5845,18 @@ pub(crate) mod tests {
             loop {
                 let Some(msg) = rx.recv().await else {
                     return std::future::pending::<ServerRecord>().await;
+                };
+                let msg = match msg {
+                    SessionOutbound::ChannelOpened { stream, .. } => {
+                        return ServerRecord::Opened { stream }
+                    }
+                    SessionOutbound::ChannelRefused { stream, reason, .. } => {
+                        return ServerRecord::Refused { stream, reason }
+                    }
+                    SessionOutbound::ChannelExit { stream, code, .. } => {
+                        return ServerRecord::Exit { stream, code }
+                    }
+                    other => other,
                 };
                 let SessionOutbound::Data(sd) = msg else {
                     continue;
@@ -5758,7 +5895,7 @@ pub(crate) mod tests {
         for signal in [RestartSignal::announced(1), RestartSignal::draining(1)] {
             let daemon = FakeDaemon::new();
             let spawner = FakeSpawner::new();
-            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let (io, inbound, mut outbound) = channel_pair();
             let runner = tokio::spawn(run_channel_session_with(
                 io,
                 spawner.clone(),
@@ -5791,7 +5928,7 @@ pub(crate) mod tests {
     async fn a_session_that_starts_during_an_announced_restart_tells_and_confirms() {
         let daemon = FakeDaemon::new();
         daemon.restart_tx.send_replace(RestartSignal::announced(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5823,7 +5960,7 @@ pub(crate) mod tests {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
         daemon.restart_tx.send_replace(RestartSignal::draining(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -5847,7 +5984,7 @@ pub(crate) mod tests {
         // Stays for the next restart.
         let daemon = FakeDaemon::new();
         daemon.restart_tx.send_replace(RestartSignal::draining(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5877,7 +6014,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn two_restarts_in_a_row_are_each_announced_once() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -5921,7 +6058,7 @@ pub(crate) mod tests {
     async fn a_session_that_ends_during_a_restart_still_confirms_its_drain() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -5947,6 +6084,15 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         let deadline = tokio::time::Instant::now() + window;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let msg = match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id, output, ..
+                } if id == stream => {
+                    out.extend(shell_record(output));
+                    continue;
+                }
+                other => other,
+            };
             if let SessionOutbound::Data(sd) = msg {
                 if sd.stream_id == stream {
                     out.extend(d.push(&sd.data));
@@ -5969,7 +6115,7 @@ pub(crate) mod tests {
     /// of everything consumed, unconditionally.
     #[tokio::test]
     async fn a_screen_channel_behind_a_closed_gate_drops_output_and_repaints_once_open() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6002,6 +6148,7 @@ pub(crate) mod tests {
         assert_eq!(
             after,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(2)
             ]
@@ -6012,7 +6159,7 @@ pub(crate) mod tests {
     /// model already holds it.
     #[tokio::test]
     async fn the_first_chunk_after_a_screen_gate_reopens_is_sent_as_a_repaint() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6034,6 +6181,7 @@ pub(crate) mod tests {
         assert_eq!(
             after,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(0)
             ]
@@ -6047,7 +6195,7 @@ pub(crate) mod tests {
     /// second repaint.
     #[tokio::test]
     async fn a_resume_reset_repaint_clears_a_stale_screen_channel() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6065,7 +6213,7 @@ pub(crate) mod tests {
         let _ = records_within(&mut outbound, 16, std::time::Duration::from_millis(200)).await;
         let _ = gate.force_open();
         inbound
-            .send(SessionInbound::ResumeReset(AttachmentContext::default()))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
         assert_eq!(next_channel_data(&mut outbound, 16).await, b"REPAINT");
@@ -6078,7 +6226,7 @@ pub(crate) mod tests {
     /// the gate opens.
     #[tokio::test]
     async fn a_line_channels_reader_stops_reading_behind_a_closed_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6123,7 +6271,8 @@ pub(crate) mod tests {
         let counted = Arc::clone(&count);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if matches!(&msg, SessionOutbound::Data(sd) if sd.stream_id == stream) {
+                if matches!(&msg, SessionOutbound::ChannelOutput { stream: id, output: ChannelOutput::Data(_), .. } if *id == stream)
+                {
                     counted.fetch_add(1, Ordering::SeqCst);
                 }
                 if tx.send(msg).is_err() {
@@ -6140,7 +6289,7 @@ pub(crate) mod tests {
     /// of forty chunks at most the one its reader had under way goes out.
     #[tokio::test]
     async fn a_closed_line_gate_does_not_hold_back_a_screen_channel() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6184,7 +6333,7 @@ pub(crate) mod tests {
     /// process is reaped.
     #[tokio::test]
     async fn closing_a_line_channel_wakes_its_reader_off_a_closed_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6243,7 +6392,7 @@ pub(crate) mod tests {
     /// reaps -- and the reader lets go of its process.
     #[tokio::test]
     async fn a_session_that_ends_wakes_a_line_reader_waiting_on_its_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let gate =
@@ -6270,7 +6419,7 @@ pub(crate) mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         rt.block_on(async {
             tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -6302,11 +6451,11 @@ pub(crate) mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(msg) = outbound.recv().await {
-                if let SessionOutbound::NotifyDelivered { stream_id, token } = msg {
+                if let Some((stream_id, token, generation)) = delivery_marker(&msg) {
                     if let Some(inbound) = weak.upgrade() {
                         let _ = inbound
                             .send(SessionInbound::Delivered {
-                                generation: 0,
+                                generation,
                                 stream: stream_id,
                                 token,
                             })
@@ -6345,8 +6494,8 @@ pub(crate) mod tests {
         let seen = Arc::clone(&requests);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let SessionOutbound::NotifyDelivered { stream_id, token } = &msg {
-                    seen.lock().unwrap().push((*stream_id, *token));
+                if let Some((stream_id, token, _)) = delivery_marker(&msg) {
+                    seen.lock().unwrap().push((stream_id, token));
                 }
                 if tx.send(msg).is_err() {
                     return;
@@ -6380,6 +6529,17 @@ pub(crate) mod tests {
         let deadline = tokio::time::Instant::now() + window;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id,
+                    output: ChannelOutput::DeliveryMarker(..),
+                    ..
+                } if id == stream => out.push(Seen::NotifyDelivered(id)),
+                SessionOutbound::ChannelOutput {
+                    stream: id, output, ..
+                } if id == stream => out.extend(shell_record(output).map(Seen::Record)),
+                SessionOutbound::ChannelExit { stream, code, .. } => {
+                    out.push(Seen::Control(ServerRecord::Exit { stream, code }))
+                }
                 SessionOutbound::Data(sd) if sd.stream_id == stream => {
                     out.extend(records.push(&sd.data).into_iter().map(Seen::Record));
                 }
@@ -6404,7 +6564,7 @@ pub(crate) mod tests {
     /// delivered, and says `Exit` only then.
     #[tokio::test]
     async fn a_channel_that_exits_says_so_only_once_its_output_is_delivered() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -6422,6 +6582,7 @@ pub(crate) mod tests {
         assert_eq!(
             before,
             vec![
+                Seen::Record(established_checkpoint()),
                 Seen::Record(ShellRecord::Data(b"hello from the shell".to_vec())),
                 Seen::Record(ShellRecord::Data(b"last words".to_vec())),
                 Seen::NotifyDelivered(16),
@@ -6450,7 +6611,7 @@ pub(crate) mod tests {
     /// channel goes -- and the `Exit` waits for that to be delivered too.
     #[tokio::test]
     async fn a_stale_screen_channel_that_exits_repaints_and_then_says_so() {
-        let (io, inbound, outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, outbound, gates) = channel_pair_with_gates();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -6472,6 +6633,7 @@ pub(crate) mod tests {
         assert_eq!(
             before,
             vec![
+                Seen::Record(established_checkpoint()),
                 Seen::Record(ShellRecord::Data(b"REPAINT".to_vec())),
                 Seen::Record(ShellRecord::EchoAck(1)),
                 Seen::NotifyDelivered(16),
@@ -6499,7 +6661,7 @@ pub(crate) mod tests {
     /// it opens again is a new channel no old `Exit` may end.
     #[tokio::test]
     async fn an_exit_still_waiting_is_dropped_by_a_close_or_a_reopen() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -6549,7 +6711,7 @@ pub(crate) mod tests {
     /// own request does.
     #[tokio::test]
     async fn a_late_answer_for_an_earlier_channel_never_releases_a_later_exit() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -6615,7 +6777,7 @@ pub(crate) mod tests {
     /// right after the repaint.
     #[tokio::test]
     async fn the_ack_tick_waits_while_a_repaint_is_pending() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6646,6 +6808,7 @@ pub(crate) mod tests {
         assert_eq!(
             records_within(&mut outbound, 16, std::time::Duration::from_millis(300)).await,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(2)
             ]
@@ -6657,7 +6820,7 @@ pub(crate) mod tests {
     /// the next one does.
     #[tokio::test]
     async fn a_writable_that_finds_the_gate_shut_again_waits_for_the_next() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -6687,6 +6850,7 @@ pub(crate) mod tests {
         assert_eq!(
             records_within(&mut outbound, 16, std::time::Duration::from_millis(300)).await,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(0)
             ]

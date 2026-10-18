@@ -12,6 +12,9 @@ use client::ShellState;
 use prediction::DisplayPreference;
 use render::{Renderer, TermCaps};
 use terminal::MouseTracking;
+use transport::channel_geometry::{
+    ChannelInstance, GeometryOutcome, GeometryRecord, ResizeRefusal,
+};
 use transport::{LinkState, Stats};
 
 use crate::args::PredictMode;
@@ -116,6 +119,8 @@ pub enum Action {
     OpenShell { cols: u16, rows: u16 },
     /// Bytes for a channel.
     SendChannel { ch: ChannelId, bytes: Vec<u8> },
+    /// Latest physical intent; hold wire submission until the debounce expires.
+    DeferResize { cols: u16, rows: u16 },
     /// A new size for a channel.
     ResizeChannel { ch: ChannelId, cols: u16, rows: u16 },
     /// The authenticated resumed inventory no longer contains the tracked shell.
@@ -187,6 +192,8 @@ enum ShellChannel {
     /// Confirmed: this is the channel input, resizes, and the far side's
     /// own channel events all address.
     Ready(ChannelId),
+    /// Final output is readable, but input and resize are closed.
+    Draining(ChannelId),
     /// The link is gone: `ch` is the channel the shell had (when it was
     /// confirmed), for the reconnect to find again. Input goes nowhere.
     Detached { ch: Option<ChannelId> },
@@ -225,6 +232,10 @@ pub struct Session {
     raw_cols: u16,
     raw_rows: u16,
     logical_size: terminal_size::TerminalSize,
+    desired_size: terminal_size::TerminalSize,
+    geometry_instance: Option<ChannelInstance>,
+    resize_notice: Option<String>,
+    continuity_notice: bool,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
     pending_size: Option<(u16, u16)>,
@@ -322,6 +333,10 @@ impl Session {
             raw_rows: rows,
             logical_size: terminal_size::TerminalSize::new(shell_cols, shell_rows)
                 .expect("adapted shell size"),
+            desired_size: size,
+            geometry_instance: None,
+            resize_notice: None,
+            continuity_notice: false,
             pending_size: None,
             resize_due_ms: 0,
             lost_since_ms: None,
@@ -432,6 +447,11 @@ impl Session {
         (self.logical_size.cols(), self.logical_size.rows())
     }
 
+    /// The most recent nonempty physical viewport intent, not a remote result.
+    pub fn desired_size(&self) -> (u16, u16) {
+        (self.desired_size.cols(), self.desired_size.rows())
+    }
+
     pub fn set_history_limit(&mut self, lines: usize) {
         self.shell.set_history_limit(lines);
     }
@@ -513,7 +533,7 @@ impl Session {
     pub fn on_link_gone(&mut self, now_ms: i64) -> Vec<Action> {
         self.lost_since_ms.get_or_insert(now_ms);
         let ch = match &self.shell_channel {
-            ShellChannel::Ready(ch) => Some(*ch),
+            ShellChannel::Ready(ch) | ShellChannel::Draining(ch) => Some(*ch),
             ShellChannel::Detached { ch } | ShellChannel::Reattaching { ch } => *ch,
             _ => None,
         };
@@ -539,7 +559,7 @@ impl Session {
         self.refresh_line(now_ms);
         let ch = match &self.shell_channel {
             ShellChannel::Detached { ch } | ShellChannel::Reattaching { ch } => *ch,
-            ShellChannel::Ready(ch) => Some(*ch),
+            ShellChannel::Ready(ch) | ShellChannel::Draining(ch) => Some(*ch),
             _ => None,
         };
         self.shell_channel = ShellChannel::Reattaching { ch };
@@ -548,22 +568,12 @@ impl Session {
 
     /// The server listed what it is running (a warm reattach).
     pub fn on_announced(&mut self, live: &[ChannelId], _now_ms: i64) -> Vec<Action> {
-        let (cols, rows) = self.size();
-        let resize_all = |s: &mut Session| {
-            // The size goes out now, so a debounced one has nothing left to do.
-            s.pending_size = None;
-            if s.raw_cols == 0 || s.raw_rows == 0 {
-                return Vec::new();
-            }
-            live.iter()
-                .map(|&ch| Action::ResizeChannel { ch, cols, rows })
-                .collect::<Vec<_>>()
-        };
+        let (cols, rows) = self.desired_size();
         if let ShellChannel::Reattaching { ch } = self.shell_channel {
             return match ch {
                 Some(ch) if live.contains(&ch) => {
                     self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
-                    resize_all(self)
+                    Vec::new()
                 }
                 _ => {
                     let mut actions = vec![
@@ -581,10 +591,75 @@ impl Session {
             self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
             vec![Action::OpenShell { cols, rows }]
         } else {
-            // The channels were opened by an earlier run, at whatever size
-            // that terminal was. This one may be a different shape.
-            resize_all(self)
+            // Only ordered Geometry establishes the retained shell's size.
+            Vec::new()
         }
+    }
+
+    /// Reconcile both live processes and retained final-output lifecycles.
+    pub fn on_snapshot(
+        &mut self,
+        active: &[ChannelId],
+        draining: &[ChannelId],
+        now_ms: i64,
+    ) -> Vec<Action> {
+        let present: Vec<_> = active.iter().chain(draining).copied().collect();
+        self.on_announced(&present, now_ms)
+    }
+
+    pub fn on_channel_draining(&mut self, ch: ChannelId) {
+        self.shell_channel = ShellChannel::Draining(ch);
+        self.pending_size = None;
+    }
+
+    /// Called only after the channel owner validated lifecycle and geometry.
+    pub fn on_geometry(&mut self, record: GeometryRecord, now_ms: i64) -> Vec<Action> {
+        let Ok(size) = terminal_size::TerminalSize::new(record.cols, record.rows) else {
+            return vec![
+                Action::Notice("qsh: shell channel has no valid PTY geometry".into()),
+                Action::Exit(1),
+            ];
+        };
+        if self.geometry_instance != Some(record.instance) {
+            self.geometry_instance = Some(record.instance);
+            self.resize_notice = None;
+            self.continuity_notice = false;
+        } else if record.outcome == GeometryOutcome::Applied {
+            self.resize_notice = None;
+        }
+        if self.logical_size != size {
+            self.logical_size = size;
+            self.history_frame = None;
+        }
+        let frame = self.shell.geometry_frame(record.cols, record.rows, now_ms);
+        self.renderer.invalidate();
+        self.last_frame = None;
+        self.paint_at(&frame, now_ms)
+    }
+
+    pub fn on_resize_refused(&mut self, reason: ResizeRefusal, now_ms: i64) -> Vec<Action> {
+        let reason = match reason {
+            ResizeRefusal::InvalidSize => "invalid size",
+            ResizeRefusal::NoPty => "no PTY",
+            ResizeRefusal::ResourceLimit => "resource limit",
+            ResizeRefusal::PtyResizeFailed => "PTY resize failed",
+            ResizeRefusal::ScreenPreparationFailed => "screen preparation failed",
+        };
+        let (cols, rows) = self.size();
+        self.resize_notice = Some(format!("Resize refused: {reason}; terminal remains {cols}x{rows}. Change the window size to retry."));
+        self.repaint(now_ms)
+    }
+
+    pub fn on_output_gap(&mut self, now_ms: i64) -> Vec<Action> {
+        self.continuity_notice = true;
+        self.repaint(now_ms)
+    }
+
+    fn live_notice(&self) -> Option<&str> {
+        self.resize_notice.as_deref().or_else(|| {
+            self.continuity_notice
+                .then_some("Output continuity lost: some previous output was not confirmed.")
+        })
     }
 
     /// Marks the shell channel as already requested, without emitting an
@@ -621,11 +696,18 @@ impl Session {
             ShellChannel::Opening { queued } => queued,
             _ => Vec::new(),
         };
-        if queued.is_empty() {
-            Vec::new()
-        } else {
-            self.send_now(ch, queued, now_ms)
+        if self.raw_cols != 0
+            && self.raw_rows != 0
+            && self.desired_size != self.logical_size
+            && self.pending_size.is_none()
+        {
+            self.pending_size = Some(self.desired_size());
         }
+        let mut actions = self.due_resize(now_ms);
+        if !queued.is_empty() {
+            actions.extend(self.send_now(ch, queued, now_ms));
+        }
+        actions
     }
 
     /// The channel's process ended with `code`. Silent for a channel this
@@ -633,7 +715,9 @@ impl Session {
     /// for a stream that is not the one shell channel it ever opened.
     pub fn on_channel_exit(&mut self, ch: ChannelId, code: i32, _now_ms: i64) -> Vec<Action> {
         match &self.shell_channel {
-            ShellChannel::Ready(known) if *known == ch => self.leave(code),
+            ShellChannel::Ready(known) | ShellChannel::Draining(known) if *known == ch => {
+                self.leave(code)
+            }
             // A refusal arrives before the channel is ever `Ready` -- there
             // is no confirmed number to compare against yet, only the one
             // channel this session is waiting on, so any `ch` here is it.
@@ -913,7 +997,7 @@ impl Session {
 
     /// `Ctrl-] h`: the line goes or comes back, and the shell's size with it.
     fn toggle_line(&mut self, now_ms: i64) -> Vec<Action> {
-        let before = self.size();
+        let before = self.desired_size();
         self.line_shown = !self.line_shown;
         self.refresh_line(now_ms);
         if self.raw_cols == 0
@@ -1008,7 +1092,7 @@ impl Session {
                 if matches!(state, LinkState::Live) && self.shell_channel == ShellChannel::Unopened
                 {
                     self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
-                    let (cols, rows) = self.size();
+                    let (cols, rows) = self.desired_size();
                     actions.push(Action::OpenShell { cols, rows });
                 }
                 actions
@@ -1017,36 +1101,61 @@ impl Session {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, now_ms: i64) -> Vec<Action> {
+        let restored = (self.raw_cols == 0 || self.raw_rows == 0) && cols != 0 && rows != 0;
         self.raw_cols = cols;
         self.raw_rows = rows;
         let viewport = terminal_size::ViewportSize::new(cols, rows);
         self.cols = viewport.cols();
         self.rows = viewport.rows();
-        self.apply_shell_size(now_ms)
+        let mut actions = self.apply_shell_size(now_ms);
+        if restored {
+            let (cols, rows) = self.desired_size();
+            self.pending_size = Some((cols, rows));
+            self.resize_due_ms = now_ms + RESIZE_QUIET_MS;
+            if !actions.contains(&Action::DeferResize { cols, rows }) {
+                actions.insert(0, Action::DeferResize { cols, rows });
+            }
+        }
+        actions
     }
 
-    /// The shell's size changed (the terminal's, or the line came or went).
-    /// The local frame follows at once: the response the user is looking for
-    /// is on their own screen, not on the server. The server hears once the
-    /// size holds still (`due_resize`).
+    /// Physical intent for transfer, including a zero viewport's send suspension.
+    pub fn deferred_size(&self) -> (u16, u16) {
+        if self.raw_cols == 0 || self.raw_rows == 0 {
+            (0, 0)
+        } else {
+            self.desired_size()
+        }
+    }
+
+    /// Project the committed grid immediately, but debounce only the request.
+    /// Physical movement never commits a remote size or reflows shell output.
     fn apply_shell_size(&mut self, now_ms: i64) -> Vec<Action> {
         if self.raw_cols == 0 || self.raw_rows == 0 {
             self.pending_size = None;
             self.renderer.invalidate();
             self.last_frame = None;
-            return Vec::new();
+            return vec![Action::DeferResize { cols: 0, rows: 0 }];
         }
         let (cols, rows) = shell_size(self.cols, self.rows, self.line_shown);
-        self.logical_size =
-            terminal_size::TerminalSize::new(cols, rows).expect("adapted shell size");
-        let frame = self.shell.resize_frame(cols, rows, now_ms);
-        self.pending_size = Some((cols, rows));
-        self.resize_due_ms = now_ms + RESIZE_QUIET_MS;
+        let desired = terminal_size::TerminalSize::new(cols, rows).expect("adapted shell size");
+        let changed = self.desired_size != desired;
+        if changed {
+            self.desired_size = desired;
+            self.resize_notice = None;
+            self.pending_size = Some((cols, rows));
+            self.resize_due_ms = now_ms + RESIZE_QUIET_MS;
+        }
+        let frame = self.shell.frame(now_ms, self.rtt_ms);
         // The size changed, so the renderer's idea of the screen is the wrong
         // shape: a diff against it would be meaningless.
         self.renderer.invalidate();
         self.last_frame = None;
-        self.paint_at(&frame, now_ms)
+        let mut actions = self.paint_at(&frame, now_ms);
+        if changed {
+            actions.insert(0, Action::DeferResize { cols, rows });
+        }
+        actions
     }
 
     /// The resize action, if the size has held still long enough AND the
@@ -1152,6 +1261,14 @@ impl Session {
 
     /// The status line's cells, as `line_view` says.
     fn line_cells(&self) -> Vec<terminal::Cell> {
+        if let Some(notice) = self.live_notice() {
+            return statusline::recovery_line(
+                self.cols,
+                notice,
+                self.chrome.glyphs.colour,
+                self.chrome.glyphs.utf8,
+            );
+        }
         if self.recovery_view.is_some() {
             return self.recovery_cells();
         }
@@ -1197,7 +1314,7 @@ impl Session {
             h.app_keypad = false;
         }
         let frame = history.as_ref().unwrap_or(frame);
-        let projected = crate::viewport::project(
+        let projected = crate::viewport::project_padded(
             frame,
             terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on())),
         );
@@ -1223,7 +1340,9 @@ impl Session {
         };
         let frame = alarm.as_ref().unwrap_or(frame);
         let line = self.line_on().then(|| self.line_cells());
-        let plate = if self.line_on() || alarm.is_some() {
+        let plate = if !self.line_on() && self.live_notice().is_some() {
+            self.live_notice().map(str::to_owned)
+        } else if self.line_on() || alarm.is_some() {
             None
         } else if self.history_frame.is_some() {
             Some(statusline::scroll_part(
@@ -1300,6 +1419,137 @@ mod tests {
     use render::TermCaps;
 
     #[test]
+    fn stage6_boundary_geometry_clears_predictions_even_at_the_same_size() {
+        let mut s = Session::new(20, 5, TermCaps::truecolor(), PredictMode::Always, plain());
+        s.on_link(LinkState::Live, 0);
+        s.on_channel_ready(16, 0);
+        s.handle(UiEvent::Stdin(b"predicted".to_vec()), 10);
+        assert!(s.shell.prediction_active());
+        s.on_geometry(
+            GeometryRecord {
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: 0,
+                outcome: GeometryOutcome::Established,
+                cols: 20,
+                rows: 5,
+            },
+            11,
+        );
+        assert!(!s.shell.prediction_active());
+    }
+
+    #[test]
+    fn stage6_intent_physical_change_defers_immediately_and_zero_suspends() {
+        let mut s = ready_session();
+        assert!(s.on_resize(100, 30, 0).contains(&Action::DeferResize {
+            cols: 100,
+            rows: 30
+        }));
+        assert!(s
+            .on_resize(0, 0, 1)
+            .contains(&Action::DeferResize { cols: 0, rows: 0 }));
+        assert!(control(&s.on_tick(1000)).is_empty());
+        assert!(s.on_resize(100, 30, 1001).contains(&Action::DeferResize {
+            cols: 100,
+            rows: 30
+        }));
+        assert!(s.on_tick(1200).contains(&Action::ResizeChannel {
+            ch: 16,
+            cols: 100,
+            rows: 30
+        }));
+    }
+
+    #[test]
+    fn committed_geometry_and_live_notices_do_not_feed_resize() {
+        let mut s = wide_ready_session();
+        let record = GeometryRecord {
+            instance: ChannelInstance::new(1).unwrap(),
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols: 80,
+            rows: 5,
+        };
+        s.on_geometry(record, 0);
+        s.on_resize(100, 30, 10);
+        s.due_resize(200);
+        let refused = GeometryRecord {
+            request_id: 1,
+            outcome: GeometryOutcome::Refused(ResizeRefusal::ResourceLimit),
+            ..record
+        };
+        s.on_geometry(refused, 210);
+        let notice = s.on_resize_refused(ResizeRefusal::ResourceLimit, 211);
+        assert!(row0(&notice, 100, 30).contains("Resize refused: resource limit"));
+        assert_eq!(s.size(), (80, 5));
+        assert_eq!(s.desired_size(), (100, 30));
+        for now in [300, 1000, 5000] {
+            assert!(control(&s.on_tick(now)).is_empty());
+            assert!(control(&s.on_resize(100, 30, now)).is_empty());
+            assert!(control(&s.on_announced(&[16], now)).is_empty());
+        }
+        s.on_resize(120, 40, 5100);
+        s.on_geometry(
+            GeometryRecord {
+                request_id: 2,
+                outcome: GeometryOutcome::Applied,
+                cols: 120,
+                rows: 40,
+                ..record
+            },
+            5300,
+        );
+        assert_eq!(s.size(), (120, 40));
+        assert!(s.resize_notice.is_none());
+    }
+
+    #[test]
+    fn draining_snapshot_preserves_final_output_without_input_or_resize() {
+        let mut s = session();
+        s.assume_channel_opening();
+        assert!(s.on_snapshot(&[], &[16], 0).is_empty());
+        s.on_channel_draining(16);
+        assert!(sent(&s.handle(UiEvent::Stdin(b"no".to_vec()), 1)).is_empty());
+        s.on_resize(30, 7, 2);
+        assert!(control(&s.on_tick(1000)).is_empty());
+        assert!(s.on_channel_exit(16, 37, 1001).contains(&Action::Exit(37)));
+    }
+
+    #[test]
+    fn physical_resize_only_changes_projection_while_pending() {
+        let mut s = ready_session();
+        let committed = s.size();
+        let _ = s.on_resize(100, 30, 10);
+        assert_eq!(
+            s.size(),
+            committed,
+            "a local viewport is not remote geometry"
+        );
+        let frame = s.shell.frame(10, 0);
+        assert_eq!((frame.cols, frame.rows), committed);
+        let shown = s.last_frame.as_ref().unwrap();
+        assert_eq!((shown.cols, shown.rows), (100, 30));
+        assert!(s.due_resize(1000).contains(&Action::ResizeChannel {
+            ch: 16,
+            cols: 100,
+            rows: 30,
+        }));
+        assert_eq!(s.size(), committed, "sending does not commit geometry");
+    }
+
+    #[test]
+    fn warm_announced_never_sends_a_blind_resize() {
+        let mut s = ready_session();
+        s.on_link_gone(10);
+        s.on_reattached(20);
+        let actions = s.on_announced(&[16], 30);
+        assert!(
+            control(&actions).is_empty(),
+            "metadata is not a resize result: {actions:?}"
+        );
+    }
+
+    #[test]
     fn physical_extents_have_bounded_coherent_logical_sizes() {
         for (cols, rows, expected) in [(1, 1, (2, 1)), (1, 2, (2, 1)), (65535, 65535, (512, 256))] {
             let mut s = Session::new(
@@ -1329,7 +1579,10 @@ mod tests {
     fn empty_physical_extent_retains_size_without_paint_or_resize() {
         let mut s = ready_session();
         let before = s.size();
-        assert!(s.on_resize(0, 0, 10).is_empty());
+        assert_eq!(
+            s.on_resize(0, 0, 10),
+            vec![Action::DeferResize { cols: 0, rows: 0 }]
+        );
         assert_eq!(s.size(), before);
         assert!(s
             .on_tick(1000)
@@ -1359,13 +1612,14 @@ mod tests {
     #[test]
     fn status_toggle_recomputes_one_size_and_zero_notifications_keep_it() {
         let mut s = ready_session();
+        let committed = s.size();
         s.on_resize(1, 2, 10);
-        assert_eq!(s.size(), (2, 2));
+        assert_eq!(s.desired_size(), (2, 2));
         s.toggle_line(20);
-        assert_eq!(s.size(), (2, 1));
+        assert_eq!(s.desired_size(), (2, 1));
         assert_eq!(
             (s.shell.frame(20, 0).cols, s.shell.frame(20, 0).rows),
-            s.size()
+            committed
         );
         assert!(s.due_resize(1000).contains(&Action::ResizeChannel {
             ch: 16,
@@ -1376,10 +1630,10 @@ mod tests {
         assert_eq!((f.cols, f.rows), (1, 2));
         s.on_resize(0, 2, 1010);
         s.toggle_line(1020);
-        assert_eq!(s.size(), (2, 1));
+        assert_eq!(s.desired_size(), (2, 1));
         assert!(s.due_resize(2000).is_empty());
         s.on_resize(1, 2, 2010);
-        assert_eq!(s.size(), (2, 2));
+        assert_eq!(s.desired_size(), (2, 2));
     }
 
     #[test]
@@ -2272,14 +2526,9 @@ mod tests {
         let typed = s.handle(UiEvent::Stdin(b"x".to_vec()), 5);
         assert!(sent(&typed).is_empty(), "no channel to send to yet");
         let announced = s.on_announced(&[16], 10);
-        assert_eq!(
-            announced,
-            vec![Action::ResizeChannel {
-                ch: 16,
-                cols: 20,
-                rows: 5
-            }],
-            "the kept shell is told this terminal's size"
+        assert!(
+            announced.is_empty(),
+            "wait for authoritative Established geometry"
         );
         let ready = s.on_channel_ready(16, 20);
         assert_eq!(sent(&ready), b"x", "what was typed meanwhile reaches it");
@@ -2411,9 +2660,9 @@ mod tests {
             "no channel to address yet"
         );
 
-        s.on_channel_ready(37, 140);
+        let ready = s.on_channel_ready(37, 140);
         assert_eq!(
-            control(&s.handle(UiEvent::Tick, 141)),
+            control(&ready),
             vec![(37, 50, 10)],
             "the settled resize must go out now, addressed to the confirmed channel"
         );
@@ -2561,14 +2810,7 @@ mod tests {
         let _ = s.on_link_gone(0);
         let _ = s.on_reattached(10);
         let a = s.on_announced(&[16], 20);
-        assert_eq!(
-            a,
-            vec![Action::ResizeChannel {
-                ch: 16,
-                cols: 20,
-                rows: 5
-            }]
-        );
+        assert!(a.is_empty(), "snapshot does not commit geometry");
         let _ = s.on_channel_ready(16, 21);
         let a = s.handle(UiEvent::Stdin(b"x".to_vec()), 30);
         assert_eq!(sent(&a), b"x", "input flows again");
@@ -2581,14 +2823,15 @@ mod tests {
         let _ = s.handle(UiEvent::Resized { cols: 30, rows: 7 }, 10);
         let _ = s.on_reattached(1_000);
         let a = s.on_announced(&[16], 1_010);
-        assert_eq!(
-            a,
-            vec![Action::ResizeChannel {
+        assert!(a.is_empty(), "snapshot does not commit geometry");
+        assert_eq!(s.size(), (20, 5));
+        assert!(s
+            .on_channel_ready(16, 1011)
+            .contains(&Action::ResizeChannel {
                 ch: 16,
                 cols: 30,
                 rows: 7
-            }]
-        );
+            }));
     }
 
     #[test]
@@ -2613,21 +2856,7 @@ mod tests {
             vec![Action::OpenShell { cols: 20, rows: 5 }]
         );
         let mut s = session();
-        assert_eq!(
-            s.on_announced(&[16, 17], 0),
-            vec![
-                Action::ResizeChannel {
-                    ch: 16,
-                    cols: 20,
-                    rows: 5
-                },
-                Action::ResizeChannel {
-                    ch: 17,
-                    cols: 20,
-                    rows: 5
-                },
-            ]
-        );
+        assert!(s.on_announced(&[16, 17], 0).is_empty());
     }
 
     #[test]
@@ -2832,7 +3061,8 @@ mod tests {
     fn hiding_the_line_gives_the_shell_its_row_back() {
         let mut s = lined(80, 24);
         let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 0);
-        assert_eq!(s.size(), (80, 24));
+        assert_eq!(s.desired_size(), (80, 24));
+        assert_eq!(s.size(), (80, 23));
         let a = s.handle(UiEvent::Tick, 1_000);
         assert!(
             a.contains(&Action::ResizeChannel {

@@ -471,6 +471,7 @@ impl Sim {
         let base = Instant::now();
         let client = Connection::new_at(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Client,
                 local_static_priv: client_kp.private,
@@ -481,6 +482,7 @@ impl Sim {
         );
         let server = Connection::new_at(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,

@@ -1126,3 +1126,280 @@ fn newer_snapshot_clears_predecessor_continuity_refusal_and_ready_allocation() {
     assert_eq!(session.resize(16, 100, 30), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (1, 100, 30)]);
 }
+
+#[test]
+fn deferred_physical_intent_prevents_an_obsolete_coalesced_resize() {
+    let (mut s, sent) = logged();
+    ready(&mut s);
+    s.resize(16, 100, 30);
+    s.resize(16, 120, 40);
+    let before = sent.lock().unwrap().len();
+    s.defer_resize(16, 140, 50);
+    assert_eq!(sent.lock().unwrap().len(), before);
+    geometry(&mut s, applied(1, 100, 30));
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        before,
+        "C must wait for the owner's debounce; B must never go out"
+    );
+    assert_eq!(s.resize(16, 140, 50), ResizeDisposition::Sent);
+    assert!(
+        matches!(sent.lock().unwrap().last(), Some(ClientRecord::ResizeRequest { request_id, cols: 140, rows: 50, .. }) if request_id.get() == 2)
+    );
+}
+
+#[test]
+fn intent_import_rejects_a_started_attachment_including_partial_control() {
+    for partial in [false, true] {
+        let (mut s, _) = logged();
+        if partial {
+            s.on_bytes(CONTROL_STREAM, &[0x29]);
+        } else {
+            ready(&mut s);
+        }
+        assert_eq!(
+            s.import_attachment_intent(AttachmentIntent::default()),
+            Err(ChannelProtocolError::Metadata)
+        );
+    }
+}
+
+#[test]
+fn intent_import_rejects_direct_lifecycle_admission() {
+    let (mut s, _) = logged();
+    s.on_event(SubstrateEvent::Snapshot(
+        ChannelSnapshot::new(vec![], vec![]).unwrap(),
+    ));
+    assert_eq!(
+        s.import_attachment_intent(AttachmentIntent::default()),
+        Err(ChannelProtocolError::Metadata)
+    );
+}
+
+#[test]
+fn deferred_intent_transfers_before_metadata_and_preserves_offline_revisions() {
+    let (mut s, _) = logged();
+    ready(&mut s);
+    s.resize(16, 100, 30);
+    geometry(
+        &mut s,
+        GeometryRecord {
+            request_id: 1,
+            outcome: GeometryOutcome::Refused(ResizeRefusal::ResourceLimit),
+            ..initial()
+        },
+    );
+    let mut intent = s.into_attachment_intent();
+    intent.defer_resize(16, 120, 40);
+    intent.defer_resize(16, 100, 30);
+    let (mut fresh, sent) = logged();
+    fresh.import_attachment_intent(intent).unwrap();
+    snapshot(&mut fresh, 1, false);
+    geometry(&mut fresh, initial());
+    assert!(
+        resize_records(&sent).is_empty(),
+        "transferred physical intent is still debouncing"
+    );
+    assert_eq!(fresh.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(
+        resize_records(&sent),
+        vec![(1, 100, 30)],
+        "changed offline intent may retry, with a fresh request scope"
+    );
+}
+
+#[test]
+fn zero_viewport_suspends_coalesced_intent_across_a_result() {
+    let (mut s, sent) = logged();
+    ready(&mut s);
+    s.resize(16, 100, 30);
+    s.resize(16, 120, 40);
+    assert_eq!(
+        s.defer_resize(16, 0, 0),
+        ResizeDisposition::Rejected(ResizeRejection::ZeroViewport)
+    );
+    geometry(&mut s, applied(1, 100, 30));
+    assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
+    assert_eq!(s.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(resize_records(&sent), vec![(1, 100, 30), (2, 120, 40)]);
+}
+
+#[test]
+fn review_early_geometry_preserves_imported_away_and_back_refusal_revision() {
+    let (mut old, _) = logged();
+    ready(&mut old);
+    assert_eq!(old.resize(16, 100, 30), ResizeDisposition::Sent);
+    geometry(
+        &mut old,
+        GeometryRecord {
+            request_id: 1,
+            outcome: GeometryOutcome::Refused(ResizeRefusal::ResourceLimit),
+            ..initial()
+        },
+    );
+    let intent = old.into_attachment_intent();
+    let (mut fresh, sent) = logged();
+    fresh.import_attachment_intent(intent).unwrap();
+    assert!(geometry(&mut fresh, initial()).is_empty());
+    assert_eq!(
+        fresh.defer_resize(16, 120, 40),
+        ResizeDisposition::Coalesced
+    );
+    assert_eq!(
+        fresh.defer_resize(16, 100, 30),
+        ResizeDisposition::Coalesced
+    );
+    let events = snapshot(&mut fresh, 1, false);
+    assert!(events.contains(&SessionEvent::Ready(16)));
+    assert!(resize_records(&sent).is_empty());
+    assert_eq!(
+        fresh.resize(16, 100, 30),
+        ResizeDisposition::Sent,
+        "physical away/back after early Geometry is a new revision, not the old refusal"
+    );
+    assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
+}
+
+#[test]
+fn review_early_geometry_keeps_latest_deferred_intent_ineligible_at_snapshot() {
+    let (mut old, _) = logged();
+    ready(&mut old);
+    assert_eq!(old.resize(16, 100, 30), ResizeDisposition::Sent);
+    let intent = old.into_attachment_intent();
+    let (mut fresh, sent) = logged();
+    fresh.import_attachment_intent(intent).unwrap();
+    assert!(geometry(&mut fresh, initial()).is_empty());
+    assert_eq!(
+        fresh.defer_resize(16, 120, 40),
+        ResizeDisposition::Coalesced
+    );
+    let events = snapshot(&mut fresh, 1, false);
+    assert!(events.contains(&SessionEvent::Ready(16)));
+    assert!(
+        resize_records(&sent).is_empty(),
+        "snapshot must not restore/send the older eligible size over the latest deferred intent"
+    );
+    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
+}
+
+#[test]
+fn review_early_geometry_preserves_zero_viewport_suspension() {
+    let (mut old, _) = logged();
+    ready(&mut old);
+    old.resize(16, 100, 30);
+    let (mut fresh, sent) = logged();
+    fresh
+        .import_attachment_intent(old.into_attachment_intent())
+        .unwrap();
+    assert!(geometry(&mut fresh, initial()).is_empty());
+    assert_eq!(
+        fresh.defer_resize(16, 0, 0),
+        ResizeDisposition::Rejected(ResizeRejection::ZeroViewport)
+    );
+    snapshot(&mut fresh, 1, false);
+    assert!(resize_records(&sent).is_empty());
+    assert_eq!(fresh.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
+}
+
+#[test]
+fn review_early_geometry_preserves_latest_intent_across_another_transfer() {
+    let (mut old, _) = logged();
+    ready(&mut old);
+    old.resize(16, 100, 30);
+    let (mut middle, _) = logged();
+    middle
+        .import_attachment_intent(old.into_attachment_intent())
+        .unwrap();
+    assert!(geometry(&mut middle, initial()).is_empty());
+    assert_eq!(
+        middle.defer_resize(16, 120, 40),
+        ResizeDisposition::Coalesced
+    );
+    let (mut fresh, sent) = logged();
+    fresh
+        .import_attachment_intent(middle.into_attachment_intent())
+        .unwrap();
+    snapshot(&mut fresh, 1, false);
+    geometry(&mut fresh, initial());
+    assert!(resize_records(&sent).is_empty());
+    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
+}
+
+#[test]
+fn review_early_geometry_keeps_refusal_and_new_instance_fences() {
+    for same_instance in [true, false] {
+        let (mut old, _) = logged();
+        ready(&mut old);
+        old.resize(16, 100, 30);
+        geometry(
+            &mut old,
+            GeometryRecord {
+                request_id: 1,
+                outcome: GeometryOutcome::Refused(ResizeRefusal::ResourceLimit),
+                ..initial()
+            },
+        );
+        let (mut fresh, sent) = logged();
+        fresh
+            .import_attachment_intent(old.into_attachment_intent())
+            .unwrap();
+        let instance = if same_instance { 1 } else { 2 };
+        assert!(geometry(
+            &mut fresh,
+            GeometryRecord {
+                instance: ChannelInstance::new(instance).unwrap(),
+                ..initial()
+            }
+        )
+        .is_empty());
+        assert_eq!(
+            fresh.defer_resize(16, 100, 30),
+            ResizeDisposition::Coalesced
+        );
+        snapshot(&mut fresh, instance, false);
+        assert!(resize_records(&sent).is_empty());
+        assert_eq!(
+            fresh.resize(16, 100, 30),
+            if same_instance {
+                ResizeDisposition::Unchanged
+            } else {
+                ResizeDisposition::Sent
+            }
+        );
+    }
+}
+
+#[test]
+fn review_early_geometry_keeps_a_new_local_open_intent_separate() {
+    let (mut old, _) = logged();
+    ready(&mut old);
+    old.resize(16, 100, 30);
+    let (mut fresh, sent) = logged();
+    fresh
+        .import_attachment_intent(old.into_attachment_intent())
+        .unwrap();
+    assert_eq!(fresh.open_shell(80, 24), Some(16));
+    assert!(geometry(
+        &mut fresh,
+        GeometryRecord {
+            instance: ChannelInstance::new(2).unwrap(),
+            ..initial()
+        }
+    )
+    .is_empty());
+    assert_eq!(
+        fresh.defer_resize(16, 120, 40),
+        ResizeDisposition::Coalesced
+    );
+    fresh.on_bytes(
+        CONTROL_STREAM,
+        &encode_server(&ServerRecord::Opened { stream: 16 }),
+    );
+    assert!(fresh.is_ready(16));
+    assert!(resize_records(&sent).is_empty());
+    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
+}

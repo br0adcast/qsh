@@ -899,6 +899,7 @@ mod tests {
     fn seeded(events: Vec<Event>) -> Connection {
         let kp = crate::handshake::generate_keypair();
         let mut conn = Connection::new(crate::conn::ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Server,
             local_static_priv: kp.private,
@@ -1340,6 +1341,7 @@ mod tests {
         let client_kp = generate_keypair();
         let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -1358,6 +1360,7 @@ mod tests {
             _ => panic!("expected a handshake datagram"),
         };
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,

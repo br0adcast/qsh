@@ -151,6 +151,13 @@ impl ShellState {
         }
     }
 
+    /// An ordered geometry boundary invalidates predictions even when the
+    /// authoritative dimensions are unchanged or history is being displayed.
+    pub fn geometry_frame(&mut self, cols: u16, rows: u16, now_ms: i64) -> terminal::Frame {
+        self.prediction.reset();
+        self.resize_frame(cols, rows, now_ms)
+    }
+
     /// Resize: the terminal recalculates the grid immediately; a resize
     /// inside `cull` resets the prediction (it's tied to the previous grid).
     /// Return the overlaid frame at the new size (raw, without overlay, while

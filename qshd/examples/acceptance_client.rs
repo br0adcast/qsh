@@ -369,6 +369,7 @@ fn cmd_probe(args: Vec<String>) -> ExitCode {
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), parsed.port),
         ConnectionConfig {
+            required_features: transport::Features::CHANNEL_GEOMETRY,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,

@@ -27,9 +27,15 @@ fn self_check_prints_its_build_architecture_and_protocol() {
     let check = self_check(None);
     assert_eq!(check.arch, std::env::consts::ARCH);
     assert_eq!(check.protocol, transport::channel::PROTOCOL_VERSION);
+    assert_eq!(check.protocols, vec![2]);
     assert!(check
-        .protocols
-        .contains(&transport::channel::PROTOCOL_VERSION));
+        .transport_features
+        .iter()
+        .any(|name| name == "channel-geometry"));
+    assert!(!check
+        .transport_features
+        .iter()
+        .any(|name| name == "auth-accepted"));
     assert!(check
         .handover_versions
         .contains(&qshd::state::HANDOVER_VERSION));

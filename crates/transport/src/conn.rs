@@ -288,6 +288,27 @@ pub struct ConnectionConfig {
     /// it and this set allows it. Production passes `Features::SUPPORTED`;
     /// tests pass `Features::NONE` to play a peer built before negotiation.
     pub features: Features,
+    /// Mandatory negotiated features for this application profile. Generic
+    /// transport tools may choose NONE; channel owners require CHANNEL_GEOMETRY.
+    pub required_features: Features,
+}
+
+/// An authenticated handshake cannot satisfy this application profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFailure {
+    UnsupportedProtocol {
+        supported: u8,
+    },
+    MissingRequiredFeatures {
+        required: Features,
+        enabled: Features,
+    },
+    InvalidHandshake {
+        reason: HsPayloadError,
+    },
+    UnofferedFeatures {
+        enabled: Features,
+    },
 }
 
 /// Link state.
@@ -359,6 +380,12 @@ pub enum Event {
     /// Client-side: an authenticated msg2 payload could not be parsed.
     /// Reported once; reading msg2 spent the handshake, so the attempt closes.
     InvalidHandshakeResponse { reason: HsPayloadError },
+    /// Authenticated msg2 omitted mandatory application features. No Live or
+    /// queued application writes follow; the consumed attempt ends once.
+    MissingRequiredFeatures {
+        required: Features,
+        enabled: Features,
+    },
 }
 
 /// Outgoing datagram: where to send it and what to send.
@@ -503,6 +530,7 @@ pub struct Connection {
     auth: AuthPolicy,
     /// What this side's configuration allows (`ConnectionConfig::features`).
     allowed_features: Features,
+    required_features: Features,
     /// Client: what this handshake's msg1 offered, read back from the payload
     /// it was started with (`NONE` for one that does not parse, like the
     /// empty payload of `start`), less what this build does not implement.
@@ -854,6 +882,7 @@ impl Connection {
             remote_pub: cfg.remote_static_pub,
             auth: cfg.auth,
             allowed_features: cfg.features,
+            required_features: cfg.required_features,
             offered_features: Features::NONE,
             features: Features::NONE,
             legacy_peer: false,
@@ -973,6 +1002,10 @@ impl Connection {
         if msg1.method != conn.auth.method() {
             return AcceptOutcome::Rejected;
         }
+        let features = Features::negotiate(msg1.offered, conn.allowed_features);
+        if !features.contains(conn.required_features) {
+            return AcceptOutcome::Rejected;
+        }
         // The only call to `resolve`, and the last point at which this
         // handshake can still be refused -- see this function's docs.
         let Msg2Inputs { resumed, nonce } = match resolve(&msg1) {
@@ -982,7 +1015,6 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let features = Features::negotiate(msg1.offered, conn.allowed_features);
         let session_id: u64 = rand::thread_rng().gen();
         conn.session_id = session_id;
         let msg2 = conn
@@ -2271,6 +2303,11 @@ impl Connection {
         } else {
             Features::negotiate(offered, self.allowed_features)
         };
+        if !features.contains(self.required_features) {
+            self.handshake = None;
+            self.set_state(LinkState::Closed);
+            return out;
+        }
         // Random session id in the authenticated, versioned msg2 payload.
         let session_id: u64 = rand::thread_rng().gen();
         self.session_id = session_id;
@@ -2351,6 +2388,15 @@ impl Connection {
         if !self.offered_features.contains(msg2.enabled) {
             self.handshake = None;
             self.events.push(Event::UnofferedFeatureEnabled {
+                enabled: msg2.enabled,
+            });
+            self.set_state(LinkState::Closed);
+            return out;
+        }
+        if !msg2.enabled.contains(self.required_features) {
+            self.handshake = None;
+            self.events.push(Event::MissingRequiredFeatures {
+                required: self.required_features,
                 enabled: msg2.enabled,
             });
             self.set_state(LinkState::Closed);
@@ -3277,7 +3323,7 @@ impl Connection {
             .or_insert_with(|| StreamState::new(stream_id, features))
     }
 
-    /// Exercise the inactive geometry bridge without advertising the capability.
+    /// Select the ordered profile explicitly in generic transport fixtures.
     #[cfg(test)]
     pub(crate) fn enable_geometry_for_test(&mut self) {
         self.apply_features(self.features | Features::CHANNEL_GEOMETRY);
@@ -3677,6 +3723,7 @@ pub(crate) mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -3684,6 +3731,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4021,6 +4069,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: offer,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4028,6 +4077,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let server_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: allow,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4103,6 +4153,83 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn missing_geometry_feature_is_rejected_before_resolve_or_direct_live() {
+        for direct in [false, true] {
+            let server = generate_keypair();
+            let client_key = generate_keypair();
+            let now = Instant::now();
+            let src = addr("198.51.100.7:40000");
+            let peer = addr("198.51.100.1:41000");
+            let mut client = Connection::new(ConnectionConfig {
+                required_features: Features::NONE,
+                features: Features::NONE,
+                role: Role::Client,
+                local_static_priv: client_key.private,
+                remote_static_pub: Some(server.public),
+                auth: AuthPolicy::Allowlist(Vec::new()),
+            });
+            let msg1 = client.start_session(now, peer, StartKind::Cold, [5; 16]);
+            let config = ConnectionConfig {
+                required_features: Features::CHANNEL_GEOMETRY,
+                features: Features::SUPPORTED,
+                role: Role::Server,
+                local_static_priv: server.private,
+                remote_static_pub: None,
+                auth: AuthPolicy::Allowlist(vec![client_key.public]),
+            };
+            if direct {
+                let mut server = Connection::new(config);
+                assert!(server.on_datagram(now, src, &msg1[0].bytes).is_empty());
+                assert_ne!(server.state(), LinkState::Live);
+                assert!(server.keys.is_none());
+            } else {
+                let Frame::Handshake { body, .. } = parse(&msg1[0].bytes).unwrap() else {
+                    panic!("msg1")
+                };
+                let mut calls = 0;
+                let outcome = Connection::accept(config, now, src, body, &mut |_| {
+                    calls += 1;
+                    Some(Msg2Inputs {
+                        resumed: false,
+                        nonce: [0; AUTH_NONCE_LEN],
+                    })
+                });
+                assert_eq!(
+                    calls, 0,
+                    "incompatible client must not mutate the session router"
+                );
+                assert!(matches!(outcome, AcceptOutcome::Rejected));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_geometry_feature_closes_authenticated_client_before_live_or_flush() {
+        let (mut client, response, now, peer) =
+            response_fixture(&encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::NONE));
+        client.required_features = Features::CHANNEL_GEOMETRY;
+        assert!(client
+            .send(now, 16, b"must not reach the application")
+            .is_empty());
+        assert!(client.on_datagram(now, peer, &response).is_empty());
+        assert_eq!(client.state(), LinkState::Closed);
+        assert!(client.keys.is_none());
+        assert!(client.handshake.is_none());
+        assert_eq!(
+            client.poll_events(),
+            vec![
+                Event::MissingRequiredFeatures {
+                    required: Features::CHANNEL_GEOMETRY,
+                    enabled: Features::NONE,
+                },
+                Event::StateChanged(LinkState::Closed)
+            ]
+        );
+        assert!(client.on_datagram(now, peer, &response).is_empty());
+        assert!(client.poll_events().is_empty());
+    }
+
     /// Spec §5.2: a msg2 that turns on what msg1 did not offer is a protocol
     /// violation. The client says so once and closes: reading msg2 spent its
     /// Noise state, so no later copy could be read either.
@@ -4117,6 +4244,7 @@ pub(crate) mod tests {
             let client_kp = generate_keypair();
             let saddr = addr("198.51.100.1:41000");
             let mut client = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: offer,
                 role: Role::Client,
                 local_static_priv: client_kp.private,
@@ -4154,6 +4282,7 @@ pub(crate) mod tests {
         let peer = addr("198.51.100.1:41000");
         let now = Instant::now();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_key.private,
@@ -4175,8 +4304,14 @@ pub(crate) mod tests {
     fn authenticated_invalid_msg2_retires_attempt_without_flushing() {
         for (payload, reason) in [
             (vec![], HsPayloadError::BadVersion),
-            (vec![2; 30], HsPayloadError::BadVersion),
-            (vec![1; 8], HsPayloadError::TooShort),
+            (
+                vec![crate::handshake_payload::HS_VERSION + 1; 30],
+                HsPayloadError::BadVersion,
+            ),
+            (
+                vec![crate::handshake_payload::HS_VERSION; 8],
+                HsPayloadError::TooShort,
+            ),
         ] {
             let (mut client, response, now, peer) = response_fixture(&payload);
             assert!(client.send(now, 0, b"pending application data").is_empty());
@@ -4252,6 +4387,7 @@ pub(crate) mod tests {
             let client_kp = generate_keypair();
             let saddr = addr("198.51.100.1:41000");
             let mut client = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: Features::SUPPORTED,
                 role: Role::Client,
                 local_static_priv: client_kp.private,
@@ -4301,6 +4437,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4308,6 +4445,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4352,6 +4490,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4359,6 +4498,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4893,6 +5033,7 @@ pub(crate) mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4900,6 +5041,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4934,6 +5076,7 @@ pub(crate) mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4941,6 +5084,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4996,6 +5140,7 @@ pub(crate) mod tests {
             });
         let m1_body = ini.write_msg(&payload);
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -5071,6 +5216,7 @@ pub(crate) mod tests {
             });
         let m1_body = ini.write_msg(&payload);
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -5096,6 +5242,7 @@ pub(crate) mod tests {
         let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -5116,6 +5263,7 @@ pub(crate) mod tests {
 
         let accepted = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -5139,6 +5287,7 @@ pub(crate) mod tests {
 
         let rejected = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -5176,6 +5325,7 @@ pub(crate) mod tests {
         let now = Instant::now();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -5195,6 +5345,7 @@ pub(crate) mod tests {
         };
 
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -5228,6 +5379,7 @@ pub(crate) mod tests {
             matches!(
                 Connection::accept(
                     ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -5262,6 +5414,7 @@ pub(crate) mod tests {
         let peer: SocketAddr = "127.0.0.1:9200".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -5284,6 +5437,7 @@ pub(crate) mod tests {
 
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -5317,6 +5471,7 @@ pub(crate) mod tests {
         let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -5341,6 +5496,7 @@ pub(crate) mod tests {
 
         let accepted = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -5432,6 +5588,7 @@ pub(crate) mod tests {
             },
         ));
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -6783,6 +6940,7 @@ pub(crate) mod tests {
         );
 
         let mut unstarted = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -7888,6 +8046,7 @@ pub(crate) mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7895,6 +8054,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -8026,6 +8186,7 @@ pub(crate) mod tests {
         let at = Instant::now() + Duration::from_secs(3600);
         let conn = Connection::new_at(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: kp.private,
@@ -8249,6 +8410,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8256,6 +8418,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -8500,6 +8663,7 @@ pub(crate) mod tests {
         let client_kp = generate_keypair();
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8685,6 +8849,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8692,6 +8857,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -8726,6 +8892,7 @@ pub(crate) mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8733,6 +8900,7 @@ pub(crate) mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,

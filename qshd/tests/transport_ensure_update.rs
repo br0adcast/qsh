@@ -274,6 +274,7 @@ fn connect(
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,

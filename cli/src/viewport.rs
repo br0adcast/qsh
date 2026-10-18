@@ -29,6 +29,25 @@ pub fn project(frame: &Frame, size: ViewportSize) -> Frame {
     out
 }
 
+/// Fill the bounded physical presentation area without reflowing the shell.
+/// Cursor visibility is decided while cropping, so padding never exposes a
+/// cursor outside the committed grid.
+pub fn project_padded(frame: &Frame, size: ViewportSize) -> Frame {
+    let mut out = project(frame, size);
+    let (cols, rows) = (out.cols, out.rows);
+    let cropped = std::mem::take(&mut out.cells);
+    out.cols = size.cols();
+    out.rows = size.rows();
+    out.cells = vec![Cell::blank(); usize::from(out.cols) * usize::from(out.rows)];
+    for row in 0..rows {
+        let src = usize::from(row) * usize::from(cols);
+        let dst = usize::from(row) * usize::from(out.cols);
+        out.cells[dst..dst + usize::from(cols)]
+            .copy_from_slice(&cropped[src..src + usize::from(cols)]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

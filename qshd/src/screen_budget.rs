@@ -726,16 +726,29 @@ mod lifecycle_tests {
             command: vec![],
         }))
     }
+    fn channel_context() -> transport::session_manager::AttachmentContext {
+        transport::session_manager::AttachmentContext {
+            features: transport::Features::CHANNEL_GEOMETRY,
+            ..Default::default()
+        }
+    }
     async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionOutbound>) -> ServerRecord {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut records = RecordDeframer::for_control();
             loop {
-                if let Some(SessionOutbound::Data(data)) = rx.recv().await {
-                    if data.stream_id == CONTROL_STREAM {
+                match rx.recv().await.expect("runner alive") {
+                    SessionOutbound::ChannelOpened { stream, .. } => {
+                        return ServerRecord::Opened { stream }
+                    }
+                    SessionOutbound::ChannelRefused { stream, reason, .. } => {
+                        return ServerRecord::Refused { stream, reason }
+                    }
+                    SessionOutbound::Data(data) if data.stream_id == CONTROL_STREAM => {
                         if let Some(raw) = records.push(&data.data).first() {
                             return decode_server(raw).unwrap();
                         }
                     }
+                    _ => {}
                 }
             }
         })
@@ -767,6 +780,9 @@ mod lifecycle_tests {
             (3, "global", false),
         ] {
             let (io, tx, mut rx) = SessionIo::test_pair_for(owner(uid, name), [uid as u8; 16]);
+            tx.try_send(SessionInbound::Live(channel_context()))
+                .unwrap();
+            let snapshots = io.snapshot_reader_for_test();
             let spawner = Arc::new(Spawner {
                 budget: budget.clone(),
                 feed: Arc::new(Mutex::new(None)),
@@ -779,7 +795,7 @@ mod lifecycle_tests {
                 accepted,
                 "{name}: {reply:?}"
             );
-            sessions.push((tx, rx, runner, spawner));
+            sessions.push((tx, rx, runner, spawner, snapshots));
         }
         assert_eq!(
             budget.used(),
@@ -791,14 +807,22 @@ mod lifecycle_tests {
         );
         sessions[0]
             .0
-            .send(SessionInbound::ResumeReset(
-                transport::session_manager::AttachmentContext::default(),
-            ))
+            .send(SessionInbound::ResumeReset(channel_context()))
             .await
             .unwrap();
-        assert!(
-            matches!(next(&mut sessions[0].1).await,ServerRecord::Channels(ref c) if c.len()==1)
-        );
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(SessionOutbound::ResumeBarrier { generation }) =
+                    sessions[0].1.recv().await
+                {
+                    break sessions[0].4(generation).expect("the actual resume snapshot");
+                }
+            }
+        })
+        .await
+        .expect("resume barrier before deadline");
+        assert_eq!(snapshot.active().len(), 1);
+        assert!(snapshot.draining().is_empty());
         assert_eq!(
             budget.used().models,
             2,
@@ -806,7 +830,7 @@ mod lifecycle_tests {
         );
         // The manager evicts/GCs a backend by dropping its inbound sender.
         // Reader tasks end through ChannelWait::kill when the runner tears down.
-        for (tx, _rx, runner, _spawner) in sessions {
+        for (tx, _rx, runner, _spawner, _snapshots) in sessions {
             drop(tx);
             runner.await.unwrap();
         }
@@ -818,6 +842,8 @@ mod lifecycle_tests {
         for outcome in ["close", "exit", "reader failure"] {
             let budget = Arc::new(ScreenBudget::new(BudgetLimits::default()));
             let (io, tx, mut rx) = SessionIo::test_pair_for(owner(1, "owner"), [0; 16]);
+            tx.try_send(SessionInbound::Live(channel_context()))
+                .unwrap();
             let spawner = Arc::new(Spawner {
                 budget: budget.clone(),
                 feed: Arc::new(Mutex::new(None)),

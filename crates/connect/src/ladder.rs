@@ -64,6 +64,12 @@ pub enum Mode {
 /// reasons. Data only: the words for a person are the caller's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoAnswerWhy {
+    /// Noise authenticated an incompatible handshake protocol.
+    UnsupportedProtocol { supported: u8 },
+    /// Noise authenticated a profile missing required capabilities.
+    MissingRequiredFeatures { required: u32, enabled: u32 },
+    /// An authenticated handshake payload violated the protocol.
+    InvalidProtocol,
     /// The network explicitly refused this UDP destination before a handshake.
     PortRefused,
     /// The OS refused to send to `to`; `os_error` is its own words, e.g.

@@ -244,6 +244,10 @@ impl ChannelSessionBackend {
 }
 
 impl SessionBackend for ChannelSessionBackend {
+    fn required_features(&self) -> transport::Features {
+        transport::Features::CHANNEL_GEOMETRY
+    }
+
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         // Logged here once per session; the runner hands the same principal
         // to the spawner with every channel it asks for, and the system

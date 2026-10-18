@@ -32,7 +32,7 @@ impl SnapshotMailbox {
         slot.value = Some(build()?);
         Ok(true)
     }
-    fn take(&self, generation: u64) -> Option<ChannelSnapshot> {
+    pub(super) fn take(&self, generation: u64) -> Option<ChannelSnapshot> {
         let mut slot = self.0.lock().expect("resume snapshot");
         (slot.generation == Some(generation))
             .then(|| slot.value.take())

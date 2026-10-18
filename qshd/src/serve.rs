@@ -1422,6 +1422,7 @@ mod tests {
             StdClient::connect(
                 server,
                 ConnectionConfig {
+                    required_features: transport::Features::NONE,
                     features: transport::Features::SUPPORTED,
                     role: Role::Client,
                     local_static_priv: generate_keypair().private,

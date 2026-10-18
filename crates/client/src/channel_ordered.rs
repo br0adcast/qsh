@@ -49,6 +49,7 @@ pub(super) const UNKNOWN_EVENTS: usize = 2048;
 struct Desired {
     size: TerminalSize,
     revision: u64,
+    eligible: bool,
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -66,6 +67,19 @@ struct Intent {
 #[derive(Default)]
 pub struct AttachmentIntent {
     entries: BTreeMap<ChannelId, Intent>,
+}
+
+impl AttachmentIntent {
+    /// Physical changes while detached retain their revision and refusal scope.
+    pub fn defer_resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
+        let Some(intent) = self.entries.get_mut(&ch) else {
+            return ResizeDisposition::Rejected(ResizeRejection::NotReady);
+        };
+        match OrderedSession::update_desired(&mut intent.desired, cols, rows, false) {
+            Ok(()) => ResizeDisposition::Coalesced,
+            Err(reason) => ResizeDisposition::Rejected(reason),
+        }
+    }
 }
 
 struct Entry {
@@ -122,7 +136,11 @@ impl Entry {
         let classification = OpenClassification::from_open(&request);
         let desired = TerminalSize::new(request.cols, request.rows)
             .ok()
-            .map(|size| Desired { size, revision: 0 });
+            .map(|size| Desired {
+                size,
+                revision: 0,
+                eligible: true,
+            });
         Self {
             request: Some(request),
             classification: Some(classification),
@@ -322,20 +340,79 @@ impl OrderedSession {
         if !entry.writable() && entry.pending.is_none() {
             return ResizeDisposition::Rejected(ResizeRejection::NotReady);
         }
-        let size = TerminalSize::for_viewport(cols, rows);
-        if entry.desired.is_none_or(|old| old.size != size) {
-            let revision = match entry.desired {
-                Some(old) => match old.revision.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        return ResizeDisposition::Rejected(ResizeRejection::RequestIdExhausted)
-                    }
-                },
-                None => 0,
-            };
-            entry.desired = Some(Desired { size, revision });
+        if let Err(reason) = Self::update_desired(&mut entry.desired, cols, rows, true) {
+            return ResizeDisposition::Rejected(reason);
         }
         Self::send_desired(substrate, ch, entry)
+    }
+    fn update_desired(
+        desired: &mut Option<Desired>,
+        cols: u16,
+        rows: u16,
+        eligible: bool,
+    ) -> Result<(), ResizeRejection> {
+        if cols == 0 || rows == 0 {
+            if let Some(desired) = desired {
+                desired.eligible = false;
+            }
+            return Err(ResizeRejection::ZeroViewport);
+        }
+        let size = TerminalSize::for_viewport(cols, rows);
+        let revision = match *desired {
+            Some(old) if old.size == size => old.revision,
+            Some(old) => old
+                .revision
+                .checked_add(1)
+                .ok_or(ResizeRejection::RequestIdExhausted)?,
+            None => 0,
+        };
+        *desired = Some(Desired {
+            size,
+            revision,
+            eligible,
+        });
+        Ok(())
+    }
+    pub(super) fn defer_resize(
+        &mut self,
+        ch: ChannelId,
+        cols: u16,
+        rows: u16,
+    ) -> ResizeDisposition {
+        if self.failure.is_some() {
+            return ResizeDisposition::Rejected(ResizeRejection::Failed);
+        }
+        let desired = if let Some(entry) = self.entries.get_mut(&ch) {
+            if entry.gone || entry.draining {
+                return ResizeDisposition::Rejected(ResizeRejection::Ended);
+            }
+            if entry
+                .classification
+                .is_some_and(|c| c.cols == 0 || c.rows == 0)
+            {
+                return ResizeDisposition::Rejected(ResizeRejection::NoPty);
+            }
+            // Early output may create a provisional entry before Snapshot. The
+            // imported intent still owns its revision/refusal basis until that
+            // snapshot establishes identity; do not start a second desired state.
+            // A local OPEN has its own request and must keep its own intent.
+            match self
+                .imported
+                .get_mut(&ch)
+                .filter(|_| entry.instance.is_none() && entry.request.is_none())
+            {
+                Some(intent) => &mut intent.desired,
+                None => &mut entry.desired,
+            }
+        } else if let Some(intent) = self.imported.get_mut(&ch) {
+            &mut intent.desired
+        } else {
+            return ResizeDisposition::Rejected(ResizeRejection::NotReady);
+        };
+        match Self::update_desired(desired, cols, rows, false) {
+            Ok(()) => ResizeDisposition::Coalesced,
+            Err(reason) => ResizeDisposition::Rejected(reason),
+        }
     }
     fn send_desired<S: ChannelSubstrate>(
         substrate: &mut S,
@@ -351,6 +428,9 @@ impl OrderedSession {
         let Some(desired) = entry.desired else {
             return ResizeDisposition::Unchanged;
         };
+        if !desired.eligible {
+            return ResizeDisposition::Coalesced;
+        }
         let committed = entry.committed.expect("ready has geometry");
         if (committed.cols, committed.rows) == (desired.size.cols(), desired.size.rows())
             || entry
@@ -441,7 +521,11 @@ impl OrderedSession {
         if entry.desired.is_none() {
             entry.desired = TerminalSize::new(record.cols, record.rows)
                 .ok()
-                .map(|size| Desired { size, revision: 0 });
+                .map(|size| Desired {
+                    size,
+                    revision: 0,
+                    eligible: true,
+                });
         }
         entry.ready = true;
         out.push(SessionEvent::Geometry { ch, record });

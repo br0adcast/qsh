@@ -215,10 +215,7 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
                 SubstrateEvent::Refused { ch: stream, reason }
             }
             ServerRecord::Exit { stream, code } => SubstrateEvent::Exit { ch: stream, code },
-            ServerRecord::Channels(_) => {
-                self.fail_protocol(QshProtocolError::UnsupportedProfile);
-                SubstrateEvent::ProtocolFailure(QshProtocolError::UnsupportedProfile)
-            }
+
             ServerRecord::ChannelSnapshot(snapshot) => SubstrateEvent::Snapshot(snapshot),
             // The daemon talking about itself: handed up as it came.
             record @ (ServerRecord::About(_)

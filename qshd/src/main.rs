@@ -227,6 +227,7 @@ fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
     std::io::stdout().flush().context("flushing stdout")?;
 
     let cfg = transport::ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: transport::Role::Server,
         local_static_priv: keypair.private,
@@ -341,6 +342,7 @@ fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
     std::io::stdout().flush().context("flushing stdout")?;
 
     let cfg = transport::ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: transport::Role::Server,
         local_static_priv: keypair.private,
@@ -1799,6 +1801,7 @@ mod tests {
         let connection = transport::driver_std::StdClient::connect(
             std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port),
             transport::ConnectionConfig {
+                required_features: transport::Features::NONE,
                 features: transport::Features::SUPPORTED,
                 role: transport::Role::Client,
                 local_static_priv: client.private,

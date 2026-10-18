@@ -85,6 +85,7 @@ async fn transport_shell_runs_command_and_survives_resize() {
         Box::new(PtyResizeHandle::new(master));
 
     let server_cfg = ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Server,
         local_static_priv: server_kp.private,
@@ -101,6 +102,7 @@ async fn transport_shell_runs_command_and_survives_resize() {
         .await
         .expect("binding the client socket");
     let mut client = Connection::new(ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Client,
         local_static_priv: client_kp.private,

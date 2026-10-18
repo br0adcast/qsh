@@ -156,6 +156,7 @@ async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
     let client = StdClient::connect(
         addr,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -195,6 +196,7 @@ async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
     let stranger_client = StdClient::connect(
         addr,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,

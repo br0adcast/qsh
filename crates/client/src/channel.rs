@@ -258,6 +258,7 @@ pub struct ChannelSession<S: ChannelSubstrate> {
     channels: HashMap<ChannelId, ChannelState>,
     ordered: Option<ordered::OrderedSession>,
     failure: Option<ChannelProtocolError>,
+    admission_started: bool,
 }
 
 impl<S: ChannelSubstrate> ChannelSession<S> {
@@ -269,6 +270,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
             channels: HashMap::new(),
             ordered,
             failure: None,
+            admission_started: false,
         }
     }
 
@@ -324,6 +326,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         cols: u16,
         rows: u16,
     ) -> Option<ChannelId> {
+        self.admission_started = true;
         if self.failure.is_some() || command.len() > MAX_COMMAND_LEN {
             return None;
         }
@@ -408,7 +411,16 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         }
     }
 
-    /// A no-op unless `ch` is `Ready`, for the same reason as [`Self::send`].
+    /// Update physical intent without making it eligible for a wire request.
+    /// Ordered channels also accept this before metadata/initial readiness;
+    /// unconfirmed substrates reject it without sending anything.
+    pub fn defer_resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
+        self.ordered.as_mut().map_or(
+            ResizeDisposition::Rejected(ResizeRejection::NotReady),
+            |state| state.defer_resize(ch, cols, rows),
+        )
+    }
+
     pub fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
         if let Some(state) = &mut self.ordered {
             return state.resize(&mut self.substrate, ch, cols, rows);
@@ -453,6 +465,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// this session. The session owns the substrate, so a caller needs no
     /// second instance of it.
     pub fn on_bytes(&mut self, stream: u8, bytes: &[u8]) -> Vec<SessionEvent> {
+        self.admission_started |= !bytes.is_empty();
         if let Some(state) = &mut self.ordered {
             if state.ignore_input(stream) {
                 return Vec::new();
@@ -504,11 +517,28 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         self.ordered
             .map_or_else(AttachmentIntent::default, |state| state.into_intent())
     }
+    /// Import portable intent before any local OPEN or received metadata.
+    pub fn import_attachment_intent(
+        &mut self,
+        intent: AttachmentIntent,
+    ) -> Result<(), ChannelProtocolError> {
+        if self.admission_started {
+            return Err(ChannelProtocolError::Metadata);
+        }
+        let Some(state) = &mut self.ordered else {
+            return Err(ChannelProtocolError::UnsupportedProfile);
+        };
+        state.import_intent(intent);
+        self.admission_started = true;
+        Ok(())
+    }
+
     /// Start a fresh attachment; wire metadata must re-establish each instance.
     pub fn with_attachment_intent(substrate: S, intent: AttachmentIntent) -> Self {
         let mut session = Self::new(substrate);
         if let Some(state) = &mut session.ordered {
             state.import_intent(intent);
+            session.admission_started = true;
         }
         session
     }
@@ -520,6 +550,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
             state.reset_attachment();
         }
         self.failure = None;
+        self.admission_started = false;
     }
 
     /// Access for substrate-specific operations. Attachment transitions must
@@ -589,6 +620,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
 
     /// Takes an event from the substrate and says what it means.
     pub fn on_event(&mut self, event: SubstrateEvent) -> Vec<SessionEvent> {
+        self.admission_started = true;
         if let Some(state) = &mut self.ordered {
             let mut out = state.on_event(&mut self.substrate, event);
             out.extend(state.finish_exits(&mut self.substrate));

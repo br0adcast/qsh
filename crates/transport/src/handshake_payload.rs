@@ -15,7 +15,7 @@ use crate::auth::AUTH_NONCE_LEN;
 use crate::features::Features;
 
 /// Handshake protocol version.
-pub const HS_VERSION: u8 = 0x01;
+pub const HS_VERSION: u8 = 0x02;
 
 /// Length of the session token in msg1.
 pub const SESSION_TOKEN_LEN: usize = 16;

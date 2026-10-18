@@ -583,6 +583,7 @@ mod tests {
     #[test]
     fn legacy_shell_cannot_advertise_channel_geometry() {
         let cfg = super::legacy_shell_config(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED | crate::Features::CHANNEL_GEOMETRY,
             role: Role::Server,
             local_static_priv: [7; 32],
@@ -590,7 +591,10 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         assert!(!cfg.features.contains(crate::Features::CHANNEL_GEOMETRY));
-        assert!(cfg.features.contains(crate::Features::SUPPORTED));
+        assert_eq!(
+            cfg.features.bits(),
+            crate::Features::SUPPORTED.bits() & !crate::Features::CHANNEL_GEOMETRY.bits()
+        );
     }
 
     #[test]
@@ -693,6 +697,7 @@ mod tests {
     fn an_exhausted_stream_ends_the_session_without_a_close() {
         let kp = crate::handshake::generate_keypair();
         let mut c = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,

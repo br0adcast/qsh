@@ -579,33 +579,16 @@ impl SessionIo {
         }
     }
     pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
-        if origin.has_geometry() {
-            let _ = self
-                .outbound
-                .send(SessionOutbound::ChannelOpened { stream, origin });
-        } else {
-            self.send(
-                crate::channel::CONTROL_STREAM,
-                crate::channel::encode_server(&crate::channel::ServerRecord::Opened { stream }),
-            );
-        }
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ChannelOpened { stream, origin });
     }
     pub(crate) fn channel_refused(&self, origin: AttachmentContext, stream: u8, reason: String) {
-        if origin.has_geometry() {
-            let _ = self.outbound.send(SessionOutbound::ChannelRefused {
-                stream,
-                origin,
-                reason,
-            });
-        } else {
-            self.send(
-                crate::channel::CONTROL_STREAM,
-                crate::channel::encode_server(&crate::channel::ServerRecord::Refused {
-                    stream,
-                    reason,
-                }),
-            );
-        }
+        let _ = self.outbound.send(SessionOutbound::ChannelRefused {
+            stream,
+            origin,
+            reason,
+        });
     }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should
@@ -675,13 +658,11 @@ impl SessionIo {
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
     ) {
-        if origin.has_geometry() {
-            let _ = self.outbound.send(SessionOutbound::ChannelClosed {
-                stream,
-                instance,
-                origin,
-            });
-        }
+        let _ = self.outbound.send(SessionOutbound::ChannelClosed {
+            stream,
+            instance,
+            origin,
+        });
     }
     pub(crate) fn send_channel_exit(
         &self,
@@ -818,6 +799,15 @@ impl SessionIo {
         )
     }
 
+    /// Observe the actual replaceable mailbox in runner fixtures without a bridge.
+    #[cfg(any(test, feature = "testnet"))]
+    pub fn snapshot_reader_for_test(
+        &self,
+    ) -> impl Fn(u64) -> Option<crate::channel::ChannelSnapshot> + Send + 'static {
+        let snapshots = self.resume_snapshots.clone();
+        move |generation| snapshots.take(generation)
+    }
+
     /// Build an in-process session fixture owned by `principal` and `login`.
     /// Available only for crate tests and the explicit `testnet` fixture feature,
     /// so consumers can test real backend lifetime without starting a daemon.
@@ -901,6 +891,11 @@ impl Drop for SessionIo {
 /// a fresh [`SessionIo`]; the returned future lives for the session. Boxed
 /// future rather than `async_trait` to keep the crate dependency-free.
 pub trait SessionBackend: Send + Sync + 'static {
+    /// Mandatory application profile, checked before resolving or creating a session.
+    fn required_features(&self) -> crate::Features {
+        crate::Features::NONE
+    }
+
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
     /// Who says when a stream's bytes are consumed (spec §4.10.3), fixed
@@ -2195,6 +2190,7 @@ impl SessionManager {
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
                     Connection::accept(
                         ConnectionConfig {
+                            required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
                             role: Role::Server,
                             local_static_priv: *ctx.server_priv,
@@ -2213,6 +2209,7 @@ impl SessionManager {
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
                     outcome = Connection::accept(
                         ConnectionConfig {
+                            required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
                             role: Role::Server,
                             local_static_priv: *ctx.server_priv,
@@ -4614,6 +4611,7 @@ mod tests {
 
         // A real client Connection driven manually over UDP.
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4735,6 +4733,7 @@ mod tests {
     ) -> (Vec<u8>, u64) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -4792,6 +4791,7 @@ mod tests {
     ) -> (Connection, UdpSocket) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -5022,6 +5022,7 @@ mod tests {
     ) -> (Connection, UdpSocket) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -5366,6 +5367,7 @@ mod tests {
         // byte-identical -- a true retransmit.
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -6612,6 +6614,7 @@ mod tests {
 
         let admission = Admission {
             conn: Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -6715,6 +6718,7 @@ mod tests {
 
         let admission = Admission {
             conn: Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -7329,6 +7333,7 @@ mod tests {
         ));
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7484,6 +7489,7 @@ mod tests {
         // A real msg1 from a real client, so the server connection below is
         // one `accept` produced rather than one assembled by hand.
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7514,6 +7520,7 @@ mod tests {
         };
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -7612,6 +7619,7 @@ mod tests {
     async fn output_resync_event_forwards_repaint_to_backend() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -7652,6 +7660,7 @@ mod tests {
     async fn a_hard_cap_report_is_logged_and_forwards_nothing() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -7685,6 +7694,7 @@ mod tests {
     fn a_quiet_server_connection() -> Connection {
         let kp = generate_keypair();
         Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -9997,7 +10007,12 @@ mod tests {
     #[tokio::test]
     async fn unnegotiated_geometry_output_fails_closed() {
         let (heard_tx, _heard_rx) = mpsc::unbounded_channel();
-        let mut rig = delivery_rig(Arc::new(InboundKindsBackend(heard_tx)), |_| {}).await;
+        let mut rig = delivery_rig_with(
+            crate::Features::NONE,
+            Arc::new(InboundKindsBackend(heard_tx)),
+            |_| {},
+        )
+        .await;
         rig.backend_sends(SessionOutbound::ResumeBarrier { generation: 0 });
         rig.run(Duration::from_millis(100)).await;
         let ended = tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
@@ -10591,6 +10606,7 @@ mod tests {
         ) -> TestClient {
             TestClient {
                 conn: Connection::new(ConnectionConfig {
+                    required_features: crate::Features::NONE,
                     features: crate::Features::SUPPORTED,
                     role: Role::Client,
                     local_static_priv: client_priv,
@@ -11325,6 +11341,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let kp = generate_keypair();
         let conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -11655,6 +11672,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11788,6 +11806,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11899,6 +11918,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12004,6 +12024,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12107,6 +12128,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12343,6 +12365,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12429,6 +12452,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12788,6 +12812,7 @@ mod tests {
         method: AuthMethod,
     ) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -13336,6 +13361,7 @@ mod tests {
     /// fresh client key the server has never seen.
     fn signature_msg1(server_pub: &[u8; 32], token: [u8; 16], start_kind: StartKind) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -13365,6 +13391,7 @@ mod tests {
         start_kind: StartKind,
     ) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -14187,6 +14214,7 @@ mod tests {
         let client_addr = sock.local_addr().unwrap();
         let server_addr = wiring.socket.local_addr().unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -14986,6 +15014,7 @@ mod tests {
     ) -> (Connection, Connection, Vec<Datagram>) {
         let client_kp = generate_keypair();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -15013,6 +15042,7 @@ mod tests {
         };
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -15338,6 +15368,7 @@ mod tests {
     async fn a_stream_out_of_offset_space_drops_the_connection_without_a_close() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
