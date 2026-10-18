@@ -72,3 +72,52 @@ fn identified_ready_names_the_same_connection_key() {
     assert!(activity.userauth.load(Ordering::SeqCst) > 0);
     assert_eq!(activity.exec.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn ready_records_without_exit_status_are_not_success() {
+    let activity = Arc::new(ServerActivity::default());
+    let server = FakeServer::start(FakeAuth {
+        accept_any_key: true,
+        activity: activity.clone(),
+        exec_outputs: vec![
+            b"os Linux\narch x86_64\nhome /test\npath /test/qshd\n".to_vec(),
+            b"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"0.5.0\",\"ports\":[60022]}\n".to_vec(),
+        ],
+        exec_missing_status: Some(1),
+        ..Default::default()
+    });
+    let error = bring_up_identified(
+        BringUpRequest {
+            name: "missing-status-test".into(),
+            ssh: ssh::SshParams {
+                host: "127.0.0.1".into(),
+                port: server.port,
+                username: "test-user".into(),
+                known_host_keys: vec![server.host_public_key_wire()],
+                connect_timeout: Duration::from_secs(2),
+                keepalive_interval: Duration::ZERO,
+                compression: false,
+                tcp_nodelay: true,
+                knock: vec![],
+            },
+            auth: ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(
+                support::SoftSigner::random(),
+            ))),
+            qsh_port: 60022,
+            client_pubkey: [9; 32],
+        },
+        InstallPolicy::ExistingOnly,
+        BringUpHooks {
+            source: None,
+            approval: Arc::new(Silent),
+            observer: Arc::new(Silent),
+            timing: InstallTiming::default(),
+        },
+        Arc::new(knock::NoBind),
+        &knock::Cancel::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
+    assert!(error.to_string().contains("exit -1"), "{error}");
+    assert_eq!(activity.exec.load(Ordering::SeqCst), 2);
+}

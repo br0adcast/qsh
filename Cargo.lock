@@ -309,6 +309,7 @@ dependencies = [
  "client",
  "knock",
  "libc",
+ "log",
  "p256 0.13.2",
  "qshd",
  "rand 0.8.7",

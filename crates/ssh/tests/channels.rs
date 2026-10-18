@@ -146,7 +146,7 @@ fn a_command_pty_does_not_echo_input_into_its_output() {
     };
     let mut req = command(
         16,
-        "test -t 0 && test -t 1 || exit 90; printf READY; IFS= read -r line; test \"$line\" = input-marker || exit 91; printf DONE",
+        "test -t 0 && test -t 1 || exit 90; printf READY >&2; IFS= read -r line; test \"$line\" = input-marker || exit 91; printf DONE",
     );
     req.cols = 80;
     req.rows = 24;
@@ -163,13 +163,34 @@ fn a_command_pty_does_not_echo_input_into_its_output() {
 }
 
 #[test]
-fn exec_stderr_arrives_as_channel_data() {
+fn exec_stderr_is_not_stdout() {
     let Some((_sshd, _conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&command(16, "echo to-stderr 1>&2"));
+    sub.open(&command(
+        16,
+        "printf stdout; printf stderr >&2; printf tail; exit 3",
+    ));
     assert!(rec.wait_for(|r| r.exit_of(16).is_some(), Duration::from_secs(5)));
-    assert!(rec.output(16).contains("to-stderr"));
+    assert_eq!(rec.output(16), "stdouttail");
+    let stderr: Vec<u8> = rec
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            SubstrateEvent::ExtendedData {
+                ch: 16,
+                data_type: 1,
+                bytes,
+            } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(stderr, b"stderr");
+    assert_eq!(rec.exit_of(16), Some(3));
 }
 
 #[test]

@@ -351,3 +351,16 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn unknown_uname_values_are_bounded_and_terminal_safe() {
+        let output = format!("os \x1b[31m{}\narch x86_64\nhome /test\n", "x".repeat(8000));
+        let error = super::probe(0, &output).unwrap_err();
+        assert!(matches!(error, crate::BringUpError::UnsupportedPlatform(_)));
+        let text = error.to_string();
+        assert!(!text.chars().any(char::is_control));
+        assert!(text.chars().count() <= 1200);
+    }
+}

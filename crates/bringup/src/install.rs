@@ -94,7 +94,8 @@ impl Session {
                 command_error(BringUpStage::Verifying, &output),
             ));
         }
-        let mut lines = output.text.lines();
+        let text = output.complete_stdout().map_err(BringUpError::Verify)?;
+        let mut lines = text.lines();
         let size = lines
             .next()
             .and_then(|line| line.trim().parse::<u64>().ok());
@@ -271,7 +272,13 @@ pub(crate) fn bring_up(
         hooks.timing.locate,
         cancel,
     )?;
-    let probe = locate::probe(output.code, &output.text)?;
+    if output.code != 0 {
+        return Err(output.failure("the qshd lookup"));
+    }
+    let stdout = output
+        .complete_stdout()
+        .map_err(BringUpError::EnsureFailed)?;
+    let probe = locate::probe(output.code, stdout)?;
     progress(hooks.observer.as_ref(), BringUpStage::Locating, true);
     check_cancel(cancel)?;
     if let locate::Located::Service(kind) = probe.located {
@@ -328,7 +335,11 @@ pub(crate) fn bring_up(
         hooks.timing.ensure,
         cancel,
     )?;
-    let ready = ensure::parse(output.code, &output.text)?;
+    if output.code != 0 {
+        return Err(output.failure("qshd transport-ensure"));
+    }
+    let stdout = output.complete_stdout().map_err(BringUpError::BadReady)?;
+    let ready = ensure::parse(output.code, stdout)?;
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
     Ok(IdentifiedReady {
@@ -411,18 +422,7 @@ fn stage_name(stage: BringUpStage) -> &'static str {
 }
 
 fn command_error(stage: BringUpStage, output: &exec::Output) -> BringUpError {
-    let text: String = output
-        .text
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .take(1000)
-        .collect();
-    BringUpError::EnsureFailed(format!(
-        "{} failed (exit {}): {}",
-        stage_name(stage),
-        output.code,
-        text.trim()
-    ))
+    output.failure(stage_name(stage))
 }
 
 fn stage_error(stage: BringUpStage, error: BringUpError) -> BringUpError {
