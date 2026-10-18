@@ -600,7 +600,9 @@ fn a_silent_link_turns_the_line_red_and_the_reconnect_is_named() {
     let cut = Instant::now();
     assert!(
         wait_for(Duration::from_secs(10), || {
-            screen.top().contains("reconnecting: 127.0.0.1 [QSH]") && screen.line_is_red()
+            screen.top().starts_with(LINE_HINT)
+                && screen.top().ends_with("reconnecting: 127.0.0.1 [QSH]")
+                && screen.line_is_red()
         }),
         "a silent link shows QSH recovery activity across a red row; top row: {:?}",
         screen.top()
@@ -610,7 +612,9 @@ fn a_silent_link_turns_the_line_red_and_the_reconnect_is_named() {
     client.master.write_all(b"\x1dr").expect("type ctrl-] r");
     assert!(
         wait_until(|| {
-            screen.top().contains("reconnecting: 127.0.0.1 [QSH]") && screen.line_is_red()
+            screen.top().starts_with(LINE_HINT)
+                && screen.top().ends_with("reconnecting: 127.0.0.1 [QSH]")
+                && screen.line_is_red()
         }),
         "a reconnect names the address it tries, on red; top row: {:?}",
         screen.top()

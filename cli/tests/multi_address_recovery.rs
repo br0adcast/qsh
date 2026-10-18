@@ -140,7 +140,8 @@ fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
                         .all(|c| frame.cell(0, c as u16).fg == terminal::Color::Indexed(15))
                 })
             };
-            top.starts_with("reconnecting: 127.0.0.1 [QSH/SSH], 127.0.0.1 [QSH/SSH]")
+            top.starts_with(" Ctrl-] ? ")
+                && top.ends_with("reconnecting: 127.0.0.1 [QSH/SSH], 127.0.0.1 [QSH/SSH]")
                 && active("QSH")
                 && active("SSH")
                 && (0..80).all(|col| frame.cell(0, col).bg == terminal::Color::Indexed(1))

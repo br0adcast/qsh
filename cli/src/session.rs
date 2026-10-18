@@ -1068,31 +1068,22 @@ impl Session {
     }
 
     fn recovery_cells(&self) -> Vec<terminal::Cell> {
-        let mut spans = if let Some(view) = &self.recovery_view {
-            view.header_spans()
-        } else {
-            vec![(
-                self.plate_text(self.line_refreshed_ms).unwrap_or_else(|| {
-                    statusline::right_part(self.line_view.0.as_deref(), &self.line_view.1).0
-                }),
-                true,
-            )]
-        };
-        if self.recovery_view.is_some() {
-            if let Some(prefix) = self.chrome.prefix.name() {
-                let hint = format!(" | {prefix} s details; . exit");
-                let len: usize = spans
-                    .iter()
-                    .map(|(text, _)| statusline::text_cells(text, self.chrome.glyphs.utf8).len())
-                    .sum();
-                if len + hint.len() <= usize::from(self.cols) {
-                    spans.push((hint, false));
-                }
-            }
+        if let Some(view) = &self.recovery_view {
+            let left = statusline::left_part(self.chrome.prefix.name().as_deref());
+            return statusline::recovery_row(
+                self.cols,
+                &left,
+                &view.header_spans(),
+                self.chrome.glyphs.colour,
+                self.chrome.glyphs.utf8,
+            );
         }
-        statusline::recovery_spans(
+        let text = self.plate_text(self.line_refreshed_ms).unwrap_or_else(|| {
+            statusline::right_part(self.line_view.0.as_deref(), &self.line_view.1).0
+        });
+        statusline::recovery_line(
             self.cols,
-            &spans,
+            &text,
             self.chrome.glyphs.colour,
             self.chrome.glyphs.utf8,
         )
@@ -1282,6 +1273,52 @@ mod tests {
     }
 
     #[test]
+    fn recovery_keeps_the_help_hint_in_its_normal_columns() {
+        let mut s = lined(100, 8);
+        s.on_link(LinkState::Live, 0);
+        let normal = s.line_cells();
+        let hint = " Ctrl-] ? ";
+        assert_eq!(
+            normal
+                .iter()
+                .take(hint.len())
+                .map(|c| c.ch)
+                .collect::<String>(),
+            hint
+        );
+        let mut view = recovery_view();
+        view.targets.truncate(1);
+        s.handle(UiEvent::RecoveryStatus { view: Some(view) }, 1);
+        for cols in [100, 40, 20] {
+            s.handle(UiEvent::Resized { cols, rows: 8 }, 2);
+            let cells = &s.last_frame.as_ref().unwrap().cells[..usize::from(cols)];
+            let text: String = cells.iter().map(|c| c.ch).collect();
+            assert!(text.starts_with(hint), "{text:?}");
+            assert_eq!(cells[hint.len()].ch, ' ');
+            assert!(cells.iter().all(|c| c.bg == terminal::Color::Indexed(1)));
+            if cols == 100 {
+                assert!(
+                    text.ends_with("reconnecting: host-1.example [QSH]"),
+                    "{text:?}"
+                );
+                assert!(!text.contains("s details"));
+                assert!(!text.contains(". exit"));
+            } else {
+                assert_eq!(cells.last().unwrap().ch, '…');
+            }
+        }
+        s.on_reattached(3);
+        assert_eq!(
+            s.line_cells()
+                .iter()
+                .take(hint.len())
+                .map(|c| c.ch)
+                .collect::<String>(),
+            hint
+        );
+    }
+
+    #[test]
     fn recovery_details_keep_elapsed_outage_time() {
         let mut s = lined(80, 8);
         s.on_link_gone(1_000);
@@ -1361,6 +1398,11 @@ mod tests {
                 2,
             );
             let top = s.last_frame.as_ref().unwrap().cells[..40].to_vec();
+            assert!(top
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .starts_with(" Ctrl-] ?  reconnecting:"));
             assert!(top.iter().all(|c| c.bg == terminal::Color::Indexed(1)));
             assert_eq!(top[39].ch, '…');
             s.handle(UiEvent::Tick, 10_000);

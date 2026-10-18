@@ -277,8 +277,15 @@ scrollback or hiding the normal status line. Its fixed text lists every configur
 hostname in command-line order, without ports, for example
 `reconnecting: host-a [QSH/SSH], host-b [QSH]`. Protocol labels
 are bright white while being tried and gray otherwise; hostnames remain gray.
+Warm probes can check several paths at once. New QSH handshakes currently try
+addresses in sequence. Gray labels indicate no current attempt; recovery can
+try eligible targets again. SSH can finish starting the daemon before QSH
+finishes checking whether the original session still exists.
 Monochrome terminals use
 bold versus regular reverse video. The text stays in place as activity changes.
+The help hint stays in its usual left-hand columns; recovery text ends at the
+rightmost terminal cell, with at least one space separating it from the hint.
+Very narrow rows omit the hint to leave room for clipped recovery text.
 Overflow is clipped with an ellipsis, without rotating the text.
 
 `Ctrl-] s` opens read-only recovery details. Use the arrow keys to scroll through

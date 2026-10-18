@@ -302,7 +302,7 @@ fn a_dead_link_reconnects_by_itself_after_a_failed_round() {
     assert!(
         wait_for(Duration::from_secs(10), || {
             let top = screen.top();
-            top.contains("reconnecting: 127.0.0.1 [QSH]") && top.contains(". exit")
+            top.starts_with(" Ctrl-] ? ") && top.ends_with("reconnecting: 127.0.0.1 [QSH]")
         }),
         "a silent link must say so on the top row, with the prefix in use; \
          top row: {:?}\ndaemon: {}",

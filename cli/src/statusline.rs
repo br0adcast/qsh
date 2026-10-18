@@ -169,6 +169,34 @@ pub fn recovery_line(cols: u16, text: &str, colour: bool, utf8: bool) -> Vec<Cel
     recovery_spans(cols, &[(text.to_string(), true)], colour, utf8)
 }
 
+/// The usual left help slot, then recovery text anchored to the exact right
+/// edge. Tiny rows omit the hint so at least the clipped recovery fits.
+pub fn recovery_row(
+    cols: u16,
+    left: &str,
+    spans: &[(String, bool)],
+    colour: bool,
+    utf8: bool,
+) -> Vec<Cell> {
+    let width = usize::from(cols);
+    let left_width = text_cells(left, utf8).len();
+    let ellipsis_width = if utf8 { 1 } else { 3 };
+    let reserved = if left_width > 0 && left_width + 1 + ellipsis_width <= width {
+        left_width + 1
+    } else {
+        0
+    };
+    let text_width: usize = spans.iter().map(|(s, _)| text_cells(s, utf8).len()).sum();
+    let gap = (width - reserved).saturating_sub(text_width);
+    let mut row = Vec::with_capacity(spans.len() + 2);
+    if reserved > 0 {
+        row.push((format!("{left} "), false));
+    }
+    row.push((" ".repeat(gap), false));
+    row.extend_from_slice(spans);
+    recovery_spans(cols, &row, colour, utf8)
+}
+
 pub fn recovery_spans(cols: u16, spans: &[(String, bool)], colour: bool, utf8: bool) -> Vec<Cell> {
     let width = usize::from(cols);
     let mut cells: Vec<_> = spans
@@ -191,7 +219,7 @@ pub fn recovery_spans(cols: u16, spans: &[(String, bool)], colour: bool, utf8: b
             .last()
             .is_some_and(|(c, _)| c.flags & terminal::FLAG_WIDE != 0)
         {
-            cells.pop();
+            *cells.last_mut().unwrap() = (Cell::blank(), false);
         }
         cells.extend(suffix);
     }
@@ -315,6 +343,57 @@ mod tests {
         assert!(mono.iter().all(|c| c.flags & FLAG_REVERSE != 0));
         assert!(mono[..3].iter().all(|c| c.flags & FLAG_BOLD != 0));
         assert!(mono[3..].iter().all(|c| c.flags & FLAG_BOLD == 0));
+    }
+
+    #[test]
+    fn recovery_row_anchors_text_at_the_right_edge_after_a_fixed_hint() {
+        let spans = vec![("界 [QSH]".into(), true)];
+        for width in [18, 30] {
+            let row = recovery_row(width, " help ", &spans, true, true);
+            assert_eq!(text(&row[..6]), " help ");
+            assert_eq!(row[usize::from(width) - 8].ch, '界');
+            assert_eq!(row.last().unwrap().ch, ']');
+            assert!(row.iter().all(|c| c.bg == Color::Indexed(1)));
+        }
+        let disabled = recovery_row(12, "", &spans, false, true);
+        assert_eq!(disabled[4].ch, '界');
+        assert_eq!(disabled.last().unwrap().ch, ']');
+        assert!(disabled.iter().all(|c| c.flags & FLAG_REVERSE != 0));
+    }
+
+    #[test]
+    fn recovery_row_clips_only_within_the_available_area() {
+        let spans = vec![("host.example [QSH]".into(), true)];
+        assert_eq!(
+            text(&recovery_row(12, " help ", &spans, true, true)),
+            " help  host…"
+        );
+        assert_eq!(
+            text(&recovery_row(12, " help ", &spans, true, false)),
+            " help  ho..."
+        );
+        assert_eq!(
+            text(&recovery_row(6, " help ", &spans, true, true)),
+            "host.…"
+        );
+        assert_eq!(
+            text(&recovery_row(8, " help ", &spans, true, false)),
+            "host...."
+        );
+        assert_eq!(
+            text(&recovery_row(9, " help ", &spans, true, false)),
+            "host.e..."
+        );
+        assert!(recovery_row(0, " help ", &spans, true, true).is_empty());
+        let wide = vec![("界界界".into(), true)];
+        let clipped = recovery_row(4, "", &wide, true, true);
+        assert_eq!(clipped[2].ch, ' ');
+        assert_eq!(clipped[3].ch, '…', "clipping keeps the exact right anchor");
+        let idle = recovery_row(12, " help ", &[(spans[0].0.clone(), false)], true, true);
+        assert_eq!(
+            text(&idle),
+            text(&recovery_row(12, " help ", &spans, true, true))
+        );
     }
 
     #[test]
