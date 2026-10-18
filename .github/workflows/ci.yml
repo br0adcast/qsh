@@ -297,7 +297,8 @@ jobs:
           run_suite test serve_system_split \
             --require the_worker_runs_as_its_configured_account
           run_suite test system_mode_accounts \
-            --require two_accounts_each_get_their_own_shell
+            --require two_accounts_each_get_their_own_shell \
+            --require attacker_controlled_authorization_is_refused
           run_suite test system_mode_pam \
             --require an_expired_account_is_refused
           run_suite test system_mode_shell \

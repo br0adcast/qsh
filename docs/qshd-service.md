@@ -142,6 +142,30 @@ reinterpreting the flag would be worse than refusing it; use
 turn, is refused without `--system`, for the same reason in the other
 direction: the personal mode has one account and nothing to expand.
 
+In system mode, the expanded key path must be absolute. The helper checks every
+opened directory from `/` to the file, and the file itself: each must be owned
+by root or the target account and must not be writable by group or others.
+The leaf must be a regular file, at most 1 MiB of UTF-8 text. Missing files admit
+no keys. Directory search and file reading still run with the account's uid,
+gid, and supplementary groups; a root-owned central store works only when that
+account can read it. Directory listing permission is not required.
+
+Symlinks at any level (including the home directory), relative paths, `.` or
+`..` components, trailing slashes, and expanded paths of 4096 bytes or more are
+refused. Repeated interior `/` separators are allowed. Configure the real,
+absolute path to a safe store when replacing an older symlink-based setup.
+Even a private directory below a writable ancestor such as `/tmp` is refused;
+the sticky bit does not exempt a directory from the ownership/write policy.
+These restrictions apply to system mode; personal-mode key loading is unchanged.
+
+The helper walks through owned directory descriptors and reads the same opened
+file it validated, so replacing a pathname cannot redirect an in-progress read.
+This is not an atomic filesystem snapshot: root and the target account remain
+trusted, and can change permissions, rename objects or modify bytes in place.
+Use atomic file replacement for key updates. An attempt that already opened the
+old file may still read it; this policy does not promise immediate revocation or
+protection against a malicious filesystem or privileged mount changes.
+
 There's no allowlist or denylist of accounts by name yet: as with a stock
 `sshd`, anyone with an account on the machine and a key in their own
 `authorized_keys` gets in.

@@ -1,135 +1,149 @@
-//! The full privilege-switching path of `authorized::read_for`, exercised
-//! for real under root -- two things nothing in this crate's own
-//! (always-unprivileged) unit tests can prove:
-//!
-//! 1. That switching only the effective user id is not enough (the defect
-//!    fix round 1 of this task found): a `root:root`, `0640` file is
-//!    unreadable to an account sharing none of root's groups, but a
-//!    helper that moved only its uid keeps root's leftover effective gid
-//!    (0) throughout the switch -- and that gid matches the file's group,
-//!    letting the read through on root's authority rather than the
-//!    account's. This test fails against a uid-only version of
-//!    `EffectiveIdentity` and passes against the uid+gid+groups version;
-//!    the fix report records both runs.
-//! 2. That the effective identity -- user, group, AND the supplementary
-//!    group list -- is fully restored after a read that fails under a
-//!    genuinely different identity. Unprivileged, "restored" and "never
-//!    moved" look identical, because the account under test would have to
-//!    be the caller's own; only a real cross-account switch, which needs
-//!    root, can tell them apart.
-//!
-//! `#![cfg(feature = "system")]` on the whole file: without the feature,
-//! `authorized::read_for` does not exist to call, so there is nothing here
-//! worth compiling under the crate's default (non-system) build -- see
-//! `qshd/tests/serve_system_split.rs` for the same reasoning applied
-//! elsewhere in this test suite.
-//!
-//! This test changes the process's EFFECTIVE identity -- user, group, and
-//! the supplementary group list -- for the whole process, for the duration
-//! of `read_for`'s internal `seteuid`/`setegid`/`setgroups` calls (glibc
-//! synchronizes these across every thread in the process, not just the
-//! calling one; only `seteuid`/`setegid` are used, never `setuid` or
-//! `setresuid`, so the REAL and SAVED ids never move at all -- see
-//! `authorized.rs`'s own module docs for why that is what makes restoring
-//! them afterward possible without needing any capability back). That is
-//! exactly why this test lives in its own integration test binary, run by
-//! this project's required gate with `--test-threads=1`, rather than
-//! inside the crate's own `#[cfg(test)]` unit tests, which run without
-//! that flag and would let a concurrently-running, unrelated test observe
-//! -- or be affected by -- the temporary switch to `nobody`.
-//!
-//! Do not add a second test to this file. This file is safe to run under a
-//! plain `sudo` invocation (no `--test-threads=1` needed by hand) only
-//! because it is the single test in its binary; a second test that also
-//! switches identity would bring back exactly the race described above,
-//! just between two tests in the same binary instead of two tests in the
-//! shared lib binary. A new identity-switching root-only test belongs in
-//! its OWN new integration file, not here.
+//! Real credential and authorization-object checks. Run this single sequential
+//! test only in a disposable root container with QSHD_TEST_DISPOSABLE_HOST=1.
+//! Never run it with host sudo: effective identity changes affect every thread.
 
 #![cfg(feature = "system")]
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{chown, PermissionsExt};
+use std::path::Path;
 
 use nix::unistd::{Gid, Uid};
-use qshd::helper::account;
+use qshd::helper::account::Account;
 use qshd::helper::authorized::{read_for, AuthorizedError};
+
+fn mode(path: &Path, bits: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+}
+
+fn identity() -> (Uid, Gid, Vec<Gid>) {
+    let mut groups = nix::unistd::getgroups().unwrap();
+    groups.sort_unstable_by_key(|group| group.as_raw());
+    (Uid::effective(), Gid::effective(), groups)
+}
+
+fn checked_read(account: &Account, path: &Path) -> Result<String, AuthorizedError> {
+    let before = identity();
+    let result = read_for(account, path.to_str().unwrap());
+    assert_eq!(
+        identity(),
+        before,
+        "restore uid, gid and supplementary groups"
+    );
+    result
+}
+
+fn refused(account: &Account, path: &Path, reason: &str) {
+    let err = checked_read(account, path).expect_err("unsafe authorization must be refused");
+    assert!(matches!(err, AuthorizedError::Read { .. }), "{err}");
+    assert!(err.to_string().contains(reason), "expected {reason}: {err}");
+}
 
 #[test]
 fn the_effective_account_is_restored_even_when_the_read_fails() {
-    if !Uid::effective().is_root() {
-        eprintln!(
-            "SKIPPED the_effective_account_is_restored_even_when_the_read_fails: the system \
-             mode needs root to set up a root-only file and to become an unprivileged account."
-        );
+    if !Uid::effective().is_root()
+        || std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() != Ok("1")
+    {
+        eprintln!("SKIPPED the_effective_account_is_restored_even_when_the_read_fails: requires root and QSHD_TEST_DISPOSABLE_HOST=1 in a disposable container");
         return;
     }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    // `tempfile` leaves the directory's mode to the umask; pin it
-    // explicitly so the file's own 0640 is what actually decides this
-    // test, not an accidentally-restrictive (or permissive) parent
-    // directory inherited from whatever umask happens to be set.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the tempdir to 0755");
-
-    let path = dir.path().join("root-only-keys");
-    std::fs::write(&path, "ssh-ed25519 AAAA root-only\n").expect("write");
-    // 0640, not 0600: a mode with zero group bits cannot tell a helper
-    // that switched the effective GROUP apart from one that did not --
-    // both would correctly be refused, for different reasons. Group-read
-    // bits on a file owned root:root (this test process's own identity,
-    // since it is running as root) are what actually exercise the
-    // group-permission path the uid-only version got wrong: root's own
-    // group (0) satisfies them, `nobody`'s does not.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
-        .expect("restrict to owner and group (root:root)");
-
-    let nobody = account::lookup("nobody").expect("the nobody account exists");
-    assert_ne!(
-        nobody.uid,
-        Uid::effective(),
-        "the test needs a genuinely different uid to prove anything"
+    // /var/lib is root-owned and not writable by other principals. A private
+    // child of /tmp would conceal leaf checks behind an unsafe ancestor.
+    let dir = tempfile::Builder::new()
+        .prefix("qshd-keys-")
+        .tempdir_in("/var/lib")
+        .unwrap();
+    mode(dir.path(), 0o755);
+    let account = Account {
+        uid: Uid::from_raw(61001),
+        gid: Gid::from_raw(61001),
+        groups: vec![Gid::from_raw(61001), Gid::from_raw(61003)],
+        name: "qshd-fixture-alice".into(),
+        home: dir.path().into(),
+        shell: "/bin/sh".into(),
+    };
+    let path = dir.path().join("keys");
+    std::fs::write(&path, "safe keys").unwrap();
+    mode(&path, 0o644);
+    assert_eq!(
+        checked_read(&account, &path).unwrap(),
+        "safe keys",
+        "root-owned readable store"
     );
-    assert!(
-        !nobody.groups.contains(&Gid::from_raw(0)),
-        "the test needs an account that does NOT share root's group, or the file would be \
-         readable for the right reason and prove nothing about the fix"
+    mode(dir.path(), 0o711);
+    assert_eq!(
+        checked_read(&account, &path).unwrap(),
+        "safe keys",
+        "search-only parent"
+    );
+    mode(dir.path(), 0o755);
+
+    // This must reach the leaf's kernel permission check, not an ancestor policy
+    // refusal. Retaining root's effective gid would incorrectly allow this read.
+    mode(&path, 0o640);
+    refused(&account, &path, "Permission denied");
+    chown(&path, Some(0), Some(61003)).unwrap();
+    assert_eq!(
+        checked_read(&account, &path).unwrap(),
+        "safe keys",
+        "supplementary group grants read"
+    );
+    chown(&path, Some(61001), Some(61001)).unwrap();
+    mode(&path, 0o600);
+    assert_eq!(
+        checked_read(&account, &path).unwrap(),
+        "safe keys",
+        "account-private keys"
     );
 
-    let before_uid = Uid::effective();
-    let before_gid = Gid::effective();
-    let mut before_groups: Vec<u32> = nix::unistd::getgroups()
-        .expect("read this process's own groups")
-        .iter()
-        .map(|g| g.as_raw())
-        .collect();
-    before_groups.sort_unstable();
+    for bits in [0o620, 0o602] {
+        mode(&path, bits);
+        refused(&account, &path, "writable by group or others");
+        mode(&path, 0o600);
+        assert_eq!(checked_read(&account, &path).unwrap(), "safe keys");
+    }
+    chown(&path, Some(61002), Some(61002)).unwrap();
+    mode(&path, 0o644);
+    refused(&account, &path, "untrusted owner");
+    chown(&path, Some(61001), Some(61001)).unwrap();
 
-    let err = read_for(&nobody, &path.display().to_string()).expect_err(
-        "an account sharing none of root's groups must be refused this 0640 root:root file, \
-         not served on root's authority",
-    );
-    assert!(matches!(err, AuthorizedError::Read { .. }), "got: {err}");
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    mode(&parent, 0o755);
+    let nested = parent.join("keys");
+    std::fs::write(&nested, "nested keys").unwrap();
+    mode(&nested, 0o644);
+    assert_eq!(checked_read(&account, &nested).unwrap(), "nested keys");
+    chown(&parent, Some(61002), Some(61002)).unwrap();
+    refused(&account, &nested, "untrusted owner");
+    chown(&parent, Some(61001), Some(61001)).unwrap();
+    for bits in [0o775, 0o757] {
+        mode(&parent, bits);
+        refused(&account, &nested, "writable by group or others");
+        mode(&parent, 0o755);
+        assert_eq!(checked_read(&account, &nested).unwrap(), "nested keys");
+    }
+    mode(dir.path(), 0o777);
+    refused(&account, &nested, "writable by group or others");
+    mode(dir.path(), 0o755);
 
     assert_eq!(
-        Uid::effective(),
-        before_uid,
-        "the effective user must be restored after a failed read under another identity"
+        checked_read(&account, &dir.path().join("missing")).unwrap(),
+        ""
     );
-    assert_eq!(
-        Gid::effective(),
-        before_gid,
-        "the effective group must be restored after a failed read under another identity"
-    );
-    let mut after_groups: Vec<u32> = nix::unistd::getgroups()
-        .expect("read this process's own groups")
-        .iter()
-        .map(|g| g.as_raw())
-        .collect();
-    after_groups.sort_unstable();
-    assert_eq!(
-        after_groups, before_groups,
-        "the supplementary group list must be restored after a failed read under another \
-         identity"
-    );
+    refused(&account, &parent, "not a regular file");
+    refused(&account, Path::new("/dev/zero"), "not a regular file");
+    let link = dir.path().join("linked-keys");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(checked_read(&account, &link).is_err());
+    std::fs::write(&path, vec![b'a'; 1024 * 1024 + 1]).unwrap();
+    refused(&account, &path, "larger than");
+    std::fs::write(&path, [0xff]).unwrap();
+    refused(&account, &path, "invalid utf-8");
+    mode(&path, 0o000);
+    refused(&account, &path, "Permission denied");
+    let unsafe_dir = tempfile::tempdir().unwrap();
+    mode(unsafe_dir.path(), 0o755);
+    let unsafe_path = unsafe_dir.path().join("keys");
+    std::fs::write(&unsafe_path, "keys").unwrap();
+    refused(&account, &unsafe_path, "writable by group or others");
 }
