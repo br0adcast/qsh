@@ -187,11 +187,31 @@ impl Drop for Sandbox {
 }
 
 /// This workspace's qshd. `CARGO_BIN_EXE_qshd` exists only for the qshd
-/// package's own tests (see `cli/tests/support/mod.rs`), so it is built
-/// here -- every time: cargo makes that a no-op when it is fresh, and a
+/// package's own tests (see `cli/tests/support/mod.rs`). Workspace runs
+/// supply QSH_TEST_QSHD so this helper cannot replace their feature build.
+/// Standalone runs without that override build here every time: cargo
+/// makes that a no-op when it is fresh, and a
 /// binary left over from before a qshd change would test the old daemon.
 /// This test binary is `target/<profile>/deps/<name>`.
 pub fn qshd_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("QSH_TEST_QSHD") {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = PathBuf::from(path);
+        let executable = path.is_absolute()
+            && path.is_file()
+            && std::ffi::CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| {
+                // Check execute permission without running the fixture. The
+                // CString owns a valid, NUL-terminated path for this call.
+                unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+            });
+        assert!(
+            executable,
+            "QSH_TEST_QSHD must name an absolute executable file"
+        );
+        return path;
+    }
+
     let exe = std::env::current_exe().expect("the test binary's path");
     let profile_dir = exe
         .parent()
@@ -323,6 +343,154 @@ impl bringup::BringUpObserver for RecordingObserver {
         self.events.lock().unwrap().push(event);
         if let Some(callback) = &self.callback {
             callback(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Child, Stdio};
+
+    struct FixtureChild(Child);
+
+    impl Drop for FixtureChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn check_in_child(valid: bool) -> bool {
+        if std::env::var_os("QSH_FIXTURE_CHECK_CHILD").is_none() {
+            return false;
+        }
+        let result = std::panic::catch_unwind(qshd_path);
+        if valid {
+            let expected = PathBuf::from(std::env::var_os("QSH_TEST_QSHD").unwrap());
+            assert!(result.is_ok_and(|path| path == expected));
+        } else {
+            let error = result.expect_err("an invalid explicit fixture must fail");
+            let message = error
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| error.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(message.contains("QSH_TEST_QSHD must name an absolute executable file"));
+        }
+        std::fs::write(std::env::var_os("QSH_FIXTURE_CHECK_DONE").unwrap(), b"done").unwrap();
+        true
+    }
+
+    fn run_fixture_case(test_name: &str, candidate: &Path) {
+        let sandbox = tempfile::tempdir().unwrap();
+        let marker = sandbox.path().join("cargo-ran");
+        let completed = sandbox.path().join("check-completed");
+        // Libtest names omit the crate prefix supplied by module_path!().
+        let test_name = test_name.split_once("::").unwrap().1;
+        if !candidate.is_absolute() && !candidate.as_os_str().is_empty() {
+            let relative_fixture = sandbox.path().join(candidate);
+            std::fs::write(&relative_fixture, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&relative_fixture, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let cargo = sandbox.path().join("cargo-tripwire");
+        std::fs::write(
+            &cargo,
+            b"#!/bin/sh\nprintf x > \"$QSH_FIXTURE_CARGO_MARKER\"\nexit 91\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let mut child = FixtureChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .current_dir(sandbox.path())
+                .env("QSH_FIXTURE_CHECK_CHILD", "1")
+                .env("QSH_FIXTURE_CHECK_DONE", &completed)
+                .env("QSH_TEST_QSHD", candidate)
+                .env("CARGO", &cargo)
+                .env("QSH_FIXTURE_CARGO_MARKER", &marker)
+                .env("HOME", sandbox.path())
+                .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+                .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+                .env("HISTFILE", "/dev/null")
+                .env("RUST_BACKTRACE", "0")
+                .env_remove("SSH_AUTH_SOCK")
+                .env_remove("SSH_AGENT_PID")
+                .stdin(Stdio::null())
+                // Keep the nested libtest summary out of strict CI log checks.
+                // The parent reports failures through bounded stderr below.
+                .stdout(Stdio::null())
+                .stderr(stderr.try_clone().unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "fixture check timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(!marker.exists(), "Cargo ran for an explicit daemon fixture");
+        stderr.seek(SeekFrom::Start(0)).unwrap();
+        let mut output = Vec::new();
+        stderr.take(1024).read_to_end(&mut output).unwrap();
+        assert!(
+            status.success(),
+            "fixture check failed: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(completed.exists(), "the selected fixture probe did not run");
+    }
+
+    #[test]
+    fn explicit_prebuilt_qshd_is_used_without_rebuilding_or_changing_it() {
+        if check_in_child(true) {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("prebuilt-qshd");
+        let bytes = b"#!/bin/sh\nexit 0\n";
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        run_fixture_case(
+            concat!(
+                module_path!(),
+                "::explicit_prebuilt_qshd_is_used_without_rebuilding_or_changing_it"
+            ),
+            &path,
+        );
+        assert!(std::fs::read(path).unwrap() == bytes);
+    }
+
+    #[test]
+    fn invalid_prebuilt_qshd_fails_without_building_a_replacement() {
+        if check_in_child(false) {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let non_executable = fixture.path().join("non-executable");
+        std::fs::write(&non_executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for path in [
+            PathBuf::new(),
+            PathBuf::from("relative-qshd"),
+            fixture.path().join("missing"),
+            fixture.path().to_path_buf(),
+            non_executable,
+        ] {
+            run_fixture_case(
+                concat!(
+                    module_path!(),
+                    "::invalid_prebuilt_qshd_fails_without_building_a_replacement"
+                ),
+                &path,
+            );
         }
     }
 }
