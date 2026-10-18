@@ -695,13 +695,17 @@ for those versions needs that one edit.
   own log does *not* read like a failed login: the signature really did
   check out, so it logs `Accepted signature for <name> from <addr> ...`
   first, and the refusal itself lands in a differently shaped line
-  (`the PAM stack refused login ...`), never one starting `Failed
+  (`login session setup failed ...`), never one starting `Failed
   signature for ...`. A filter built to catch failed logins by matching
   that `Failed signature` shape catches nothing here (see "Checking it"
   for where to look instead). There is no way to change a password
   through `qsh`; fix the account another way first (console access,
   `sshd`, whatever else reaches this machine), and logging in through
   `qshd` starts working again;
+- Each login starts PAM with the account's NSS supplementary groups. Every
+  channel receives the exact group list left by the full PAM session opening,
+  including additions, removals, or an empty list. Authorization-file access
+  keeps the NSS baseline; another login cannot inherit these session groups.
 - `/etc/pam.d/qshd` is a real, editable configuration file, and an
   administrator is expected to open it — but a module that decides by
   client address (`pam_access`, `pam_rhosts`) would be trusting a value

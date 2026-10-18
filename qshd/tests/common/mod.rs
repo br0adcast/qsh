@@ -284,6 +284,16 @@ pub(crate) fn start_daemon(dir: &Path) -> (Daemon, [u8; 32], u16) {
 /// attempt's own `read_server_pubkey` call returns as soon as the process
 /// either prints its banner or exits.
 pub(crate) fn start_daemon_with(dir: &Path, extra_args: &[&str]) -> (Daemon, [u8; 32], u16) {
+    start_daemon_with_groups(dir, extra_args, None)
+}
+
+/// Install synthetic inherited groups only in the disposable daemon child.
+pub(crate) fn start_daemon_with_groups(
+    dir: &Path,
+    extra_args: &[&str],
+    groups: Option<Vec<nix::unistd::Gid>>,
+) -> (Daemon, [u8; 32], u16) {
+    use std::os::unix::process::CommandExt;
     let host_key = dir.join("host_key");
     let mut last_attempt_port = 0u16;
     let mut last_stderr = String::new();
@@ -291,7 +301,16 @@ pub(crate) fn start_daemon_with(dir: &Path, extra_args: &[&str]) -> (Daemon, [u8
     for _ in 0..START_DAEMON_ATTEMPTS {
         clear_system_log();
         let port = free_udp_port();
-        let mut child = Command::new(qshd_binary())
+        let mut command = Command::new(qshd_binary());
+        if let Some(groups) = groups.clone() {
+            // SAFETY: setgroups is the only child operation; the list is prepared before fork.
+            unsafe {
+                command.pre_exec(move || {
+                    nix::unistd::setgroups(&groups).map_err(std::io::Error::from)
+                });
+            }
+        }
+        let mut child = command
             .args([
                 "serve",
                 "--system",
@@ -530,6 +549,29 @@ impl Session {
                 screen: false,
                 command,
             })),
+        );
+    }
+
+    /// A second command channel in the same login. Its output can be a fixture file.
+    pub(crate) fn run_another_command(&self, command: &str) {
+        let stream = FIRST_CHANNEL_STREAM + 1;
+        self.client.send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: command.as_bytes().to_vec(),
+            })),
+        );
+        assert!(
+            wait_until(|| self
+                .control_records()
+                .contains(&ServerRecord::Exit { stream, code: 0 })),
+            "second channel must execute successfully: {:?}",
+            self.control_records()
         );
     }
 

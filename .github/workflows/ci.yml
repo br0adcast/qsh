@@ -170,6 +170,9 @@ jobs:
       # pay for it -- the packaging path, where
       # `packaging/build-server-packages.sh` already calls this same script
       # over each binary it is about to wrap.
+      - name: Build the disposable PAM group fixture
+        run: scripts/build-test-pam-modules.sh "$GITHUB_WORKSPACE/target/test-fixtures/pam"
+
       - name: The shipped binary asks libpam for nothing newer than LIBPAM_1.0
         run: scripts/check-pam-linkage.sh target/debug/qshd
 
@@ -253,13 +256,17 @@ jobs:
             bad=0
             # Only the library's IPv6 PAM policy fixture needs to add a
             # documentation address inside its disposable network namespace.
+            fixture_env=()
+            if [ "$kind" = lib ] || [ "$name" = system_mode_pam ]; then
+              fixture_env=(-e "QSHD_TEST_PAM_GROUP_MODULE=$GITHUB_WORKSPACE/target/test-fixtures/pam/session_groups.so")
+            fi
             network_caps=()
             if [ "$kind" = lib ]; then network_caps=(--cap-add=NET_ADMIN); fi
             echo "::group::$name"
             # Merge the test's streams before Docker multiplexes them.
             # Host-side 2>&1 alone can reorder libtest's result and a skip
             # diagnostic, making a complete run look like a missing test.
-            if docker run --rm --init --cap-add=SYS_PTRACE "${network_caps[@]}" \
+            if docker run --rm --init --cap-add=SYS_PTRACE "${network_caps[@]}" "${fixture_env[@]}" \
               -e QSHD_TEST_DISPOSABLE_HOST=1 \
               -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
               ubuntu:24.04 sh -c 'exec "$@" 2>&1' sh "$bin" --test-threads=1 --nocapture \
@@ -300,7 +307,12 @@ jobs:
             --require two_accounts_each_get_their_own_shell \
             --require attacker_controlled_authorization_is_refused
           run_suite test system_mode_pam \
-            --require an_expired_account_is_refused
+            --require an_expired_account_is_refused \
+            --require pam_receives_only_the_account_group_baseline \
+            --require shell_keeps_groups_established_by_pam \
+            --require pam_can_remove_all_supplementary_groups \
+            --require pam_groups_are_isolated_between_logins \
+            --require pam_group_teardown_uses_the_opening_monitor
           run_suite test system_mode_shell \
             --require the_system_mode_serves_a_shell_over_the_seam
           run_suite test authorized_keys_privilege \
