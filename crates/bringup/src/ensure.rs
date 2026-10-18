@@ -34,8 +34,8 @@ pub(crate) fn parse(code: i32, out: &str) -> Result<Ready, BringUpError> {
         )));
     }
     let bad = |what: &str| BringUpError::BadReady(format!("{what}: {}", excerpt(out, code)));
-    // Parsed for its form only: trust in the daemon's key comes from qsh
-    // itself, never from what SSH carried (spec §2).
+    // The verified SSH login reports the intended daemon identity here.
+    // Callers bind it to their endpoint; Noise must still prove possession.
     let key = line_after(out, "server-pubkey: ").ok_or_else(|| bad("no server-pubkey line"))?;
     let server_pubkey = BASE64
         .decode(key.trim())

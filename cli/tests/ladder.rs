@@ -501,14 +501,12 @@ fn ssh_brings_qshd_up_and_qsh_logs_in_with_the_process_key() {
         screen.text(),
         sshd_log()
     );
+    decline_recovery_binding(&mut client, &mut screen);
     assert!(
-        screen.next(&format!("First time seeing server 127.0.0.1:{q}"))
-            && screen.next("Key fingerprint"),
-        "the qsh server key must be asked about; client saw: {}",
+        !screen.text().contains("Key fingerprint"),
+        "the verified SSH result establishes the daemon key without another trust question: {}",
         screen.text()
     );
-    answer_yes(&mut client);
-    decline_recovery_binding(&mut client, &mut screen);
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
 
     assert!(
@@ -577,8 +575,6 @@ fn a_daemon_on_another_port_is_reached_on_its_own_port() {
         format!("qsh: 127.0.0.1:{b}: {}", closed_words(b)),
         format!("qsh: 127.0.0.1: trying ssh:{sshd}"),
         format!("qsh: 127.0.0.1: qshd listens on {a}, not {b}"),
-        format!("First time seeing server 127.0.0.1:{a}"),
-        "Key fingerprint".to_string(),
     ] {
         assert!(
             screen.next(&line),
@@ -587,9 +583,13 @@ fn a_daemon_on_another_port_is_reached_on_its_own_port() {
             sb.sshd.log()
         );
     }
-    answer_yes(&mut client);
     decline_recovery_binding(&mut client, &mut screen);
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
+    assert!(
+        !screen.text().contains("Key fingerprint"),
+        "{}",
+        screen.text()
+    );
     assert!(
         !screen.text().contains("The authenticity of host"),
         "a known ssh host key is not asked about; client saw: {}",

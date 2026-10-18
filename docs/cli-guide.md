@@ -69,8 +69,12 @@ existing files remain untouched. Server-side qshd state and host keys are unaffe
 
 SSH independently uses `~/.ssh/known_hosts`, including hashed entries,
 `[host]:port`, and revoked keys. Unknown SSH keys need confirmation; changed
-ones are refused. Trusting an SSH key does not implicitly trust a different qsh
-server key.
+ones are refused. When that verified SSH login starts qshd, its returned daemon
+key binds only the same address and the UDP port it reports. qsh compares discovery
+with that key and atomically remembers it without another QSH trust question.
+Conflicting existing pins, discovery keys, or session identities are refused;
+Noise still proves the daemon holds the private key. Other endpoints receive no
+SSH bootstrap trust grant.
 
 Background SSH recovery additionally needs an explicit association between the
 QSH server key, account, SSH endpoint, and SSH host key. After an initial SSH

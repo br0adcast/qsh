@@ -231,14 +231,24 @@ impl Setup {
             .ssh_bindings()
             .allowed(&server, &endpoint)
             .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
-        self.ssh_step(true).run_bound_observed(
+        let ready = self.ssh_step(true).run_bound_observed(
             address,
             route,
             self.keypair.public,
             &keys,
             cancel,
             started,
-        )
+        )?;
+        let port = ready.port_for(address.qsh_port);
+        trust::check_bootstrap_key(&address.host, port, server.qsh_key, ready.server_pubkey)
+            .and_then(|()| {
+                trust::recovery_server_key(&address.host, port, server.qsh_key, &self.pins)
+                    .map(|_| ())
+            })
+            .map_err(|error| {
+                SshStepError::Failed(::connect::SshFailure::plain(error.to_string()))
+            })?;
+        Ok(ready)
     }
 
     /// The authenticated QSH peer; SSH readiness never changes this identity.
@@ -445,7 +455,16 @@ pub struct Climb<'a> {
         ::connect::recovery_gate::RecoveryEpoch,
         ::connect::recovery_gate::SweepId,
     )>,
-    bootstrap: Option<(usize, ssh::HostKeyInfo)>,
+    bootstrap: Option<SshBootstrap>,
+}
+
+/// An identity grant belongs only to the route and UDP port reported by
+/// this verified SSH login; it cannot authorize another candidate endpoint.
+struct SshBootstrap {
+    addr: usize,
+    port: u16,
+    key: [u8; 32],
+    ssh_host_key: ssh::HostKeyInfo,
 }
 
 impl<'a> Climb<'a> {
@@ -589,9 +608,14 @@ impl<'a> Climb<'a> {
                     }
                     match result {
                         Ok(identified) => {
-                            self.bootstrap = Some((addr, identified.ssh_host_key));
                             let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
+                            self.bootstrap = Some(SshBootstrap {
+                                addr,
+                                port,
+                                key: ready.server_pubkey,
+                                ssh_host_key: identified.ssh_host_key,
+                            });
                             self.setup.allowlist(host, port);
                             self.say(&report::qshd_ready(host, addrs[addr].qsh_port, port));
                             if let Some(w) = &ready.warning {
@@ -643,8 +667,8 @@ impl<'a> Climb<'a> {
                         .take()
                         .expect("a Connected action follows a login");
                     if !self.background() {
-                        if let Some((bootstrap_addr, info)) = self.bootstrap.take() {
-                            if bootstrap_addr == addr {
+                        if let Some(bootstrap) = self.bootstrap.take() {
+                            if bootstrap.addr == addr && bootstrap.port == port {
                                 if let Some(server) = self.setup.server_identity() {
                                     let endpoint = ::connect::server_identity::SshEndpoint {
                                         host: addrs[addr].host.clone(),
@@ -661,7 +685,12 @@ impl<'a> Climb<'a> {
                                         },
                                     );
                                     if let Err(error) = crate::ssh_authorization::offer_binding(
-                                        &server, &endpoint, &info, self.setup, &permit, cancel,
+                                        &server,
+                                        &endpoint,
+                                        &bootstrap.ssh_host_key,
+                                        self.setup,
+                                        &permit,
+                                        cancel,
                                     ) {
                                         eprintln!("qsh: {error}; QSH session remains connected");
                                     }
@@ -954,7 +983,26 @@ impl<'a> Climb<'a> {
             .session_key
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let server = if let (Some(_), Some(key)) = (self.recovery, session_key) {
+        let bootstrap = self.bootstrap.as_ref().filter(|bootstrap| {
+            stage == Stage::AfterSsh && bootstrap.addr == i && bootstrap.port == port
+        });
+        let server = if let Some(bootstrap) = bootstrap {
+            session_key
+                .map_or(Ok(()), |key| {
+                    trust::check_bootstrap_key(&host, port, key, bootstrap.key)
+                })
+                .and_then(|()| {
+                    trust::ssh_server_key(
+                        &host,
+                        port,
+                        sockaddr,
+                        bootstrap.key,
+                        &self.setup.pins,
+                        &self.line(),
+                        discovery,
+                    )
+                })
+        } else if let (Some(_), Some(key)) = (self.recovery, session_key) {
             trust::recovery_server_key(&host, port, key, &self.setup.pins)
         } else {
             trust::server_key(
@@ -982,7 +1030,8 @@ impl<'a> Climb<'a> {
                         let line = report::no_answer(&host, port, &why);
                         (DirectOutcome::NoAnswer(why), Some(line))
                     }
-                    trust::TrustError::KeyChanged { .. } => {
+                    trust::TrustError::KeyChanged { .. }
+                    | trust::TrustError::BootstrapMismatch { .. } => {
                         self.say_loud(format!("qsh: {e}"));
                         (DirectOutcome::KeyChanged, None)
                     }
@@ -1237,7 +1286,9 @@ impl<'a> Climb<'a> {
             (Some(failure), _) => send_why(sockaddr, failure, on_macos),
             // The server named this key on this run: it answers the key
             // request, and not the login.
-            (None, trust::KeySource::Discovered) => NoAnswerWhy::KeyedButSilent,
+            (None, trust::KeySource::Discovered | trust::KeySource::SshBootstrap) => {
+                NoAnswerWhy::KeyedButSilent
+            }
             // Spec §4a rule 3: the neighbour's key got nothing here. One key
             // request tells another server from a silence with another
             // cause; the key it offers is never pinned -- it proves nothing.
@@ -2031,3 +2082,7 @@ mod authorization_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "climb_bootstrap_tests.rs"]
+mod bootstrap_tests;

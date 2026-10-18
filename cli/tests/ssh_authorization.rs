@@ -307,10 +307,12 @@ fn bootstrap(answer: &[u8], accept: bool) {
     wait(&output, "The authenticity of host");
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
     client.master.write_all(b"yes\n").unwrap();
-    wait(&output, "Key fingerprint");
-    assert!(!home.path().join("qsh/ssh_bindings.json").exists());
-    client.master.write_all(b"yes\n").unwrap();
     wait(&output, "Authorize SSH recovery");
+    assert!(
+        !text(&output).contains("Key fingerprint"),
+        "{}",
+        text(&output)
+    );
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
     client.master.write_all(answer).unwrap();
     if answer == b"\x03" {

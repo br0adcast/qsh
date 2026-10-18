@@ -188,8 +188,8 @@ impl KnownHosts {
     /// and say what was on file before: `Unknown` means it is pinned now;
     /// `Known` and `Changed` mean the file was left exactly as it was.
     ///
-    /// For a key the caller learned without asking anyone -- a handshake
-    /// that proved the server holds it -- where an existing line, even a
+    /// For a key authenticated by a completed handshake or reported by a
+    /// verified SSH bootstrap, where an existing line, even a
     /// stale one, is for a person to remove, not for this call to replace.
     /// The check and the write happen under one [`PinLock`], so another
     /// process pinning this host in between cannot be overwritten.
