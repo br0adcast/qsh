@@ -19,6 +19,190 @@ fn object(root: &std::path::Path, archive: &[u8]) -> std::path::PathBuf {
     root.join("releases/0.4.0/x86_64-unknown-linux-musl/objects")
         .join(digest(archive))
 }
+
+#[test]
+fn optional_cache_open_failure_still_returns_verified_download() {
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("cache");
+    fs::write(&blocked, b"keep this file").unwrap();
+    let online = Fake::new(archive());
+    let image = load(&blocked, online.clone()).expect("cache storage is optional");
+    assert_eq!(&*image.bytes, IMAGE);
+    assert_eq!(
+        online.calls(),
+        2,
+        "fetch current sums and verify a fresh archive"
+    );
+    assert_eq!(fs::read(blocked).unwrap(), b"keep this file");
+}
+
+#[test]
+fn optional_cache_lock_failure_still_returns_verified_download() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = root
+        .path()
+        .join("releases/0.4.0/x86_64-unknown-linux-musl/.lock");
+    fs::create_dir_all(&lock).unwrap();
+    let online = Fake::new(archive());
+    let image = load(root.path(), online.clone()).expect("unusable lock skips cache");
+    assert_eq!(&*image.bytes, IMAGE);
+    assert_eq!(online.calls(), 2);
+    assert!(lock.is_dir());
+}
+
+#[test]
+fn optional_cache_publication_failure_keeps_verified_image() {
+    let root = tempfile::tempdir().unwrap();
+    let pointer = root
+        .path()
+        .join("releases/0.4.0/x86_64-unknown-linux-musl/current.json");
+    fs::create_dir_all(&pointer).unwrap();
+    let online = Fake::new(archive());
+    let image = load(root.path(), online.clone()).expect("publication follows verification");
+    assert_eq!(&*image.bytes, IMAGE);
+    assert_eq!(online.calls(), 2);
+    assert!(pointer.is_dir());
+}
+
+#[test]
+fn optional_cache_repair_failure_keeps_reverified_offline_image() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = archive();
+    load(root.path(), Fake::new(bytes.clone())).unwrap();
+    let cached_image = object(root.path(), &bytes).join("image");
+    fs::remove_file(&cached_image).unwrap();
+    fs::create_dir(&cached_image).unwrap();
+    let offline = Fake::offline();
+    let image = load(root.path(), offline.clone()).expect("verified archive does not need repair");
+    assert_eq!(&*image.bytes, IMAGE);
+    assert_eq!(offline.calls(), 1, "still check GitHub before offline use");
+    assert!(cached_image.is_dir());
+}
+
+#[test]
+fn optional_cache_archive_read_failure_downloads_and_verifies_fresh_image() {
+    let root = tempfile::tempdir().unwrap();
+    let bytes = archive();
+    load(root.path(), Fake::new(bytes.clone())).unwrap();
+    let cached_archive = object(root.path(), &bytes).join("archive");
+    fs::remove_file(&cached_archive).unwrap();
+    fs::create_dir(&cached_archive).unwrap();
+    let online = Fake::new(bytes);
+    let image = load(root.path(), online.clone()).expect("unreadable cache is a miss");
+    assert_eq!(&*image.bytes, IMAGE);
+    assert_eq!(online.calls(), 2);
+    assert!(cached_archive.is_dir());
+}
+
+#[test]
+fn optional_cache_failure_never_bypasses_metadata_or_archive_verification() {
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("cache");
+    fs::write(&blocked, b"storage unavailable").unwrap();
+    for metadata in [
+        b"invalid metadata".to_vec(),
+        format!("{}  {STEM}.tar.gz\n", "00".repeat(32)).into_bytes(),
+    ] {
+        let online = Arc::new(Fake {
+            sums: metadata,
+            archive: archive(),
+            calls: AtomicUsize::new(0),
+            offline: false,
+        });
+        assert!(matches!(load(&blocked, online), Err(ImageError::Checksum)));
+    }
+}
+
+#[test]
+fn offline_cache_never_uses_a_different_release_version() {
+    let root = tempfile::tempdir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    let mut other = request();
+    other.version = "0.4.1".into();
+    let offline = Fake::offline();
+    let result = GitHubImages::with_transport(root.path().into(), offline.clone()).load(
+        &other,
+        &InstallTiming::default(),
+        &knock::Cancel::new(),
+        &Silent,
+    );
+    assert!(matches!(result, Err(ImageError::Download(_))));
+    assert_eq!(offline.calls(), 1);
+}
+
+#[test]
+fn optional_cache_does_not_follow_unsafe_descendants() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let sentinel = outside.path().join("keep");
+    fs::write(&sentinel, b"unchanged").unwrap();
+    symlink(outside.path(), root.path().join("releases")).unwrap();
+    let online = Fake::new(archive());
+    assert_eq!(&*load(root.path(), online.clone()).unwrap().bytes, IMAGE);
+    assert_eq!(online.calls(), 2);
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);
+    assert!(matches!(
+        load(root.path(), Fake::offline()),
+        Err(ImageError::Download(_))
+    ));
+}
+
+#[test]
+fn optional_cache_cannot_hide_publication_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("cache");
+    fs::write(&blocked, b"storage unavailable").unwrap();
+    let online = Fake::new(archive());
+    let result = GitHubImages::with_transport(blocked, online.clone()).load(
+        &request(),
+        &InstallTiming {
+            publish: std::time::Duration::ZERO,
+            ..InstallTiming::default()
+        },
+        &knock::Cancel::new(),
+        &Silent,
+    );
+    assert!(matches!(result, Err(ImageError::Invalid(_))));
+    assert_eq!(
+        online.calls(),
+        2,
+        "deadline applies after verified download"
+    );
+}
+
+#[test]
+fn optional_cache_cannot_hide_cancellation_after_metadata() {
+    use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
+    struct CancelAfterMetadata;
+    impl ReleaseTransport for CancelAfterMetadata {
+        fn fetch(
+            &self,
+            url: &str,
+            _: FetchLimits,
+            cancel: &knock::Cancel,
+            _: &dyn bringup::BringUpObserver,
+        ) -> Result<Vec<u8>, FetchError> {
+            assert!(
+                url.ends_with("SHA256SUMS"),
+                "cancellation must stop archive download"
+            );
+            cancel.cancel();
+            Ok(sums(&archive()))
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let blocked = root.path().join("cache");
+    fs::write(&blocked, b"storage unavailable").unwrap();
+    let result = GitHubImages::with_transport(blocked, Arc::new(CancelAfterMetadata)).load(
+        &request(),
+        &InstallTiming::default(),
+        &knock::Cancel::new(),
+        &Silent,
+    );
+    assert!(matches!(result, Err(ImageError::Cancelled)));
+}
 #[test]
 fn release_cache_path_uses_xdg_then_home_independently_of_host_os() {
     use std::{
