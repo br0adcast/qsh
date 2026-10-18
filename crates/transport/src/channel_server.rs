@@ -826,6 +826,10 @@ pub async fn run_channel_session_with(
     let mut next_instance: u64 = 0;
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
+    // Staged geometry codecs are not advertised yet. An unsupported request
+    // stops application input for this attachment; lifecycle closure is wired
+    // with the confirmed-geometry runner before feature activation.
+    let mut unsupported_control = false;
     // The client's terminal type, once it says: every channel opened after
     // that is spawned with it. `None` until then, and for a client that
     // never says at all -- the spawner decides what to do with that.
@@ -854,6 +858,10 @@ pub async fn run_channel_session_with(
         match wakeup {
             Wakeup::Inbound(Some(SessionInbound::Data(StreamData { stream_id, data }))) => {
                 let n = data.len();
+                if unsupported_control {
+                    io.consumed(stream_id, n);
+                    continue;
+                }
                 if stream_id == CONTROL_STREAM {
                     let records = control_buf.push(&data);
                     if control_buf.overflowed() && !control_overflow_logged {
@@ -864,7 +872,7 @@ pub async fn run_channel_session_with(
                         );
                     }
                     for raw in records {
-                        apply_control_record(
+                        if !apply_control_record(
                             &io,
                             &mut channels,
                             &mut exits,
@@ -874,7 +882,10 @@ pub async fn run_channel_session_with(
                             raw,
                             &mut term,
                             &mut update,
-                        );
+                        ) {
+                            unsupported_control = true;
+                            break;
+                        }
                     }
                     // Applied, held as an unfinished record, or dropped:
                     // taken (spec §4.10.3).
@@ -910,6 +921,7 @@ pub async fn run_channel_session_with(
                 // byte: nothing half-read on the old one carries over.
                 control_buf = RecordDeframer::for_control();
                 control_overflow_logged = false;
+                unsupported_control = false;
                 // A warm reattach is a new client connection: its echo_ack
                 // accounting starts over, exactly as `serve_shell` resets its
                 // own on a fresh `HandshakeInit` -- the same cue there: a new
@@ -1175,8 +1187,12 @@ fn apply_control_record(
     raw: RawRecord,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
-) {
+) -> bool {
     match decode_client(&raw) {
+        Ok(ClientRecord::ResizeRequest { .. }) => {
+            log::warn!("correlated resize received without channel-geometry support; application input stopped");
+            return false;
+        }
         Ok(ClientRecord::Open(req)) => {
             // A client opens a number it considers free: whatever ended on
             // it before, it is not waiting for that `Exit` any more, and it
@@ -1262,6 +1278,10 @@ fn apply_control_record(
         Ok(ClientRecord::AboutRequest) => update.about(),
         Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
         Err(ChannelCodecError::UnknownKind(_)) => {}
+        Err(ChannelCodecError::Malformed) if raw.kind == crate::channel::REC_RESIZE_REQUEST => {
+            log::warn!("malformed correlated resize; application input stopped");
+            return false;
+        }
         Err(ChannelCodecError::Malformed) => {
             log::warn!(
                 "malformed control record from client (kind {:#04x}, {} bytes) -- \
@@ -1271,6 +1291,7 @@ fn apply_control_record(
             );
         }
     }
+    true
 }
 
 /// All fallible steps precede model/request mutation. A failed ioctl drops
@@ -2176,6 +2197,73 @@ pub(crate) mod tests {
             spawner.owners.lock().unwrap().is_empty(),
             "validate before invoking a spawner"
         );
+    }
+
+    #[tokio::test]
+    async fn unsupported_geometry_control_stops_suffix_until_attachment_reset() {
+        let valid = vec![
+            16, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 80, 0, 24,
+        ];
+        for payload in [valid, vec![]] {
+            let spawner = FakeSpawner::new();
+            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+            let SessionInbound::Data(prefix) = open(16, ChannelKind::Shell, false) else {
+                unreachable!()
+            };
+            let SessionInbound::Data(suffix) = open(17, ChannelKind::Shell, false) else {
+                unreachable!()
+            };
+            let bytes = [
+                prefix.data,
+                crate::shell_frame::encode_record(0x16, &payload),
+                suffix.data,
+            ]
+            .concat();
+            let n = bytes.len();
+            inbound
+                .send(SessionInbound::Data(StreamData {
+                    stream_id: CONTROL_STREAM,
+                    data: bytes,
+                }))
+                .await
+                .unwrap();
+            consumed_until(&mut outbound, CONTROL_STREAM, n).await;
+            let before_reset = spawner
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            inbound.send(SessionInbound::ResumeReset).await.unwrap();
+            let event = open(18, ChannelKind::Shell, false);
+            let SessionInbound::Data(ref data) = event else {
+                unreachable!()
+            };
+            let n = data.data.len();
+            inbound.send(event).await.unwrap();
+            consumed_until(&mut outbound, CONTROL_STREAM, n).await;
+            let after_reset = spawner
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for stream in [16, 17, 18] {
+                spawner.end_channel(stream);
+            }
+            drop(inbound);
+            runner.await.unwrap();
+            assert_eq!(
+                before_reset,
+                vec![16],
+                "no application input after unsupported geometry"
+            );
+            assert_eq!(after_reset, vec![16, 18]);
+            assert!(spawner.sizes.lock().unwrap().is_empty());
+        }
     }
 
     /// Spec §4.10.3: a control record is taken once applied.

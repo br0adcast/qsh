@@ -3,7 +3,9 @@
 //!
 //! Shared shell state without sockets or knowledge of the local terminal UI.
 
-use transport::shell_frame::{ShellDeframer, ShellRecord};
+use transport::shell_frame::{
+    ShellCodecError, ShellDeframer, ShellRecord, REC_GEOMETRY, REC_OUTPUT_GAP,
+};
 
 pub mod channel;
 pub mod qsh;
@@ -53,6 +55,13 @@ impl ShellState {
             input_bytes_sent: 0,
             history_view: false,
         }
+    }
+
+    /// The legacy framed stream cannot interpret geometry or gap boundaries.
+    /// Stop decoding and expose the error rather than applying later DATA using
+    /// an unconfirmed size. Resetting the stream establishes a fresh scope.
+    pub fn stream_error(&self) -> Option<ShellCodecError> {
+        self.deframer.error()
     }
 
     /// Whether the prediction engine shows anything right now -- for tests
@@ -120,6 +129,14 @@ impl ShellState {
                     }
                 }
                 ShellRecord::EchoAck(k) => self.prediction.set_echo_ack(k as i64),
+                ShellRecord::Geometry(_) => {
+                    self.deframer.reject_unsupported(REC_GEOMETRY);
+                    break;
+                }
+                ShellRecord::OutputGap { .. } => {
+                    self.deframer.reject_unsupported(REC_OUTPUT_GAP);
+                    break;
+                }
             }
         }
         let auth = self.terminal.frame();
@@ -243,6 +260,42 @@ impl ShellState {
 mod state_tests {
     use super::*;
     use transport::shell_frame::{encode_record, ShellRecord, REC_DATA, REC_ECHO_ACK};
+
+    #[test]
+    fn legacy_shell_stops_at_unsupported_geometry_until_reset() {
+        let mut state = ShellState::new(20, 1, prediction::DisplayPreference::Always, false);
+        let bytes = [
+            encode_record(REC_DATA, b"a"),
+            encode_record(
+                REC_GEOMETRY,
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80, 0, 24,
+                ],
+            ),
+            encode_record(REC_DATA, b"b"),
+        ]
+        .concat();
+        let first = state.on_stream0(&bytes, 1, 0);
+        assert_eq!(
+            state.stream_error(),
+            Some(ShellCodecError::UnsupportedKind(REC_GEOMETRY))
+        );
+        assert_eq!(
+            state.on_stream0(&encode_record(REC_DATA, b"c"), 2, 0),
+            first
+        );
+        let mut expected = ShellState::new(20, 1, prediction::DisplayPreference::Always, false);
+        assert_eq!(
+            first,
+            expected.on_stream0(&encode_record(REC_DATA, b"a"), 1, 0)
+        );
+        state.on_reset();
+        assert_eq!(state.stream_error(), None);
+        assert_eq!(
+            state.on_stream0(&encode_record(REC_DATA, b"d"), 3, 0),
+            expected.on_stream0(&encode_record(REC_DATA, b"d"), 3, 0)
+        );
+    }
 
     #[test]
     fn explicit_history_mode_suppresses_prediction_at_the_live_bottom() {

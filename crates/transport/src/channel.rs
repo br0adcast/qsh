@@ -7,6 +7,7 @@
 //! payload`), so an unknown record kind is skipped by its length and cannot
 //! desynchronise the stream.
 
+use crate::channel_geometry::{ChannelInstance, ProtocolErrorCode, ResizeRequestId};
 use crate::shell_frame::{encode_record, RawRecord};
 // Only the tests exercise the deframer directly (production code decodes
 // records handed to it by the connection layer); keep the import out of a
@@ -42,6 +43,8 @@ pub const MAX_COMMAND_LEN: usize = 4096;
 
 const REC_OPEN: u8 = 0x10;
 const REC_RESIZE: u8 = 0x11;
+pub const REC_RESIZE_REQUEST: u8 = 0x16;
+pub const REC_PROTOCOL_ERROR: u8 = 0x28;
 const REC_CLOSE: u8 = 0x12;
 const REC_TERM: u8 = 0x13;
 const REC_OPENED: u8 = 0x20;
@@ -469,6 +472,15 @@ pub struct OpenRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRecord {
     Open(OpenRequest),
+    /// Correlated request; dimensions are validated by the channel owner so
+    /// invalid sizes can receive an explicit refusal.
+    ResizeRequest {
+        stream: u8,
+        instance: ChannelInstance,
+        request_id: ResizeRequestId,
+        cols: u16,
+        rows: u16,
+    },
     Resize {
         stream: u8,
         cols: u16,
@@ -520,6 +532,9 @@ fn is_terminal_name(name: &str) -> bool {
 /// A record the server sends on [`CONTROL_STREAM`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerRecord {
+    ProtocolError {
+        code: ProtocolErrorCode,
+    },
     Opened {
         stream: u8,
     },
@@ -662,6 +677,21 @@ pub fn encode_client(rec: &ClientRecord) -> Vec<u8> {
             put_open(&mut payload, req);
             encode_record(REC_OPEN, &payload)
         }
+        ClientRecord::ResizeRequest {
+            stream,
+            instance,
+            request_id,
+            cols,
+            rows,
+        } => {
+            let mut payload = Vec::with_capacity(21);
+            payload.push(*stream);
+            payload.extend_from_slice(&instance.get().to_be_bytes());
+            payload.extend_from_slice(&request_id.get().to_be_bytes());
+            payload.extend_from_slice(&cols.to_be_bytes());
+            payload.extend_from_slice(&rows.to_be_bytes());
+            encode_record(REC_RESIZE_REQUEST, &payload)
+        }
         ClientRecord::Resize { stream, cols, rows } => {
             let mut payload = Vec::with_capacity(5);
             payload.push(*stream);
@@ -695,6 +725,23 @@ pub fn decode_client(raw: &RawRecord) -> Result<ClientRecord, ChannelCodecError>
                 return Err(ChannelCodecError::Malformed);
             }
             Ok(ClientRecord::Open(req))
+        }
+        REC_RESIZE_REQUEST => {
+            let p = &raw.payload;
+            if p.len() != 21 || p[0] < FIRST_CHANNEL_STREAM {
+                return Err(ChannelCodecError::Malformed);
+            }
+            let instance = ChannelInstance::new(u64::from_be_bytes(p[1..9].try_into().unwrap()))
+                .ok_or(ChannelCodecError::Malformed)?;
+            let request_id = ResizeRequestId::new(u64::from_be_bytes(p[9..17].try_into().unwrap()))
+                .ok_or(ChannelCodecError::Malformed)?;
+            Ok(ClientRecord::ResizeRequest {
+                stream: p[0],
+                instance,
+                request_id,
+                cols: u16::from_be_bytes(p[17..19].try_into().unwrap()),
+                rows: u16::from_be_bytes(p[19..21].try_into().unwrap()),
+            })
         }
         REC_RESIZE => {
             if raw.payload.len() != 5 {
@@ -748,6 +795,9 @@ pub fn decode_client(raw: &RawRecord) -> Result<ClientRecord, ChannelCodecError>
 /// Encode a record the server sends on [`CONTROL_STREAM`].
 pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
     match rec {
+        ServerRecord::ProtocolError { code } => {
+            encode_record(REC_PROTOCOL_ERROR, &(*code as u16).to_be_bytes())
+        }
         ServerRecord::Opened { stream } => encode_record(REC_OPENED, &[*stream]),
         ServerRecord::Refused { stream, reason } => {
             let mut payload = Vec::with_capacity(1 + reason.len());
@@ -793,6 +843,16 @@ pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
 /// malformed payload does not.
 pub fn decode_server(raw: &RawRecord) -> Result<ServerRecord, ChannelCodecError> {
     match raw.kind {
+        REC_PROTOCOL_ERROR => {
+            let bytes: [u8; 2] = raw
+                .payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| ChannelCodecError::Malformed)?;
+            let code = ProtocolErrorCode::from_wire(u16::from_be_bytes(bytes))
+                .ok_or(ChannelCodecError::Malformed)?;
+            Ok(ServerRecord::ProtocolError { code })
+        }
         REC_OPENED => {
             if raw.payload.len() != 1 {
                 return Err(ChannelCodecError::Malformed);
@@ -1366,6 +1426,118 @@ mod tests {
             decode_server(&raw[3]),
             Ok(ServerRecord::Opened { stream: 16 }),
             "the record after the unknown ones still parses"
+        );
+    }
+}
+
+#[cfg(test)]
+mod geometry_codec_tests {
+    use super::*;
+
+    #[test]
+    fn resize_request_exact_wire() {
+        let bytes = [
+            0x16, 0, 0, 0, 21, 16, 1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1, 1, 255, 0, 24,
+        ];
+        for split in 0..=bytes.len() {
+            let mut parser = RecordDeframer::for_control();
+            let mut records = parser.push(&bytes[..split]);
+            records.extend(parser.push(&bytes[split..]));
+            assert_eq!(records.len(), 1);
+            let decoded = decode_client(&records[0]).expect("correlated resize must decode");
+            assert_eq!(encode_client(&decoded), bytes);
+        }
+    }
+
+    #[test]
+    fn protocol_error_exact_wire() {
+        let bytes = [0x28, 0, 0, 0, 2, 0, 1];
+        for split in 0..=bytes.len() {
+            let mut parser = RecordDeframer::for_control();
+            let mut records = parser.push(&bytes[..split]);
+            records.extend(parser.push(&bytes[split..]));
+            assert_eq!(records.len(), 1);
+            let decoded = decode_server(&records[0]).expect("protocol error must decode");
+            assert_eq!(encode_server(&decoded), bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod geometry_invalid_control_tests {
+    use super::*;
+
+    #[test]
+    fn resize_request_rejects_invalid_identity_but_preserves_sizes_for_refusal() {
+        let valid = vec![
+            16, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 80, 0, 24,
+        ];
+        let mut invalid = vec![];
+        for len in 0..21 {
+            invalid.push(valid[..len].to_vec());
+        }
+        invalid.push([valid.clone(), vec![0]].concat());
+        for range in [1..9, 9..17] {
+            let mut p = valid.clone();
+            p[range].fill(0);
+            invalid.push(p);
+        }
+        for stream in [0, 1, 14, 15] {
+            let mut p = valid.clone();
+            p[0] = stream;
+            invalid.push(p);
+        }
+        for payload in invalid {
+            assert_eq!(
+                decode_client(&RawRecord {
+                    kind: 0x16,
+                    payload
+                }),
+                Err(ChannelCodecError::Malformed)
+            );
+        }
+        for (cols, rows) in [(0, 0), (1, 24), (u16::MAX, u16::MAX)] {
+            let mut payload = valid.clone();
+            payload[17..19].copy_from_slice(&cols.to_be_bytes());
+            payload[19..21].copy_from_slice(&rows.to_be_bytes());
+            assert!(matches!(decode_client(&RawRecord { kind: 0x16, payload }),
+                Ok(ClientRecord::ResizeRequest { cols: c, rows: r, .. }) if (c, r) == (cols, rows)));
+        }
+    }
+
+    #[test]
+    fn protocol_error_rejects_unknown_code_and_nonexact_length() {
+        for payload in [
+            vec![],
+            vec![1],
+            vec![0, 0],
+            vec![0, 2],
+            vec![255, 255],
+            vec![0, 1, 0],
+        ] {
+            assert_eq!(
+                decode_server(&RawRecord {
+                    kind: 0x28,
+                    payload
+                }),
+                Err(ChannelCodecError::Malformed)
+            );
+        }
+        assert_eq!(
+            decode_server(&RawRecord {
+                kind: 0x28,
+                payload: vec![0, 1]
+            }),
+            Ok(ServerRecord::ProtocolError {
+                code: ProtocolErrorCode::ResizePipelineOverflow
+            })
+        );
+        assert_eq!(
+            decode_server(&RawRecord {
+                kind: 255,
+                payload: vec![]
+            }),
+            Err(ChannelCodecError::UnknownKind(255))
         );
     }
 }
