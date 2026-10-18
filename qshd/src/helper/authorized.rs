@@ -3,12 +3,14 @@
 //! The helper is root, so it could simply open the file. It deliberately
 //! does not: it switches its EFFECTIVE identity to the account first --
 //! user, group, AND supplementary groups -- and lets the kernel decide.
-//! That way the permission checks, the symlink resolution and every
-//! directory on the path are evaluated with the account's own rights -- so
-//! a link planted in a world-writable directory and pointing at somebody
-//! else's key file cannot be followed on root's authority. It is also the
-//! only thing that works on a home directory mounted over NFS with root
-//! squashed.
+//! Every opened directory from `/` and the regular-file leaf must be owned
+//! by root or that account, and not writable by group or others. Symlinks
+//! and ambiguous path syntax are refused. Owned directory descriptors anchor
+//! each next lookup; the leaf is read through the descriptor validated by
+//! fstat. This preserves object identity across pathname replacement, not
+//! immutable contents or permissions: root, the account and filesystem
+//! authority remain trusted. Account-credential access also works with
+//! root-squashed NFS homes without reading on root's authority.
 //!
 //! All three of user, group and supplementary groups move, not just the
 //! user. An earlier version of this module switched only the effective
@@ -85,7 +87,7 @@
 
 use std::fmt;
 use std::io::Read;
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
 use nix::fcntl::{self, OFlag};
@@ -188,7 +190,7 @@ impl Drop for EffectiveIdentity {
     }
 }
 
-/// The exact `open` flags [`read_regular_file_bounded`] uses. Pulled out
+/// The exact flags used when opening an authorization leaf. Pulled out
 /// into a named constant, rather than written inline at the one call site,
 /// specifically so this module's own fork-based test can reference the
 /// SAME value (as a plain integer, computed once before the fork -- see
@@ -220,46 +222,153 @@ impl Drop for EffectiveIdentity {
 const OPEN_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_NONBLOCK)
     .union(OFlag::O_CLOEXEC)
-    .union(OFlag::O_NOCTTY);
+    .union(OFlag::O_NOCTTY)
+    .union(OFlag::O_NOFOLLOW);
 
-/// Open `path` under whatever identity is currently effective, refuse
-/// anything that is not a regular file, and read at most
-/// [`MAX_AUTHORIZED_KEYS_BYTES`] bytes -- see this module's docs for why
-/// both of those matter. `Ok(None)` means the file does not exist, which
-/// `read_for` turns into an empty result rather than an error.
-///
-/// `pub(super)`: visible to the rest of `helper`, not wider -- `server`'s
-/// own tests build a `read_keys_plainly` that reads the same file with the
-/// same bounds but never switches identity (`read_for` always calls
-/// `setgroups`, which needs `CAP_SETGID` even to "become yourself" and so
-/// cannot run unprivileged), reusing this function and [`to_key_text`]
-/// rather than a hand-copied duplicate that could drift from the real
-/// bounds over time.
+/// Keep the kernel's old full-path work bound even though traversal is now
+/// component-wise. Inspect raw bytes: Path::components normalizes dot segments.
+fn absolute_components(path: &Path) -> std::io::Result<Vec<&std::ffi::OsStr>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    if !bytes.starts_with(b"/")
+        || bytes.ends_with(b"/")
+        || bytes.len() >= 4096
+        || bytes.contains(&0)
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            "authorized_keys requires an absolute file path shorter than 4096 bytes, without NUL or trailing slash"));
+    }
+    let mut components = Vec::new();
+    for part in bytes
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty())
+    {
+        if part == b"." || part == b".." {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "authorized_keys path must not contain dot or parent components",
+            ));
+        }
+        components.push(std::ffi::OsStr::from_bytes(part));
+    }
+    Ok(components)
+}
+
+fn validate_object(fd: std::os::fd::RawFd, uid: Uid, kind: SFlag) -> std::io::Result<()> {
+    let metadata = stat::fstat(fd).map_err(std::io::Error::from)?;
+    if metadata.st_mode & SFlag::S_IFMT.bits() != kind.bits() {
+        let reason = if kind == SFlag::S_IFREG {
+            "not a regular file"
+        } else {
+            "not a directory"
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            reason,
+        ));
+    }
+    if metadata.st_uid != 0 && metadata.st_uid != uid.as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "authorized_keys object has an untrusted owner",
+        ));
+    }
+    if metadata.st_mode & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "authorized_keys object is writable by group or others",
+        ));
+    }
+    Ok(())
+}
+
+const DIRECTORY_FLAGS: OFlag = OFlag::O_PATH
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_CLOEXEC);
+
+/// The descriptor, rather than its old pathname, anchors the next lookup.
+struct TrustedDirectory(std::fs::File);
+
+impl TrustedDirectory {
+    fn from_fd(fd: std::os::fd::RawFd, uid: Uid) -> std::io::Result<Self> {
+        // SAFETY: the successful open transfers its sole descriptor immediately.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        validate_object(file.as_raw_fd(), uid, SFlag::S_IFDIR)?;
+        Ok(Self(file))
+    }
+
+    fn root(uid: Uid) -> std::io::Result<Self> {
+        let fd = fcntl::open(Path::new("/"), DIRECTORY_FLAGS, stat::Mode::empty())?;
+        Self::from_fd(fd, uid)
+    }
+
+    fn child(&self, name: &std::ffi::OsStr, uid: Uid) -> std::io::Result<Self> {
+        let fd = fcntl::openat(
+            Some(self.0.as_raw_fd()),
+            name,
+            DIRECTORY_FLAGS,
+            stat::Mode::empty(),
+        )?;
+        Self::from_fd(fd, uid)
+    }
+
+    fn leaf(&self, name: &std::ffi::OsStr, uid: Uid) -> std::io::Result<std::fs::File> {
+        let fd = fcntl::openat(
+            Some(self.0.as_raw_fd()),
+            name,
+            OPEN_FLAGS,
+            stat::Mode::empty(),
+        )?;
+        // SAFETY: immediately own the new fd, including on validation failure.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        validate_object(file.as_raw_fd(), uid, SFlag::S_IFREG)?;
+        Ok(file)
+    }
+}
+
+/// All components come from absolute_components, so no openat argument can
+/// escape this descriptor through slashes, dot or parent segments.
+fn read_beneath(
+    mut dir: TrustedDirectory,
+    components: &[&std::ffi::OsStr],
+    uid: Uid,
+) -> std::io::Result<Option<String>> {
+    let (leaf, parents) = components.split_last().expect("validated file path");
+    for name in parents {
+        dir = match dir.child(name, uid) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+    match dir.leaf(leaf, uid) {
+        Ok(file) => read_opened_regular_file(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_trusted_file(path: &Path, uid: Uid) -> std::io::Result<Option<String>> {
+    let components = absolute_components(path)?;
+    read_beneath(TrustedDirectory::root(uid)?, &components, uid)
+}
+
+/// Explicit test-only byte-reader mock for helper protocol tests. It bypasses
+/// identity and path-trust policy, and cannot be selected by production.
+#[cfg(test)]
 pub(super) fn read_regular_file_bounded(path: &Path) -> std::io::Result<Option<String>> {
-    // `O_NONBLOCK`: opening a FIFO for reading alone blocks until some
-    // process opens it for writing. An account can put a FIFO at its own
-    // key path, and this helper is single-threaded, so a blocking `open`
-    // here would stop it from serving every login on the machine, not
-    // just this account's, forever. `O_NONBLOCK` makes `open` return
-    // immediately no matter what is at the other end; `fstat` right after
-    // is what actually tells a FIFO (or a device, or a socket) apart from
-    // a regular file, and refuses it before a single byte is read.
-    //
-    // `O_NOCTTY`: see [`OPEN_FLAGS`]'s own docs -- without it, opening a
-    // terminal device here could make it this (possibly session-leader,
-    // possibly controlling-terminal-less) process's controlling terminal.
     let fd = match fcntl::open(path, OPEN_FLAGS, stat::Mode::empty()) {
         Ok(fd) => fd,
         Err(nix::errno::Errno::ENOENT) => return Ok(None),
-        Err(e) => return Err(std::io::Error::from(e)),
+        Err(error) => return Err(error.into()),
     };
-    // SAFETY: `fd` was just returned by `open` above and nothing else has
-    // a copy of it. Wrapping it in a `File` immediately, rather than
-    // juggling the raw descriptor by hand, is what makes every exit path
-    // below -- including the early returns -- close it via the ordinary
-    // `Drop` glue.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: this is the sole owner of the descriptor just opened above.
+    read_opened_regular_file(unsafe { std::fs::File::from_raw_fd(fd) })
+}
 
+fn read_opened_regular_file(mut file: std::fs::File) -> std::io::Result<Option<String>> {
+    let fd = file.as_raw_fd();
     let metadata = stat::fstat(fd).map_err(std::io::Error::from)?;
     if metadata.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFREG.bits() {
         return Err(std::io::Error::new(
@@ -268,10 +377,9 @@ pub(super) fn read_regular_file_bounded(path: &Path) -> std::io::Result<Option<S
         ));
     }
 
-    // Back to ordinary blocking mode before anything reads from it: a
-    // regular file never blocks on `read` regardless of this flag, but
-    // there is no reason to leave a nonblocking descriptor as a surprise
-    // for whatever touches it next.
+    // Regular-file and network-filesystem I/O can still block. The verifier
+    // child timeout bounds the attempt; O_NONBLOCK only prevents FIFO open
+    // from waiting for a writer before the type check above.
     fcntl::fcntl(fd, fcntl::FcntlArg::F_SETFL(OFlag::empty())).map_err(std::io::Error::from)?;
 
     let mut buf = Vec::new();
@@ -289,7 +397,7 @@ pub(super) fn read_regular_file_bounded(path: &Path) -> std::io::Result<Option<S
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Turn what [`read_regular_file_bounded`] found into `read_for`'s result:
+/// Turn what the bounded reader found into `read_for`'s result:
 /// a missing file is not an error (an account that has added no key admits
 /// nobody, which is a policy, not a failure), and any other read failure
 /// becomes an [`AuthorizedError::Read`] naming the path. Split out from
@@ -298,8 +406,7 @@ pub(super) fn read_regular_file_bounded(path: &Path) -> std::io::Result<Option<S
 /// the rest of `read_for` cannot exercise without root (see this module's
 /// docs and `qshd/tests/authorized_keys_privilege.rs`).
 ///
-/// `pub(super)`: see [`read_regular_file_bounded`]'s docs -- widened for the
-/// same test-only reader, no wider.
+/// Shared with the explicit test-only protocol reader.
 pub(super) fn to_key_text(
     found: std::io::Result<Option<String>>,
     path: &Path,
@@ -320,12 +427,259 @@ pub(super) fn to_key_text(
 pub fn read_for(account: &Account, template: &str) -> Result<String, AuthorizedError> {
     let path = super::account::expand_template(template, account);
     let _as_them = EffectiveIdentity::become_account(account)?;
-    to_key_text(read_regular_file_bounded(&path), &path)
+    to_key_text(read_trusted_file(&path, account.uid), &path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn safe_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        set_mode(dir.path(), 0o700);
+        dir
+    }
+
+    fn write_safe(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+        std::fs::write(path.as_ref(), bytes)?;
+        set_mode(path.as_ref(), 0o644);
+        Ok(())
+    }
+
+    fn create_safe_dir(path: impl AsRef<Path>) -> std::io::Result<()> {
+        std::fs::create_dir(path.as_ref())?;
+        set_mode(path.as_ref(), 0o755);
+        Ok(())
+    }
+
+    // This anchor is test-only: it proves descendant traversal, not production
+    // root trust. Production always obtains its anchor from root().
+    fn anchor(path: &Path) -> TrustedDirectory {
+        let fd = fcntl::open(path, DIRECTORY_FLAGS, stat::Mode::empty()).unwrap();
+        TrustedDirectory::from_fd(fd, Uid::effective()).unwrap()
+    }
+
+    fn anchored_read(dir: &Path, relative: &str) -> std::io::Result<Option<String>> {
+        let absolute = std::path::PathBuf::from(format!("/{relative}"));
+        let components = absolute_components(&absolute)?;
+        read_beneath(anchor(dir), &components, Uid::effective())
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn each_writable_ancestor_is_refused_before_reading_or_missing_leaf() {
+        let dir = safe_tempdir();
+        let higher = dir.path().join("higher");
+        let parent = higher.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        set_mode(&higher, 0o755);
+        set_mode(&parent, 0o755);
+        write_safe(parent.join("keys"), "safe").unwrap();
+        for object in [&higher, &parent] {
+            for mode in [0o775, 0o757] {
+                assert_eq!(
+                    anchored_read(dir.path(), "higher/parent/keys")
+                        .unwrap()
+                        .as_deref(),
+                    Some("safe")
+                );
+                set_mode(object, mode);
+                for leaf in ["keys", "missing"] {
+                    let error =
+                        anchored_read(dir.path(), &format!("higher/parent/{leaf}")).unwrap_err();
+                    assert!(
+                        error.to_string().contains("writable by group or others"),
+                        "{error}"
+                    );
+                }
+                set_mode(object, 0o755);
+            }
+        }
+    }
+
+    #[test]
+    fn symlinks_are_refused_for_leaf_directory_and_loop() {
+        use std::os::unix::fs::symlink;
+        let dir = safe_tempdir();
+        create_safe_dir(dir.path().join("safe")).unwrap();
+        write_safe(dir.path().join("safe/keys"), "safe").unwrap();
+        assert_eq!(
+            anchored_read(dir.path(), "safe/keys").unwrap().as_deref(),
+            Some("safe")
+        );
+        symlink("safe/keys", dir.path().join("leaf")).unwrap();
+        symlink("safe", dir.path().join("parent")).unwrap();
+        symlink("loop", dir.path().join("loop")).unwrap();
+        for path in ["leaf", "parent/keys", "loop", "loop/keys"] {
+            assert!(anchored_read(dir.path(), path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn repeated_success_and_refusal_close_every_descriptor() {
+        const CHILD: &str = "QSHD_TEST_AUTHORIZED_FD_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "helper::authorized::tests::repeated_success_and_refusal_close_every_descriptor", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("descriptor checks completed"));
+            return;
+        }
+        // A fresh test process excludes unrelated concurrent fd activity.
+        let dir = safe_tempdir();
+        write_safe(dir.path().join("keys"), "safe").unwrap();
+        write_safe(dir.path().join("unsafe"), "unsafe").unwrap();
+        set_mode(&dir.path().join("unsafe"), 0o666);
+        std::os::unix::fs::symlink("keys", dir.path().join("link")).unwrap();
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = count();
+        for _ in 0..256 {
+            assert_eq!(
+                anchored_read(dir.path(), "keys").unwrap().as_deref(),
+                Some("safe")
+            );
+            assert!(anchored_read(dir.path(), "missing").unwrap().is_none());
+            assert!(anchored_read(dir.path(), "unsafe").is_err());
+            assert!(anchored_read(dir.path(), "link").is_err());
+        }
+        assert_eq!(count(), before);
+        println!("descriptor checks completed");
+    }
+
+    #[test]
+    fn path_syntax_is_checked_before_normalization() {
+        for path in [
+            "",
+            "keys",
+            "/",
+            "//",
+            "/keys/",
+            "/./keys",
+            "/a/../keys",
+            "/a/.",
+            "/a/..",
+            "/a\0b",
+        ] {
+            assert!(absolute_components(Path::new(path)).is_err(), "{path:?}");
+        }
+        assert!(absolute_components(Path::new(&format!("/{}", "a".repeat(4095)))).is_err());
+        assert_eq!(
+            absolute_components(Path::new("//a///keys")).unwrap(),
+            vec![std::ffi::OsStr::new("a"), std::ffi::OsStr::new("keys")]
+        );
+    }
+
+    #[test]
+    fn production_root_walk_refuses_private_keys_below_tmp() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        set_mode(dir.path(), 0o700);
+        let path = dir.path().join("keys");
+        write_safe(&path, "safe").unwrap();
+        assert_eq!(
+            anchored_read(dir.path(), "keys").unwrap().as_deref(),
+            Some("safe")
+        );
+        let error = read_trusted_file(&path, Uid::effective()).unwrap_err();
+        assert!(
+            error.to_string().contains("writable by group or others"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn opened_directory_is_not_redirected_by_path_replacement() {
+        let dir = safe_tempdir();
+        let parent = dir.path().join("parent");
+        create_safe_dir(&parent).unwrap();
+        write_safe(parent.join("keys"), "original").unwrap();
+        let opened = anchor(dir.path())
+            .child(std::ffi::OsStr::new("parent"), Uid::effective())
+            .unwrap();
+        std::fs::rename(&parent, dir.path().join("moved")).unwrap();
+        create_safe_dir(&parent).unwrap();
+        write_safe(parent.join("keys"), "replacement").unwrap();
+        set_mode(&parent, 0o777);
+        assert_eq!(
+            read_beneath(opened, &[std::ffi::OsStr::new("keys")], Uid::effective())
+                .unwrap()
+                .as_deref(),
+            Some("original")
+        );
+        assert!(anchored_read(dir.path(), "parent/keys").is_err());
+    }
+
+    #[test]
+    fn opened_leaf_metadata_and_bytes_survive_path_replacement() {
+        let dir = safe_tempdir();
+        let path = dir.path().join("keys");
+        write_safe(&path, "original").unwrap();
+        let opened = anchor(dir.path())
+            .leaf(std::ffi::OsStr::new("keys"), Uid::effective())
+            .unwrap();
+        let inode = stat::fstat(opened.as_raw_fd()).unwrap().st_ino;
+        std::fs::rename(&path, dir.path().join("moved")).unwrap();
+        write_safe(&path, "replacement").unwrap();
+        set_mode(&path, 0o666);
+        if Uid::effective().is_root()
+            && std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref() == Ok("1")
+        {
+            std::os::unix::fs::chown(&path, Some(61002), Some(61002)).unwrap();
+        }
+        assert_eq!(stat::fstat(opened.as_raw_fd()).unwrap().st_ino, inode);
+        assert_eq!(
+            read_opened_regular_file(opened).unwrap().as_deref(),
+            Some("original")
+        );
+        assert!(anchored_read(dir.path(), "keys").is_err());
+    }
+
+    #[test]
+    fn trusted_leaf_keeps_type_size_and_utf8_bounds() {
+        let dir = safe_tempdir();
+        assert!(anchored_read(dir.path(), "missing/keys").unwrap().is_none());
+        let path = dir.path().join("keys");
+        write_safe(&path, vec![b'a'; MAX_AUTHORIZED_KEYS_BYTES as usize]).unwrap();
+        assert_eq!(
+            anchored_read(dir.path(), "keys").unwrap().unwrap().len(),
+            MAX_AUTHORIZED_KEYS_BYTES as usize
+        );
+        write_safe(&path, vec![b'a'; MAX_AUTHORIZED_KEYS_BYTES as usize + 1]).unwrap();
+        assert!(anchored_read(dir.path(), "keys")
+            .unwrap_err()
+            .to_string()
+            .contains("larger than"));
+        write_safe(&path, [0xff]).unwrap();
+        assert_eq!(
+            anchored_read(dir.path(), "keys").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        std::fs::remove_file(&path).unwrap();
+        create_safe_dir(&path).unwrap();
+        assert!(anchored_read(dir.path(), "keys")
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(anchored_read(dir.path(), "keys").is_err());
+        std::fs::remove_file(&path).unwrap();
+        nix::unistd::mkfifo(&path, stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(anchored_read(dir.path(), "keys").is_err()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap());
+    }
 
     // Every test below exercises `read_regular_file_bounded` and
     // `to_key_text` directly rather than `read_for`. That is not a
@@ -356,6 +710,24 @@ mod tests {
             .expect("read")
             .expect("the file exists");
         assert!(text.contains("ssh-ed25519"));
+    }
+
+    #[test]
+    fn group_writable_authorization_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = safe_tempdir();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, "attacker key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            anchored_read(dir.path(), "keys").unwrap().as_deref(),
+            Some("attacker key")
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            anchored_read(dir.path(), "keys").is_err(),
+            "group-writable authorization must be refused"
+        );
     }
 
     /// A missing file reads as `None`, not an error -- `to_key_text` below

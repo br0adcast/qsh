@@ -519,3 +519,104 @@ fn the_daemon_refuses_to_start_without_its_pam_service_file() {
         },
     );
 }
+
+/// A valid signature is insufficient when another principal can edit the
+/// account's authorization source. Exercise the real helper, not its mock reader.
+#[test]
+fn attacker_controlled_authorization_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    common::on_a_disposable_host(
+        "attacker_controlled_authorization_is_refused",
+        WHAT_THESE_TESTS_DO,
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            let alice = common::TestAccount::create("qshd-test-alice", "/bin/sh");
+            let mallory = common::TestAccount::create("qshd-test-mallory", "/bin/sh");
+            let user = nix::unistd::User::from_name(&alice.name).unwrap().unwrap();
+            let ssh = user.dir.join(".ssh");
+            let keys = ssh.join("authorized_keys");
+            common::install_service_file(include_str!("../../packaging/pam.d/qshd.debian"));
+            let (_daemon, server_pub, port) = common::start_daemon_for_accounts(dir.path());
+            let prove_alice = || {
+                assert_shell_ran_as(
+                    &alice,
+                    &common::run_one_command_in_a_shell(
+                        port,
+                        server_pub,
+                        &alice.key,
+                        &alice.name,
+                        WHO_AM_I,
+                    ),
+                );
+            };
+            prove_alice();
+            // Permit Mallory to traverse the fixture and change only the leaf.
+            std::fs::set_permissions(&user.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let public = mallory.key.public_key().to_openssh().unwrap();
+            let log = common::daemon_log_path();
+            let refuse_mallory = |reason: &str| {
+                let before = common::log_mentions(&log, reason);
+                let session = common::Session::connect(port, server_pub, &mallory.key, &alice.name);
+                session.request_channel(None);
+                assert!(
+                    common::wait_until(
+                        || session.saw_opened() || common::log_mentions(&log, reason) > before
+                    ),
+                    "no authorization verdict: {:?}",
+                    std::fs::read_to_string(&log)
+                );
+                assert!(
+                    !session.saw_opened(),
+                    "Mallory's correctly signed proof must not authorize Alice"
+                );
+                assert!(common::log_mentions(&log, reason) > before);
+            };
+            // Run the actual write as Mallory; neither root nor Alice plants the key.
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o666)).unwrap();
+            common::run_account_command_or_panic(
+                "runuser",
+                &[
+                    "-u",
+                    &mallory.name,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "printf '%s\n' \"$1\" > \"$2\"",
+                    "sh",
+                    &public,
+                    keys.to_str().unwrap(),
+                ],
+            );
+            refuse_mallory("writable by group or others");
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&keys, alice.key.public_key().to_openssh().unwrap()).unwrap();
+            prove_alice();
+            // Independently replace the leaf through an unsafe parent. The new
+            // Mallory-owned leaf is readable, but the parent must refuse first.
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o777)).unwrap();
+            common::run_account_command_or_panic(
+                "runuser",
+                &[
+                    "-u",
+                    &mallory.name,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "rm -- \"$2\" && umask 022 && printf '%s\n' \"$1\" > \"$2\"",
+                    "sh",
+                    &public,
+                    keys.to_str().unwrap(),
+                ],
+            );
+            refuse_mallory("writable by group or others");
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            refuse_mallory("untrusted owner");
+            std::os::unix::fs::chown(&keys, Some(user.uid.as_raw()), Some(user.gid.as_raw()))
+                .unwrap();
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::write(&keys, alice.key.public_key().to_openssh().unwrap()).unwrap();
+            prove_alice();
+        },
+    );
+}

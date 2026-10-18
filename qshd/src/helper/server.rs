@@ -5497,12 +5497,13 @@ pub(crate) mod tests {
 
     // -- Request::Verify: the helper checks a client's proof itself -------
 
-    /// Test-only key reader: the same file, the same bounds, no identity
-    /// switch. The real reader, `authorized::read_for`, always calls
+    /// Explicit protocol-test mock: bounded bytes without identity switching
+    /// or path-trust validation. It does not prove production authorization.
+    /// The real reader, `authorized::read_for`, always calls
     /// `setgroups`, which needs `CAP_SETGID` even to "become yourself" --
     /// so it cannot run unprivileged. The switch itself is proven under
-    /// root in `qshd/tests/authorized_keys_privilege.rs` and end to end in
-    /// a later task.
+    /// root in `qshd/tests/authorized_keys_privilege.rs`; real daemon attack
+    /// rejection is exercised in `system_mode_accounts.rs`.
     fn read_keys_plainly(account: &Account, template: &str) -> Result<String, AuthorizedError> {
         let path = super::account::expand_template(template, account);
         super::authorized::to_key_text(super::authorized::read_regular_file_bounded(&path), &path)

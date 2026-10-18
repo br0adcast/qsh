@@ -70,16 +70,15 @@ fn qshd_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_qshd"))
 }
 
-/// Where this suite's `authorized_keys` lives for a daemon started over
-/// `dir`: `<dir>/.ssh/authorized_keys`, an absolute path.
-///
-/// `start_daemon` hands the daemon this path as its
-/// `--authorized-keys-template`, with no placeholder in it, so the helper
-/// reads this one file for whichever account logs in. `$HOME` would not
-/// do: the helper reads an account's home from `passwd`, never from its own
-/// environment, and root's real home is no place for a test's key.
+/// Keep authorization sources below safe root-owned ancestors. The rest of
+/// each daemon's state remains in its ordinary temporary directory. These
+/// fixtures exist only inside the disposable container and disappear with it.
 pub(crate) fn authorized_keys_path(dir: &Path) -> PathBuf {
-    dir.join(".ssh").join("authorized_keys")
+    assert!(Uid::effective().is_root());
+    assert_eq!(std::env::var(DISPOSABLE_HOST_VAR).as_deref(), Ok("1"));
+    Path::new("/var/lib/qshd-test-keys")
+        .join(dir.file_name().expect("unique test directory"))
+        .join("authorized_keys")
 }
 
 /// Writes `key`'s public half as the sole line of a fresh `authorized_keys`
@@ -88,7 +87,12 @@ pub(crate) fn write_authorized_keys(dir: &Path, key: &PrivateKey) -> PathBuf {
     let path = authorized_keys_path(dir);
     std::fs::create_dir_all(path.parent().expect("the path has a parent"))
         .expect("create .ssh directory");
+    for parent in [Path::new("/var/lib/qshd-test-keys"), path.parent().unwrap()] {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let mut f = std::fs::File::create(&path).expect("create authorized_keys");
+    f.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .unwrap();
     writeln!(
         f,
         "{}",
@@ -991,6 +995,16 @@ pub(crate) fn write_authorized_keys_for_account(home: &Path, uid: Uid, gid: Gid,
         std::os::unix::fs::chown(path, Some(uid.as_raw()), Some(gid.as_raw()))
             .unwrap_or_else(|e| panic!("chown {}: {e}", path.display()));
     };
+
+    // NSS homes are real authorization paths. Keep this precondition explicit
+    // so a fixture cannot pass by being refused before the intended check.
+    use std::os::unix::fs::MetadataExt;
+    for ancestor in home.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).unwrap();
+        assert!(metadata.is_dir());
+        assert!(metadata.uid() == 0 || metadata.uid() == uid.as_raw());
+        assert_eq!(metadata.mode() & 0o022, 0);
+    }
 
     let ssh_dir = home.join(".ssh");
     std::fs::create_dir(&ssh_dir).unwrap_or_else(|e| panic!("create {}: {e}", ssh_dir.display()));
