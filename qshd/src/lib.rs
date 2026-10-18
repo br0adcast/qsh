@@ -73,73 +73,8 @@ pub mod transport_daemon;
 pub mod update;
 pub mod version;
 
-use std::io::Write;
-use std::path::Path;
-
-use anyhow::{bail, Context, Result};
-
-/// Provides a persistent server Noise key in the `path` file: loads it if
-/// present, generates and saves one if not (with owner-only permissions).
-/// The file holds 64 raw bytes -- 32 bytes of the X25519 private key,
-/// followed by 32 bytes of the corresponding public key. The public part
-/// is kept alongside the private one so we don't need a separate crypto
-/// dependency to derive it; that's enough for the diagnostic echo. Key
-/// stability across runs matters: the client pins `server-pubkey` like an
-/// SSH host key.
-///
-/// Lives here (the library crate) rather than in `main.rs` (the binary
-/// crate) because [`serve`] needs to call it too, and a binary crate can
-/// depend on its own library crate but not the other way around.
-pub fn load_or_create_transport_key(path: &Path) -> Result<transport::handshake::Keypair> {
-    if path.exists() {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if bytes.len() != 64 {
-            bail!(
-                "key file {} is corrupt: expected 64 bytes, found {}",
-                path.display(),
-                bytes.len()
-            );
-        }
-        let mut private = [0u8; 32];
-        let mut public = [0u8; 32];
-        private.copy_from_slice(&bytes[..32]);
-        public.copy_from_slice(&bytes[32..]);
-        return Ok(transport::handshake::Keypair { private, public });
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory {}", parent.display()))?;
-    }
-    let keypair = transport::handshake::generate_keypair();
-    let mut buf = Vec::with_capacity(64);
-    buf.extend_from_slice(&keypair.private);
-    buf.extend_from_slice(&keypair.public);
-    // The private key is created atomically with 0600 permissions already
-    // set: the file must not exist even for an instant with umask-readable
-    // permissions between creation and chmod. Same intent as
-    // `state.rs`/`log.rs` (restrict_to_owner), but the permissions are set
-    // at creation time rather than after the fact. `create_new` is only
-    // the creation branch (an existing key was already read above via
-    // `path.exists()`).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        f.write_all(&buf)
-            .with_context(|| format!("writing {}", path.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, &buf).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(keypair)
-}
+mod host_key;
+pub use host_key::load_or_create_transport_key;
 
 /// The personal mode's source of handshake nonces -- one fresh, locally
 /// minted value per handshake, with no privileged helper involved.

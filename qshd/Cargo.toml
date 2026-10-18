@@ -21,8 +21,6 @@ logging = { path = "../crates/logging" }
 transport = { path = "../crates/transport", features = ["tokio-driver"] }
 sshauth = { path = "../crates/sshauth" }
 terminal = { path = "../crates/terminal" }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
 tempfile = "3"
 
 [features]
