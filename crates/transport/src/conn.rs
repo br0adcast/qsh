@@ -19,7 +19,7 @@ use crate::features::Features;
 use crate::handshake::{Handshake, TransportKeys};
 use crate::handshake_payload::{
     encode_msg1, encode_msg2, encode_msg2_without_tail, parse_msg1, parse_msg2, AuthMethod,
-    Msg1Payload, StartKind, SESSION_TOKEN_LEN,
+    HsPayloadError, Msg1Payload, StartKind, SESSION_TOKEN_LEN,
 };
 use crate::paths::{PathTable, RoadInfo, PROBE_URGENT};
 use crate::reliability::{StreamFrame, StreamReceiver, StreamSender};
@@ -339,6 +339,9 @@ pub enum Event {
     /// violation (spec §5.2). Reported once; the connection closes, since
     /// reading msg2 spent the handshake.
     UnofferedFeatureEnabled { enabled: Features },
+    /// Client-side: an authenticated msg2 payload could not be parsed.
+    /// Reported once; reading msg2 spent the handshake, so the attempt closes.
+    InvalidHandshakeResponse { reason: HsPayloadError },
 }
 
 /// Outgoing datagram: where to send it and what to send.
@@ -2176,7 +2179,14 @@ impl Connection {
         };
         let msg2 = match parse_msg2(&payload) {
             Ok(m) => m,
-            Err(_) => return out, // unknown version or malformed -- ignore
+            Err(reason) => {
+                // Authentication succeeded and consumed the initiator turn.
+                // A fresh attempt is required; retransmission cannot repair it.
+                self.handshake = None;
+                self.events.push(Event::InvalidHandshakeResponse { reason });
+                self.set_state(LinkState::Closed);
+                return out;
+            }
         };
         // Spec §5.2: a bit msg1 did not offer is a violation. Reading msg2
         // spent the handshake, so no later copy could be read either: say so
@@ -3691,6 +3701,93 @@ mod tests {
             );
             assert!(!events.contains(&Event::HandshakeDone));
             assert_eq!(client.state(), LinkState::Closed);
+        }
+    }
+
+    // Real Noise responders exercise the boundary between authentication and
+    // payload parsing; all keys are freshly generated test-only identities.
+    fn response_fixture(payload: &[u8]) -> (Connection, Vec<u8>, Instant, SocketAddr) {
+        let server = generate_keypair();
+        let client_key = generate_keypair();
+        let peer = addr("198.51.100.1:41000");
+        let now = Instant::now();
+        let mut client = Connection::new(ConnectionConfig {
+            features: Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: client_key.private,
+            remote_static_pub: Some(server.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        let init = client.start_session(now, peer, StartKind::Cold, [5; 16]);
+        let Frame::Handshake { body, .. } = parse(&init[0].bytes).unwrap() else {
+            panic!("msg1");
+        };
+        let mut responder = Handshake::new_responder(&server.private);
+        responder.read_msg(body).unwrap();
+        let response = encode_handshake(Kind::HandshakeResp, &responder.write_msg(payload));
+        client.poll_events();
+        (client, response, now, peer)
+    }
+
+    #[test]
+    fn authenticated_invalid_msg2_retires_attempt_without_flushing() {
+        for (payload, reason) in [
+            (vec![], HsPayloadError::BadVersion),
+            (vec![2; 30], HsPayloadError::BadVersion),
+            (vec![1; 8], HsPayloadError::TooShort),
+        ] {
+            let (mut client, response, now, peer) = response_fixture(&payload);
+            assert!(client.send(now, 0, b"pending application data").is_empty());
+            assert!(client.on_datagram(now, peer, &response).is_empty());
+            assert_eq!(client.state(), LinkState::Closed);
+            assert!(client.handshake.is_none());
+            assert!(client.keys.is_none());
+            let events = client.poll_events();
+            assert_eq!(events.len(), 2, "one error and one Closed: {events:?}");
+            assert_eq!(events[0], Event::InvalidHandshakeResponse { reason });
+            assert_eq!(events[1], Event::StateChanged(LinkState::Closed));
+            assert!(!events.contains(&Event::HandshakeDone));
+            assert!(client.on_datagram(now, peer, &response).is_empty());
+            assert!(client.on_timeout(now + Duration::from_secs(60)).is_empty());
+            assert!(client.poll_events().is_empty());
+
+            let (mut fresh, valid, now, peer) =
+                response_fixture(&encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::NONE));
+            fresh.on_datagram(now, peer, &valid);
+            assert_eq!(fresh.state(), LinkState::Live);
+            assert!(fresh.poll_events().contains(&Event::HandshakeDone));
+        }
+    }
+
+    #[test]
+    fn authenticated_legacy_msg2_lengths_remain_accepted() {
+        let full = encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::NONE);
+        for len in 9..=full.len() {
+            let (mut client, response, now, peer) = response_fixture(&full[..len]);
+            client.on_datagram(now, peer, &response);
+            assert_eq!(client.state(), LinkState::Live, "payload length {len}");
+            assert!(client.poll_events().contains(&Event::HandshakeDone));
+        }
+    }
+
+    #[test]
+    fn unauthenticated_msg2_does_not_poison_current_attempt() {
+        for invalid_kind in 0..3 {
+            let payload = encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::NONE);
+            let (mut client, valid, now, peer) = response_fixture(&payload);
+            let mut invalid = valid.clone();
+            match invalid_kind {
+                0 => *invalid.last_mut().unwrap() ^= 1,
+                1 => invalid.truncate(invalid.len() - 20),
+                // A valid response from an unrelated responder/initiator pair.
+                _ => invalid = response_fixture(&payload).1,
+            }
+            assert!(client.on_datagram(now, peer, &invalid).is_empty());
+            assert_eq!(client.state(), LinkState::Connecting);
+            assert!(client.poll_events().is_empty());
+            client.on_datagram(now, peer, &valid);
+            assert_eq!(client.state(), LinkState::Live, "case {invalid_kind}");
+            assert!(client.poll_events().contains(&Event::HandshakeDone));
         }
     }
 

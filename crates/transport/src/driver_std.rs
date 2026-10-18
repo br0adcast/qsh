@@ -1418,6 +1418,9 @@ fn dispatch_event(
                 "stream {stream_id}: send buffer over the hard cap, a producer ignores its send gate"
             );
         }
+        Event::InvalidHandshakeResponse { reason } => {
+            log::warn!("server sent an invalid authenticated handshake response: {reason}");
+        }
         Event::UnofferedFeatureEnabled { enabled } => {
             #[cfg(test)]
             UNOFFERED_LOGGED.with(|n| n.set(n.get() + 1));
