@@ -3277,6 +3277,12 @@ impl Connection {
             .or_insert_with(|| StreamState::new(stream_id, features))
     }
 
+    /// Exercise the inactive geometry bridge without advertising the capability.
+    #[cfg(test)]
+    pub(crate) fn enable_geometry_for_test(&mut self) {
+        self.apply_features(self.features | Features::CHANNEL_GEOMETRY);
+    }
+
     /// Take `features` as this connection's (spec §5.4): on every stream it
     /// has already -- a client may have queued bytes before its handshake
     /// ended -- as on those it makes later.

@@ -1,11 +1,44 @@
 //! Owned channel output between the runner and bounded Connection admission.
 use super::*;
+use crate::channel::{ChannelCodecError, ChannelSnapshot, DrainingChannel};
 use crate::channel_geometry::{ChannelInstance, GeometryOutcome, GeometryRecord, OutputGapCause};
 use crate::channel_timeline::{TimelineBudget, TimelinePermit, GEOMETRY_BYTES};
 use crate::shell_frame::{encode_shell, ShellRecord};
 
 const TURN_RECORDS: usize = 32;
 const TURN_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct SnapshotSlot {
+    generation: Option<u64>,
+    value: Option<ChannelSnapshot>,
+}
+#[derive(Clone, Default)]
+pub(super) struct SnapshotMailbox(Arc<Mutex<SnapshotSlot>>);
+impl SnapshotMailbox {
+    pub(super) fn publish(
+        &self,
+        generation: u64,
+        build: impl FnOnce() -> Result<ChannelSnapshot, ChannelCodecError>,
+    ) -> Result<bool, ChannelCodecError> {
+        let mut slot = self.0.lock().expect("resume snapshot");
+        if slot.generation.is_some_and(|old| old >= generation) {
+            return Ok(false);
+        }
+        // Release the old command storage before constructing a replacement.
+        // Together with the bridge admission slot, at most two snapshots live.
+        slot.value = None;
+        slot.generation = Some(generation);
+        slot.value = Some(build()?);
+        Ok(true)
+    }
+    fn take(&self, generation: u64) -> Option<ChannelSnapshot> {
+        let mut slot = self.0.lock().expect("resume snapshot");
+        (slot.generation == Some(generation))
+            .then(|| slot.value.take())
+            .flatten()
+    }
+}
 
 struct Queued {
     origin: AttachmentContext,
@@ -16,7 +49,7 @@ struct Queued {
 }
 enum Item {
     Record(ChannelOutput),
-    Exit(i32, TimelinePermit),
+    Exit(i32, crate::channel::OpenClassification, TimelinePermit),
 }
 struct Stream {
     instance: ChannelInstance,
@@ -40,6 +73,9 @@ struct Stream {
 }
 #[derive(Default)]
 pub(super) struct ChannelBridge {
+    pub(super) snapshots: SnapshotMailbox,
+    pending_snapshot: Option<ChannelSnapshot>,
+    snapshot_failed: bool,
     streams: BTreeMap<u8, Stream>,
     declarations: BTreeMap<u8, bool>,
     retired: BTreeMap<u8, u64>, // u8 namespace bounds tombstones, no per-Attach history.
@@ -238,6 +274,7 @@ impl ChannelBridge {
                 instance,
                 origin,
                 code,
+                open,
                 permit,
             } => {
                 if let Some(state) = self
@@ -248,7 +285,7 @@ impl ChannelBridge {
                     state.ended = true;
                     state.fifo.push_back(Queued {
                         origin,
-                        output: Item::Exit(code, permit),
+                        output: Item::Exit(code, open, permit),
                         charge: None,
                         offset: 0,
                         bound: None,
@@ -272,7 +309,7 @@ impl ChannelBridge {
                     self.delivered.remove(&stream);
                 }
             }
-            SessionOutbound::ResumeBarrier { generation } => self.barrier(generation),
+            SessionOutbound::ResumeBarrier { generation } => self.prepare_snapshot(generation),
             SessionOutbound::RepaintBarrier {
                 generation,
                 sequence,
@@ -295,6 +332,8 @@ impl ChannelBridge {
         state.fifo.push_back(queued);
     }
     pub(super) fn attach(&mut self, conn: &Connection, generation: u64) {
+        self.pending_snapshot = None;
+        self.snapshot_failed = false;
         self.generation = generation;
         self.target = Some(generation);
         self.hot_target = None;
@@ -324,7 +363,74 @@ impl ChannelBridge {
             state.gate.update(0);
         }
     }
-    pub(super) fn barrier(&mut self, generation: u64) {
+    fn prepare_snapshot(&mut self, generation: u64) {
+        if self.target != Some(generation) {
+            return;
+        }
+        let Some(snapshot) = self.snapshots.take(generation) else {
+            self.snapshot_failed = true;
+            return;
+        };
+        let (active, old_draining) = snapshot.into_parts();
+        for (stream, instance, ended) in active
+            .iter()
+            .map(|entry| (entry.request.stream, entry.instance, false))
+            .chain(
+                old_draining
+                    .iter()
+                    .map(|entry| (entry.stream, entry.instance, true)),
+            )
+        {
+            let Some(state) = self.streams.get_mut(&stream) else {
+                self.snapshot_failed = true;
+                return;
+            };
+            if state.instance != instance || (state.ended && !ended) {
+                self.snapshot_failed = true;
+                return;
+            }
+            state.ended |= ended;
+        }
+        // A fixed upper capacity avoids geometric Vec growth beyond the finite
+        // identity namespace while adding bridge-owned queued Exit descriptors.
+        let mut draining = Vec::with_capacity(crate::channel::CHANNEL_IDENTITIES);
+        draining.extend(old_draining);
+        for (&stream, state) in &self.streams {
+            for queued in &state.fifo {
+                let Item::Exit(_, open, _) = queued.output else {
+                    continue;
+                };
+                let entry = DrainingChannel {
+                    stream,
+                    instance: state.instance,
+                    open,
+                };
+                if active.iter().any(|a| a.request.stream == stream) {
+                    self.snapshot_failed = true;
+                    return;
+                }
+                if let Some(existing) = draining.iter().find(|d| d.stream == stream) {
+                    if *existing != entry {
+                        self.snapshot_failed = true;
+                        return;
+                    }
+                } else if active.len() + draining.len() < crate::channel::CHANNEL_IDENTITIES {
+                    draining.push(entry);
+                } else {
+                    self.snapshot_failed = true;
+                    return;
+                }
+            }
+        }
+        match ChannelSnapshot::new(active, draining) {
+            Ok(snapshot) => self.pending_snapshot = Some(snapshot),
+            Err(_) => self.snapshot_failed = true,
+        }
+    }
+    pub(super) fn receive_fenced(&self) -> bool {
+        self.pending_snapshot.is_some()
+    }
+    fn release_barrier(&mut self, generation: u64) {
         if self.target != Some(generation) {
             return;
         }
@@ -395,11 +501,43 @@ impl ChannelBridge {
         out: &mut Vec<Datagram>,
     ) -> bool {
         self.seal_ended(conn);
-        if parked || self.target.is_some() || conn.state() != LinkState::Live {
+        if self.snapshot_failed {
+            out.extend(conn.close(now));
+            return false;
+        }
+        if parked || conn.state() != LinkState::Live {
             return false;
         }
         let mut records = 0;
         let mut bytes = 0;
+        if let Some(snapshot) = &self.pending_snapshot {
+            let n = snapshot.payload_len() + 5;
+            if !Self::offset_fits(conn, crate::channel::CONTROL_STREAM, n)
+                || conn.stream_write_room(
+                    crate::channel::CONTROL_STREAM,
+                    crate::send_gate::PIPE_HIGH as usize,
+                ) < n
+            {
+                return false;
+            }
+            let encoded = snapshot.encode_record();
+            let Ok(datagrams) = conn.try_send_bounded(
+                now,
+                crate::channel::CONTROL_STREAM,
+                &encoded,
+                crate::send_gate::PIPE_HIGH as usize,
+            ) else {
+                return false;
+            };
+            out.extend(datagrams);
+            self.pending_snapshot = None;
+            self.release_barrier(self.generation);
+            records = 1;
+            bytes = n;
+        }
+        if self.target.is_some() {
+            return false;
+        }
         loop {
             let keys: Vec<_> = self.streams.keys().copied().collect();
             let mut progressed = false;
@@ -619,7 +757,7 @@ impl ChannelBridge {
                 }
                 encode_shell(&ShellRecord::EchoAck(*n)).unwrap()
             }
-            Item::Exit(code, _) => {
+            Item::Exit(code, _, _) => {
                 if room < 10 || conn.stream_progress(stream).unacked != 0 {
                     return Step::Blocked;
                 }
@@ -654,7 +792,7 @@ impl ChannelBridge {
                     return Step::Sent(n);
                 }
             }
-            Item::Exit(_, permit) => {
+            Item::Exit(_, _, permit) => {
                 let _ = permit;
             }
             _ => {}
@@ -697,6 +835,8 @@ mod tests {
         budget: TimelineBudget,
         frames: ShellDeframer,
         records: Vec<ShellRecord>,
+        control_frames: crate::shell_frame::RecordDeframer,
+        control_records: Vec<crate::channel::ServerRecord>,
         other_frames: BTreeMap<u8, ShellDeframer>,
         other_records: BTreeMap<u8, Vec<ShellRecord>>,
     }
@@ -719,6 +859,8 @@ mod tests {
                 budget: TimelineBudget::new(ChannelInstance::new(1).unwrap(), 0, |_| {}),
                 frames: ShellDeframer::new(),
                 records: Vec::new(),
+                control_frames: crate::shell_frame::RecordDeframer::for_control(),
+                control_records: Vec::new(),
                 other_frames: BTreeMap::new(),
                 other_records: BTreeMap::new(),
             }
@@ -791,6 +933,8 @@ mod tests {
             (self.client, self.server) = Self::pair(self.peer);
             self.frames = ShellDeframer::new();
             self.records.clear();
+            self.control_frames = crate::shell_frame::RecordDeframer::for_control();
+            self.control_records.clear();
             self.other_frames.clear();
             self.other_records.clear();
             self.budget
@@ -815,7 +959,19 @@ mod tests {
                     if let Event::StreamData { stream_id, data } = ev {
                         if stream_id == STREAM {
                             self.records.extend(self.frames.push(&data));
-                        } else if stream_id != crate::channel::CONTROL_STREAM {
+                        } else if stream_id == crate::channel::CONTROL_STREAM {
+                            self.control_records.extend(
+                                self.control_frames.push(&data).iter().filter_map(|raw| {
+                                    match crate::channel::decode_server(raw) {
+                                        Ok(record) => Some(record),
+                                        Err(crate::channel::ChannelCodecError::UnknownKind(_)) => {
+                                            None
+                                        }
+                                        Err(error) => panic!("malformed test control: {error:?}"),
+                                    }
+                                }),
+                            );
+                        } else {
                             self.other_records.entry(stream_id).or_default().extend(
                                 self.other_frames.entry(stream_id).or_default().push(&data),
                             );
@@ -834,6 +990,433 @@ mod tests {
             }
         }
     }
+    // Decode lifecycle metadata on a new Connection, without carrying any
+    // previous client's OPEN state across the attachment.
+    async fn fresh_attach_after_retained_runner_output(
+        ended_count: u8,
+        queue_exit: bool,
+        eof_held: bool,
+    ) -> Vec<crate::channel::ServerRecord> {
+        use crate::channel::{
+            encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, CONTROL_STREAM,
+        };
+        let ended = ended_count != 0;
+        let count = ended_count.max(1);
+        let mut rig = Rig::new();
+        rig.client.set_default_consumption(Consumption::Explicit);
+        let occupied = crate::shell_frame::encode_record(
+            crate::shell_frame::REC_DATA,
+            &vec![0; crate::reliability::STREAM_WINDOW as usize - 5],
+        );
+        let datagrams = rig.server.send(rig.now, STREAM, &occupied);
+        rig.pump(datagrams);
+        assert_eq!(
+            rig.server
+                .stream_write_room(STREAM, crate::send_gate::PIPE_HIGH as usize),
+            0
+        );
+        let spawner = crate::channel_server::tests::FakeSpawner::new();
+        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        rig.bridge.snapshots = io.resume_snapshots.clone();
+        let runner = tokio::spawn(crate::channel_server::run_channel_session(
+            io,
+            spawner.clone(),
+        ));
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            inbound
+                .send(SessionInbound::Live(rig.origin()))
+                .await
+                .unwrap();
+            let mut held = Vec::new();
+            for stream in STREAM..STREAM + count {
+                inbound
+                    .send(SessionInbound::Data(StreamData {
+                        stream_id: CONTROL_STREAM,
+                        data: encode_client(&ClientRecord::Open(OpenRequest {
+                            stream,
+                            kind: ChannelKind::Command,
+                            cols: if eof_held { 80 } else { 0 },
+                            rows: 24,
+                            screen: eof_held,
+                            command: b"fixture-command".to_vec(),
+                        })),
+                    }))
+                    .await
+                    .unwrap();
+                loop {
+                    let message = outbound.recv().await.unwrap();
+                    let saw_data = matches!(&message, SessionOutbound::ChannelOutput {
+                    output: ChannelOutput::Data(bytes), ..
+                } if bytes == b"hello from the shell");
+                    if matches!(message, SessionOutbound::ChannelOutput { .. }) {
+                        rig.bridge.push(message);
+                    }
+                    if saw_data {
+                        break;
+                    }
+                }
+                if ended {
+                    if eof_held {
+                        let state = &rig.bridge.streams[&stream];
+                        while let Some(permit) = state.budget.try_reserve(EntryClass::Ordinary, 27)
+                        {
+                            held.push(permit);
+                        }
+                        assert!(state.gate.is_open());
+                        rig.bridge.declare(stream, true);
+                    }
+                    spawner.end_channel(stream);
+                    if eof_held {
+                        while rig.bridge.streams[&stream].gate.is_open() {
+                            tokio::task::yield_now().await;
+                        }
+                        // EOF's final checkpoint cannot reserve an ordinary slot,
+                        // so the real runner still owns Channel, not PendingExit.
+                        assert_eq!(
+                            rig.bridge.streams[&stream]
+                                .budget
+                                .usage(EntryClass::Ordinary)
+                                .0,
+                            128
+                        );
+                        continue;
+                    }
+                    loop {
+                        let message = outbound.recv().await.unwrap();
+                        let saw_marker = matches!(
+                            message,
+                            SessionOutbound::ChannelOutput {
+                                output: ChannelOutput::DeliveryMarker(..),
+                                ..
+                            }
+                        );
+                        if matches!(message, SessionOutbound::ChannelOutput { .. }) {
+                            rig.bridge.push(message);
+                        }
+                        if saw_marker {
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(
+                !rig.drain(count > 1),
+                "old output stays credit-blocked or parked"
+            );
+            let retained = &rig.bridge.streams[&STREAM];
+            assert_eq!(retained.ended, ended && !eof_held);
+            assert!(retained.fifo.iter().any(|q| matches!(
+                &q.output, Item::Record(ChannelOutput::Data(bytes))
+                if bytes == b"hello from the shell" && q.charge.as_ref().unwrap().bytes > 0
+            )));
+            if queue_exit {
+                assert_eq!(ended_count, 1);
+                let credit = rig.client.on_consumed(
+                    rig.now,
+                    STREAM,
+                    crate::reliability::STREAM_WINDOW as usize,
+                );
+                let mut out = Vec::new();
+                for dg in credit {
+                    out.extend(rig.server.on_datagram(rig.now, rig.peer, &dg.bytes));
+                }
+                rig.pump(out);
+                rig.drain(false);
+                rig.drain(false);
+                let delivered = rig
+                    .bridge
+                    .notifications()
+                    .into_iter()
+                    .find(|event| matches!(event, SessionInbound::Delivered { stream: STREAM, .. }))
+                    .expect("the final prefix is acknowledged before the runner transfers Exit");
+                let fill = crate::shell_frame::encode_record(
+                    0x7f,
+                    &vec![0; crate::reliability::STREAM_WINDOW as usize - 5],
+                );
+                let out = rig.server.send(rig.now, CONTROL_STREAM, &fill);
+                rig.pump(out);
+                inbound.send(delivered).await.unwrap();
+                loop {
+                    let message = outbound.recv().await.unwrap();
+                    if matches!(message, SessionOutbound::ChannelExit { .. }) {
+                        rig.bridge.push(message);
+                        break;
+                    }
+                }
+                let held = rig.bridge.streams[&STREAM]
+                    .budget
+                    .usage(EntryClass::Lifecycle);
+                assert!(!rig.drain(false));
+                assert_eq!(
+                    rig.bridge.streams[&STREAM]
+                        .budget
+                        .usage(EntryClass::Lifecycle),
+                    held
+                );
+                assert!(matches!(
+                    rig.bridge.streams[&STREAM].fifo.front().unwrap().output,
+                    Item::Exit(0, _, _)
+                ));
+            }
+            rig.attach();
+            inbound
+                .send(SessionInbound::ResumeReset(rig.origin()))
+                .await
+                .unwrap();
+            loop {
+                match outbound.recv().await.unwrap() {
+                    message @ (SessionOutbound::ChannelOutput { .. }
+                    | SessionOutbound::ResumeBarrier { .. }) => rig.bridge.push(message),
+                    SessionOutbound::Data(data) if data.stream_id == CONTROL_STREAM => {
+                        let datagrams = rig.server.send(rig.now, CONTROL_STREAM, &data.data);
+                        rig.pump(datagrams);
+                    }
+                    _ => {}
+                }
+                rig.drain(false);
+                if rig
+                    .control_records
+                    .iter()
+                    .any(|r| matches!(r, ServerRecord::ChannelSnapshot(_)))
+                {
+                    break;
+                }
+            }
+            rig.drain(false);
+            assert!(matches!(rig.records.first(), Some(ShellRecord::Geometry(g))
+                if g.cols == if eof_held { 80 } else { 0 } && g.rows == 24));
+            if !queue_exit {
+                assert!(rig.records.iter().any(
+                    |r| matches!(r, ShellRecord::Data(bytes) if bytes == b"hello from the shell")
+                ));
+                for stream in STREAM + 1..STREAM + count {
+                    assert!(rig.other_records[&stream].iter().any(|r|
+                        matches!(r, ShellRecord::Data(bytes) if bytes == b"hello from the shell")
+                    ));
+                }
+            } else {
+                assert!(rig.control_records.iter().any(|r| matches!(
+                    r,
+                    ServerRecord::Exit {
+                        stream: STREAM,
+                        code: 0
+                    }
+                )));
+            }
+            if eof_held {
+                assert!(rig.bridge.streams[&STREAM].ended);
+                assert!(!held.is_empty());
+            }
+            rig.control_records.clone()
+        })
+        .await;
+        // Cleanup precedes the intentional RED assertion in the calling test.
+        drop(inbound);
+        spawner.end_channel(STREAM);
+        runner.await.unwrap();
+        observed.expect("runner and fresh connection reached the resume snapshot")
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_active_output_has_open_classification() {
+        let records = fresh_attach_after_retained_runner_output(0, false, false).await;
+        assert!(records.iter().any(|r| matches!(r,
+            crate::channel::ServerRecord::ChannelSnapshot(snapshot) if snapshot.draining().is_empty() && snapshot.active().iter().any(|entry| { let req = &entry.request;
+                req.stream == STREAM && req.cols == 0 && req.rows == 24
+                && req.kind == crate::channel::ChannelKind::Command
+                && req.command == b"fixture-command"
+            })
+        )));
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_retained_final_output_requires_open_classification() {
+        let records = fresh_attach_after_retained_runner_output(1, false, false).await;
+        let classification = records.iter().find_map(|r| match r {
+            crate::channel::ServerRecord::ChannelSnapshot(snapshot) => {
+                assert!(snapshot.active().is_empty(), "ended process is not active");
+                snapshot
+                    .draining()
+                    .iter()
+                    .find(|entry| entry.stream == STREAM)
+            }
+            _ => None,
+        });
+        assert!(
+            classification.is_some(),
+            "fresh attachment received retained final GEOMETRY/DATA but no lifecycle OPEN classification: {records:?}"
+        );
+        let entry = classification.unwrap();
+        assert_eq!(entry.instance, ChannelInstance::new(1).unwrap());
+        assert_eq!(entry.open.kind, crate::channel::ChannelKind::Command);
+        assert_eq!((entry.open.cols, entry.open.rows), (0, 24));
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_eof_before_pending_exit_is_draining_while_checkpoint_blocked() {
+        let records = fresh_attach_after_retained_runner_output(1, false, true).await;
+        assert!(records.iter().any(|record| matches!(record,
+            crate::channel::ServerRecord::ChannelSnapshot(snapshot)
+                if snapshot.active().is_empty() && snapshot.draining().len() == 1
+                    && snapshot.draining()[0].open.cols == 80
+                    && snapshot.draining()[0].open.rows == 24
+                    && snapshot.draining()[0].open.screen
+        )));
+    }
+
+    #[test]
+    fn resume_snapshot_mailbox_has_one_latest_exact_generation() {
+        let mailbox = SnapshotMailbox::default();
+        for generation in 1..=300 {
+            assert!(mailbox
+                .publish(generation, || ChannelSnapshot::new(Vec::new(), Vec::new()))
+                .unwrap());
+            assert!(mailbox.take(generation - 1).is_none());
+            assert!(mailbox.0.lock().unwrap().value.is_some());
+        }
+        assert!(!mailbox
+            .publish(299, || panic!("obsolete builder must not allocate"))
+            .unwrap());
+        assert!(mailbox.take(300).is_some());
+        assert!(mailbox.take(300).is_none());
+        assert!(!mailbox
+            .publish(300, || panic!("same generation is consumed once"))
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_nine_ended_channels_are_not_limited_to_eight_live_slots() {
+        let records = fresh_attach_after_retained_runner_output(9, false, false).await;
+        let snapshot = records
+            .iter()
+            .find_map(|r| match r {
+                crate::channel::ServerRecord::ChannelSnapshot(snapshot) => Some(snapshot),
+                _ => None,
+            })
+            .unwrap();
+        assert!(snapshot.active().is_empty());
+        assert_eq!(
+            snapshot
+                .draining()
+                .iter()
+                .map(|e| e.stream)
+                .collect::<Vec<_>>(),
+            (16..25).collect::<Vec<_>>()
+        );
+        assert!(snapshot
+            .draining()
+            .iter()
+            .all(|e| e.open.cols == 0 && e.open.rows == 24));
+    }
+
+    #[tokio::test]
+    async fn fresh_attach_runner_transferred_exit_keeps_classification_in_bridge() {
+        let records = fresh_attach_after_retained_runner_output(1, true, false).await;
+        assert!(
+            matches!(records.first(), Some(crate::channel::ServerRecord::ChannelSnapshot(snapshot))
+            if snapshot.active().is_empty() && snapshot.draining().len() == 1)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    crate::channel::ServerRecord::Exit {
+                        stream: STREAM,
+                        code: 0
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn queued_exit_snapshot_survives_control_block_and_second_attach() {
+        let mut rig = Rig::new();
+        rig.geometry(80, 0);
+        rig.drain(false);
+        let open = crate::channel::OpenClassification {
+            kind: crate::channel::ChannelKind::Command,
+            cols: 80,
+            rows: 24,
+            screen: false,
+        };
+        let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
+        rig.bridge.push(SessionOutbound::ChannelExit {
+            stream: STREAM,
+            instance: ChannelInstance::new(1).unwrap(),
+            origin: rig.origin(),
+            code: 42,
+            open,
+            permit,
+        });
+        for generation in 1..=2 {
+            rig.attach();
+            rig.client.set_default_consumption(Consumption::Explicit);
+            let occupied = crate::shell_frame::encode_record(
+                0x7f,
+                &vec![0; crate::reliability::STREAM_WINDOW as usize - 5],
+            );
+            let datagrams = rig
+                .server
+                .send(rig.now, crate::channel::CONTROL_STREAM, &occupied);
+            // Rig's pump parses control bytes; reset the framing after all fill
+            // bytes have arrived, before observing actual snapshot records.
+            rig.pump(datagrams);
+            assert!(rig.client.unconsumed_streams().contains(&(
+                crate::channel::CONTROL_STREAM,
+                crate::reliability::STREAM_WINDOW
+            )));
+            rig.control_frames = crate::shell_frame::RecordDeframer::for_control();
+            rig.control_records.clear();
+            rig.bridge
+                .snapshots
+                .publish(generation, || ChannelSnapshot::new(Vec::new(), Vec::new()))
+                .unwrap();
+            rig.bridge
+                .push(SessionOutbound::ResumeBarrier { generation });
+            assert!(rig.bridge.receive_fenced());
+            let held = rig.budget.usage(EntryClass::Lifecycle);
+            assert!(!rig.drain(false));
+            assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
+            assert!(rig.bridge.receive_fenced());
+            assert_eq!(
+                rig.bridge.pending_snapshot.as_ref().unwrap().draining(),
+                &[DrainingChannel {
+                    stream: STREAM,
+                    instance: ChannelInstance::new(1).unwrap(),
+                    open,
+                }]
+            );
+        }
+        let credit = rig.client.on_consumed(
+            rig.now,
+            crate::channel::CONTROL_STREAM,
+            crate::reliability::STREAM_WINDOW as usize,
+        );
+        let mut out = Vec::new();
+        for dg in credit {
+            out.extend(rig.server.on_datagram(rig.now, rig.peer, &dg.bytes));
+        }
+        rig.pump(out);
+        rig.drain(false);
+        rig.drain(false);
+        assert!(!rig.bridge.receive_fenced());
+        assert!(matches!(
+            rig.control_records.first(),
+            Some(crate::channel::ServerRecord::ChannelSnapshot(_))
+        ));
+        assert!(rig.control_records.iter().any(|r| matches!(
+            r,
+            crate::channel::ServerRecord::Exit {
+                stream: STREAM,
+                code: 42
+            }
+        )));
+        assert!(rig.bridge.streams.is_empty());
+    }
+
     #[test]
     fn pending_noscreen_output_survives_two_attaches() {
         let mut rig = Rig::new();
@@ -841,13 +1424,13 @@ mod tests {
         rig.data(b"retained");
         rig.attach();
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert!(
             rig.records.is_empty(),
             "obsolete barrier must not release prefix"
         );
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         rig.drain(false);
         assert_eq!(rig.records.len(), 2);
         assert!(
@@ -863,7 +1446,7 @@ mod tests {
         rig.geometry(100, 1);
         rig.data(b"B");
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.geometry(100, 0);
         rig.drain(false);
         assert_eq!(rig.records.len(), 5);
@@ -936,7 +1519,7 @@ mod tests {
         rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
         assert_eq!(rig.server.stream_progress(STREAM).queued, 27);
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.geometry(80, 0);
         rig.drain(false);
         assert!(!rig
@@ -964,11 +1547,17 @@ mod tests {
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
             code: 0,
+            open: crate::channel::OpenClassification {
+                kind: crate::channel::ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+            },
             permit,
         });
         rig.attach();
         rig.attach();
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         rig.drain(false);
         assert!(matches!(&rig.records[0],ShellRecord::Geometry(g) if g.request_id==0));
         assert!(matches!(&rig.records[1], ShellRecord::OutputGap { .. }));
@@ -1028,7 +1617,7 @@ mod tests {
         );
         rig.attach();
         rig.attach();
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         rig.drain(false);
         assert_eq!(
             rig.records[1],
@@ -1056,7 +1645,7 @@ mod tests {
         rig.geometry(80, 0);
         rig.data(b"obsolete");
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.geometry(100, 0);
         rig.data(b"current");
         rig.drain(false);
@@ -1075,7 +1664,7 @@ mod tests {
             instance: ChannelInstance::new(1).unwrap(),
             origin,
         });
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert!(rig.records.is_empty());
         assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
@@ -1179,6 +1768,114 @@ mod tests {
             budget.usage(EntryClass::Lifecycle),
             (1, BRIDGE_LIFECYCLE_BYTES)
         );
+    }
+
+    #[test]
+    fn snapshot_close_reuse_never_resurrects_old_exit_or_debits_replacement_gate() {
+        use crate::channel::{
+            ActiveChannel, ChannelKind, OpenClassification, OpenRequest, ServerRecord,
+        };
+        let mut rig = Rig::new();
+        rig.geometry(80, 0);
+        let old_origin = rig.origin();
+        let old_instance = ChannelInstance::new(1).unwrap();
+        rig.bridge.push(SessionOutbound::ChannelExit {
+            stream: STREAM,
+            instance: old_instance,
+            origin: old_origin,
+            code: 42,
+            open: OpenClassification {
+                kind: ChannelKind::Command,
+                cols: 0,
+                rows: 24,
+                screen: false,
+            },
+            permit: rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap(),
+        });
+        rig.attach();
+        // Close belongs to its channel instance even though its attachment was
+        // replaced. It must release the old Exit descriptor and permit.
+        rig.bridge.push(SessionOutbound::ChannelClosed {
+            stream: STREAM,
+            instance: old_instance,
+            origin: old_origin,
+        });
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+        assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
+        let instance = ChannelInstance::new(2).unwrap();
+        let budget = TimelineBudget::new(instance, rig.generation, |_| {});
+        let gate = Arc::new(SendGate::new(crate::send_gate::GateKind::Pipe));
+        rig.io.send_channel_output(
+            STREAM,
+            instance,
+            rig.origin(),
+            gate.clone(),
+            ChannelOutput::Geometry(
+                GeometryRecord {
+                    instance,
+                    request_id: 0,
+                    outcome: GeometryOutcome::Established,
+                    cols: 100,
+                    rows: 30,
+                },
+                budget
+                    .try_reserve(EntryClass::Ordinary, GEOMETRY_BYTES)
+                    .unwrap(),
+            ),
+            budget.try_reserve(EntryClass::Lifecycle, BRIDGE_LIFECYCLE_BYTES),
+        );
+        rig.bridge.push(rig.outbound.try_recv().unwrap());
+        for _ in 0..2 {
+            rig.bridge
+                .snapshots
+                .publish(rig.generation, || {
+                    ChannelSnapshot::new(
+                        vec![ActiveChannel {
+                            instance,
+                            request: OpenRequest {
+                                stream: STREAM,
+                                kind: ChannelKind::Shell,
+                                cols: 100,
+                                rows: 30,
+                                screen: false,
+                                command: vec![],
+                            },
+                        }],
+                        vec![],
+                    )
+                })
+                .unwrap();
+            rig.bridge.push(SessionOutbound::ResumeBarrier {
+                generation: rig.generation,
+            });
+            let before = budget.usage(EntryClass::Lifecycle);
+            rig.bridge.push(SessionOutbound::ChannelClosed {
+                stream: STREAM,
+                instance: old_instance,
+                origin: old_origin,
+            });
+            assert_eq!(budget.usage(EntryClass::Lifecycle), before);
+            assert_eq!(rig.bridge.streams[&STREAM].instance, instance);
+            rig.drain(false);
+            assert!(
+                matches!(rig.control_records.as_slice(), [ServerRecord::ChannelSnapshot(snapshot)]
+                if snapshot.draining().is_empty() && snapshot.active().len() == 1 && snapshot.active()[0].instance == instance)
+            );
+            assert!(rig.records.iter().any(
+                |record| matches!(record, ShellRecord::Geometry(g) if g.instance == instance)
+            ));
+            rig.attach();
+        }
+        assert_eq!(rig.bridge.streams.len(), 1);
+        assert_eq!(rig.bridge.retired.len(), 1);
+        rig.bridge.push(SessionOutbound::ChannelClosed {
+            stream: STREAM,
+            instance,
+            origin: rig.origin(),
+        });
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (0, 0));
+        assert_eq!(budget.usage(EntryClass::Ordinary), (0, 0));
+        assert!(gate.is_open());
     }
 
     #[test]
@@ -1451,7 +2148,7 @@ mod tests {
             .collect();
         assert_eq!(rig.budget.usage(EntryClass::Lifecycle).0, 8);
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert_eq!(
             rig.records.len(),
@@ -1496,10 +2193,10 @@ mod tests {
         rig.attach();
         rig.attach();
         rig.bridge.repaint_barrier(0, 3);
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert!(rig.records.is_empty());
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         rig.geometry(100, 0);
         rig.data(b"current snapshot");
         rig.drain(false);
@@ -1549,7 +2246,7 @@ mod tests {
             rig.bridge.repaint_barrier(0, 1);
             rig.attach();
             rig.attach();
-            rig.bridge.barrier(2);
+            rig.bridge.release_barrier(2);
             rig.drain(false);
             assert!(matches!(rig.records[0], ShellRecord::Geometry(_)));
             assert_eq!(
@@ -1602,12 +2299,31 @@ mod tests {
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
             code: 42,
+            open: crate::channel::OpenClassification {
+                kind: crate::channel::ChannelKind::Command,
+                cols: 0,
+                rows: 24,
+                screen: false,
+            },
             permit,
         });
         let held = rig.budget.usage(EntryClass::Lifecycle);
         assert!(!rig.drain(false));
         assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
         assert_eq!(rig.bridge.streams[&STREAM].fifo.len(), 1);
+        assert!(matches!(
+            rig.bridge.streams[&STREAM].fifo[0].output,
+            Item::Exit(
+                42,
+                crate::channel::OpenClassification {
+                    kind: crate::channel::ChannelKind::Command,
+                    cols: 0,
+                    rows: 24,
+                    screen: false,
+                },
+                _
+            )
+        ));
         for dg in
             rig.client
                 .on_consumed(rig.now, control, crate::reliability::STREAM_WINDOW as usize)
@@ -1652,7 +2368,7 @@ mod tests {
             None,
         );
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert_eq!(
             rig.records
@@ -1720,10 +2436,10 @@ mod tests {
         }
         rig.attach();
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert!(rig.records.is_empty() && rig.other_records.is_empty());
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         // The live model can repaint on reset without any new process bytes.
         rig.geometry(80, 0);
         rig.data(b"current Screen checkpoint");
@@ -1761,7 +2477,7 @@ mod tests {
         assert_eq!(rig.budget.usage(EntryClass::Ordinary), (1, 27));
         assert_eq!(rig.bridge.streams[&STREAM].fifo.len(), 1);
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert!(matches!(rig.records.as_slice(), [ShellRecord::Geometry(_)]));
         assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
@@ -1776,7 +2492,7 @@ mod tests {
             rig.bridge
                 .drain(&mut rig.server, rig.now, false, &mut abandoned);
             rig.attach();
-            rig.bridge.barrier(1);
+            rig.bridge.release_barrier(1);
             let mut gap_datagrams = Vec::new();
             rig.bridge
                 .drain(&mut rig.server, rig.now, false, &mut gap_datagrams);
@@ -1789,7 +2505,7 @@ mod tests {
                 rig.pump(gap_datagrams);
             }
             rig.attach();
-            rig.bridge.barrier(2);
+            rig.bridge.release_barrier(2);
             rig.data(b"final retained output");
             let marker = rig.budget.try_reserve(EntryClass::Lifecycle, 32).unwrap();
             rig.emit(
@@ -1846,7 +2562,7 @@ mod tests {
         rig.bridge
             .drain(&mut rig.server, rig.now, false, &mut abandoned);
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.bridge
             .drain(&mut rig.server, rig.now, false, &mut abandoned);
         assert_eq!(rig.server.stream_progress(STREAM).queued, 41);
@@ -1882,7 +2598,7 @@ mod tests {
             rig.bridge.push(message);
         }
         rig.attach();
-        rig.bridge.barrier(2);
+        rig.bridge.release_barrier(2);
         rig.drain(false);
         assert_eq!(rig.records.len(), 2);
         assert!(matches!(rig.records[0], ShellRecord::Geometry(g) if g.instance == newer));
@@ -1924,7 +2640,7 @@ mod tests {
             assert_eq!(retained.charge.as_ref().unwrap().bytes, 8197);
             if attach {
                 rig.attach();
-                rig.bridge.barrier(1);
+                rig.bridge.release_barrier(1);
             } else {
                 for dg in rig.client.on_consumed(
                     rig.now,
@@ -1982,7 +2698,7 @@ mod tests {
         assert_eq!(retained.offset, 0);
         assert_eq!(retained.charge.as_ref().unwrap().bytes, 8197);
         rig.attach();
-        rig.bridge.barrier(1);
+        rig.bridge.release_barrier(1);
         rig.drain(false);
         assert_eq!(rig.records.len(), 3);
         assert!(matches!(rig.records[0], ShellRecord::Geometry(_)));
@@ -2047,6 +2763,12 @@ mod tests {
                 instance: ChannelInstance::new(u64::from(stream)).unwrap(),
                 origin: rig.origin(),
                 code: 0,
+                open: crate::channel::OpenClassification {
+                    kind: crate::channel::ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                },
                 permit: budget.try_reserve(EntryClass::Lifecycle, 10).unwrap(),
             });
         }
@@ -2089,7 +2811,7 @@ mod tests {
             .drain(&mut rig.server, rig.now, false, &mut abandoned);
         for _ in 0..32 {
             rig.attach();
-            rig.bridge.barrier(rig.generation);
+            rig.bridge.release_barrier(rig.generation);
             abandoned.clear();
             rig.bridge
                 .drain(&mut rig.server, rig.now, false, &mut abandoned);

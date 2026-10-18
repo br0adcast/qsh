@@ -63,12 +63,12 @@
 //! screen model to repaint and puts any non-empty answer on that channel's
 //! own stream; a channel with no screen model (`NoScreen`) always answers
 //! empty, so no separate "has a screen" bookkeeping is needed. `ResumeReset`
-//! (a warm reattach) resets every channel's echo_ack accounting, announces
-//! `ServerRecord::Channels` with what is still running -- geometry included,
-//! so a client can tell whether the size it wants is already applied -- and
-//! only then repaints. `Channels` is never sent on `Live` (a cold start): an
-//! empty list would be indistinguishable from a server that forgot to
-//! answer.
+//! (a warm reattach) resets every channel's echo_ack accounting and publishes
+//! one atomic lifecycle snapshot before replay. The geometry profile separates
+//! active channels from draining EOF owners and retains exact OPEN classification;
+//! only ordered GEOMETRY confirms a size. The temporary inactive legacy route
+//! still emits `Channels` and is removed at Stage 6 activation. Neither snapshot
+//! is sent on `Live` (a cold start), where no retained channels are expected.
 //!
 //! **Send gates (spec §4.7.2).** Every channel takes a gate on its stream
 //! when it opens, and gives it up when it goes. A channel with a screen
@@ -753,6 +753,7 @@ struct PendingExit {
     instance: u64,
     code: i32,
     geometry: GeometryRecord,
+    open: crate::channel::OpenClassification,
     gate: Arc<SendGate>,
     final_marker: DeliveryMarker,
     producer: ProducerState,
@@ -801,7 +802,7 @@ struct Channel {
     instance: u64,
     /// The request that opened this channel, kept up to date by `Resize` so
     /// it always reflects the geometry actually applied. Used to build
-    /// `ServerRecord::Channels` on a warm reattach.
+    /// active lifecycle metadata on a warm reattach; EOF retains only classification.
     request: OpenRequest,
     /// Reaps the channel's process: fetches its exit code when the reader
     /// hits EOF, or is forced down if the session ends first (see the
@@ -1141,14 +1142,43 @@ fn reset_attachment_outputs(
     for pending in exits.values_mut() {
         pending.reset(context);
     }
-    // The barrier cannot wait for producer/metadata gates. All old runner
-    // emissions precede it; current Channels/checkpoints follow it.
+    // The barrier cannot wait for producer/metadata gates. Its snapshot is
+    // published in one replaceable mailbox, never copied into the output FIFO.
     if context.has_geometry() {
-        io.resume_barrier(context.generation);
+        io.publish_resume_snapshot(context, || {
+            use crate::channel::{
+                ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification,
+            };
+            let mut active = Vec::with_capacity(channels.len());
+            let mut draining = Vec::with_capacity(exits.len() + channels.len());
+            for (&stream, ch) in channels.iter() {
+                let instance = ChannelInstance::new(ch.instance).expect("channel instance");
+                if ch.producer.eof {
+                    draining.push(DrainingChannel {
+                        stream,
+                        instance,
+                        open: OpenClassification::from_open(&ch.request),
+                    });
+                } else {
+                    active.push(ActiveChannel {
+                        instance,
+                        request: ch.request.clone(),
+                    });
+                }
+            }
+            draining.extend(exits.iter().map(|(&stream, pending)| DrainingChannel {
+                stream,
+                instance: pending.geometry.instance,
+                open: pending.open,
+            }));
+            ChannelSnapshot::new(active, draining)
+        });
+    } else {
+        // Removed with Stage 6 activation; not a released compatibility mode.
+        let mut live: Vec<OpenRequest> = channels.values().map(|ch| ch.request.clone()).collect();
+        live.sort_by_key(|req| req.stream);
+        io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
     }
-    let mut live: Vec<OpenRequest> = channels.values().map(|ch| ch.request.clone()).collect();
-    live.sort_by_key(|req| req.stream);
-    io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
     // The new client's screens are empty until this repaints
     // them -- see this module's own docs above ("Repaint and the
     // live-channel list") for the fuller rationale.
@@ -1161,8 +1191,11 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
     let permit = pending.producer.exit_permit.take().expect("one final Exit");
     if pending.producer.origin.has_geometry() {
         io.send_channel_exit(
-            stream,
-            pending.geometry.instance,
+            crate::channel::DrainingChannel {
+                stream,
+                instance: pending.geometry.instance,
+                open: pending.open,
+            },
             pending.producer.origin,
             code,
             permit,
@@ -1178,6 +1211,7 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
 
 async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
     let geometry = current_geometry(&ch);
+    let open = crate::channel::OpenClassification::from_open(&ch.request);
     let final_marker = DeliveryMarker { token: ch.instance };
     drop(ch.input_tx);
     let code = tokio::task::spawn_blocking(move || ch.wait.wait())
@@ -1203,6 +1237,7 @@ async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
         instance: ch.instance,
         code,
         geometry,
+        open,
         gate: ch.gate,
         final_marker,
         producer: ch.producer,
@@ -1678,7 +1713,12 @@ fn apply_control_record(
             if update.restarting() {
                 // Its process would outlive the drain and become a child of
                 // the new binary, which never waits for it.
-                refuse(io, req.stream, "the daemon is restarting".to_string());
+                refuse(
+                    io,
+                    req.stream,
+                    "the daemon is restarting".to_string(),
+                    context.attachment,
+                );
             } else {
                 // Numbered whether or not it opens: only uniqueness matters.
                 let instance = *next_instance;
@@ -1837,18 +1877,28 @@ fn open_channel(
         // Checked BEFORE the cap: a session at the limit that gets a
         // re-used number deserves the precise reason, not "too many
         // channels".
-        refuse(io, stream, "channel already open".to_string());
+        refuse(
+            io,
+            stream,
+            "channel already open".to_string(),
+            context.attachment,
+        );
         return;
     }
     if channels.len() >= MAX_CHANNELS {
-        refuse(io, stream, "too many channels".to_string());
+        refuse(
+            io,
+            stream,
+            "too many channels".to_string(),
+            context.attachment,
+        );
         return;
     }
 
     // Either zero dimension preserves the generic no-PTY request exactly.
     if req.cols != 0 && req.rows != 0 {
         if let Err(reason) = TerminalSize::new(req.cols, req.rows) {
-            refuse(io, stream, reason.to_string());
+            refuse(io, stream, reason.to_string(), context.attachment);
             return;
         }
     }
@@ -1860,7 +1910,7 @@ fn open_channel(
     let spawned = match spawner.spawn(io.principal(), io.login(), &req, term) {
         Ok(spawned) => spawned,
         Err(reason) => {
-            refuse(io, stream, reason);
+            refuse(io, stream, reason, context.attachment);
             return;
         }
     };
@@ -1938,20 +1988,14 @@ fn open_channel(
     // `Connection::is_bulk_output_stream`, which the connection falls back
     // to for a stream nobody declared).
     io.set_stream_resyncable(stream, recoverable);
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::Opened { stream }),
-    );
+    io.channel_opened(context.attachment, stream);
     checkpoint(io, channels.get_mut(&stream).expect("opened channel"));
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
 /// [`CONTROL_STREAM`].
-fn refuse(io: &SessionIo, stream: u8, reason: String) {
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::Refused { stream, reason }),
-    );
+fn refuse(io: &SessionIo, stream: u8, reason: String, origin: AttachmentContext) {
+    io.channel_refused(origin, stream, reason);
 }
 
 /// The blocking loop for one channel's reader: forwards chunks read from its
@@ -2357,6 +2401,15 @@ pub(crate) mod tests {
                 .await
                 .expect("the runner must answer within five seconds")
                 .expect("the runner must not drop its outbound channel");
+            let msg = match msg {
+                SessionOutbound::ChannelOpened { stream, .. } => {
+                    return ServerRecord::Opened { stream }
+                }
+                SessionOutbound::ChannelRefused { stream, reason, .. } => {
+                    return ServerRecord::Refused { stream, reason }
+                }
+                other => other,
+            };
             let SessionOutbound::Data(sd) = msg else {
                 continue;
             };

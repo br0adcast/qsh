@@ -9,6 +9,12 @@
 
 use crate::channel_geometry::{ChannelInstance, ProtocolErrorCode, ResizeRequestId};
 use crate::shell_frame::{encode_record, RawRecord};
+#[path = "channel_snapshot.rs"]
+mod snapshot;
+pub use snapshot::{
+    ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification, CHANNEL_IDENTITIES,
+    CHANNEL_SNAPSHOT_MAX,
+};
 // Only the tests exercise the deframer directly (production code decodes
 // records handed to it by the connection layer); keep the import out of a
 // non-test build so it doesn't sit there unused.
@@ -45,6 +51,7 @@ const REC_OPEN: u8 = 0x10;
 const REC_RESIZE: u8 = 0x11;
 pub const REC_RESIZE_REQUEST: u8 = 0x16;
 pub const REC_PROTOCOL_ERROR: u8 = 0x28;
+pub const REC_CHANNEL_SNAPSHOT: u8 = 0x29;
 const REC_CLOSE: u8 = 0x12;
 const REC_TERM: u8 = 0x13;
 const REC_OPENED: u8 = 0x20;
@@ -556,6 +563,8 @@ pub enum ServerRecord {
     /// empty list would be indistinguishable from a server that forgot to
     /// answer.
     Channels(Vec<OpenRequest>),
+    /// Atomic active/draining lifecycle metadata for the ordered profile.
+    ChannelSnapshot(ChannelSnapshot),
     /// The answer to [`ClientRecord::AboutRequest`].
     About(About),
     /// The answer to [`ClientRecord::UpdateOffer`].
@@ -819,6 +828,7 @@ pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
             }
             encode_record(REC_CHANNELS, &payload)
         }
+        ServerRecord::ChannelSnapshot(snapshot) => snapshot.encode_record(),
         ServerRecord::About(about) => {
             let mut payload = Vec::with_capacity(8 + 32 + 1 + about.arch.len() + 2);
             payload.extend_from_slice(&about.build.to_be_bytes());
@@ -905,6 +915,9 @@ pub fn decode_server(raw: &RawRecord) -> Result<ServerRecord, ChannelCodecError>
                 return Err(ChannelCodecError::Malformed);
             }
             Ok(ServerRecord::Channels(channels))
+        }
+        REC_CHANNEL_SNAPSHOT => {
+            ChannelSnapshot::decode(&raw.payload).map(ServerRecord::ChannelSnapshot)
         }
         REC_ABOUT => decode_about(&raw.payload).map(ServerRecord::About),
         REC_UPDATE_ANSWER => decode_answer(&raw.payload).map(ServerRecord::UpdateAnswer),

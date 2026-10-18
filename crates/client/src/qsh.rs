@@ -176,7 +176,11 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
                     // it is reported through `on_malformed_control` rather
                     // than dropped in silence.
                     Err(ChannelCodecError::Malformed) => {
-                        if raw.kind == transport::channel::REC_PROTOCOL_ERROR {
+                        if matches!(
+                            raw.kind,
+                            transport::channel::REC_PROTOCOL_ERROR
+                                | transport::channel::REC_CHANNEL_SNAPSHOT
+                        ) {
                             self.fail_protocol(QshProtocolError::UnexpectedRecord(raw.kind));
                             break;
                         }
@@ -250,6 +254,14 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
                 SubstrateEvent::Exit { ch: stream, code }
             }
             ServerRecord::Channels(list) => SubstrateEvent::Announced(list),
+            ServerRecord::ChannelSnapshot(_) => {
+                // Inactive Stage 4.5: accepting only the active subset would
+                // silently lose retained EOF output. Stage 5 supplies its owner.
+                self.fail_protocol(QshProtocolError::UnexpectedRecord(
+                    transport::channel::REC_CHANNEL_SNAPSHOT,
+                ));
+                return None;
+            }
             // The daemon talking about itself: handed up as it came.
             record @ (ServerRecord::About(_)
             | ServerRecord::UpdateAnswer(_)
@@ -759,6 +771,43 @@ mod tests {
 mod geometry_staging_tests {
     use super::*;
     use transport::shell_frame::{encode_record, REC_DATA};
+
+    #[test]
+    fn inactive_snapshot_is_explicitly_rejected_instead_of_projected_active_only() {
+        let snapshot = transport::channel::ChannelSnapshot::new(
+            Vec::new(),
+            vec![transport::channel::DrainingChannel {
+                stream: 16,
+                instance: transport::channel_geometry::ChannelInstance::new(1).unwrap(),
+                open: transport::channel::OpenClassification {
+                    kind: transport::channel::ChannelKind::Command,
+                    cols: 0,
+                    rows: 24,
+                    screen: false,
+                },
+            }],
+        )
+        .unwrap();
+        for bytes in [
+            snapshot.encode_record(),
+            encode_record(transport::channel::REC_CHANNEL_SNAPSHOT, &[9]),
+        ] {
+            for split in 0..=bytes.len() {
+                let mut sub = QshSubstrate::new(|_, _| {});
+                assert!(sub.on_stream(CONTROL_STREAM, &bytes[..split]).is_empty());
+                assert!(sub.on_stream(CONTROL_STREAM, &bytes[split..]).is_empty());
+                assert_eq!(
+                    sub.protocol_error(),
+                    Some(QshProtocolError::UnexpectedRecord(
+                        transport::channel::REC_CHANNEL_SNAPSHOT
+                    ))
+                );
+                assert!(sub
+                    .on_stream(16, &encode_record(REC_DATA, b"final"))
+                    .is_empty());
+            }
+        }
+    }
 
     #[test]
     fn unsupported_geometry_stops_at_boundary_and_reset_link_starts_fresh() {

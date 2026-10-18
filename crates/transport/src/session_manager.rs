@@ -453,6 +453,15 @@ pub enum SessionInbound {
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    ChannelOpened {
+        stream: u8,
+        origin: AttachmentContext,
+    },
+    ChannelRefused {
+        stream: u8,
+        origin: AttachmentContext,
+        reason: String,
+    },
     RepaintBarrier {
         generation: u64,
         sequence: u64,
@@ -480,6 +489,7 @@ pub enum SessionOutbound {
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
         code: i32,
+        open: crate::channel::OpenClassification,
         permit: crate::channel_timeline::TimelinePermit,
     },
     ResumeBarrier {
@@ -538,6 +548,7 @@ pub type LoginId = [u8; 16];
 /// outbound [`SessionOutbound`]. The backend never sees the socket or the
 /// `Connection`.
 pub struct SessionIo {
+    resume_snapshots: channel_bridge::SnapshotMailbox,
     inbound: mpsc::Receiver<SessionInbound>,
     outbound: mpsc::UnboundedSender<SessionOutbound>,
     /// Who this session belongs to. Set once, when the session is created:
@@ -555,6 +566,47 @@ pub struct SessionIo {
 }
 
 impl SessionIo {
+    pub(crate) fn publish_resume_snapshot(
+        &self,
+        origin: AttachmentContext,
+        build: impl FnOnce()
+            -> Result<crate::channel::ChannelSnapshot, crate::channel::ChannelCodecError>,
+    ) {
+        match self.resume_snapshots.publish(origin.generation, build) {
+            Ok(true) => self.resume_barrier(origin.generation),
+            Ok(false) => {}
+            Err(_) => self.protocol_failure(origin, None),
+        }
+    }
+    pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
+        if origin.has_geometry() {
+            let _ = self
+                .outbound
+                .send(SessionOutbound::ChannelOpened { stream, origin });
+        } else {
+            self.send(
+                crate::channel::CONTROL_STREAM,
+                crate::channel::encode_server(&crate::channel::ServerRecord::Opened { stream }),
+            );
+        }
+    }
+    pub(crate) fn channel_refused(&self, origin: AttachmentContext, stream: u8, reason: String) {
+        if origin.has_geometry() {
+            let _ = self.outbound.send(SessionOutbound::ChannelRefused {
+                stream,
+                origin,
+                reason,
+            });
+        } else {
+            self.send(
+                crate::channel::CONTROL_STREAM,
+                crate::channel::encode_server(&crate::channel::ServerRecord::Refused {
+                    stream,
+                    reason,
+                }),
+            );
+        }
+    }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should
     /// then wind down.
@@ -633,17 +685,17 @@ impl SessionIo {
     }
     pub(crate) fn send_channel_exit(
         &self,
-        stream: u8,
-        instance: crate::channel_geometry::ChannelInstance,
+        descriptor: crate::channel::DrainingChannel,
         origin: AttachmentContext,
         code: i32,
         permit: crate::channel_timeline::TimelinePermit,
     ) {
         let _ = self.outbound.send(SessionOutbound::ChannelExit {
-            stream,
-            instance,
+            stream: descriptor.stream,
+            instance: descriptor.instance,
             origin,
             code,
+            open: descriptor.open,
             permit,
         });
     }
@@ -782,6 +834,7 @@ impl SessionIo {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         (
             SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal,
@@ -2747,6 +2800,7 @@ impl SessionManager {
         // The send gates live as long as the io: across every warm reattach.
         let gates = Arc::new(GateTable::new());
         let io = SessionIo {
+            resume_snapshots: channel_bridge::SnapshotMailbox::default(),
             inbound: in_rx,
             outbound: out_tx,
             principal,
@@ -3229,8 +3283,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let consumption = backend.consumption();
     // The backend runs for the bridge's whole life. `io` is MOVED into it and
     // is not `Clone`, so there is no second spawn to guard against.
+    let resume_snapshots = io.resume_snapshots.clone();
     tokio::spawn(async move { backend.run(io).await });
     let mut link = BackendLink::new(io_inbound_tx, consumption);
+    link.channel_output.snapshots = resume_snapshots;
 
     // `first_live_sent` is BRIDGE-level, spanning every connection this
     // backend drives: a reattach never re-sends `Live` (it sends
@@ -3321,7 +3377,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
                     _ = timer => Wakeup::Timeout,
-                    o = backend_out_rx.recv() => Wakeup::Backend(o),
+                    o = backend_out_rx.recv(), if !link.channel_output.receive_fenced() => Wakeup::Backend(o),
                     _ = std::future::ready(()), if drain_pending => Wakeup::Drain,
                     // Room in the backend's queue for what waits (spec
                     // §4.10.2): the bridge never stands on its backend.
@@ -3385,6 +3441,44 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                         ));
                     }
                     out.extend(conn.close(now));
+                }
+            }
+            Wakeup::Backend(Some(
+                message @ (SessionOutbound::ChannelOpened { .. }
+                | SessionOutbound::ChannelRefused { .. }),
+            )) => {
+                let (origin, record) = match message {
+                    SessionOutbound::ChannelOpened { stream, origin } => {
+                        (origin, crate::channel::ServerRecord::Opened { stream })
+                    }
+                    SessionOutbound::ChannelRefused {
+                        stream,
+                        origin,
+                        reason,
+                    } => (
+                        origin,
+                        crate::channel::ServerRecord::Refused { stream, reason },
+                    ),
+                    _ => unreachable!(),
+                };
+                if origin.generation == link.ledger.generation()
+                    && origin.session_id == conn.session_id()
+                {
+                    if !conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                        out.extend(conn.close(now));
+                    } else {
+                        writable.extend(take_backend_data(
+                            &mut conn,
+                            &gates,
+                            parked,
+                            now,
+                            StreamData {
+                                stream_id: crate::channel::CONTROL_STREAM,
+                                data: crate::channel::encode_server(&record),
+                            },
+                            &mut out,
+                        ));
+                    }
                 }
             }
             Wakeup::Backend(Some(SessionOutbound::Data(sd))) => {
@@ -7455,6 +7549,7 @@ mod tests {
             token: [11u8; 16],
             backend: Arc::new(EchoBackend),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7818,6 +7913,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7903,6 +7999,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7984,6 +8081,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -8095,6 +8193,7 @@ mod tests {
             token,
             backend,
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -8216,6 +8315,141 @@ mod tests {
                 .unwrap();
             self.client = client;
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_receive_fence_survives_two_attaches_and_wakes_on_credit_alone() {
+        use crate::channel::{ChannelSnapshot, ServerRecord, CONTROL_STREAM};
+        struct SnapshotBackend(mpsc::UnboundedSender<u64>);
+        impl SessionBackend for SnapshotBackend {
+            fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let observed = self.0.clone();
+                Box::pin(async move {
+                    while let Some(event) = io.recv().await {
+                        if let SessionInbound::ResumeReset(origin) = event {
+                            io.publish_resume_snapshot(origin, || {
+                                ChannelSnapshot::new(vec![], vec![])
+                            });
+                            io.channel_opened(origin, 16 + origin.generation as u8);
+                            io.channel_refused(
+                                origin,
+                                32 + origin.generation as u8,
+                                "fixture".into(),
+                            );
+                            observed.send(origin.generation).unwrap();
+                        }
+                    }
+                })
+            }
+        }
+        let features = crate::Features::SUPPORTED | crate::Features::CHANNEL_GEOMETRY;
+        let (observed, mut generations) = mpsc::unbounded_channel();
+        let mut rig = delivery_rig_with(features, Arc::new(SnapshotBackend(observed)), |conn| {
+            conn.enable_geometry_for_test()
+        })
+        .await;
+        let occupied = crate::reliability::STREAM_WINDOW as usize - 6;
+        for generation in 1..=2 {
+            let (mut client, mut conn, msg2) =
+                accepted_connection_with(&rig.server_kp, rig.token, rig.peer, features);
+            client.on_datagram(Instant::now(), rig.peer, &msg2[0].bytes);
+            client.enable_geometry_for_test();
+            conn.enable_geometry_for_test();
+            client.set_default_consumption(Consumption::Explicit);
+            // Six bytes admit Opened, but cannot admit even the empty atomic
+            // snapshot (seven bytes). Consume the filler only after Attach #2.
+            let mut now = Instant::now();
+            let mut out = conn.send(now, CONTROL_STREAM, &vec![0; occupied]);
+            for _ in 0..100 {
+                for dg in std::mem::take(&mut out) {
+                    for ack in client.on_datagram(now, rig.peer, &dg.bytes) {
+                        out.extend(conn.on_datagram(now, rig.peer, &ack.bytes));
+                    }
+                }
+                client.poll_events();
+                now += Duration::from_millis(20);
+                for ack in client.on_timeout(now) {
+                    out.extend(conn.on_datagram(now, rig.peer, &ack.bytes));
+                }
+                out.extend(conn.on_timeout(now));
+                if out.is_empty() && conn.stream_progress(CONTROL_STREAM).unacked == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                client.unconsumed_streams(),
+                vec![(CONTROL_STREAM, occupied as u64)]
+            );
+            assert_eq!(
+                conn.stream_write_room(CONTROL_STREAM, crate::send_gate::PIPE_HIGH as usize),
+                6
+            );
+            assert_eq!(conn.state(), LinkState::Live);
+            assert!(conn.features().contains(crate::Features::CHANNEL_GEOMETRY));
+            rig.ctl_tx
+                .send(BridgeControl::Attach(Box::new(conn), vec![], vec![]))
+                .unwrap();
+            rig.client = client;
+            rig.run(Duration::from_millis(100)).await;
+            assert_eq!(generations.try_recv().unwrap(), generation);
+            assert!(
+                rig.done_rx.try_recv().is_err(),
+                "bridge ended during blocked generation {generation}; client state {:?}",
+                rig.client.state()
+            );
+            assert!(
+                !rig.client.poll_events().iter().any(|event| matches!(
+                    event,
+                    Event::StreamData {
+                        stream_id: CONTROL_STREAM,
+                        ..
+                    }
+                )),
+                "no later lifecycle control bypasses the blocked snapshot"
+            );
+        }
+        // No backend event is produced after this point. Transport credit must
+        // independently wake admission and the receive fence must then reopen.
+        for dg in rig
+            .client
+            .on_consumed(Instant::now(), CONTROL_STREAM, occupied)
+        {
+            assert!(rig.dg_tx.send(rig.peer, dg.bytes));
+        }
+        rig.run(Duration::from_millis(200)).await;
+        let mut frames = crate::shell_frame::RecordDeframer::for_control();
+        let mut records = Vec::new();
+        for event in rig.client.poll_events() {
+            if let Event::StreamData {
+                stream_id: CONTROL_STREAM,
+                data,
+            } = event
+            {
+                records.extend(
+                    frames
+                        .push(&data)
+                        .iter()
+                        .map(|raw| crate::channel::decode_server(raw).unwrap()),
+                );
+            }
+        }
+        assert_eq!(
+            records,
+            vec![
+                ServerRecord::ChannelSnapshot(ChannelSnapshot::new(vec![], vec![]).unwrap()),
+                ServerRecord::Opened { stream: 18 },
+                ServerRecord::Refused {
+                    stream: 34,
+                    reason: "fixture".into()
+                },
+            ],
+            "old-generation controls are discarded; new controls follow the atomic snapshot"
+        );
+        drop(rig.dg_tx);
+        tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// A backend that takes every inbound event, counts the stream bytes it
@@ -11115,6 +11349,7 @@ mod tests {
             token: [0u8; 16],
             backend: Arc::new(ChattyBackend { log: log.clone() }),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -14848,6 +15083,7 @@ mod tests {
                 token,
                 backend: Arc::new(ForwardingBackend(heard_tx)),
                 io: SessionIo {
+                    resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
                     principal: test_principal(),
@@ -15192,6 +15428,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -15399,6 +15636,7 @@ mod tests {
             token,
             backend: Arc::new(ForwardingBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
