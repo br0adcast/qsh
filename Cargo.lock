@@ -2332,6 +2332,7 @@ dependencies = [
  "sshauth",
  "tempfile",
  "terminal",
+ "terminal-size",
  "tokio",
  "transport",
 ]
@@ -3593,6 +3594,7 @@ dependencies = [
  "rand 0.8.7",
  "snow",
  "socket2",
+ "terminal-size",
  "tokio",
  "zeroize",
 ]

@@ -619,7 +619,9 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         socket,
         keypair.private,
         auth,
-        Arc::new(managed(ChannelSessionBackend::new())),
+        Arc::new(managed(ChannelSessionBackend::new(Arc::new(
+            crate::screen_budget::ScreenBudget::new(crate::screen_budget::BudgetLimits::default()),
+        )))),
         // No helper, so nobody can report a login ended from outside: in
         // the personal mode the router is the only authority on whether a
         // login lives.

@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+terminal-size = { path = "../terminal-size" }
 # The handshake and its hash only (spec §4.9). The raw split hands the two
 # transport keys over, and `chacha20poly1305` seals datagrams itself: snow's
 # transport state has no associated data.

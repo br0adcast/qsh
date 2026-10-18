@@ -67,6 +67,7 @@ pub mod log;
 pub mod nonce_pool;
 pub mod pty;
 pub mod screen;
+pub mod screen_budget;
 pub mod serve;
 pub mod state;
 pub mod transport_daemon;

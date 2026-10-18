@@ -916,7 +916,9 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     // startup session of its own to decide, and no tmux to drive -- it hands
     // out channels, and what to put in them (attaching to an existing tmux
     // session or something else entirely) is the client's decision now.
-    let mut backend = channel_backend::ChannelSessionBackend::new();
+    let mut backend = channel_backend::ChannelSessionBackend::new(Arc::new(
+        qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
+    ));
     if !start.binary_path.as_os_str().is_empty() {
         // `None`: the checksum is worked out on the first `About`, off the
         // start-up path. `personal` sweeps away staged files an update that
@@ -1784,9 +1786,11 @@ mod tests {
             Arc::new(socket),
             server.private,
             auth,
-            transport::BackendFactory(
-                Arc::new(qshd::channel_backend::ChannelSessionBackend::new()),
-            ),
+            transport::BackendFactory(Arc::new(qshd::channel_backend::ChannelSessionBackend::new(
+                Arc::new(qshd::screen_budget::ScreenBudget::new(
+                    qshd::screen_budget::BudgetLimits::default(),
+                )),
+            ))),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             transport::LoginEndedReports::none(),
         ));

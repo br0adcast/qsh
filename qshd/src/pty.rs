@@ -405,16 +405,16 @@ impl PtyResizeHandle {
 }
 
 impl transport::shell_server::ResizeHandle for PtyResizeHandle {
-    fn resize(&self, cols: u16, rows: u16) {
-        // A resize error (e.g. the PTY just closed) is deliberately not
-        // treated as a reason to panic -- the next resize might arrive
-        // while the PTY is alive again.
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+    fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        terminal_size::TerminalSize::new(cols, rows).map_err(|e| e.to_string())?;
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("resizing the terminal: {e}"))
     }
 }
 

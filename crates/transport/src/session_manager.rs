@@ -559,12 +559,11 @@ impl SessionIo {
         )
     }
 
-    /// Test-only: [`SessionIo::test_pair`], owned by `principal` and
-    /// `login` -- for a test that checks the session's principal or login is
-    /// what reaches the code that acts on it, which a fixed placeholder
-    /// could satisfy by coincidence.
-    #[cfg(test)]
-    pub(crate) fn test_pair_for(
+    /// Build an in-process session fixture owned by `principal` and `login`.
+    /// Available only for crate tests and the explicit `testnet` fixture feature,
+    /// so consumers can test real backend lifetime without starting a daemon.
+    #[cfg(any(test, feature = "testnet"))]
+    pub fn test_pair_for(
         principal: Principal,
         login: LoginId,
     ) -> (

@@ -1197,6 +1197,17 @@ fn serve_channel_seam(
             shell,
             command,
         }) => {
+            // A compromised worker cannot bypass geometry admission here.
+            if let Err(reason) = terminal_size::TerminalSize::new(cols, rows) {
+                reply(
+                    sock,
+                    &Response::Failed {
+                        id,
+                        reason: reason.to_string(),
+                    },
+                );
+                return Next::Continue;
+            }
             // Only for an account this helper verified itself
             // (`Request::Verify`, on the other seam): the uid comes from the
             // worker, and a taken-over worker would name whichever account
@@ -6281,6 +6292,33 @@ pub(crate) mod tests {
         seam.serve(state, req, &test_config(), UNPRIVILEGED.become_account);
         seam.settle(state, &test_config());
         next_response(&seam.worker)
+    }
+
+    #[test]
+    fn invalid_helper_open_is_refused_before_launch() {
+        let mut state = empty_state();
+        for (cols, rows) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)] {
+            let req = Request::Open {
+                id: 1,
+                uid: me_uid(),
+                login: PROOF_LOGIN,
+                cols,
+                rows,
+                term: None,
+                echo: true,
+                shell: false,
+                command: "never run".into(),
+            };
+            let (response, fd) = call_channel_seam_once(&mut state, &req);
+            let expected = terminal_size::TerminalSize::new(cols, rows)
+                .unwrap_err()
+                .to_string();
+            assert!(matches!(response, Response::Failed { reason, .. } if reason == expected));
+            assert!(fd.is_none());
+            assert!(state.pending.is_empty());
+            assert!(state.live.is_empty());
+            assert!(state.monitors.is_empty());
+        }
     }
 
     /// A `LoopState` with `account` already verified and `logins`

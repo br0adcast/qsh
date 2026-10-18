@@ -99,6 +99,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use terminal_size::TerminalSize;
 
 use tokio::sync::mpsc;
 
@@ -1209,13 +1210,16 @@ fn apply_control_record(
         }
         Ok(ClientRecord::Resize { stream, cols, rows }) => {
             if let Some(ch) = channels.get_mut(&stream) {
-                ch.resize.resize(cols, rows);
-                ch.screen.resize(cols, rows);
-                // Kept current so a later `ServerRecord::Channels` reports
-                // the geometry actually applied, not the one the channel was
-                // opened with.
-                ch.request.cols = cols;
-                ch.request.rows = rows;
+                // No-PTY is an OPEN classification and cannot be changed by
+                // a resize. Invalid geometry never reaches model or ioctl.
+                if ch.request.cols != 0 && ch.request.rows != 0 {
+                    if let Ok(size) = TerminalSize::new(cols, rows) {
+                        let result = resize_channel(ch, size);
+                        if let Err(reason) = result {
+                            log::warn!(target: "transport", "channel resize refused: {reason}");
+                        }
+                    }
+                }
             }
             // A resize for a channel that isn't open (yet, or any more) has
             // nothing to apply to -- ignored for the same reason stray data
@@ -1269,6 +1273,17 @@ fn apply_control_record(
     }
 }
 
+/// All fallible steps precede model/request mutation. A failed ioctl drops
+/// the reservation, releasing provisional storage without changing the model.
+fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), String> {
+    let prepared = ch.screen.prepare_resize(size)?;
+    ch.resize.try_resize(size.cols(), size.rows())?;
+    prepared.commit();
+    ch.request.cols = size.cols();
+    ch.request.rows = size.rows();
+    Ok(())
+}
+
 /// Open one channel: refuse past the cap or on a re-used stream number,
 /// otherwise ask `spawner` to spawn it, wire up its bridge tasks, declare its
 /// recoverability to the connection, and answer `OPENED`/`REFUSED` on
@@ -1296,6 +1311,14 @@ fn open_channel(
     if channels.len() >= MAX_CHANNELS {
         refuse(io, stream, "too many channels".to_string());
         return;
+    }
+
+    // Either zero dimension preserves the generic no-PTY request exactly.
+    if req.cols != 0 && req.rows != 0 {
+        if let Err(reason) = TerminalSize::new(req.cols, req.rows) {
+            refuse(io, stream, reason.to_string());
+            return;
+        }
     }
 
     // The session's own principal and login, never a placeholder: a spawner
@@ -1543,8 +1566,9 @@ pub(crate) mod tests {
     }
 
     impl ResizeHandle for FakeResize {
-        fn resize(&self, cols: u16, rows: u16) {
+        fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
             self.sizes.lock().unwrap().push((self.stream, cols, rows));
+            Ok(())
         }
     }
 
@@ -1556,9 +1580,20 @@ pub(crate) mod tests {
         repaints: Arc<Mutex<Vec<u8>>>,
     }
 
+    struct FakePreparedResize;
+    impl crate::shell_server::PreparedScreenResize for FakePreparedResize {
+        fn commit(self: Box<Self>) {}
+    }
+
     impl SessionScreen for FakeScreen {
         fn absorb(&mut self, _bytes: &[u8]) {}
-        fn resize(&mut self, _cols: u16, _rows: u16) {}
+        fn prepare_resize(
+            &mut self,
+            size: TerminalSize,
+        ) -> Result<Box<dyn crate::shell_server::PreparedScreenResize + '_>, String> {
+            let _ = size;
+            Ok(Box::new(FakePreparedResize))
+        }
         fn repaint(&mut self) -> Vec<u8> {
             self.repaints.lock().unwrap().push(self.stream);
             b"REPAINT".to_vec()
@@ -1881,6 +1916,266 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.0.hold_writes(false);
         }
+    }
+
+    // Transactions are observed independently of the implementation: a pending
+    // resource and a model frame stay unchanged when either admission or PTY fails.
+    struct TransactionScreen {
+        geometry: Arc<Mutex<(u16, u16)>>,
+        pending: Arc<AtomicUsize>,
+        fail: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    struct TransactionResize<'a> {
+        screen: &'a mut TransactionScreen,
+        size: TerminalSize,
+    }
+    impl Drop for TransactionResize<'_> {
+        fn drop(&mut self) {
+            self.screen.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl crate::shell_server::PreparedScreenResize for TransactionResize<'_> {
+        fn commit(self: Box<Self>) {
+            self.screen.events.lock().unwrap().push("commit");
+            *self.screen.geometry.lock().unwrap() = (self.size.cols(), self.size.rows());
+        }
+    }
+    impl SessionScreen for TransactionScreen {
+        fn absorb(&mut self, _bytes: &[u8]) {}
+        fn repaint(&mut self) -> Vec<u8> {
+            vec![]
+        }
+        fn prepare_resize(
+            &mut self,
+            size: TerminalSize,
+        ) -> Result<Box<dyn crate::shell_server::PreparedScreenResize + '_>, String> {
+            self.events.lock().unwrap().push("prepare");
+            if self.fail {
+                return Err("budget refused".into());
+            }
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(TransactionResize { screen: self, size }))
+        }
+    }
+    struct TransactionPty {
+        fail: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl ResizeHandle for TransactionPty {
+        fn try_resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            self.events.lock().unwrap().push("ioctl");
+            if self.fail {
+                Err("ioctl failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_transaction_commits_only_after_successful_ioctl() {
+        for (fail_prepare, fail_ioctl, want) in [
+            (true, false, vec!["prepare"]),
+            (false, true, vec!["prepare", "ioctl"]),
+            (false, false, vec!["prepare", "ioctl", "commit"]),
+        ] {
+            let spawner = FakeSpawner::new();
+            let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+            let (io, _inbound, _outbound) = SessionIo::test_pair();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut channels = HashMap::new();
+            open_channel(
+                &io,
+                &mut channels,
+                &dyn_spawner,
+                &tx,
+                OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols: 2,
+                    rows: 1,
+                    screen: false,
+                    command: vec![],
+                },
+                None,
+                1,
+            );
+            let geometry = Arc::new(Mutex::new((2, 1)));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(vec![]));
+            let ch = channels.get_mut(&16).unwrap();
+            ch.screen = Box::new(TransactionScreen {
+                geometry: geometry.clone(),
+                pending: pending.clone(),
+                fail: fail_prepare,
+                events: events.clone(),
+            });
+            ch.resize = Box::new(TransactionPty {
+                fail: fail_ioctl,
+                events: events.clone(),
+            });
+            let result = resize_channel(ch, TerminalSize::new(2, 2).unwrap());
+            assert_eq!(result.is_ok(), !fail_prepare && !fail_ioctl);
+            assert_eq!(*events.lock().unwrap(), want);
+            assert_eq!(
+                pending.load(Ordering::SeqCst),
+                0,
+                "cancel or commit returns scratch"
+            );
+            let expected = if result.is_ok() { (2, 2) } else { (2, 1) };
+            assert_eq!(*geometry.lock().unwrap(), expected);
+            assert_eq!(
+                (ch.request.cols, ch.request.rows),
+                expected,
+                "Channels must report committed geometry"
+            );
+            spawner.end_channel(16);
+            drop(channels);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_open_keeps_generic_no_pty_fields_and_resize_cannot_change_mode() {
+        for (cols, rows) in [(0, 0), (0, 700), (900, 0)] {
+            let spawner = FakeSpawner::new();
+            let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+            let (io, _inbound, _outbound) = SessionIo::test_pair();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut channels = HashMap::new();
+            let request = OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols,
+                rows,
+                screen: false,
+                command: vec![],
+            };
+            open_channel(
+                &io,
+                &mut channels,
+                &dyn_spawner,
+                &tx,
+                request.clone(),
+                None,
+                1,
+            );
+            assert_eq!(channels[&16].request, request);
+            let raw = crate::shell_frame::RecordDeframer::for_control().push(&encode_client(
+                &ClientRecord::Resize {
+                    stream: 16,
+                    cols: 2,
+                    rows: 1,
+                },
+            ));
+            for record in raw {
+                apply_control_record(
+                    &io,
+                    &mut channels,
+                    &mut HashMap::new(),
+                    &mut 2,
+                    &dyn_spawner,
+                    &tx,
+                    record,
+                    &mut None,
+                    &mut SessionUpdate::new(None),
+                );
+            }
+            assert_eq!(channels[&16].request, request);
+            assert!(spawner.sizes.lock().unwrap().is_empty());
+            spawner.end_channel(16);
+            drop(channels);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_resize_never_reaches_model_or_pty() {
+        let spawner = FakeSpawner::new();
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut channels = HashMap::new();
+        let request = OpenRequest {
+            stream: 16,
+            kind: ChannelKind::Shell,
+            cols: 2,
+            rows: 1,
+            screen: true,
+            command: vec![],
+        };
+        open_channel(
+            &io,
+            &mut channels,
+            &dyn_spawner,
+            &tx,
+            request.clone(),
+            None,
+            1,
+        );
+        let events = Arc::new(Mutex::new(vec![]));
+        channels.get_mut(&16).unwrap().screen = Box::new(TransactionScreen {
+            geometry: Arc::new(Mutex::new((2, 1))),
+            pending: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            events: events.clone(),
+        });
+        for (cols, rows) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)] {
+            for record in
+                RecordDeframer::for_control().push(&encode_client(&ClientRecord::Resize {
+                    stream: 16,
+                    cols,
+                    rows,
+                }))
+            {
+                apply_control_record(
+                    &io,
+                    &mut channels,
+                    &mut HashMap::new(),
+                    &mut 2,
+                    &dyn_spawner,
+                    &tx,
+                    record,
+                    &mut None,
+                    &mut SessionUpdate::new(None),
+                );
+            }
+        }
+        assert_eq!(channels[&16].request, request);
+        assert!(spawner.sizes.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+        spawner.end_channel(16);
+        drop(channels);
+    }
+
+    #[tokio::test]
+    async fn invalid_nonzero_open_never_calls_spawner() {
+        let spawner = FakeSpawner::new();
+        *spawner.refuse.lock().unwrap() = Some("spy must not run".into());
+        let (io, _inbound, _outbound) = SessionIo::test_pair();
+        let (tx, _rx) = mpsc::channel(1);
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        for (cols, rows) in [(1, 1), (513, 1), (2, 257), (u16::MAX, u16::MAX)] {
+            open_channel(
+                &io,
+                &mut HashMap::new(),
+                &dyn_spawner,
+                &tx,
+                OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols,
+                    rows,
+                    screen: true,
+                    command: vec![],
+                },
+                None,
+                1,
+            );
+        }
+        assert!(
+            spawner.owners.lock().unwrap().is_empty(),
+            "validate before invoking a spawner"
+        );
     }
 
     /// Spec §4.10.3: a control record is taken once applied.
