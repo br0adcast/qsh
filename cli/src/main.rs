@@ -1201,7 +1201,7 @@ fn apply_actions(
                     }
                     Action::SendChannel { ch, bytes } => live.channel_session.send(ch, &bytes),
                     Action::ResizeChannel { ch, cols, rows } => {
-                        live.channel_session.resize(ch, cols, rows)
+                        live.channel_session.resize(ch, cols, rows);
                     }
                     _ => unreachable!("every other action is handled above"),
                 }
@@ -1234,8 +1234,20 @@ fn on_wire(
                 links.shell_channel = Some(ch);
                 actions.extend(sess.on_channel_ready(ch, now_ms()));
             }
-            SessionEvent::Announced { live } => {
-                actions.extend(sess.on_announced(&live, now_ms()));
+            SessionEvent::Announced { .. }
+            | SessionEvent::Geometry { .. }
+            | SessionEvent::ResizeRefused { .. }
+            | SessionEvent::DrainingReady(_)
+            | SessionEvent::OutputContinuityLost { .. }
+            | SessionEvent::ProtocolFailure(_) => {
+                // Stage 5 is inactive: Stage 6 supplies ordered rendering and
+                // reconnect intent transfer before this profile is advertised.
+                actions.push(Action::Notice(
+                    "qsh: ordered channel profile is not supported by this console checkpoint"
+                        .into(),
+                ));
+                actions.push(Action::Exit(1));
+                return actions;
             }
             SessionEvent::Exit { ch, code } => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));

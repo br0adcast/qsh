@@ -1,44 +1,32 @@
-//! The qsh substrate: lays the channel session model (`crate::channel`) onto
-//! a real qsh connection.
-//!
-//! Two decisions live here and nowhere else. Which wire stream a byte goes
-//! on: session-control records always go out on `CONTROL_STREAM`, while a
-//! channel's own bytes go out raw on the stream that IS the channel's
-//! identity. And how a channel's stream is deframed back into records: each
-//! channel keeps its own deframer, dropped the moment the channel ends (an
-//! explicit close, a refusal, or an exit), so a record split across two
-//! deliveries on one channel never disturbs another AND a stream number
-//! reused for a later channel never inherits a dead one's half-eaten
-//! leftovers. An acknowledgment record becomes `SubstrateEvent::InputConsumed`
-//! instead of being dropped -- a substrate with no output framing has no
-//! acknowledgment to hand back, which is exactly why prediction cannot run
-//! over SSH, whose substrate has none to give.
+//! Ordered QSH channel framing. ChannelSession owns lifecycle and geometry;
+//! this substrate owns only per-stream decoding and the outbound wire mapping.
+//! Exit does not retire a deframer: the owner first releases prior received
+//! output and any partial record. Channel reuse starts with fresh framing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[path = "qsh_input.rs"]
+mod input;
+use input::Input;
 
-use crate::channel::{ChannelId, ChannelSubstrate, SubstrateEvent};
+pub use crate::channel::ChannelProtocolError as QshProtocolError;
+use crate::channel::{
+    ChannelId, ChannelSubstrate, InputLimits, InputUsage, ResizeSemantics, SubstrateEvent,
+};
 use transport::channel::{
     decode_server, encode_client, ChannelCodecError, ClientRecord, OpenRequest, ServerRecord,
     CONTROL_STREAM, FIRST_CHANNEL_STREAM,
 };
+use transport::channel_geometry::{ChannelInstance, ResizeRequestId};
 // Only the tests build an `OpenRequest` directly; production code merely
 // clones one handed to it by `crate::channel`, so keep this out of a
 // non-test build.
 #[cfg(test)]
 use transport::channel::ChannelKind;
+#[cfg(test)]
 use transport::channel_geometry::ProtocolErrorCode;
-use transport::shell_frame::{
-    RecordDeframer, ShellCodecError, ShellDeframer, ShellRecord, REC_GEOMETRY, REC_OUTPUT_GAP,
-};
-
-/// Terminal decoding failure for the current attachment. Until ordered geometry
-/// is activated, receiving its records is an unsupported protocol attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QshProtocolError {
-    Shell(ShellCodecError),
-    UnexpectedRecord(u8),
-    Remote(ProtocolErrorCode),
-}
+#[cfg(test)]
+use transport::shell_frame::REC_GEOMETRY;
+use transport::shell_frame::{decode_shell, ShellCodecError, ShellRecord};
 
 /// Lays [`crate::channel::ChannelSession`] onto a qsh connection: session
 /// control records travel framed on [`CONTROL_STREAM`], and each channel's
@@ -49,17 +37,9 @@ pub struct QshSubstrate<F: FnMut(u8, Vec<u8>)> {
     sink: F,
     protocol_error: Option<QshProtocolError>,
     /// Deframer for `CONTROL_STREAM`: session-control records only.
-    control: RecordDeframer,
-    /// One deframer per channel's own stream, removed the moment the
-    /// channel ends (see [`Self::end_channel`]). A single shared deframer
-    /// would interleave two channels' bytes into nonsense the moment a
-    /// record from each is in flight at once -- see
-    /// `each_channel_is_deframed_on_its_own` below; leaving a dead
-    /// channel's entry behind causes the same nonsense stretched out in
-    /// time, once `crate::channel`'s free-stream policy reuses its stream
-    /// number for a new channel -- see
-    /// `a_channels_deframer_is_dropped_on_exit_so_a_reused_stream_starts_clean`.
-    channels: HashMap<ChannelId, ShellDeframer>,
+    control: Input,
+    /// Partial input remains owned here until explicit retirement or reset.
+    channels: HashMap<ChannelId, Input>,
     /// Where a malformed `CONTROL_STREAM` record is reported, if the owner
     /// asked to know -- see [`Self::on_malformed_control`]. This crate has
     /// no logging of its own (the host may already own the terminal), so it
@@ -67,18 +47,6 @@ pub struct QshSubstrate<F: FnMut(u8, Vec<u8>)> {
     /// in this file, and any owner indifferent to this, pays nothing for
     /// the field.
     on_malformed_control: Box<dyn FnMut(&str) + Send>,
-    /// Whether [`Self::on_malformed_control`] has already been told about
-    /// the control stream overflowing (spec §4.16, QSH-06): reported once
-    /// per connection, like the daemon's own log line, not once per byte
-    /// pushed after it.
-    control_overflow_reported: bool,
-    /// Which channels' overflow has already been told to
-    /// [`Self::on_malformed_control`] (spec §4.16, QSH-06): a channel whose
-    /// deframer stops for good is reported once, like the control stream,
-    /// so a frozen channel is not a silent one. Cleared per channel when
-    /// its entry in `channels` is (the same three occasions), so a stream
-    /// number reused for a later channel starts able to report again.
-    channel_overflow_reported: HashSet<ChannelId>,
 }
 
 impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
@@ -88,11 +56,9 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
         QshSubstrate {
             sink: send,
             protocol_error: None,
-            control: RecordDeframer::for_control(),
+            control: Input::default(),
             channels: HashMap::new(),
             on_malformed_control: Box::new(|_| {}),
-            control_overflow_reported: false,
-            channel_overflow_reported: HashSet::new(),
         }
     }
 
@@ -100,15 +66,12 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
     /// a NEW connection, whose streams all start from the beginning.
     pub fn reset_link(&mut self) {
         self.protocol_error = None;
-        self.control = RecordDeframer::for_control();
+        self.control = Input::default();
         self.channels.clear();
-        self.control_overflow_reported = false;
-        self.channel_overflow_reported.clear();
     }
 
-    /// A sticky terminal failure for this attachment. No later input records
-    /// are delivered until `reset_link`. The owner must end the bad attempt;
-    /// full transport lifecycle propagation precedes geometry activation.
+    /// Sticky failure until the owner starts a new attachment. ChannelSession
+    /// emits the corresponding typed terminal failure, never a fake Exit.
     pub fn protocol_error(&self) -> Option<QshProtocolError> {
         self.protocol_error
     }
@@ -116,6 +79,8 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
     fn fail_protocol(&mut self, error: QshProtocolError) {
         if self.protocol_error.is_none() {
             self.protocol_error = Some(error);
+            self.channels.clear();
+            self.control = Input::default();
             (self.on_malformed_control)(&format!("qsh protocol error: {error:?}"));
         }
     }
@@ -130,138 +95,131 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
         self
     }
 
-    /// Bytes newly arrived on `stream`, turned into the events they carry.
-    /// `CONTROL_STREAM` yields session-control events (`Opened`, `Refused`,
-    /// `Exit`, `Announced`); a stream in `FIRST_CHANNEL_STREAM..=255` is a
-    /// channel's own and yields `Data`/`InputConsumed`. Anything below
-    /// `FIRST_CHANNEL_STREAM` (the reserved range that holds the auth
-    /// stream) is not a channel and never will be, so it is dropped
-    /// outright rather than starting a deframer for a stream number that
-    /// could never legitimately carry channel data.
+    /// Conservative standalone decoding, bounded to one early-input batch.
+    /// ChannelSession instead uses on_bytes_step, recomputing budgets after each
+    /// event and allowing bounded DATA chunks once the channel is ready.
     pub fn on_stream(&mut self, stream: u8, bytes: &[u8]) -> Vec<SubstrateEvent> {
-        if self.protocol_error.is_some() {
-            return Vec::new();
-        }
-        if stream == CONTROL_STREAM {
-            let raws = self.control.push(bytes);
-            if self.control.overflowed() && !self.control_overflow_reported {
-                self.control_overflow_reported = true;
-                (self.on_malformed_control)(
-                    "a control record declared a length past the control limit -- \
-                     the control stream is ignored from here on",
-                );
-            }
-            let mut events = Vec::with_capacity(raws.len());
-            for raw in raws {
-                match decode_server(&raw) {
-                    // `UnknownKind` is a newer peer's record this build
-                    // doesn't recognize -- dropping it silently is the
-                    // codec's own documented behavior: the envelope already
-                    // kept the stream in sync regardless of whether the
-                    // type is understood.
-                    Ok(rec) => {
-                        if let Some(event) = self.translate_control(rec) {
-                            events.push(event);
-                        }
-                        if self.protocol_error.is_some() {
-                            break;
-                        }
-                    }
-                    Err(ChannelCodecError::UnknownKind(_)) => {}
-                    // `Malformed`, in contrast, is a *known* kind whose
-                    // payload didn't parse -- a broken promise, not an
-                    // evolution -- and every record on this stream is
-                    // one-shot: losing a malformed `Opened` or `Refused`
-                    // here leaves that channel stuck `Opening` forever, so
-                    // it is reported through `on_malformed_control` rather
-                    // than dropped in silence.
-                    Err(ChannelCodecError::Malformed) => {
-                        if matches!(
-                            raw.kind,
-                            transport::channel::REC_PROTOCOL_ERROR
-                                | transport::channel::REC_CHANNEL_SNAPSHOT
-                        ) {
-                            self.fail_protocol(QshProtocolError::UnexpectedRecord(raw.kind));
-                            break;
-                        }
-                        (self.on_malformed_control)(&format!(
-                            "malformed control record (kind {:#04x}, {} bytes) -- \
-                             the channel it named may hang open forever",
-                            raw.kind,
-                            raw.payload.len()
-                        ));
-                    }
+        let mut remaining = bytes;
+        let mut out = Vec::new();
+        let mut payload = 0usize;
+        let mut retained = 0usize;
+        while !remaining.is_empty() {
+            let mut limits = InputLimits {
+                payload: (64 * 1024usize).saturating_sub(payload),
+                bytes: (512 * 1024usize).saturating_sub(retained),
+                events: 256usize.saturating_sub(out.len()),
+            };
+            for (&ch, parser) in &self.channels {
+                if ch != stream {
+                    let used = parser.usage();
+                    limits.bytes = limits.bytes.saturating_sub(used.bytes);
+                    limits.events = limits.events.saturating_sub(used.events);
                 }
             }
-            events
-        } else if stream < FIRST_CHANNEL_STREAM {
-            Vec::new()
-        } else {
-            let deframer = self.channels.entry(stream).or_default();
-            let recs = deframer.push(bytes);
-            // A channel's own stream stopping for good (QSH-06) must not be
-            // a silent freeze: report it once, like the control stream --
-            // see the module docs and `channel_overflow_reported`'s own.
-            if deframer.overflowed() && self.channel_overflow_reported.insert(stream) {
-                (self.on_malformed_control)(&format!(
-                    "channel {stream}: a record declared a length past the limit -- \
-                     its stream is ignored from here on"
-                ));
+            let (used, events) = self.step(stream, remaining, limits);
+            for event in &events {
+                let bytes = match event {
+                    SubstrateEvent::Data { bytes, .. } => {
+                        payload += bytes.len();
+                        bytes.len() + 5
+                    }
+                    SubstrateEvent::Snapshot(snapshot) => snapshot.payload_len() + 5,
+                    SubstrateEvent::Refused { reason, .. } => reason.len() + 8,
+                    _ => 27,
+                };
+                retained += bytes;
             }
-            let error = deframer.error();
-            let mut events = Vec::new();
-            for record in recs {
-                match record {
-                    ShellRecord::Data(bytes) => {
-                        events.push(SubstrateEvent::Data { ch: stream, bytes })
-                    }
-                    ShellRecord::EchoAck(offset) => {
-                        events.push(SubstrateEvent::InputConsumed { ch: stream, offset })
-                    }
-                    ShellRecord::Geometry(_) => {
-                        self.fail_protocol(QshProtocolError::UnexpectedRecord(REC_GEOMETRY));
-                        break;
-                    }
-                    ShellRecord::OutputGap { .. } => {
-                        self.fail_protocol(QshProtocolError::UnexpectedRecord(REC_OUTPUT_GAP));
-                        break;
-                    }
-                }
+            out.extend(events);
+            if used == 0 {
+                break;
             }
-            if let Some(error) = error {
-                self.fail_protocol(QshProtocolError::Shell(error));
-            }
-            events
+            remaining = &remaining[used..];
         }
+        out
     }
 
-    /// One control record translated into the session event it means.
-    /// `Refused` and `Exit` both end the channel for good, so its deframer
-    /// is dropped right here -- see [`Self::end_channel`].
+    fn step(
+        &mut self,
+        stream: u8,
+        bytes: &[u8],
+        limits: InputLimits,
+    ) -> (usize, Vec<SubstrateEvent>) {
+        if self.protocol_error.is_some()
+            || (stream != CONTROL_STREAM && stream < FIRST_CHANNEL_STREAM)
+        {
+            return (bytes.len(), Vec::new());
+        }
+        let control = stream == CONTROL_STREAM;
+        let parser = if control {
+            &mut self.control
+        } else {
+            self.channels.entry(stream).or_default()
+        };
+        let parsed = parser.step(bytes, limits, control);
+        let error = match parsed {
+            Err(error) => error,
+            Ok((used, None)) => return (used, Vec::new()),
+            Ok((used, Some(raw))) => {
+                let event = if control {
+                    match decode_server(&raw) {
+                        Ok(record) => Ok(self.translate_control(record)),
+                        Err(ChannelCodecError::UnknownKind(_)) => Ok(None),
+                        Err(ChannelCodecError::Malformed) => {
+                            Err(QshProtocolError::UnexpectedRecord(raw.kind))
+                        }
+                    }
+                } else {
+                    match decode_shell(raw) {
+                        Ok(ShellRecord::Data(bytes)) => {
+                            Ok(Some(SubstrateEvent::Data { ch: stream, bytes }))
+                        }
+                        Ok(ShellRecord::EchoAck(offset)) => {
+                            Ok(Some(SubstrateEvent::InputConsumed { ch: stream, offset }))
+                        }
+                        Ok(ShellRecord::Geometry(record)) => {
+                            Ok(Some(SubstrateEvent::Geometry { ch: stream, record }))
+                        }
+                        Ok(ShellRecord::OutputGap { instance, cause }) => {
+                            Ok(Some(SubstrateEvent::OutputGap {
+                                ch: stream,
+                                instance,
+                                cause,
+                            }))
+                        }
+                        Err(ShellCodecError::UnknownKind(_)) => Ok(None),
+                        Err(error) => Err(QshProtocolError::Shell(error)),
+                    }
+                };
+                match event {
+                    Ok(event) => return (used, event.into_iter().collect()),
+                    Err(error) => error,
+                }
+            }
+        };
+        self.fail_protocol(error);
+        (bytes.len(), vec![SubstrateEvent::ProtocolFailure(error)])
+    }
+
+    /// Control lifecycle metadata does not itself authorize ordered output.
     fn translate_control(&mut self, rec: ServerRecord) -> Option<SubstrateEvent> {
         Some(match rec {
             ServerRecord::ProtocolError { code } => {
                 self.fail_protocol(QshProtocolError::Remote(code));
-                return None;
+                return Some(SubstrateEvent::ProtocolFailure(QshProtocolError::Remote(
+                    code,
+                )));
             }
             ServerRecord::Opened { stream } => SubstrateEvent::Opened(stream),
             ServerRecord::Refused { stream, reason } => {
                 self.end_channel(stream);
                 SubstrateEvent::Refused { ch: stream, reason }
             }
-            ServerRecord::Exit { stream, code } => {
-                self.end_channel(stream);
-                SubstrateEvent::Exit { ch: stream, code }
+            ServerRecord::Exit { stream, code } => SubstrateEvent::Exit { ch: stream, code },
+            ServerRecord::Channels(_) => {
+                self.fail_protocol(QshProtocolError::UnsupportedProfile);
+                SubstrateEvent::ProtocolFailure(QshProtocolError::UnsupportedProfile)
             }
-            ServerRecord::Channels(list) => SubstrateEvent::Announced(list),
-            ServerRecord::ChannelSnapshot(_) => {
-                // Inactive Stage 4.5: accepting only the active subset would
-                // silently lose retained EOF output. Stage 5 supplies its owner.
-                self.fail_protocol(QshProtocolError::UnexpectedRecord(
-                    transport::channel::REC_CHANNEL_SNAPSHOT,
-                ));
-                return None;
-            }
+            ServerRecord::ChannelSnapshot(snapshot) => SubstrateEvent::Snapshot(snapshot),
             // The daemon talking about itself: handed up as it came.
             record @ (ServerRecord::About(_)
             | ServerRecord::UpdateAnswer(_)
@@ -270,23 +228,67 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
         })
     }
 
-    /// Drops channel `ch`'s deframer and whatever record is still buffered
-    /// inside it. Called on every event that ends a channel for good: an
-    /// explicit `close()`, a server `Refused`, or a server `Exit` --
-    /// symmetric with how the server side (`channel_server.rs`) removes its
-    /// own per-channel state on the same three occasions. Skipping this
-    /// would let a stray, half-eaten record sit under `ch`'s number until
-    /// `crate::channel`'s free-stream policy reuses that number for a new
-    /// channel (the lowest freed number, once every untouched one is gone),
-    /// at which point the new channel's first bytes would be parsed as a
-    /// continuation of the old, dead channel's leftover record.
+    /// Explicit owner retirement, refusal, or close releases partial framing.
     fn end_channel(&mut self, ch: ChannelId) {
         self.channels.remove(&ch);
-        self.channel_overflow_reported.remove(&ch);
     }
 }
 
 impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
+    fn input_usage(&self, ch: ChannelId) -> InputUsage {
+        self.channels
+            .get(&ch)
+            .map_or_else(InputUsage::default, Input::usage)
+    }
+    fn on_bytes_step(
+        &mut self,
+        stream: u8,
+        bytes: &[u8],
+        limits: InputLimits,
+    ) -> (usize, Vec<SubstrateEvent>) {
+        self.step(stream, bytes, limits)
+    }
+    fn resize_semantics(&self) -> ResizeSemantics {
+        ResizeSemantics::ConfirmedOrdered
+    }
+    fn resize_correlated(
+        &mut self,
+        ch: ChannelId,
+        instance: ChannelInstance,
+        request_id: ResizeRequestId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), QshProtocolError> {
+        if let Some(error) = self.protocol_error {
+            return Err(error);
+        }
+        (self.sink)(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::ResizeRequest {
+                stream: ch,
+                instance,
+                request_id,
+                cols,
+                rows,
+            }),
+        );
+        Ok(())
+    }
+    fn retire_channel(&mut self, ch: ChannelId) {
+        self.end_channel(ch);
+    }
+    fn has_partial_input(&self, ch: ChannelId) -> bool {
+        self.channels
+            .get(&ch)
+            .is_some_and(|parser| parser.partial())
+    }
+    fn reset_attachment(&mut self) {
+        self.reset_link();
+    }
+    fn protocol_failed(&mut self, error: QshProtocolError) {
+        self.fail_protocol(error);
+    }
+
     fn open(&mut self, req: &OpenRequest) {
         (self.sink)(
             CONTROL_STREAM,
@@ -307,15 +309,8 @@ impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
         );
     }
 
-    fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) {
-        (self.sink)(
-            CONTROL_STREAM,
-            encode_client(&ClientRecord::Resize {
-                stream: ch,
-                cols,
-                rows,
-            }),
-        );
+    fn resize(&mut self, _ch: ChannelId, _cols: u16, _rows: u16) {
+        self.fail_protocol(QshProtocolError::UnsupportedProfile);
     }
 
     fn close(&mut self, ch: ChannelId) {
@@ -350,7 +345,6 @@ impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
     /// for no reason connected to this channel at all.
     fn reset_stream(&mut self, ch: ChannelId) {
         self.channels.remove(&ch);
-        self.channel_overflow_reported.remove(&ch);
     }
 }
 
@@ -420,7 +414,12 @@ mod tests {
         let malformed = encode_record(0x20, &[]);
         let events = sub.on_stream(CONTROL_STREAM, &malformed);
 
-        assert!(events.is_empty(), "a malformed record yields no event");
+        assert_eq!(
+            events,
+            vec![SubstrateEvent::ProtocolFailure(
+                QshProtocolError::UnexpectedRecord(0x20)
+            )]
+        );
         assert_eq!(
             reports.lock().unwrap().len(),
             1,
@@ -471,7 +470,12 @@ mod tests {
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         let lie = control_overflow_lie();
-        assert!(sub.on_stream(CONTROL_STREAM, &lie).is_empty());
+        assert_eq!(
+            sub.on_stream(CONTROL_STREAM, &lie),
+            vec![SubstrateEvent::ProtocolFailure(
+                QshProtocolError::EarlyOutputOverflow
+            )]
+        );
         assert_eq!(
             reports.lock().unwrap().len(),
             1,
@@ -527,7 +531,12 @@ mod tests {
 
         let mut lie = vec![0xffu8];
         lie.extend_from_slice(&u32::MAX.to_be_bytes());
-        assert!(sub.on_stream(16, &lie).is_empty());
+        assert_eq!(
+            sub.on_stream(16, &lie),
+            vec![SubstrateEvent::ProtocolFailure(
+                QshProtocolError::EarlyOutputOverflow
+            )]
+        );
         assert_eq!(
             reports.lock().unwrap().len(),
             1,
@@ -603,7 +612,7 @@ mod tests {
     /// `each_channel_is_deframed_on_its_own` rules out for two channels open
     /// at once, just stretched out in time instead.
     #[test]
-    fn a_channels_deframer_is_dropped_on_exit_so_a_reused_stream_starts_clean() {
+    fn owner_retirement_after_exit_discards_deframer_for_reused_stream() {
         let (mut sub, _) = substrate();
 
         // Half a record lands on channel 16, then the server reports the
@@ -622,6 +631,11 @@ mod tests {
 
         // Stream 16 is reused by a brand new channel, which gets a whole
         // record of its own.
+        assert!(
+            sub.has_partial_input(16),
+            "Exit cannot discard prior received partial output"
+        );
+        sub.retire_channel(16);
         let fresh = encode_record(REC_DATA, b"brand new");
         assert_eq!(
             sub.on_stream(16, &fresh),
@@ -768,19 +782,20 @@ mod tests {
 }
 
 #[cfg(test)]
-mod geometry_staging_tests {
+mod geometry_profile_tests {
     use super::*;
-    use transport::shell_frame::{encode_record, REC_DATA};
+    use transport::channel_geometry::{GeometryOutcome, GeometryRecord, OutputGapCause};
+    use transport::shell_frame::{encode_record, encode_shell, REC_DATA};
 
     #[test]
-    fn inactive_snapshot_is_explicitly_rejected_instead_of_projected_active_only() {
+    fn atomic_snapshot_preserves_draining_and_rejects_malformed_at_every_split() {
         let snapshot = transport::channel::ChannelSnapshot::new(
             Vec::new(),
             vec![transport::channel::DrainingChannel {
                 stream: 16,
-                instance: transport::channel_geometry::ChannelInstance::new(1).unwrap(),
+                instance: ChannelInstance::new(1).unwrap(),
                 open: transport::channel::OpenClassification {
-                    kind: transport::channel::ChannelKind::Command,
+                    kind: ChannelKind::Command,
                     cols: 0,
                     rows: 24,
                     screen: false,
@@ -788,40 +803,56 @@ mod geometry_staging_tests {
             }],
         )
         .unwrap();
-        for bytes in [
-            snapshot.encode_record(),
-            encode_record(transport::channel::REC_CHANNEL_SNAPSHOT, &[9]),
+        for (bytes, expected) in [
+            (snapshot.encode_record(), SubstrateEvent::Snapshot(snapshot)),
+            (
+                encode_record(transport::channel::REC_CHANNEL_SNAPSHOT, &[9]),
+                SubstrateEvent::ProtocolFailure(QshProtocolError::UnexpectedRecord(
+                    transport::channel::REC_CHANNEL_SNAPSHOT,
+                )),
+            ),
         ] {
             for split in 0..=bytes.len() {
                 let mut sub = QshSubstrate::new(|_, _| {});
-                assert!(sub.on_stream(CONTROL_STREAM, &bytes[..split]).is_empty());
-                assert!(sub.on_stream(CONTROL_STREAM, &bytes[split..]).is_empty());
-                assert_eq!(
-                    sub.protocol_error(),
-                    Some(QshProtocolError::UnexpectedRecord(
-                        transport::channel::REC_CHANNEL_SNAPSHOT
-                    ))
-                );
-                assert!(sub
-                    .on_stream(16, &encode_record(REC_DATA, b"final"))
-                    .is_empty());
+                let mut events = sub.on_stream(CONTROL_STREAM, &bytes[..split]);
+                events.extend(sub.on_stream(CONTROL_STREAM, &bytes[split..]));
+                assert_eq!(events, vec![expected.clone()]);
             }
         }
     }
-
     #[test]
-    fn unsupported_geometry_stops_at_boundary_and_reset_link_starts_fresh() {
-        let geometry = [
-            0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80, 0, 24,
-        ];
-        let gap = [0, 0, 0, 0, 0, 0, 0, 1, 1];
-        for (kind, payload) in [
-            (REC_GEOMETRY, geometry.as_slice()),
-            (REC_OUTPUT_GAP, gap.as_slice()),
+    fn geometry_and_gap_keep_order_at_every_split() {
+        let instance = ChannelInstance::new(1).unwrap();
+        let geometry = GeometryRecord {
+            instance,
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols: 80,
+            rows: 24,
+        };
+        for (record, event) in [
+            (
+                ShellRecord::Geometry(geometry),
+                SubstrateEvent::Geometry {
+                    ch: 16,
+                    record: geometry,
+                },
+            ),
+            (
+                ShellRecord::OutputGap {
+                    instance,
+                    cause: OutputGapCause::PreviousConnectionOutputUnconfirmed,
+                },
+                SubstrateEvent::OutputGap {
+                    ch: 16,
+                    instance,
+                    cause: OutputGapCause::PreviousConnectionOutputUnconfirmed,
+                },
+            ),
         ] {
             let bytes = [
                 encode_record(REC_DATA, b"before"),
-                encode_record(kind, payload),
+                encode_shell(&record).unwrap(),
                 encode_record(REC_DATA, b"after"),
             ]
             .concat();
@@ -831,59 +862,49 @@ mod geometry_staging_tests {
                 events.extend(sub.on_stream(16, &bytes[split..]));
                 assert_eq!(
                     events,
-                    vec![SubstrateEvent::Data {
-                        ch: 16,
-                        bytes: b"before".to_vec()
-                    }]
+                    vec![
+                        SubstrateEvent::Data {
+                            ch: 16,
+                            bytes: b"before".to_vec()
+                        },
+                        event.clone(),
+                        SubstrateEvent::Data {
+                            ch: 16,
+                            bytes: b"after".to_vec()
+                        }
+                    ]
                 );
-                assert_eq!(
-                    sub.protocol_error(),
-                    Some(QshProtocolError::UnexpectedRecord(kind))
-                );
-                assert!(sub
-                    .on_stream(17, &encode_record(REC_DATA, b"other"))
-                    .is_empty());
-                sub.reset_stream(16);
-                assert!(
-                    sub.protocol_error().is_some(),
-                    "stream reset cannot cure an unsupported attachment"
-                );
-                sub.reset_link();
                 assert_eq!(sub.protocol_error(), None);
-                assert_eq!(
-                    sub.on_stream(16, &encode_record(REC_DATA, b"fresh")),
-                    vec![SubstrateEvent::Data {
-                        ch: 16,
-                        bytes: b"fresh".to_vec()
-                    }]
-                );
             }
         }
     }
-
     #[test]
     fn malformed_geometry_and_remote_protocol_error_are_explicit_and_terminal() {
         let mut sub = QshSubstrate::new(|_, _| {});
-        assert!(sub
-            .on_stream(16, &encode_record(REC_GEOMETRY, &[]))
-            .is_empty());
+        let error = QshProtocolError::Shell(ShellCodecError::Malformed);
         assert_eq!(
-            sub.protocol_error(),
-            Some(QshProtocolError::Shell(ShellCodecError::Malformed))
+            sub.on_stream(16, &encode_record(REC_GEOMETRY, &[])),
+            vec![SubstrateEvent::ProtocolFailure(error)]
         );
+        assert_eq!(sub.protocol_error(), Some(error));
+        sub.reset_stream(16);
+        assert_eq!(sub.protocol_error(), Some(error));
+        assert!(sub
+            .on_stream(16, &encode_record(REC_DATA, b"late"))
+            .is_empty());
         sub.reset_link();
+        assert_eq!(sub.protocol_error(), None);
         let mut bytes = transport::channel::encode_server(&ServerRecord::ProtocolError {
             code: ProtocolErrorCode::ResizePipelineOverflow,
         });
         bytes.extend(transport::channel::encode_server(&ServerRecord::Opened {
             stream: 16,
         }));
-        assert!(sub.on_stream(CONTROL_STREAM, &bytes).is_empty());
+        let error = QshProtocolError::Remote(ProtocolErrorCode::ResizePipelineOverflow);
         assert_eq!(
-            sub.protocol_error(),
-            Some(QshProtocolError::Remote(
-                ProtocolErrorCode::ResizePipelineOverflow
-            ))
+            sub.on_stream(CONTROL_STREAM, &bytes),
+            vec![SubstrateEvent::ProtocolFailure(error)]
         );
+        assert_eq!(sub.protocol_error(), Some(error));
     }
 }
