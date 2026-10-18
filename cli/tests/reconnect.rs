@@ -302,7 +302,7 @@ fn a_dead_link_reconnects_by_itself_after_a_failed_round() {
     assert!(
         wait_for(Duration::from_secs(10), || {
             let top = screen.top();
-            top.contains("link lost") && top.contains("Ctrl-] r -- reconnect")
+            top.contains("reconnecting: 127.0.0.1 [QSH]") && top.contains(". exit")
         }),
         "a silent link must say so on the top row, with the prefix in use; \
          top row: {:?}\ndaemon: {}",
@@ -312,9 +312,9 @@ fn a_dead_link_reconnects_by_itself_after_a_failed_round() {
     let lost_at = cut.elapsed();
 
     assert!(
-        wait_for(Duration::from_secs(60), || screen
-            .top()
-            .contains("reconnecting to 127.0.0.1")),
+        wait_for(Duration::from_secs(60), || verbose_log(config.path())
+            .contains("recovery: UDP round 1")
+            && screen.top().contains("reconnecting: 127.0.0.1 [QSH]")),
         "the death timer must end the link and start a round by itself; top row: {:?}\n\
          daemon: {}",
         screen.top(),
@@ -889,7 +889,7 @@ fn leaving_while_reconnecting_is_quick_and_keeps_the_session() {
     relay.cut();
     client.master.write_all(b"\x1dr").expect("type ctrl-] r");
     assert!(
-        wait_until(|| screen.top().contains("reconnecting")),
+        wait_until(|| screen.top().contains("reconnecting: 127.0.0.1 [QSH]")),
         "Ctrl-] r must start a round, and the plate must say so; top row: {:?}\ndaemon: {}",
         screen.top(),
         daemon.output_text()

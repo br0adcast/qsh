@@ -111,10 +111,8 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     for (i, ch) in right.iter().take(shown).enumerate() {
         cells[start + i].ch = *ch;
     }
-    if alarm && shown > 0 {
-        let from = start.saturating_sub(1);
-        let to = (start + shown + 1).min(cols);
-        for cell in &mut cells[from..to] {
+    if alarm {
+        for cell in &mut cells {
             if colour {
                 cell.fg = Color::Indexed(15);
                 cell.bg = Color::Indexed(1);
@@ -132,6 +130,89 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     }
     cells
 }
+/// Display cells, including wide spacers. Zero-width characters cannot be
+/// represented by Cell; omit them rather than allocating phantom columns.
+pub(crate) fn text_cells(text: &str, utf8: bool) -> Vec<Cell> {
+    use unicode_width::UnicodeWidthChar;
+    let mut cells = Vec::new();
+    for ch in text.chars() {
+        let ch = if ch.is_control() || (!utf8 && !ch.is_ascii()) {
+            '?'
+        } else {
+            ch
+        };
+        let width = ch.width().unwrap_or(0);
+        if width == 0 {
+            continue;
+        }
+        let mut cell = Cell {
+            ch,
+            ..Cell::blank()
+        };
+        if width == 2 {
+            cell.flags = terminal::FLAG_WIDE;
+        }
+        cells.push(cell);
+        if width == 2 {
+            cells.push(Cell {
+                flags: terminal::FLAG_WIDE_SPACER,
+                ..Cell::blank()
+            });
+        }
+    }
+    cells
+}
+
+/// Fixed left-aligned activity row: no pagination, no wrapping, and every
+/// column (including padding) retains the outage alarm.
+pub fn recovery_line(cols: u16, text: &str, colour: bool, utf8: bool) -> Vec<Cell> {
+    recovery_spans(cols, &[(text.to_string(), true)], colour, utf8)
+}
+
+pub fn recovery_spans(cols: u16, spans: &[(String, bool)], colour: bool, utf8: bool) -> Vec<Cell> {
+    let width = usize::from(cols);
+    let mut cells: Vec<_> = spans
+        .iter()
+        .flat_map(|(text, active)| {
+            text_cells(text, utf8)
+                .into_iter()
+                .map(|cell| (cell, *active))
+        })
+        .collect();
+    if cells.len() > width {
+        let suffix = if utf8 { "…" } else { "..." };
+        let suffix: Vec<_> = text_cells(suffix, utf8)
+            .into_iter()
+            .take(width)
+            .map(|c| (c, false))
+            .collect();
+        cells.truncate(width - suffix.len());
+        if cells
+            .last()
+            .is_some_and(|(c, _)| c.flags & terminal::FLAG_WIDE != 0)
+        {
+            cells.pop();
+        }
+        cells.extend(suffix);
+    }
+    cells.resize(width, (Cell::blank(), false));
+    cells
+        .into_iter()
+        .map(|(mut cell, active)| {
+            if colour {
+                cell.fg = Color::Indexed(if active { 15 } else { 7 });
+                cell.bg = Color::Indexed(1);
+            } else {
+                cell.flags |= FLAG_REVERSE;
+                if active {
+                    cell.flags |= FLAG_BOLD;
+                }
+            }
+            cell
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,13 +288,59 @@ mod tests {
     }
 
     #[test]
+    fn the_entire_alarm_row_including_padding_has_alarm_style() {
+        for colour in [false, true] {
+            let cells = line(40, " Ctrl-] ? ", "lost", true, colour);
+            assert!(cells.iter().all(|c| if colour {
+                c.bg == Color::Indexed(1)
+            } else {
+                c.flags & FLAG_BOLD != 0
+            }));
+        }
+    }
+
+    #[test]
+    fn recovery_spans_change_only_brightness_not_text_or_positions() {
+        let spans = vec![
+            ("QSH".into(), true),
+            ("/".into(), false),
+            ("SSH".into(), false),
+        ];
+        let colour = recovery_spans(12, &spans, true, true);
+        assert_eq!(text(&colour), "QSH/SSH     ");
+        assert!(colour.iter().all(|c| c.bg == Color::Indexed(1)));
+        assert!(colour[..3].iter().all(|c| c.fg == Color::Indexed(15)));
+        assert!(colour[3..].iter().all(|c| c.fg == Color::Indexed(7)));
+        let mono = recovery_spans(12, &spans, false, true);
+        assert!(mono.iter().all(|c| c.flags & FLAG_REVERSE != 0));
+        assert!(mono[..3].iter().all(|c| c.flags & FLAG_BOLD != 0));
+        assert!(mono[3..].iter().all(|c| c.flags & FLAG_BOLD == 0));
+    }
+
+    #[test]
+    fn recovery_text_clips_by_cells_with_an_ellipsis() {
+        let row = recovery_line(8, "QSH: 界界", true, true);
+        assert_eq!(row.len(), 8);
+        assert_eq!(row[5].ch, '界');
+        assert_ne!(row[5].flags & terminal::FLAG_WIDE, 0);
+        assert_ne!(row[6].flags & terminal::FLAG_WIDE_SPACER, 0);
+        assert_eq!(row[7].ch, '…');
+        assert_eq!(
+            text(&recovery_line(8, "QSH: host:60000", true, false)),
+            "QSH: ..."
+        );
+        assert_eq!(recovery_line(0, "QSH: x", true, true).len(), 0);
+        assert_eq!(text(&recovery_line(1, "QSH: x", true, true)), "…");
+    }
+
+    #[test]
     fn an_alarm_is_red_with_colour() {
         let cells = line(20, "", "7 s", true, true);
         let start = 20 - 1 - 3;
         assert_eq!(cells[start].bg, Color::Indexed(1));
         assert_eq!(cells[start].fg, Color::Indexed(15));
         assert_eq!(cells[start].flags & FLAG_REVERSE, 0);
-        assert_eq!(cells[0].bg, Color::Default);
+        assert_eq!(cells[0].bg, Color::Indexed(1));
     }
 
     #[test]

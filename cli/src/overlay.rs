@@ -3,12 +3,10 @@
 //! on top of both. Built on a copy, on the way to the renderer: none of it
 //! ever enters the screen model (`ShellState`), which is the server's alone.
 
-use terminal::{Cell, Frame, FLAG_LEADING_WIDE_SPACER, FLAG_WIDE, FLAG_WIDE_SPACER};
+use terminal::{Cell, Frame, FLAG_WIDE, FLAG_WIDE_SPACER};
 
 use crate::status;
 use crate::window::Boxed;
-
-const WIDE_FLAGS: u16 = FLAG_WIDE | FLAG_WIDE_SPACER | FLAG_LEADING_WIDE_SPACER;
 
 /// `shell` as the terminal shows it. With `line`, one row taller: the line
 /// on row 0, the shell's rows below it and its cursor one row down; the
@@ -63,7 +61,11 @@ fn paint_box(frame: &mut Frame, boxed: &Boxed) {
         let start = row * cols;
         for (col, cell) in (left..right).zip(line) {
             let mut cell = *cell;
-            cell.flags &= !WIDE_FLAGS;
+            if (col + 1 == right && cell.flags & FLAG_WIDE != 0)
+                || (col == left && cell.flags & FLAG_WIDE_SPACER != 0)
+            {
+                cell = Cell::blank();
+            }
             frame.cells[start + col] = cell;
         }
         // The first half of a wide glyph just left of the box, its second

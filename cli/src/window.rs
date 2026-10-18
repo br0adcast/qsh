@@ -419,6 +419,65 @@ pub fn roads_box(rows: &[Row], state: &Roads, cols: u16, height: u16, g: Glyphs)
     ))
 }
 
+/// Wrapped recovery details are read-only. Selection is a line viewport, not
+/// an address index; Enter must never turn a diagnostic into a road switch.
+pub fn recovery_lines(details: &[String], cols: u16, utf8: bool) -> Vec<Vec<Cell>> {
+    let width = usize::from(cols.saturating_sub(6)).max(2);
+    let mut rows = Vec::new();
+    for text in details {
+        let cells = crate::statusline::text_cells(text, utf8);
+        let mut rest = cells.as_slice();
+        if rest.is_empty() {
+            rows.push(Vec::new());
+        }
+        while !rest.is_empty() {
+            let mut end = rest.len().min(width);
+            if rest[end - 1].flags & terminal::FLAG_WIDE != 0 {
+                end -= 1;
+            }
+            rows.push(rest[..end].to_vec());
+            rest = &rest[end..];
+        }
+    }
+    rows
+}
+
+pub fn recovery_box(
+    details: &[String],
+    state: &Roads,
+    cols: u16,
+    height: u16,
+    g: Glyphs,
+) -> Option<Boxed> {
+    if cols < MIN_COLS || height < MIN_HEIGHT {
+        return None;
+    }
+    let all = recovery_lines(details, cols, g.utf8);
+    let capacity = road_capacity(cols, height);
+    let start = state.selected.min(all.len().saturating_sub(capacity));
+    let end = (start + capacity).min(all.len());
+    let title = format!(
+        "Recovery {}-{}/{}",
+        start + usize::from(!all.is_empty()),
+        end,
+        all.len()
+    );
+    let hint = if g.utf8 {
+        "↑↓ scroll · Esc close"
+    } else {
+        "up/down scroll | Esc close"
+    };
+    Some(frame(
+        &title,
+        hint,
+        all[start..end].to_vec(),
+        usize::from(cols) - 6,
+        cols,
+        height,
+        g,
+    ))
+}
+
 /// The help window, or `None` when the terminal is too small.
 pub fn help_box(prefix_name: &str, cols: u16, height: u16, g: Glyphs) -> Option<Boxed> {
     if cols < MIN_COLS || height < MIN_HEIGHT {
@@ -477,6 +536,25 @@ mod tests {
             ewma_ms: ewma,
             failed_ago_ms: failed,
         }
+    }
+
+    #[test]
+    fn recovery_details_scroll_past_the_visible_capacity() {
+        let details: Vec<_> = (1..=20).map(|i| format!("target-{i}:60000")).collect();
+        let g = Glyphs {
+            utf8: true,
+            colour: true,
+        };
+        let mut state = Roads::new();
+        let first = recovery_box(&details, &state, 40, 8, g).unwrap();
+        assert!(box_text(&first).join("\n").contains("target-1:"));
+        state.selected = 19;
+        let last = recovery_box(&details, &state, 40, 8, g).unwrap();
+        assert!(box_text(&last).join("\n").contains("target-20:"));
+        assert!(!box_text(&last).join("\n").contains("Enter use"));
+        assert!(recovery_lines(&["界界界".into()], 8, true)
+            .iter()
+            .all(|line| line.len() <= 2));
     }
 
     #[test]

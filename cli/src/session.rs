@@ -92,6 +92,10 @@ pub enum UiEvent {
     /// No round now; the next one starts at `until_ms` (on the session's
     /// clock). `hint`, when there is one, says what to do about it.
     ReconnectWaiting { until_ms: i64, hint: Option<String> },
+    /// Owner-polled recovery activity; no worker may enqueue this event.
+    RecoveryStatus {
+        view: Option<crate::recovery_status::View>,
+    },
     /// Roads as `main` sees them now, in command-line order; the one in use
     /// has `in_use` set.
     Roads { roads: Vec<window::Road> },
@@ -249,6 +253,7 @@ pub struct Session {
     window_tail: Vec<u8>,
     /// The roads from the last snapshot, in command-line order.
     roads: Vec<window::Road>,
+    recovery_view: Option<crate::recovery_status::View>,
     /// Seconds of silence on the road in use, from the last `Stats`.
     silent_secs: u64,
     /// What the status line says: the road in use (when there are several)
@@ -300,6 +305,7 @@ impl Session {
             window_held: Vec::new(),
             window_tail: Vec::new(),
             roads: Vec::new(),
+            recovery_view: None,
             silent_secs: 0,
             line_view: (None, Link::Unknown),
             line_refreshed_ms: 0,
@@ -363,6 +369,16 @@ impl Session {
             }
             UiEvent::ReconnectWaiting { until_ms, hint } => {
                 self.set_plate(Plate::Waiting { until_ms, hint }, now_ms)
+            }
+            UiEvent::RecoveryStatus { view } => {
+                if self.recovery_view == view {
+                    return Vec::new();
+                }
+                if view.is_none() {
+                    self.clear_recovery_view();
+                }
+                self.recovery_view = view;
+                self.repaint(now_ms)
             }
             UiEvent::Roads { roads } => {
                 self.roads = roads;
@@ -460,6 +476,7 @@ impl Session {
     /// The link is gone; a reconnect is under way. Input goes nowhere until
     /// `on_reattached`.
     pub fn on_link_gone(&mut self, now_ms: i64) -> Vec<Action> {
+        self.lost_since_ms.get_or_insert(now_ms);
         let ch = match &self.shell_channel {
             ShellChannel::Ready(ch) => Some(*ch),
             ShellChannel::Detached { ch } | ShellChannel::Reattaching { ch } => *ch,
@@ -477,6 +494,7 @@ impl Session {
         self.renderer.invalidate();
         self.last_frame = None;
         self.plate = None;
+        self.clear_recovery_view();
         self.lost_since_ms = None;
         // The last `Stats` were the dead link's: its silence and round trip
         // say nothing about the new one. Until the new link's own figures
@@ -735,6 +753,32 @@ impl Session {
         if matches!(self.window, Some(Open::Help)) {
             return self.set_window(None, now_ms);
         }
+        if self.recovery_view.is_some() {
+            let count = window::recovery_lines(
+                &self.recovery_details(now_ms),
+                self.cols,
+                self.chrome.glyphs.utf8,
+            )
+            .len();
+            let max = count.saturating_sub(window::road_capacity(
+                self.cols,
+                self.rows.saturating_sub(1),
+            ));
+            for key in keys {
+                let Some(Open::Roads(state)) = &mut self.window else {
+                    break;
+                };
+                state.switching = None;
+                state.selected = state.selected.min(max);
+                match key {
+                    window::Key::Up => state.selected = state.selected.saturating_sub(1),
+                    window::Key::Down => state.selected = (state.selected + 1).min(max),
+                    window::Key::Close => self.close_window(),
+                    _ => {}
+                }
+            }
+            return self.repaint(now_ms);
+        }
         let rows = self.visible_rows();
         let mut actions = Vec::new();
         for key in keys {
@@ -795,6 +839,17 @@ impl Session {
             Some(Open::Help) => {
                 let name = self.chrome.prefix.name().unwrap_or_default();
                 window::help_box(&name, cols, rows, glyphs)
+            }
+            Some(Open::Roads(state)) if self.recovery_view.is_some() => {
+                let mut boxed = window::recovery_box(
+                    &self.recovery_details(self.line_refreshed_ms),
+                    state,
+                    cols,
+                    rows.saturating_sub(1),
+                    glyphs,
+                )?;
+                boxed.top += 1;
+                Some(boxed)
             }
             Some(Open::Roads(_)) => {
                 let visible = self.visible_rows().len();
@@ -883,6 +938,9 @@ impl Session {
                 self.repaint(now_ms)
             }
             LinkState::Live | LinkState::Connecting => {
+                if state == LinkState::Live {
+                    self.clear_recovery_view();
+                }
                 let was_lost = self.lost_since_ms.take().is_some();
                 let line_changed = self.refresh_line(now_ms);
                 let mut actions = if was_lost {
@@ -982,11 +1040,72 @@ impl Session {
         }
     }
 
+    fn recovery_details(&self, now_ms: i64) -> Vec<String> {
+        let age = self
+            .lost_since_ms
+            .map_or(0, |since| ((now_ms - since).max(0) / 1000) as u64)
+            .max(self.silent_secs);
+        let mut details = vec![format!("Outage: {}", statusline::human_age(age))];
+        if let Some(view) = &self.recovery_view {
+            details.extend(view.details());
+        }
+        details
+    }
+
+    fn clear_recovery_view(&mut self) {
+        if self.recovery_view.take().is_some() && matches!(self.window, Some(Open::Roads(_))) {
+            self.close_window();
+        }
+    }
+
+    fn outage(&self) -> bool {
+        self.recovery_view.is_some()
+            || self.lost_since_ms.is_some()
+            || matches!(
+                self.line_view.1,
+                Link::Silent { .. } | Link::Reconnecting { .. } | Link::Waiting { .. }
+            )
+    }
+
+    fn recovery_cells(&self) -> Vec<terminal::Cell> {
+        let mut spans = if let Some(view) = &self.recovery_view {
+            view.header_spans()
+        } else {
+            vec![(
+                self.plate_text(self.line_refreshed_ms).unwrap_or_else(|| {
+                    statusline::right_part(self.line_view.0.as_deref(), &self.line_view.1).0
+                }),
+                true,
+            )]
+        };
+        if self.recovery_view.is_some() {
+            if let Some(prefix) = self.chrome.prefix.name() {
+                let hint = format!(" | {prefix} s details; . exit");
+                let len: usize = spans
+                    .iter()
+                    .map(|(text, _)| statusline::text_cells(text, self.chrome.glyphs.utf8).len())
+                    .sum();
+                if len + hint.len() <= usize::from(self.cols) {
+                    spans.push((hint, false));
+                }
+            }
+        }
+        statusline::recovery_spans(
+            self.cols,
+            &spans,
+            self.chrome.glyphs.colour,
+            self.chrome.glyphs.utf8,
+        )
+    }
+
     /// The status line's cells, as `line_view` says.
     fn line_cells(&self) -> Vec<terminal::Cell> {
+        if self.recovery_view.is_some() {
+            return self.recovery_cells();
+        }
         let left = statusline::left_part(self.chrome.prefix.name().as_deref());
         let (road, link) = &self.line_view;
-        let (right, alarm) = if self.history_frame.is_some() {
+        let (right, alarm) = if self.history_frame.is_some() && !self.outage() {
             (
                 statusline::scroll_part(self.shell.display_offset(), self.shell.history_size()),
                 false,
@@ -1024,8 +1143,27 @@ impl Session {
         }
         let frame = history.as_ref().unwrap_or(frame);
         self.shell_mouse = frame.mouse_tracking != MouseTracking::Off;
+        // The hidden-status alarm replaces the entire top row on a copy; it
+        // must also remain visible while local scrollback is being inspected.
+        let alarm = if !self.line_on() && self.outage() {
+            let mut copy = frame.clone();
+            if copy.rows > 0 {
+                for (cell, alarm) in copy
+                    .cells
+                    .iter_mut()
+                    .take(usize::from(copy.cols))
+                    .zip(self.recovery_cells())
+                {
+                    *cell = alarm;
+                }
+            }
+            Some(copy)
+        } else {
+            None
+        };
+        let frame = alarm.as_ref().unwrap_or(frame);
         let line = self.line_on().then(|| self.line_cells());
-        let plate = if self.line_on() {
+        let plate = if self.line_on() || alarm.is_some() {
             None
         } else if self.history_frame.is_some() {
             Some(statusline::scroll_part(
@@ -1036,7 +1174,14 @@ impl Session {
             self.plate_text(now_ms)
         };
         let boxed = self.window_box();
-        let shown = overlay::compose(frame, line.as_deref(), plate.as_deref(), boxed.as_ref());
+        let mut shown = overlay::compose(frame, line.as_deref(), plate.as_deref(), boxed.as_ref());
+        if self.recovery_view.is_some() && matches!(self.window, Some(Open::Roads(_))) {
+            // Recovery details reserve row zero: keep its activity contrast
+            // while the shell behind the window is dimmed.
+            for cell in shown.cells.iter_mut().take(usize::from(shown.cols)) {
+                cell.flags &= !terminal::FLAG_DIM;
+            }
+        }
         if self.last_frame.as_ref() == Some(&shown) {
             return Vec::new();
         }
@@ -1119,6 +1264,115 @@ mod tests {
         let _ = s.on_link(LinkState::Live, 0);
         let _ = s.on_channel_ready(16, 0);
         s
+    }
+
+    fn recovery_view() -> crate::recovery_status::View {
+        use crate::recovery_status::{QshState, Target, View};
+        View {
+            targets: (1..=12)
+                .map(|i| Target {
+                    host: format!("host-{i}.example"),
+                    label: format!("host-{i}.example:60000"),
+                    endpoint: None,
+                    qsh: QshState::Trying,
+                    ssh: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn recovery_details_keep_elapsed_outage_time() {
+        let mut s = lined(80, 8);
+        s.on_link_gone(1_000);
+        s.handle(
+            UiEvent::RecoveryStatus {
+                view: Some(recovery_view()),
+            },
+            1_000,
+        );
+        assert_eq!(s.recovery_details(6_000)[0], "Outage: 5 s");
+        assert_eq!(s.recovery_details(66_000)[0], "Outage: 1 min");
+    }
+
+    #[test]
+    fn recovery_details_are_scrollable_and_never_switch_roads() {
+        let mut s = lined(80, 8);
+        s.on_link_gone(0);
+        s.handle(
+            UiEvent::RecoveryStatus {
+                view: Some(recovery_view()),
+            },
+            1,
+        );
+        s.handle(UiEvent::Stdin(b"\x1ds".to_vec()), 2);
+        assert!(
+            s.last_frame.as_ref().unwrap().cells[..80]
+                .iter()
+                .all(|c| c.bg == terminal::Color::Indexed(1)),
+            "details must not cover the outage row"
+        );
+        assert!(
+            s.last_frame.as_ref().unwrap().cells[..80]
+                .iter()
+                .all(|c| c.flags & terminal::FLAG_DIM == 0),
+            "details must preserve active protocol brightness"
+        );
+        for now in 3..40 {
+            s.handle(UiEvent::Stdin(b"\x1b[B".to_vec()), now);
+        }
+        let text: String = s
+            .draw_window()
+            .unwrap()
+            .lines
+            .iter()
+            .flatten()
+            .map(|c| c.ch)
+            .collect();
+        assert!(text.contains("host-12.example"), "{text}");
+        let actions = s.handle(UiEvent::Stdin(b"\r".to_vec()), 40);
+        assert!(!actions.iter().any(|a| matches!(a, Action::UseRoad(_))));
+        assert!(sent(&actions).is_empty());
+        s.on_reattached(41);
+        assert!(
+            !s.window_open(),
+            "success dismisses read-only recovery details"
+        );
+    }
+
+    #[test]
+    fn recovery_alarm_covers_hidden_status_and_scrollback_and_resizes_without_rotating() {
+        for line in [false, true] {
+            let mut s = Session::new(
+                40,
+                6,
+                TermCaps::truecolor(),
+                PredictMode::Never,
+                Chrome { line, ..plain() },
+            );
+            s.on_link(LinkState::Live, 0);
+            s.on_channel_ready(16, 0);
+            s.on_link_gone(1);
+            s.history_frame = Some(terminal::Frame::blank(40, s.size().1));
+            s.handle(
+                UiEvent::RecoveryStatus {
+                    view: Some(recovery_view()),
+                },
+                2,
+            );
+            let top = s.last_frame.as_ref().unwrap().cells[..40].to_vec();
+            assert!(top.iter().all(|c| c.bg == terminal::Color::Indexed(1)));
+            assert_eq!(top[39].ch, '…');
+            s.handle(UiEvent::Tick, 10_000);
+            assert_eq!(s.last_frame.as_ref().unwrap().cells[..40], top);
+            s.handle(UiEvent::Resized { cols: 9, rows: 6 }, 10_001);
+            assert_eq!(s.last_frame.as_ref().unwrap().cell(0, 8).ch, '…');
+            s.on_reattached(10_002);
+            assert!(s.recovery_view.is_none());
+            assert!(s.last_frame.as_ref().unwrap().cells[..9]
+                .iter()
+                .all(|c| c.bg != terminal::Color::Indexed(1)));
+        }
     }
 
     fn sent(actions: &[Action]) -> Vec<u8> {

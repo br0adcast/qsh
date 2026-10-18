@@ -19,6 +19,7 @@ pub mod paths;
 pub mod port_probe;
 pub mod prompt;
 pub mod recovery;
+pub mod recovery_status;
 pub mod releases;
 pub mod report;
 pub mod road_catalog;

@@ -387,6 +387,20 @@ impl SshStep<'_> {
         bound_keys: &[Vec<u8>],
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
+        self.run_bound_observed(addr, route, client_pubkey, bound_keys, cancel, || {})
+    }
+
+    /// Observation starts only after the existing trust restrictions admit an
+    /// attempt. The callback cannot grant trust or affect the result.
+    pub(crate) fn run_bound_observed(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        bound_keys: &[Vec<u8>],
+        cancel: &knock::Cancel,
+        started: impl FnOnce(),
+    ) -> Result<bringup::Ready, SshStepError> {
         if !self.background || cancel.is_cancelled() {
             return Err(SshStepError::NeedsPrompt);
         }
@@ -396,6 +410,7 @@ impl SshStep<'_> {
         if keys.known.is_empty() {
             return Err(SshStepError::NeedsPrompt);
         }
+        started();
         self.attempt(addr, route, client_pubkey, &keys, cancel)
             .map(|identified| identified.ready)
             .map_err(Attempted::into_error)
@@ -570,6 +585,17 @@ mod tests {
             qsh_port: 60022,
             ssh: Some(route.clone()),
         };
+        let observed = std::cell::Cell::new(false);
+        assert_eq!(
+            step.run_bound_observed(&addr, &route, [7; 32], &[], &knock::Cancel::new(), || {
+                observed.set(true)
+            }),
+            Err(SshStepError::NeedsPrompt)
+        );
+        assert!(
+            !observed.get(),
+            "an unbound route is not an active SSH attempt"
+        );
         assert_eq!(
             step.run_bound(
                 &addr,

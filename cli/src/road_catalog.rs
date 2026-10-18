@@ -90,6 +90,15 @@ impl RoadCatalog {
         (0..self.entries.len()).map(AddressId).collect()
     }
 
+    pub fn resolving(&self) -> Vec<AddressId> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.pending.is_some())
+            .map(|(i, _)| AddressId(i))
+            .collect()
+    }
+
     pub fn endpoints(&self) -> Vec<(AddressId, SocketAddr)> {
         self.entries
             .iter()

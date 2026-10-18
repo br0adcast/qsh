@@ -62,6 +62,10 @@ impl RoundTask {
         self.recovery.update_endpoints(epoch, endpoints);
     }
 
+    pub fn activity(&self) -> crate::recovery::Activity {
+        self.recovery.activity()
+    }
+
     pub fn retry_now(&self) {
         self.recovery.retry_now();
     }
