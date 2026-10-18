@@ -3403,6 +3403,7 @@ version = "0.5.0"
 dependencies = [
  "alacritty_terminal",
  "memchr",
+ "terminal-size",
  "unicode-width",
 ]
 

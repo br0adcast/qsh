@@ -9,10 +9,13 @@
 
 use std::sync::Arc;
 
+mod limits;
 mod replay;
 mod tracking;
 
+pub use limits::TerminalOptions;
 pub use replay::StateSnapshot;
+use terminal_size::{TerminalSize, ViewportSize};
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -227,22 +230,50 @@ struct ReplayState {
 impl TerminalCore {
     /// Creates a terminal of size `cols` by `rows` (columns by rows).
     pub fn new(cols: u16, rows: u16) -> Self {
-        // `TermSize` implements the `Dimensions` trait that `Term::new` expects.
-        let size = TermSize::new(cols as usize, rows as usize);
-        let term = Term::new(Config::default(), &size, VoidListener);
+        Self::with_options(
+            TerminalSize::for_viewport(cols, rows),
+            TerminalOptions::default(),
+        )
+    }
+
+    /// Creates a model with validated geometry and bounded history before allocation.
+    pub fn with_options(size: TerminalSize, options: TerminalOptions) -> Self {
+        let dimensions = TermSize::new(size.cols() as usize, size.rows() as usize);
+        let term = Term::new(
+            Config {
+                scrolling_history: limits::effective_history(options.history_lines, size),
+                ..Config::default()
+            },
+            &dimensions,
+            VoidListener,
+        );
         Self {
             term,
             parser: Processor::new(),
-            replay: None,
-            history_limit: 10_000,
+            replay: options.replay.then(|| ReplayState {
+                tracked: tracking::Tracked::new(size.cols() as usize, size.rows() as usize),
+                pending: tracking::PendingSequence::default(),
+            }),
+            history_limit: options.history_lines,
         }
+    }
+
+    /// Current validated model dimensions.
+    pub fn size(&self) -> TerminalSize {
+        TerminalSize::new(self.term.columns() as u16, self.term.screen_lines() as u16)
+            .expect("terminal model geometry is bounded")
+    }
+
+    /// History rows allowed by the requested limit and current width.
+    pub fn effective_history_limit(&self) -> usize {
+        limits::effective_history(self.history_limit, self.size())
     }
 
     /// Sets the primary screen's history capacity, including zero to disable it.
     pub fn set_history_limit(&mut self, lines: usize) {
         self.history_limit = lines;
         self.term.set_options(Config {
-            scrolling_history: lines,
+            scrolling_history: self.effective_history_limit(),
             ..Config::default()
         });
     }
@@ -266,13 +297,13 @@ impl TerminalCore {
     /// in. That costs some time on every `feed`, which only the daemon's
     /// model of a screen needs to pay.
     pub fn with_replay(cols: u16, rows: u16) -> Self {
-        Self {
-            replay: Some(ReplayState {
-                tracked: tracking::Tracked::new(cols as usize, rows as usize),
-                pending: tracking::PendingSequence::default(),
-            }),
-            ..Self::new(cols, rows)
-        }
+        Self::with_options(
+            TerminalSize::for_viewport(cols, rows),
+            TerminalOptions {
+                replay: true,
+                ..TerminalOptions::default()
+            },
+        )
     }
 
     /// Feeds bytes to the parser: printable characters land in the grid,
@@ -297,16 +328,26 @@ impl TerminalCore {
     /// Changes the terminal size (columns by rows), e.g. on screen rotation
     /// or a window resize on the client side.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let size = TermSize::new(cols as usize, rows as usize);
-        match &mut self.replay {
-            None => self.term.resize(size),
-            Some(replay) => {
-                let (old_cols, old_rows) = (self.term.columns(), self.term.screen_lines());
-                self.term.resize(size);
-                replay
-                    .tracked
-                    .resize(old_cols, old_rows, cols as usize, rows as usize);
-            }
+        self.resize_to(TerminalSize::for_viewport(cols, rows));
+    }
+
+    /// Resizes the model, shrinking history before any width growth.
+    pub fn resize_to(&mut self, size: TerminalSize) {
+        let (old_cols, old_rows) = (self.term.columns(), self.term.screen_lines());
+        // Alacritty set_options targets the primary grid even while it is inactive.
+        self.term.set_options(Config {
+            scrolling_history: limits::effective_history(self.history_limit, size),
+            ..Config::default()
+        });
+        self.term
+            .resize(TermSize::new(size.cols() as usize, size.rows() as usize));
+        if let Some(replay) = &mut self.replay {
+            replay.tracked.resize(
+                old_cols,
+                old_rows,
+                size.cols() as usize,
+                size.rows() as usize,
+            );
         }
     }
 
@@ -473,6 +514,8 @@ impl Frame {
     /// (tests, the renderer's "nothing drawn yet" state) start here, so
     /// adding a field to `Frame` doesn't ripple through every call site.
     pub fn blank(cols: u16, rows: u16) -> Frame {
+        let size = ViewportSize::new(cols, rows);
+        let (cols, rows) = (size.cols(), size.rows());
         Frame {
             cols,
             rows,
@@ -818,6 +861,95 @@ impl TerminalCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_geometry_wide_wrap_replay() {
+        let mut source = TerminalCore::with_replay(0, 0);
+        source.feed("日a日".as_bytes());
+        let mut target = TerminalCore::with_replay(1, 0);
+        target.feed(&source.replay().unwrap());
+        assert_eq!(source.snapshot(), target.snapshot());
+        assert_eq!((source.frame().cols, source.frame().rows), (2, 1));
+    }
+
+    #[test]
+    fn history_cell_budget_tracks_width() {
+        for alternate in [false, true] {
+            let mut t = TerminalCore::new(2, 2);
+            for _ in 0..5000 {
+                t.feed(b"x\r\n");
+            }
+            if alternate {
+                t.feed(b"\x1b[?1049h");
+            }
+            t.resize(512, 2);
+            if alternate {
+                t.feed(b"\x1b[?1049l");
+            }
+            assert_eq!(t.effective_history_limit(), 2048);
+            assert!(t.history_size() <= 2048);
+            let retained = t.history_size();
+            t.resize(2, 2);
+            assert_eq!(t.effective_history_limit(), 10000);
+            assert!(t.history_size() <= retained);
+            for _ in 0..11000 {
+                t.feed(b"x\r\n");
+            }
+            assert_eq!(t.history_size(), 10000);
+        }
+    }
+
+    #[test]
+    fn history_zero_from_construction() {
+        let mut t = TerminalCore::with_options(
+            TerminalSize::new(512, 1).unwrap(),
+            TerminalOptions {
+                history_lines: 0,
+                replay: true,
+            },
+        );
+        assert_eq!(t.effective_history_limit(), 0);
+        for _ in 0..3000 {
+            t.feed(b"x\r\n");
+        }
+        assert_eq!(t.history_size(), 0);
+        t.set_history_limit(usize::MAX);
+        for _ in 0..3000 {
+            t.feed(b"x\r\n");
+        }
+        assert!(t.history_size() <= 2048);
+        t.set_history_limit(0);
+        t.clear_history();
+        t.feed(b"x\r\n");
+        assert_eq!(t.history_size(), 0);
+    }
+
+    #[test]
+    fn raw_geometry_adapters_are_bounded() {
+        // Check the adapter before exercising maximum values to avoid a raw allocation.
+        let mut t = TerminalCore::new(0, 0);
+        assert_eq!((t.frame().cols, t.frame().rows), (2, 1));
+        for replay in [false, true] {
+            t = if replay {
+                TerminalCore::with_replay(u16::MAX, u16::MAX)
+            } else {
+                TerminalCore::new(u16::MAX, u16::MAX)
+            };
+            assert_eq!((t.frame().cols, t.frame().rows), (512, 256));
+            t.resize(u16::MAX, u16::MAX);
+            assert_eq!((t.frame().cols, t.frame().rows), (512, 256));
+        }
+    }
+
+    #[test]
+    fn presentation_frame_accepts_one_and_zero() {
+        for (cols, rows) in [(0, 0), (1, 1), (0, 257)] {
+            let f = Frame::blank(cols, rows);
+            assert_eq!((f.cols, f.rows), (cols, rows));
+        }
+        let f = Frame::blank(513, 258);
+        assert_eq!((f.cols, f.rows), (512, 257));
+    }
 
     #[test]
     fn feed_puts_char_into_grid() {

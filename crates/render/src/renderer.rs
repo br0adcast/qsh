@@ -562,8 +562,8 @@ fn rows_equal(a: &Frame, b: &Frame, a_row: u16, b_row: u16) -> bool {
 fn shift_up(previous: &Frame, lines: u16) -> Frame {
     let mut shifted = Frame::blank(previous.cols, previous.rows);
     shifted.palette = std::sync::Arc::clone(&previous.palette);
-    for row in 0..(previous.rows - lines) {
-        for col in 0..previous.cols {
+    for row in 0..shifted.rows.saturating_sub(lines) {
+        for col in 0..shifted.cols {
             *shifted.cell_mut(row, col) = *previous.cell(row + lines, col);
         }
     }
