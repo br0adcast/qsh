@@ -506,11 +506,12 @@ struct LoopState {
     /// [`forget_login`] once that uid's last login ends -- see
     /// `Request::LoginEnded`'s docs for why: the threat model promises only
     /// whoever is connected right now, not whoever ever connected.
-    /// `Request::Open` refuses any uid missing from here, and takes
-    /// everything else about the channel's account -- gid, groups, home,
-    /// shell -- from here too, so a channel never needs a second `getpwuid`
-    /// (under NSS/LDAP, a lookup this single-threaded helper cannot afford
-    /// to repeat per channel).
+    /// `Request::Open` refuses any uid missing from here. Account policy
+    /// comes from the bound login instead: several account aliases can
+    /// share a UID, and the latest verification must not replace an earlier
+    /// login's gid, groups, home or shell. Neither path needs a second
+    /// `getpwuid` (under NSS/LDAP, a lookup this single-threaded helper cannot
+    /// afford to repeat per channel).
     verified: HashMap<Uid, Account>,
     /// Every LIVE login, by its [`LoginId`] -- about LOGINS, not accounts,
     /// which is why this is a second table rather than folded into
@@ -1205,16 +1206,13 @@ fn serve_channel_seam(
             // which is
             // what this check makes safe to do.
             //
-            // Cloned out of `state.verified` (rather than borrowed) so the
-            // borrow releases at once: the arms below take `state` whole.
-            //
             // `verified` forgets an account once its last login has ended
             // (`Request::LoginEnded`, see `forget_login`): a worker that
             // once admitted alice cannot go on opening channels as her once
             // every login of hers is over, only for as long as at least one
             // still is. Either way it still cannot name an account whose
             // proof this helper never checked.
-            let Some(account) = state.verified.get(&Uid::from_raw(uid)).cloned() else {
+            if !state.verified.contains_key(&Uid::from_raw(uid)) {
                 crate::log::warn(
                     "helper",
                     &format!("refusing a channel for uid {uid}, which has not authenticated"),
@@ -1227,7 +1225,7 @@ fn serve_channel_seam(
                     },
                 );
                 return Next::Continue;
-            };
+            }
             // And only under a login that is already on file, bound to this
             // very account. `Open` never creates a login entry: only the
             // `Request::Verify` that proved it does (see
@@ -1253,22 +1251,28 @@ fn serve_channel_seam(
             //
             // Both refusals carry the `REFUSED_REASON` every refusal of this
             // kind does; the real one goes to the helper's own log only.
-            let refusal = match state.logins.get(&login) {
-                Some(entry) if entry.account.uid == account.uid => None,
-                Some(_) => Some("its login is already bound to a different account"),
-                None => Some("its login is not on file -- it has ended, or nothing proved it"),
+            let bound_account = match state.logins.get(&login) {
+                Some(entry) if entry.account.uid == Uid::from_raw(uid) => Ok(entry.account.clone()),
+                Some(_) => Err("its login is already bound to a different account"),
+                None => Err("its login is not on file -- it has ended, or nothing proved it"),
             };
-            if let Some(why) = refusal {
-                crate::log::warn("helper", &format!("refusing an Open for uid {uid}: {why}"));
-                reply(
-                    sock,
-                    &Response::Failed {
-                        id,
-                        reason: REFUSED_REASON.to_string(),
-                    },
-                );
-                return Next::Continue;
-            }
+            let account = match bound_account {
+                Ok(account) => account,
+                Err(why) => {
+                    crate::log::warn("helper", &format!("refusing an Open for uid {uid}: {why}"));
+                    reply(
+                        sock,
+                        &Response::Failed {
+                            id,
+                            reason: REFUSED_REASON.to_string(),
+                        },
+                    );
+                    return Next::Continue;
+                }
+            };
+            // A UID can have several account aliases. The UID cache proves
+            // admission only; policy must come from this login's bound account,
+            // even if a later verification replaced the cache's account alias.
             // The account's shell runs the show either way -- it is the
             // exec target for both a `shell: true` request (a login shell)
             // and a command (`<shell> -c <command>`), taken from passwd as
@@ -2602,8 +2606,8 @@ const VERDICT_REFUSED: u8 = 0;
 /// learns from it.
 ///
 /// `Admitted` carries the WHOLE account, not merely its uid and name,
-/// because `LoopState::verified` stores an `Account` and a channel takes
-/// its gid, its supplementary groups, its home and its shell from there --
+/// because the login binds that `Account` and a channel takes its gid,
+/// its supplementary groups, its home and its shell from the bound login --
 /// and must never repeat the lookup. A record carrying less would leave the
 /// parent two choices, both wrong: re-run `account::lookup` on the loop,
 /// undoing this entire split, or store a defaulted account, and then a
@@ -3566,9 +3570,8 @@ fn finish_pending(
                             // second `account::lookup`: repeating that
                             // lookup on the loop is the unbounded
                             // name-service call this entire fork exists to
-                            // be rid of, and a channel takes this
-                            // account's gid, groups, home and shell from
-                            // here.
+                            // be rid of. This cache tracks UID admission;
+                            // channel policy comes from the bound login.
                             state.verified.insert(account.uid, account);
                             response
                         }
@@ -6450,6 +6453,111 @@ pub(crate) mod tests {
         let mut token = [0u8; 16];
         token[..8].copy_from_slice(&(n as u64).to_be_bytes());
         token
+    }
+
+    /// Verification caches are UID-keyed, but a login's policy belongs to
+    /// the exact account alias that authenticated it. Exercise real monitors,
+    /// PAM sessions and shells in both verification orders.
+    #[test]
+    fn same_uid_aliases_keep_their_bound_channel_policy() {
+        for reverse in [false, true] {
+            for established in [false, true] {
+                let dir = tempfile::tempdir().expect("private fixture");
+                let marker = dir.path().join("pam-users");
+                let pam_script = dir.path().join("record-user");
+                write_script(
+                    &pam_script,
+                    &format!(
+                        "if [ \"$PAM_TYPE\" = open_session ]; then echo \"$PAM_USER\" >> {}; fi",
+                        marker.display()
+                    ),
+                );
+                write_stack(
+                    dir.path(),
+                    "qshd-alias-test",
+                    &format!(
+                        "auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_exec.so {}\nsession required pam_permit.so\n",
+                        pam_script.display()
+                    ),
+                );
+                let config = HelperConfig {
+                    pam_service: "qshd-alias-test".into(),
+                    pam_confdir: Some(dir.path().to_path_buf()),
+                    ..test_config()
+                };
+                let aliases: Vec<Account> = ["alias-a", "alias-b"]
+                    .into_iter()
+                    .map(|name| {
+                        let home = dir.path().join(name);
+                        std::fs::create_dir(&home).expect("alias home");
+                        let shell = dir.path().join(format!("{name}-shell"));
+                        write_script(
+                            &shell,
+                            &format!("export ALIAS_SHELL={name}\nexec /bin/sh \"$@\""),
+                        );
+                        Account {
+                            name: name.into(),
+                            home,
+                            shell,
+                            ..my_account()
+                        }
+                    })
+                    .collect();
+                let (first, second) = if reverse {
+                    (&aliases[1], &aliases[0])
+                } else {
+                    (&aliases[0], &aliases[1])
+                };
+                let login = [41; 16];
+                let other = [42; 16];
+                let mut state = state_with_login(first, login);
+                let seam = DirectSeam::new();
+                let mut observations = Vec::new();
+                let mut observe = |state: &mut LoopState, id, login| {
+                    let mut request = open_request(id, first.uid.as_raw(), login);
+                    if let Request::Open { command, .. } = &mut request {
+                        *command = "printf '%s|%s|%s|%s|%s|DONE\\n' \"$USER\" \"$LOGNAME\" \"$HOME\" \"$SHELL\" \"$ALIAS_SHELL\"".into();
+                    }
+                    seam.serve(state, &request, &config, UNPRIVILEGED.become_account);
+                    seam.settle(state, &config);
+                    let (response, fd, _) = answer_to(&seam.worker, id);
+                    assert!(matches!(response, Response::Opened { .. }), "{response:?}");
+                    let mut terminal = std::fs::File::from(fd.expect("terminal"));
+                    observations.push(read_until_or_timeout(&mut terminal, "DONE"));
+                };
+                if established {
+                    observe(&mut state, 1, login);
+                }
+                // The successful Verify settlement binds the login first,
+                // then overwrites the UID cache with the newly verified alias.
+                ensure_login(&mut state, other, second, String::new()).expect("second login");
+                state.verified.insert(second.uid, second.clone());
+                observe(&mut state, 2, login);
+                observe(&mut state, 3, other);
+                stop_monitors(&mut state);
+
+                let expected = |account: &Account| {
+                    format!(
+                        "{}|{}|{}|{}|{}|DONE",
+                        account.name,
+                        account.name,
+                        account.home.display(),
+                        account.shell.display(),
+                        account.name
+                    )
+                };
+                for seen in &observations[..observations.len() - 1] {
+                    assert!(seen.contains(&expected(first)),
+                        "reverse={reverse}, established={established}: first login must keep its bound policy, got {seen:?}");
+                }
+                assert!(observations.last().unwrap().contains(&expected(second)));
+                assert_eq!(
+                    std::fs::read_to_string(&marker).expect("PAM identities"),
+                    format!("{}\n{}\n", first.name, second.name),
+                    "each login opens exactly one PAM session under its bound alias"
+                );
+            }
+        }
     }
 
     /// The program still runs as its account and still reports its exit
