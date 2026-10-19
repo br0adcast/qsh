@@ -63,6 +63,10 @@ RUN dnf -y install epel-release \
         curl \
         gcc \
         gcc-aarch64-linux-gnu \
+        gnupg2 \
+        make \
+        perl-core \
+        python3 \
         file \
         pam-devel \
         rpm-build \
