@@ -359,6 +359,128 @@ fn daemon_gone(pid: u32, sock: &Path) -> bool {
     }
 }
 
+/// Serializes check/start/publication for one personal control path. The file
+/// is permanent: unlinking it would let later callers lock a different inode.
+/// Drop only closes this descriptor, never LOCK_UN: a fork inherits the same
+/// open-file description, so the lock ends only after its last copy closes.
+pub struct EnsureLock {
+    _file: std::fs::File,
+}
+
+impl EnsureLock {
+    pub fn acquire(socket: &Path) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+        let parent = socket
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let mut name = socket.as_os_str().to_os_string();
+        name.push(".lock");
+        let path = std::path::PathBuf::from(name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the ensure lock must be a private, singly linked regular file owned by this user",
+            ));
+        }
+        loop {
+            // SAFETY: the descriptor remains owned by file throughout the call.
+            if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        let current = std::fs::symlink_metadata(&path)?;
+        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the ensure lock changed while waiting",
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Owns removal of one published socket, including startup errors. Keeping a
+/// listener reference until removal prevents another ensure from observing a
+/// refused endpoint between the serving future's drop and this cleanup.
+/// The duplicate is close-on-exec; only the original listener crosses update
+/// handover, whose resumed owner creates its own guard before serving.
+pub struct SocketCleanup {
+    path: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+    remove_on_drop: bool,
+    _listener: UnixListener,
+}
+
+impl SocketCleanup {
+    /// A daemonization parent cannot infer child death from a wait error.
+    /// Leave publication to the child's inherited guard (or stale recovery).
+    pub fn leave_to_child(&mut self) {
+        self.remove_on_drop = false;
+    }
+
+    /// The caller must know that this path names this listener: an owned
+    /// private staging path, or a cooperatively inherited update listener.
+    /// A live inherited listener prevents another ensure from replacing it;
+    /// arbitrary external same-UID pathname mutation is outside this contract.
+    pub fn capture(listener: &UnixListener, path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the published control path is not a socket",
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            remove_on_drop: true,
+            _listener: listener.try_clone()?,
+        })
+    }
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if !self.remove_on_drop {
+            return;
+        }
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if let Ok(current) = std::fs::symlink_metadata(&self.path) {
+            if current.file_type().is_socket()
+                && current.dev() == self.device
+                && current.ino() == self.inode
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 /// Name of the staged socket inside the staging directory. One byte, kept
 /// short for the same reason the directory name is (see [`bind_private`]'s
 /// doc, Minor 1 of the task 6 review): a long staging path could refuse to
@@ -401,6 +523,25 @@ fn bind_in(dir: &Path, name: &str) -> std::io::Result<UnixListener> {
 /// [`bind_in`]'s error names the staging path it actually failed on, since
 /// that is the one that may be too long even though `path` itself is not.
 pub fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
+    bind_private_prepared(path, |listener, _| Ok(listener))
+}
+
+/// Bind with cleanup ownership already allocated before publishing the path.
+/// The caller serializes replacement of this control path with EnsureLock.
+/// A failed descriptor clone leaves only private staging, never a published
+/// endpoint that no owner can remove.
+pub fn bind_private_owned(path: &Path) -> std::io::Result<(UnixListener, SocketCleanup)> {
+    bind_private_prepared(path, |listener, staged| {
+        let mut cleanup = SocketCleanup::capture(&listener, staged)?;
+        cleanup.path = path.to_owned();
+        Ok((listener, cleanup))
+    })
+}
+
+fn bind_private_prepared<T>(
+    path: &Path,
+    prepare: impl FnOnce(UnixListener, &Path) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     use std::os::unix::fs::DirBuilderExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     sweep_stale_staging(parent, std::time::SystemTime::now());
@@ -416,8 +557,9 @@ pub fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
         std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
     }
     let bound = bind_in(&staging, STAGED_NAME).and_then(|listener| {
+        let prepared = prepare(listener, &staged)?;
         std::fs::rename(&staged, path)?;
-        Ok(listener)
+        Ok(prepared)
     });
     let _ = std::fs::remove_file(&staged);
     let _ = std::fs::remove_dir(&staging);
@@ -580,6 +722,106 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+
+    #[test]
+    fn ensure_lock_rejects_unsafe_files_without_modifying_them() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let lock = dir.path().join("control.sock.lock");
+        let target = dir.path().join("untouched");
+        std::fs::write(&target, b"fixture sentinel").unwrap();
+        symlink(&target, &lock).unwrap();
+        assert!(EnsureLock::acquire(&socket).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"fixture sentinel");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::hard_link(&target, &lock).unwrap();
+        assert!(EnsureLock::acquire(&socket).is_err());
+        std::fs::remove_file(&lock).unwrap();
+        nix::unistd::mkfifo(
+            &lock,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(EnsureLock::acquire(&socket).is_err());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, b"retained lock contents").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(EnsureLock::acquire(&socket).is_err());
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(EnsureLock::acquire(&socket).unwrap());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"retained lock contents");
+    }
+
+    #[test]
+    fn ensure_lock_lasts_until_the_last_inherited_descriptor_closes() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let held = EnsureLock::acquire(&socket).unwrap();
+        let inherited = held._file.try_clone().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("control.sock.lock"))
+            .unwrap();
+        drop(held);
+        // dup and fork refer to the same open-file description. Closing the
+        // original guard must not unlock while its inherited copy remains.
+        assert_eq!(
+            unsafe {
+                nix::libc::flock(
+                    contender.as_raw_fd(),
+                    nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+                )
+            },
+            -1
+        );
+        drop(inherited);
+        assert_eq!(
+            unsafe {
+                nix::libc::flock(
+                    contender.as_raw_fd(),
+                    nix::libc::LOCK_EX | nix::libc::LOCK_NB,
+                )
+            },
+            0
+        );
+        assert!(dir.path().join("control.sock.lock").exists());
+    }
+
+    #[test]
+    fn daemonization_parent_leaves_publication_to_the_child_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = bind_private(&path).unwrap();
+        let mut parent = SocketCleanup::capture(&listener, &path).unwrap();
+        let child = SocketCleanup::capture(&listener, &path).unwrap();
+        // Exercise the same owned-resource seam as an uncertain parent outcome:
+        // closing the parent's guard must not remove the child's live endpoint.
+        parent.leave_to_child();
+        drop(parent);
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(child);
+        assert!(!path.exists(), "known child termination still owns cleanup");
+    }
+
+    #[test]
+    fn socket_cleanup_keeps_listener_alive_until_its_own_path_is_removed() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = bind_private(&path).unwrap();
+        let cleanup = SocketCleanup::capture(&listener, &path).unwrap();
+        let flags = unsafe { nix::libc::fcntl(cleanup._listener.as_raw_fd(), nix::libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & nix::libc::FD_CLOEXEC != 0,
+            "the cleanup duplicate must not leak through update exec"
+        );
+        drop(listener);
+        assert!(UnixStream::connect(&path).is_ok());
+        drop(cleanup);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn parses_status() {

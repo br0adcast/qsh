@@ -650,6 +650,8 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
 
     let cache_dir = default_cache_dir();
     let sock_path = control_sock_path(&cache_dir);
+    let transaction = control::EnsureLock::acquire(&sock_path)
+        .context("locking the transport ensure transaction")?;
 
     // The server Noise key is read/created from the same file the daemon
     // uses (`load_or_create_transport_key`): when reusing a live daemon,
@@ -733,7 +735,14 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     // only, just this call's `--client-pubkey` (no on-disk set to union
     // with anymore).
     let allowlist = transport_daemon::build_server_allowlist(parsed.client_pubkey);
-    become_transport_daemon(&parsed, &cache_dir, &sock_path, keypair, allowlist)
+    become_transport_daemon(
+        &parsed,
+        &cache_dir,
+        &sock_path,
+        keypair,
+        allowlist,
+        transaction,
+    )
 }
 
 /// How long `transport-ensure` waits before asking a second time when the
@@ -777,7 +786,7 @@ fn ask_status_with(
 /// Becomes the transport daemon: binds the transport's UDP socket and the
 /// control Unix socket SYNCHRONOUSLY, BEFORE the fork (the tokio runtime
 /// does not survive `fork`, so everything async only happens after
-/// `daemonize().start()`), prints `TRANSPORT-READY` in the parent, and
+/// `daemonize().execute()`), prints `TRANSPORT-READY` in the parent, and
 /// daemonizes. From here on only the detached daemon runs --
 /// [`transport_daemon::run_transport_daemon`].
 ///
@@ -792,6 +801,7 @@ fn become_transport_daemon(
     sock_path: &Path,
     keypair: transport::handshake::Keypair,
     allowlist: Vec<[u8; 32]>,
+    transaction: control::EnsureLock,
 ) -> Result<()> {
     // The transport's UDP socket -- synchronously, before the fork (like `become_daemon`).
     let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, parsed.port)) {
@@ -819,8 +829,12 @@ fn become_transport_daemon(
     // from its first instant (spec §4.16, QSH-14). By this point there is
     // definitely no live daemon (see `run_transport_ensure`), so a file at
     // the name is a stale one, and `bind_private` replaces it.
-    let listener = control::bind_private(sock_path)
+    let (listener, mut cleanup) = control::bind_private_owned(sock_path)
         .with_context(|| format!("binding the control socket {}", sock_path.display()))?;
+    let bound_port = socket
+        .local_addr()
+        .context("reading the bound UDP port")?
+        .port();
 
     // Print `TRANSPORT-READY` in the PARENT, BEFORE the fork: otherwise
     // the SSH `exec` won't see the lines (the same criticality as
@@ -830,16 +844,28 @@ fn become_transport_daemon(
     write_transport_ready(
         &mut std::io::stdout(),
         &keypair.public,
-        std::slice::from_ref(&parsed.port),
+        std::slice::from_ref(&bound_port),
         None,
     )?;
 
-    // Daemonize: the parent exits inside `start()` (the SSH `exec` gets
+    // Daemonize: the parent exits after its upstream outcome (the SSH `exec` gets
     // EOF and returns the captured lines), the daemon inherits the bound
     // sockets.
-    daemonize::Daemonize::new()
-        .start()
-        .context("daemonizing qshd (transport)")?;
+    match daemonize::Daemonize::new().execute() {
+        daemonize::Outcome::Parent(result) => {
+            // Even a parent wait error does not prove that its forked child
+            // failed. Only the child's own guard may now unlink publication.
+            cleanup.leave_to_child();
+            let parent = result.context("daemonizing qshd (transport parent)")?;
+            std::process::exit(parent.first_child_exit_code);
+        }
+        daemonize::Outcome::Child(result) => {
+            result.context("daemonizing qshd (transport child)")?;
+        }
+    }
+    // Parent/intermediate copies close when daemonize exits them. The final
+    // child releases its copy after publication/fork, before serving requests.
+    drop(transaction);
 
     // From here on -- ONLY the daemon. stdout/stderr went to /dev/null:
     // events and panics are written to `<cache_dir>/qshd.log`.
@@ -862,8 +888,19 @@ fn become_transport_daemon(
         allowlist,
         cache_dir: cache_dir.to_path_buf(),
         sock_path: sock_path.to_path_buf(),
-        port: parsed.port,
-        ports: parsed.ports.clone(),
+        cleanup,
+        port: bound_port,
+        ports: parsed
+            .ports
+            .iter()
+            .map(|&port| {
+                if port == parsed.port {
+                    bound_port
+                } else {
+                    port
+                }
+            })
+            .collect(),
         name: parsed.name.clone(),
         binary_path,
     })
@@ -878,6 +915,7 @@ struct PersonalStart {
     allowlist: Vec<[u8; 32]>,
     cache_dir: PathBuf,
     sock_path: PathBuf,
+    cleanup: control::SocketCleanup,
     port: u16,
     ports: Vec<u16>,
     name: String,
@@ -956,7 +994,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         personal_server_auth(shared_allowlist, start.keypair.public, admission),
         Arc::new(backend),
         start.listener,
-        start.sock_path,
+        start.cleanup,
         vec![start.port],
         active_count,
         control_gate,
@@ -1073,6 +1111,8 @@ fn resume_personal_daemon(handover: handover::Handover) -> Result<()> {
         log::warn("update", &format!("{e:#}"));
     }
     let (socket, listener) = handover::adopt_sockets(&handover)?;
+    let cleanup = control::SocketCleanup::capture(&listener, &handover.control_path)
+        .context("retaining the inherited control socket publication")?;
     let keypair = load_or_create_transport_key(&default_transport_key_path(&handover.cache_dir))?;
     let allowlist = handover::decode_allowlist(&handover.allowlist)?;
     log::info(
@@ -1090,6 +1130,7 @@ fn resume_personal_daemon(handover: handover::Handover) -> Result<()> {
         allowlist,
         cache_dir: handover.cache_dir.clone(),
         sock_path: handover.control_path.clone(),
+        cleanup,
         port: handover.port,
         ports: handover.ports.clone(),
         name: handover.name.clone(),
