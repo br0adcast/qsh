@@ -15,8 +15,8 @@
 //! Doing the same per channel here would mean a growing number of `select!`
 //! arms as channels come and go, so instead every channel's reader task
 //! shares ONE output channel, tagging each chunk with the stream it came
-//! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that one channel's
-//! process ending, not the session's). Input stays one UNbounded channel PER
+//! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that instance's
+//! output EOF, which does not prove its process has ended). Input stays one UNbounded channel PER
 //! channel, same as `serve_shell` and for the same reason: a synchronous
 //! send from the async loop must never block it (see that module's docs for
 //! the full argument).
@@ -33,38 +33,25 @@
 //! fails, the client gets `ServerRecord::Refused` and the session keeps
 //! running with whatever else is already open.
 //!
-//! **A channel ending is news, not a session failure either.** When a
-//! channel's reader hits EOF, its process's exit code is fetched (via a
-//! blocking [`ChannelWait::wait`]) and reported as `ServerRecord::Exit` --
-//! but not at once. The shared output channel is FIFO per producer, so by
-//! the EOF every chunk the process wrote has been handled (and a stale
-//! screen channel repaints now, its last frame being among what it
-//! dropped). On the wire, though, `Exit` travels on `CONTROL_STREAM` and
-//! the output on the channel's own stream, and streams are delivered
-//! independently: a small `Exit` overtakes a stream still holding output,
-//! and the client drops a channel's data once it has seen its `Exit`. So
-//! the runner asks the bridge to say when everything it sent on the
-//! channel's stream is acknowledged ([`SessionIo::notify_delivered`]) and
-//! sends `Exit` on that answer -- the request names the channel's own
-//! instance, so a late answer to an earlier channel on the same number does
-//! not count. Nothing changes on the wire. A `Close`
-//! from the client in between owes it no `Exit`, as ever; a stream number
-//! it opens again drops the old channel's. The session itself keeps running
-//! with whatever else is open.
+//! **Channel termination and final output are separate.** Reader EOF starts
+//! an asynchronous exact-instance retirement owner; the loop keeps servicing
+//! other channels. That owner serializes child status observation and stop
+//! requests. The runner sends the terminal record only after both exact reap
+//! proof and delivery of all accepted output. A delivery marker names the
+//! instance and attachment generation, so an old acknowledgement cannot end a
+//! replacement. Warm reattachment retains draining metadata and renews only
+//! delivery evidence. An explicit Close owes no final record and may reuse the
+//! stream, but cannot refund an unresolved child slot.
 //!
-//! **Reaping is not optional.** `portable_pty::Child` is not reaped on drop
-//! (see `qshd/src/channel_backend.rs`'s `ChildWait`, which always calls
-//! `kill()` then `wait()` on its children), so this runner does the same
-//! in three places: a channel's own natural end (above -- the process has
-//! already exited by then, so `wait()` alone is enough), a channel the
-//! CLIENT closes while its process may still be running, and every channel
-//! still open when the SESSION ends (the manager drops the io). The latter
-//! two also drop the channel's writer before calling [`ChannelWait::kill`]
-//! -- not because the process is guaranteed to see that as a hangup before
-//! it is killed (there is no synchronisation between the two, and `kill()`
-//! typically wins the race anyway), but because otherwise the writer's own
-//! blocking bridge task would sit in `blocking_recv()` forever with nothing
-//! left to tell it to stop.
+//! **Reaping is not optional.** Dropping a portable-pty child does not reap it.
+//! Installed children move into factory-owned custody before a retirement task
+//! is scheduled. A dropped runner, cancelled queued task, wait error or missing
+//! helper connection does not prove cleanup. Unknown observation parks custody
+//! without retaining a blocking worker; a later exact helper receipt can wake
+//! it. Stop and poll share one exclusive child owner, and no signal is allowed
+//! after reap or after PID identity becomes unknown. Session shutdown and
+//! restart request stop for active and already-draining children, then wait
+//! for exact cleanup. Broader runtime/task shutdown is a separate obligation.
 //!
 //! **Repaint and the live-channel list.** `Repaint` asks every channel's
 //! screen model to repaint and puts any non-empty answer on that channel's
@@ -148,24 +135,36 @@ const CHUNK_SIZE: usize = 8 * 1024;
 /// extra `select!` arm instead of one per channel.
 const CHANNEL_CAPACITY: usize = 16;
 
-/// Waits for a channel's process to end and reports its exit code, and can
-/// force it down early. Both are blocking by nature (`portable-pty`'s
-/// `Child::kill`/`Child::wait` are), so the runner only ever calls them from
-/// a blocking task.
-///
-/// `portable_pty::Child` is NOT reaped on drop -- unlike `std::process::Child`,
-/// dropping it leaks the OS process as a zombie. Every caller that owns one
-/// must call `kill()` then `wait()` itself; `qshd/src/channel_backend.rs`'s
-/// `ChildWait` already does, and this runner must too, for every channel, on
-/// every path a channel can stop existing (see the module docs).
+/// A child observation. Only Reaped proves cleanup; its exit code can be
+/// unavailable even when an exact backend receipt proves the child is gone.
+pub enum ChildStatus {
+    Running,
+    Reaped { code: Option<i32> },
+    Unknown(String),
+}
+
+#[path = "channel_reap.rs"]
+pub(crate) mod reaping;
+pub use reaping::ReapNotifier;
+use reaping::ReapSet;
+
+/// Exclusive child lifecycle operations. The runner calls observation/stop on
+/// blocking workers; a pending or failed observation never releases custody.
 pub trait ChannelWait: Send {
+    /// Nonblocking observation by the exclusive wait owner. After Unknown the
+    /// owner must retain custody and must not signal a possibly reused PID.
+    fn poll_exit(&mut self) -> ChildStatus;
+
+    /// Wake a parked retirement owner after an exact backend receipt arrives.
+    fn set_reap_notifier(&mut self, _notifier: ReapNotifier) {}
+
     /// Force the process down. Called only where the process is not already
     /// known to have exited (a `CLOSE` or a session tearing down while a
-    /// channel is still open) -- a channel that ended on its own only ever
-    /// gets `wait()`.
+    /// channel is still open). Natural termination is observed with `poll_exit`.
     fn kill(&mut self);
 
-    /// Block until the process has exited and return its exit code.
+    /// Legacy blocking fixture/adapter operation. Installed retirement uses
+    /// `poll_exit` so that a stop request never competes with an owned waiter.
     fn wait(self: Box<Self>) -> i32;
 
     /// Cleanup of a never-installed result. A status code, timeout or kill
@@ -746,11 +745,8 @@ async fn join_update(task: &mut Option<tokio::task::JoinHandle<UpdateTaskEnd>>) 
 /// End every channel still open and wait for its process -- the same reap
 /// the session's own end does (see the module docs), shared with a drain
 /// before the daemon replaces itself.
-fn begin_reap_all(
-    io: &SessionIo,
-    channels: &mut HashMap<u8, Channel>,
-    reaps: &mut tokio::task::JoinSet<i32>,
-) {
+fn begin_reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>, reaps: &mut ReapSet) {
+    reaps.stop_all();
     for (stream, ch) in channels.drain() {
         io.channel_closed(
             stream,
@@ -759,13 +755,18 @@ fn begin_reap_all(
         );
         forget_channel_stream(io, stream);
         let Channel {
-            input_tx, mut wait, ..
+            input_tx,
+            wait,
+            _open_slot,
+            instance,
+            ..
         } = ch;
         drop(input_tx);
-        reaps.spawn_blocking(move || {
-            wait.kill();
-            wait.wait()
-        });
+        if let Some(wait) = wait {
+            reaps.start(stream, instance, wait, _open_slot, true);
+        } else {
+            reaps.stop(instance);
+        }
     }
 }
 
@@ -790,7 +791,8 @@ struct PendingExit {
     /// names it, and an answer to an earlier channel's request -- one the
     /// client closed and opened again -- must not release this one.
     instance: u64,
-    code: i32,
+    code: Option<Option<i32>>,
+    delivered: bool,
     geometry: GeometryRecord,
     open: crate::channel::OpenClassification,
     gate: Arc<SendGate>,
@@ -803,6 +805,7 @@ impl PendingExit {
             .timeline
             .reset_attachment(self.geometry.instance, origin.generation);
         self.producer.origin = origin;
+        self.delivered = false;
         self.geometry.request_id = 0;
         self.geometry.outcome = GeometryOutcome::Established;
     }
@@ -847,7 +850,9 @@ struct Channel {
     /// Reaps the channel's process: fetches its exit code when the reader
     /// hits EOF, or is forced down if the session ends first (see the
     /// module docs).
-    wait: Box<dyn ChannelWait>,
+    wait: Option<Box<dyn ChannelWait>>,
+    /// Confirmed process termination, including an unavailable exit status.
+    terminal_code: Option<Option<i32>>,
 }
 
 /// The runner's ordered attachment, admitted-open ledger and capacity signal.
@@ -1172,7 +1177,7 @@ enum Wakeup {
     AckTick,
     OutputReady,
     OpenReady,
-    Reaped,
+    Reaped(reaping::Completion),
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
@@ -1216,7 +1221,7 @@ fn reset_attachment_outputs(
         let mut draining = Vec::with_capacity(exits.len() + channels.len());
         for (&stream, ch) in channels.iter() {
             let instance = ChannelInstance::new(ch.instance).expect("channel instance");
-            if ch.producer.eof {
+            if ch.wait.is_none() {
                 draining.push(DrainingChannel {
                     stream,
                     instance,
@@ -1243,7 +1248,9 @@ fn reset_attachment_outputs(
 }
 
 fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
-    let code = pending.code;
+    let code = pending
+        .code
+        .expect("child termination confirmed before Exit");
     forget_channel_stream(io, stream);
     let permit = pending.producer.exit_permit.take().expect("one final Exit");
     io.send_channel_exit(
@@ -1258,14 +1265,30 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
     );
 }
 
-async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
+/// Transfer process custody exactly once, independently of output backpressure.
+/// Natural EOF observes without signalling; an explicit stop also reaches a
+/// process already being observed by the registered reaper.
+fn begin_channel_ending(ch: &mut Channel, reaps: &mut ReapSet, stop: bool) {
+    ch.producer.deferred = None;
+    if let Some(wait) = ch.wait.take() {
+        reaps.start(
+            ch.request.stream,
+            ch.instance,
+            wait,
+            ch._open_slot.take(),
+            stop,
+        );
+    } else if stop {
+        reaps.stop(ch.instance);
+    }
+}
+
+fn finish_channel(io: &SessionIo, mut ch: Channel, reaps: &mut ReapSet) -> PendingExit {
+    begin_channel_ending(&mut ch, reaps, false);
     let geometry = current_geometry(&ch);
     let open = crate::channel::OpenClassification::from_open(&ch.request);
     let final_marker = DeliveryMarker { token: ch.instance };
     drop(ch.input_tx);
-    let code = tokio::task::spawn_blocking(move || ch.wait.wait())
-        .await
-        .unwrap_or(-1);
     io.send_channel_output(
         ch.request.stream,
         geometry.instance,
@@ -1279,7 +1302,8 @@ async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
     );
     PendingExit {
         instance: ch.instance,
-        code,
+        code: ch.terminal_code,
+        delivered: false,
         geometry,
         open,
         gate: ch.gate,
@@ -1315,12 +1339,12 @@ pub async fn run_channel_session_with(
 ) {
     let mut channels: HashMap<u8, Channel> = HashMap::new();
     let mut opening = HashMap::new();
-    let mut reaps = tokio::task::JoinSet::new();
+    let mut reaps = ReapSet::new(spawner.open_registry());
     let mut draining = None;
     let executor =
         crate::channel_open::ChannelOpenExecutor::new(spawner.clone(), spawner.open_registry());
-    // Channels that ended, by stream, with their exit code: each `Exit`
-    // waits for its channel's output to be delivered (see the module docs).
+    // EOF owners by stream: final output delivery and exact child reap are
+    // independent prerequisites of each terminal record.
     let mut exits: HashMap<u8, PendingExit> = HashMap::new();
     // Numbers every channel opened, so a delivery answer names the channel
     // it was asked for (see `PendingExit`).
@@ -1357,7 +1381,7 @@ pub async fn run_channel_session_with(
             _ = ack_tick.tick() => Wakeup::AckTick,
             _ = producer.ready.notified() => Wakeup::OutputReady,
             _ = producer.opens.notified() => Wakeup::OpenReady,
-            _ = reaps.join_next(), if !reaps.is_empty() => Wakeup::Reaped,
+            done = reaps.next(), if !reaps.is_empty() => Wakeup::Reaped(done),
             signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
             reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
             end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
@@ -1396,6 +1420,7 @@ pub async fn run_channel_session_with(
                             &mut term,
                             &mut update,
                             &producer,
+                            &mut reaps,
                         ) {
                             unsupported_control = true;
                             for ch in channels.values_mut() {
@@ -1411,6 +1436,11 @@ pub async fn run_channel_session_with(
                 } else if stream_id == UPDATE_STREAM {
                     update.receive(&io, data);
                 } else if let Some(ch) = channels.get_mut(&stream_id) {
+                    if ch.wait.is_none() {
+                        // Ending channels retain output, but accept no new input.
+                        io.consumed(stream_id, n);
+                        continue;
+                    }
                     // The offset of consumed input grows BEFORE the write --
                     // same reasoning as `serve_shell`.
                     ch.input_consumed += n as u64;
@@ -1505,8 +1535,7 @@ pub async fn run_channel_session_with(
                         && e.final_marker.token == token
                         && e.producer.origin.generation == generation
                 }) {
-                    let mut pending = exits.remove(&stream).expect("just found");
-                    send_pending_exit(&io, stream, &mut pending);
+                    exits.get_mut(&stream).expect("just found").delivered = true;
                 }
             }
             Wakeup::Inbound(Some(SessionInbound::OutputReady {
@@ -1523,7 +1552,27 @@ pub async fn run_channel_session_with(
                     }
                 }
             }
-            Wakeup::OpenReady | Wakeup::Reaped => {}
+            Wakeup::OpenReady => {}
+            Wakeup::Reaped(done) => {
+                if done.code.is_none() {
+                    log::warn!(
+                        "channel {}/{} reaped without an exit status",
+                        done.stream,
+                        done.instance
+                    );
+                }
+                if let Some(pending) = exits
+                    .get_mut(&done.stream)
+                    .filter(|p| p.instance == done.instance)
+                {
+                    pending.code = Some(done.code);
+                } else if let Some(ch) = channels
+                    .get_mut(&done.stream)
+                    .filter(|ch| ch.instance == done.instance)
+                {
+                    ch.terminal_code = Some(done.code);
+                }
+            }
             Wakeup::OutputReady => {
                 for ch in channels.values_mut() {
                     let instance = ChannelInstance::new(ch.instance).unwrap();
@@ -1555,8 +1604,7 @@ pub async fn run_channel_session_with(
                     .filter(|ch| ch.instance == instance)
                 {
                     ch.producer.eof = true;
-                    // Lifecycle termination wins over an unexecuted intent.
-                    ch.producer.deferred = None;
+                    begin_channel_ending(ch, &mut reaps, false);
                     if ch.stale || ch.screened {
                         // The model cannot repaint once EOF moves to PendingExit.
                         repaint_stale(&io, stream, ch);
@@ -1634,8 +1682,16 @@ pub async fn run_channel_session_with(
             .collect();
         for stream in finished {
             let ch = channels.remove(&stream).expect("finished channel");
-            let pending = finish_channel(&io, ch).await;
+            let pending = finish_channel(&io, ch, &mut reaps);
             exits.insert(stream, pending);
+        }
+        let delivered: Vec<_> = exits
+            .iter()
+            .filter_map(|(&stream, p)| (p.delivered && p.code.is_some()).then_some(stream))
+            .collect();
+        for stream in delivered {
+            let mut pending = exits.remove(&stream).expect("completed exit");
+            send_pending_exit(&io, stream, &mut pending);
         }
     }
 
@@ -1660,7 +1716,7 @@ pub async fn run_channel_session_with(
     // still own this runner's drain obligation. Unknown never gets a timeout refund.
     while !reaps.is_empty() || producer.opens.occupied() != 0 {
         tokio::select! {
-            _ = reaps.join_next(), if !reaps.is_empty() => {}
+            _ = reaps.next(), if !reaps.is_empty() => {}
             _ = producer.opens.notified() => {}
             signal = restart_signal_changed(&mut update.restart_rx) => {
                 if signal.phase == RestartPhase::Announced { update.join(signal.restart); }
@@ -1768,6 +1824,7 @@ fn apply_control_record(
     term: &mut Option<String>,
     update: &mut SessionUpdate,
     context: &ProducerContext,
+    reaps: &mut ReapSet,
 ) -> bool {
     match decode_client(&raw) {
         Ok(ClientRecord::ResizeRequest {
@@ -1802,6 +1859,7 @@ fn apply_control_record(
             // it before, it is not waiting for that `Exit` any more, and it
             // must not end the new channel.
             if let Some(pending) = exits.remove(&req.stream) {
+                reaps.stop(pending.instance);
                 io.channel_closed(
                     req.stream,
                     pending.geometry.instance,
@@ -1852,6 +1910,7 @@ fn apply_control_record(
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
             if let Some(pending) = exits.remove(&stream) {
+                reaps.stop(pending.instance);
                 io.channel_closed(stream, pending.geometry.instance, pending.producer.origin);
                 forget_channel_stream(io, stream);
             }
@@ -1881,13 +1940,18 @@ fn apply_control_record(
                 );
                 forget_channel_stream(io, stream);
                 let Channel {
-                    input_tx, mut wait, ..
+                    input_tx,
+                    wait,
+                    _open_slot,
+                    instance,
+                    ..
                 } = ch;
                 drop(input_tx);
-                tokio::task::spawn_blocking(move || {
-                    wait.kill();
-                    wait.wait()
-                });
+                if let Some(wait) = wait {
+                    reaps.start(stream, instance, wait, _open_slot, true);
+                } else {
+                    reaps.stop(instance);
+                }
             }
         }
         Ok(ClientRecord::AboutRequest) => update.about(),
@@ -2302,7 +2366,8 @@ impl<'a> PreparedInstallation<'a> {
             stale: false,
             instance: self.instance,
             request: self.request,
-            wait,
+            wait: Some(wait),
+            terminal_code: None,
         });
         bridges
     }
@@ -2446,6 +2511,7 @@ fn channel_writer_loop(
 #[cfg(test)]
 pub(crate) mod tests {
     include!("channel_server_open_tests.rs");
+    include!("channel_server_reap_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2566,6 +2632,7 @@ pub(crate) mod tests {
         greeting: Option<Vec<u8>>,
         feed: std_mpsc::Receiver<Vec<u8>>,
         reads: Arc<AtomicUsize>,
+        exited: Arc<AtomicBool>,
     }
 
     impl Read for FakeProcess {
@@ -2578,9 +2645,15 @@ pub(crate) mod tests {
             match self.feed.recv() {
                 Ok(bytes) => {
                     buf[..bytes.len()].copy_from_slice(&bytes);
+                    if bytes.is_empty() {
+                        self.exited.store(true, Ordering::SeqCst);
+                    }
                     Ok(bytes.len())
                 }
-                Err(_) => Ok(0),
+                Err(_) => {
+                    self.exited.store(true, Ordering::SeqCst);
+                    Ok(0)
+                }
             }
         }
     }
@@ -2671,9 +2744,26 @@ pub(crate) mod tests {
         code: i32,
         killed: Arc<Mutex<Vec<u8>>>,
         waited: Arc<Mutex<Vec<u8>>>,
+        wait_hold: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        exited: Arc<AtomicBool>,
+        observed: bool,
     }
 
     impl ChannelWait for FakeWait {
+        fn poll_exit(&mut self) -> ChildStatus {
+            let mut observed = self.waited.lock().unwrap();
+            if !self.observed {
+                observed.push(self.stream);
+                self.observed = true;
+            }
+            if *self.wait_hold.0.lock().unwrap() || !self.exited.load(Ordering::SeqCst) {
+                ChildStatus::Running
+            } else {
+                ChildStatus::Reaped {
+                    code: Some(self.code),
+                }
+            }
+        }
         fn cleanup_uninstalled(
             &mut self,
             authority: &crate::channel_open::CleanupAuthority<'_>,
@@ -2684,10 +2774,16 @@ pub(crate) mod tests {
         }
         fn kill(&mut self) {
             self.killed.lock().unwrap().push(self.stream);
+            self.exited.store(true, Ordering::SeqCst);
         }
 
         fn wait(self: Box<Self>) -> i32 {
             self.waited.lock().unwrap().push(self.stream);
+            let (lock, changed) = &*self.wait_hold;
+            let mut held = lock.lock().unwrap();
+            while *held {
+                held = changed.wait(held).unwrap();
+            }
             self.code
         }
     }
@@ -2728,6 +2824,7 @@ pub(crate) mod tests {
         /// Shared with every `FakeWriter` this spawner hands out: see
         /// [`FakeSpawner::hold_writes`].
         held: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        wait_hold: Arc<(Mutex<bool>, std::sync::Condvar)>,
         /// Shared with every `FakeWriter` this spawner hands out: see
         /// [`FakeSpawner::break_writes`].
         broken: Arc<AtomicBool>,
@@ -2751,6 +2848,7 @@ pub(crate) mod tests {
                 owners: Arc::new(Mutex::new(Vec::new())),
                 logins: Mutex::new(Vec::new()),
                 held: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+                wait_hold: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                 broken: Arc::new(AtomicBool::new(false)),
             })
         }
@@ -2824,11 +2922,13 @@ pub(crate) mod tests {
             }
             let (end_tx, end_rx) = std_mpsc::channel::<Vec<u8>>();
             self.enders.lock().unwrap().push((req.stream, end_tx));
+            let exited = Arc::new(AtomicBool::new(false));
             let spawned = SpawnedChannel {
                 reader: Box::new(FakeProcess {
                     greeting: Some(b"hello from the shell".to_vec()),
                     feed: end_rx,
                     reads: self.reads.clone(),
+                    exited: exited.clone(),
                 }),
                 writer: Box::new(FakeWriter {
                     stream: req.stream,
@@ -2853,6 +2953,9 @@ pub(crate) mod tests {
                     code: self.exit_code,
                     killed: self.killed.clone(),
                     waited: self.waited.clone(),
+                    wait_hold: self.wait_hold.clone(),
+                    exited,
+                    observed: false,
                 }),
             };
             Ok(custody.protect(spawned.wait, spawned.screen).finish(
@@ -2897,7 +3000,10 @@ pub(crate) mod tests {
                 .expect("the runner must not drop its outbound channel");
             let msg = match msg {
                 SessionOutbound::ChannelExit { stream, code, .. } => {
-                    return ServerRecord::Exit { stream, code }
+                    return match code {
+                        Some(code) => ServerRecord::Exit { stream, code },
+                        None => ServerRecord::ExitStatusUnavailable { stream },
+                    }
                 }
                 SessionOutbound::ChannelOpened { stream, .. } => {
                     return ServerRecord::Opened { stream }
@@ -3065,12 +3171,16 @@ pub(crate) mod tests {
                     screen: false,
                     command: vec![],
                 },
-                wait: Box::new(FakeWait {
+                wait: Some(Box::new(FakeWait {
                     stream: 16,
                     code: 0,
                     killed: Arc::default(),
                     waited: Arc::default(),
-                }),
+                    wait_hold: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+                    exited: Arc::new(AtomicBool::new(true)),
+                    observed: false,
+                })),
+                terminal_code: None,
                 producer: ProducerState::new(ChannelInstance::new(1).unwrap(), &producer),
             };
             Self {
@@ -3312,7 +3422,9 @@ pub(crate) mod tests {
         let rig = ResizeRig::new(false, false);
         let timeline = rig.channel.producer.timeline.clone();
         let mut outbound = rig.outbound;
-        let mut pending = finish_channel(&rig.io, rig.channel).await;
+        let mut reaps = ReapSet::default();
+        let mut pending = finish_channel(&rig.io, rig.channel, &mut reaps);
+        pending.code = Some(reaps.next().await.code);
         let _marker = outbound.try_recv().unwrap();
         send_pending_exit(&rig.io, 16, &mut pending);
         assert!(matches!(
@@ -3324,7 +3436,7 @@ pub(crate) mod tests {
         ));
         let exit = outbound.try_recv().unwrap();
         assert!(
-            matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:0,..} if instance.get()==1 && origin.generation==1)
+            matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:Some(0),..} if instance.get()==1 && origin.generation==1)
         );
         assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 83));
         drop(exit);
@@ -4151,6 +4263,7 @@ pub(crate) mod tests {
                     &mut None,
                     &mut SessionUpdate::new(None),
                     &channel_producer(),
+                    &mut ReapSet::default(),
                 );
             }
             assert_eq!(channels[&16].request, request);
@@ -4219,6 +4332,7 @@ pub(crate) mod tests {
                     &mut None,
                     &mut SessionUpdate::new(None),
                     &channel_producer(),
+                    &mut ReapSet::default(),
                 );
             }
         }
@@ -4920,14 +5034,12 @@ pub(crate) mod tests {
         runner.await.unwrap();
     }
 
-    /// Closing a channel frees its slot, so an open that would have been
-    /// refused a moment ago now succeeds.
+    /// A close retains the slot until the exact child has actually reaped.
     #[tokio::test]
-    async fn a_closed_channel_frees_its_slot() {
+    async fn a_closed_channel_frees_its_slot_only_after_reaping() {
         let spawner = FakeSpawner::new();
         let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
-
         for n in 0..MAX_CHANNELS {
             let stream = FIRST_CHANNEL_STREAM + n as u8;
             inbound
@@ -4939,7 +5051,8 @@ pub(crate) mod tests {
                 ServerRecord::Opened { stream }
             );
         }
-
+        *spawner.wait_hold.0.lock().unwrap() = true;
+        let release = asynchronous_reaping::ReleaseWait(spawner.wait_hold.clone());
         inbound
             .send(SessionInbound::Data(StreamData {
                 stream_id: CONTROL_STREAM,
@@ -4949,18 +5062,32 @@ pub(crate) mod tests {
             }))
             .await
             .unwrap();
-
+        until(|| {
+            spawner
+                .killed
+                .lock()
+                .unwrap()
+                .contains(&FIRST_CHANNEL_STREAM)
+        })
+        .await;
         let over = FIRST_CHANNEL_STREAM + MAX_CHANNELS as u8;
+        inbound
+            .send(open(over, ChannelKind::Shell, false))
+            .await
+            .unwrap();
+        assert!(matches!(next_control(&mut outbound).await,
+            ServerRecord::Refused { stream, .. } if stream == over));
+        assert_eq!(spawner.opens.outstanding(), 1, "close is not cleanup proof");
+        drop(release);
+        until(|| spawner.opens.outstanding() == 0).await;
         inbound
             .send(open(over, ChannelKind::Shell, false))
             .await
             .unwrap();
         assert_eq!(
             next_control(&mut outbound).await,
-            ServerRecord::Opened { stream: over },
-            "the slot the close freed is usable again"
+            ServerRecord::Opened { stream: over }
         );
-
         drop(inbound);
         runner.await.unwrap();
     }
@@ -6319,7 +6446,10 @@ pub(crate) mod tests {
                         return ServerRecord::Refused { stream, reason }
                     }
                     SessionOutbound::ChannelExit { stream, code, .. } => {
-                        return ServerRecord::Exit { stream, code }
+                        return match code {
+                            Some(code) => ServerRecord::Exit { stream, code },
+                            None => ServerRecord::ExitStatusUnavailable { stream },
+                        }
                     }
                     other => other,
                 };
@@ -7028,7 +7158,10 @@ pub(crate) mod tests {
                     stream: id, output, ..
                 } if id == stream => out.extend(shell_record(output).map(Seen::Record)),
                 SessionOutbound::ChannelExit { stream, code, .. } => {
-                    out.push(Seen::Control(ServerRecord::Exit { stream, code }))
+                    out.push(Seen::Control(match code {
+                        Some(code) => ServerRecord::Exit { stream, code },
+                        None => ServerRecord::ExitStatusUnavailable { stream },
+                    }))
                 }
                 SessionOutbound::Data(sd) if sd.stream_id == stream => {
                     out.extend(records.push(&sd.data).into_iter().map(Seen::Record));

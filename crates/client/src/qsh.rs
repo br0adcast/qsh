@@ -215,6 +215,9 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
                 SubstrateEvent::Refused { ch: stream, reason }
             }
             ServerRecord::Exit { stream, code } => SubstrateEvent::Exit { ch: stream, code },
+            ServerRecord::ExitStatusUnavailable { stream } => {
+                SubstrateEvent::ExitStatusUnavailable { ch: stream }
+            }
 
             ServerRecord::ChannelSnapshot(snapshot) => SubstrateEvent::Snapshot(snapshot),
             // The daemon talking about itself: handed up as it came.

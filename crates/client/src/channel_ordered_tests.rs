@@ -1403,3 +1403,150 @@ fn review_early_geometry_keeps_a_new_local_open_intent_separate() {
     assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
 }
+
+#[test]
+fn unavailable_exit_waits_for_draining_geometry_and_partial_output() {
+    let (mut s, _) = logged();
+    let data = wire(ShellRecord::Data(b"final tail".to_vec()));
+    assert!(geometry(&mut s, initial()).is_empty());
+    assert!(s.on_bytes(16, &data[..6]).is_empty());
+    let terminal = encode_server(&ServerRecord::ExitStatusUnavailable { stream: 16 });
+    assert!(s.on_bytes(CONTROL_STREAM, &terminal).is_empty());
+    assert!(s.on_bytes(CONTROL_STREAM, &terminal).is_empty());
+    let announced = snapshot(&mut s, 1, true);
+    assert!(announced.contains(&SessionEvent::DrainingReady(16)));
+    assert!(!announced
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ExitStatusUnavailable { .. })));
+    assert_eq!(
+        s.on_bytes(16, &data[6..]),
+        vec![
+            SessionEvent::Data {
+                ch: 16,
+                bytes: b"final tail".to_vec()
+            },
+            SessionEvent::ExitStatusUnavailable { ch: 16 },
+        ]
+    );
+    assert!(s.on_bytes(CONTROL_STREAM, &terminal).is_empty());
+    // Same-instance metadata cannot restore a terminal owner.
+    assert!(!snapshot(&mut s, 1, true).iter().any(|event| matches!(
+        event,
+        SessionEvent::Ready(_)
+            | SessionEvent::DrainingReady(_)
+            | SessionEvent::ExitStatusUnavailable { .. }
+    )));
+}
+
+#[test]
+fn unavailable_exit_conflicts_with_a_different_terminal_outcome() {
+    for unavailable_first in [true, false] {
+        let (mut s, _) = logged();
+        let unavailable = encode_server(&ServerRecord::ExitStatusUnavailable { stream: 16 });
+        let known = encode_server(&ServerRecord::Exit {
+            stream: 16,
+            code: 7,
+        });
+        let (first, second) = if unavailable_first {
+            (&unavailable, &known)
+        } else {
+            (&known, &unavailable)
+        };
+        assert!(s.on_bytes(CONTROL_STREAM, first).is_empty());
+        assert_eq!(
+            s.on_bytes(CONTROL_STREAM, second),
+            vec![SessionEvent::ProtocolFailure(
+                ChannelProtocolError::Metadata
+            )]
+        );
+        assert!(
+            geometry(&mut s, initial()).is_empty(),
+            "failure must stay sticky"
+        );
+    }
+}
+
+#[test]
+fn unavailable_exit_leaves_a_healthy_sibling_writable() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let seen = sent.clone();
+    let sink: Sink = Box::new(move |stream, bytes| {
+        seen.lock().unwrap().push((stream, bytes));
+    });
+    let mut s = ChannelSession::new(QshSubstrate::new(sink));
+    ready(&mut s);
+    let sibling = s.open_shell(80, 24).unwrap();
+    assert_ne!(sibling, 16);
+    s.on_bytes(
+        CONTROL_STREAM,
+        &encode_server(&ServerRecord::Opened { stream: sibling }),
+    );
+    let sibling_geometry = GeometryRecord {
+        instance: ChannelInstance::new(2).unwrap(),
+        ..initial()
+    };
+    assert!(s
+        .on_bytes(sibling, &wire(ShellRecord::Geometry(sibling_geometry)))
+        .contains(&SessionEvent::Ready(sibling)));
+    assert_eq!(
+        s.on_bytes(
+            CONTROL_STREAM,
+            &encode_server(&ServerRecord::ExitStatusUnavailable { stream: 16 })
+        ),
+        vec![SessionEvent::ExitStatusUnavailable { ch: 16 }]
+    );
+    assert!(s.is_ready(sibling));
+    assert_eq!(
+        s.on_bytes(sibling, &wire(ShellRecord::Data(b"alive".to_vec()))),
+        vec![SessionEvent::Data {
+            ch: sibling,
+            bytes: b"alive".to_vec()
+        }]
+    );
+    s.send(sibling, b"still writable");
+    assert!(sent
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(stream, bytes)| *stream == sibling && bytes == b"still writable"));
+}
+
+#[test]
+fn unavailable_exit_malformed_wire_fails_sticky_at_the_client() {
+    for payload in [vec![], vec![16, 0], vec![15]] {
+        let (mut s, _) = logged();
+        let bytes = transport::shell_frame::encode_record(0x2a, &payload);
+        assert_eq!(
+            s.on_bytes(CONTROL_STREAM, &bytes),
+            vec![SessionEvent::ProtocolFailure(
+                ChannelProtocolError::UnexpectedRecord(0x2a)
+            )]
+        );
+        assert!(s
+            .on_bytes(
+                CONTROL_STREAM,
+                &encode_server(&ServerRecord::ExitStatusUnavailable { stream: 16 })
+            )
+            .is_empty());
+    }
+}
+
+#[test]
+fn unavailable_exit_occupies_one_early_terminal_slot_even_when_repeated() {
+    let (mut s, _) = logged();
+    let terminal = encode_server(&ServerRecord::ExitStatusUnavailable { stream: 16 });
+    assert!(s.on_bytes(CONTROL_STREAM, &terminal).is_empty());
+    assert!(s.on_bytes(CONTROL_STREAM, &terminal).is_empty());
+    let mut batch = wire(ShellRecord::Geometry(initial()));
+    for _ in 0..254 {
+        batch.extend(wire(ShellRecord::Data(vec![])));
+    }
+    // One terminal + one geometry +254 DATA =256. Duplicate terminal is free.
+    assert!(s.on_bytes(16, &batch).is_empty());
+    assert_eq!(
+        s.on_bytes(16, &wire(ShellRecord::Data(vec![]))),
+        vec![SessionEvent::ProtocolFailure(
+            ChannelProtocolError::EarlyOutputOverflow
+        )]
+    );
+}

@@ -31,6 +31,9 @@ mod async_open_tests {
         stream: u8,
     }
     impl ChannelWait for Wait {
+        fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+            transport::channel_server::ChildStatus::Reaped { code: Some(7) }
+        }
         fn kill(&mut self) {
             self.feeds.lock().unwrap().remove(&self.stream);
         }
@@ -112,7 +115,7 @@ mod async_open_tests {
             ),
             SessionOutbound::ChannelExit { stream, code, .. } => (
                 CONTROL_STREAM,
-                encode_server(&ServerRecord::Exit { stream, code }),
+                encode_server(&match code { Some(code) => ServerRecord::Exit { stream, code }, None => ServerRecord::ExitStatusUnavailable { stream } }),
             ),
             SessionOutbound::ChannelOutput { stream, output, .. } => {
                 let record = match output {

@@ -96,6 +96,9 @@ mod open24_exec_tests {
 
     struct ReceiptWait(Arc<AtomicBool>);
     impl ChannelWait for ReceiptWait {
+        fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+            transport::channel_server::ChildStatus::Reaped { code: Some(0) }
+        }
         fn kill(&mut self) {}
         fn wait(self: Box<Self>) -> i32 {
             -1

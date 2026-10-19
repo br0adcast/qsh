@@ -492,11 +492,13 @@ pub enum SessionOutbound {
     },
     /// A final control record whose permit survives the outbound queue. Stage 4
     /// admits it on CONTROL_STREAM only for its current instance/attachment.
+    /// None means confirmed child cleanup with a lost exit status; it never
+    /// means that cleanup is still unknown or in progress.
     ChannelExit {
         stream: u8,
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
-        code: i32,
+        code: Option<i32>,
         open: crate::channel::OpenClassification,
         permit: crate::channel_timeline::TimelinePermit,
     },
@@ -676,7 +678,7 @@ impl SessionIo {
         &self,
         descriptor: crate::channel::DrainingChannel,
         origin: AttachmentContext,
-        code: i32,
+        code: Option<i32>,
         permit: crate::channel_timeline::TimelinePermit,
     ) {
         let _ = self.outbound.send(SessionOutbound::ChannelExit {

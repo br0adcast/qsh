@@ -264,6 +264,11 @@ mod open24_tests {
         }
     }
     impl ChannelWait for StalledReap {
+        fn poll_exit(&mut self) -> ChildStatus {
+            self.entered.notify_one();
+            if *self.release.0.lock().unwrap() { ChildStatus::Reaped { code: Some(0) } }
+            else { ChildStatus::Running }
+        }
         fn kill(&mut self) {
             self.end.take();
         }
@@ -312,6 +317,7 @@ mod open24_tests {
                         greeting: None,
                         feed: rx,
                         reads: Arc::new(AtomicUsize::new(0)),
+                        exited: Arc::new(AtomicBool::new(false)),
                     }),
                     Box::new(std::io::sink()),
                     Box::new(FakeResize {
@@ -771,6 +777,9 @@ mod open24_tests {
                         code: 0,
                         killed: Default::default(),
                         waited: Default::default(),
+                        wait_hold: Arc::new((Mutex::new(false), Condvar::new())),
+                        exited: Arc::new(AtomicBool::new(true)),
+                        observed: false,
                     }),
                     Box::new(self.screen.lock().unwrap().take().unwrap()),
                 )

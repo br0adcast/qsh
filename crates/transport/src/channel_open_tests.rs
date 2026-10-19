@@ -17,6 +17,9 @@ impl Drop for Wait {
     }
 }
 impl ChannelWait for Wait {
+    fn poll_exit(&mut self) -> crate::channel_server::ChildStatus {
+        crate::channel_server::ChildStatus::Reaped { code: None }
+    }
     fn kill(&mut self) {}
     fn wait(self: Box<Self>) -> i32 {
         -1
@@ -380,6 +383,9 @@ fn open24_receipt_during_cleanup_is_retried_before_returning_unknown() {
         first: bool,
     }
     impl ChannelWait for RacingWait {
+        fn poll_exit(&mut self) -> crate::channel_server::ChildStatus {
+            crate::channel_server::ChildStatus::Reaped { code: None }
+        }
         fn kill(&mut self) {}
         fn wait(self: Box<Self>) -> i32 {
             -1

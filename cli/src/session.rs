@@ -726,6 +726,24 @@ impl Session {
         }
     }
 
+    /// The remote child ended, but its status was lost. The local failure code
+    /// must not be represented as an exit status supplied by the remote process.
+    pub fn on_channel_exit_status_unavailable(&mut self, ch: ChannelId) -> Vec<Action> {
+        let tracked = match &self.shell_channel {
+            ShellChannel::Ready(known) | ShellChannel::Draining(known) => *known == ch,
+            ShellChannel::Opening { .. } => true,
+            _ => false,
+        };
+        if !tracked {
+            return Vec::new();
+        }
+        let mut actions = vec![Action::Notice(
+            "qsh: the remote process ended, but its exit status is unavailable".into(),
+        )];
+        actions.extend(self.leave(1));
+        actions
+    }
+
     /// Splits keyboard bytes into input and prefix commands (spec §8.3), in
     /// order. Input goes to the shell, or to the window while one is open.
     fn on_stdin(&mut self, bytes: Vec<u8>, now_ms: i64) -> Vec<Action> {

@@ -2013,6 +2013,7 @@ Records on `CONTROL_STREAM`, in the envelope of §1.5:
 | `0x20` `OPENED` | server | `stream(1)` — it is running |
 | `0x21` `REFUSED` | server | `stream(1)` + a human-readable reason |
 | `0x22` `EXIT` | server | `stream(1) code(i32)` — the process ended |
+| `0x2a` `EXIT_STATUS_UNAVAILABLE` | server | `stream(1)` — the child was reaped, but its exit status is unavailable |
 | `0x28` `PROTOCOL_ERROR` | server | `code(u16)` |
 | `0x29` `CHANNEL_SNAPSHOT` | server | one atomic active/draining lifecycle snapshot after warm attachment |
 | `0x24` `ABOUT` | server | `build(u64) checksum(32) arch_len(1) arch protocol(1) mode(1)` |
@@ -2046,7 +2047,13 @@ geometry and exact exhaustion. Its maximum payload is
 validated lengths. Eight live channels does not bound ended channels to eight.
 
 `REFUSED` is `stream(1)` followed by its UTF-8 reason; `EXIT` is
-`stream(1) | code(i32 big-endian)`. Retired kinds `0x11` and `0x23` are
+`stream(1) | code(i32 big-endian)`. `EXIT_STATUS_UNAVAILABLE` has exactly one
+payload byte naming a channel (16–255), six bytes including the envelope.
+It proves termination of that exact child; it does not report an invented exit
+code or an unknown cleanup outcome. Only that channel ends; other channels
+remain usable. The console reports the missing remote status and exits with
+local failure code 1. Numeric `EXIT` remains unchanged (ten bytes framed).
+Retired kinds `0x11` and `0x23` are
 malformed known messages, not accepted legacy messages or skippable extensions.
 
 `cols` or `rows` of 0 means "no pseudo-terminal". `take_open` rejects a
@@ -2112,15 +2119,24 @@ before Ready. Draining metadata never authorizes input. A new instance retires
 old parser/buffer/intent ownership atomically; the same ended instance cannot
 resurrect, lose its continuity state, or produce a second Exit.
 
-After EOF, final geometry/checkpoint output precedes an internal delivery marker.
-`EXIT` is held with its descriptor and budget permit until the output frontier
-has been transport-acknowledged and the control record reaches a real bounded
-handoff, or scoped teardown releases it. Warm attach carries pending ownership
-forward rather than declaring old output delivered. An ACK proves transport
-receipt, not application display. The client retains partial output framing when
-Exit arrives on the independent control stream and drains complete records
-before exposing Exit. A client CLOSE owes no Exit; reused instances cannot receive
-an old instance's completion.
+Output EOF does not prove process termination. The server observes the exact
+child asynchronously, allowing sibling channels to keep progressing. Final
+geometry/checkpoint output precedes an internal delivery marker; a terminal
+record requires both confirmed process cleanup and transport acknowledgement
+of that output frontier. Missing numeric status uses `EXIT_STATUS_UNAVAILABLE`
+without inventing a remote exit code or ending sibling channels.
+
+The final marker retains its original budget permit until Exit or scoped
+teardown. Warm attach reuses that marker and requires fresh acknowledgement of
+the new bootstrap and retained output, even if the old attachment acknowledged
+its marker before the child exited. `EXIT` or `EXIT_STATUS_UNAVAILABLE` retains
+its descriptor and budget permit until a real bounded control-stream handoff,
+or scoped teardown releases it. An ACK proves transport receipt, not application
+display. The client retains partial output framing when either terminal record
+arrives on the independent control stream and drains complete records before
+exposing it. Both use the same conservative ten-byte terminal metadata allowance
+and exact-instance retirement rules. A client CLOSE owes no Exit; reused
+instances cannot receive an old instance's completion.
 
 **Ordered geometry.** `GEOMETRY` has a 22-byte payload:
 `instance(u64) request_id(u64) outcome(1) reason(1) cols(2) rows(2)`.

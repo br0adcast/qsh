@@ -58,6 +58,7 @@ const REC_TERM: u8 = 0x13;
 const REC_OPENED: u8 = 0x20;
 const REC_REFUSED: u8 = 0x21;
 const REC_EXIT: u8 = 0x22;
+const REC_EXIT_STATUS_UNAVAILABLE: u8 = 0x2a;
 const REC_RETIRED_CHANNELS: u8 = 0x23;
 
 const REC_ABOUT_REQUEST: u8 = 0x14;
@@ -553,6 +554,11 @@ pub enum ServerRecord {
         stream: u8,
         code: i32,
     },
+    /// The exact child was reaped, but its exit status is unavailable.
+    /// Terminal for this channel only; this is not an unknown cleanup outcome.
+    ExitStatusUnavailable {
+        stream: u8,
+    },
     /// Atomic active/draining lifecycle metadata for the ordered profile.
     ChannelSnapshot(ChannelSnapshot),
     /// The answer to [`ClientRecord::AboutRequest`].
@@ -794,6 +800,9 @@ pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
             encode_record(REC_EXIT, &payload)
         }
 
+        ServerRecord::ExitStatusUnavailable { stream } => {
+            encode_record(REC_EXIT_STATUS_UNAVAILABLE, &[*stream])
+        }
         ServerRecord::ChannelSnapshot(snapshot) => snapshot.encode_record(),
         ServerRecord::About(about) => {
             let mut payload = Vec::with_capacity(8 + 32 + 1 + about.arch.len() + 2);
@@ -866,6 +875,14 @@ pub fn decode_server(raw: &RawRecord) -> Result<ServerRecord, ChannelCodecError>
                 raw.payload[4],
             ]);
             Ok(ServerRecord::Exit { stream, code })
+        }
+        REC_EXIT_STATUS_UNAVAILABLE => {
+            if raw.payload.len() != 1 || raw.payload[0] < FIRST_CHANNEL_STREAM {
+                return Err(ChannelCodecError::Malformed);
+            }
+            Ok(ServerRecord::ExitStatusUnavailable {
+                stream: raw.payload[0],
+            })
         }
         REC_RETIRED_CHANNELS => Err(ChannelCodecError::Malformed),
         REC_CHANNEL_SNAPSHOT => {
@@ -1538,6 +1555,43 @@ mod geometry_invalid_control_tests {
                 payload: vec![]
             }),
             Err(ChannelCodecError::UnknownKind(255))
+        );
+    }
+    #[test]
+    fn unavailable_exit_status_has_an_explicit_control_record() {
+        let raw = RawRecord {
+            kind: 0x2a,
+            payload: vec![16],
+        };
+        let record =
+            decode_server(&raw).expect("confirmed cleanup without status must be representable");
+        assert_eq!(encode_server(&record), vec![0x2a, 0, 0, 0, 1, 16]);
+    }
+
+    #[test]
+    fn unavailable_exit_status_rejects_malformed_payload_and_keeps_numeric_exit_wire() {
+        for payload in [vec![], vec![16, 0], vec![0], vec![15]] {
+            assert_eq!(
+                decode_server(&RawRecord {
+                    kind: 0x2a,
+                    payload
+                }),
+                Err(ChannelCodecError::Malformed)
+            );
+        }
+        assert_eq!(
+            decode_server(&RawRecord {
+                kind: 0x2a,
+                payload: vec![255]
+            }),
+            Ok(ServerRecord::ExitStatusUnavailable { stream: 255 })
+        );
+        assert_eq!(
+            encode_server(&ServerRecord::Exit {
+                stream: 16,
+                code: 37
+            }),
+            vec![0x22, 0, 0, 0, 5, 16, 0, 0, 0, 37]
         );
     }
 }
