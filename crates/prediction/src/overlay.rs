@@ -148,6 +148,7 @@ impl ConditionalOverlayCell {
                 ch: '\0',
                 fg: Color::Default,
                 bg: Color::Default,
+                combining: Default::default(),
                 flags: 0,
             },
             unknown: false,
@@ -269,6 +270,7 @@ mod tests {
             ch,
             fg: Color::Default,
             bg: Color::Default,
+            combining: Default::default(),
             flags: 0,
         }
     }
@@ -335,5 +337,28 @@ mod tests {
         c.base.active = true;
         c.replacement = cell_of('a');
         assert_eq!(c.get_validity(&fb, 0, 0, 5), Validity::IncorrectOrExpired);
+    }
+}
+
+#[cfg(test)]
+mod complete_cell_tests {
+    use super::*;
+    #[test]
+    fn complete_cell_prediction_compares_marks_and_copies_whole_cell() {
+        let mut source = terminal::TerminalCore::new(12, 2);
+        source.feed("\x1b[8me\u{301}".as_bytes());
+        let mut frame = source.frame();
+        let mut prediction = ConditionalOverlayCell::new(1, 0, 0);
+        prediction.base.active = true;
+        prediction.replacement = frame.cells[0];
+        prediction.replacement.combining = terminal::CombiningMarks::from_slice(&['\u{302}']);
+        assert_eq!(
+            prediction.get_validity(&frame, 0, 0, 1),
+            Validity::IncorrectOrExpired
+        );
+        prediction.apply(&mut frame, 0, 0, false);
+        assert_eq!(frame.cells[0], prediction.replacement);
+        assert_ne!(frame.cells[0].flags & terminal::FLAG_HIDDEN, 0);
+        assert_eq!(prediction.get_validity(&frame, 0, 0, 1), Validity::Correct);
     }
 }

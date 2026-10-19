@@ -12,8 +12,8 @@
 //! and the history to scroll back through is the client's own.
 
 use terminal::{
-    Cell, Color, Frame, MouseTracking, FLAG_BOLD, FLAG_DIM, FLAG_ITALIC, FLAG_LEADING_WIDE_SPACER,
-    FLAG_REVERSE, FLAG_UNDERLINE, FLAG_WIDE, FLAG_WIDE_SPACER,
+    Cell, Color, Frame, MouseTracking, FLAG_BOLD, FLAG_DIM, FLAG_HIDDEN, FLAG_ITALIC,
+    FLAG_LEADING_WIDE_SPACER, FLAG_REVERSE, FLAG_UNDERLINE, FLAG_WIDE, FLAG_WIDE_SPACER,
 };
 
 use crate::caps::TermCaps;
@@ -30,7 +30,8 @@ pub const RESET_TERMINAL_MODES: &[u8] =
 /// flags live in the same word but carry no appearance, and letting them
 /// into the style would force a full SGR reset at every wide-character
 /// boundary.
-const STYLE_FLAGS: u16 = FLAG_BOLD | FLAG_DIM | FLAG_ITALIC | FLAG_UNDERLINE | FLAG_REVERSE;
+const STYLE_FLAGS: u16 =
+    FLAG_BOLD | FLAG_DIM | FLAG_ITALIC | FLAG_UNDERLINE | FLAG_REVERSE | FLAG_HIDDEN;
 
 /// The input modes we mirror onto the user's terminal. Nothing about how the
 /// screen LOOKS lives here -- only what makes the terminal encode keyboard
@@ -257,6 +258,14 @@ impl Renderer {
             };
             let mut buf = [0u8; 4];
             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            if !cell.ch.is_control()
+                && cell.flags & (FLAG_WIDE_SPACER | FLAG_LEADING_WIDE_SPACER) == 0
+                && (cell.flags & FLAG_WIDE == 0 || wide)
+            {
+                for mark in cell.combining.as_slice() {
+                    out.extend_from_slice(mark.encode_utf8(&mut buf).as_bytes());
+                }
+            }
             pen += if wide { 2 } else { 1 };
         }
     }
@@ -396,6 +405,7 @@ fn row_content_end(frame: &Frame, row: u16) -> u16 {
 /// no glyph and is a blank too.
 fn is_drawable_blank(cell: &Cell) -> bool {
     (cell.ch == ' ' || cell.ch.is_control())
+        && cell.combining.is_empty()
         && cell.bg == Color::Default
         && cell.flags & !(FLAG_WIDE_SPACER | FLAG_LEADING_WIDE_SPACER) == 0
 }
@@ -468,7 +478,7 @@ fn through_wide_successor(frame: &Frame, row: u16, mut end: u16) -> u16 {
 /// Cells are the same for drawing purposes when character, colors and
 /// attributes match.
 fn same_cell(a: &Cell, b: &Cell) -> bool {
-    a.ch == b.ch && a.fg == b.fg && a.bg == b.bg && a.flags == b.flags
+    a == b
 }
 
 /// Whether everything from `from` to the end of `row` is blank with the

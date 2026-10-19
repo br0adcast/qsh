@@ -94,6 +94,7 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
         ch: ' ',
         fg: Color::Default,
         bg: Color::Default,
+        combining: Default::default(),
         flags: FLAG_REVERSE,
     };
     let mut cells = vec![plain; cols];
@@ -110,6 +111,7 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     };
     for (i, source) in right.iter().take(shown).enumerate() {
         cells[start + i].ch = source.ch;
+        cells[start + i].combining = source.combining;
         cells[start + i].flags |= source.flags;
     }
     if alarm {
@@ -127,22 +129,23 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     if !left.is_empty() && left.len() + 1 + shown < cols {
         for (i, source) in left.iter().enumerate() {
             cells[i].ch = source.ch;
+            cells[i].combining = source.combining;
             cells[i].flags |= source.flags;
         }
     }
     if let Some(last) = cells.last_mut() {
         if last.flags & terminal::FLAG_WIDE != 0 {
-            last.ch = ' ';
+            last.set_char(' ');
             last.flags &= !terminal::FLAG_WIDE;
         }
     }
     cells
 }
-/// Display cells, including wide spacers. Zero-width characters cannot be
-/// represented by Cell; omit them rather than allocating phantom columns.
+/// Display cells with zero-width suffixes attached to their owning glyph.
+/// Leading marks without an owner are omitted; wide spacers own no suffix.
 pub(crate) fn text_cells(text: &str, utf8: bool) -> Vec<Cell> {
     use unicode_width::UnicodeWidthChar;
-    let mut cells = Vec::new();
+    let mut cells: Vec<Cell> = Vec::new();
     for ch in text.chars() {
         let ch = if ch.is_control() || (!utf8 && !ch.is_ascii()) {
             '?'
@@ -151,6 +154,13 @@ pub(crate) fn text_cells(text: &str, utf8: bool) -> Vec<Cell> {
         };
         let width = ch.width().unwrap_or(0);
         if width == 0 {
+            if let Some(owner) = cells
+                .iter_mut()
+                .rev()
+                .find(|cell| cell.flags & terminal::FLAG_WIDE_SPACER == 0)
+            {
+                owner.combining.push(ch);
+            }
             continue;
         }
         let mut cell = Cell {
@@ -452,5 +462,29 @@ mod tests {
     #[test]
     fn no_prefix_no_hint() {
         assert_eq!(left_part(None), "");
+    }
+}
+
+#[cfg(test)]
+mod complete_cell_tests {
+    use super::*;
+    #[test]
+    fn complete_cell_status_text_owns_marks_without_phantom_columns() {
+        let cells = text_cells("\u{301}e\u{302}界\u{303}", true);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[0].combining.as_slice(), &['\u{302}']);
+        assert_eq!(cells[1].combining.as_slice(), &['\u{303}']);
+        assert!(cells[2].combining.is_empty());
+        let row = line(12, "e\u{302}", "界\u{303}", false, true);
+        assert_eq!(row[0].combining.as_slice(), &['\u{302}']);
+        assert_eq!(row[9].combining.as_slice(), &['\u{303}']);
+        let clipped = line(1, "", "界\u{303}", false, true);
+        assert_eq!(clipped[0].ch, ' ');
+        assert!(clipped[0].combining.is_empty());
+        let capped = text_cells(&format!("e{}", "\u{301}".repeat(17)), true);
+        assert_eq!(
+            capped[0].combining.as_slice().len(),
+            terminal::MAX_COMBINING_MARKS
+        );
     }
 }

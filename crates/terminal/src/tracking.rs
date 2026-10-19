@@ -110,7 +110,7 @@ pub(crate) fn accept_input<T>(term: &Term<T>, c: char) -> bool {
     }
     grid[line][column]
         .zerowidth()
-        .is_none_or(|marks| marks.len() < 16)
+        .is_none_or(|marks| marks.len() < crate::MAX_COMBINING_MARKS)
 }
 
 fn bounded_title(title: String) -> String {
