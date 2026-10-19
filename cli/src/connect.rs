@@ -18,7 +18,9 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use transport::driver_std::{Binder, ClientEvents, DriverSetup, SendFailure, StdClient};
+use transport::driver_std::{
+    Binder, ClientEvents, DriverSetup, RecoveryProgress, SendFailure, StdClient,
+};
 use transport::{LinkState, Stats};
 
 /// Failure budget for explicit server acceptance. Elapsed time never proves success.
@@ -128,6 +130,7 @@ pub struct Events {
     room: Condvar,
     /// Nothing takes from the queue any more: a waiting delivery returns.
     released: AtomicBool,
+    recovery_progress: Option<Arc<dyn Fn(RecoveryProgress) + Send + Sync>>,
 }
 
 impl Events {
@@ -143,6 +146,7 @@ impl Events {
             queued: Mutex::new(0),
             room: Condvar::new(),
             released: AtomicBool::new(false),
+            recovery_progress: None,
         }
     }
 
@@ -164,6 +168,12 @@ impl Events {
 }
 
 impl ClientEvents for Events {
+    fn on_recovery_progress(&self, progress: RecoveryProgress) {
+        if let Some(observer) = &self.recovery_progress {
+            observer(progress);
+        }
+    }
+
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         {
             let mut queued = self.queued.lock().expect("queue count");
@@ -306,6 +316,11 @@ pub fn auth_for(
     }
 }
 
+enum AttemptTarget {
+    Single(SocketAddr),
+    Shared(Vec<transport::recovery_handshake::RecoveryEndpoint>),
+}
+
 impl Attempt {
     /// Opens a connection that logs in the way `login` says.
     ///
@@ -322,46 +337,104 @@ impl Attempt {
         tx: Sender<crate::session::UiEvent>,
         token: [u8; 16],
     ) -> Attempt {
+        Self::open_target(
+            AttemptTarget::Single(addr),
+            server_pub,
+            local_priv,
+            login,
+            tx,
+            token,
+            None,
+        )
+    }
+
+    /// One transcript for the complete physical recovery catalog. Progress is
+    /// actual socket/Noise evidence, never a substitute for AuthAccepted.
+    pub fn open_recovery(
+        endpoints: Vec<transport::recovery_handshake::RecoveryEndpoint>,
+        server_pub: [u8; 32],
+        local_priv: [u8; 32],
+        login: Login,
+        tx: Sender<crate::session::UiEvent>,
+        token: [u8; 16],
+        progress: Arc<dyn Fn(RecoveryProgress) + Send + Sync>,
+    ) -> Attempt {
+        Self::open_target(
+            AttemptTarget::Shared(endpoints),
+            server_pub,
+            local_priv,
+            login,
+            tx,
+            token,
+            Some(progress),
+        )
+    }
+
+    fn open_target(
+        target: AttemptTarget,
+        server_pub: [u8; 32],
+        local_priv: [u8; 32],
+        login: Login,
+        tx: Sender<crate::session::UiEvent>,
+        token: [u8; 16],
+        progress: Option<Arc<dyn Fn(RecoveryProgress) + Send + Sync>>,
+    ) -> Attempt {
         let (auth, signer) = auth_for(&login);
-        let events = Arc::new(Events::new(tx));
+        let mut events = Events::new(tx);
+        events.recovery_progress = progress;
+        let events = Arc::new(events);
         // The token identifies the SESSION, not this connection: it comes
         // from the caller's session store, so a later run of `qsh` returns to
         // the shell this one leaves behind rather than starting another.
-        let client = Arc::new(StdClient::connect_with(
-            addr,
-            transport::ConnectionConfig {
-                required_features: transport::Features::CHANNEL_GEOMETRY
-                    | transport::Features::AUTH_ACCEPTED,
-                features: transport::Features::SUPPORTED,
-                role: transport::Role::Client,
-                local_static_priv: local_priv,
-                remote_static_pub: Some(server_pub),
-                auth,
-            },
-            token,
-            // Always warm: the server answers an unknown token with a fresh
-            // session and no complaint, so asking to resume costs nothing
-            // when there is nothing to resume -- and asking cold would
-            // REPLACE a session that is still there, which is precisely the
-            // one we came back for.
-            transport::StartKind::Warm,
-            Arc::new(NoopBinder),
-            events.clone(),
-            signer,
-            // Spec §4.13: a channel's bytes count as taken when they reach
-            // the terminal (reported by `interactive`); the control stream
-            // and the proof's stream on delivery.
-            DriverSetup {
-                default_consumption: transport::Consumption::Explicit,
-                stream_consumption: vec![
-                    (
-                        transport::channel::CONTROL_STREAM,
-                        transport::Consumption::OnDelivery,
-                    ),
-                    (transport::AUTH_STREAM, transport::Consumption::OnDelivery),
-                ],
-            },
-        ));
+        let config = transport::ConnectionConfig {
+            required_features: transport::Features::CHANNEL_GEOMETRY
+                | transport::Features::AUTH_ACCEPTED,
+            features: transport::Features::SUPPORTED,
+            role: transport::Role::Client,
+            local_static_priv: local_priv,
+            remote_static_pub: Some(server_pub),
+            auth,
+        };
+        // Always warm: the server answers an unknown token with a fresh
+        // session and no complaint, so asking to resume costs nothing
+        // when there is nothing to resume -- and asking cold would
+        // REPLACE a session that is still there, which is precisely the
+        // one we came back for.
+        // Spec §4.13: a channel's bytes count as taken when they reach
+        // the terminal (reported by `interactive`); the control stream
+        // and the proof's stream on delivery.
+        let setup = DriverSetup {
+            default_consumption: transport::Consumption::Explicit,
+            stream_consumption: vec![
+                (
+                    transport::channel::CONTROL_STREAM,
+                    transport::Consumption::OnDelivery,
+                ),
+                (transport::AUTH_STREAM, transport::Consumption::OnDelivery),
+            ],
+        };
+        let client = Arc::new(match target {
+            AttemptTarget::Single(addr) => StdClient::connect_with(
+                addr,
+                config,
+                token,
+                transport::StartKind::Warm,
+                Arc::new(NoopBinder),
+                events.clone(),
+                signer,
+                setup,
+            ),
+            AttemptTarget::Shared(endpoints) => StdClient::connect_recovery_with(
+                endpoints,
+                config,
+                token,
+                transport::StartKind::Warm,
+                Arc::new(NoopBinder),
+                events.clone(),
+                signer,
+                setup,
+            ),
+        });
         Attempt {
             client,
             events,

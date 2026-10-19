@@ -9,6 +9,7 @@
 pub mod ladder;
 pub mod reconnect;
 pub mod recovery_gate;
+pub mod recovery_sweep;
 pub mod server_identity;
 
 pub use ladder::*;

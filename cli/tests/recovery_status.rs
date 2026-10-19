@@ -72,10 +72,10 @@ fn ssh_backoff_does_not_hide_an_actual_qsh_attempt() {
     }];
     let now = Instant::now();
     let activity = Activity {
-        qsh: Some(QshActivity {
+        qsh: vec![QshActivity {
             address: AddressId(0),
             endpoint: Some("192.0.2.1:60001".parse().unwrap()),
-        }),
+        }],
         ssh: None,
         ssh_retry_at: Some(now + Duration::from_secs(8)),
         ssh_allowed: true,

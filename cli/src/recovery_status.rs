@@ -69,9 +69,7 @@ impl View {
             .enumerate()
             .map(|(i, addr)| {
                 let id = AddressId(i);
-                let current = activity
-                    .and_then(|a| a.qsh.as_ref())
-                    .filter(|q| q.address == id);
+                let current = activity.and_then(|a| a.qsh.iter().find(|q| q.address == id));
                 let endpoint = current
                     .and_then(|q| q.endpoint)
                     .or_else(|| endpoints.iter().find(|(a, _)| *a == id).map(|(_, e)| *e));

@@ -51,8 +51,23 @@ impl RecoveryNetwork {
             }
         }
     }
+    pub fn handshake_only(&self, road: usize, enabled: bool) {
+        self.roads[road].handshake_only(enabled);
+    }
+    pub fn transport_received(&self, road: usize) -> usize {
+        self.roads[road].transport_received()
+    }
+    pub fn transport_after_next_initiator(&self, road: usize) {
+        self.roads[road].transport_after_next_initiator();
+    }
+    pub fn saw_next_initiator(&self, road: usize) -> bool {
+        self.roads[road].saw_next_initiator()
+    }
     pub fn probes(&self) -> [usize; 2] {
         std::array::from_fn(|i| self.roads[i].received())
+    }
+    pub fn handshakes(&self) -> [Vec<std::time::Instant>; 2] {
+        std::array::from_fn(|i| self.roads[i].handshakes())
     }
     pub fn pin_qsh(&self, home: &Path) {
         let store = sshauth::known_hosts::KnownHosts::open(home.join("qsh/known_hosts"));
