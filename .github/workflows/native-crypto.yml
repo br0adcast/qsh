@@ -1,0 +1,118 @@
+name: Native crypto prerequisite
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/*openssl*'
+      - 'scripts/openssl/**'
+      - 'scripts/tests/test_build_openssl.py'
+      - '.github/workflows/native-crypto.yml'
+      - '.github/workflows/release.yml'
+      - 'packaging/Dockerfile.build-*'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/*openssl*'
+      - 'scripts/openssl/**'
+      - 'scripts/tests/test_build_openssl.py'
+      - '.github/workflows/native-crypto.yml'
+      - '.github/workflows/release.yml'
+      - 'packaging/Dockerfile.build-*'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  HISTFILE: /dev/null
+
+jobs:
+  portable:
+    name: Native ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native prerequisites
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
+          else
+            brew install gnupg
+          fi
+      - name: Build and execute the pinned backend
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          args=()
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Only kernel UAPI headers supplement musl's own include path;
+            # adding /usr/include wholesale would mix glibc and musl headers.
+            uapi="$RUNNER_TEMP/kernel-uapi"
+            mkdir -p "$uapi"
+            ln -s /usr/include/linux "$uapi/linux"
+            ln -s /usr/include/asm-generic "$uapi/asm-generic"
+            ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
+            args+=(--cflag=-idirafter --cflag="$uapi")
+          fi
+          bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}"
+
+  system-floors:
+    name: Native system floor (${{ matrix.format }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [deb, rpm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install explicit ARM emulator
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Build existing package-floor image
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: docker build -f "packaging/Dockerfile.build-$FORMAT" -t qsh-native-floor .
+      - name: Qualify both GNU architectures inside the actual floor
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-floor"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -e CARGO_BUILD_JOBS=2 -e HISTFILE=/dev/null -e FORMAT \
+            -v "$PWD:/work:ro" -v "$RUNNER_TEMP/native-floor:/native" \
+            -v /usr/bin/qemu-aarch64-static:/usr/local/bin/qemu-aarch64-static:ro \
+            qsh-native-floor bash -euc '
+              bash scripts/qualify-openssl.sh --target x86_64-unknown-linux-gnu \
+                --cache /native --toolchain-id "package-floor-$FORMAT"
+              if [ "$FORMAT" = deb ]; then
+                sysroot=/usr/aarch64-linux-gnu
+              else
+                sysroot=/usr/aarch64-linux-gnu/sys-root
+              fi
+              bash scripts/qualify-openssl.sh --target aarch64-unknown-linux-gnu \
+                --cache /native --cc aarch64-linux-gnu-gcc \
+                --ar aarch64-linux-gnu-ar --ranlib aarch64-linux-gnu-ranlib \
+                --toolchain-id "package-floor-$FORMAT" \
+                --runner /usr/local/bin/qemu-aarch64-static \
+                --runner-arg=-L --runner-arg="$sysroot"
+            '

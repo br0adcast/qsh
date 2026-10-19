@@ -24,6 +24,11 @@ permissions:
   contents: read
 
 jobs:
+  # The same path-filtered CI qualification is mandatory for a release build.
+  # This prerequisite adds no native dependency to the current Rust products.
+  native-crypto:
+    uses: ./.github/workflows/native-crypto.yml
+
   linux:
     runs-on: ubuntu-latest
     # Cross-compiling two targets and building two package formats; a hang
@@ -323,6 +328,7 @@ jobs:
   release:
     needs:
       [
+        native-crypto,
         linux,
         macos,
         server-packages,

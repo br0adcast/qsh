@@ -54,6 +54,8 @@ this section.**
   tests fail rather than pass having checked nothing; `QSH_NO_SSHD=1`
   skips them instead, and each skip says so.
 - `cargo fmt` and `cargo clippy` are clean on the files you changed.
+- Changes to the native crypto build prerequisite follow
+  [its source verification and qualification procedure](docs/native-crypto.md).
 - A change to how `qshd` uses Linux-PAM (`qshd/src/helper/pam.rs`, the
   `system` feature) keeps `scripts/check-pam-linkage.sh` passing; its header
   says what it checks, and when only `--featureless-only` applies.
