@@ -58,6 +58,61 @@ pub const FLAG_LEADING_WIDE_SPACER: u16 = 0b0100_0000;
 /// Faint (SGR 2). Set only by the console client's own chrome, never by the emulator.
 pub const FLAG_DIM: u16 = 0b1000_0000;
 
+/// Concealed text (SGR 8). This affects display, not storage or confidentiality.
+pub const FLAG_HIDDEN: u16 = 0b1_0000_0000;
+
+/// Maximum accepted zero-width scalars following a cell's base character.
+pub const MAX_COMBINING_MARKS: usize = 16;
+
+/// Bounded inline zero-width suffix. Copying a cell never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombiningMarks {
+    chars: [char; MAX_COMBINING_MARKS],
+    len: u8,
+}
+
+impl Default for CombiningMarks {
+    fn default() -> Self {
+        Self {
+            chars: ['\0'; MAX_COMBINING_MARKS],
+            len: 0,
+        }
+    }
+}
+
+impl CombiningMarks {
+    /// Retain accepted zero-width scalars, dropping invalid or excess input.
+    pub fn from_slice(marks: &[char]) -> Self {
+        let mut result = Self::default();
+        for &mark in marks {
+            result.push(mark);
+        }
+        result
+    }
+
+    /// Append a non-control, zero-width scalar if capacity remains.
+    /// Returns false when the scalar is invalid or the suffix is full.
+    pub fn push(&mut self, mark: char) -> bool {
+        use unicode_width::UnicodeWidthChar;
+        if mark.is_control()
+            || mark.width() != Some(0)
+            || usize::from(self.len) == MAX_COMBINING_MARKS
+        {
+            return false;
+        }
+        self.chars[usize::from(self.len)] = mark;
+        self.len += 1;
+        true
+    }
+
+    pub fn as_slice(&self) -> &[char] {
+        &self.chars[..usize::from(self.len)]
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// A cell color exactly as the application asked for it. Resolving it into
 /// concrete RGB is the consumer's job: a client that draws into SOMEONE
 /// ELSE'S terminal must keep an indexed color indexed, otherwise it would
@@ -132,12 +187,15 @@ pub enum MouseTracking {
     Motion,
 }
 
-/// One frame cell: a character, foreground/background colors (kept as the
+/// One frame cell: a base character with a bounded zero-width suffix,
+/// foreground/background colors (kept as the
 /// application meant them -- see `Color`), and attributes (see the `FLAG_*`
 /// constants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
+    /// Zero-width scalars attached to the base character.
+    pub combining: CombiningMarks,
     pub fg: Color,
     pub bg: Color,
     pub flags: u16,
@@ -148,23 +206,30 @@ impl Cell {
     pub fn blank() -> Cell {
         Cell {
             ch: ' ',
+            combining: CombiningMarks::default(),
             fg: Color::Default,
             bg: Color::Default,
             flags: 0,
         }
     }
 
+    /// Replace the base text, clearing any suffix inherited from old content.
+    pub fn set_char(&mut self, ch: char) {
+        self.ch = ch;
+        self.combining = CombiningMarks::default();
+    }
+
     /// Whether the cell is blank (space or NUL). Port of mosh's
     /// `Cell::is_blank` - prediction gives no "credit" for matching a blank cell.
     pub fn is_blank(&self) -> bool {
-        self.ch == ' ' || self.ch == '\0'
+        (self.ch == ' ' || self.ch == '\0') && self.combining.is_empty()
     }
 
-    /// Whether the CONTENTS (character) of two cells match, ignoring
+    /// Whether the complete text of two cells matches, ignoring
     /// colors/attributes. Port of mosh's `Cell::contents_match`: prediction
-    /// validity is decided by the character, while colors are copied separately.
+    /// validity is decided by text, while colors are copied separately.
     pub fn contents_match(&self, other: &Cell) -> bool {
-        self.ch == other.ch
+        self.ch == other.ch && self.combining == other.combining
     }
 }
 
@@ -433,6 +498,7 @@ impl TerminalCore {
                 let cell = &self.term.grid()[point];
                 cells.push(Cell {
                     ch: cell.c,
+                    combining: CombiningMarks::from_slice(cell.zerowidth().unwrap_or_default()),
                     fg: convert_color(cell.fg, colors),
                     bg: convert_color(cell.bg, colors),
                     flags: convert_flags(cell.flags),
@@ -561,6 +627,9 @@ impl Frame {
 /// whole mask.
 fn convert_flags(flags: CellFlags) -> u16 {
     let mut result = 0u16;
+    if flags.contains(CellFlags::HIDDEN) {
+        result |= FLAG_HIDDEN;
+    }
     if flags.contains(CellFlags::BOLD) {
         result |= FLAG_BOLD;
     }
@@ -1267,12 +1336,14 @@ mod tests {
             ch: 'a',
             fg: Color::Indexed(1),
             bg: Color::Indexed(2),
+            combining: Default::default(),
             flags: 0,
         };
         let a2 = Cell {
             ch: 'a',
             fg: Color::Indexed(9),
             bg: Color::Indexed(9),
+            combining: Default::default(),
             flags: 4,
         };
         assert!(a.contents_match(&a2)); // compared by character, ignoring colors/attributes
@@ -1512,5 +1583,43 @@ mod payload_tests {
         t.feed(b"\x1b]8;id=ok;ok\x07");
         t.feed(format!("\x1b]8;id=x;{}\x07", "u".repeat(4096)).as_bytes());
         assert!(t.term.grid().cursor.template.hyperlink().is_none());
+    }
+}
+
+#[cfg(test)]
+mod complete_cell_tests {
+    use super::*;
+    #[test]
+    fn complete_cell_suffix_is_bounded_validated_and_copyable() {
+        let mut suffix = CombiningMarks::default();
+        assert!(!suffix.push('x'));
+        assert!(!suffix.push('\0'));
+        for _ in 0..MAX_COMBINING_MARKS {
+            assert!(suffix.push('\u{301}'));
+        }
+        assert!(!suffix.push('\u{302}'));
+        assert_eq!(suffix.as_slice(), &['\u{301}'; MAX_COMBINING_MARKS]);
+        let mut cell = Cell::blank();
+        cell.combining = suffix;
+        assert!(!cell.is_blank());
+        assert!(!cell.contents_match(&Cell::blank()));
+        let copied = cell;
+        cell.set_char('x');
+        assert!(cell.combining.is_empty());
+        assert_eq!(copied.combining, suffix);
+        let bytes = std::mem::size_of::<Cell>();
+        eprintln!("public Cell={bytes}, inline suffix={}, frame cell backing: 80x24={}, 200x60={}, 512x256={}", std::mem::size_of::<CombiningMarks>(), bytes*80*24, bytes*200*60, bytes*512*256);
+        assert!(!std::mem::needs_drop::<Cell>());
+    }
+
+    #[test]
+    fn complete_cell_history_frame_retains_text_and_hidden() {
+        let mut terminal = TerminalCore::with_replay(12, 3);
+        terminal.feed("\x1b[8me\u{301}\x1b[0m\r\na\r\nb\r\nc".as_bytes());
+        terminal.scroll(1);
+        let frame = terminal.frame();
+        assert_eq!(frame.cells[0].ch, 'e');
+        assert_eq!(frame.cells[0].combining.as_slice(), &['\u{301}']);
+        assert_ne!(frame.cells[0].flags & FLAG_HIDDEN, 0);
     }
 }

@@ -454,7 +454,7 @@ impl PredictionEngine {
                                 cell.original_contents.push(orig);
                                 // replacement = orig, then clear()+append(' ').
                                 cell.replacement = orig;
-                                cell.replacement.ch = ' ';
+                                cell.replacement.set_char(' ');
                             } else {
                                 for i in col..width {
                                     let orig = *fb.cell(cur_row as u16, i as u16);
@@ -573,6 +573,7 @@ impl PredictionEngine {
                                 ch,
                                 fg: rf,
                                 bg: rb,
+                                combining: Default::default(),
                                 flags: rfl,
                             };
                             cell.original_contents.push(orig);
@@ -635,7 +636,7 @@ impl PredictionEngine {
                 cell.base.active = true;
                 cell.base.tentative_until_epoch = epoch;
                 cell.base.expire(lfs, now);
-                cell.replacement.ch = ' ';
+                cell.replacement.set_char(' ');
             }
         } else {
             self.cursor_mut().row += 1;
@@ -670,11 +671,66 @@ mod tests {
             ch: 'a',
             fg: Color::Default,
             bg: Color::Default,
+            combining: Default::default(),
             flags: 0,
         };
         server.cursor_col = 1;
         e.cull(&server, 0); // 'a' Correct -> confirmed_epoch == prediction_epoch
         e.set_local_frame_sent(1);
+    }
+
+    #[test]
+    fn complete_cell_overwrite_backspace_clears_marks() {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        warm_up(&mut e);
+        e.set_predict_overwrite(true);
+        let mut fb = frame(20, 1);
+        for cell in &mut fb.cells[..2] {
+            cell.ch = 'e';
+            cell.combining = terminal::CombiningMarks::from_slice(&['\u{301}']);
+            cell.flags = terminal::FLAG_HIDDEN;
+        }
+        fb.cursor_col = 1;
+        e.new_user_byte(0x7f, &fb, 1000);
+        let shown = e.apply(&fb);
+        assert_eq!(shown.cells[0].ch, ' ');
+        assert!(shown.cells[0].combining.is_empty());
+        assert_ne!(shown.cells[0].flags & terminal::FLAG_HIDDEN, 0);
+    }
+
+    #[test]
+    fn complete_cell_delete_moves_marks_and_hidden_style() {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        warm_up(&mut e);
+        let mut fb = frame(20, 1);
+        fb.cursor_col = 1;
+        fb.cells[1].ch = 'e';
+        fb.cells[1].combining = terminal::CombiningMarks::from_slice(&['\u{301}']);
+        fb.cells[1].flags = terminal::FLAG_HIDDEN;
+        e.new_user_byte(0x7f, &fb, 1000);
+        let mut expected = fb.cells[1];
+        expected.flags |= terminal::FLAG_UNDERLINE; // Existing prediction highlighting.
+        assert_eq!(e.apply(&fb).cells[0], expected);
+    }
+
+    #[test]
+    fn complete_cell_new_text_inherits_style_but_not_marks() {
+        let mut e = PredictionEngine::new(DisplayPreference::Always);
+        warm_up(&mut e);
+        e.set_predict_overwrite(true);
+        let mut fb = frame(20, 1);
+        fb.cursor_col = 1;
+        for cell in &mut fb.cells[..2] {
+            cell.ch = 'e';
+            cell.combining = terminal::CombiningMarks::from_slice(&['\u{301}']);
+            cell.flags = terminal::FLAG_HIDDEN;
+        }
+        e.new_user_byte(b'x', &fb, 1000);
+        let shown = e.apply(&fb);
+        assert_eq!(shown.cells[1].ch, 'x');
+        assert!(shown.cells[1].combining.is_empty());
+        assert_ne!(shown.cells[1].flags & terminal::FLAG_HIDDEN, 0);
+        assert_eq!(shown.cells[0], fb.cells[0]);
     }
 
     // Always: the typed character is visible in the overlaid frame immediately
@@ -707,6 +763,7 @@ mod tests {
             ch: 'h',
             fg: Color::Default,
             bg: Color::Default,
+            combining: Default::default(),
             flags: 0,
         };
         fb1.cursor_col = 1;

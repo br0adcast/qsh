@@ -145,9 +145,11 @@ pub fn overlay(frame: &Frame, text: &str) -> Frame {
         .zip(crate::statusline::text_cells(text, true))
     {
         cell.ch = source.ch;
+        cell.combining = source.combining;
         cell.flags &= !(terminal::FLAG_WIDE
             | terminal::FLAG_WIDE_SPACER
-            | terminal::FLAG_LEADING_WIDE_SPACER);
+            | terminal::FLAG_LEADING_WIDE_SPACER
+            | terminal::FLAG_HIDDEN);
         cell.flags |= FLAG_REVERSE | source.flags;
     }
     // Text and the surviving underlying cells can both end with half a pair.
@@ -354,5 +356,19 @@ mod tests {
             shell_ended_text(),
             "qsh: the shell on the server ended while the link was down"
         );
+    }
+}
+
+#[cfg(test)]
+mod complete_cell_tests {
+    #[test]
+    fn complete_cell_status_replaces_hidden_marked_shell_text() {
+        let mut source = terminal::TerminalCore::new(12, 2);
+        source.feed("\x1b[8me\u{301}".as_bytes());
+        let shown = super::overlay(&source.frame(), "O\u{302}K");
+        assert_eq!(shown.cells[0].ch, 'O');
+        assert_eq!(shown.cells[0].combining.as_slice(), &['\u{302}']);
+        assert_eq!(shown.cells[0].flags & terminal::FLAG_HIDDEN, 0);
+        assert!(shown.cells[1].combining.is_empty());
     }
 }

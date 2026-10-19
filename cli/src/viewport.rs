@@ -84,3 +84,20 @@ mod tests {
         assert!(projected.mouse_sgr && projected.bracketed_paste && projected.cursor_visible);
     }
 }
+
+#[cfg(test)]
+mod complete_cell_tests {
+    use super::*;
+    #[test]
+    fn complete_cell_projection_preserves_or_removes_entire_cluster() {
+        let mut source = terminal::TerminalCore::new(12, 2);
+        source.feed("e\u{301}界\u{302}".as_bytes());
+        let source = source.frame();
+        let intact = project(&source, ViewportSize::new(3, 2));
+        assert_eq!(intact.cells[0], source.cells[0]);
+        assert_eq!(intact.cells[1], source.cells[1]);
+        let clipped = project(&source, ViewportSize::new(2, 2));
+        assert_eq!(clipped.cells[0], source.cells[0]);
+        assert_eq!(clipped.cells[1], Cell::blank());
+    }
+}

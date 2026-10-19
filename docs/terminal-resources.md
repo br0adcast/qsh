@@ -275,7 +275,23 @@ The observer cannot see allocator-internal old/new realloc residency; these
 analytic allowances are separate from its observed live-request counter.
 `encode_record` requests exactly replay.len()+5 while replay remains alive.
 
-A frame owns exactly c×r public Cells plus A(Palette). A snapshot owns up to two
+A frame owns exactly c×r public Cells plus A(Palette). Public `terminal::Cell`
+keeps its base `ch` and up to 16 zero-width scalars in an inline `CombiningMarks`
+value; no cell suffix allocates. Cells remain `Copy`, and copying or moving a
+cell preserves its complete text. On the qualified x86-64 build, a public Cell
+is 92 bytes (previously 24): cell backing is 176,640 bytes for 80×24, 1,104,000
+for 200×60, and 12,058,624 for the 512×256 maximum, plus the palette allocation.
+These sizes are target/compiler observations; the observer uses `size_of` rather
+than assuming the layout. Model geometry limits and reservations are unchanged.
+This increases caller-retained frame memory, not the daemon's model charge.
+
+Public consumers constructing exhaustive Cell literals must initialize
+`combining` (or use `..Cell::blank()`). Read the complete text as `ch` followed
+by `combining.as_slice()`; `set_char` replaces text and clears the suffix.
+`FLAG_HIDDEN` carries SGR 8 concealment through rendering. Concealment controls
+appearance only: the text remains in frames, replay and terminal output.
+
+A snapshot owns up to two
 visible pictures: 2cr CellStates, 2r row Vec descriptors, at most 16 chars per
 cell and three cursor pens, c tab bools, and 259 optional RGB entries. Its
 primary capture can overlap the retained alternate Grid clone. Private snapshot

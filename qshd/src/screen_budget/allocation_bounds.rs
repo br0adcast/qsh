@@ -332,6 +332,7 @@ fn requested_storage() {
         "\x1b[1;2;3;4:5;7;8;9;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255m界{}",
         "\u{301}".repeat(17)
     );
+    let saturated_cell = format!("e{}", "\u{301}".repeat(terminal::MAX_COMBINING_MARKS));
     let title = format!("\x1b]2;{}\x07", "t".repeat(TITLE));
     let link = format!("\x1b]8;id=x;{}\x07x", "u".repeat(4095));
     let no_id_link = format!("\x1b]8;;{}\x07x", "u".repeat(4077));
@@ -500,7 +501,23 @@ fn requested_storage() {
             + extra(),
     );
     observe(|| drop(snapshot));
+    let (_, s) = observe(|| {
+        t.feed(b"\x1b[H");
+        for _ in 0..current.cells() {
+            t.feed(saturated_cell.as_bytes());
+        }
+    });
+    check(
+        "saturated frame source",
+        s,
+        retained(envelope),
+        retained(envelope) + feed_scratch(),
+    );
     let (frame, s) = observe(|| black_box(t.frame()));
+    assert!(frame
+        .cells
+        .iter()
+        .all(|cell| cell.combining.as_slice().len() == terminal::MAX_COMBINING_MARKS));
     check(
         "frame",
         s,

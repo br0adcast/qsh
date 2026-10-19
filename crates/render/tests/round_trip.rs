@@ -29,15 +29,19 @@ const VISIBLE_ATTRS: u16 = FLAG_BOLD | FLAG_ITALIC | FLAG_UNDERLINE | FLAG_REVER
 ///   * the foreground of a blank cell on the default background with no
 ///     visible attribute cannot be seen at all, so the renderer rightly
 ///     spends no SGR on it.
-fn visible(cell: &Cell) -> (char, Color, Color, u16) {
+fn visible(cell: &Cell) -> (char, terminal::CombiningMarks, Color, Color, u16) {
     let ch = if cell.ch.is_control() { ' ' } else { cell.ch };
     let flags = cell.flags & !FLAG_LEADING_WIDE_SPACER;
-    let fg = if ch == ' ' && cell.bg == Color::Default && flags & VISIBLE_ATTRS == 0 {
+    let fg = if ch == ' '
+        && cell.combining.is_empty()
+        && cell.bg == Color::Default
+        && flags & VISIBLE_ATTRS == 0
+    {
         Color::Default
     } else {
         cell.fg
     };
-    (ch, fg, cell.bg, flags)
+    (ch, cell.combining, fg, cell.bg, flags)
 }
 
 /// Compare what matters for drawing: the grid and the cursor. Palette and
@@ -897,7 +901,13 @@ fn a_damaged_wide_character_does_not_leave_its_paint_on_an_unchanged_neighbour()
     assert_eq!(frame.cell(0, 2).flags & FLAG_WIDE, FLAG_WIDE);
     assert_eq!(
         visible(frame.cell(0, 3)),
-        (' ', Color::Default, Color::Indexed(6), 0),
+        (
+            ' ',
+            Default::default(),
+            Color::Default,
+            Color::Indexed(6),
+            0
+        ),
         "column 3 is the plain cyan blank it was before"
     );
     dst.feed(&r.render(&frame));
@@ -925,7 +935,7 @@ fn a_damaged_wide_character_does_not_paint_past_the_row_content_on_a_full_repain
     assert_eq!(expected.cell(0, 0).flags & FLAG_WIDE, FLAG_WIDE);
     assert_eq!(
         visible(expected.cell(0, 1)),
-        (' ', Color::Default, Color::Default, 0),
+        (' ', Default::default(), Color::Default, Color::Default, 0),
         "the second half is a default blank"
     );
 
@@ -977,7 +987,8 @@ fn an_orphan_spacer_is_drawn_when_its_row_moves_onto_other_text() {
                 ch,
                 fg: Color::Default,
                 bg: Color::Default,
-                flags: 0
+                flags: 0,
+                combining: Default::default(),
             },
             "row 0, col {col}"
         );
@@ -1005,6 +1016,155 @@ fn cropped_viewport_never_scrolls_the_physical_terminal() {
                     visible(frame.cell(row, col))
                 );
             }
+        }
+    }
+}
+
+/// This oracle reads Alacritty directly, without the public frame conversion
+/// under test. Literal marks and attributes must survive the emitted bytes.
+fn parse_complete_cells(
+    bytes: &[u8],
+) -> alacritty_terminal::term::Term<alacritty_terminal::event::VoidListener> {
+    use alacritty_terminal::{
+        event::VoidListener,
+        term::{test::TermSize, Config, Term},
+        vte::ansi::Processor,
+    };
+    let mut term = Term::new(Config::default(), &TermSize::new(12, 3), VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, bytes);
+    term
+}
+
+#[test]
+fn complete_cell_text_survives_frame_and_render() {
+    use alacritty_terminal::index::{Column, Line};
+    let mut source = TerminalCore::new(12, 3);
+    // Split every UTF-8 sequence to exercise incremental input as well.
+    for byte in "e\u{301}\u{302} \u{303}界\u{304}".as_bytes() {
+        source.feed(&[*byte]);
+    }
+    let mut renderer = Renderer::new(TermCaps::truecolor());
+    let term = parse_complete_cells(&renderer.render(&source.frame()));
+    for (column, base, marks) in [
+        (0, 'e', vec!['\u{301}', '\u{302}']),
+        (1, ' ', vec!['\u{303}']),
+        (2, '界', vec!['\u{304}']),
+    ] {
+        let cell = &term.grid()[Line(0)][Column(column)];
+        assert_eq!(cell.c, base);
+        assert_eq!(
+            cell.zerowidth().unwrap_or_default(),
+            marks,
+            "column {column}"
+        );
+    }
+    assert_eq!(term.grid().cursor.point.column, Column(4));
+}
+
+#[test]
+fn complete_cell_concealment_survives_frame_and_render() {
+    use alacritty_terminal::{
+        index::{Column, Line},
+        term::cell::Flags,
+    };
+    let mut source = TerminalCore::new(12, 3);
+    source.feed(b"\x1b[1;8mH\x1b[28mV\x1b[8mX\x1b[0mY");
+    for caps in [TermCaps::truecolor(), TermCaps::detect(Some("dumb"), None)] {
+        let mut renderer = Renderer::new(caps);
+        let term = parse_complete_cells(&renderer.render(&source.frame()));
+        for (column, hidden) in [(0, true), (1, false), (2, true), (3, false)] {
+            assert_eq!(
+                term.grid()[Line(0)][Column(column)]
+                    .flags
+                    .contains(Flags::HIDDEN),
+                hidden,
+                "column {column}"
+            );
+            assert_eq!(
+                term.grid()[Line(0)][Column(column)]
+                    .flags
+                    .contains(Flags::BOLD),
+                column < 3
+            );
+        }
+    }
+}
+
+#[test]
+fn complete_cell_suffix_changes_and_removal_repaint_the_cluster() {
+    use alacritty_terminal::index::{Column, Line};
+    let mut source = TerminalCore::new(12, 3);
+    let mut renderer = Renderer::new(TermCaps::truecolor());
+    let mut output = Vec::new();
+    for (text, marks) in [
+        ("e\u{301}", vec!['\u{301}']),
+        ("e\u{302}", vec!['\u{302}']),
+        ("e", vec![]),
+        (" \u{303}", vec!['\u{303}']),
+        (" ", vec![]),
+    ] {
+        source.feed(b"\x1b[H");
+        source.feed(text.as_bytes());
+        output.extend(renderer.render(&source.frame()));
+        let actual = parse_complete_cells(&output);
+        assert_eq!(
+            actual.grid()[Line(0)][Column(0)]
+                .zerowidth()
+                .unwrap_or_default(),
+            marks
+        );
+        assert_eq!(actual.grid().cursor.point.column, Column(1));
+    }
+}
+
+#[test]
+fn complete_cell_replay_keeps_saturated_marks_and_concealment() {
+    use alacritty_terminal::{
+        index::{Column, Line},
+        term::cell::Flags,
+    };
+    for alternate in [false, true] {
+        let mut source = TerminalCore::with_replay(12, 3);
+        if alternate {
+            source.feed(b"\x1b[?1049h");
+        }
+        source.feed(format!("\x1b[8me{}", "\u{301}".repeat(100)).as_bytes());
+        let mut restored = TerminalCore::new(12, 3);
+        restored.feed(&source.replay().unwrap());
+        let mut renderer = Renderer::new(TermCaps::truecolor());
+        let actual = parse_complete_cells(&renderer.render(&restored.frame()));
+        let cell = &actual.grid()[Line(0)][Column(0)];
+        assert_eq!(cell.c, 'e');
+        assert_eq!(
+            cell.zerowidth().unwrap(),
+            &['\u{301}'; terminal::MAX_COMBINING_MARKS]
+        );
+        assert!(cell.flags.contains(Flags::HIDDEN));
+    }
+}
+
+#[test]
+fn complete_cell_normalized_spacers_and_clipped_glyphs_emit_no_marks() {
+    use alacritty_terminal::index::{Column, Line};
+    for (col, ch, flags) in [
+        (0, ' ', FLAG_WIDE_SPACER),
+        (0, ' ', FLAG_LEADING_WIDE_SPACER),
+        (0, '\t', 0),
+        (11, '界', FLAG_WIDE),
+    ] {
+        let mut frame = Frame::blank(12, 3);
+        let cell = frame.cell_mut(0, col);
+        cell.ch = ch;
+        cell.flags = flags;
+        cell.combining = terminal::CombiningMarks::from_slice(&['\u{301}']);
+        let bytes = Renderer::new(TermCaps::truecolor()).render(&frame);
+        let actual = parse_complete_cells(&bytes);
+        for column in 0..12 {
+            assert!(actual.grid()[Line(0)][Column(column)]
+                .zerowidth()
+                .unwrap_or_default()
+                .is_empty());
         }
     }
 }

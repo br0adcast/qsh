@@ -1,7 +1,9 @@
 //! Turning a cell's appearance into SGR escapes, and downgrading colors the
 //! terminal cannot show.
 
-use terminal::{Color, Palette, FLAG_BOLD, FLAG_DIM, FLAG_ITALIC, FLAG_REVERSE, FLAG_UNDERLINE};
+use terminal::{
+    Color, Palette, FLAG_BOLD, FLAG_DIM, FLAG_HIDDEN, FLAG_ITALIC, FLAG_REVERSE, FLAG_UNDERLINE,
+};
 
 use crate::caps::{ColorDepth, TermCaps};
 
@@ -56,6 +58,9 @@ pub fn write_sgr(out: &mut Vec<u8>, from: Style, to: Style, caps: TermCaps, pale
     }
     if base.flags & FLAG_REVERSE == 0 && to.flags & FLAG_REVERSE != 0 {
         out.extend_from_slice(b"\x1b[7m");
+    }
+    if base.flags & FLAG_HIDDEN == 0 && to.flags & FLAG_HIDDEN != 0 {
+        out.extend_from_slice(b"\x1b[8m");
     }
     if caps.color == ColorDepth::Mono {
         return;

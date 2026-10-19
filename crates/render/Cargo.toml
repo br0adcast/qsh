@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 terminal = { path = "../terminal" }
+
+[dev-dependencies]
+alacritty_terminal = "=0.26.0"

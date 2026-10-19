@@ -218,6 +218,7 @@ fn plain(ch: char) -> Cell {
         ch,
         fg: Color::Default,
         bg: Color::Default,
+        combining: Default::default(),
         flags: 0,
     }
 }
