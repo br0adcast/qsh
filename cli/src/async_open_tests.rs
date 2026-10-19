@@ -117,11 +117,12 @@ mod async_open_tests {
                 CONTROL_STREAM,
                 encode_server(&match code { Some(code) => ServerRecord::Exit { stream, code }, None => ServerRecord::ExitStatusUnavailable { stream } }),
             ),
-            SessionOutbound::ChannelOutput { stream, output, .. } => {
+            SessionOutbound::ChannelOutput { stream, instance, output, .. } => {
                 let record = match output {
                     ChannelOutput::Geometry(record, _) => ShellRecord::Geometry(record),
                     ChannelOutput::Data(bytes) => ShellRecord::Data(bytes),
                     ChannelOutput::EchoAck(offset, _) => ShellRecord::EchoAck(offset),
+                    ChannelOutput::OutputGap(cause, _) => ShellRecord::OutputGap { instance, cause },
                     ChannelOutput::DeliveryMarker(..) => return Vec::new(),
                 };
                 (stream, encode_shell(&record).unwrap())

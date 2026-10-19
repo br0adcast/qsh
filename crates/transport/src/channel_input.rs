@@ -10,6 +10,16 @@ use std::sync::{Arc, Mutex};
 
 const NETWORK_BYTES: usize = 8 * 1024 * 1024;
 const NETWORK_ITEMS: usize = 16_384;
+const LOCAL_CHANNEL_BYTES: usize = 64 * 1024;
+const LOCAL_SESSION_BYTES: usize = 512 * 1024;
+const LOCAL_CHANNEL_ITEMS: usize = 64;
+const LOCAL_SESSION_ITEMS: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputOrigin {
+    Network,
+    LocalReply,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputScope {
@@ -21,16 +31,28 @@ pub enum InputScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputLimit {
     Closed(InputScope),
-    Bytes { scope: InputScope },
-    Items { scope: InputScope },
+    Bytes {
+        origin: InputOrigin,
+        scope: InputScope,
+    },
+    Items {
+        origin: InputOrigin,
+        scope: InputScope,
+    },
 }
 
 #[derive(Clone, Copy)]
-struct InputLimits {
+struct QuotaLimits {
     channel_bytes: usize,
     session_bytes: usize,
     channel_items: usize,
     session_items: usize,
+}
+
+#[derive(Clone, Copy)]
+struct InputLimits {
+    network: QuotaLimits,
+    local: QuotaLimits,
 }
 
 impl Default for InputLimits {
@@ -39,10 +61,27 @@ impl Default for InputLimits {
             // The bridge pending cap is 8 MiB, and the stream window is 512 KiB.
             // This also admits an 8 MiB paste split into 512-byte chunks. Tiny
             // fragments may exhaust the item quota before the byte quota.
-            channel_bytes: NETWORK_BYTES,
-            session_bytes: NETWORK_BYTES,
-            channel_items: NETWORK_ITEMS,
-            session_items: NETWORK_ITEMS,
+            network: QuotaLimits {
+                channel_bytes: NETWORK_BYTES,
+                session_bytes: NETWORK_BYTES,
+                channel_items: NETWORK_ITEMS,
+                session_items: NETWORK_ITEMS,
+            },
+            local: QuotaLimits {
+                channel_bytes: LOCAL_CHANNEL_BYTES,
+                session_bytes: LOCAL_SESSION_BYTES,
+                channel_items: LOCAL_CHANNEL_ITEMS,
+                session_items: LOCAL_SESSION_ITEMS,
+            },
+        }
+    }
+}
+
+impl InputLimits {
+    fn quota(self, origin: InputOrigin) -> QuotaLimits {
+        match origin {
+            InputOrigin::Network => self.network,
+            InputOrigin::LocalReply => self.local,
         }
     }
 }
@@ -53,10 +92,25 @@ struct QuotaUsage {
     items: usize,
 }
 
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+struct Usage {
+    network: QuotaUsage,
+    local: QuotaUsage,
+}
+
+impl Usage {
+    fn quota_mut(&mut self, origin: InputOrigin) -> &mut QuotaUsage {
+        match origin {
+            InputOrigin::Network => &mut self.network,
+            InputOrigin::LocalReply => &mut self.local,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     closed: bool,
-    usage: QuotaUsage,
+    usage: Usage,
 }
 
 struct Session {
@@ -98,7 +152,7 @@ impl SessionInputBudget {
     }
 
     #[cfg(test)]
-    fn usage(&self) -> QuotaUsage {
+    fn usage(&self) -> Usage {
         self.0.state.lock().unwrap().usage
     }
 }
@@ -112,8 +166,20 @@ pub struct ChannelInputBudget {
 
 impl ChannelInputBudget {
     pub fn try_network(&self, bytes: Vec<u8>) -> Result<Option<InputChunk>, InputLimit> {
+        self.try_input(bytes, InputOrigin::Network)
+    }
+
+    pub fn try_local_reply(&self, bytes: Vec<u8>) -> Result<Option<InputChunk>, InputLimit> {
+        self.try_input(bytes, InputOrigin::LocalReply)
+    }
+
+    fn try_input(
+        &self,
+        bytes: Vec<u8>,
+        origin: InputOrigin,
+    ) -> Result<Option<InputChunk>, InputLimit> {
         let len = bytes.len();
-        let quota = self.session.0.limits;
+        let quota = self.session.0.limits.quota(origin);
         let permit = {
             // Admission and release always lock session before channel. Validate
             // all counters before changing either scope, including closed state.
@@ -128,26 +194,31 @@ impl ChannelInputBudget {
             if len == 0 {
                 return Ok(None);
             }
+            let session = session.usage.quota_mut(origin);
+            let channel = channel.usage.quota_mut(origin);
             check(
-                &session.usage,
+                session,
                 quota.session_bytes,
                 quota.session_items,
                 len,
+                origin,
                 InputScope::Session,
             )?;
             check(
-                &channel.usage,
+                channel,
                 quota.channel_bytes,
                 quota.channel_items,
                 len,
+                origin,
                 InputScope::Channel,
             )?;
-            session.usage.bytes += len;
-            session.usage.items += 1;
-            channel.usage.bytes += len;
-            channel.usage.items += 1;
+            session.bytes += len;
+            session.items += 1;
+            channel.bytes += len;
+            channel.items += 1;
             InputPermit {
                 channel: self.clone(),
+                origin,
                 len,
             }
         };
@@ -155,10 +226,7 @@ impl ChannelInputBudget {
         // also refunds if a future fallible normalization unwinds. Keep no spare
         // Vec capacity beyond the charged length in a queued or held chunk.
         let bytes = bytes.into_boxed_slice().into_vec();
-        Ok(Some(InputChunk {
-            bytes,
-            _permit: permit,
-        }))
+        Ok(Some(InputChunk { bytes, permit }))
     }
 
     pub fn close(&self) {
@@ -166,7 +234,7 @@ impl ChannelInputBudget {
     }
 
     #[cfg(test)]
-    fn usage(&self) -> QuotaUsage {
+    fn usage(&self) -> Usage {
         self.state.lock().unwrap().usage
     }
 }
@@ -176,19 +244,21 @@ fn check(
     bytes: usize,
     items: usize,
     len: usize,
+    origin: InputOrigin,
     scope: InputScope,
 ) -> Result<(), InputLimit> {
     if len > bytes.saturating_sub(usage.bytes) {
-        return Err(InputLimit::Bytes { scope });
+        return Err(InputLimit::Bytes { origin, scope });
     }
     if usage.items >= items {
-        return Err(InputLimit::Items { scope });
+        return Err(InputLimit::Items { origin, scope });
     }
     Ok(())
 }
 
 struct InputPermit {
     channel: ChannelInputBudget,
+    origin: InputOrigin,
     len: usize,
 }
 
@@ -197,11 +267,12 @@ impl Drop for InputPermit {
         let mut session = self.channel.session.0.state.lock().unwrap();
         let mut channel = self.channel.state.lock().unwrap();
         for usage in [&mut session.usage, &mut channel.usage] {
-            usage.bytes = usage
+            let quota = usage.quota_mut(self.origin);
+            quota.bytes = quota
                 .bytes
                 .checked_sub(self.len)
                 .expect("input byte accounting");
-            usage.items = usage.items.checked_sub(1).expect("input item accounting");
+            quota.items = quota.items.checked_sub(1).expect("input item accounting");
         }
     }
 }
@@ -211,24 +282,31 @@ impl Drop for InputPermit {
 /// There is deliberately no method to extract the Vec and discard its permit.
 pub struct InputChunk {
     bytes: Vec<u8>,
-    // Declared after bytes so payload storage is freed before quota is returned.
-    _permit: InputPermit,
+    permit: InputPermit,
 }
 
 impl InputChunk {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    pub fn origin(&self) -> InputOrigin {
+        self.permit.origin
+    }
 
-    /// Received network bytes to report after writing or explicitly discarding.
+    /// Only received network bytes count toward transport consumption. Local
+    /// replies must never advance input credit or echo acknowledgements.
     pub fn network_bytes(&self) -> usize {
-        self.bytes.len()
+        match self.origin() {
+            InputOrigin::Network => self.bytes.len(),
+            InputOrigin::LocalReply => 0,
+        }
     }
 }
 
 impl fmt::Debug for InputChunk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InputChunk")
+            .field("origin", &self.origin())
             .field("len", &self.bytes.len())
             .finish_non_exhaustive()
     }
@@ -243,10 +321,18 @@ mod tests {
 
     fn small() -> SessionInputBudget {
         SessionInputBudget::with_limits(InputLimits {
-            channel_bytes: 4,
-            session_bytes: 4,
-            channel_items: 2,
-            session_items: 2,
+            network: QuotaLimits {
+                channel_bytes: 4,
+                session_bytes: 4,
+                channel_items: 2,
+                session_items: 2,
+            },
+            local: QuotaLimits {
+                channel_bytes: 3,
+                session_bytes: 3,
+                channel_items: 1,
+                session_items: 1,
+            },
         })
     }
 
@@ -311,11 +397,11 @@ mod tests {
             .unwrap();
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         drop(tx);
-        assert_eq!(session.usage().bytes, 4);
-        assert_eq!(session.usage().items, 1);
+        assert_eq!(session.usage().network.bytes, 4);
+        assert_eq!(session.usage().network.items, 1);
         assert!(channel.try_network(vec![2]).is_err());
         worker.finish();
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -325,12 +411,34 @@ mod tests {
         let next = session.channel();
         let held = first.try_network(vec![1; 4]).unwrap().unwrap();
         assert!(next.try_network(vec![2]).is_err());
-        assert_eq!(next.usage(), QuotaUsage::default());
+        assert_eq!(next.usage(), Usage::default());
         drop(held);
         let accepted = next.try_network(vec![2; 4]).unwrap().unwrap();
-        assert_eq!(next.usage().bytes, 4);
+        assert_eq!(next.usage().network.bytes, 4);
         drop(accepted);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
+    }
+
+    #[test]
+    fn network_and_local_reply_keep_separate_quotas_and_one_fifo_order() {
+        let session = small();
+        let channel = session.channel();
+        let (tx, rx) = mpsc::channel();
+        tx.send(channel.try_network(b"net!".to_vec()).unwrap().unwrap())
+            .unwrap();
+        tx.send(channel.try_local_reply(b"ans".to_vec()).unwrap().unwrap())
+            .unwrap();
+        assert!(channel.try_network(vec![1]).is_err());
+        assert!(channel.try_local_reply(vec![1]).is_err());
+        let network = rx.recv().unwrap();
+        let local = rx.recv().unwrap();
+        assert_eq!(network.bytes(), b"net!");
+        assert_eq!(network.network_bytes(), 4);
+        assert_eq!(local.bytes(), b"ans");
+        assert_eq!(local.network_bytes(), 0);
+        assert_eq!(local.origin(), InputOrigin::LocalReply);
+        drop((network, local));
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -344,10 +452,10 @@ mod tests {
         let reused = session.channel();
         assert!(stale_sender.try_network(vec![2]).is_err());
         assert!(reused.try_network(vec![3]).is_err());
-        assert_eq!(session.usage().bytes, 4);
+        assert_eq!(session.usage().network.bytes, 4);
         drop(held);
         assert!(reused.try_network(vec![3; 4]).unwrap().is_some());
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -359,16 +467,16 @@ mod tests {
         let failed = tx
             .send(channel.try_network(vec![1; 4]).unwrap().unwrap())
             .unwrap_err();
-        assert_eq!(session.usage().bytes, 4);
+        assert_eq!(session.usage().network.bytes, 4);
         drop(failed);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
         let (tx, rx) = mpsc::channel();
-        tx.send(channel.try_network(vec![1; 2]).unwrap().unwrap())
+        tx.send(channel.try_network(vec![1; 4]).unwrap().unwrap())
             .unwrap();
-        tx.send(channel.try_network(vec![2; 2]).unwrap().unwrap())
+        tx.send(channel.try_local_reply(vec![2; 3]).unwrap().unwrap())
             .unwrap();
         drop(rx);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -394,9 +502,9 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
-        assert_eq!(session.usage().bytes, 4);
+        assert_eq!(session.usage().network.bytes, 4);
         drop((first, second));
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
     #[test]
     fn the_default_budget_accepts_eight_mib_in_normal_chunks() {
@@ -406,7 +514,7 @@ mod tests {
             .map(|_| channel.try_network(vec![0; 512]).unwrap().unwrap())
             .collect();
         assert_eq!(
-            session.usage(),
+            session.usage().network,
             QuotaUsage {
                 bytes: 8 * 1024 * 1024,
                 items: 16_384
@@ -415,11 +523,12 @@ mod tests {
         assert_eq!(
             channel.try_network(vec![0]).unwrap_err(),
             InputLimit::Bytes {
+                origin: InputOrigin::Network,
                 scope: InputScope::Session,
             }
         );
         drop(chunks);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -429,15 +538,76 @@ mod tests {
         let chunks: Vec<_> = (0..16_384)
             .map(|_| channel.try_network(vec![0]).unwrap().unwrap())
             .collect();
-        assert_eq!(session.usage().bytes, 16_384);
+        assert_eq!(session.usage().network.bytes, 16_384);
         assert_eq!(
             channel.try_network(vec![0]).unwrap_err(),
             InputLimit::Items {
+                origin: InputOrigin::Network,
                 scope: InputScope::Session,
             }
         );
+        assert!(channel.try_local_reply(vec![0]).unwrap().is_some());
         drop(chunks);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
+    }
+
+    #[test]
+    fn local_reply_quotas_bound_each_channel_and_the_aggregate() {
+        let session = SessionInputBudget::new();
+        let channels: Vec<_> = (0..9).map(|_| session.channel()).collect();
+        let mut chunks = Vec::new();
+        for channel in &channels[..8] {
+            chunks.push(
+                channel
+                    .try_local_reply(vec![0; 64 * 1024])
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(session.usage().local.bytes, 512 * 1024);
+        assert_eq!(
+            channels[8].try_local_reply(vec![0]).unwrap_err(),
+            InputLimit::Bytes {
+                origin: InputOrigin::LocalReply,
+                scope: InputScope::Session,
+            }
+        );
+        drop(chunks.pop());
+        assert_eq!(
+            channels[0].try_local_reply(vec![0]).unwrap_err(),
+            InputLimit::Bytes {
+                origin: InputOrigin::LocalReply,
+                scope: InputScope::Channel,
+            }
+        );
+        assert!(channels[8].try_network(vec![0]).unwrap().is_some());
+        drop(chunks);
+        assert_eq!(session.usage(), Usage::default());
+
+        let mut items = Vec::new();
+        for channel in &channels[..8] {
+            for _ in 0..64 {
+                items.push(channel.try_local_reply(vec![0]).unwrap().unwrap());
+            }
+        }
+        assert_eq!(session.usage().local.items, 512);
+        assert_eq!(
+            channels[8].try_local_reply(vec![0]).unwrap_err(),
+            InputLimit::Items {
+                origin: InputOrigin::LocalReply,
+                scope: InputScope::Session,
+            }
+        );
+        drop(items.pop());
+        assert_eq!(
+            channels[0].try_local_reply(vec![0]).unwrap_err(),
+            InputLimit::Items {
+                origin: InputOrigin::LocalReply,
+                scope: InputScope::Channel,
+            }
+        );
+        drop(items);
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -448,29 +618,31 @@ mod tests {
             .try_network(Vec::with_capacity(1024))
             .unwrap()
             .is_none());
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert!(channel.try_local_reply(Vec::new()).unwrap().is_none());
+        assert_eq!(session.usage(), Usage::default());
         let mut oversized = Vec::with_capacity(1024);
         oversized.extend_from_slice(b"large");
         assert_eq!(
             channel.try_network(oversized).unwrap_err(),
             InputLimit::Bytes {
+                origin: InputOrigin::Network,
                 scope: InputScope::Session,
             }
         );
-        assert_eq!(channel.usage(), QuotaUsage::default());
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(channel.usage(), Usage::default());
+        assert_eq!(session.usage(), Usage::default());
         let mut padded = Vec::with_capacity(1024);
         padded.extend_from_slice(b"four");
         let chunk = channel.try_network(padded).unwrap().unwrap();
         assert_eq!(chunk.bytes.capacity(), 4);
         assert_eq!(chunk.bytes(), b"four");
-        assert_eq!(session.usage().bytes, 4);
+        assert_eq!(session.usage().network.bytes, 4);
         // Debug formatting must never expose the input bytes or control codes.
         let debug = format!("{chunk:?}");
         assert!(!debug.contains("four"));
-        assert!(debug.contains("len: 4"));
+        assert!(debug.contains("Network"));
         drop(chunk);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -484,7 +656,7 @@ mod tests {
             InputLimit::Closed(InputScope::Channel)
         );
         assert_eq!(
-            channel.try_network(Vec::new()).unwrap_err(),
+            channel.try_local_reply(Vec::new()).unwrap_err(),
             InputLimit::Closed(InputScope::Channel)
         );
         let next = session.channel();
@@ -498,12 +670,12 @@ mod tests {
             InputLimit::Closed(InputScope::Session)
         );
         assert_eq!(
-            session.channel().try_network(vec![1]).unwrap_err(),
+            session.channel().try_local_reply(vec![1]).unwrap_err(),
             InputLimit::Closed(InputScope::Session)
         );
-        assert_eq!(session.usage().bytes, 4);
+        assert_eq!(session.usage().network.bytes, 4);
         drop(held);
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
     }
 
     #[test]
@@ -516,7 +688,7 @@ mod tests {
             panic!("injected writer panic");
         });
         assert!(result.is_err());
-        assert_eq!(session.usage(), QuotaUsage::default());
+        assert_eq!(session.usage(), Usage::default());
         assert!(channel.try_network(vec![2; 4]).unwrap().is_some());
     }
 }

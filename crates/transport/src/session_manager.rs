@@ -382,6 +382,11 @@ pub enum ChannelOutput {
         crate::channel_timeline::TimelinePermit,
     ),
     EchoAck(u64, crate::channel_timeline::TimelinePermit),
+    /// One terminal failure disclosure retained through attachment and ACK.
+    OutputGap(
+        crate::channel_geometry::OutputGapCause,
+        crate::channel_timeline::TimelinePermit,
+    ),
     DeliveryMarker(DeliveryMarker, crate::channel_timeline::TimelinePermit),
 }
 impl ChannelOutput {
@@ -390,6 +395,7 @@ impl ChannelOutput {
             Self::Data(bytes) => 5 + bytes.len(),
             Self::Geometry(..) => 27,
             Self::EchoAck(..) => 13,
+            Self::OutputGap(..) => 14,
             Self::DeliveryMarker(..) => crate::channel_timeline::DELIVERY_MARKER_BYTES,
         }
     }

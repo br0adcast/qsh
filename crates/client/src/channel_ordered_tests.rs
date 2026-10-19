@@ -350,6 +350,36 @@ fn repeated_snapshot_after_resize_does_not_reject_updated_effective_dimensions()
     assert_eq!(s.committed_geometry(16), Some(applied(1, 100, 30)));
 }
 #[test]
+fn reply44_failure_marks_exact_instance_continuity_without_inventing_exit_status() {
+    let (mut s, _) = logged();
+    ready(&mut s);
+    let encoded = [3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2];
+    let events = s.on_bytes(16, &encoded);
+    assert!(
+        matches!(events.as_slice(), [SessionEvent::OutputContinuityLost {
+        ch: 16, instance, cause,
+    }] if instance.get() == 1 && *cause as u8 == 2),
+        "failure is typed continuity loss, not session failure: {events:?}"
+    );
+    assert!(s.continuity_lost(16));
+    assert!(
+        s.is_ready(16),
+        "only the actual lifecycle record ends the channel"
+    );
+    assert_eq!(
+        s.on_bytes(
+            CONTROL_STREAM,
+            &encode_server(&ServerRecord::Exit {
+                stream: 16,
+                code: 7
+            })
+        ),
+        vec![SessionEvent::Exit { ch: 16, code: 7 }]
+    );
+    assert!(s.continuity_lost(16));
+}
+
+#[test]
 fn continuity_warning_survives_ready_and_real_exit() {
     let (mut s, _) = logged();
     ready(&mut s);

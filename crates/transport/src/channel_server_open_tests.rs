@@ -266,8 +266,11 @@ mod open24_tests {
     impl ChannelWait for StalledReap {
         fn poll_exit(&mut self) -> ChildStatus {
             self.entered.notify_one();
-            if *self.release.0.lock().unwrap() { ChildStatus::Reaped { code: Some(0) } }
-            else { ChildStatus::Running }
+            if *self.release.0.lock().unwrap() {
+                ChildStatus::Reaped { code: Some(0) }
+            } else {
+                ChildStatus::Running
+            }
         }
         fn kill(&mut self) {
             self.end.take();
@@ -725,7 +728,14 @@ mod open24_tests {
         publisher: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     }
     impl SessionScreen for PublicationScreen {
-        fn absorb(&mut self, _: &[u8]) {}
+        fn absorb(&mut self, _: &[u8]) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
+        fn flush_pending_output(
+            &mut self,
+        ) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
         fn prepare_resize(
             &mut self,
             size: TerminalSize,
@@ -736,8 +746,14 @@ mod open24_tests {
             let _ = size;
             Ok(Box::new(FakePreparedResize))
         }
-        fn repaint(&mut self) -> Vec<u8> {
-            Vec::new()
+        fn repaint(
+            &mut self,
+        ) -> Result<crate::shell_server::ScreenRepaint, crate::shell_server::ScreenReplyError>
+        {
+            Ok(crate::shell_server::ScreenRepaint {
+                bytes: Vec::new(),
+                replies: Vec::new(),
+            })
         }
         fn has_screen(&self) -> bool {
             let (done, received) = std_mpsc::sync_channel(1);

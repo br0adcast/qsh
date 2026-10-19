@@ -13,7 +13,7 @@ use prediction::DisplayPreference;
 use render::{Renderer, TermCaps};
 use terminal::MouseTracking;
 use transport::channel_geometry::{
-    ChannelInstance, GeometryOutcome, GeometryRecord, ResizeRefusal,
+    ChannelInstance, GeometryOutcome, GeometryRecord, OutputGapCause, ResizeRefusal,
 };
 use transport::{LinkState, Stats};
 
@@ -235,7 +235,7 @@ pub struct Session {
     desired_size: terminal_size::TerminalSize,
     geometry_instance: Option<ChannelInstance>,
     resize_notice: Option<String>,
-    continuity_notice: bool,
+    continuity_notice: Option<OutputGapCause>,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
     pending_size: Option<(u16, u16)>,
@@ -336,7 +336,7 @@ impl Session {
             desired_size: size,
             geometry_instance: None,
             resize_notice: None,
-            continuity_notice: false,
+            continuity_notice: None,
             pending_size: None,
             resize_due_ms: 0,
             lost_since_ms: None,
@@ -623,7 +623,7 @@ impl Session {
         if self.geometry_instance != Some(record.instance) {
             self.geometry_instance = Some(record.instance);
             self.resize_notice = None;
-            self.continuity_notice = false;
+            self.continuity_notice = None;
         } else if record.outcome == GeometryOutcome::Applied {
             self.resize_notice = None;
         }
@@ -650,15 +650,32 @@ impl Session {
         self.repaint(now_ms)
     }
 
-    pub fn on_output_gap(&mut self, now_ms: i64) -> Vec<Action> {
-        self.continuity_notice = true;
-        self.repaint(now_ms)
+    pub fn on_output_gap(&mut self, cause: OutputGapCause, now_ms: i64) -> Vec<Action> {
+        let terminal_failure = cause == OutputGapCause::TerminalReplyFailure;
+        let first_terminal_failure = terminal_failure
+            && self.continuity_notice != Some(OutputGapCause::TerminalReplyFailure);
+        if terminal_failure || self.continuity_notice.is_none() {
+            self.continuity_notice = Some(cause);
+        }
+        let mut actions = self.repaint(now_ms);
+        if first_terminal_failure {
+            actions.push(Action::Notice(
+                "qsh: the server could not deliver terminal replies; the channel was stopped and some output may be missing".into(),
+            ));
+        }
+        actions
     }
 
     fn live_notice(&self) -> Option<&str> {
         self.resize_notice.as_deref().or_else(|| {
-            self.continuity_notice
-                .then_some("Output continuity lost: some previous output was not confirmed.")
+            self.continuity_notice.map(|cause| match cause {
+                OutputGapCause::PreviousConnectionOutputUnconfirmed => {
+                    "Output continuity lost: some previous output was not confirmed."
+                }
+                OutputGapCause::TerminalReplyFailure => {
+                    "Terminal replies failed: channel stopped; some output may be missing."
+                }
+            })
         })
     }
 

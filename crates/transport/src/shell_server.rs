@@ -115,6 +115,12 @@ pub enum ScreenReplyError {
     Overflow,
 }
 
+/// A repaint plus responses produced while flushing buffered fresh output.
+pub struct ScreenRepaint {
+    pub bytes: Vec<u8>,
+    pub replies: Vec<u8>,
+}
+
 /// A model resize reserved before PTY ioctl; cancellation leaves it unchanged.
 pub trait PreparedScreenResize: Send {
     fn commit(self: Box<Self>);
@@ -142,6 +148,10 @@ pub trait SessionScreen: Send {
     /// A failed batch returns no prefix; the owner must end this channel.
     fn absorb(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError>;
 
+    /// Execute buffered fresh output at the old committed geometry. Call before
+    /// preparing a resize and admit these replies before changing the PTY/model.
+    fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError>;
+
     /// Reserve model storage before touching the PTY. Drop cancels; commit
     /// applies the model only after the PTY accepted the same geometry.
     fn prepare_resize(
@@ -149,10 +159,9 @@ pub trait SessionScreen: Send {
         size: TerminalSize,
     ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError>;
 
-    /// Bytes that rebuild the current screen from scratch: content, cursor
-    /// and modes. An empty answer means "nothing to say" and puts nothing on
-    /// the wire.
-    fn repaint(&mut self) -> Vec<u8>;
+    /// Rebuild the screen, returning any replies from pending fresh output
+    /// separately. Admit replies even when the display send gate is parked.
+    fn repaint(&mut self) -> Result<ScreenRepaint, ScreenReplyError>;
 
     /// Whether this model actually has something to redraw from -- `true`
     /// by default, overridden by [`NoScreen`] to `false`.
@@ -184,14 +193,20 @@ impl SessionScreen for NoScreen {
     fn absorb(&mut self, _bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError> {
         Ok(Vec::new())
     }
+    fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError> {
+        Ok(Vec::new())
+    }
     fn prepare_resize(
         &mut self,
         _size: TerminalSize,
     ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError> {
         Ok(Box::new(EmptyResize))
     }
-    fn repaint(&mut self) -> Vec<u8> {
-        Vec::new()
+    fn repaint(&mut self) -> Result<ScreenRepaint, ScreenReplyError> {
+        Ok(ScreenRepaint {
+            bytes: Vec::new(),
+            replies: Vec::new(),
+        })
     }
     fn has_screen(&self) -> bool {
         false

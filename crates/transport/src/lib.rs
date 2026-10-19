@@ -9,6 +9,8 @@ mod channel_input;
 #[cfg(feature = "tokio-driver")]
 pub mod channel_open;
 #[cfg(feature = "tokio-driver")]
+mod channel_reply_delivery;
+#[cfg(feature = "tokio-driver")]
 pub mod channel_server;
 pub mod channel_timeline;
 mod congestion;

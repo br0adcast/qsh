@@ -15,7 +15,7 @@ use crate::channel_geometry::{
 
 /// An authoritative geometry boundary on the channel output stream.
 pub const REC_GEOMETRY: u8 = 2;
-/// Disclosure that a previous connection's output was not confirmed.
+/// Typed disclosure that channel output continuity could not be preserved.
 pub const REC_OUTPUT_GAP: u8 = 3;
 
 /// A data record: raw PTY output bytes.
@@ -604,7 +604,7 @@ mod geometry_validation_tests {
             invalid.push(valid[..len].to_vec());
         }
         invalid.push([valid.clone(), vec![0]].concat());
-        for cause in [0, 2, 255] {
+        for cause in [0, 3, 255] {
             let mut p = valid.clone();
             p[8] = cause;
             invalid.push(p);
@@ -657,5 +657,48 @@ mod geometry_validation_tests {
             [ShellRecord::Geometry(_)]
         ));
         assert_eq!(parser.error(), None);
+    }
+}
+
+#[cfg(test)]
+mod terminal_reply_failure_tests {
+    use super::*;
+
+    #[test]
+    fn reply44_failure_is_a_distinct_exact_gap_record_and_unknown_causes_stay_invalid() {
+        let payload = vec![0, 0, 0, 0, 0, 0, 0, 7, 2];
+        let decoded = decode_shell(RawRecord {
+            kind: REC_OUTPUT_GAP,
+            payload,
+        });
+        assert!(
+            decoded.is_ok(),
+            "terminal reply failure must remain an ordered continuity disclosure: {decoded:?}"
+        );
+        let decoded = decoded.unwrap();
+        assert!(
+            matches!(&decoded, ShellRecord::OutputGap { instance, cause } if instance.get() == 7 && *cause as u8 == 2)
+        );
+        assert_eq!(
+            encode_shell(&decoded).unwrap(),
+            vec![3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7, 2]
+        );
+        for cause in [0, 3, 255] {
+            assert_eq!(
+                decode_shell(RawRecord {
+                    kind: REC_OUTPUT_GAP,
+                    payload: vec![0, 0, 0, 0, 0, 0, 0, 7, cause],
+                }),
+                Err(ShellCodecError::Malformed)
+            );
+        }
+        let old = ShellRecord::OutputGap {
+            instance: ChannelInstance::new(7).unwrap(),
+            cause: OutputGapCause::PreviousConnectionOutputUnconfirmed,
+        };
+        assert_eq!(
+            encode_shell(&old).unwrap(),
+            vec![3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7, 1]
+        );
     }
 }

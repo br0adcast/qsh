@@ -45,7 +45,12 @@ impl Drop for Screen {
     }
 }
 impl SessionScreen for Screen {
-    fn absorb(&mut self, _: &[u8]) {}
+    fn absorb(&mut self, _: &[u8]) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+        Ok(Vec::new())
+    }
+    fn flush_pending_output(&mut self) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+        Ok(Vec::new())
+    }
     fn prepare_resize(
         &mut self,
         _: terminal_size::TerminalSize,
@@ -55,8 +60,13 @@ impl SessionScreen for Screen {
     > {
         Err(crate::shell_server::ScreenPreparationError::PreparationFailed("unused".into()))
     }
-    fn repaint(&mut self) -> Vec<u8> {
-        Vec::new()
+    fn repaint(
+        &mut self,
+    ) -> Result<crate::shell_server::ScreenRepaint, crate::shell_server::ScreenReplyError> {
+        Ok(crate::shell_server::ScreenRepaint {
+            bytes: Vec::new(),
+            replies: Vec::new(),
+        })
     }
 }
 struct Resize;

@@ -67,6 +67,10 @@ struct Stream {
     // Original final marker ownership survives its delivery notification until
     // Exit or scoped teardown. Attach reuses it for fresh delivery proof.
     delivered_marker: Option<Queued>,
+    // One terminal failure disclosure survives sender admission and ACK until
+    // scoped teardown. A new attachment must learn why no repaint is possible.
+    terminal_gap: Option<Queued>,
+    terminal_gap_seen: bool,
     frontier: Option<GeometryRecord>,
     data_end: u64,
     // The last admitted continuity warning remains owed until this frontier is ACKed.
@@ -128,6 +132,7 @@ impl ChannelBridge {
             if conn.retain_stream_output(stream) {
                 state.bootstrap = true;
                 Self::rearm_final_marker(state);
+                Self::rearm_terminal_gap(state);
                 for queued in &mut state.fifo {
                     queued.bound = None;
                 }
@@ -156,6 +161,7 @@ impl ChannelBridge {
             if state.ended {
                 state.bootstrap = true;
                 Self::rearm_final_marker(state);
+                Self::rearm_terminal_gap(state);
                 for queued in &mut state.fifo {
                     queued.bound = None;
                 }
@@ -240,6 +246,8 @@ impl ChannelBridge {
                             bootstrap_charge: None,
                             fifo: VecDeque::new(),
                             delivered_marker: None,
+                            terminal_gap: None,
+                            terminal_gap_seen: false,
                             frontier: None,
                             data_end: 0,
                             gap_end: 0,
@@ -256,10 +264,32 @@ impl ChannelBridge {
                 let state = self.streams.get_mut(&stream).unwrap();
                 if state.waiting_geometry {
                     match &output {
-                        ChannelOutput::Geometry(..) => state.waiting_geometry = false,
+                        ChannelOutput::Geometry(record, ..) => {
+                            // A failed model cannot supply a repaint. If its
+                            // committed checkpoint was capacity-blocked, use
+                            // that actual late checkpoint for the bootstrap;
+                            // keep the original event and permit in FIFO order.
+                            if state.terminal_gap_seen
+                                && state.bootstrap
+                                && state.frontier.is_none()
+                            {
+                                state.frontier = Some(established(*record));
+                            }
+                            state.waiting_geometry = false;
+                        }
                         ChannelOutput::Data(_) | ChannelOutput::EchoAck(..) => return,
-                        ChannelOutput::DeliveryMarker(..) => {}
+                        ChannelOutput::DeliveryMarker(..) | ChannelOutput::OutputGap(..) => {}
                     }
+                }
+                if matches!(output, ChannelOutput::OutputGap(..)) {
+                    if state.terminal_gap_seen {
+                        return; // Drop only the duplicate event's permit/charge.
+                    }
+                    state.terminal_gap_seen = true;
+                    state.bootstrap |= state.waiting_geometry;
+                    // Its model is no longer a valid replay source, even while
+                    // the reader is still draining toward actual EOF.
+                    state.ended = true;
                 }
                 if matches!(output, ChannelOutput::DeliveryMarker(..)) {
                     state.ended = true;
@@ -347,6 +377,16 @@ impl ChannelBridge {
             state.fifo.push_front(marker);
         }
     }
+    fn rearm_terminal_gap(state: &mut Stream) {
+        if let Some(mut gap) = state.terminal_gap.take() {
+            debug_assert!(gap.charge.is_none(), "admitted gap transferred its charge");
+            gap.bound = None;
+            gap.charge = Some(charge(&state.gate, 14));
+            // The original permit stays owned. A delivered final marker was
+            // rearmed first, so this warning precedes its new ACK boundary.
+            state.fifo.push_front(gap);
+        }
+    }
     pub(super) fn attach(&mut self, conn: &Connection, generation: u64) {
         self.pending_snapshot = None;
         self.snapshot_failed = false;
@@ -367,6 +407,7 @@ impl ChannelBridge {
             state.bootstrap = true;
             state.hot_blocked = false;
             Self::rearm_final_marker(state);
+            Self::rearm_terminal_gap(state);
             let old = std::mem::take(&mut state.fifo);
             for mut queued in old {
                 if matches!(queued.output, Item::Record(ChannelOutput::EchoAck(..))) {
@@ -735,6 +776,7 @@ impl ChannelBridge {
             }
             Item::Record(ChannelOutput::Geometry(..)) => 27,
             Item::Record(ChannelOutput::EchoAck(..)) => 13,
+            Item::Record(ChannelOutput::OutputGap(..)) => 14,
             Item::Exit(..) => 10,
             Item::Record(ChannelOutput::DeliveryMarker(..)) => unreachable!(),
         };
@@ -778,6 +820,16 @@ impl ChannelBridge {
                 }
                 encode_shell(&ShellRecord::EchoAck(*n)).unwrap()
             }
+            Item::Record(ChannelOutput::OutputGap(cause, _)) => {
+                if room < 14 {
+                    return Step::Blocked;
+                }
+                encode_shell(&ShellRecord::OutputGap {
+                    instance: state.instance,
+                    cause: *cause,
+                })
+                .unwrap()
+            }
             Item::Exit(code, _, _) => {
                 if room < 10 || conn.stream_progress(stream).unacked != 0 {
                     return Step::Blocked;
@@ -817,15 +869,27 @@ impl ChannelBridge {
                     return Step::Sent(n);
                 }
             }
+            Item::Record(ChannelOutput::OutputGap(..)) => {
+                conn.track_channel_continuity_end(
+                    stream,
+                    state.instance,
+                    conn.stream_progress(stream).queued,
+                );
+            }
             Item::Exit(_, _, permit) => {
                 let _ = permit;
             }
             _ => {}
         }
         let exited = matches!(front.output, Item::Exit(..));
+        let terminal_gap = matches!(front.output, Item::Record(ChannelOutput::OutputGap(..)));
         let mut retired = state.fifo.pop_front().unwrap();
         if let Some(charge) = retired.charge.take() {
             charge.transfer(tail);
+        }
+        if terminal_gap {
+            retired.bound = Some(conn.stream_progress(stream).queued);
+            state.terminal_gap = Some(retired);
         }
         if exited {
             Step::Exited(n)
@@ -2993,5 +3057,312 @@ mod tests {
         });
         assert!(rig.bridge.streams.is_empty());
         assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+    }
+    fn reply44_gap(rig: &mut Rig) {
+        let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 14).unwrap();
+        rig.emit(
+            ChannelOutput::OutputGap(OutputGapCause::TerminalReplyFailure, permit),
+            None,
+        );
+    }
+    fn reply44_marker(rig: &mut Rig) {
+        let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 32).unwrap();
+        rig.emit(
+            ChannelOutput::DeliveryMarker(DeliveryMarker { token: 1 }, permit),
+            None,
+        );
+    }
+    fn reply44_gap_count(rig: &Rig) -> usize {
+        rig.records
+            .iter()
+            .filter(|record| {
+                matches!(record, ShellRecord::OutputGap {
+            instance, cause: OutputGapCause::TerminalReplyFailure,
+        } if instance.get() == 1)
+            })
+            .count()
+    }
+
+    #[test]
+    fn reply44_terminal_gap_waits_for_credit_and_precedes_final_delivery() {
+        let mut rig = Rig::new();
+        rig.client.set_default_consumption(Consumption::Explicit);
+        let occupied = crate::shell_frame::encode_record(
+            crate::shell_frame::REC_DATA,
+            &vec![0; crate::reliability::STREAM_WINDOW as usize - 5],
+        );
+        let out = rig.server.send(rig.now, STREAM, &occupied);
+        rig.pump(out);
+        rig.records.clear();
+        rig.geometry(80, 0);
+        rig.data(b"retained before failure");
+        reply44_gap(&mut rig);
+        reply44_marker(&mut rig);
+        let held = rig.budget.usage(EntryClass::Lifecycle);
+        assert_eq!(held, (3, 87));
+        let before = rig.server.stream_progress(STREAM);
+        for _ in 0..3 {
+            assert!(!rig.drain(false));
+            assert_eq!(rig.server.stream_progress(STREAM), before);
+            assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
+            assert!(rig.records.is_empty());
+            assert!(!rig
+                .bridge
+                .notifications()
+                .iter()
+                .any(|e| matches!(e, SessionInbound::Delivered { .. })));
+        }
+        let updates =
+            rig.client
+                .on_consumed(rig.now, STREAM, crate::reliability::STREAM_WINDOW as usize);
+        for dg in updates {
+            rig.server.on_datagram(rig.now, rig.peer, &dg.bytes);
+        }
+        let mut pending = Vec::new();
+        rig.bridge
+            .drain(&mut rig.server, rig.now, false, &mut pending);
+        assert!(!rig
+            .bridge
+            .notifications()
+            .iter()
+            .any(|e| matches!(e, SessionInbound::Delivered { .. })));
+        rig.pump(pending);
+        rig.drain(false);
+        assert_eq!(rig.records.len(), 3);
+        assert!(matches!(rig.records[0], ShellRecord::Geometry(_)));
+        assert_eq!(
+            rig.records[1],
+            ShellRecord::Data(b"retained before failure".to_vec())
+        );
+        assert_eq!(reply44_gap_count(&rig), 1);
+        assert!(rig
+            .bridge
+            .notifications()
+            .iter()
+            .any(|e| matches!(e, SessionInbound::Delivered { token: 1, .. })));
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
+        rig.bridge.push(SessionOutbound::ChannelClosed {
+            stream: STREAM,
+            instance: ChannelInstance::new(1).unwrap(),
+            origin: rig.origin(),
+        });
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+    }
+
+    #[test]
+    fn reply44_acknowledged_gap_survives_warm_attach_while_child_reap_is_pending() {
+        for consume_old_callback in [false, true] {
+            let mut rig = Rig::new();
+            rig.bridge.declare(STREAM, true);
+            rig.geometry(80, 0);
+            rig.data(b"before failure");
+            reply44_gap(&mut rig);
+            reply44_marker(&mut rig);
+            rig.drain(false);
+            rig.drain(false);
+            assert_eq!(reply44_gap_count(&rig), 1);
+            if consume_old_callback {
+                assert!(rig
+                    .bridge
+                    .notifications()
+                    .iter()
+                    .any(|e| matches!(e, SessionInbound::Delivered { token: 1, .. })));
+            }
+            let held = rig.budget.usage(EntryClass::Lifecycle);
+            assert_eq!(held, (3, 87));
+            for generation in 1..=3 {
+                rig.attach();
+                rig.bridge.release_barrier(generation);
+                let mut pending = Vec::new();
+                rig.bridge
+                    .drain(&mut rig.server, rig.now, false, &mut pending);
+                assert!(!rig
+                    .bridge
+                    .notifications()
+                    .iter()
+                    .any(|e| matches!(e, SessionInbound::Delivered { .. })));
+                rig.pump(pending);
+                rig.drain(false);
+                assert_eq!(
+                    reply44_gap_count(&rig),
+                    1,
+                    "each new client learns the retained cause"
+                );
+                assert!(matches!(rig.records[0], ShellRecord::Geometry(_)));
+                assert!(
+                    rig.bridge.notifications().iter().any(|e| matches!(e,
+                    SessionInbound::Delivered { token: 1, generation: g, .. } if *g == generation))
+                );
+                assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
+                assert!(!rig.drain(false));
+                assert_eq!(
+                    reply44_gap_count(&rig),
+                    1,
+                    "ACK must not queue another same-attachment warning"
+                );
+            }
+            rig.bridge.push(SessionOutbound::ChannelExit {
+                stream: STREAM,
+                instance: ChannelInstance::new(1).unwrap(),
+                origin: rig.origin(),
+                code: Some(7),
+                open: crate::channel::OpenClassification {
+                    kind: crate::channel::ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: true,
+                },
+                permit: rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap(),
+            });
+            rig.drain(false);
+            assert!(!rig.bridge.streams.contains_key(&STREAM));
+            assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+        }
+    }
+
+    #[test]
+    fn reply44_hot_reset_before_eof_keeps_output_and_failure_without_model_repaint() {
+        let mut rig = Rig::new();
+        rig.bridge.declare(STREAM, true);
+        rig.geometry(80, 0);
+        rig.data(b"already admitted before poisoned screen");
+        reply44_gap(&mut rig);
+        assert!(rig.bridge.hot_reset());
+        let barrier = rig
+            .bridge
+            .notifications()
+            .into_iter()
+            .find_map(|e| match e {
+                SessionInbound::RepaintCutover {
+                    generation,
+                    sequence,
+                } => Some((generation, sequence)),
+                _ => None,
+            })
+            .unwrap();
+        // The poisoned model supplies no replacement geometry/data. The ordered
+        // runner barrier must preserve the already-admitted records by itself.
+        rig.bridge.repaint_barrier(barrier.0, barrier.1);
+        rig.drain(false);
+        assert!(rig.records.contains(&ShellRecord::Data(
+            b"already admitted before poisoned screen".to_vec()
+        )));
+        assert_eq!(reply44_gap_count(&rig), 1);
+        assert!(!rig
+            .bridge
+            .notifications()
+            .iter()
+            .any(|e| matches!(e, SessionInbound::Delivered { .. })));
+        reply44_marker(&mut rig); // Only actual reader EOF grants this marker.
+        rig.drain(false);
+        rig.drain(false);
+        assert!(rig
+            .bridge
+            .notifications()
+            .iter()
+            .any(|e| matches!(e, SessionInbound::Delivered { token: 1, .. })));
+    }
+
+    #[test]
+    fn reply44_duplicate_failure_and_stream_reuse_keep_one_scoped_owner() {
+        let mut rig = Rig::new();
+        rig.geometry(80, 0);
+        reply44_gap(&mut rig);
+        let held = rig.budget.usage(EntryClass::Lifecycle);
+        for _ in 0..3 {
+            reply44_gap(&mut rig);
+        }
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
+        rig.drain(false);
+        assert_eq!(reply44_gap_count(&rig), 1);
+        let newer = ChannelInstance::new(2).unwrap();
+        let budget = TimelineBudget::new(newer, 0, |_| {});
+        let gate = Arc::new(SendGate::new(crate::send_gate::GateKind::Pipe));
+        rig.io.send_channel_output(
+            STREAM,
+            newer,
+            rig.origin(),
+            gate.clone(),
+            ChannelOutput::Geometry(
+                GeometryRecord {
+                    instance: newer,
+                    request_id: 0,
+                    outcome: GeometryOutcome::Established,
+                    cols: 100,
+                    rows: 24,
+                },
+                budget.try_reserve(EntryClass::Ordinary, 27).unwrap(),
+            ),
+            budget.try_reserve(EntryClass::Lifecycle, BRIDGE_LIFECYCLE_BYTES),
+        );
+        rig.bridge.push(rig.outbound.try_recv().unwrap());
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+        rig.records.clear();
+        reply44_gap(&mut rig); // A late message from the replaced instance.
+        rig.drain(false);
+        assert_eq!(reply44_gap_count(&rig), 0);
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+        assert_eq!(rig.bridge.streams[&STREAM].instance, newer);
+        assert!(!rig.bridge.streams[&STREAM].ended);
+        rig.bridge.push(SessionOutbound::ChannelClosed {
+            stream: STREAM,
+            instance: newer,
+            origin: rig.origin(),
+        });
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (0, 0));
+    }
+    #[test]
+    fn reply44_failure_after_hot_barrier_bootstraps_the_retained_committed_geometry() {
+        let mut rig = Rig::new();
+        rig.bridge.declare(STREAM, true);
+        rig.geometry(80, 0);
+        rig.drain(false);
+        rig.records.clear();
+        assert!(rig.bridge.hot_reset());
+        let barrier = rig
+            .bridge
+            .notifications()
+            .into_iter()
+            .find_map(|e| match e {
+                SessionInbound::RepaintCutover {
+                    generation,
+                    sequence,
+                } => Some((generation, sequence)),
+                _ => None,
+            })
+            .unwrap();
+        rig.bridge.repaint_barrier(barrier.0, barrier.1);
+        reply44_gap(&mut rig);
+        rig.drain(false);
+        assert!(
+            matches!(rig.records.first(), Some(ShellRecord::Geometry(g)) if g.cols == 80 && g.request_id == 0)
+        );
+        assert_eq!(reply44_gap_count(&rig), 1);
+    }
+
+    #[test]
+    fn reply44_failure_waits_for_a_late_warm_checkpoint_without_bypassing_geometry() {
+        let mut rig = Rig::new();
+        rig.bridge.declare(STREAM, true);
+        rig.geometry(80, 0);
+        rig.drain(false);
+        rig.attach();
+        rig.bridge.release_barrier(rig.generation);
+        // The active warm barrier requires a fresh checkpoint; the producer
+        // may still be waiting for its bounded metadata slot when parsing fails.
+        reply44_gap(&mut rig);
+        assert!(
+            !rig.drain(false),
+            "a failure gap cannot bypass missing geometry"
+        );
+        assert!(rig.records.is_empty());
+        rig.geometry(80, 0); // Capacity returned; committed geometry needs no model replay.
+        rig.drain(false);
+        assert!(
+            matches!(rig.records.first(), Some(ShellRecord::Geometry(g)) if g.cols == 80 && g.request_id == 0)
+        );
+        assert_eq!(reply44_gap_count(&rig), 1);
+        assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
+        assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (2, 55));
     }
 }
