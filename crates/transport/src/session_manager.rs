@@ -14255,6 +14255,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shell_replacement_control_manager_rejects_candidates_without_replacing_active_route() {
+        let token = [0xA4; 16];
+        let helper = HelperLogins::with(token);
+        let (mut wiring, _verdicts) = RouterWiring::new(helper.clone()).await;
+        let allowed = generate_keypair();
+        wiring.auth.verifier = None;
+        wiring.auth.allowlist.lock().unwrap().push(allowed.public);
+        let mut router = Router::new();
+        let (mut control, mut route) =
+            synthetic_live_entry_with_key(&mut router, token, 42, allowed.public);
+        router.backends.get_mut(&token).unwrap().incarnation = 7;
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let src = stranger.local_addr().unwrap();
+        let unlisted = generate_keypair();
+        let candidates = [
+            crate::wire::encode_handshake(Kind::HandshakeInit, &[]),
+            crate::wire::encode_handshake(Kind::HandshakeInit, &[0; 40]),
+            msg1_with_method(
+                &wiring.server_pub,
+                unlisted.private,
+                token,
+                StartKind::Cold,
+                AuthMethod::Allowlist,
+            ),
+        ];
+        for bytes in candidates {
+            SessionManager::handle_datagram(&wiring.ctx(), &mut router, bytes.len(), src, &bytes)
+                .await;
+            let entry = &router.backends[&token];
+            assert_eq!(
+                (entry.session_id, entry.incarnation, entry.client_key),
+                (42, 7, allowed.public)
+            );
+            assert!(matches!(entry.state, EntryState::Live));
+            assert!(entry.parked_dgram.is_none());
+            assert!(helper.opens_channels_for(token));
+            assert!(wiring
+                .auth
+                .allowlist
+                .lock()
+                .unwrap()
+                .contains(&allowed.public));
+            assert!(router.probation.is_empty());
+            assert!(matches!(
+                control.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            // The router forwards by session id; decryption belongs to its
+            // consumer. Observe the original receiver, not only table size.
+            let marker =
+                crate::wire::encode_transport(&crate::wire::transport_header(42, 1), &[0xA4; 16]);
+            SessionManager::handle_datagram(&wiring.ctx(), &mut router, marker.len(), src, &marker)
+                .await;
+            assert_eq!(route.try_recv(), Some((src, marker)));
+        }
+    }
+
     /// A client handshakes into probation through the real `handle_datagram`,
     /// and the probation task verifies its proof. Returns the
     /// `ProbationEnded` that task queued -- NOT yet handed to the router, so

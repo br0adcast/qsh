@@ -4,7 +4,9 @@
 //! on a separate UDP socket through a Noise IK handshake, sending a
 //! command to the shell (stream 0) and a resize (stream 1), checking that
 //! the shell's output comes back on stream 0 and that resize does not
-//! crash the server (echo continues afterward).
+//! crash the server (echo continues afterward). Rejected handshake candidates
+//! must preserve that shell, and a different allowed key must replace only the
+//! connection while keeping the shell's variable state.
 //!
 //! The client is also a sans-IO `Connection`: the test itself drives I/O
 //! (sends outgoing datagrams over the socket, feeds incoming ones into
@@ -19,6 +21,7 @@ use tokio::net::UdpSocket;
 
 use qshd::pty::{spawn_shell, PtyResizeHandle, DEFAULT_PTY_SIZE};
 use transport::handshake::generate_keypair;
+use transport::shell_frame::{ShellDeframer, ShellRecord};
 use transport::{AuthPolicy, Connection, ConnectionConfig, Datagram, Event, Role};
 
 /// Marker the shell prints on our command, which we look for in the
@@ -49,6 +52,23 @@ async fn send_all(socket: &UdpSocket, dgrams: &[Datagram]) {
     }
 }
 
+/// Own cleanup before any post-spawn assertion can fail. Aborting the async
+/// bridge alone cannot interrupt a blocking PTY reader; kill/reap its shell too.
+struct ShellFixture {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    server: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ShellFixture {
+    fn drop(&mut self) {
+        if let Some(server) = &self.server {
+            server.abort();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[tokio::test]
 async fn transport_shell_runs_command_and_survives_resize() {
     // Peer keys: the client's public key goes into the server's allowlist
@@ -56,6 +76,8 @@ async fn transport_shell_runs_command_and_survives_resize() {
     // `Connection::on_handshake_init`).
     let server_kp = generate_keypair();
     let client_kp = generate_keypair();
+    let replacement_kp = generate_keypair();
+    let unlisted_kp = generate_keypair();
 
     // Server socket on a random free loopback port.
     let server_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -77,8 +99,11 @@ async fn transport_shell_runs_command_and_survives_resize() {
     // The test side itself brings up the PTY shell and hands it to
     // `serve_shell` -- exactly as the `transport-shell` subcommand does in
     // qshd.
-    let (master, mut child) =
-        spawn_shell(DEFAULT_PTY_SIZE, None).expect("shell started in the PTY");
+    let (master, child) = spawn_shell(DEFAULT_PTY_SIZE, None).expect("shell started in the PTY");
+    let mut fixture = ShellFixture {
+        child,
+        server: None,
+    };
     let reader = master.try_clone_reader().expect("PTY master side's reader");
     let writer = master.take_writer().expect("PTY master side's writer");
     let resize: Box<dyn transport::shell_server::ResizeHandle> =
@@ -90,12 +115,12 @@ async fn transport_shell_runs_command_and_survives_resize() {
         role: Role::Server,
         local_static_priv: server_kp.private,
         remote_static_pub: None,
-        auth: AuthPolicy::Allowlist(vec![client_kp.public]),
+        auth: AuthPolicy::Allowlist(vec![client_kp.public, replacement_kp.public]),
     };
-    let server_task = tokio::spawn(async move {
+    fixture.server = Some(tokio::spawn(async move {
         transport::shell_server::serve_shell(server_socket, server_cfg, reader, writer, resize)
             .await
-    });
+    }));
 
     // Client socket and client connection.
     let client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -116,9 +141,32 @@ async fn transport_shell_runs_command_and_survives_resize() {
 
     // Spin the client's recv/timeout loop until the marker shows up among
     // stream 0's bytes. The whole loop is under an overall timeout.
+    let mut phase = 0usize;
     let outcome = tokio::time::timeout(TEST_TIMEOUT, async {
         let mut buf = vec![0u8; 64 * 1024];
         let mut collected: Vec<u8> = Vec::new();
+        let mut parser = ShellDeframer::new();
+        let stranger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut unlisted = Connection::new(ConnectionConfig {
+            required_features: transport::Features::NONE,
+            features: transport::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: unlisted_kp.private,
+            remote_static_pub: Some(server_kp.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        let invalid = [
+            transport::wire::encode_handshake(transport::wire::Kind::HandshakeInit, &[]),
+            transport::wire::encode_handshake(transport::wire::Kind::HandshakeInit, &[0; 40]),
+            unlisted.start(Instant::now(), server_addr).remove(0).bytes,
+        ];
+        let expected: [&[u8]; 5] = [
+            MARKER,
+            b"CONTINUITY_preserved_1",
+            b"CONTINUITY_preserved_2",
+            b"CONTINUITY_preserved_3",
+            b"REPLACED_preserved",
+        ];
         loop {
             let next = client.next_timeout();
             let packet = match next {
@@ -154,30 +202,80 @@ async fn transport_shell_runs_command_and_survives_resize() {
                 match ev {
                     Event::HandshakeDone => {
                         outgoing.extend(client.send(now, 1, &resize_record(100, 40)));
-                        outgoing.extend(client.send(now, 0, b"printf ALACRITTY_OK\n"));
+                        let command: &[u8] = if phase == 0 {
+                            // Split the marker in the command so local PTY echo
+                            // cannot masquerade as actual shell execution.
+                            b"QSH_TEST_SESSION_VALUE=preserved; printf 'ALA%s_OK' CRITTY\n"
+                        } else {
+                            b"printf 'REPLACED_%s' \"$QSH_TEST_SESSION_VALUE\"\n"
+                        };
+                        outgoing.extend(client.send(now, 0, command));
                     }
-                    Event::StreamData { stream_id: 0, data } => collected.extend(data),
+                    Event::StreamData { stream_id: 0, data } => {
+                        for record in parser.push(&data) {
+                            if let ShellRecord::Data(bytes) = record {
+                                collected.extend(bytes);
+                            }
+                        }
+                        assert!(
+                            collected.len() <= 64 * 1024,
+                            "unexpectedly large test output"
+                        );
+                    }
                     _ => {}
                 }
             }
             send_all(&client_socket, &outgoing).await;
 
             if collected
-                .windows(MARKER.len())
-                .any(|window| window == MARKER)
+                .windows(expected[phase].len())
+                .any(|window| window == expected[phase])
             {
-                break;
+                if phase == 4 {
+                    break;
+                }
+                collected.clear();
+                if phase < 3 {
+                    stranger
+                        .send_to(&invalid[phase], server_addr)
+                        .await
+                        .unwrap();
+                    phase += 1;
+                    let command =
+                        format!("printf 'CONTINUITY_%s_{phase}' \"$QSH_TEST_SESSION_VALUE\"\n");
+                    send_all(
+                        &client_socket,
+                        &client.send(Instant::now(), 0, command.as_bytes()),
+                    )
+                    .await;
+                } else {
+                    // A different allowed key still takes over the existing
+                    // shell. Its variable proves the PTY was not respawned.
+                    phase = 4;
+                    client = Connection::new(ConnectionConfig {
+                        required_features: transport::Features::NONE,
+                        features: transport::Features::SUPPORTED,
+                        role: Role::Client,
+                        local_static_priv: replacement_kp.private,
+                        remote_static_pub: Some(server_kp.public),
+                        auth: AuthPolicy::Allowlist(Vec::new()),
+                    });
+                    parser = ShellDeframer::new();
+                    send_all(&client_socket, &client.start(Instant::now(), server_addr)).await;
+                }
             }
         }
     })
     .await;
 
-    server_task.abort();
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Some(server) = fixture.server.take() {
+        server.abort();
+        let _ = server.await;
+    }
+    drop(fixture);
 
-    outcome.expect(
-        "the ALACRITTY_OK marker must arrive on stream 0 within the allotted timeout \
-         (including after the resize was sent -- the server is alive)",
+    assert!(
+        outcome.is_ok(),
+        "shell continuity/replacement timed out in phase {phase}"
     );
 }
