@@ -40,7 +40,6 @@
 //! router on one socket, no control socket, no `daemonize`, no version
 //! negotiation -- `serve` is not self-installing, so none of that applies.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -144,8 +143,8 @@ pub fn transport_status_response(ports: &[u16], total_connections: u64) -> Resul
 /// synchronously (before the fork) are handed over to tokio, and the control
 /// server and the multi-session router are brought up in a single runtime.
 /// The function returns once the router exits or a `STOP` arrives; before
-/// returning it removes the control socket file (like the qsh path's
-/// `run_daemon`), so the next `transport-ensure` won't see a dead daemon
+/// returning its ownership guard removes only its own published control socket,
+/// so the next `transport-ensure` won't see a dead daemon
 /// behind an existing file.
 ///
 /// `server_priv` is the daemon's static Noise private key (the manager needs
@@ -178,7 +177,7 @@ pub async fn run_transport_daemon(
     auth: ServerAuth,
     backend: Arc<dyn SessionBackend>,
     listener: std::os::unix::net::UnixListener,
-    sock_path: PathBuf,
+    _cleanup: control::SocketCleanup,
     ports: Vec<u16>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
@@ -240,7 +239,6 @@ pub async fn run_transport_daemon(
     }
 
     log::info("qshd", "transport daemon stopped");
-    std::fs::remove_file(&sock_path).ok();
     Ok(())
 }
 
