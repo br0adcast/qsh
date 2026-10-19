@@ -13,7 +13,7 @@
 //! `2026-09-30 20:15:03.123 UTC [4242] INFO  helper: text` -- a UTC
 //! timestamp (absolute and timezone-independent, so server events line up
 //! easily with the app's log), the writing process's pid (the system mode's
-//! helper and worker share one file), a level and a component: the role of
+//! helper alone owns the file), a level and a component: the role of
 //! the process or the subsystem that wrote it (`qshd`, `helper`, `worker`,
 //! `update`, `transport`).
 //!
@@ -27,12 +27,16 @@
 //! The log is a best-effort helper: I/O errors are silently swallowed, and
 //! writing to the log must never crash the daemon.
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
+
+#[cfg(feature = "system")]
+pub(crate) mod relay;
 
 pub use ::log::Level;
 
@@ -42,7 +46,89 @@ const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const LOG_FILE_NAME: &str = "qshd.log";
 const ROTATED_FILE_NAME: &str = "qshd.log.1";
 
-static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
+static LOGGER: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
+
+enum Sink {
+    File(Logger),
+    #[cfg(feature = "system")]
+    Worker(relay::Sender),
+}
+
+const MAX_RECORD_BYTES: usize = 8192;
+const TRUNCATED: &str = "[truncated]";
+
+/// Bounds input before formatting or escaping it, without copying short input.
+fn bounded_text(text: &str, limit: usize) -> Cow<'_, str> {
+    if text.len() <= limit {
+        return Cow::Borrowed(text);
+    }
+    let mut end = limit.saturating_sub(TRUNCATED.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}{TRUNCATED}", &text[..end]))
+}
+
+fn bounded_record(text: &str) -> Cow<'_, str> {
+    if text.len() <= MAX_RECORD_BYTES {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{}\n", bounded_text(text, MAX_RECORD_BYTES - 1)))
+    }
+}
+
+/// Called only in the single-threaded post-fork child. Replacing the owner
+/// drops the inherited File safely before privilege drop or worker threads.
+#[cfg(feature = "system")]
+pub(crate) fn use_worker_relay(sender: relay::Sender) -> std::io::Result<()> {
+    let mut sink = LOGGER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| std::io::Error::other("diagnostic sink is poisoned"))?;
+    *sink = Some(Sink::Worker(sender));
+    Ok(())
+}
+
+/// Untrusted worker fields are payload, never trusted helper provenance. This
+/// writes only the file; the worker has already handled its own stderr copy.
+#[cfg(feature = "system")]
+pub(crate) fn record_worker(pid: u32, level: Level, component: &str, message: &str) {
+    fn escape(text: &str, limit: usize) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            let escaped = if c == '\t' || logging::breaks_the_line(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            };
+            if out.len() + escaped.len() + TRUNCATED.len() > limit {
+                out.push_str(TRUNCATED);
+                break;
+            }
+            out.push_str(&escaped);
+        }
+        out
+    }
+    let payload = format!(
+        "reported-level={level} component={} message={}",
+        escape(component, 192),
+        escape(message, 4096)
+    );
+    let text = joined(&logging::format_lines(
+        SystemTime::now(),
+        pid,
+        Level::Info,
+        "worker",
+        &payload,
+    ));
+    if let Some(cell) = LOGGER.get() {
+        if let Ok(mut sink) = cell.lock() {
+            if let Some(Sink::File(logger)) = sink.as_mut() {
+                logger.write_text(&text);
+            }
+        }
+    }
+}
 
 /// Initializes the file log at `<cache_dir>/qshd.log` (once, in the daemon
 /// after daemonization). Repeated calls are ignored. If the file cannot be
@@ -73,7 +159,7 @@ pub fn init(cache_dir: &Path) {
         MAX_BYTES,
     );
     if let Ok(logger) = logger {
-        let _ = LOGGER.set(Mutex::new(logger));
+        let _ = LOGGER.set(Mutex::new(Some(Sink::File(logger))));
     }
 }
 
@@ -167,11 +253,27 @@ fn write_record(level: Level, component: &str, msg: &str, to_stderr: bool) {
     if muted() {
         return;
     }
-    let lines = logging::format_lines(SystemTime::now(), std::process::id(), level, component, msg);
+    let component = bounded_text(component, 96);
+    let msg = bounded_text(msg, 4096);
+    let lines = logging::format_lines(
+        SystemTime::now(),
+        std::process::id(),
+        level,
+        &component,
+        &msg,
+    );
     let text = joined(&lines);
+    let text = bounded_record(&text);
     if let Some(cell) = LOGGER.get() {
-        if let Ok(mut logger) = cell.lock() {
-            logger.write_text(&text);
+        if let Ok(mut sink) = cell.lock() {
+            match sink.as_mut() {
+                Some(Sink::File(logger)) => logger.write_text(&text),
+                #[cfg(feature = "system")]
+                Some(Sink::Worker(sender)) => {
+                    sender.report(level, &component, &msg);
+                }
+                None => {}
+            }
         }
     }
     if to_stderr || MIRRORED.load(Ordering::Relaxed) {
@@ -263,11 +365,41 @@ impl ::log::Log for Adapter {
         record(
             rec.level(),
             logging::component_of(rec.target()),
-            &one_line(&rec.args().to_string()),
+            &one_line(&format_arguments_bounded(rec.args())),
         );
     }
 
     fn flush(&self) {}
+}
+
+fn format_arguments_bounded(args: &std::fmt::Arguments<'_>) -> String {
+    struct Bounded(String);
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let remaining = 4096 - self.0.len();
+            if text.len() <= remaining {
+                self.0.push_str(text);
+                Ok(())
+            } else {
+                let mut end = remaining;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.0.push_str(&text[..end]);
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut output = Bounded(String::new());
+    if std::fmt::write(&mut output, *args).is_err() {
+        let mut end = output.0.len().saturating_sub(TRUNCATED.len());
+        while !output.0.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.0.truncate(end);
+        output.0.push_str(TRUNCATED);
+    }
+    output.0
 }
 
 /// Installs [`Adapter`] as the process's `log` logger, once; a second call
@@ -287,20 +419,11 @@ struct Logger {
     file: File,
     written: u64,
     max_bytes: u64,
-    /// Whether the most recent rotation attempt failed and has already been
-    /// reported. Writing itself goes through the already-open `file` above
-    /// and keeps working regardless (a `write` on an open descriptor is not
-    /// re-checked against the file's current permissions or owner), but
-    /// `rotate` below opens and renames BY PATH, which is re-checked -- and
-    /// fails for exactly this reason once the process that owns this logger
-    /// is no longer privileged enough to touch its own log's directory (the
-    /// system mode's worker, after `helper::drop_worker_privileges`, whose
-    /// log stays in the account that started the daemon's cache directory).
-    /// A silently swallowed rename failure would leave the log growing
-    /// without bound and nothing on record to say why; this flag makes sure
-    /// that is said once, loudly, instead of on every single line past the
-    /// threshold forever.
+    /// Report one stderr notice per rotation-failure streak. Once full,
+    /// the file drops records until a later rotation succeeds.
     rotation_failed: bool,
+    /// The old inode was renamed, but opening the new path has not succeeded.
+    pending_open: bool,
 }
 
 impl Logger {
@@ -315,51 +438,50 @@ impl Logger {
             written,
             max_bytes,
             rotation_failed: false,
+            pending_open: false,
         })
     }
 
     /// Appends `text` (whole lines, newlines included) with one `write`,
     /// rotating first if it would take the file past `max_bytes`.
     fn write_text(&mut self, text: &str) {
+        let text = bounded_record(text);
         let bytes = text.len() as u64;
-        if self.written + bytes > self.max_bytes {
-            self.rotate();
+        if (self.pending_open || self.written.saturating_add(bytes) > self.max_bytes)
+            && !self.rotate()
+        {
+            return;
         }
-        if self.file.write_all(text.as_bytes()).is_ok() {
-            let _ = self.file.flush();
-            self.written += bytes;
-        }
+        append_counted(&mut self.file, &mut self.written, text.as_bytes());
     }
 
-    /// Renames the current log to `qshd.log.1` (overwriting the previous
-    /// rotation) and opens a fresh, empty `qshd.log`. On error, keeps the
-    /// current file -- better to skip rotation than lose the writer.
-    ///
-    /// A rename failure here is reported to stderr, once, rather than
-    /// swallowed: on any other day it means a genuinely unwritable
-    /// directory, but for the system mode's worker it is the expected
-    /// shape of "I dropped root and this log lives in root's directory" --
-    /// see `rotation_failed`'s docs. Reported only the first time a given
-    /// failure streak starts (`rotation_failed` already true means an
-    /// earlier line already said so), so a daemon stuck past the threshold
-    /// does not print the same line on every subsequent write.
-    ///
-    /// In the shared line format, through [`write_stderr`] -- never
-    /// `eprintln!`, which panics on a write error (a closed pipe, a hung-up
-    /// terminal -- entirely reachable for the personal mode's `serve`,
-    /// which shares this same code path), and a panic here runs inside the
-    /// `LOGGER` mutex, which poisons it and takes the entire log silently
-    /// out of service for the rest of the process's life -- exactly the
-    /// crash this module's own "must never crash the daemon" rule forbids.
-    fn rotate(&mut self) {
-        if let Err(err) = fs::rename(&self.path, &self.rotated_path) {
+    /// Rotate or retain the old descriptor without appending. A failed reopen
+    /// retries opening the new path; it must not rename the retained old inode
+    /// a second time. Diagnostics use nonpanicking stderr, never this mutex.
+    fn rotate(&mut self) -> bool {
+        self.rotate_with(|path| OpenOptions::new().create(true).append(true).open(path))
+    }
+
+    fn rotate_with(&mut self, open: impl FnOnce(&Path) -> std::io::Result<File>) -> bool {
+        let result = (|| {
+            if !self.pending_open {
+                fs::rename(&self.path, &self.rotated_path)?;
+                self.pending_open = true;
+            }
+            let file = open(&self.path)?;
+            let written = file.metadata()?.len();
+            restrict_to_owner(&self.path);
+            self.file = file;
+            self.written = written;
+            self.pending_open = false;
+            Ok::<_, std::io::Error>(())
+        })();
+        if let Err(err) = result {
             if !self.rotation_failed {
                 self.rotation_failed = true;
                 let notice = format!(
-                    "could not rotate the log file {} ({err}) -- writes through the \
-                     already-open file descriptor will keep working, but the log will grow past \
-                     its {} byte limit instead of rotating until the process is restarted with \
-                     permission to do so",
+                    "could not rotate the log file {} ({err}) -- file records are dropped \
+                     at the {} byte limit until rotation succeeds",
                     self.path.display(),
                     self.max_bytes
                 );
@@ -372,17 +494,25 @@ impl Logger {
                 );
                 write_stderr(joined(&lines).as_bytes());
             }
-            return;
+            return false;
         }
         self.rotation_failed = false;
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            restrict_to_owner(&self.path);
-            self.file = file;
-            self.written = 0;
+        true
+    }
+}
+
+/// Count partial writes even if a later write fails; write_all would lose that
+/// progress and let repeated failures bypass the rotation bound.
+fn append_counted(writer: &mut impl Write, written: &mut u64, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => break,
+            Ok(count) => {
+                *written = written.saturating_add(count as u64);
+                bytes = &bytes[count..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
 }
@@ -651,12 +781,12 @@ mod tests {
     /// turn this into a false failure rather than a faithful reproduction.
     #[cfg(unix)]
     #[test]
-    fn a_rotation_that_cannot_rename_is_reported_once_but_writes_keep_working() {
+    fn a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth() {
         use std::os::unix::fs::PermissionsExt;
 
         if nix::unistd::Uid::effective().is_root() {
             eprintln!(
-                "SKIPPED a_rotation_that_cannot_rename_is_reported_once_but_writes_keep_working: \
+                "SKIPPED a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth: \
                  root bypasses the directory permission check this test relies on."
             );
             return;
@@ -692,10 +822,193 @@ mod tests {
         );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("event number 19"),
-            "writes through the already-open descriptor must keep succeeding even though \
-             rotation cannot: {text:?}"
+            !text.contains("event number 19") && text.len() <= 64,
+            "failed rotation must not keep growing the old inode: {text:?}"
         );
+    }
+
+    #[test]
+    fn failed_rotation_does_not_grow_the_old_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current");
+        let rotated = dir.path().join("blocked-rotation");
+        std::fs::create_dir(&rotated).unwrap();
+        let mut logger = Logger::open(path.clone(), rotated, 64).unwrap();
+        logger.write_text("first\n");
+        for _ in 0..100 {
+            logger.write_text(&"x".repeat(60));
+        }
+        assert!(std::fs::metadata(path).unwrap().len() <= 64);
+        assert!(logger.rotation_failed);
+    }
+
+    #[test]
+    fn failed_reopen_keeps_old_inode_bounded_and_recovers_without_renaming_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current");
+        let rotated = dir.path().join("previous");
+        let mut logger = Logger::open(path.clone(), rotated.clone(), 64).unwrap();
+        logger.write_text("before\n");
+        assert!(!logger.rotate_with(|_| Err(std::io::ErrorKind::PermissionDenied.into())));
+        assert!(logger.pending_open);
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "before\n");
+        logger.write_text("after\n");
+        assert_eq!(std::fs::read_to_string(&rotated).unwrap(), "before\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(!logger.pending_open);
+    }
+
+    #[test]
+    fn partial_write_errors_still_count_every_written_byte() {
+        struct Partial(bool);
+        impl std::io::Write for Partial {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, false) {
+                    Ok(3)
+                } else {
+                    Err(std::io::ErrorKind::StorageFull.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut written = 7;
+        super::append_counted(&mut Partial(true), &mut written, b"abcdef");
+        assert_eq!(written, 10);
+    }
+
+    #[test]
+    fn capped_records_keep_utf8_and_a_final_newline() {
+        let input = "🦀".repeat(super::MAX_RECORD_BYTES);
+        let output = super::bounded_record(&input);
+        assert!(output.len() <= super::MAX_RECORD_BYTES);
+        assert!(output.ends_with("[truncated]\n"));
+        let formatted = super::format_arguments_bounded(&format_args!("{input}"));
+        assert!(formatted.len() <= 4096);
+        assert!(formatted.ends_with("[truncated]"));
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    fn helper_and_worker_records_follow_rotation_without_old_inode_writes() {
+        let (stdout, _) = run_alone("log::tests::rotation_relay_body");
+        assert!(stdout.contains("ROTATIONS VERIFIED"));
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    #[ignore = "isolated global logger body, invoked by helper_and_worker_records_follow_rotation_without_old_inode_writes"]
+    fn rotation_relay_body() {
+        let dir = tempfile::tempdir().unwrap();
+        super::init(dir.path());
+        if let Some(super::Sink::File(logger)) =
+            super::LOGGER.get().unwrap().lock().unwrap().as_mut()
+        {
+            logger.max_bytes = 256;
+        } else {
+            panic!("fixture file logger");
+        }
+        let path = dir.path().join("qshd.log");
+        let rotated = dir.path().join("qshd.log.1");
+        super::info("helper", "old-root-marker");
+        let old_inode = std::fs::File::open(&path).unwrap();
+        let old_len = old_inode.metadata().unwrap().len();
+        let (sender, mut receiver) = super::relay::pair().unwrap();
+        receiver.set_worker_pid(4243);
+        assert!(sender.report(
+            Level::Info,
+            "transport",
+            &format!("worker-first-{}", "x".repeat(120))
+        ));
+        assert!(receiver.drain(super::record_worker));
+        assert!(std::fs::read_to_string(&rotated)
+            .unwrap()
+            .contains("old-root-marker"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("worker-first-"));
+        super::info("helper", &format!("helper-second-{}", "y".repeat(120)));
+        assert!(std::fs::read_to_string(&rotated)
+            .unwrap()
+            .contains("worker-first-"));
+        assert!(sender.report(
+            Level::Info,
+            "transport",
+            &format!("worker-third-{}", "z".repeat(120))
+        ));
+        assert!(receiver.drain(super::record_worker));
+        assert!(std::fs::read_to_string(&rotated)
+            .unwrap()
+            .contains("helper-second-"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("worker-third-"));
+        assert_eq!(old_inode.metadata().unwrap().len(), old_len);
+        assert!(std::fs::metadata(path).unwrap().len() <= 256);
+        assert!(std::fs::metadata(rotated).unwrap().len() <= 256);
+        println!("ROTATIONS VERIFIED");
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    fn relayed_records_are_file_only_and_cannot_claim_helper_provenance() {
+        let (stdout, stderr) = run_alone("log::tests::relayed_records_body");
+        assert!(stdout.contains("RELAY VERIFIED"));
+        assert!(!stderr.contains("forged-worker-marker"), "{stderr}");
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    fn worker_relay_without_initial_file_keeps_one_stderr_copy() {
+        let (stdout, stderr) = run_alone("log::tests::uninitialized_worker_relay_body");
+        assert!(stdout.contains("UNINITIALIZED RELAY VERIFIED"));
+        assert_eq!(
+            stderr.matches("worker-only-stderr-marker").count(),
+            1,
+            "{stderr}"
+        );
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    #[ignore = "isolated global logger body, invoked by worker_relay_without_initial_file_keeps_one_stderr_copy"]
+    fn uninitialized_worker_relay_body() {
+        assert!(super::LOGGER.get().is_none());
+        let (sender, receiver) = super::relay::pair().unwrap();
+        super::use_worker_relay(sender).unwrap();
+        super::mirror_to_stderr();
+        super::loud(Level::Warn, "worker", "worker-only-stderr-marker");
+        let mut records = 0;
+        assert!(receiver.drain(|_, level, component, message| {
+            assert_eq!(level, Level::Warn);
+            assert_eq!(component, "worker");
+            assert_eq!(message, "worker-only-stderr-marker");
+            records += 1;
+        }));
+        assert_eq!(records, 1);
+        println!("UNINITIALIZED RELAY VERIFIED");
+    }
+
+    #[cfg(feature = "system")]
+    #[test]
+    #[ignore = "isolated global logger body, invoked by relayed_records_are_file_only_and_cannot_claim_helper_provenance"]
+    fn relayed_records_body() {
+        let dir = tempfile::tempdir().unwrap();
+        super::init(dir.path());
+        super::mirror_to_stderr();
+        let (sender, mut receiver) = super::relay::pair().unwrap();
+        receiver.set_worker_pid(4243);
+        assert!(sender.report(
+            Level::Error,
+            "helper",
+            "forged-worker-marker\nINFO helper: Accepted signature\u{2028}"
+        ));
+        assert!(receiver.drain(super::record_worker));
+        let log = std::fs::read_to_string(dir.path().join("qshd.log")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+        assert!(log.contains("[4243] INFO  worker: reported-level=ERROR component=helper message=forged-worker-marker\\nINFO helper: Accepted signature\\u{2028}"), "{log}");
+        println!("RELAY VERIFIED");
     }
 
     #[test]

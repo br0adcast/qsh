@@ -169,6 +169,13 @@ pub(crate) fn current_login() -> String {
 /// while both halves are healthy, so nothing else would.
 pub(crate) struct Daemon {
     pub(crate) child: Child,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Daemon {
+    pub(crate) fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_tail.lock().unwrap()).into_owned()
+    }
 }
 
 impl Drop for Daemon {
@@ -339,17 +346,32 @@ pub(crate) fn start_daemon_with_groups(
 
         let mut stdout = child.stdout.take().expect("process stdout captured");
         if let Some(server_pub) = read_server_pubkey(&mut stdout) {
-            // `serve` writes every log line to stderr too (for the journal),
-            // the helper's and the worker's alike: a pipe nobody reads fills
-            // up after some hundred lines and then blocks whichever process
-            // writes next -- the helper included. Drained for the daemon's
-            // whole life; the lines themselves are in `daemon_log_path()`.
+            // Keep a bounded tail while continuously draining the pipe. Worker
+            // exit diagnostics must remain observable even if the helper is stopped.
+            let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             if let Some(mut stderr) = child.stderr.take() {
+                let captured = stderr_tail.clone();
                 std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                    const CAP: usize = 64 * 1024;
+                    let mut buf = [0; 4096];
+                    loop {
+                        match stderr.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let mut tail = captured.lock().unwrap();
+                                let discard = (tail.len() + n).saturating_sub(CAP);
+                                tail.drain(..discard);
+                                tail.extend_from_slice(&buf[..n]);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 });
             }
-            return (Daemon { child }, server_pub, port);
+            return (Daemon { child, stderr_tail }, server_pub, port);
         }
 
         // Lost the race (or a real bug): collect the evidence, reap this

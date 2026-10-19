@@ -368,8 +368,20 @@ const SEAM_SEND_TIMEOUT: Duration = super::spawner::HELPER_ANSWER_TIMEOUT;
 /// service disappearing out from under the other half -- so `exit(0)`,
 /// which systemd reads as an intentional, successful stop, would leave the
 /// whole service down instead of restarted.
-pub fn run(channels: UnixStream, auth: UnixStream, config: HelperConfig) -> ! {
-    run_until_peer_closes(channels, auth, config);
+pub(crate) fn run_with_diagnostics(
+    channels: UnixStream,
+    auth: UnixStream,
+    config: HelperConfig,
+    diagnostics: crate::log::relay::Receiver,
+) -> ! {
+    serve(
+        channels,
+        auth,
+        config,
+        HashMap::new(),
+        AccountSwitches::REAL,
+        Some(diagnostics),
+    );
     crate::log::error("helper", "the worker is gone, stopping");
     std::process::exit(1);
 }
@@ -398,6 +410,7 @@ pub fn run_until_peer_closes(channels: UnixStream, auth: UnixStream, config: Hel
         config,
         HashMap::new(),
         AccountSwitches::REAL,
+        None,
     );
 }
 
@@ -914,6 +927,7 @@ fn serve(
     config: HelperConfig,
     admitted: HashMap<LoginId, Account>,
     switches: AccountSwitches,
+    mut diagnostics: Option<crate::log::relay::Receiver>,
 ) {
     // Neither seam may be able to park this loop for good -- see
     // `SEAM_SEND_TIMEOUT`. Reported rather than fatal: a helper that could
@@ -1014,6 +1028,10 @@ fn serve(
                 PollFlags::POLLIN,
             ));
         }
+        let diagnostic_index = fds.len();
+        if let Some(receiver) = diagnostics.as_ref() {
+            fds.push(PollFd::new(receiver.as_fd(), PollFlags::POLLIN));
+        }
         // Never longer than REAP_INTERVAL, so a child that exits while the
         // worker is silent is still noticed -- and never past the nearest
         // startup deadline either, so a child that says nothing at all is
@@ -1049,6 +1067,16 @@ fn serve(
             .filter(|(_, polled)| polled.any().unwrap_or(true))
             .map(|(login, _)| *login)
             .collect();
+
+        let diagnostic_ready = diagnostics.is_some() && fds[diagnostic_index].any().unwrap_or(true);
+        drop(fds);
+        if diagnostic_ready {
+            if let Some(receiver) = diagnostics.as_ref() {
+                if !receiver.drain(crate::log::record_worker) {
+                    diagnostics = None;
+                }
+            }
+        }
 
         // Settled BEFORE either seam is served, and that order is
         // load-bearing: `ready_reports` names raw descriptor NUMBERS, and
@@ -4311,6 +4339,7 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("log_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -5793,7 +5822,14 @@ pub(crate) mod tests {
     ) -> TestHelper {
         let ((channels, auth), (helper_channels, helper_auth)) = seams_for_test();
         let thread = std::thread::spawn(move || {
-            serve(helper_channels, helper_auth, config, admitted, switches)
+            serve(
+                helper_channels,
+                helper_auth,
+                config,
+                admitted,
+                switches,
+                None,
+            )
         });
         TestHelper {
             channels,
@@ -8716,7 +8752,14 @@ pub(crate) mod tests {
         let login = [1u8; 16];
         let admitted = HashMap::from([(login, my_account())]);
         let thread = std::thread::spawn(move || {
-            serve(helper_ch, helper_auth, test_config(), admitted, switches)
+            serve(
+                helper_ch,
+                helper_auth,
+                test_config(),
+                admitted,
+                switches,
+                None,
+            )
         });
 
         let req = open_request(1, me_uid(), login);
@@ -9749,8 +9792,9 @@ pub(crate) mod tests {
         };
         let login = [17u8; 16];
         let admitted = HashMap::from([(login, my_account())]);
-        let thread =
-            std::thread::spawn(move || serve(helper_ch, helper_auth, config, admitted, switches));
+        let thread = std::thread::spawn(move || {
+            serve(helper_ch, helper_auth, config, admitted, switches, None)
+        });
 
         let req = open_request(1, me_uid(), login);
         super::channel::send(&worker_ch, &encode(&req).expect("encode"), None).expect("send");
@@ -10435,6 +10479,7 @@ pub(crate) mod tests {
                 config,
                 HashMap::new(),
                 switches,
+                None,
             )
         });
         TestHelper {
@@ -12274,6 +12319,7 @@ pub(crate) mod tests {
                 test_config(),
                 HashMap::new(),
                 UNPRIVILEGED,
+                None,
             )
         });
 

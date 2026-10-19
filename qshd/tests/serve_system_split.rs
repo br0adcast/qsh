@@ -429,24 +429,11 @@ fn is_enosys(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENOSYS)
 }
 
-/// Finds the fd NUMBERS (not the inodes `open_socket_inodes` above
-/// returns) of the helper's own ends of its two seams to the worker -- the
-/// channel seam and the authentication seam, the only two `AF_UNIX`
-/// sockets it should hold. REQUIRES there be exactly two such candidates
-/// and panics naming all of them otherwise: after the split the helper
-/// holds no INET socket at all (proven by the fd-isolation test above) and
-/// opens no socket of any other kind, so this test's whole premise is that
-/// the socket-shaped fds found here ARE those seams -- taking "whatever was
-/// found" without checking that would risk duplicating the WRONG
-/// descriptor if that premise were ever violated (an NSS module's own
-/// socket opened during the account lookup before the fork, an inherited
-/// stdin that happens to be a socket, ...), and the death test below would
-/// then still pass through the worker's reader-thread EOF hook when the
-/// REAL channel seam closes with the helper -- proving nothing about the
-/// parent-death signal at all, silently. Fewer is equally a hard failure,
-/// not a skip: a helper this test just started and is about to kill must
-/// have both seams open.
-fn seam_fd_numbers(pid: u32) -> [i32; 2] {
+/// Finds exactly the helper's channel, authentication and diagnostic sockets.
+/// Pair creation order identifies auth as the middle descriptor; the auth-loss
+/// test independently proves that identity through the named reader's stderr.
+/// An unexpected extra socket is a failure, never an arbitrary candidate choice.
+fn seam_fd_numbers(pid: u32) -> [i32; 3] {
     let candidates: Vec<i32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap_or_else(|e| panic!("read /proc/{pid}/fd: {e}"))
         .filter_map(|entry| entry.ok())
@@ -458,10 +445,9 @@ fn seam_fd_numbers(pid: u32) -> [i32; 2] {
         .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
         .collect();
     match candidates[..] {
-        [first, second] => [first, second],
+        [first, second, third] => [first, second, third],
         ref other => panic!(
-            "the helper (pid {pid}) must hold exactly two AF_UNIX socket fds (its ends of the \
-             channel and authentication seams) to duplicate unambiguously, found {}: {other:?}",
+            "the helper (pid {pid}) must hold exactly three AF_UNIX socket fds (channel, authentication and diagnostic seams) to duplicate unambiguously, found {}: {other:?}",
             other.len()
         ),
     }
@@ -602,6 +588,48 @@ fn the_helper_holds_no_network_descriptor_after_the_split() {
 /// Needs root, and `/proc/<pid>/task/<pid>/children` (see
 /// `wait_for_worker_pid`'s docs) to find the worker's pid at all --
 /// skipped, loudly, when either is unavailable.
+#[test]
+fn the_worker_holds_no_privileged_log_descriptor_after_the_split() {
+    use std::os::unix::fs::MetadataExt;
+
+    const NAME: &str = "the_worker_holds_no_privileged_log_descriptor_after_the_split";
+    common::on_a_disposable_host(NAME, WHAT_THESE_TESTS_DO, || {
+        common::install_service_file(include_str!("../../packaging/pam.d/qshd.debian"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (daemon, _, _) = common::start_daemon(dir.path());
+        let helper_pid = daemon.child.id();
+        let worker_pid = wait_for_worker_pid(helper_pid)
+            .expect("the disposable Linux fixture exposes the helper's children");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .unwrap()
+            .expect("fixture worker account");
+        wait_until_worker_is_armed_the_second_time(worker_pid, nobody.uid);
+
+        let log = std::fs::metadata(common::daemon_log_path()).expect("helper log exists");
+        assert_eq!(log.uid(), 0, "the fixture log must belong to the helper");
+        let same_file_fds = |pid: u32| -> Vec<i32> {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("inspect owned fixture process descriptors")
+                .map(|entry| entry.expect("descriptor entry"))
+                .filter_map(|entry| {
+                    let metadata = match std::fs::metadata(entry.path()) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                        Err(error) => panic!("cannot inspect fixture descriptor: {error}"),
+                    };
+                    (metadata.dev() == log.dev() && metadata.ino() == log.ino())
+                        .then(|| entry.file_name().to_string_lossy().parse().unwrap())
+                })
+                .collect()
+        };
+        assert!(!same_file_fds(helper_pid).is_empty(), "helper owns the log");
+        assert!(
+            same_file_fds(worker_pid).is_empty(),
+            "the worker must not retain authority over the privileged log inode"
+        );
+    });
+}
+
 #[test]
 fn the_worker_runs_as_its_configured_account() {
     common::on_a_disposable_host(
@@ -815,7 +843,7 @@ fn the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open() {
 
             // The duplicates must be the seams themselves, not merely SOME
             // sockets that happened to be the only ones found:
-            // `seam_fd_numbers` already narrows to exactly two AF_UNIX
+            // `seam_fd_numbers` already narrows to exactly three AF_UNIX
             // candidates, and this confirms each one's type matches
             // `helper::channel::pair`'s `SOCK_SEQPACKET` exactly.
             for fd in &held_open {
@@ -1131,7 +1159,7 @@ fn proc_stat_field(pid: u32, field: usize) -> Option<String> {
 /// right after it, with nothing closed in between, and a new descriptor
 /// always takes the lowest free number -- so both of the authentication
 /// pair's descriptors are numbered above both of the channel pair's, and the
-/// helper's authentication end is the higher of its two. Socket inode
+/// helper's authentication end is the middle of its three (diagnostics is last). Socket inode
 /// numbers are no second witness: the kernel hands them out from per-CPU
 /// batches, so a process that moves to another CPU between the two
 /// `socketpair` calls can get the later pair a LOWER inode. What does
@@ -1188,7 +1216,7 @@ fn the_worker_ends_itself_when_only_its_authentication_seam_is_lost() {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // The higher of the helper's two seam descriptors -- see this
+        // The second of three ordered descriptors: channel, authentication,
         // test's docs for why that is the authentication seam, and for
         // what confirms it once the worker has ended.
         let mut seams = seam_fd_numbers(helper_pid);
@@ -1262,14 +1290,18 @@ fn the_worker_ends_itself_when_only_its_authentication_seam_is_lost() {
         // reader is what noticed: had the channel seam been taken for it,
         // the channel seam's reader would have ended the worker instead,
         // and this line would be missing.
-        let log_path = common::daemon_log_path();
-        let log = std::fs::read_to_string(&log_path)
-            .unwrap_or_else(|e| panic!("read the daemon's log at {}: {e}", log_path.display()));
+        let deadline = Instant::now() + WORKER_WAIT;
+        let log = loop {
+            let log = daemon.stderr_text();
+            if log.contains(AUTH_SEAM_CLOSED_LOG) || Instant::now() >= deadline {
+                break log;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert!(
             log.contains(AUTH_SEAM_CLOSED_LOG),
-            "the worker's log must show the authentication seam's reader noticing the lost \
-             seam ({AUTH_SEAM_CLOSED_LOG:?}); otherwise the seam shut down was not the \
-             authentication one. The log:\n{log}"
+            "the worker stderr must identify the lost authentication seam ({AUTH_SEAM_CLOSED_LOG:?}) \
+             while the helper is stopped; captured stderr: {log}"
         );
 
         let _ = daemon.child.kill();
