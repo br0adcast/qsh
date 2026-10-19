@@ -642,9 +642,7 @@ mod lifecycle_tests {
         decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord,
         CONTROL_STREAM,
     };
-    use transport::channel_server::{
-        run_channel_session, ChannelSpawner, ChannelWait, SpawnedChannel,
-    };
+    use transport::channel_server::{run_channel_session, ChannelSpawner, ChannelWait};
     use transport::session_manager::{
         LoginId, SessionInbound, SessionIo, SessionOutbound, StreamData,
     };
@@ -664,6 +662,13 @@ mod lifecycle_tests {
     }
     struct Wait(Feed);
     impl ChannelWait for Wait {
+        fn cleanup_uninstalled(
+            &mut self,
+            authority: &transport::channel_open::CleanupAuthority<'_>,
+        ) -> transport::channel_open::CleanupStatus {
+            self.0.lock().unwrap().take();
+            authority.reaped()
+        }
         fn kill(&mut self) {
             self.0.lock().unwrap().take();
         }
@@ -679,27 +684,32 @@ mod lifecycle_tests {
         }
     }
     struct Spawner {
+        opens: Arc<transport::channel_open::ChannelOpenRegistry>,
         budget: Arc<ScreenBudget>,
         feed: Feed,
     }
     impl ChannelSpawner for Spawner {
+        fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+            self.opens.clone()
+        }
         fn spawn(
             &self,
             owner: &Principal,
             _login: LoginId,
             req: &OpenRequest,
             _term: Option<&str>,
-        ) -> Result<SpawnedChannel, String> {
-            let screen = crate::channel_backend::make_screen(req, owner, self.budget.clone())?;
+            custody: &transport::channel_open::OpenCustody,
+        ) -> Result<
+            transport::channel_open::UninstalledChannel,
+            transport::channel_open::SpawnFailure,
+        > {
+            let screen = crate::channel_backend::make_screen(req, owner, self.budget.clone())
+                .map_err(|e| custody.refuse_before_creation(e))?;
             let (tx, rx) = mpsc::channel();
             *self.feed.lock().unwrap() = Some(tx);
-            Ok(SpawnedChannel {
-                reader: Box::new(Reader(rx)),
-                writer: Box::new(io::sink()),
-                resize: Box::new(Resize),
-                screen,
-                wait: Box::new(Wait(self.feed.clone())),
-            })
+            Ok(custody
+                .protect(Box::new(Wait(self.feed.clone())), screen)
+                .finish(Box::new(Reader(rx)), Box::new(io::sink()), Box::new(Resize)))
         }
     }
     fn owner(uid: u32, name: &str) -> Principal {
@@ -784,6 +794,7 @@ mod lifecycle_tests {
                 .unwrap();
             let snapshots = io.snapshot_reader_for_test();
             let spawner = Arc::new(Spawner {
+                opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
                 budget: budget.clone(),
                 feed: Arc::new(Mutex::new(None)),
             });
@@ -845,6 +856,7 @@ mod lifecycle_tests {
             tx.try_send(SessionInbound::Live(channel_context()))
                 .unwrap();
             let spawner = Arc::new(Spawner {
+                opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
                 budget: budget.clone(),
                 feed: Arc::new(Mutex::new(None)),
             });

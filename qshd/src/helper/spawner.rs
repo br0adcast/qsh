@@ -3,8 +3,8 @@
 //! [`HelperChannelSpawner`] is a [`ChannelSpawner`] that asks the helper for
 //! a channel instead of opening a pseudo-terminal itself, over the channel
 //! seam. One reader thread owns that seam's receiving side, because it
-//! carries two kinds of message at once: replies to requests, and `Exited`
-//! notices that arrive whenever a child dies. "The next message answers my
+//! carries request outcomes, installed `Exited` notices, and independent
+//! terminal cleanup receipts. "The next message answers my
 //! request" is therefore false there, and something has to demultiplex by
 //! channel id.
 //!
@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use transport::auth::{AuthError, AuthRecord, AuthVerifier, Principal};
 use transport::channel::{ChannelKind, OpenRequest};
-use transport::channel_server::{ChannelSpawner, ChannelWait, SpawnedChannel};
+#[cfg(test)]
+use transport::channel_server::SpawnedChannel;
+use transport::channel_server::{ChannelSpawner, ChannelWait};
 use transport::probation::MAX_PROBATION;
 use transport::session_manager::{
     login_end_channel, LoginEndNotReported, LoginEndedReports, LoginId, LoginSink,
@@ -43,7 +45,8 @@ use crate::screen_budget::{BudgetLimits, ScreenBudget};
 use super::channel;
 use super::config::HelperConfig;
 use super::protocol::{
-    decode, encode, AuthRequest, AuthRequestId, AuthResponse, ChannelId, Nonce, Request, Response,
+    decode, encode, AuthRequest, AuthRequestId, AuthResponse, ChannelId, CleanupKind, Nonce,
+    Request, Response,
 };
 
 /// The most bytes of a thread's name Linux keeps: `TASK_COMM_LEN` is 16,
@@ -332,6 +335,7 @@ pub(super) fn worker_clients(
 /// Asks a privileged helper to open channels, over one `socketpair` shared
 /// with it.
 pub struct HelperChannelSpawner {
+    opens: Arc<transport::channel_open::ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
     /// The sending side. A mutex, not a channel: `spawn` is synchronous (the
     /// trait is), the message is tiny, and the helper answers in
@@ -360,6 +364,37 @@ pub struct HelperChannelSpawner {
 struct Pending {
     opened: Option<Sender<Result<OwnedFd, String>>>,
     exited: Option<Sender<i32>>,
+    outcome: OpenOutcome,
+    receipt: Arc<Mutex<CleanupReceipt>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenOutcome {
+    Waiting,
+    Opened,
+    Failed,
+    Abandoned,
+}
+
+struct CleanupReceipt {
+    kind: Option<CleanupKind>,
+    cleanup_requested: bool,
+    notify: transport::channel_open::CleanupNotifier,
+}
+
+impl Pending {
+    fn finished(&self) -> bool {
+        self.receipt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .kind
+            .is_some()
+            && match self.outcome {
+                OpenOutcome::Waiting => false,
+                OpenOutcome::Opened => self.exited.is_none(),
+                OpenOutcome::Failed | OpenOutcome::Abandoned => true,
+            }
+    }
 }
 
 impl HelperChannelSpawner {
@@ -502,6 +537,7 @@ impl HelperChannelSpawner {
                 )
             })?;
         Ok(HelperChannelSpawner {
+            opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
             budget,
             tx: Mutex::new(sock),
             next_id: AtomicU64::new(1),
@@ -602,19 +638,32 @@ fn read_loop(
                 let Some(pending) = map.get_mut(&id) else {
                     continue;
                 };
-                if let Some(tx) = pending.opened.take() {
-                    match fd {
-                        Some(fd) => {
-                            let _ = tx.send(Ok(fd));
-                        }
-                        // `Opened` without a descriptor is the helper
-                        // breaking its own contract; refuse rather than
-                        // hand the caller a channel with no terminal.
-                        None => {
-                            let _ = tx.send(Err(
-                                "the helper opened a channel but sent no terminal".to_string(),
-                            ));
-                        }
+                if pending.outcome == OpenOutcome::Waiting {
+                    let tx = pending.opened.take().expect("one pending outcome");
+                    let result = fd.ok_or_else(|| {
+                        "the helper opened a channel but sent no terminal".to_string()
+                    });
+                    pending.outcome = if result.is_ok() {
+                        OpenOutcome::Opened
+                    } else {
+                        OpenOutcome::Failed
+                    };
+                    if tx.send(result).is_err() {
+                        pending.outcome = OpenOutcome::Abandoned;
+                        pending.exited = None;
+                    }
+                }
+                let close = matches!(
+                    pending.outcome,
+                    OpenOutcome::Failed | OpenOutcome::Abandoned
+                );
+                if pending.finished() {
+                    map.remove(&id);
+                }
+                drop(map);
+                if close {
+                    if let Ok(bytes) = encode(&Request::Close { id }) {
+                        let _ = channel::send(&sock, &bytes, None);
                     }
                 }
             }
@@ -622,10 +671,16 @@ fn read_loop(
                 let Some(pending) = map.get_mut(&id) else {
                     continue;
                 };
-                if let Some(tx) = pending.opened.take() {
-                    let _ = tx.send(Err(reason));
+                if pending.outcome == OpenOutcome::Waiting {
+                    pending.outcome = OpenOutcome::Failed;
+                    pending.exited = None;
+                    if let Some(tx) = pending.opened.take() {
+                        let _ = tx.send(Err(reason));
+                    }
                 }
-                map.remove(&id);
+                if pending.finished() {
+                    map.remove(&id);
+                }
             }
             Response::Exited { id, code } => {
                 let Some(pending) = map.get_mut(&id) else {
@@ -634,7 +689,38 @@ fn read_loop(
                 if let Some(tx) = pending.exited.take() {
                     let _ = tx.send(code);
                 }
-                map.remove(&id);
+                if pending.finished() {
+                    map.remove(&id);
+                }
+            }
+            Response::CleanupComplete { id, kind } => {
+                // This connection owns this map. A new helper connection can
+                // never satisfy an old ticket, even if its numeric IDs match.
+                if fd.is_some() {
+                    continue;
+                }
+                let Some(pending) = map.get_mut(&id) else {
+                    continue;
+                };
+                let notify = {
+                    let mut receipt = pending.receipt.lock().unwrap_or_else(|e| e.into_inner());
+                    if receipt.kind.is_some() {
+                        continue;
+                    }
+                    receipt.kind = Some(kind);
+                    receipt.cleanup_requested.then(|| receipt.notify.clone())
+                };
+                if pending.finished() {
+                    map.remove(&id);
+                }
+                drop(map);
+                // Never call the registry or backend while holding helper
+                // map/ticket locks. A sticky receipt makes this path I/O-free.
+                // A healthy Ready result may already have exited naturally;
+                // recording that fact alone must never cancel its adoption.
+                if let Some(notify) = notify {
+                    let _ = notify.retry_cleanup();
+                }
             }
             // `HelperChannelSpawner` never sends `Request::Nonce` or
             // `Request::Verify` on this socket -- authentication has its own
@@ -673,34 +759,44 @@ fn read_loop(
 }
 
 impl HelperChannelSpawner {
-    /// Give up on channel `id` after the helper may already have opened it:
-    /// ask for it to be closed, and drop this side's bookkeeping for it.
-    ///
-    /// Best-effort by nature -- a helper that is truly gone fails the send,
-    /// and there was nothing left to close anyway -- and a no-op on the
-    /// helper's side for an id it never opened. What it must not be is
-    /// nothing at all: a channel whose process is running with no
-    /// `ChannelWait` anywhere is a process nothing can ever end, and the
-    /// worker has already lost the only handle it had to it.
-    ///
+    /// Suppress this open's outcome and request Close after possible creation.
+    /// Keep the bounded ticket and custody until an exact cleanup receipt.
+    /// A failed send or a disconnected helper leaves cleanup Unknown, not
+    /// successful; neither proves that the process or its resources are gone.
     /// Takes the `tx` lock, so no caller may already hold it.
     fn abandon(&self, id: ChannelId) {
-        if let Ok(close) = encode(&Request::Close { id }) {
-            let tx = self.tx.lock().expect("the helper socket is never poisoned");
-            let _ = channel::send(&tx, &close, None);
+        let needs_close = {
+            let mut map = self
+                .waiting
+                .lock()
+                .expect("the waiting map is never poisoned");
+            if let Some(pending) = map.get_mut(&id) {
+                pending.outcome = OpenOutcome::Abandoned;
+                pending.opened = None;
+                pending.exited = None;
+                if pending.finished() {
+                    map.remove(&id);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        };
+        if needs_close {
+            if let Ok(close) = encode(&Request::Close { id }) {
+                let tx = self.tx.lock().expect("the helper socket is never poisoned");
+                let _ = channel::send(&tx, &close, None);
+            }
         }
-        // Nothing will ever read this id's receivers again, so leaving its
-        // entry in `waiting` would be bookkeeping nobody reclaims -- the
-        // same leak `spawn`'s encode-failure path avoids by never creating
-        // one.
-        self.waiting
-            .lock()
-            .expect("the waiting map is never poisoned")
-            .remove(&id);
     }
 }
 
 impl ChannelSpawner for HelperChannelSpawner {
+    fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+        self.opens.clone()
+    }
     /// Asks for the channel on `owner`'s behalf: its uid goes into the
     /// request, and the helper opens the channel only if it verified that
     /// account itself -- through `HelperAuth`, when the session logged in.
@@ -713,14 +809,37 @@ impl ChannelSpawner for HelperChannelSpawner {
         login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
-    ) -> Result<SpawnedChannel, String> {
+        custody: &transport::channel_open::OpenCustody,
+    ) -> Result<transport::channel_open::UninstalledChannel, transport::channel_open::SpawnFailure>
+    {
+        self.spawn_with_clone(owner, login, req, term, custody, std::fs::File::try_clone)
+    }
+}
+
+impl HelperChannelSpawner {
+    // Descriptor preparation is fallible even after the helper reports Opened.
+    // Keep it inside the same custody scope as the creating request.
+    fn spawn_with_clone(
+        &self,
+        owner: &Principal,
+        login: LoginId,
+        req: &OpenRequest,
+        term: Option<&str>,
+        custody: &transport::channel_open::OpenCustody,
+        mut clone_descriptor: impl FnMut(&std::fs::File) -> io::Result<std::fs::File>,
+    ) -> Result<transport::channel_open::UninstalledChannel, transport::channel_open::SpawnFailure>
+    {
         // The same refusal the personal mode's spawner gives, in the same
         // words: the two must not disagree about what a channel is.
         if req.cols == 0 || req.rows == 0 {
-            return Err("a channel without a terminal is not supported yet".to_string());
+            return Err(custody.refuse_before_creation(
+                "a channel without a terminal is not supported yet".to_string(),
+            ));
         }
-        terminal_size::TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
-        let screen = make_screen(req, owner, Arc::clone(&self.budget))?;
+        terminal_size::TerminalSize::new(req.cols, req.rows)
+            .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))
+            .map_err(|e| custody.refuse_before_creation(e))?;
         let (shell, command) = match req.kind {
             // The helper runs the account's login shell, from passwd as it
             // verified the account (`helper::server::login_shell`) -- never
@@ -740,8 +859,9 @@ impl ChannelSpawner for HelperChannelSpawner {
             // runs everything and there is no shell to confine anyone.
             ChannelKind::Command => (
                 false,
-                String::from_utf8(req.command.clone())
-                    .map_err(|e| format!("the command is not valid UTF-8: {e}"))?,
+                String::from_utf8(req.command.clone()).map_err(|e| {
+                    custody.refuse_before_creation(format!("the command is not valid UTF-8: {e}"))
+                })?,
             ),
         };
         // Echo ON for a shell (a full-screen program sets raw mode itself),
@@ -753,7 +873,20 @@ impl ChannelSpawner for HelperChannelSpawner {
         // already live, so every request on this connection needs an id
         // that has never been used before, for as long as the connection
         // lasts.
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let tx = self.tx.lock().expect("the helper socket is never poisoned");
+        let mut id = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).ok_or_else(|| {
+                custody.refuse_before_creation("helper channel identity exhausted".into())
+            })?;
+            match self
+                .next_id
+                .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
 
         let request = Request::Open {
             id,
@@ -778,10 +911,32 @@ impl ChannelSpawner for HelperChannelSpawner {
         // `waiting`, with both its senders, for the rest of the process's
         // life -- nobody left to remove it. Failing here, before either
         // sender exists, needs no such cleanup at all.
-        let bytes = encode(&request).map_err(|e| format!("could not ask for a channel: {e}"))?;
+        let bytes = encode(&request).map_err(|e| {
+            custody.refuse_before_creation(format!("could not ask for a channel: {e}"))
+        })?;
 
         let (opened_tx, opened_rx) = mpsc::channel::<Result<OwnedFd, String>>();
         let (exited_tx, exited_rx) = mpsc::channel::<i32>();
+        // Clone the close handle before sending any possibly creating request.
+        let wait_tx = tx.try_clone().map_err(|e| {
+            custody.refuse_before_creation(format!("closing the channel later: {e}"))
+        })?;
+        let receipt = Arc::new(Mutex::new(CleanupReceipt {
+            kind: None,
+            cleanup_requested: false,
+            notify: custody.cleanup_notifier(),
+        }));
+        let construction = custody.protect(
+            Box::new(HelperWait {
+                id,
+                exits: exited_rx,
+                receipt: receipt.clone(),
+                tx: wait_tx,
+                disconnected_locally: self.disconnected_locally.clone(),
+            }),
+            screen,
+        );
+
         self.waiting
             .lock()
             .expect("the waiting map is never poisoned")
@@ -790,23 +945,18 @@ impl ChannelSpawner for HelperChannelSpawner {
                 Pending {
                     opened: Some(opened_tx),
                     exited: Some(exited_tx),
+                    outcome: OpenOutcome::Waiting,
+                    receipt,
                 },
             );
 
-        {
-            let tx = self.tx.lock().expect("the helper socket is never poisoned");
-            if let Err(e) = channel::send(&tx, &bytes, None) {
-                // The request never reached the helper, so no response is
-                // ever coming for this id -- remove it ourselves rather
-                // than leaving it in the map forever (the reader thread,
-                // if it is even still running, has no way to know about an
-                // id that arrived after it already gave up).
-                self.waiting
-                    .lock()
-                    .expect("the waiting map is never poisoned")
-                    .remove(&id);
-                return Err(format!("could not reach the helper: {e}"));
-            }
+        let sent = channel::send(&tx, &bytes, None);
+        drop(tx);
+        if let Err(e) = sent {
+            // A generic send error is not a receipt. Keep the bounded ticket
+            // registered in case a delivered request later proves cleanup.
+            self.abandon(id);
+            return Err(custody.failure(format!("could not reach the helper: {e}")));
         }
 
         // Blocking on purpose: `ChannelSpawner::spawn` is synchronous, and
@@ -818,57 +968,48 @@ impl ChannelSpawner for HelperChannelSpawner {
         // bound catches is a helper that stays connected but simply never
         // answers.
         let fd = match opened_rx.recv_timeout(self.open_timeout) {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(|reason| custody.failure(reason))?,
             Err(_) => {
                 // A reply that was merely slow rather than lost would leave
                 // a channel running with nothing holding a `ChannelWait`
                 // able to close it -- see `abandon`.
                 self.abandon(id);
-                return Err("the helper did not answer an open request in time".to_string());
+                return Err(custody
+                    .failure("the helper did not answer an open request in time".to_string()));
             }
         };
 
-        // From here on the channel is RUNNING in the helper: its process
-        // started and its terminal came back. So every way out of this
-        // function that is not a `SpawnedChannel` has to take it down
-        // again -- the `ChannelWait` that could is built at the very end,
-        // and until it exists a failure here would leave a process running
-        // for the rest of the daemon's life with nothing able to end it.
+        // The helper has returned a live descriptor. Preparation can still
+        // fail, so the construction guard already owns the wait handle and
+        // screen. Abandon requests Close and suppresses late outcomes; only
+        // the exact receipt releases the registered cleanup custody.
         let master = std::fs::File::from(fd);
-        let clone = |what: &str| {
-            master.try_clone().map_err(|e| {
+        let mut clone = |what: &str| {
+            clone_descriptor(&master).map_err(|e| {
                 self.abandon(id);
-                format!("{what}: {e}")
+                custody.failure(format!("{what}: {e}"))
             })
         };
         let reader = Box::new(clone("reading the channel")?);
         let writer = Box::new(clone("writing the channel")?);
-        // The guard is taken and dropped inside this block on purpose:
-        // `abandon` takes the same lock, and taking it twice on one thread
-        // would deadlock.
-        let wait_tx = {
-            let tx = self.tx.lock().expect("the helper socket is never poisoned");
-            tx.try_clone()
-        };
-        let wait_tx = match wait_tx {
-            Ok(tx) => tx,
-            Err(e) => {
-                self.abandon(id);
-                return Err(format!("closing the channel later: {e}"));
-            }
-        };
-        Ok(SpawnedChannel {
+        Ok(construction.finish(
             reader,
             writer,
-            resize: Box::new(MasterResize(clone("resizing the channel")?)),
-            screen,
-            wait: Box::new(HelperWait {
-                id,
-                exits: exited_rx,
-                tx: wait_tx,
-                disconnected_locally: Arc::clone(&self.disconnected_locally),
-            }),
-        })
+            Box::new(MasterResize(clone("resizing the channel")?)),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl HelperChannelSpawner {
+    fn spawn(
+        &self,
+        owner: &Principal,
+        login: LoginId,
+        req: &OpenRequest,
+        term: Option<&str>,
+    ) -> Result<SpawnedChannel, String> {
+        crate::channel_backend::fixture_spawn(self, owner, login, req, term)
     }
 }
 
@@ -876,6 +1017,7 @@ impl ChannelSpawner for HelperChannelSpawner {
 struct HelperWait {
     id: ChannelId,
     exits: Receiver<i32>,
+    receipt: Arc<Mutex<CleanupReceipt>>,
     tx: UnixStream,
     /// Shared with the [`HelperChannelSpawner`] this channel came from --
     /// see that field's docs. Read only on the failure path of `wait`,
@@ -884,6 +1026,26 @@ struct HelperWait {
 }
 
 impl ChannelWait for HelperWait {
+    fn cleanup_uninstalled(
+        &mut self,
+        authority: &transport::channel_open::CleanupAuthority<'_>,
+    ) -> transport::channel_open::CleanupStatus {
+        // Check the sticky fact first: receipt-triggered retries must never
+        // perform socket I/O on the reader thread or lose a pre-cancel receipt.
+        let kind = {
+            let mut receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+            receipt.cleanup_requested = true;
+            receipt.kind
+        };
+        match kind {
+            Some(CleanupKind::NoChild) => authority.no_child(),
+            Some(CleanupKind::Reaped) => authority.reaped(),
+            None => {
+                self.kill();
+                transport::channel_open::CleanupStatus::Unknown
+            }
+        }
+    }
     fn kill(&mut self) {
         match encode(&Request::Close { id: self.id }) {
             Ok(bytes) => {
@@ -2420,9 +2582,24 @@ pub(crate) mod tests {
                 None,
             )
             .unwrap();
+            (helper, id)
         });
         assert!(spawner.spawn(&anyone(), any_login(), &req, None).is_err());
-        stub.join().unwrap();
+        let (helper, id) = stub.join().unwrap();
+        assert_eq!(budget.used().models, 1, "Failed alone is not cleanup");
+        channel::send(
+            &helper,
+            &encode(&Response::CleanupComplete {
+                id,
+                kind: CleanupKind::NoChild,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        wait_for("the exact receipt refunds the screen", &|| {
+            budget.used().models == 0
+        });
         assert_eq!(budget.used(), crate::screen_budget::Usage::default());
     }
 
@@ -3656,30 +3833,35 @@ pub(crate) mod tests {
         // for the removal the second assertion below is about and prove
         // nothing about it. (Checked: with it dropped, deleting that removal
         // left this test green.)
-        let (id, next, _helper) = stub.join().expect("join");
+        let (id, next, helper) = stub.join().expect("join");
         assert_eq!(
             next,
             Some(Request::Close { id }),
             "an open the worker gave up on must be closed, or its process outlives every handle \
              to it"
         );
-        assert!(
-            spawner.waiting.lock().expect("not poisoned").is_empty(),
-            "an abandoned channel must leave no entry behind: nothing will ever read its \
-             receivers again"
+        assert_eq!(
+            spawner.waiting.lock().unwrap().len(),
+            1,
+            "abandonment retains the proof route"
         );
+        channel::send(
+            &helper,
+            &encode(&Response::CleanupComplete {
+                id,
+                kind: CleanupKind::Reaped,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        wait_for("abandoned receipt retires its ticket", &|| {
+            spawner.waiting.lock().unwrap().is_empty()
+        });
     }
 
-    /// A channel the helper refuses leaves no entry in `waiting` behind. The
-    /// neighbouring leak on the encode-failure path is pinned (see
-    /// `an_over_long_command_is_refused_without_leaking_its_bookkeeping`),
-    /// but this ORDINARY completion path was not, and deleting its
-    /// `map.remove` kept the suite green -- one `Pending`, holding two
-    /// senders, for every open that ever fails.
-    ///
-    /// The stub's end of the pair is handed back rather than dropped: the
-    /// reader thread clears the whole map when its peer goes away, which
-    /// would stand in for the removal under test and prove nothing.
+    /// A refused outcome retains its receipt route. NoChild retires that exact
+    /// ticket while the socket remains open, so EOF cannot fake the removal.
     #[test]
     fn a_failed_open_leaves_no_bookkeeping_behind() {
         let (worker, helper) = super::channel::pair().expect("socketpair");
@@ -3696,7 +3878,7 @@ pub(crate) mod tests {
                 reason: "this stub opens nothing".to_string(),
             };
             channel::send(&helper, &encode(&refusal).expect("encode"), None).expect("reply");
-            helper
+            (helper, id)
         });
 
         let spawner = Arc::new(HelperChannelSpawner::new(worker).expect("spawner"));
@@ -3707,18 +3889,33 @@ pub(crate) mod tests {
         assert!(result.is_err(), "the stub refuses every channel");
 
         // Held open for the assertion below -- see this test's doc comment.
-        let _helper = stub.join().expect("join");
+        let (helper, id) = stub.join().expect("join");
+        assert_eq!(
+            spawner.waiting.lock().unwrap().len(),
+            1,
+            "outcome alone cannot retire cleanup custody"
+        );
+        channel::send(
+            &helper,
+            &encode(&Response::CleanupComplete {
+                id,
+                kind: CleanupKind::NoChild,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        wait_for("receipt retires bookkeeping", &|| {
+            spawner.waiting.lock().unwrap().is_empty()
+        });
         assert!(
             spawner.waiting.lock().expect("not poisoned").is_empty(),
             "a channel the helper refused must leave no entry behind"
         );
     }
 
-    /// The twin of the test above for the other ordinary completion path: a
-    /// channel that has reported its exit must leave no entry behind either.
-    /// Every channel exits eventually, so a leak here grows without bound
-    /// over a long-running worker's life -- and deleting that `map.remove`
-    /// also kept the whole suite green.
+    /// Installed Exited delivery and terminal cleanup are separate: preserve
+    /// the real exit code, then retire bookkeeping only after exact Reaped.
     #[test]
     fn an_exited_channel_leaves_no_bookkeeping_behind() {
         let (worker, helper) = super::channel::pair().expect("socketpair");
@@ -3735,7 +3932,7 @@ pub(crate) mod tests {
             channel::send(&helper, &opened, Some(fake_master.as_fd())).expect("reply");
             let exited = encode(&Response::Exited { id, code: 7 }).expect("encode");
             channel::send(&helper, &exited, None).expect("report the exit");
-            helper
+            (helper, id)
         });
 
         let spawner = Arc::new(HelperChannelSpawner::new(worker).expect("spawner"));
@@ -3752,7 +3949,25 @@ pub(crate) mod tests {
 
         // Held open for the assertion below, for the reason the twin test
         // above spells out.
-        let _helper = stub.join().expect("join");
+        let (helper, id) = stub.join().expect("join");
+        assert_eq!(
+            spawner.waiting.lock().unwrap().len(),
+            1,
+            "outcome alone cannot retire cleanup custody"
+        );
+        channel::send(
+            &helper,
+            &encode(&Response::CleanupComplete {
+                id,
+                kind: CleanupKind::Reaped,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        wait_for("receipt retires bookkeeping", &|| {
+            spawner.waiting.lock().unwrap().is_empty()
+        });
         assert!(
             spawner.waiting.lock().expect("not poisoned").is_empty(),
             "a channel that has reported its exit must leave no entry behind"
@@ -3835,7 +4050,7 @@ pub(crate) mod tests {
     }
 
     /// A request that could not be sent gets no response, ever -- so `spawn`
-    /// removes the entry it inserted moments earlier rather than leaving it
+    /// retains the entry it inserted moments earlier rather than refunding it
     /// for a reader thread that has no way to know about an id which arrived
     /// after it gave up.
     ///
@@ -3847,7 +4062,7 @@ pub(crate) mod tests {
     /// refuses more (with `MSG_DONTWAIT`, for the reason its sibling tests
     /// spell out) and the peer is kept alive.
     #[test]
-    fn a_request_that_could_not_be_sent_leaves_no_bookkeeping_behind() {
+    fn a_request_send_failure_keeps_unknown_cleanup_charged() {
         let (worker, _never_read) = super::channel::pair().expect("socketpair");
         let filler = [0u8; 100];
         let mut queued = 0usize;
@@ -3879,9 +4094,15 @@ pub(crate) mod tests {
             err.contains("could not reach the helper"),
             "spawn must fail at its own send, got: {err}"
         );
-        assert!(
-            spawner.waiting.lock().expect("not poisoned").is_empty(),
-            "a request that never reached the helper must leave no entry behind"
+        assert_eq!(
+            spawner.waiting.lock().unwrap().len(),
+            1,
+            "a generic send failure is not a cleanup receipt"
+        );
+        assert_eq!(
+            spawner.open_registry().outstanding(),
+            1,
+            "unknown cleanup retains its charge"
         );
     }
 
@@ -6369,4 +6590,111 @@ pub(crate) mod tests {
              them, must each be logged; the log is:\n{log}"
         );
     }
+
+    #[test]
+    fn open24_failed_outcome_keeps_custody_until_no_child_receipt() {
+        use transport::channel_geometry::ChannelInstance;
+        use transport::channel_open::{CleanupStatus, OpenIdentity, OpenRequestSnapshot};
+        let budget = Arc::new(ScreenBudget::new(BudgetLimits::default()));
+        let (worker, helper) = channel::pair().unwrap();
+        helper.set_read_timeout(Some(TEST_RECV_TIMEOUT)).unwrap();
+        let spawner = HelperChannelSpawner::with_budget_hook(
+            worker,
+            budget.clone(),
+            || {},
+            Box::new(|_, _| {}),
+        )
+        .unwrap();
+        let registry = spawner.open_registry();
+        let session = registry.session().unwrap();
+        let mut request = shell_request();
+        request.cols = 2;
+        request.rows = 1;
+        request.screen = true;
+        let job = registry
+            .try_reserve(
+                &session,
+                OpenRequestSnapshot {
+                    owner: anyone(),
+                    login: any_login(),
+                    request: request.clone(),
+                    term: None,
+                    identity: OpenIdentity {
+                        session: session.id(),
+                        instance: ChannelInstance::new(1).unwrap(),
+                        stream: request.stream,
+                        generation: 1,
+                        invalidation_epoch: 0,
+                    },
+                },
+            )
+            .unwrap();
+        let helper = std::thread::scope(|scope| {
+            let stub = scope.spawn(move || {
+                let (bytes, _) = channel::recv(&helper).unwrap().unwrap();
+                let Request::Open { id, .. } = decode::<Request>(&bytes).unwrap() else {
+                    panic!("expected the actual Open request")
+                };
+                channel::send(
+                    &helper,
+                    &encode(&Response::Failed {
+                        id,
+                        reason: "fixture refused".into(),
+                    })
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+                (helper, id)
+            });
+            let outcome = ChannelSpawner::spawn(
+                &spawner,
+                &anyone(),
+                any_login(),
+                &request,
+                None,
+                job.custody(),
+            );
+            let helper = stub.join().unwrap();
+            assert!(outcome.is_err(), "the real Failed outcome must arrive");
+            drop(outcome);
+            helper
+        });
+        assert!(matches!(job.cleanup(), CleanupStatus::Unknown));
+        assert_eq!(registry.outstanding(), 1);
+        assert_eq!(session.occupied(), 1);
+        assert_eq!(budget.used().models, 1);
+        let (helper, id) = helper;
+        let (bytes, _) = channel::recv(&helper).unwrap().unwrap();
+        assert_eq!(decode::<Request>(&bytes).unwrap(), Request::Close { id });
+        channel::send(
+            &helper,
+            &serde_json::to_vec(&serde_json::json!({
+                "CleanupComplete": { "id": id, "kind": "NoChild" }
+            }))
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while registry.outstanding() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            registry.outstanding(),
+            0,
+            "the exact receipt must release its job"
+        );
+        assert_eq!(session.occupied(), 0);
+        assert_eq!(budget.used(), crate::screen_budget::Usage::default());
+    }
+    fn wait_for(what: &str, ready: &impl Fn() -> bool) {
+        let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        while !ready() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    include!("spawner_open_tests.rs");
+    include!("executor_open_tests.rs");
 }

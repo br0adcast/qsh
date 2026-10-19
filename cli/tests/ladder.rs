@@ -69,6 +69,45 @@ impl Screen {
     }
 }
 
+const RETURNED_SHELL_MARKER: &str = "PORTRETURNREADY";
+
+/// This poll runs only after the capture cursor was advanced at barrier release.
+/// A transport reconnect log or an old repaint cannot authorize the input.
+fn send_after_returned_shell(screen: &mut Screen, send: impl FnOnce()) -> bool {
+    let text = screen.text();
+    let Some(at) = text
+        .get(screen.from..)
+        .unwrap_or("")
+        .find(RETURNED_SHELL_MARKER)
+    else {
+        return false;
+    };
+    screen.from += at + RETURNED_SHELL_MARKER.len();
+    send();
+    true
+}
+
+#[test]
+fn recovery_input_waits_for_the_complete_fresh_shell_marker() {
+    let seen = Arc::new(Mutex::new(RETURNED_SHELL_MARKER.as_bytes().to_vec()));
+    let mut screen = Screen {
+        seen: seen.clone(),
+        from: 0,
+    };
+    // The same arming operation used immediately before releasing the FIFO.
+    screen.from = screen.text().len();
+    let mut sent = 0;
+    assert!(!send_after_returned_shell(&mut screen, || sent += 1));
+    seen.lock().unwrap().extend_from_slice(b"PORTRETURN");
+    assert!(!send_after_returned_shell(&mut screen, || sent += 1));
+    assert_eq!(sent, 0, "neither stale nor incomplete output permits input");
+    seen.lock().unwrap().extend_from_slice(b"READY");
+    assert!(send_after_returned_shell(&mut screen, || sent += 1));
+    assert_eq!(sent, 1);
+    assert!(!send_after_returned_shell(&mut screen, || sent += 1));
+    assert_eq!(sent, 1, "a consumed marker cannot authorize another send");
+}
+
 /// A fresh ed25519 key for `qsh -i`, in `dir`: its path and its public line.
 fn client_key(dir: &Path) -> (PathBuf, String) {
     let key = ssh_key::PrivateKey::random(
@@ -639,8 +678,31 @@ fn ssh_recovery_hands_a_new_port_to_udp_and_keeps_the_shell() {
     answer_yes(&mut client);
     assert!(screen.next("Authorize SSH recovery"), "{}", screen.text());
     answer_yes(&mut client);
+    // Keep the original shell at an external barrier. Opening a nonblocking
+    // reader first lets the writer open without waiting for the shell. Writer
+    // Drop gives EOF once the shell has opened the FIFO; the existing client
+    // and Sandbox process guards also cover cancellation before that open.
+    // This barrier introduces no helper process or background loop.
+    use std::os::unix::fs::OpenOptionsExt;
+    let fifo = home.path().join("shell-return");
+    let fifo_name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // The CString remains alive through the call and contains no interior NUL.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let _fifo_reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let mut fifo_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
     client.type_line("export PORT_MARK=kept");
-    client.type_line("echo PORT'READY'");
+    client.type_line(&format!(
+        "echo PORT'READY'; IFS= read -r _ < '{}'; echo PORT'RETURN'READY",
+        fifo.to_str().unwrap().replace('\'', "'\\''")
+    ));
     assert!(screen.next("PORTREADY"), "{}", screen.text());
     relay.cut();
     client.master.write_all(b"\x1dr").unwrap();
@@ -650,7 +712,17 @@ fn ssh_recovery_hands_a_new_port_to_udp_and_keeps_the_shell() {
         "SSH must hand its new port and authorization to UDP: {}",
         log_text()
     );
-    client.type_line("echo PORT$PORT_MARK");
+    // The log above confirms the connection, before Snapshot/Geometry makes
+    // the channel interactive. Only fresh output released from the original
+    // shell proves that the resumed channel can accept this input.
+    screen.from = screen.text().len();
+    fifo_writer.write_all(b"resume\n").unwrap();
+    assert!(
+        wait_until(|| send_after_returned_shell(&mut screen, || {
+            client.type_line("echo PORT$PORT_MARK")
+        })),
+        "the original shell did not cross its return barrier"
+    );
     assert!(
         screen.next("PORTkept"),
         "the original shell must return: {}",

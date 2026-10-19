@@ -50,6 +50,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
+use transport::channel_open::{ChannelOpenRegistry, OpenExecPermit, RestartOpenFence};
 
 use anyhow::Result;
 use nix::errno::Errno;
@@ -335,10 +336,14 @@ struct DrainCount {
     released: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestartCounterExhausted;
+
 /// The restart signal every session watches, with the count of who joined
 /// each attempt and who has confirmed its drain -- exact per attempt (see
 /// `transport::channel_server::RestartSignal`).
 pub(crate) struct Restarts {
+    publication: Mutex<()>,
     tx: watch::Sender<RestartSignal>,
     last: AtomicU64,
     count: Mutex<DrainCount>,
@@ -347,6 +352,7 @@ pub(crate) struct Restarts {
 impl Restarts {
     pub(crate) fn new() -> Restarts {
         Restarts {
+            publication: Mutex::new(()),
             tx: watch::channel(RestartSignal::IDLE).0,
             last: AtomicU64::new(0),
             count: Mutex::new(DrainCount::default()),
@@ -371,15 +377,27 @@ impl Restarts {
     }
 
     /// Begin a new attempt: a larger number than any before, announced.
-    pub(crate) fn announce(&self) -> u64 {
-        let restart = self.last.fetch_add(1, Ordering::SeqCst) + 1;
+    pub(crate) fn announce(&self) -> Result<u64, RestartCounterExhausted> {
+        let _publication = self
+            .publication
+            .lock()
+            .map_err(|_| RestartCounterExhausted)?;
+        let restart = self
+            .last
+            .load(Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or(RestartCounterExhausted)?;
+        self.last.store(restart, Ordering::SeqCst);
         *self.count() = DrainCount {
             restart,
             joined: 0,
             released: 0,
         };
-        self.tx.send_replace(RestartSignal::announced(restart));
-        restart
+        // The count lock is released before publishing: readers join under a
+        // watch guard followed by the count lock, never in reverse order.
+        self.tx
+            .send_replace(RestartSignal::announced(restart, restart));
+        Ok(restart)
     }
 
     /// A session asks to be counted in attempt `restart`. Decided while the
@@ -387,7 +405,7 @@ impl Restarts {
     /// and the count: every join counted happened before the drain began.
     pub(crate) fn join(&self, restart: u64) -> bool {
         let signal = self.tx.borrow();
-        if *signal != RestartSignal::announced(restart) {
+        if signal.restart != restart || signal.phase != RestartPhase::Announced {
             return false;
         }
         let mut count = self.count();
@@ -430,13 +448,24 @@ impl Restarts {
 
     /// Tell every session to end its channels. No join is counted after this.
     pub(crate) fn drain(&self, restart: u64) {
-        self.tx.send_replace(RestartSignal::draining(restart));
+        let Ok(_publication) = self.publication.lock() else {
+            return;
+        };
+        let current = *self.tx.borrow();
+        if current.restart == restart && current.phase == RestartPhase::Announced {
+            self.tx
+                .send_replace(RestartSignal::draining(restart, current.invalidation_epoch));
+        }
     }
 
     /// Wait, at most `timeout`, until every session counted in `restart` has
     /// confirmed. `false` if some had not by then.
+    #[cfg(test)]
     pub(crate) fn wait_drained(&self, restart: u64, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+        self.wait_drained_until(restart, Instant::now() + timeout)
+    }
+
+    fn wait_drained_until(&self, restart: u64, deadline: Instant) -> bool {
         loop {
             {
                 let count = self.count();
@@ -453,7 +482,11 @@ impl Restarts {
 
     /// The attempt is over, one way or the other.
     pub(crate) fn end(&self) {
-        self.tx.send_replace(RestartSignal::IDLE);
+        let Ok(_publication) = self.publication.lock() else {
+            return;
+        };
+        self.tx
+            .send_replace(RestartSignal::idle(self.last.load(Ordering::SeqCst)));
     }
 
     fn phase(&self) -> RestartPhase {
@@ -476,6 +509,7 @@ pub struct DaemonSelf {
     active: Arc<AtomicUsize>,
     in_progress: Arc<AtomicBool>,
     restarts: Arc<Restarts>,
+    opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
     exec: ExecFn,
 }
@@ -489,6 +523,7 @@ impl DaemonSelf {
     /// Sweeps away staged files an update that never finished left next to
     /// the binary -- all but the one this process may be running from.
     pub fn personal(
+        opens: Arc<ChannelOpenRegistry>,
         own: Option<OwnImage>,
         binary_path: PathBuf,
         own_uid: u32,
@@ -505,6 +540,7 @@ impl DaemonSelf {
             active,
             in_progress: Arc::new(AtomicBool::new(false)),
             restarts: Arc::new(Restarts::new()),
+            opens,
             handover: handover.map(Arc::new),
             exec: Arc::new(handover::exec_staged),
         }
@@ -512,7 +548,7 @@ impl DaemonSelf {
 
     /// A daemon a service manager or a package owns: it describes itself and
     /// answers every offer `Managed`.
-    pub fn managed(own: Option<OwnImage>) -> DaemonSelf {
+    pub fn managed(opens: Arc<ChannelOpenRegistry>, own: Option<OwnImage>) -> DaemonSelf {
         DaemonSelf {
             own: own_cell(own),
             managed: true,
@@ -521,6 +557,7 @@ impl DaemonSelf {
             active: Arc::new(AtomicUsize::new(0)),
             in_progress: Arc::new(AtomicBool::new(false)),
             restarts: Arc::new(Restarts::new()),
+            opens,
             handover: None,
             exec: Arc::new(handover::exec_staged),
         }
@@ -653,6 +690,7 @@ impl DaemonUpdates for DaemonSelf {
             active: Arc::clone(&self.active),
             in_progress: Arc::clone(&self.in_progress),
             restarts: Arc::clone(&self.restarts),
+            opens: self.opens.clone(),
             handover: self.handover.clone(),
             exec: Arc::clone(&self.exec),
         }))
@@ -689,6 +727,7 @@ struct StagedImage {
     active: Arc<AtomicUsize>,
     in_progress: Arc<AtomicBool>,
     restarts: Arc<Restarts>,
+    opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
     exec: ExecFn,
 }
@@ -822,14 +861,30 @@ impl UpdateTransfer for StagedImage {
         // Closed already by the last count in `verify`, and kept closed to
         // the exec: no new session from here on (see the module docs).
         base.admission.close();
-        let restart = self.restarts.announce();
-        // Whatever way this function is left short of a successful exec --
-        // a failure, a panic -- handshakes are admitted again and the
-        // attempt is over. (The slot is freed by `StagedImage`'s own drop,
-        // which runs after this guard's.)
-        let _undo = UndoRestart {
+        let fence = match self.opens.begin_restart_fence() {
+            Ok(fence) => fence,
+            Err(_) => {
+                return UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "channel opening could not be fenced".into(),
+                };
+            }
+        };
+        // Fence first: cancellation survives a dropped runner and precedes
+        // watch publication. Every failure unwinds Idle -> registry -> admission.
+        let undo = UndoRestart {
             admission: Arc::clone(&base.admission),
             restarts: Arc::clone(&self.restarts),
+            opens: Some(fence),
+        };
+        let restart = match self.restarts.announce() {
+            Ok(restart) => restart,
+            Err(_) => {
+                return UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "restart identity exhausted".into(),
+                };
+            }
         };
         // Only for the sessions to put `Restarting` on the wire: the
         // decision is made, and nobody is admitted meanwhile.
@@ -845,17 +900,27 @@ impl UpdateTransfer for StagedImage {
                 "not every session heard the restart in time; draining anyway",
             );
         }
+        let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         self.restarts.drain(restart);
-        if !self.restarts.wait_drained(restart, DRAIN_TIMEOUT) {
+        if !self.restarts.wait_drained_until(restart, drain_deadline) {
             crate::log::warn(
                 "update",
                 &format!(
-                    "not every session reaped its channels within {} s; \
-                 replacing the daemon anyway",
+                    "not every session reaped its installed channels within {} s",
                     DRAIN_TIMEOUT.as_secs()
                 ),
             );
         }
+        let Some(open_exec_permit) = undo
+            .opens
+            .as_ref()
+            .and_then(|fence| fence.wait_until(drain_deadline))
+        else {
+            return UpdateResult::Rejected {
+                code: RejectCode::ExecFailed,
+                detail: "pending channel creation has not proved cleanup".into(),
+            };
+        };
         // No `ADD-CLIENT` between the allowlist snapshot and the exec: the
         // gate is taken here, after the drain -- a key added during the
         // drain is in the snapshot, and `STATUS` is answered throughout it
@@ -873,7 +938,7 @@ impl UpdateTransfer for StagedImage {
                 detail: reason,
             };
         };
-        let reason = self.exec_with_handover(&base);
+        let reason = self.exec_with_handover(&base, &open_exec_permit);
         // Still here: the exec failed, and this daemon goes on as it was --
         // minus the channels it drained.
         crate::log::warn("update", &reason);
@@ -889,12 +954,16 @@ impl UpdateTransfer for StagedImage {
 struct UndoRestart {
     admission: Arc<AdmissionGate>,
     restarts: Arc<Restarts>,
+    opens: Option<RestartOpenFence>,
 }
 
 impl Drop for UndoRestart {
     fn drop(&mut self) {
-        self.admission.open();
         self.restarts.end();
+        if let Some(fence) = self.opens.take() {
+            fence.reopen();
+        }
+        self.admission.open();
     }
 }
 
@@ -937,7 +1006,7 @@ fn write_within(
 impl StagedImage {
     /// Hand everything over and exec the staged binary. Returns only if that
     /// failed, with the descriptors put back the way this process needs them.
-    fn exec_with_handover(&self, base: &HandoverBase) -> String {
+    fn exec_with_handover(&self, base: &HandoverBase, _opens: &OpenExecPermit<'_>) -> String {
         debug_assert_eq!(self.restarts.phase(), RestartPhase::Draining);
         let allowlist = match base.allowlist.lock() {
             Ok(keys) => keys.clone(),
@@ -1075,6 +1144,7 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 
 #[cfg(test)]
 mod tests {
+    include!("update_open_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
     use std::os::fd::AsRawFd;
@@ -1139,6 +1209,7 @@ mod tests {
     fn service(dir: &Path, active: usize) -> (DaemonSelf, Arc<AtomicUsize>) {
         let active = Arc::new(AtomicUsize::new(active));
         let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
             Some(own_image()),
             dir.join("qshd"),
             uid(),
@@ -1168,11 +1239,20 @@ mod tests {
     /// A restartable daemon over this test's own sockets whose exec is
     /// `exec`, with an image already accepted, written and verified.
     fn verified_transfer(dir: &Path, exec: ExecFn) -> Restartable {
+        verified_transfer_with_registry(dir, exec, ChannelOpenRegistry::new(Default::default()))
+    }
+
+    fn verified_transfer_with_registry(
+        dir: &Path,
+        exec: ExecFn,
+        opens: Arc<ChannelOpenRegistry>,
+    ) -> Restartable {
         let (base, udp, control) = handover_base(dir);
         let admission = Arc::clone(&base.admission);
         let control_gate = Arc::clone(&base.control_gate);
         let daemon = Arc::new(
             DaemonSelf::personal(
+                opens,
                 Some(own_image()),
                 dir.join("qshd"),
                 uid(),
@@ -1464,9 +1544,12 @@ mod tests {
             })
         );
         assert_eq!(
-            DaemonSelf::managed(Some(own_image()))
-                .about()
-                .map(|a| a.mode),
+            DaemonSelf::managed(
+                ChannelOpenRegistry::new(Default::default()),
+                Some(own_image())
+            )
+            .about()
+            .map(|a| a.mode),
             Some(DaemonMode::Managed)
         );
     }
@@ -1475,7 +1558,7 @@ mod tests {
     /// works it out on the first `About`, from its own binary.
     #[test]
     fn the_own_image_is_worked_out_on_the_first_question() {
-        let daemon = DaemonSelf::managed(None);
+        let daemon = DaemonSelf::managed(ChannelOpenRegistry::new(Default::default()), None);
         let about = daemon.about().expect("this test binary can be hashed");
         assert_eq!(about.build, state::build_label());
         assert_eq!(about.arch, ARCH);
@@ -1486,7 +1569,11 @@ mod tests {
     fn a_managed_daemon_takes_no_offer() {
         let image = script_image(101, 0);
         assert!(matches!(
-            DaemonSelf::managed(Some(own_image())).offer(&me(), &offer_for(&image, 101)),
+            DaemonSelf::managed(
+                ChannelOpenRegistry::new(Default::default()),
+                Some(own_image())
+            )
+            .offer(&me(), &offer_for(&image, 101)),
             Err(UpdateAnswer::Managed)
         ));
     }
@@ -1621,6 +1708,7 @@ mod tests {
         let admission = Arc::clone(&base.admission);
         let nonces = GatedNonces::new(Arc::new(transport::RandomNonces), Arc::clone(&admission));
         let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
             Some(own_image()),
             dir.path().join("qshd"),
             uid(),
@@ -1654,6 +1742,7 @@ mod tests {
         let admission = Arc::clone(&base.admission);
         let active = Arc::new(AtomicUsize::new(1));
         let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
             Some(own_image()),
             dir.path().join("qshd"),
             uid(),
@@ -1816,6 +1905,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (base, udp, control) = handover_base(dir.path());
         let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
             Some(own_image()),
             dir.path().join("qshd"),
             uid(),
@@ -1888,6 +1978,7 @@ mod tests {
             })
         };
         let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
             Some(own_image()),
             dir.path().join("qshd"),
             uid(),
@@ -1974,13 +2065,13 @@ mod tests {
     #[test]
     fn restarts_are_numbered_upwards() {
         let restarts = Restarts::new();
-        let first = restarts.announce();
+        let first = restarts.announce().unwrap();
         restarts.end();
-        let second = restarts.announce();
+        let second = restarts.announce().unwrap();
         assert!(second > first && first > 0);
         assert_eq!(
             *restarts.subscribe().borrow(),
-            RestartSignal::announced(second)
+            RestartSignal::announced(second, second)
         );
     }
 
@@ -1989,7 +2080,7 @@ mod tests {
     #[test]
     fn a_session_that_joined_just_before_the_drain_is_waited_for() {
         let restarts = Arc::new(Restarts::new());
-        let n = restarts.announce();
+        let n = restarts.announce().unwrap();
         assert!(restarts.join(n), "announced: counted");
         restarts.drain(n);
         let late = {
@@ -2014,7 +2105,7 @@ mod tests {
     #[test]
     fn a_late_subscriber_is_neither_counted_nor_waited_for() {
         let restarts = Restarts::new();
-        let n = restarts.announce();
+        let n = restarts.announce().unwrap();
         assert!(restarts.join(n));
         restarts.drain(n);
         assert!(!restarts.join(n), "draining: not counted");
@@ -2030,10 +2121,10 @@ mod tests {
     #[test]
     fn a_confirmation_of_an_older_restart_is_ignored() {
         let restarts = Restarts::new();
-        let old = restarts.announce();
+        let old = restarts.announce().unwrap();
         assert!(restarts.join(old));
         restarts.end();
-        let n = restarts.announce();
+        let n = restarts.announce().unwrap();
         assert!(restarts.join(n));
         restarts.drain(n);
         restarts.release(old);
@@ -2047,7 +2138,7 @@ mod tests {
     fn the_daemon_counts_joins_and_releases_per_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (daemon, _) = service(dir.path(), 1);
-        let n = daemon.restarts.announce();
+        let n = daemon.restarts.announce().unwrap();
         assert!(daemon.restart_joined(n));
         assert!(!daemon.restart_joined(n + 1), "not the attempt under way");
         daemon.restarts.drain(n);
@@ -2379,7 +2470,7 @@ exit 0
     /// asked twice, it works its image out once.
     #[test]
     fn the_own_image_is_worked_out_once() {
-        let daemon = DaemonSelf::managed(None);
+        let daemon = DaemonSelf::managed(ChannelOpenRegistry::new(Default::default()), None);
         assert!(daemon.own.get().is_none(), "nothing hashed at construction");
         let first = daemon.about();
         assert!(daemon.own.get().is_some());

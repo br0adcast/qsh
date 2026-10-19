@@ -633,7 +633,8 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
 /// manager started it, from a path a package or an administrator owns. Its
 /// own checksum is worked out on the first `About`, not here.
 fn managed(backend: ChannelSessionBackend) -> ChannelSessionBackend {
-    backend.with_daemon(Arc::new(crate::update::DaemonSelf::managed(None)))
+    let opens = backend.open_registry();
+    backend.with_daemon(Arc::new(crate::update::DaemonSelf::managed(opens, None)))
 }
 
 /// The system mode's authentication setup, built inside the worker after

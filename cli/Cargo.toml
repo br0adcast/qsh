@@ -43,6 +43,7 @@ transport = { path = "../crates/transport" }
 unicode-width = "0.2.2"
 
 [dev-dependencies]
+transport = { path = "../crates/transport", features = ["testnet"] }
 tempfile = "3"
 # Only for building keys in tests (an encrypted key, a generated identity);
 # never used by the crate's real dependency graph. Pinned exactly, matching

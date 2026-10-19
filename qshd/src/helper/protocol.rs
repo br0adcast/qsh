@@ -17,7 +17,7 @@
 //! Two seams carry these messages, each its own socket pair (see
 //! `helper::split_and_run`):
 //! - the CHANNEL seam carries bare [`Request::Open`]/[`Request::Close`] and
-//!   their answers, plus the `Exited` notices the helper sends unprompted;
+//!   their outcomes, installed `Exited` notices, and independent cleanup receipts;
 //! - the AUTHENTICATION seam carries [`Request::Nonce`],
 //!   [`Request::ReleaseNonce`] and [`Request::Verify`], each wrapped in an
 //!   [`AuthRequest`] and answered in an [`AuthResponse`] carrying the same
@@ -42,7 +42,8 @@ use transport::{LoginId, AUTH_NONCE_LEN};
 pub const MAX_MESSAGE_LEN: usize = 8 * 1024;
 
 /// Identifies one channel for the life of the connection between the two
-/// processes. Chosen by the worker, echoed by the helper.
+/// processes. Chosen by the worker in strictly increasing send order, never
+/// reused or wrapped, and echoed by the helper.
 pub type ChannelId = u64;
 
 /// Numbers one request on the authentication seam. Chosen by the worker,
@@ -202,6 +203,8 @@ pub enum Request {
 /// the next message answers its last request.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
+    /// Exact terminal cleanup fact, independent of Open/Exit outcomes.
+    CleanupComplete { id: ChannelId, kind: CleanupKind },
     /// The channel is open: the account's SHELL has exec'd, which is the
     /// moment the child's close-on-exec startup-report pipe reaches
     /// end-of-file (see `helper::server::read_startup_report`). It does NOT
@@ -335,16 +338,26 @@ pub enum MonitorRequest {
     Close { id: ChannelId },
 }
 
+/// Trusted internal cleanup provenance; errors and disconnection are neither.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CleanupKind {
+    NoChild,
+    Reaped,
+}
+
 /// What a monitor tells the helper about the shells it was asked to fork.
 ///
 /// Each names the channel it is about, because one monitor serves every
 /// channel of its login and the helper must never take one channel's news
 /// for another's. Exactly one of `Started`/`Failed` is sent per `Open`, and
 /// an `Exited` only ever follows a `Started`: a channel whose start failed
-/// has already been answered, and a second answer for one channel id would
-/// be one more than the worker's protocol allows.
+/// has already been answered. CleanupComplete is a separate terminal fact:
+/// only successful exact-child waitpid proves Reaped; audited pre-fork
+/// failures prove NoChild. Neither an outcome nor disconnection proves either.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MonitorEvent {
+    /// No shell was created, or this monitor reaped its exact shell PID.
+    CleanupComplete { id: ChannelId, kind: CleanupKind },
     /// The shell exec'd -- the same moment, and the same evidence (the
     /// startup-report pipe at end-of-file), that [`Response::Opened`]
     /// stands for.
@@ -532,6 +545,14 @@ mod tests {
     fn a_response_round_trips() {
         for msg in [
             Response::Opened { id: 1 },
+            Response::CleanupComplete {
+                id: 1,
+                kind: CleanupKind::NoChild,
+            },
+            Response::CleanupComplete {
+                id: 2,
+                kind: CleanupKind::Reaped,
+            },
             Response::Failed {
                 id: 2,
                 reason: "no such file".to_string(),
@@ -580,6 +601,14 @@ mod tests {
         }
         for event in [
             MonitorEvent::Started { id: 4 },
+            MonitorEvent::CleanupComplete {
+                id: 4,
+                kind: CleanupKind::NoChild,
+            },
+            MonitorEvent::CleanupComplete {
+                id: 5,
+                kind: CleanupKind::Reaped,
+            },
             MonitorEvent::Failed {
                 id: 4,
                 errno: nix::libc::ENOENT,

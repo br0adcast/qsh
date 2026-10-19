@@ -22,8 +22,11 @@ use portable_pty::{Child, CommandBuilder, PtySize};
 
 use transport::auth::Principal;
 use transport::channel::{ChannelKind, OpenRequest};
+use transport::channel_open::{ChannelOpenRegistry, OpenCustody, SpawnFailure, UninstalledChannel};
+#[cfg(test)]
+use transport::channel_server::SpawnedChannel;
 use transport::channel_server::{
-    run_channel_session_with, ChannelSpawner, ChannelWait, DaemonUpdates, SpawnedChannel,
+    run_channel_session_with, ChannelSpawner, ChannelWait, DaemonUpdates,
 };
 use transport::conn::Consumption;
 use transport::session_manager::{LoginId, SessionBackend, SessionIo};
@@ -35,16 +38,23 @@ use terminal_size::TerminalSize;
 
 /// Opens a channel by spawning a pseudo-terminal through `portable-pty`.
 pub struct PtyChannelSpawner {
+    opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
 }
 
 impl PtyChannelSpawner {
     pub fn new(budget: Arc<ScreenBudget>) -> Self {
-        Self { budget }
+        Self {
+            budget,
+            opens: ChannelOpenRegistry::new(Default::default()),
+        }
     }
 }
 
 impl ChannelSpawner for PtyChannelSpawner {
+    fn open_registry(&self) -> Arc<ChannelOpenRegistry> {
+        self.opens.clone()
+    }
     /// Owner uid keys the shared screen budget, including aliases.
     ///
     /// `_login` is ignored: the personal mode has exactly one login, for
@@ -58,12 +68,17 @@ impl ChannelSpawner for PtyChannelSpawner {
         _login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
-    ) -> Result<SpawnedChannel, String> {
+        custody: &OpenCustody,
+    ) -> Result<UninstalledChannel, SpawnFailure> {
         if req.cols == 0 || req.rows == 0 {
-            return Err("a channel without a terminal is not supported yet".to_string());
+            return Err(custody.refuse_before_creation(
+                "a channel without a terminal is not supported yet".to_string(),
+            ));
         }
-        TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
-        let screen = make_screen(req, owner, Arc::clone(&self.budget))?;
+        TerminalSize::new(req.cols, req.rows)
+            .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))
+            .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
             rows: req.rows,
             cols: req.cols,
@@ -84,26 +99,90 @@ impl ChannelSpawner for PtyChannelSpawner {
             // own writes echoed back. `spawn_command_no_echo` is the whole
             // channel, hard-coded rather than decided per request -- there
             // is no way here yet for a command channel to ask for echo ON.
-            ChannelKind::Command => {
-                pty::spawn_command_no_echo(size, command_builder(&req.command)?, term)
-            }
+            ChannelKind::Command => pty::spawn_command_no_echo(
+                size,
+                command_builder(&req.command).map_err(|e| custody.refuse_before_creation(e))?,
+                term,
+            ),
         }
-        .map_err(|e| format!("could not open channel: {e:#}"))?;
+        .map_err(|e| custody.refuse_before_creation(format!("could not open channel: {e:#}")))?;
         drop(permit);
+        finish_personal_spawn(master, child, screen, custody)
+    }
+}
 
-        let reader = master
-            .try_clone_reader()
-            .map_err(|e| format!("reading from the channel is unavailable: {e:#}"))?;
-        let writer = master
-            .take_writer()
-            .map_err(|e| format!("writing to the channel is unavailable: {e:#}"))?;
-        Ok(SpawnedChannel {
-            reader,
-            writer,
-            resize: Box::new(pty::PtyResizeHandle::new(master)),
-            screen,
-            wait: Box::new(ChildWait(child)),
-        })
+/// Assemble the spawned PTY at the descriptor-preparation boundary.
+fn finish_personal_spawn(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    screen: Box<dyn SessionScreen>,
+    custody: &OpenCustody,
+) -> Result<UninstalledChannel, SpawnFailure> {
+    let construction = custody.protect(Box::new(ChildWait(child)), screen);
+    let reader = master
+        .try_clone_reader()
+        .map_err(|e| custody.failure(format!("reading from the channel is unavailable: {e:#}")))?;
+    let writer = master
+        .take_writer()
+        .map_err(|e| custody.failure(format!("writing to the channel is unavailable: {e:#}")))?;
+    Ok(construction.finish(reader, writer, Box::new(pty::PtyResizeHandle::new(master))))
+}
+
+#[cfg(test)]
+impl PtyChannelSpawner {
+    fn spawn(
+        &self,
+        owner: &Principal,
+        login: LoginId,
+        req: &OpenRequest,
+        term: Option<&str>,
+    ) -> Result<SpawnedChannel, String> {
+        fixture_spawn(self, owner, login, req, term)
+    }
+}
+
+/// Existing backend fixtures inspect raw descriptors. Their spawner keeps the
+/// registration alive on Unknown; this adapter does not infer cleanup from Err.
+#[cfg(test)]
+pub(crate) fn fixture_spawn(
+    spawner: &dyn ChannelSpawner,
+    owner: &Principal,
+    login: LoginId,
+    req: &OpenRequest,
+    term: Option<&str>,
+) -> Result<SpawnedChannel, String> {
+    use transport::channel_open::{OpenIdentity, OpenRequestSnapshot};
+    let registry = spawner.open_registry();
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(
+            &session,
+            OpenRequestSnapshot {
+                owner: owner.clone(),
+                login,
+                request: req.clone(),
+                term: term.map(str::to_owned),
+                identity: OpenIdentity {
+                    session: session.id(),
+                    instance: transport::channel_geometry::ChannelInstance::new(1).unwrap(),
+                    stream: req.stream,
+                    generation: 0,
+                    invalidation_epoch: 0,
+                },
+            },
+        )
+        .map_err(|_| "fixture open admission refused".to_string())?;
+    match ChannelSpawner::spawn(spawner, owner, login, req, term, job.custody()) {
+        Ok(channel) => {
+            let (channel, _slot) = job
+                .adopt(channel)
+                .map_err(|_| "fixture adoption refused".to_string())?;
+            Ok(channel)
+        }
+        Err(failure) => {
+            job.cleanup();
+            Err(failure.reason)
+        }
     }
 }
 
@@ -172,6 +251,17 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
 impl ChannelWait for ChildWait {
+    fn cleanup_uninstalled(
+        &mut self,
+        authority: &transport::channel_open::CleanupAuthority<'_>,
+    ) -> transport::channel_open::CleanupStatus {
+        // A successful kill request alone does not establish termination.
+        let _ = self.0.kill();
+        match self.0.wait() {
+            Ok(_) => authority.reaped(),
+            Err(_) => transport::channel_open::CleanupStatus::Unknown,
+        }
+    }
     fn kill(&mut self) {
         // Best-effort: a process that has already exited on its own has
         // nothing left to kill, and that is not a reason to panic -- the
@@ -236,6 +326,11 @@ impl ChannelSessionBackend {
         }
     }
 
+    /// The factory owner survives every warm/cold session runner replacement.
+    pub fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+        self.spawner.open_registry()
+    }
+
     /// Every session this backend runs speaks for `daemon`.
     pub fn with_daemon(mut self, daemon: Arc<dyn DaemonUpdates>) -> ChannelSessionBackend {
         self.daemon = Some(daemon);
@@ -277,6 +372,7 @@ impl SessionBackend for ChannelSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    include!("channel_backend_open_tests.rs");
     use super::*;
     fn budget() -> Arc<ScreenBudget> {
         Arc::new(ScreenBudget::new(

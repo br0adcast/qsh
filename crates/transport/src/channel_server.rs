@@ -21,6 +21,13 @@
 //! send from the async loop must never block it (see that module's docs for
 //! the full argument).
 //!
+//! **Opening stays off the loop.** The factory registry admits finite work
+//! before the blocking executor calls a spawner. Pending jobs count against the
+//! session slot cap and keep their child/model custody through cancellation.
+//! Only exact cleanup proof refunds unresolved work; a late Ready result cannot
+//! cross reset, stream reuse or restart. Adoption installs inert ownership under
+//! the epoch/registry guards before backend callbacks and bridge scheduling.
+//!
 //! **A refusal is an answer, not a session failure.** Past the channel cap,
 //! on a re-used stream number, or when [`ChannelSpawner::spawn`] itself
 //! fails, the client gets `ServerRecord::Refused` and the session keeps
@@ -160,6 +167,13 @@ pub trait ChannelWait: Send {
 
     /// Block until the process has exited and return its exit code.
     fn wait(self: Box<Self>) -> i32;
+
+    /// Cleanup of a never-installed result. A status code, timeout or kill
+    /// request is not proof; return Unknown unless the exact child was reaped.
+    fn cleanup_uninstalled(
+        &mut self,
+        authority: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus;
 }
 
 /// Everything one opened channel gives the runner. Assembled by the caller
@@ -175,10 +189,13 @@ pub struct SpawnedChannel {
     pub wait: Box<dyn ChannelWait>,
 }
 
-/// Turns a client's request into a running channel. The `Err` string is
+/// Constructs a channel on its already-admitted blocking worker. The typed
+/// failure preserves any unresolved child/model custody. Its reason string is
 /// shown to the user, so it is written in the language the daemon's other
 /// messages use.
 pub trait ChannelSpawner: Send + Sync + 'static {
+    /// Factory-owned registry; every runner and replacement uses this same owner.
+    fn open_registry(&self) -> Arc<crate::channel_open::ChannelOpenRegistry>;
     /// `owner` is whose session asks for the channel -- the session's own
     /// [`SessionIo::principal`], exactly as authentication established it.
     /// A spawner that serves several accounts opens the channel for this
@@ -204,7 +221,8 @@ pub trait ChannelSpawner: Send + Sync + 'static {
         login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
-    ) -> Result<SpawnedChannel, String>;
+        custody: &crate::channel_open::OpenCustody,
+    ) -> Result<crate::channel_open::UninstalledChannel, crate::channel_open::SpawnFailure>;
 }
 
 /// How long an accepted transfer may go without a byte before it is given
@@ -250,6 +268,8 @@ pub enum RestartPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestartSignal {
     pub restart: u64,
+    /// Persistent invalidation survives returning to Idle.
+    pub invalidation_epoch: u64,
     pub phase: RestartPhase,
 }
 
@@ -257,21 +277,32 @@ impl RestartSignal {
     /// No restart under way.
     pub const IDLE: RestartSignal = RestartSignal {
         restart: 0,
+        invalidation_epoch: 0,
         phase: RestartPhase::Idle,
     };
 
-    /// Attempt `restart` is announced.
-    pub const fn announced(restart: u64) -> RestartSignal {
+    pub const fn idle(invalidation_epoch: u64) -> RestartSignal {
+        RestartSignal {
+            restart: 0,
+            invalidation_epoch,
+            phase: RestartPhase::Idle,
+        }
+    }
+
+    /// Attempt `restart` is announced with its persistent invalidation epoch.
+    pub const fn announced(restart: u64, invalidation_epoch: u64) -> RestartSignal {
         RestartSignal {
             restart,
+            invalidation_epoch,
             phase: RestartPhase::Announced,
         }
     }
 
     /// Attempt `restart` is draining.
-    pub const fn draining(restart: u64) -> RestartSignal {
+    pub const fn draining(restart: u64, invalidation_epoch: u64) -> RestartSignal {
         RestartSignal {
             restart,
+            invalidation_epoch,
             phase: RestartPhase::Draining,
         }
     }
@@ -540,6 +571,15 @@ impl SessionUpdate {
             .map_or(RestartSignal::IDLE, |rx| *rx.borrow())
     }
 
+    fn idle_epoch_guard(
+        &self,
+    ) -> Result<crate::channel_open::IdleEpochGuard<'_>, crate::channel_open::OpenRefusal> {
+        match &self.restart_rx {
+            Some(rx) => crate::channel_open::IdleEpochGuard::from_signal(rx.borrow()),
+            None => Ok(crate::channel_open::IdleEpochGuard::initial()),
+        }
+    }
+
     /// A restart is under way: no channel may be opened.
     fn restarting(&self) -> bool {
         self.current_signal().phase != RestartPhase::Idle
@@ -706,8 +746,11 @@ async fn join_update(task: &mut Option<tokio::task::JoinHandle<UpdateTaskEnd>>) 
 /// End every channel still open and wait for its process -- the same reap
 /// the session's own end does (see the module docs), shared with a drain
 /// before the daemon replaces itself.
-async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
-    let mut reaps = Vec::new();
+fn begin_reap_all(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    reaps: &mut tokio::task::JoinSet<i32>,
+) {
     for (stream, ch) in channels.drain() {
         io.channel_closed(
             stream,
@@ -719,13 +762,10 @@ async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
             input_tx, mut wait, ..
         } = ch;
         drop(input_tx);
-        reaps.push(tokio::task::spawn_blocking(move || {
+        reaps.spawn_blocking(move || {
             wait.kill();
             wait.wait()
-        }));
-    }
-    for reap in reaps {
-        let _ = reap.await;
+        });
     }
 }
 
@@ -775,6 +815,7 @@ impl Drop for PendingExit {
 
 /// One open channel, as the runner keeps track of it.
 struct Channel {
+    _open_slot: Option<crate::channel_open::InstalledSlot>,
     producer: ProducerState,
     /// Sends keystrokes to this channel's process. Unbounded: a synchronous
     /// send from the loop must never block it (see `shell_server`'s module
@@ -809,11 +850,50 @@ struct Channel {
     wait: Box<dyn ChannelWait>,
 }
 
-/// The runner's ordered attachment scope and one coalescing capacity signal.
+/// The runner's ordered attachment, admitted-open ledger and capacity signal.
 #[derive(Default)]
 struct ProducerContext {
     attachment: AttachmentContext,
     ready: Arc<tokio::sync::Notify>,
+    opens: OpenScope,
+}
+struct OpenScope {
+    registry: Arc<crate::channel_open::ChannelOpenRegistry>,
+    session: Option<Arc<crate::channel_open::SessionOpenLedger>>,
+}
+impl OpenScope {
+    fn new(registry: Arc<crate::channel_open::ChannelOpenRegistry>) -> Self {
+        let allocation = registry.session();
+        Self::from_allocation(registry, allocation)
+    }
+    fn from_allocation(
+        registry: Arc<crate::channel_open::ChannelOpenRegistry>,
+        allocation: Result<
+            Arc<crate::channel_open::SessionOpenLedger>,
+            crate::channel_open::OpenRefusal,
+        >,
+    ) -> Self {
+        let session = allocation.ok();
+        Self { registry, session }
+    }
+    fn occupied(&self) -> usize {
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.occupied())
+    }
+    async fn notified(&self) {
+        match &self.session {
+            Some(session) => session.notified().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+impl Default for OpenScope {
+    fn default() -> Self {
+        Self::new(crate::channel_open::ChannelOpenRegistry::new(
+            Default::default(),
+        ))
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResizeIntent {
@@ -1091,6 +1171,8 @@ enum Wakeup {
     /// The short echo_ack flush timer, as in `serve_shell`.
     AckTick,
     OutputReady,
+    OpenReady,
+    Reaped,
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
@@ -1232,13 +1314,22 @@ pub async fn run_channel_session_with(
     daemon: Option<Arc<dyn DaemonUpdates>>,
 ) {
     let mut channels: HashMap<u8, Channel> = HashMap::new();
+    let mut opening = HashMap::new();
+    let mut reaps = tokio::task::JoinSet::new();
+    let mut draining = None;
+    let executor =
+        crate::channel_open::ChannelOpenExecutor::new(spawner.clone(), spawner.open_registry());
     // Channels that ended, by stream, with their exit code: each `Exit`
     // waits for its channel's output to be delivered (see the module docs).
     let mut exits: HashMap<u8, PendingExit> = HashMap::new();
     // Numbers every channel opened, so a delivery answer names the channel
     // it was asked for (see `PendingExit`).
     let mut next_instance: u64 = 1;
-    let mut producer = ProducerContext::default();
+    let mut producer = ProducerContext {
+        opens: OpenScope::new(spawner.open_registry()),
+        attachment: AttachmentContext::default(),
+        ready: Arc::new(tokio::sync::Notify::new()),
+    };
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
     // A protocol failure stops further application input for this attachment.
@@ -1265,6 +1356,8 @@ pub async fn run_channel_session_with(
             c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
             _ = ack_tick.tick() => Wakeup::AckTick,
             _ = producer.ready.notified() => Wakeup::OutputReady,
+            _ = producer.opens.notified() => Wakeup::OpenReady,
+            _ = reaps.join_next(), if !reaps.is_empty() => Wakeup::Reaped,
             signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
             reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
             end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
@@ -1297,8 +1390,8 @@ pub async fn run_channel_session_with(
                             &mut channels,
                             &mut exits,
                             &mut next_instance,
-                            &spawner,
-                            &chan_out_tx,
+                            &executor,
+                            &mut opening,
                             raw,
                             &mut term,
                             &mut update,
@@ -1348,6 +1441,7 @@ pub async fn run_channel_session_with(
                     io.protocol_failure(context, None);
                     break;
                 }
+                opening.clear(); // Drop cancels; registry custody survives until proof.
                 producer.attachment = context;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
@@ -1429,6 +1523,7 @@ pub async fn run_channel_session_with(
                     }
                 }
             }
+            Wakeup::OpenReady | Wakeup::Reaped => {}
             Wakeup::OutputReady => {
                 for ch in channels.values_mut() {
                     let instance = ChannelInstance::new(ch.instance).unwrap();
@@ -1485,28 +1580,49 @@ pub async fn run_channel_session_with(
                     send_echo_ack_if_moved(&io, *stream, ch);
                 }
             }
-            Wakeup::Restart(signal) => match signal.phase {
-                RestartPhase::Idle => {}
-                RestartPhase::Announced => {
-                    update.announce(&io, signal.restart);
-                    update.join(signal.restart);
-                }
-                RestartPhase::Draining => {
-                    // A client about to lose its channels hears why first,
-                    // even if the announcement itself was coalesced away.
-                    update.announce(&io, signal.restart);
-                    // Reaped whether or not the daemon counted this session:
-                    // a process left running would become a child of the new
-                    // binary. Only a counted session confirms.
-                    if update.owes_reap(signal.restart) {
-                        reap_all(&io, &mut channels).await;
-                        update.confirm_released(signal.restart);
+            Wakeup::Restart(signal) => {
+                opening.retain(|_, job| {
+                    signal.phase == RestartPhase::Idle
+                        && job.request().identity.invalidation_epoch == signal.invalidation_epoch
+                });
+                match signal.phase {
+                    RestartPhase::Idle => {}
+                    RestartPhase::Announced => {
+                        opening.clear();
+                        update.announce(&io, signal.restart);
+                        update.join(signal.restart);
+                    }
+                    RestartPhase::Draining => {
+                        opening.clear();
+                        // A client about to lose its channels hears why first,
+                        // even if the announcement itself was coalesced away.
+                        update.announce(&io, signal.restart);
+                        // Reaped whether or not the daemon counted this session:
+                        // a process left running would become a child of the new
+                        // binary. Only a counted session confirms.
+                        if update.owes_reap(signal.restart) {
+                            begin_reap_all(&io, &mut channels, &mut reaps);
+                            draining = Some(signal.restart);
+                        }
                     }
                 }
-            },
+            }
             Wakeup::Reply(reply) => update.on_reply(&io, reply),
             Wakeup::Update(end) => update.on_task_end(&io, end),
         }
+        if reaps.is_empty() && producer.opens.occupied() == 0 {
+            if let Some(restart) = draining.take() {
+                update.confirm_released(restart);
+            }
+        }
+        complete_opens(
+            &io,
+            &mut channels,
+            &mut opening,
+            &chan_out_tx,
+            &update,
+            &producer,
+        );
         let finished: Vec<_> = channels
             .iter()
             .filter_map(|(&stream, ch)| {
@@ -1537,8 +1653,22 @@ pub async fn run_channel_session_with(
     // lifetime. Every gate is closed first, for good: a line channel's
     // reader waiting on its shut gate wakes and ends instead of waiting for
     // a bridge that is gone.
+    opening.clear();
     io.close_send_gates();
-    reap_all(&io, &mut channels).await;
+    begin_reap_all(&io, &mut channels, &mut reaps);
+    // The transport is gone, but exact cleanup receipts and blocking reaps
+    // still own this runner's drain obligation. Unknown never gets a timeout refund.
+    while !reaps.is_empty() || producer.opens.occupied() != 0 {
+        tokio::select! {
+            _ = reaps.join_next(), if !reaps.is_empty() => {}
+            _ = producer.opens.notified() => {}
+            signal = restart_signal_changed(&mut update.restart_rx) => {
+                if signal.phase == RestartPhase::Announced { update.join(signal.restart); }
+            }
+            reply = next_reply(&mut update.replies_rx) => update.on_reply(&io, reply),
+            end = join_update(&mut update.task), if update.task.is_some() => update.on_task_end(&io, end),
+        }
+    }
     // A session that ends while a restart is under way has, by now, ended
     // and reaped everything it had: that is its drain, and the daemon --
     // which may be counting on this session -- is told so rather than left
@@ -1632,8 +1762,8 @@ fn apply_control_record(
     channels: &mut HashMap<u8, Channel>,
     exits: &mut HashMap<u8, PendingExit>,
     next_instance: &mut u64,
-    spawner: &Arc<dyn ChannelSpawner>,
-    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
+    executor: &crate::channel_open::ChannelOpenExecutor,
+    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
     raw: RawRecord,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
@@ -1696,14 +1826,15 @@ fn apply_control_record(
                     return false;
                 };
                 *next_instance = next;
-                open_channel(
+                open_channel_async(
                     io,
                     channels,
-                    spawner,
-                    chan_out_tx,
+                    executor,
+                    opening,
                     req,
                     term.as_deref(),
                     instance,
+                    update,
                     context,
                 )
             }
@@ -1717,6 +1848,7 @@ fn apply_control_record(
         }
 
         Ok(ClientRecord::Close { stream }) => {
+            opening.remove(&stream);
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
             if let Some(pending) = exits.remove(&stream) {
@@ -1805,11 +1937,239 @@ fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), ResizeRefu
     Ok(())
 }
 
-/// Open one channel: refuse past the cap or on a re-used stream number,
-/// otherwise ask `spawner` to spawn it, wire up its bridge tasks, declare its
-/// recoverability to the connection, and answer `OPENED`/`REFUSED` on
-/// [`CONTROL_STREAM`].
-#[allow(clippy::too_many_arguments)] // Runner dependencies plus scoped producer identity.
+#[allow(clippy::too_many_arguments)]
+fn open_channel_async(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    executor: &crate::channel_open::ChannelOpenExecutor,
+    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
+    req: OpenRequest,
+    term: Option<&str>,
+    instance: u64,
+    update: &SessionUpdate,
+    context: &ProducerContext,
+) {
+    let stream = req.stream;
+    if opening.contains_key(&stream) {
+        refuse(
+            io,
+            stream,
+            "channel already opening".into(),
+            context.attachment,
+        );
+        return;
+    }
+    let prepared = match prepare_open(io, channels, req, term, instance, context) {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            refuse(io, stream, reason, context.attachment);
+            return;
+        }
+    };
+    let job = match admit_prepared_open(prepared, update, &context.opens.registry) {
+        Ok(job) => job,
+        Err(reason) => {
+            let reason = if reason == crate::channel_open::OpenRefusal::Restarting {
+                "the daemon is restarting"
+            } else {
+                "too many pending channels"
+            };
+            refuse(io, stream, reason.into(), context.attachment);
+            return;
+        }
+    };
+    // Capacity and identity are charged before scheduling any blocking work.
+    if executor.submit(&job).is_err() {
+        job.custody()
+            .refuse_before_creation("channel opening unavailable".into());
+        job.cleanup(); // No backend was scheduled; this is a proved no-child transition.
+        refuse(
+            io,
+            stream,
+            "channel opening unavailable".into(),
+            context.attachment,
+        );
+        return;
+    }
+    opening.insert(stream, job);
+}
+
+fn complete_opens(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
+    update: &SessionUpdate,
+    context: &ProducerContext,
+) {
+    // At most MAX_CHANNELS jobs can be active or unresolved in this session.
+    let completed: Vec<_> = opening
+        .iter()
+        .filter_map(|(&stream, job)| job.take_outcome().map(|outcome| (stream, outcome)))
+        .collect();
+    for (stream, outcome) in completed {
+        let Some(job) = opening.remove(&stream) else {
+            continue;
+        };
+        let request = job.request();
+        let identity = request.identity;
+        let req = request.request.clone();
+        if identity.generation != context.attachment.generation || channels.contains_key(&stream) {
+            continue;
+        }
+        match outcome {
+            crate::channel_open::OpenOutcome::Failed(reason) => {
+                let current = update
+                    .idle_epoch_guard()
+                    .is_ok_and(|epoch| identity.invalidation_epoch == epoch.epoch());
+                // The exact attachment/request was checked above. Publication
+                // follows this epoch check without awaiting another loop turn.
+                if current {
+                    refuse(io, stream, reason, context.attachment);
+                }
+            }
+            crate::channel_open::OpenOutcome::Ready(channel) => {
+                let Some(adopted) = job.try_adopt(channel) else {
+                    continue;
+                };
+                let Some(installation) =
+                    PreparedInstallation::new(channels, req, identity.instance, context)
+                else {
+                    let current = update
+                        .idle_epoch_guard()
+                        .is_ok_and(|epoch| identity.invalidation_epoch == epoch.epoch());
+                    if current {
+                        refuse(
+                            io,
+                            stream,
+                            "channel preparation unavailable".into(),
+                            context.attachment,
+                        );
+                    }
+                    continue;
+                };
+                let Ok(epoch) = update.idle_epoch_guard() else {
+                    continue;
+                };
+                let committed = adopted.commit(&epoch, &identity, installation);
+                // Installation is now owned by the session. Backend callbacks and
+                // bridge scheduling must not hold up restart publication.
+                drop(epoch);
+                if let Some(bridges) = committed {
+                    start_installed(io, channels, chan_out_tx, bridges, context);
+                }
+            }
+        }
+    }
+}
+
+/// Validation and owned request data are prepared before watching restart state.
+struct PreparedOpen {
+    session: Arc<crate::channel_open::SessionOpenLedger>,
+    request: crate::channel_open::OpenRequestSnapshot,
+}
+
+fn prepare_open(
+    io: &SessionIo,
+    channels: &HashMap<u8, Channel>,
+    req: OpenRequest,
+    term: Option<&str>,
+    instance: u64,
+    context: &ProducerContext,
+) -> Result<PreparedOpen, String> {
+    let stream = req.stream;
+    if channels.contains_key(&stream) {
+        return Err("channel already open".into());
+    }
+    if channels.len() >= MAX_CHANNELS {
+        return Err("too many channels".into());
+    }
+    // Either zero dimension preserves the generic no-PTY request exactly.
+    if req.cols != 0 && req.rows != 0 {
+        TerminalSize::new(req.cols, req.rows).map_err(|reason| reason.to_string())?;
+    }
+    let session = context
+        .opens
+        .session
+        .as_ref()
+        .ok_or_else(|| "channel opening identity exhausted".to_string())?
+        .clone();
+    let identity = crate::channel_open::OpenIdentity {
+        session: session.id(),
+        instance: ChannelInstance::new(instance).expect("nonzero instance"),
+        stream,
+        generation: context.attachment.generation,
+        // Filled from the guarded current state at actual admission.
+        invalidation_epoch: 0,
+    };
+    Ok(PreparedOpen {
+        session,
+        request: crate::channel_open::OpenRequestSnapshot {
+            // The session's authenticated principal/login are immutable.
+            owner: io.principal().clone(),
+            login: io.login(),
+            request: req,
+            term: term.map(str::to_owned),
+            identity,
+        },
+    })
+}
+
+fn admit_prepared_open(
+    prepared: PreparedOpen,
+    update: &SessionUpdate,
+    registry: &Arc<crate::channel_open::ChannelOpenRegistry>,
+) -> Result<crate::channel_open::OpenJob, crate::channel_open::OpenRefusal> {
+    let epoch = update.idle_epoch_guard()?;
+    let PreparedOpen {
+        session,
+        mut request,
+    } = prepared;
+    request.identity.invalidation_epoch = epoch.epoch();
+    // Guarded admission cannot cross Announced -> Idle rollback and reuse a
+    // stale epoch. No output, backend callback or scheduling occurs here.
+    let admitted = registry.try_reserve(&session, request);
+    drop(epoch);
+    admitted
+}
+
+/// Existing direct fixtures reserve at an explicitly chosen epoch. Production
+/// uses guarded admission above and publishes any refusal after it returns.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn reserve_open(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    req: OpenRequest,
+    term: Option<&str>,
+    instance: u64,
+    epoch: u64,
+    context: &ProducerContext,
+) -> Option<crate::channel_open::OpenJob> {
+    let stream = req.stream;
+    let result = prepare_open(io, channels, req, term, instance, context).and_then(|prepared| {
+        let PreparedOpen {
+            session,
+            mut request,
+        } = prepared;
+        request.identity.invalidation_epoch = epoch;
+        context
+            .opens
+            .registry
+            .try_reserve(&session, request)
+            .map_err(|_| "too many pending channels".into())
+    });
+    match result {
+        Ok(job) => Some(job),
+        Err(reason) => {
+            refuse(io, stream, reason, context.attachment);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn open_channel(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
@@ -1820,78 +2180,153 @@ fn open_channel(
     instance: u64,
     context: &ProducerContext,
 ) {
+    let Some(job) = reserve_open(io, channels, req.clone(), term, instance, 0, context) else {
+        return;
+    };
     let stream = req.stream;
-    if channels.contains_key(&stream) {
-        // The client picks stream numbers, and only the client opens
-        // channels, so this should never happen in practice -- refuse
-        // rather than silently replace a channel that is still running.
-        // Checked BEFORE the cap: a session at the limit that gets a
-        // re-used number deserves the precise reason, not "too many
-        // channels".
-        refuse(
-            io,
-            stream,
-            "channel already open".to_string(),
-            context.attachment,
-        );
-        return;
-    }
-    if channels.len() >= MAX_CHANNELS {
-        refuse(
-            io,
-            stream,
-            "too many channels".to_string(),
-            context.attachment,
-        );
-        return;
-    }
-
-    // Either zero dimension preserves the generic no-PTY request exactly.
-    if req.cols != 0 && req.rows != 0 {
-        if let Err(reason) = TerminalSize::new(req.cols, req.rows) {
-            refuse(io, stream, reason.to_string(), context.attachment);
-            return;
-        }
-    }
-
-    // The session's own principal and login, never a placeholder: a spawner
-    // serving several accounts (the system mode's, which asks a privileged
-    // helper) opens the channel for exactly this account, and its login is
-    // the token a PAM session has to be keyed by (see `SessionIo::login`).
-    let spawned = match spawner.spawn(io.principal(), io.login(), &req, term) {
+    let uninstalled = match spawner.spawn(io.principal(), io.login(), &req, term, job.custody()) {
         Ok(spawned) => spawned,
-        Err(reason) => {
-            refuse(io, stream, reason, context.attachment);
+        Err(failure) => {
+            // Synchronous prerequisite. Task 7 moves this work onto its admitted worker.
+            job.cleanup();
+            refuse(io, stream, failure.reason, context.attachment);
             return;
         }
     };
-    let SpawnedChannel {
+    let job_id = job.id();
+    let (spawned, open_slot) = match job.adopt(uninstalled) {
+        Ok(adopted) => adopted,
+        Err(result) => {
+            drop(result);
+            context.opens.registry.cleanup(job_id);
+            refuse(
+                io,
+                stream,
+                "channel ended before installation".into(),
+                context.attachment,
+            );
+            return;
+        }
+    };
+    install_open(
+        io,
+        channels,
+        chan_out_tx,
+        req,
+        instance,
+        context,
+        spawned,
+        open_slot,
+    );
+}
+
+/// An inert, preallocated insertion. Preparing or dropping it cannot start
+/// process bridges or extract the registry's child/model custody.
+pub(crate) struct PreparedInstallation<'a> {
+    entry: std::collections::hash_map::VacantEntry<'a, u8, Channel>,
+    producer: ProducerState,
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    gate: Arc<SendGate>,
+    request: OpenRequest,
+    instance: u64,
+}
+pub(crate) struct InstalledBridges {
+    stream: u8,
+    instance: u64,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+impl<'a> PreparedInstallation<'a> {
+    fn new(
+        channels: &'a mut HashMap<u8, Channel>,
+        request: OpenRequest,
+        instance: ChannelInstance,
+        context: &ProducerContext,
+    ) -> Option<Self> {
+        channels.try_reserve(1).ok()?;
+        let std::collections::hash_map::Entry::Vacant(entry) = channels.entry(request.stream)
+        else {
+            return None;
+        };
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        Some(Self {
+            entry,
+            producer: ProducerState::new(instance, context),
+            input_tx,
+            input_rx,
+            // This inert gate is replaced with the bridge's shared gate before any
+            // reader starts or lifecycle output is published.
+            gate: Arc::new(SendGate::new(GateKind::Pipe)),
+            request,
+            instance: instance.get(),
+        })
+    }
+    pub(crate) fn matches(&self, identity: &crate::channel_open::OpenIdentity) -> bool {
+        self.request.stream == identity.stream
+            && self.instance == identity.instance.get()
+            && self.producer.origin.generation == identity.generation
+    }
+    /// Only concrete moves and a previously reserved vacant insertion occur here.
+    /// No backend callback, allocation, task launch, I/O or publication.
+    pub(crate) fn commit(
+        self,
+        spawned: SpawnedChannel,
+        slot: crate::channel_open::InstalledSlot,
+    ) -> InstalledBridges {
+        let SpawnedChannel {
+            reader,
+            writer,
+            resize,
+            screen,
+            wait,
+        } = spawned;
+        let bridges = InstalledBridges {
+            stream: self.request.stream,
+            instance: self.instance,
+            reader,
+            writer,
+            input_rx: self.input_rx,
+        };
+        self.entry.insert(Channel {
+            _open_slot: Some(slot),
+            producer: self.producer,
+            input_tx: self.input_tx,
+            resize,
+            screen,
+            input_consumed: 0,
+            last_acked: 0,
+            gate: self.gate,
+            screened: false,
+            stale: false,
+            instance: self.instance,
+            request: self.request,
+            wait,
+        });
+        bridges
+    }
+}
+
+fn start_installed(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
+    bridges: InstalledBridges,
+    context: &ProducerContext,
+) {
+    let InstalledBridges {
+        stream,
+        instance,
         reader,
         writer,
-        resize,
-        screen,
-        wait,
-    } = spawned;
-
-    // What the SPAWNED channel actually answered -- never `req.screen`,
-    // which is only what the CLIENT asked for. `qshd/src/channel_backend.rs`'s
-    // `make_screen` hands back `NoScreen` for any request that didn't ask
-    // for one, and a future backend with no emulator of its own to build a
-    // real model from could hand back `NoScreen` regardless of what was
-    // asked. Declaring recoverable off the request instead would be a lie
-    // the connection would act on: it would drop this channel's backlog
-    // after a long absence and have nothing to repaint it from, leaving the
-    // client desynced with no way back -- see `SessionScreen::has_screen`'s
-    // own doc for the full account. Captured before `screen` moves into
-    // `Channel` below.
-    let recoverable = screen.has_screen();
-
-    // A screen channel's reader never waits: the process runs at full speed,
-    // the model sees every byte, and output behind a closed gate is dropped
-    // and repainted. A line channel has nothing to repaint from, so its
-    // reader waits for the gate before each read and the process blocks on
-    // its PTY, as behind a slow SSH (spec §4.7.2).
-    let gate = io.send_gate(
+        input_rx,
+    } = bridges;
+    let ch = channels.get_mut(&stream).expect("committed installation");
+    // Only the actual model determines recoverability, never the requested flag.
+    let recoverable = ch.screen.has_screen();
+    ch.screened = recoverable;
+    ch.gate = io.send_gate(
         stream,
         if recoverable {
             GateKind::Screen
@@ -1899,48 +2334,40 @@ fn open_channel(
             GateKind::Pipe
         },
     );
-    let reader_gate = (!recoverable).then(|| Arc::clone(&gate));
-
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let reader_gate = (!recoverable).then(|| ch.gate.clone());
     let reader_out = chan_out_tx.clone();
-    // A blocking task: the reader blocks in `read`, and a line channel's also
-    // on its gate -- never on the runtime's own threads.
     tokio::task::spawn_blocking(move || {
         channel_reader_loop(stream, instance, reader, reader_out, reader_gate)
     });
     let reporter = io.consumption_reporter();
     tokio::task::spawn_blocking(move || channel_writer_loop(stream, input_rx, writer, reporter));
-
-    channels.insert(
-        stream,
-        Channel {
-            producer: ProducerState::new(
-                ChannelInstance::new(instance).expect("nonzero channel instance"),
-                context,
-            ),
-            input_tx,
-            resize,
-            screen,
-            input_consumed: 0,
-            last_acked: 0,
-            gate,
-            screened: recoverable,
-            stale: false,
-            instance,
-            request: req,
-            wait,
-        },
-    );
-
-    // Declared BEFORE `Opened`, so the connection knows this stream's
-    // recoverability before the client has any right to write to it. Only
-    // this layer knows whether the channel has a screen model to redraw
-    // from (see `crates/transport/src/conn.rs`'s
-    // `Connection::is_bulk_output_stream`, which the connection falls back
-    // to for a stream nobody declared).
     io.set_stream_resyncable(stream, recoverable);
     io.channel_opened(context.attachment, stream);
-    checkpoint(io, channels.get_mut(&stream).expect("opened channel"));
+    checkpoint(io, ch);
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn install_open(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
+    req: OpenRequest,
+    instance: u64,
+    context: &ProducerContext,
+    spawned: SpawnedChannel,
+    open_slot: crate::channel_open::InstalledSlot,
+) {
+    let Some(prepared) = PreparedInstallation::new(
+        channels,
+        req,
+        ChannelInstance::new(instance).expect("nonzero instance"),
+        context,
+    ) else {
+        return;
+    };
+    let bridges = prepared.commit(spawned, open_slot);
+    start_installed(io, channels, chan_out_tx, bridges, context);
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
@@ -2018,6 +2445,7 @@ fn channel_writer_loop(
 // `session_manager::tests::a_channel_reused_after_a_reattach_is_credited_only_its_own_report`.
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("channel_server_open_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2246,6 +2674,14 @@ pub(crate) mod tests {
     }
 
     impl ChannelWait for FakeWait {
+        fn cleanup_uninstalled(
+            &mut self,
+            authority: &crate::channel_open::CleanupAuthority<'_>,
+        ) -> crate::channel_open::CleanupStatus {
+            self.kill();
+            self.waited.lock().unwrap().push(self.stream);
+            authority.reaped()
+        }
         fn kill(&mut self) {
             self.killed.lock().unwrap().push(self.stream);
         }
@@ -2259,6 +2695,7 @@ pub(crate) mod tests {
     /// Everything the tests need to steer and observe the spawner.
     #[allow(clippy::type_complexity)]
     pub(crate) struct FakeSpawner {
+        opens: Arc<crate::channel_open::ChannelOpenRegistry>,
         /// When set, every `spawn` refuses with this reason.
         refuse: Mutex<Option<String>>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
@@ -2299,6 +2736,7 @@ pub(crate) mod tests {
     impl FakeSpawner {
         pub(crate) fn new() -> Arc<FakeSpawner> {
             Arc::new(FakeSpawner {
+                opens: crate::channel_open::ChannelOpenRegistry::new(Default::default()),
                 refuse: Mutex::new(None),
                 written: Arc::new(Mutex::new(Vec::new())),
                 sizes: Arc::new(Mutex::new(Vec::new())),
@@ -2360,13 +2798,18 @@ pub(crate) mod tests {
     }
 
     impl ChannelSpawner for FakeSpawner {
+        fn open_registry(&self) -> Arc<crate::channel_open::ChannelOpenRegistry> {
+            self.opens.clone()
+        }
         fn spawn(
             &self,
             owner: &Principal,
             login: LoginId,
             req: &OpenRequest,
             term: Option<&str>,
-        ) -> Result<SpawnedChannel, String> {
+            custody: &crate::channel_open::OpenCustody,
+        ) -> Result<crate::channel_open::UninstalledChannel, crate::channel_open::SpawnFailure>
+        {
             self.owners
                 .lock()
                 .unwrap()
@@ -2377,11 +2820,11 @@ pub(crate) mod tests {
                 .unwrap()
                 .push((req.stream, term.map(str::to_string)));
             if let Some(reason) = self.refuse.lock().unwrap().clone() {
-                return Err(reason);
+                return Err(custody.refuse_before_creation(reason));
             }
             let (end_tx, end_rx) = std_mpsc::channel::<Vec<u8>>();
             self.enders.lock().unwrap().push((req.stream, end_tx));
-            Ok(SpawnedChannel {
+            let spawned = SpawnedChannel {
                 reader: Box::new(FakeProcess {
                     greeting: Some(b"hello from the shell".to_vec()),
                     feed: end_rx,
@@ -2411,7 +2854,12 @@ pub(crate) mod tests {
                     killed: self.killed.clone(),
                     waited: self.waited.clone(),
                 }),
-            })
+            };
+            Ok(custody.protect(spawned.wait, spawned.screen).finish(
+                spawned.reader,
+                spawned.writer,
+                spawned.resize,
+            ))
         }
     }
 
@@ -2591,6 +3039,7 @@ pub(crate) mod tests {
                 ..channel_producer()
             };
             let channel = Channel {
+                _open_slot: None,
                 input_tx,
                 resize: Box::new(TransactionPty {
                     fail: ioctl_fails,
@@ -3693,8 +4142,11 @@ pub(crate) mod tests {
                     &mut channels,
                     &mut HashMap::new(),
                     &mut 2,
-                    &dyn_spawner,
-                    &tx,
+                    &crate::channel_open::ChannelOpenExecutor::new(
+                        dyn_spawner.clone(),
+                        dyn_spawner.open_registry(),
+                    ),
+                    &mut HashMap::new(),
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
@@ -3758,8 +4210,11 @@ pub(crate) mod tests {
                     &mut channels,
                     &mut HashMap::new(),
                     &mut 2,
-                    &dyn_spawner,
-                    &tx,
+                    &crate::channel_open::ChannelOpenExecutor::new(
+                        dyn_spawner.clone(),
+                        dyn_spawner.open_registry(),
+                    ),
+                    &mut HashMap::new(),
                     record,
                     &mut None,
                     &mut SessionUpdate::new(None),
@@ -4220,7 +4675,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let declared = collect_declarations(&mut outbound, 2).await;
+        let mut declared = collect_declarations(&mut outbound, 2).await;
+        // Independent admitted opens may complete in either order.
+        declared.sort_unstable_by_key(|(stream, _)| *stream);
         assert_eq!(
             declared,
             vec![(16u8, true), (17u8, false)],
@@ -5334,7 +5791,7 @@ pub(crate) mod tests {
             // Held across the check, as the real daemon does: the signal
             // cannot move to `Draining` between the look and the count.
             let signal = self.restart_tx.borrow();
-            if *signal != RestartSignal::announced(restart) {
+            if *signal != RestartSignal::announced(restart, restart) {
                 return false;
             }
             self.log.lock().unwrap().push(format!("joined {restart}"));
@@ -5386,12 +5843,12 @@ pub(crate) mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             };
-            self.restart_tx.send_replace(RestartSignal::announced(1));
+            self.restart_tx.send_replace(RestartSignal::announced(1, 1));
             // The one runner of these tests joins, then releases its channels.
             wait_for("joined 1");
-            self.restart_tx.send_replace(RestartSignal::draining(1));
+            self.restart_tx.send_replace(RestartSignal::draining(1, 1));
             wait_for("released 1");
-            self.restart_tx.send_replace(RestartSignal::IDLE);
+            self.restart_tx.send_replace(RestartSignal::idle(1));
             UpdateResult::Rejected {
                 code: RejectCode::ExecFailed,
                 detail: "exec is not available in a test".to_string(),
@@ -5765,7 +6222,9 @@ pub(crate) mod tests {
             .unwrap();
         let _ = next_control(&mut outbound1).await;
         let _ = next_control(&mut outbound2).await;
-        daemon.restart_tx.send_replace(RestartSignal::announced(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(1, 1));
         assert_eq!(next_control(&mut outbound1).await, ServerRecord::Restarting);
         assert_eq!(next_control(&mut outbound2).await, ServerRecord::Restarting);
         drop(inbound1);
@@ -5790,10 +6249,14 @@ pub(crate) mod tests {
             with_daemon(&daemon),
         ));
         open_a_shell_channel(&inbound, &mut outbound).await;
-        daemon.restart_tx.send_replace(RestartSignal::announced(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(1, 1));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         until(|| daemon.log().contains(&"joined 1".to_string())).await;
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         let killed = spawner.killed.clone();
         let waited = spawner.waited.clone();
         until(|| daemon.log().contains(&"released 1".to_string())).await;
@@ -5821,7 +6284,9 @@ pub(crate) mod tests {
             with_daemon(&daemon),
         ));
         open_a_shell_channel(&inbound, &mut outbound).await;
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         assert_eq!(
             next_control(&mut outbound).await,
             ServerRecord::Restarting,
@@ -5892,7 +6357,10 @@ pub(crate) mod tests {
     /// nobody waits for. Refused, and the spawner is never asked.
     #[tokio::test]
     async fn a_channel_opened_during_a_restart_is_refused_and_nothing_spawns() {
-        for signal in [RestartSignal::announced(1), RestartSignal::draining(1)] {
+        for signal in [
+            RestartSignal::announced(1, 1),
+            RestartSignal::draining(1, 1),
+        ] {
             let daemon = FakeDaemon::new();
             let spawner = FakeSpawner::new();
             let (io, inbound, mut outbound) = channel_pair();
@@ -5927,7 +6395,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_session_that_starts_during_an_announced_restart_tells_and_confirms() {
         let daemon = FakeDaemon::new();
-        daemon.restart_tx.send_replace(RestartSignal::announced(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(1, 1));
         let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
@@ -5936,7 +6406,9 @@ pub(crate) mod tests {
         ));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         until(|| logged(&daemon, "joined 1") == 1).await;
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         until(|| released_count(&daemon) == 1).await;
         assert_no_control(&mut outbound).await;
         drop(inbound);
@@ -5959,7 +6431,9 @@ pub(crate) mod tests {
         // Exits during the drain.
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
@@ -5983,7 +6457,9 @@ pub(crate) mod tests {
 
         // Stays for the next restart.
         let daemon = FakeDaemon::new();
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
@@ -5993,11 +6469,15 @@ pub(crate) mod tests {
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         assert_no_control(&mut outbound).await;
         assert_eq!(released_count(&daemon), 0);
-        daemon.restart_tx.send_replace(RestartSignal::IDLE);
-        daemon.restart_tx.send_replace(RestartSignal::announced(2));
+        daemon.restart_tx.send_replace(RestartSignal::idle(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(2, 2));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         until(|| logged(&daemon, "joined 2") == 1).await;
-        daemon.restart_tx.send_replace(RestartSignal::draining(2));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(2, 2));
         until(|| released_count(&daemon) == 1).await;
         drop(inbound);
         runner.await.unwrap();
@@ -6030,15 +6510,23 @@ pub(crate) mod tests {
             next_control(&mut outbound).await,
             ServerRecord::About(fake_about())
         );
-        daemon.restart_tx.send_replace(RestartSignal::announced(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(1, 1));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         until(|| logged(&daemon, "joined 1") == 1).await;
-        daemon.restart_tx.send_replace(RestartSignal::draining(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(1, 1));
         until(|| released_count(&daemon) == 1).await;
         // Back to back: the session is likely to see only the last of these.
-        daemon.restart_tx.send_replace(RestartSignal::IDLE);
-        daemon.restart_tx.send_replace(RestartSignal::announced(2));
-        daemon.restart_tx.send_replace(RestartSignal::draining(2));
+        daemon.restart_tx.send_replace(RestartSignal::idle(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(2, 2));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::draining(2, 2));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         assert_no_control(&mut outbound).await;
         drop(inbound);
@@ -6065,7 +6553,9 @@ pub(crate) mod tests {
             with_daemon(&daemon),
         ));
         open_a_shell_channel(&inbound, &mut outbound).await;
-        daemon.restart_tx.send_replace(RestartSignal::announced(1));
+        daemon
+            .restart_tx
+            .send_replace(RestartSignal::announced(1, 1));
         assert_eq!(next_control(&mut outbound).await, ServerRecord::Restarting);
         until(|| logged(&daemon, "joined 1") == 1).await;
         drop(inbound);

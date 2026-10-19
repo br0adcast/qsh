@@ -151,7 +151,7 @@ pub(super) const CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// here: a monitor that has not answered within this budget is one that
 /// is not serving, and a process that is not serving cannot be asked to
 /// close anything politely. What CAN be done is to make sure the ordinary
-/// path never comes here, and that is what `forget_login`'s seam drop plus
+/// path never comes here, and that is what receipt-driven monitor retirement plus
 /// `monitor::SessionDeadline` are for: a monitor that is merely stuck
 /// inside its PAM stack now comes back and ends its own login, instead of
 /// waiting here to be killed.
@@ -550,85 +550,22 @@ struct LoopState {
     /// just served -- and that entry, once its channel opened, would never
     /// have been removed again.
     ///
-    /// # Every place an entry is REMOVED, and the one rule they share
-    ///
-    /// **A login entry is removed only when nothing of its is in flight,
-    /// and `Request::LoginEnded` gets there by cancelling rather than by
-    /// waiting.**
-    ///
-    /// The rule has no exception, and that is deliberate: tasks 7 and 8
-    /// decide a monitor's and a PAM session's lifetime from this state, and
-    /// a rule with a documented carve-out is one somebody satisfies on the
-    /// wrong side. What makes it necessary: a channel between its fork and
-    /// its verdict is not in `LoginState::channels` yet, so "no channels"
-    /// is not "nothing here", and a remover that ignores the difference
-    /// drops an entry out from under a channel that is about to open. That
-    /// happened once for each remover there has been, which is why the list
-    /// is written out here rather than left to be rediscovered:
-    ///
-    /// 1. [`sweep_expired_logins`] -> [`forget_login`], on age, and only for
-    ///    an entry that never became established. Asks
-    ///    [`PendingTable::holds_login`] in its filter, and declines to
-    ///    remove while a start is in flight.
-    /// 2. `Request::LoginEnded` -> [`forget_login`]. Cannot decline: no
-    ///    second `LoginEnded` is coming, and an entry that goes on to
-    ///    become established is never swept either, so a removal deferred
-    ///    here is a removal lost -- the entry and its account's place in
-    ///    `verified` would outlive the session for the daemon's whole life.
-    ///    So it makes the condition true instead, with
-    ///    [`PendingTable::cancel_login`]: every start of that login is
-    ///    cancelled, and each is then refused and killed by its own verdict
-    ///    (`finish_pending`), exactly as a `Close` during startup is.
-    ///    `login_ended_cancels_a_start_still_in_flight` pins it.
-    ///
-    /// Nothing on the `Open` path removes an entry, whatever becomes of the
-    /// request: an `Open` never inserted the entry it names, so it has
-    /// nothing of its own to take back.
+    /// Authentication ends immediately on LoginEnded or monitor loss. In-flight
+    /// startup callbacks are retired, but unresolved channel cleanup moves to
+    /// `retired` and remains charged until an exact receipt arrives. An age
+    /// sweep still leaves a pending start alone. No failed Open recreates an
+    /// authentication entry or refunds an unresolved cleanup slot.
     logins: HashMap<LoginId, LoginState>,
-    /// The monitor of every login that has one: the process that forks and
-    /// watches that login's shells (`super::monitor`).
-    ///
-    /// # Its life is the LOGIN ENTRY's life, in BOTH directions
-    ///
-    /// One is forked by the first `Request::Open` of a login that has none,
-    /// and taken down in exactly one place: inside [`forget_login`], just
-    /// after it has removed the login's entry -- inlined there rather
-    /// than kept as a function of its own precisely so that no other place
-    /// can take a monitor down without ending its login (see the comment at
-    /// that spot). And the other way round: every path
-    /// that loses a monitor -- one killed for not answering, one nobody can
-    /// reach, one that died on its own -- goes through [`forget_login`]
-    /// too, so the login goes in the same step. The two tables therefore
-    /// cannot disagree about whether a login is live.
-    ///
-    /// The second direction is what makes one login's monitor UNIQUE for
-    /// that login's whole life. A login whose monitor was lost but whose
-    /// entry stayed would be given a second monitor by its next
-    /// `Request::Open` -- and from the next task on that is a second
-    /// `pam_open_session` for one login, while the first session is left
-    /// open with the process that could have closed it already killed. Spec
-    /// §3.3 is exactly about that, and it is why a lost monitor ends its
-    /// login rather than being replaced: a fresh proof is what admits the
-    /// device again, and a fresh proof is a fresh login ENTRY.
-    /// `a_login_never_gets_a_second_monitor` pins it.
-    ///
-    /// The entry, and not the token: the token is the CLIENT's to choose
-    /// (`msg1.token`, carried into `Request::Verify`), so a client may well
-    /// prove itself again under the very same one, and `ensure_login` then
-    /// makes a new entry for it -- which `logins` allows outright. The
-    /// invariant is therefore "one login ENTRY, one monitor, for that
-    /// entry's life", never "one token, one monitor, for ever". From the
-    /// next task on that is the distinction that matters, because a PAM
-    /// session hangs off the monitor and so off the entry.
-    ///
-    /// `LoginState::channels` has nothing to say about it. That set means
-    /// "open right now" and empties every time somebody types `exit`
-    /// (`LoginState::channels`'s own docs), while the login is still very
-    /// much alive and may open another channel a moment later -- and from
-    /// the next task on, ending a monitor ends that login's PAM session.
-    /// Deciding a monitor's life from that set would close the session
-    /// under a session that has not ended.
-    monitors: HashMap<LoginId, Monitor>,
+    /// One monitor per admitted login incarnation. A retired incarnation can
+    /// keep its receipt route while a freshly verified incarnation of the same
+    /// token gets its own monitor. Every event is checked against the exact
+    /// owner before it can mutate a channel. Losing a monitor ends its active
+    /// authentication; it never authorizes a replacement under that incarnation.
+    /// Reaping a monitor retains its socket until queued receipts/EOF are read.
+    monitors: HashMap<MonitorOwner, Monitor>,
+    /// Authentication is gone; only exact unresolved cleanup remains.
+    retired: HashSet<MonitorOwner>,
+    highest_channel_id: ChannelId,
     /// The number [`ensure_login`] gives the next login entry it creates,
     /// and then advances -- see [`LoginState::incarnation`] for what the
     /// number is for.
@@ -652,6 +589,7 @@ struct Monitor {
     /// The monitor's process, so the helper can reap it -- and, past
     /// [`MONITOR_GRACE_PERIOD`], kill it.
     pid: Pid,
+    reaped: bool,
 }
 
 /// One login's own bookkeeping: which account it belongs to (fixed for the
@@ -826,34 +764,51 @@ fn sanitized_identity(value: &str, max_len: usize) -> String {
 /// an id the first shell also holds -- one channel, two processes, and
 /// whichever `Close` arrived would end only one of them.
 ///
-/// So both states live in `LoopState::live` and both refuse a repeated id.
+/// Starting, Running and Cleaning all occupy `LoopState::live`. IDs are never
+/// reused on the worker connection, including after cleanup.
 /// Each names the LOGIN the channel belongs to, which is how the helper
 /// finds the monitor to forward a `Close` to and the monitor to kill when
 /// one stops answering; the shell's own pid is no business of the helper's
 /// since task 7 -- it is the monitor's child, and only the monitor may
 /// signal or reap it.
 ///
-/// What the difference between the two states decides is whether an exit
+/// The lifecycle state decides whether an installed exit
 /// may be reported for this id at all: a `Starting` one's `Exited` would be
 /// an answer to a request the worker has not been given its first answer to
 /// yet.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct MonitorOwner {
+    login: LoginId,
+    incarnation: u64,
+}
+
+fn owner_for(state: &LoopState, login: LoginId) -> MonitorOwner {
+    MonitorOwner {
+        login,
+        incarnation: state.logins[&login].incarnation,
+    }
+}
+
+#[derive(Clone, Copy)]
 enum ChannelSlot {
-    /// Asked for, and the monitor has not yet said whether the `exec` took.
-    /// The matching entry in `LoopState::pending` is what is waiting for
-    /// that.
-    Starting(LoginId),
-    /// The monitor reported a successful start; the worker has been handed
-    /// its terminal.
-    Running(LoginId),
+    Starting(MonitorOwner),
+    Running(MonitorOwner),
+    Cleaning(MonitorOwner),
+    /// Exact reap arrived before the installed exit verdict; preserve both.
+    ReapedRunning(MonitorOwner),
 }
 
 impl ChannelSlot {
-    /// The login this channel belongs to, whichever state it is in -- what
-    /// names the monitor that owns its shell.
-    fn login(&self) -> LoginId {
-        match self {
-            ChannelSlot::Starting(login) | ChannelSlot::Running(login) => *login,
+    fn owner(&self) -> MonitorOwner {
+        match *self {
+            Self::Starting(owner)
+            | Self::Running(owner)
+            | Self::Cleaning(owner)
+            | Self::ReapedRunning(owner) => owner,
         }
+    }
+    fn login(&self) -> LoginId {
+        self.owner().login
     }
 }
 
@@ -978,6 +933,8 @@ fn serve(
             })
             .collect(),
         monitors: HashMap::new(),
+        retired: HashSet::new(),
+        highest_channel_id: 0,
         next_incarnation: 1 + seeded as u64,
     };
     // Borrowed once, for the whole loop: both are owned locals that outlive
@@ -1000,7 +957,7 @@ fn serve(
         // against it -- the same shape the report pipes use, and for the
         // same reason (the array must not borrow the table it was built
         // from).
-        let monitor_logins: Vec<LoginId> = state.monitors.keys().copied().collect();
+        let monitor_logins: Vec<MonitorOwner> = state.monitors.keys().copied().collect();
         let mut fds: Vec<PollFd> = Vec::with_capacity(2 + report_fds.len() + monitor_logins.len());
         fds.push(PollFd::new(channels.as_fd(), PollFlags::POLLIN));
         fds.push(PollFd::new(auth.as_fd(), PollFlags::POLLIN));
@@ -1061,7 +1018,7 @@ fn serve(
             .filter(|(_, polled)| polled.any().unwrap_or(true))
             .map(|(fd, _)| *fd)
             .collect();
-        let ready_monitors: Vec<LoginId> = monitor_logins
+        let ready_monitors: Vec<MonitorOwner> = monitor_logins
             .iter()
             .zip(&fds[2 + report_fds.len()..])
             .filter(|(_, polled)| polled.any().unwrap_or(true))
@@ -1154,7 +1111,7 @@ fn end_the_monitors(state: &mut LoopState) {
     let mut leaving: Vec<Pid> = state
         .monitors
         .drain()
-        .map(|(_, monitor)| monitor.pid)
+        .filter_map(|(_, monitor)| (!monitor.reaped).then_some(monitor.pid))
         .collect();
     if leaving.is_empty() {
         return;
@@ -1225,15 +1182,13 @@ fn serve_channel_seam(
             shell,
             command,
         }) => {
+            let fresh = id > state.highest_channel_id;
+            if fresh {
+                state.highest_channel_id = id;
+            }
             // A compromised worker cannot bypass geometry admission here.
             if let Err(reason) = terminal_size::TerminalSize::new(cols, rows) {
-                reply(
-                    sock,
-                    &Response::Failed {
-                        id,
-                        reason: reason.to_string(),
-                    },
-                );
+                refuse_open(sock, id, reason.to_string(), fresh);
                 return Next::Continue;
             }
             // Only for an account this helper verified itself
@@ -1257,13 +1212,7 @@ fn serve_channel_seam(
                     "helper",
                     &format!("refusing a channel for uid {uid}, which has not authenticated"),
                 );
-                reply(
-                    sock,
-                    &Response::Failed {
-                        id,
-                        reason: UNVERIFIED_ACCOUNT_REASON.to_string(),
-                    },
-                );
+                refuse_open(sock, id, UNVERIFIED_ACCOUNT_REASON.to_string(), fresh);
                 return Next::Continue;
             }
             // And only under a login that is already on file, bound to this
@@ -1300,13 +1249,7 @@ fn serve_channel_seam(
                 Ok(account) => account,
                 Err(why) => {
                     crate::log::warn("helper", &format!("refusing an Open for uid {uid}: {why}"));
-                    reply(
-                        sock,
-                        &Response::Failed {
-                            id,
-                            reason: REFUSED_REASON.to_string(),
-                        },
-                    );
+                    refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
                     return Next::Continue;
                 }
             };
@@ -1335,13 +1278,12 @@ fn serve_channel_seam(
             // else's -- and, once it really exited, the id would be freed
             // out from under the second one. Refuse instead, before
             // anything is started for the new request.
-            if state.live.contains_key(&id) {
-                reply(
+            if !fresh || state.live.contains_key(&id) {
+                refuse_open(
                     sock,
-                    &Response::Failed {
-                        id,
-                        reason: "a channel with this id is already open".to_string(),
-                    },
+                    id,
+                    "a channel with this id is already open".to_string(),
+                    false,
                 );
                 return Next::Continue;
             }
@@ -1394,22 +1336,18 @@ fn serve_channel_seam(
                         login[0], login[1]
                     ),
                 );
-                reply(
-                    sock,
-                    &Response::Failed {
-                        id,
-                        reason: REFUSED_REASON.to_string(),
-                    },
-                );
+                refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
                 return Next::Continue;
             }
+            let owner = owner_for(state, login);
+            state.live.insert(id, ChannelSlot::Starting(owner));
             match open_channel(sock, state, &account, login, config, &launch, switches) {
                 Ok(master) => {
                     // The id is taken from the instant the shell is ASKED
                     // for, not from the instant the monitor reports it --
                     // see `ChannelSlot` for what a second `Open` naming it
                     // would otherwise cost.
-                    state.live.insert(id, ChannelSlot::Starting(login));
+                    state.live.insert(id, ChannelSlot::Starting(owner));
                     // And this request now leaves the handler unanswered:
                     // `Opened` (with the terminal) or `Failed` goes out
                     // from the loop once the monitor has spoken, or once
@@ -1427,11 +1365,14 @@ fn serve_channel_seam(
                         },
                     });
                 }
-                Err(e) => {
-                    // Nothing was started: everything that can fail in
-                    // there fails before the monitor is asked for a shell,
-                    // so there is no channel to track and no reserved id to
-                    // give back.
+                Err((e, no_child)) => {
+                    // A send failure is not proof; earlier preparation is.
+                    if let Some(slot) = state.live.get_mut(&id) {
+                        *slot = ChannelSlot::Cleaning(owner);
+                    }
+                    // Only audited preparation failures prove NoChild.
+                    // Once a send was attempted, preserve the exact charge
+                    // until the monitor supplies a terminal cleanup receipt.
                     reply(
                         sock,
                         &Response::Failed {
@@ -1439,6 +1380,15 @@ fn serve_channel_seam(
                             reason: format!("{e:#}"),
                         },
                     );
+                    if no_child {
+                        complete_cleanup(
+                            sock,
+                            state,
+                            owner,
+                            id,
+                            super::protocol::CleanupKind::NoChild,
+                        );
+                    }
                 }
             }
         }
@@ -1450,8 +1400,8 @@ fn serve_channel_seam(
             let slot = state
                 .live
                 .get(&id)
-                .map(|slot| (slot.login(), matches!(slot, ChannelSlot::Starting(_))));
-            if let Some((login, still_starting)) = slot {
+                .map(|slot| (slot.owner(), matches!(slot, ChannelSlot::Starting(_))));
+            if let Some((owner, still_starting)) = slot {
                 if still_starting {
                     // The monitor's `SIGHUP` ends a shell that has not
                     // exec'd yet, and its report pipe then reaches
@@ -1470,7 +1420,7 @@ fn serve_channel_seam(
                 // helper's own escalation is one level up -- see
                 // `MONITOR_GRACE_PERIOD`, which is the deadline recorded
                 // here.
-                tell_monitor(sock, state, login, &MonitorRequest::Close { id });
+                tell_monitor(sock, state, owner, &MonitorRequest::Close { id });
                 state
                     .closing
                     .insert(id, Instant::now() + MONITOR_GRACE_PERIOD);
@@ -1798,204 +1748,127 @@ fn ensure_login(
     account: &Account,
     rhost: String,
 ) -> Result<u64, &'static str> {
-    if !state.logins.contains_key(&login) && state.logins.len() >= MAX_LOGINS {
-        return Err("already holding MAX_LOGINS logins");
+    if let Some(entry) = state.logins.get(&login) {
+        return if entry.account.uid == account.uid {
+            Ok(entry.incarnation)
+        } else {
+            Err("its login is already bound to a different account")
+        };
     }
-    // Taken before the entry is touched, and spent only if one is really
-    // created: `or_insert_with` runs its closure at most once, so a repeat
-    // proof for a token already on file keeps the incarnation it has. That
-    // is what makes a warm reattach -- which re-proves under the same token
-    // -- leave the number alone, so a notice still in flight for THIS life
-    // of the login is acted on rather than mistaken for a stale one.
+    if state.logins.len() + state.retired.len() >= MAX_LOGINS {
+        return Err("already holding MAX_LOGINS live or unresolved logins");
+    }
     let fresh = state.next_incarnation;
-    let entry = state
-        .logins
-        .entry(login)
-        .or_insert_with(|| LoginState::provisional(account.clone(), rhost, fresh));
-    if entry.account.uid != account.uid {
-        return Err("its login is already bound to a different account");
-    }
-    let incarnation = entry.incarnation;
-    if incarnation == fresh {
-        state.next_incarnation += 1;
-    }
-    Ok(incarnation)
+    let next = fresh.checked_add(1).ok_or("login identity exhausted")?;
+    state.logins.insert(
+        login,
+        LoginState::provisional(account.clone(), rhost, fresh),
+    );
+    state.next_incarnation = next;
+    Ok(fresh)
 }
 
-/// A login is over for good: take its monitor down, drop its entry, and
-/// drop the account it belonged to from `verified` once no OTHER login of
-/// that same account is still on file -- the threat model promises only
-/// whoever is connected right now, not whoever ever connected (see the
-/// slice's own review finding, referenced from `LoopState::verified`'s
-/// docs).
-///
-/// **The one door.** Every way a login can end comes through here: the
-/// worker reporting it (`Request::LoginEnded`), the age sweep
-/// ([`sweep_expired_logins`]), and every way its MONITOR can be lost --
-/// killed for not answering, unreachable, or dead on its own
-/// ([`lose_monitor`], `reap`, [`serve_ready_monitors`]). That is what keeps
-/// the two tables from ever disagreeing, and what makes a login's monitor
-/// unique for that login's whole life: see [`LoopState::monitors`] for what
-/// a second one would mean from the next task on.
-///
-/// **And the worker is told** ([`Response::LoginEnded`]), whenever there
-/// was an entry to remove and for no other reason. That telling lives here
-/// for the same
-/// reason the monitor's teardown does: every way a login can end already
-/// converges on this one door, and a telling lifted out to the callers is
-/// one that a path added later forgets. A login whose end the worker never
-/// hears leaves it holding a session that is STERILE -- it pings fine and
-/// every channel it asks for is refused, for good -- and the person sees
-/// not a disconnect but a channel that will not open. The worker cannot
-/// work that out for itself: a refusal carries one shared reason whatever
-/// caused it ([`REFUSED_REASON`]), deliberately, so that a taken-over
-/// worker cannot enumerate accounts.
-///
-/// **"There was an entry", not "the entry was established."** The narrower
-/// gate looks safer and is worse, because the two predicates are exact
-/// complements: [`sweep_expired_logins`] selects on `!established`, so a
-/// notice gated on `established` can never fire for the one class of login
-/// the helper's own garbage collector ends. A client that proves itself,
-/// gets a live session bound, and then opens no channel within
-/// [`LOGIN_GRACE`] -- an app frozen by Doze right after connecting is
-/// enough, against a retention of an hour -- loses its login from under a
-/// session that is kept, and that is exactly the symptom this notice
-/// exists to end. The same shape covers a monitor that dies DURING the
-/// first `Open` and a PAM stack that refuses the first channel: both end a
-/// login while it is still provisional.
-///
-/// Nor does the narrow gate buy anything against enumeration. Every entry
-/// in [`LoopState::logins`] was created by [`ensure_login`] out of the
-/// worker's OWN `Request::Verify`, provisional ones included, so naming any
-/// of them tells a taken-over worker nothing it did not already have. What
-/// must never be named is a token the helper never held -- and that is what
-/// the `let Some(ended)` guard below is for, not `established`.
-///
-/// The first two halves are unconditional, and deliberately so: the entry
-/// is removed
-/// whether or not it was there, and the monitor is taken down whether or
-/// not the entry was. A login with no entry but a live monitor is exactly
-/// the state this function exists to make unreachable, so it must not be a
-/// state this function can return from. NOT pinned by a test -- making the
-/// monitor's half conditional on the entry having been there leaves the
-/// whole suite green, precisely because every caller reaches here with the
-/// two in step, so no test can tell the difference -- so this is reasoning,
-/// not coverage: treat it as load-bearing when you edit it. It is a belt
-/// over braces, and the braces are what the rest of these docs describe.
-///
-/// **What a user sees that they did not before.** A login that ends while a
-/// channel is still open now takes that channel's shell -- and everything
-/// under it -- down within `CLOSE_GRACE_PERIOD`, and the worker is told the
-/// channel exited (code 137). The worker's router ends a login not only on
-/// a graceful close but on eviction and on garbage collection past
-/// retention (`transport::session_manager`), so a session collected while
-/// its channel was open used to leave that shell running and now does not.
-/// That is the right way round: a shell left behind would be a root-forked
-/// process under an account whose verification this same call has just
-/// dropped, holding a pseudo-terminal that no `Close` can name any more --
-/// the worker cannot close a channel of a login it has already reported as
-/// ended. For this product the cost is small, since the work that must
-/// survive lives in tmux on the server rather than in the channel's own
-/// shell; but "the session was collected" went from harmless to
-/// destructive, and that is worth knowing before reading a bug report about
-/// it. `a_login_that_ends_takes_its_open_channels_with_it` pins it.
+/// End authentication immediately, report LoginEnded, and retire startup
+/// callbacks. Unresolved channels keep a bounded owner stub and receipt-capable
+/// monitor route. Close requests take down their shells; exact cleanup receipts
+/// release the slots. If that route is lost, custody remains quarantined rather
+/// than treating monitor death, a signal, or timeout as shell cleanup proof.
+/// Once the last receipt arrives, closing the monitor seam lets it close PAM.
 fn forget_login(sock: &UnixStream, state: &mut LoopState, login: LoginId) {
-    let ended = state.logins.remove(&login);
+    let Some(entry) = state.logins.get(&login) else {
+        return;
+    };
+    let owner = MonitorOwner {
+        login,
+        incarnation: entry.incarnation,
+    };
+    retire_login(sock, state, owner);
+}
 
-    // Taking the monitor down is INLINED here, and deliberately not a
-    // function of its own. While it was one (`shut_down_monitor`), six of
-    // the seven places that lose a monitor could be made to call IT instead
-    // of this function -- which compiles, passes every test, and is exactly
-    // the bug the fix round before this one removed. There is now nothing
-    // to call wrongly: a monitor can only be taken down by the code that
-    // has just removed its login entry, in the line above. Do not lift this
-    // back out; if it grows, it grows here.
-    //
-    // Dropping the helper's end of the seam is what ends a live monitor:
-    // its own end reaches end-of-file, it takes its shells down (`SIGHUP`,
-    // then `SIGKILL`) and exits, and every shell that somehow outran that
-    // dies with it through the parent-death signal each one armed before
-    // its `execve`. Its pid goes to `orphans`, because nothing here waits
-    // for it: a monitor gets the same treatment as every other child this
-    // helper has given up on (see `reap`).
-    //
-    // The channels go with it, and the worker is told so -- it is the only
-    // half that can close a channel, and one it never hears the end of is a
-    // session it waits on for ever. A channel still STARTING is refused
-    // instead, since the worker has had no answer to its `Open` yet.
-    if let Some(monitor) = state.monitors.remove(&login) {
-        drop(monitor.seam);
-        state.orphans.push(monitor.pid);
-
-        let hers: Vec<(ChannelId, bool)> = state
-            .live
-            .iter()
-            .filter(|(_, slot)| slot.login() == login)
-            .map(|(id, slot)| (*id, matches!(slot, ChannelSlot::Running(_))))
-            .collect();
-        for (id, running) in hers {
-            if running {
-                // 128 plus the signal number, the way every other signalled
-                // exit is reported: a shell of a monitor that is gone was
-                // killed, by that monitor or by the kernel on its behalf.
-                report_exit(
-                    sock,
-                    state,
-                    id,
-                    128 + nix::sys::signal::Signal::SIGKILL as i32,
-                );
-            } else {
-                let Some(pending) = state.pending.take_channel(id) else {
-                    // Not waiting on it any more -- some earlier step of
-                    // this same pass already settled it.
-                    continue;
-                };
-                let PendingWhat::Channel { master, .. } = pending.what else {
-                    continue;
-                };
-                drop(master);
-                refuse_starting_channel(
-                    sock,
-                    state,
-                    id,
-                    "the monitor of the login this channel belongs to is gone".to_string(),
-                );
+fn finish_retired(state: &mut LoopState, owner: MonitorOwner) {
+    if state.retired.contains(&owner) && !state.live.values().any(|slot| slot.owner() == owner) {
+        state.retired.remove(&owner);
+        if let Some(monitor) = state.monitors.remove(&owner) {
+            if !monitor.reaped {
+                state.orphans.push(monitor.pid);
             }
         }
     }
+}
 
-    let Some(ended) = ended else {
-        return;
-    };
-    let uid = ended.account.uid;
-    let still_has_a_live_login = state.logins.values().any(|l| l.account.uid == uid);
-    if !still_has_a_live_login {
-        state.verified.remove(&uid);
+fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
+    if state
+        .logins
+        .get(&owner.login)
+        .is_some_and(|entry| entry.incarnation == owner.incarnation)
+    {
+        let ended = state.logins.remove(&owner.login).unwrap();
+        if !state
+            .logins
+            .values()
+            .any(|entry| entry.account.uid == ended.account.uid)
+        {
+            state.verified.remove(&ended.account.uid);
+        }
+        reply(
+            sock,
+            &Response::LoginEnded {
+                login: owner.login,
+                incarnation: owner.incarnation,
+            },
+        );
     }
+    state.retired.insert(owner);
+    let ids: Vec<_> = state
+        .live
+        .iter()
+        .filter(|(_, slot)| slot.owner() == owner)
+        .map(|(id, slot)| (*id, *slot))
+        .collect();
+    for (id, slot) in ids {
+        match slot {
+            ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_) => {
+                // A reaped monitor may have queued the exact shell exit.
+                // Keep that outcome route until its buffered events or EOF
+                // are consumed; monitor death alone is not an exit verdict.
+                if !state
+                    .monitors
+                    .get(&owner)
+                    .is_some_and(|monitor| monitor.reaped)
+                {
+                    report_exit(sock, state, id, 128 + nix::libc::SIGKILL);
+                }
+            }
+            ChannelSlot::Starting(_) => {
+                if let Some(pending) = state.pending.take_channel(id) {
+                    drop(pending);
+                    refuse_starting_channel(
+                        sock,
+                        state,
+                        id,
+                        "the login ended while the channel was starting".into(),
+                    );
+                }
+            }
+            ChannelSlot::Cleaning(_) => {}
+        }
+        if state.live.contains_key(&id) && state.monitors.get(&owner).is_some_and(|m| !m.reaped) {
+            tell_monitor(sock, state, owner, &MonitorRequest::Close { id });
+            state
+                .closing
+                .entry(id)
+                .or_insert_with(|| Instant::now() + MONITOR_GRACE_PERIOD);
+        }
+    }
+    finish_retired(state, owner);
+}
 
-    // And the worker is told, because nothing else will tell it: see
-    // `Response::LoginEnded`, and this function's own docs for why the
-    // telling lives HERE rather than in any of the callers, and why the
-    // condition is "there was an entry" rather than "the entry was
-    // established" -- the narrower one is silent for exactly the logins the
-    // age sweep ends.
-    //
-    // Inside the `Some(ended)` arm, which is the whole gate: a token the
-    // helper never held is named to nobody.
-    //
-    // LAST, after the block above has reported every channel of this login
-    // as exited: the worker settles each channel's waiter first and only
-    // then hears that the session behind them is over. Nothing depends on
-    // the order today -- the worker ends the session either way -- but the
-    // other order would have it tear the session down with channel waiters
-    // still parked on answers that are already on the seam behind it.
-    reply(
-        sock,
-        &Response::LoginEnded {
-            login,
-            incarnation: ended.incarnation,
-        },
-    );
+fn detach_monitor(state: &mut LoopState, owner: MonitorOwner) {
+    if let Some(monitor) = state.monitors.remove(&owner) {
+        if !monitor.reaped {
+            state.orphans.push(monitor.pid);
+        }
+    }
 }
 
 /// A monitor that cannot serve its login any more: say why, kill it, and
@@ -2006,23 +1879,19 @@ fn forget_login(sock: &UnixStream, state: &mut LoopState, login: LoginId) {
 /// [`LoopState::monitors`] for why that is the one thing this table may
 /// never allow. The client is not stranded by this: a fresh proof admits
 /// the device again, under a login of its own.
-fn lose_monitor(sock: &UnixStream, state: &mut LoopState, login: LoginId, why: &str) {
-    let Some(pid) = state.monitors.get(&login).map(|monitor| monitor.pid) else {
-        return;
-    };
-    crate::log::warn(
-        "helper",
-        &format!(
-            "the monitor of login {:02x}{:02x}.. {why}; killing it and ending the login",
-            login[0], login[1]
-        ),
-    );
-    log_failed_kill(
-        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL),
-        pid,
-        "SIGKILL to a monitor that cannot serve",
-    );
-    forget_login(sock, state, login);
+fn lose_monitor(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner, why: &str) {
+    if let Some(monitor) = state.monitors.get(&owner) {
+        if !monitor.reaped {
+            crate::log::warn("helper", &format!("login monitor cannot serve: {why}"));
+            log_failed_kill(
+                nix::sys::signal::kill(monitor.pid, nix::sys::signal::Signal::SIGKILL),
+                monitor.pid,
+                "SIGKILL to a monitor that cannot serve",
+            );
+        }
+    }
+    detach_monitor(state, owner);
+    retire_login(sock, state, owner);
 }
 
 /// Send one request to a login's monitor. Nothing answers here: what the
@@ -2038,10 +1907,10 @@ fn lose_monitor(sock: &UnixStream, state: &mut LoopState, login: LoginId, why: &
 fn tell_monitor(
     sock: &UnixStream,
     state: &mut LoopState,
-    login: LoginId,
+    owner: MonitorOwner,
     request: &MonitorRequest,
 ) {
-    let Some(monitor) = state.monitors.get(&login) else {
+    let Some(monitor) = state.monitors.get(&owner) else {
         return;
     };
     let failed = match encode(request) {
@@ -2051,7 +1920,7 @@ fn tell_monitor(
         Err(e) => Some(e.to_string()),
     };
     if let Some(why) = failed {
-        lose_monitor(sock, state, login, &format!("could not be reached ({why})"));
+        lose_monitor(sock, state, owner, &format!("could not be reached ({why})"));
     }
 }
 
@@ -2062,126 +1931,55 @@ fn tell_monitor(
 /// pass: a monitor with a backlog cannot starve the others, and the loop
 /// comes straight back for the rest (`poll` returns at once while anything
 /// is still readable).
-fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[LoginId]) {
-    for login in ready {
-        let Some(monitor) = state.monitors.get(login) else {
-            // Gone already -- an earlier step of this same pass took it
-            // down (its login ended, or another of its events did).
+fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[MonitorOwner]) {
+    for &owner in ready {
+        let Some(monitor) = state.monitors.get(&owner) else {
             continue;
         };
         let message = match channel::recv(&monitor.seam) {
-            Ok(Some((bytes, _fd))) => bytes,
-            // The monitor closed its end, or died: either way it is gone,
-            // and so are its login and every channel of it. The LOGIN goes
-            // too, and not only the monitor -- an entry left behind would
-            // be given a monitor of its own by its next `Open`, and one
-            // login may never have two (see `LoopState::monitors`).
-            Ok(None) => {
-                crate::log::warn(
-                    "helper",
-                    &format!(
-                        "the monitor of login {:02x}{:02x}.. is gone; ending the login \
-                     and its channels",
-                        login[0], login[1]
-                    ),
-                );
-                forget_login(seams.channels, state, *login);
-                continue;
-            }
-            Err(e) => {
-                crate::log::warn(
-                    "helper",
-                    &format!(
-                        "receiving from the monitor of login {:02x}{:02x}.. failed: {e}; \
-                     ending the login",
-                        login[0], login[1]
-                    ),
-                );
-                forget_login(seams.channels, state, *login);
+            Ok(Some((bytes, fd))) if fd.is_none() => bytes,
+            _ => {
+                detach_monitor(state, owner);
+                retire_login(seams.channels, state, owner);
                 continue;
             }
         };
-        match decode::<MonitorEvent>(&message) {
-            Ok(MonitorEvent::Started { id }) => {
-                finish_channel(seams.channels, state, id, StartupReport::Started)
+        let event = match decode::<MonitorEvent>(&message) {
+            Ok(event) => event,
+            Err(_) => {
+                lose_monitor(seams.channels, state, owner, "invalid event");
+                continue;
             }
-            Ok(MonitorEvent::Failed { id, errno }) => finish_channel(
-                seams.channels,
-                state,
-                id,
-                StartupReport::Failed(nix::Error::from_raw(errno)),
-            ),
-            Ok(MonitorEvent::Exited { id, code }) => report_exit(seams.channels, state, id, code),
-            // Login session setup failed before any shell was forked.
-            // The real reason is written down HERE, in the
-            // one process that has a log (a monitor may not write to it --
-            // see `monitor`'s module docs), and the worker is told only the
-            // shared `REFUSED_REASON`: which check refused a login is
-            // exactly what a worker that has been taken over must not be
-            // able to enumerate.
-            //
-            // The monitor ends itself after saying this, so its login ends
-            // too, through the same one door every other lost monitor takes
-            // (`forget_login`, reached from the end-of-file this seam is
-            // about to reach). Nothing here has to do that: doing it twice
-            // is what leaves the two tables disagreeing.
-            Ok(MonitorEvent::Refused { id, why }) => {
-                crate::log::warn(
-                    "helper",
-                    &format!(
-                        "login session setup failed {:02x}{:02x}.. at channel {id}: \
-                     {why}; refusing the channel and ending the login",
-                        login[0], login[1]
-                    ),
-                );
+        };
+        let id = match &event {
+            MonitorEvent::Started { id }
+            | MonitorEvent::Failed { id, .. }
+            | MonitorEvent::Exited { id, .. }
+            | MonitorEvent::CleanupComplete { id, .. }
+            | MonitorEvent::Refused { id, .. }
+            | MonitorEvent::Noted { id, .. }
+            | MonitorEvent::SignalFailed { id, .. } => *id,
+        };
+        if !state
+            .live
+            .get(&id)
+            .is_some_and(|slot| slot.owner() == owner)
+        {
+            continue;
+        }
+        match event {
+            MonitorEvent::Started { id } => finish_channel(seams.channels, state, id, StartupReport::Started),
+            MonitorEvent::Failed { id, errno } => finish_channel(seams.channels, state, id,
+                StartupReport::Failed(nix::Error::from_raw(errno))),
+            MonitorEvent::Exited { id, code } => report_exit(seams.channels, state, id, code),
+            MonitorEvent::CleanupComplete { id, kind } => complete_cleanup(seams.channels, state, owner, id, kind),
+            MonitorEvent::Refused { id, why } => {
+                crate::log::warn("helper", &format!("login session setup failed {:02x}{:02x}.. at channel {id}: {why}; refusing the channel and ending the login", owner.login[0], owner.login[1]));
                 refuse_channel_outright(seams.channels, state, id);
             }
-            // The stack let this login IN and complained while doing it: an
-            // `optional` module that failed, a password about to expire.
-            // Nothing is refused -- the channel is answered exactly as it
-            // would have been -- but the line has nowhere else to go: the
-            // person logging in has no interactive side while their session
-            // is being opened, and a monitor may not write to this file
-            // itself (see `monitor`'s module docs).
-            Ok(MonitorEvent::Noted { id, what }) => crate::log::info(
-                "helper",
-                &format!(
-                    "the PAM stack of login {:02x}{:02x}.. admitted channel {id} and \
-                 said: {what}",
-                    login[0], login[1]
-                ),
-            ),
-            // A monitor could not signal its own child. `EPERM` above all,
-            // which is what a service unit that stopped granting `CAP_KILL`
-            // (spec §8.3) looks like from in there -- and what would
-            // otherwise be silent, since a monitor may not write to the log
-            // (see `monitor`'s module docs). Same wording as
-            // `log_failed_kill`, which used to say this when the helper
-            // still signalled channels itself.
-            Ok(MonitorEvent::SignalFailed { id, signal, errno }) => crate::log::warn(
-                "helper",
-                &format!(
-                    "signal {signal} to channel {id}'s process failed in the monitor of \
-                 login {:02x}{:02x}..: {} -- the process may outlive its channel (does the \
-                 service unit grant CAP_KILL?)",
-                    login[0],
-                    login[1],
-                    nix::Error::from_raw(errno)
-                ),
-            ),
-            Err(e) => {
-                // A monitor is this helper's own code, one fork away. A
-                // message that does not decode is not a monitor.
-                crate::log::warn(
-                    "helper",
-                    &format!(
-                        "the monitor of login {:02x}{:02x}.. said something that is not \
-                     an event ({e}); ending the login",
-                        login[0], login[1]
-                    ),
-                );
-                forget_login(seams.channels, state, *login);
-            }
+            MonitorEvent::Noted { id, what } => crate::log::info("helper", &format!("the PAM stack of login {:02x}{:02x}.. admitted channel {id} and said: {what}", owner.login[0], owner.login[1])),
+            MonitorEvent::SignalFailed { id, signal, errno } => crate::log::warn("helper",
+                &format!("signal {signal} to channel {id}'s process failed in the monitor of login {:02x}{:02x}..: {} -- the process may outlive its channel (does the service unit grant CAP_KILL?)", owner.login[0], owner.login[1], nix::Error::from_raw(errno))),
         }
     }
 }
@@ -2216,47 +2014,29 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
 
     // Snapshot first: `forget_login` mutates `monitors`, so mutating it
     // while iterating it directly would be a borrow conflict.
-    let monitors: Vec<(LoginId, Pid)> = state
+    let monitors: Vec<_> = state
         .monitors
         .iter()
-        .map(|(login, monitor)| (*login, monitor.pid))
+        .filter(|(_, monitor)| !monitor.reaped)
+        .map(|(owner, monitor)| (*owner, monitor.pid))
         .collect();
-    for (login, pid) in monitors {
+    for (owner, pid) in monitors {
         let gone = loop {
             match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => break true,
-                // Still running, or (should not happen -- `monitors` only
-                // ever holds pids this process itself forked) not our
-                // child.
-                Ok(_) | Err(nix::Error::ECHILD) => break false,
                 Err(nix::Error::EINTR) => continue,
-                Err(e) => {
-                    crate::log::warn("helper", &format!("waitpid({pid}) failed: {e}"));
-                    break false;
-                }
+                _ => break false,
             }
         };
         if gone {
-            crate::log::warn(
-                "helper",
-                &format!(
-                    "the monitor of login {:02x}{:02x}.. exited; ending the login and \
-                 its channels",
-                    login[0], login[1]
-                ),
-            );
-            // The LOGIN goes with it, not only the monitor: an entry left
-            // behind would be given a second monitor by its next `Open`,
-            // which is the one thing `LoopState::monitors` may never allow.
-            forget_login(sock, state, login);
-            // `forget_login` pushed this pid to `orphans`, where the sweep
-            // below finds it already reaped and drops it.
+            if let Some(monitor) = state.monitors.get_mut(&owner) {
+                monitor.reaped = true;
+            }
+            // The socket may still hold Failed + CleanupComplete. Keep reading
+            // it until EOF rather than losing the proof after the first event.
+            retire_login(sock, state, owner);
         }
     }
-    // No channel id was ever handed out for a verifying child, and a
-    // monitor's exit has already been acted on above -- so there is nothing
-    // left to report for either, only reaping to finish once each is truly
-    // gone.
     state.orphans.retain(|&pid| !reap_orphan(pid));
 
     let now = Instant::now();
@@ -2293,7 +2073,7 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
         }
     });
     for id in escalate {
-        let Some(login) = state.live.get(&id).map(ChannelSlot::login) else {
+        let Some(owner) = state.live.get(&id).map(ChannelSlot::owner) else {
             continue;
         };
         // And the login goes with its monitor -- see `lose_monitor`, and
@@ -2302,7 +2082,7 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
         lose_monitor(
             sock,
             state,
-            login,
+            owner,
             &format!(
                 "did not report channel {id} as exited within {MONITOR_GRACE_PERIOD:?} of its \
                  Close"
@@ -3055,21 +2835,75 @@ fn reap_orphan(pid: Pid) -> bool {
 /// `Open` has not been answered at all yet, and its refusal is on its way
 /// through the pending table.
 fn report_exit(sock: &UnixStream, state: &mut LoopState, id: ChannelId, code: i32) {
-    if !matches!(state.live.get(&id), Some(ChannelSlot::Running(_))) {
+    let Some(slot @ (ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_))) =
+        state.live.get(&id).copied()
+    else {
         return;
+    };
+    let owner = slot.owner();
+    state.live.insert(id, ChannelSlot::Cleaning(owner));
+    if let Some(login) = state.logins.get_mut(&owner.login) {
+        if login.incarnation == owner.incarnation {
+            login.channels.remove(&id);
+        }
+    }
+    reply(sock, &Response::Exited { id, code });
+    if matches!(slot, ChannelSlot::ReapedRunning(_)) {
+        complete_cleanup(sock, state, owner, id, super::protocol::CleanupKind::Reaped);
+    }
+}
+
+fn refuse_open(sock: &UnixStream, id: ChannelId, reason: String, fresh: bool) {
+    reply(sock, &Response::Failed { id, reason });
+    if fresh {
+        reply(
+            sock,
+            &Response::CleanupComplete {
+                id,
+                kind: super::protocol::CleanupKind::NoChild,
+            },
+        );
+    }
+}
+
+fn complete_cleanup(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    owner: MonitorOwner,
+    id: ChannelId,
+    kind: super::protocol::CleanupKind,
+) {
+    let Some(slot) = state
+        .live
+        .get(&id)
+        .copied()
+        .filter(|slot| slot.owner() == owner)
+    else {
+        return;
+    };
+    if matches!(slot, ChannelSlot::Running(_)) {
+        if kind == super::protocol::CleanupKind::Reaped {
+            state.live.insert(id, ChannelSlot::ReapedRunning(owner));
+        }
+        return;
+    }
+    if matches!(slot, ChannelSlot::ReapedRunning(_)) {
+        return;
+    }
+    if let Some(pending) = state.pending.take_channel(id) {
+        drop(pending); // retire startup callback and its descriptor before proof
+        reply(
+            sock,
+            &Response::Failed {
+                id,
+                reason: "the channel ended before startup completed".into(),
+            },
+        );
     }
     state.live.remove(&id);
     state.closing.remove(&id);
-    // A channel belongs to exactly one login; drop it from whichever one
-    // has it, mirroring the removal from `live` above. See
-    // `LoginState::channels`'s own docs for why this matters: that set is
-    // meant to answer "what does this login have open RIGHT NOW", and
-    // without this it would only ever grow, answering "what has it ever
-    // opened" instead (fix round F5).
-    for login in state.logins.values_mut() {
-        login.channels.remove(&id);
-    }
-    reply(sock, &Response::Exited { id, code });
+    reply(sock, &Response::CleanupComplete { id, kind });
+    finish_retired(state, owner);
 }
 
 fn reply<T: serde::Serialize>(sock: &UnixStream, msg: &T) {
@@ -3185,97 +3019,102 @@ fn open_channel(
     config: &HelperConfig,
     launch: &Launch<'_>,
     switches: AccountSwitches,
-) -> anyhow::Result<OwnedFd> {
+) -> Result<OwnedFd, (anyhow::Error, bool)> {
     use nix::pty::{openpty, Winsize};
 
-    let winsize = Winsize {
-        ws_row: launch.rows,
-        ws_col: launch.cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = openpty(&winsize, None).context("opening the pseudo-terminal")?;
-    // The account must own its own terminal (`give_terminal`): `openpty`
-    // gives it to whoever opened it, and that is root here.
-    give_terminal(
-        pty.slave.as_raw_fd(),
-        account.uid,
-        config.tty_gid.unwrap_or(account.gid),
-    )
-    .context("giving the terminal to the account")?;
-    if !launch.echo {
-        disable_echo(pty.master.as_fd()).context("disabling echo on the master side")?;
-    }
+    let owner = owner_for(state, login);
+    let prepared = (|| -> anyhow::Result<_> {
+        let winsize = Winsize {
+            ws_row: launch.rows,
+            ws_col: launch.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(&winsize, None).context("opening the pseudo-terminal")?;
+        // The account must own its own terminal (`give_terminal`): `openpty`
+        // gives it to whoever opened it, and that is root here.
+        give_terminal(
+            pty.slave.as_raw_fd(),
+            account.uid,
+            config.tty_gid.unwrap_or(account.gid),
+        )
+        .context("giving the terminal to the account")?;
+        if !launch.echo {
+            disable_echo(pty.master.as_fd()).context("disabling echo on the master side")?;
+        }
 
-    if !state.monitors.contains_key(&login) {
-        // The terminal's name, for the `PAM_TTY` of the session the monitor
-        // opens. Taken from the FIRST channel of the login, which is the one
-        // whose monitor -- and whose session -- this is; a later channel
-        // gets a terminal of its own that the session never hears about
-        // (spec §9 `tty-first-channel`).
-        let tty = nix::unistd::ttyname(pty.slave.as_fd())
-            .context("reading the name of the channel's terminal")?;
-        // No test of this crate may fork a monitor that reads the MACHINE's
-        // `/etc/pam.d`. Nothing structural stopped one: a fixture built
-        // with `pam_confdir: None` would open its channels against the
-        // host's policy and pass or fail by it. Proven not to fire today --
-        // replacing the non-test branch of `monitor::start_transaction` with
-        // a process that dies leaves all 360 tests green and its marker
-        // unwritten -- so this is a latch on a door nobody is at, put there
-        // because the cost of noticing later is a green suite that tests
-        // the wrong machine.
-        #[cfg(test)]
-        assert!(
+        if !state.monitors.contains_key(&owner) {
+            // The terminal's name, for the `PAM_TTY` of the session the monitor
+            // opens. Taken from the FIRST channel of the login, which is the one
+            // whose monitor -- and whose session -- this is; a later channel
+            // gets a terminal of its own that the session never hears about
+            // (spec §9 `tty-first-channel`).
+            let tty = nix::unistd::ttyname(pty.slave.as_fd())
+                .context("reading the name of the channel's terminal")?;
+            // No test of this crate may fork a monitor that reads the MACHINE's
+            // `/etc/pam.d`. Nothing structural stopped one: a fixture built
+            // with `pam_confdir: None` would open its channels against the
+            // host's policy and pass or fail by it. Proven not to fire today --
+            // replacing the non-test branch of `monitor::start_transaction` with
+            // a process that dies leaves all 360 tests green and its marker
+            // unwritten -- so this is a latch on a door nobody is at, put there
+            // because the cost of noticing later is a green suite that tests
+            // the wrong machine.
+            #[cfg(test)]
+            assert!(
             config.pam_confdir.is_some(),
             "a test that forks a monitor must point it at a PAM stack of its own; with None it \
              would read the machine's /etc/pam.d and pass or fail by the host's policy"
         );
-        let plan = MonitorPlan {
-            account: account.clone(),
-            login,
-            tty: tty
-                .into_os_string()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("the terminal's name is not UTF-8"))?,
-            rhost: state
-                .logins
-                .get(&login)
-                .map(|entry| entry.rhost.clone())
-                .unwrap_or_default(),
-            pam_service: config.pam_service.clone(),
-            #[cfg(test)]
-            pam_confdir: config.pam_confdir.clone(),
-            become_account: switches.become_account,
-            session_group_ops: switches.session_group_ops,
-            fd_limit: max_open_descriptors(),
-            // The monitor's share of this channel's own budget. The session
-            // it is about to open opens INSIDE this `Open`, so a stack that
-            // takes longer than the helper is prepared to wait for the
-            // channel has already lost that channel -- and the monitor that
-            // is still waiting for it is a root process outliving whatever
-            // the helper decides in the meantime, its login included. See
-            // `MonitorPlan::session_budget` and `monitor::SessionDeadline`.
-            session_budget: config.startup_timeout,
-            // Twice that, and the reason the two are separate fields is in
-            // the field's own docs: a close abandoned half-way loses work
-            // that might still have succeeded, while an open abandoned
-            // half-way loses work that had not started.
-            session_close_budget: config.startup_timeout.saturating_mul(2),
-        };
-        let monitor = fork_monitor(plan).context("forking the login's monitor")?;
-        state.monitors.insert(login, monitor);
-    }
+            let plan = MonitorPlan {
+                account: account.clone(),
+                login,
+                tty: tty
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("the terminal's name is not UTF-8"))?,
+                rhost: state
+                    .logins
+                    .get(&login)
+                    .map(|entry| entry.rhost.clone())
+                    .unwrap_or_default(),
+                pam_service: config.pam_service.clone(),
+                #[cfg(test)]
+                pam_confdir: config.pam_confdir.clone(),
+                become_account: switches.become_account,
+                session_group_ops: switches.session_group_ops,
+                fd_limit: max_open_descriptors(),
+                // The monitor's share of this channel's own budget. The session
+                // it is about to open opens INSIDE this `Open`, so a stack that
+                // takes longer than the helper is prepared to wait for the
+                // channel has already lost that channel -- and the monitor that
+                // is still waiting for it is a root process outliving whatever
+                // the helper decides in the meantime, its login included. See
+                // `MonitorPlan::session_budget` and `monitor::SessionDeadline`.
+                session_budget: config.startup_timeout,
+                // Twice that, and the reason the two are separate fields is in
+                // the field's own docs: a close abandoned half-way loses work
+                // that might still have succeeded, while an open abandoned
+                // half-way loses work that had not started.
+                session_close_budget: config.startup_timeout.saturating_mul(2),
+            };
+            let monitor = fork_monitor(plan).context("forking the login's monitor")?;
+            state.monitors.insert(owner, monitor);
+        }
 
-    let request = MonitorRequest::Open {
-        id: launch.id,
-        term: launch.term.map(str::to_string),
-        shell: launch.shell,
-        command: launch.command.to_string(),
-    };
-    let bytes = encode(&request).context("encoding the monitor's request")?;
+        let request = MonitorRequest::Open {
+            id: launch.id,
+            term: launch.term.map(str::to_string),
+            shell: launch.shell,
+            command: launch.command.to_string(),
+        };
+        let bytes = encode(&request).context("encoding the monitor's request")?;
+        Ok((pty, bytes))
+    })();
+    let (pty, bytes) = prepared.map_err(|error| (error, true))?;
     let monitor = state
         .monitors
-        .get(&login)
+        .get(&owner)
         .expect("the monitor was just put on file");
     if let Err(e) = channel::send(&monitor.seam, &bytes, Some(pty.slave.as_fd())) {
         // The monitor cannot be reached, so this channel can never start --
@@ -3287,10 +3126,13 @@ fn open_channel(
         lose_monitor(
             sock,
             state,
-            login,
+            owner,
             &format!("could not be asked for a channel ({e})"),
         );
-        anyhow::bail!("the login's monitor could not be reached: {e}");
+        return Err((
+            anyhow::anyhow!("the login's monitor could not be reached: {e}"),
+            false,
+        ));
     }
     // Ours is closed now that the monitor has a copy of its own: a slave
     // side still open here would keep the terminal from ever hanging up
@@ -3374,6 +3216,7 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
         ForkResult::Parent { child } => {
             drop(monitor_end);
             Ok(Monitor {
+                reaped: false,
                 seam: helper_end,
                 pid: child,
             })
@@ -3758,6 +3601,13 @@ fn apply_channel_verdict(
     else {
         return;
     };
+    let Some(ChannelSlot::Starting(owner)) = state.live.get(&id).copied() else {
+        return;
+    };
+    if owner.login != login {
+        return;
+    }
+    let cancelled = cancelled || state.retired.contains(&owner);
     match report {
         StartupReport::Started if cancelled => {
             // `Request::Close` reached this channel while it was still
@@ -3777,7 +3627,7 @@ fn apply_channel_verdict(
             // pseudo-terminal with no channel id, closed by nobody. The
             // monitor is asked again, since only it can signal its own
             // child, and it escalates to `SIGKILL` on its own grace.
-            tell_monitor(channels, state, login, &MonitorRequest::Close { id });
+            tell_monitor(channels, state, owner, &MonitorRequest::Close { id });
             drop(master);
             refuse_starting_channel(
                 channels,
@@ -3790,7 +3640,7 @@ fn apply_channel_verdict(
             // The slot the `Open` reserved becomes a running channel: only
             // from here may an `Exited` be reported for this id at all --
             // see `ChannelSlot`.
-            state.live.insert(id, ChannelSlot::Running(login));
+            state.live.insert(id, ChannelSlot::Running(owner));
             match state.logins.get_mut(&login) {
                 Some(entry) => {
                     // Only now, once the channel is really open -- never
@@ -3847,7 +3697,7 @@ fn apply_channel_verdict(
             // it, which is the only way this process can reach another
             // process's child; if the monitor is what is wedged, the
             // escalation in `reap` reaches the monitor itself.
-            tell_monitor(channels, state, login, &MonitorRequest::Close { id });
+            tell_monitor(channels, state, owner, &MonitorRequest::Close { id });
             crate::log::warn(
                 "helper",
                 &format!(
@@ -3867,7 +3717,7 @@ fn apply_channel_verdict(
 }
 
 /// What a failed start and a start that never reported have in common: the
-/// id goes back and the worker is told why. The login entry is left alone
+/// worker is told why while the exact cleanup slot stays charged. The login entry is left alone
 /// -- this request never created it (see `LoopState::logins`), and it stays
 /// provisional unless some other channel really opened under it, so the
 /// grace still bounds it.
@@ -3882,19 +3732,12 @@ fn refuse_starting_channel(
     id: ChannelId,
     reason: String,
 ) {
-    // The id is free again only now: from the request to this line a second
-    // `Open` naming it was refused, which is the whole point of reserving
-    // it early (see `ChannelSlot`).
-    state.live.remove(&id);
-    // And no escalation is owed for a channel that never opened: a `Close`
-    // that arrived while it was starting has been answered by this refusal.
-    // `reap`'s own `retain` would drop this entry on its next pass anyway;
-    // what this line adds is that the id cannot carry an old deadline into
-    // a NEW channel the worker opens under the same number before that pass
-    // runs. NOT pinned by a test -- the window is a few milliseconds wide
-    // and not reachable on demand -- so this is reasoning, not coverage:
-    // treat it as load-bearing when you edit it.
-    state.closing.remove(&id);
+    // Failed is an outcome, not cleanup. Keep the exact owner and any
+    // existing close/escalation deadline until its terminal receipt arrives.
+    // This connection never reuses the numeric ID, even after cleanup.
+    if let Some(slot) = state.live.get_mut(&id) {
+        *slot = ChannelSlot::Cleaning(slot.owner());
+    }
     reply(channels, &Response::Failed { id, reason });
 }
 
@@ -6235,7 +6078,7 @@ pub(crate) mod tests {
         /// and the same production functions applied to whatever spoke.
         fn one_pass(&self, state: &mut LoopState, config: &HelperConfig) {
             let report_fds = state.pending.poll_fds();
-            let monitor_logins: Vec<LoginId> = state.monitors.keys().copied().collect();
+            let monitor_logins: Vec<MonitorOwner> = state.monitors.keys().copied().collect();
             let mut fds: Vec<PollFd> = Vec::with_capacity(report_fds.len() + monitor_logins.len());
             for fd in &report_fds {
                 // SAFETY: as in `serve`'s own loop -- every number came
@@ -6266,7 +6109,7 @@ pub(crate) mod tests {
                 .filter(|(_, polled)| polled.any().unwrap_or(true))
                 .map(|(fd, _)| *fd)
                 .collect();
-            let ready_monitors: Vec<LoginId> = monitor_logins
+            let ready_monitors: Vec<MonitorOwner> = monitor_logins
                 .iter()
                 .zip(&fds[report_fds.len()..])
                 .filter(|(_, polled)| polled.any().unwrap_or(true))
@@ -6275,6 +6118,35 @@ pub(crate) mod tests {
             settle_ready_pending(self.seams(), state, config, &ready);
             serve_ready_monitors(self.seams(), state, &ready_monitors);
             expire_pending(self.seams(), state, config, Instant::now());
+        }
+    }
+
+    fn await_cleanup(
+        seam: &DirectSeam,
+        state: &mut LoopState,
+        config: &HelperConfig,
+        id: ChannelId,
+    ) {
+        let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        while state.live.contains_key(&id) {
+            assert!(
+                Instant::now() < deadline,
+                "channel {id} never produced cleanup proof"
+            );
+            seam.one_pass(state, config);
+            reap(&seam.helper, state);
+        }
+        loop {
+            let (response, fd) = next_response(&seam.worker);
+            assert!(fd.is_none(), "cleanup never returns a terminal");
+            match response {
+                Response::CleanupComplete {
+                    id: actual,
+                    kind: super::super::protocol::CleanupKind::Reaped,
+                } if actual == id => break,
+                Response::LoginEnded { .. } | Response::Exited { .. } => {}
+                other => panic!("expected exact Reaped after outcome, got {other:?}"),
+            }
         }
     }
 
@@ -6290,7 +6162,7 @@ pub(crate) mod tests {
     fn stop_monitors(state: &mut LoopState) {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
-        let monitors: Vec<Pid> = state
+        let mut monitors: Vec<Pid> = state
             .monitors
             .drain()
             .map(|(_, monitor)| {
@@ -6299,6 +6171,7 @@ pub(crate) mod tests {
                 monitor.pid
             })
             .collect();
+        monitors.append(&mut state.orphans);
         let give_up_at = Instant::now() + TEST_RECV_TIMEOUT;
         for pid in monitors {
             loop {
@@ -6383,6 +6256,8 @@ pub(crate) mod tests {
             verified: HashMap::from([(account.uid, account.clone())]),
             logins,
             monitors: HashMap::new(),
+            retired: HashSet::new(),
+            highest_channel_id: 0,
             next_incarnation: 1,
         }
     }
@@ -6444,6 +6319,8 @@ pub(crate) mod tests {
             verified: HashMap::new(),
             logins: HashMap::new(),
             monitors: HashMap::new(),
+            retired: HashSet::new(),
+            highest_channel_id: 0,
             next_incarnation: 1,
         }
     }
@@ -8218,9 +8095,12 @@ pub(crate) mod tests {
         helper_end
             .set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("bounded read");
+        let monitor_owner = owner_for(&state, login);
+        state.live.insert(1, ChannelSlot::Running(monitor_owner));
         state.monitors.insert(
-            login,
+            monitor_owner,
             Monitor {
+                reaped: false,
                 seam: helper_end,
                 pid: Pid::from_raw(i32::MAX),
             },
@@ -8233,7 +8113,7 @@ pub(crate) mod tests {
         super::channel::send(&monitor_stub, &encode(&event).expect("encode"), None).expect("send");
 
         let seam = DirectSeam::new();
-        serve_ready_monitors(seam.seams(), &mut state, &[login]);
+        serve_ready_monitors(seam.seams(), &mut state, &[monitor_owner]);
 
         let log = std::fs::read_to_string(dir.path().join("qshd.log")).unwrap_or_default();
         assert!(
@@ -8431,9 +8311,10 @@ pub(crate) mod tests {
         // repeated-id check only looks at whether `state.live` has this
         // key, never at what it maps to.
         let occupied_id = 999;
-        state
-            .live
-            .insert(occupied_id, ChannelSlot::Running(login_token(0)));
+        state.live.insert(
+            occupied_id,
+            ChannelSlot::Running(owner_for(&state, login_token(0))),
+        );
         let unproved = login_token(1);
 
         let (refused, fd) = call_channel_seam_once(
@@ -8502,7 +8383,6 @@ pub(crate) mod tests {
         let other = [8u8; 16];
         let now = Instant::now();
         let mut state = empty_state();
-        state.live.insert(1, ChannelSlot::Running(login));
         state.logins = HashMap::from([
             (login, login_entry(&account, now, true, &[1])),
             // A SECOND login, with an open channel of its own. An
@@ -8514,6 +8394,9 @@ pub(crate) mod tests {
             // pinning here.
             (other, login_entry(&account, now, true, &[2])),
         ]);
+        state
+            .live
+            .insert(1, ChannelSlot::Running(owner_for(&state, login)));
         let (sock, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("bounded read");
@@ -8521,8 +8404,8 @@ pub(crate) mod tests {
         report_exit(&sock, &mut state, 1, 0);
 
         assert!(
-            !state.live.contains_key(&1),
-            "setup: report_exit must remove the exited channel from live"
+            matches!(state.live.get(&1), Some(ChannelSlot::Cleaning(_))),
+            "the exit outcome retains a cleanup slot until its receipt"
         );
         assert!(
             state.logins.get(&login).expect("entry").channels.is_empty(),
@@ -8660,7 +8543,9 @@ pub(crate) mod tests {
             .insert(login, login_entry(&account, origin, false, &[]));
         // A channel id occupied with no real process behind it -- the
         // repeated-id check only looks at whether `state.live` has the key.
-        state.live.insert(1, ChannelSlot::Running(login));
+        state
+            .live
+            .insert(1, ChannelSlot::Running(owner_for(&state, login)));
 
         let (refused, fd) =
             call_channel_seam_once(&mut state, &open_request(1, account.uid.as_raw(), login));
@@ -8826,7 +8711,7 @@ pub(crate) mod tests {
             matches!(state.live.get(&1), Some(ChannelSlot::Starting(_))),
             "setup: the request must have reserved the id"
         );
-        let monitor = state.monitors[&login].pid;
+        let monitor = state.monitors[&owner_for(&state, login)].pid;
         let shell = wait_until_child_of(monitor, "the monitor must fork a shell for this Open");
 
         seam.settle(&mut state, &config);
@@ -8838,8 +8723,8 @@ pub(crate) mod tests {
         );
         assert!(fd.is_none(), "a refusal must not hand back a terminal");
         assert!(
-            !state.live.contains_key(&1),
-            "and the id it was holding must be free again"
+            matches!(state.live.get(&1), Some(ChannelSlot::Cleaning(_))),
+            "the failed outcome must retain its cleanup registration"
         );
         assert!(
             state.logins.get(&login).is_some_and(|l| !l.established),
@@ -8860,6 +8745,7 @@ pub(crate) mod tests {
             "a shell that missed its channel's startup deadline must be ended, not merely \
              refused",
         );
+        await_cleanup(&seam, &mut state, &config, 1);
         stop_monitors(&mut state);
     }
 
@@ -9050,8 +8936,10 @@ pub(crate) mod tests {
     #[test]
     fn an_exit_for_a_channel_that_is_still_starting_is_not_reported() {
         let login = [3u8; 16];
-        let mut state = filled_state(&my_account(), 0);
-        state.live.insert(1, ChannelSlot::Starting(login));
+        let mut state = state_with_login(&my_account(), login);
+        state
+            .live
+            .insert(1, ChannelSlot::Starting(owner_for(&state, login)));
         let (sock, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(Duration::from_millis(200)))
             .expect("bounded read");
@@ -9183,7 +9071,7 @@ pub(crate) mod tests {
             matches!(state.live.get(&1), Some(ChannelSlot::Starting(_))),
             "setup: the request must have reserved the id"
         );
-        let monitor = state.monitors[&login].pid;
+        let monitor = state.monitors[&owner_for(&state, login)].pid;
         let shell = wait_until_child_of(monitor, "the monitor must fork a shell for this Open");
         assert!(
             state.logins.contains_key(&login),
@@ -9222,13 +9110,15 @@ pub(crate) mod tests {
             "and must not hand a terminal to a login that is over"
         );
         assert!(
-            !state.live.contains_key(&1),
-            "and its id must be free again"
+            matches!(state.live.get(&1), Some(ChannelSlot::Cleaning(_))),
+            "the failed outcome must retain its cleanup registration"
         );
+        await_cleanup(&seam, &mut state, &test_config(), 1);
         assert!(
             state.monitors.is_empty(),
             "and the login's monitor must be gone with its entry"
         );
+        stop_monitors(&mut state);
         wait_until_process_gone(
             shell,
             "a start cancelled because its login ended must be ended too, or it holds a terminal \
@@ -9404,7 +9294,7 @@ pub(crate) mod tests {
         );
         let served = state
             .monitors
-            .get(&login)
+            .get(&owner_for(&state, login))
             .map(|monitor| monitor.pid)
             .expect("control: an Open must fork a monitor for its login");
         assert!(
@@ -9412,7 +9302,13 @@ pub(crate) mod tests {
             "control: and that monitor must be running"
         );
         seam.settle(&mut state, &config);
+        let (opened, terminal) = next_response(&seam.worker);
+        assert!(matches!(opened, Response::Opened { id: 1 }));
+        assert!(terminal.is_some(), "control must actually open a terminal");
+        drop(terminal);
         forget_login(&seam.helper, &mut state, login);
+        await_cleanup(&seam, &mut state, &config, 1);
+        stop_monitors(&mut state);
         wait_until_process_gone(served, "control: the monitor must end with its login");
 
         // And now the same `Open`, with the monitor's body panicking.
@@ -9426,7 +9322,7 @@ pub(crate) mod tests {
         );
         let monitor = state
             .monitors
-            .get(&login)
+            .get(&owner_for(&state, login))
             .map(|monitor| monitor.pid)
             .expect("setup: the Open must fork a monitor");
 
@@ -9746,8 +9642,8 @@ pub(crate) mod tests {
         // it, so nothing here is a shortcut past the check under test.
         finish_channel(&seam.helper, &mut state, 1, StartupReport::Started);
         assert!(
-            !state.live.contains_key(&1),
-            "a late Started must not put the channel back"
+            matches!(state.live.get(&1), Some(ChannelSlot::Cleaning(_))),
+            "a late Started must not revive the cleaned-up outcome"
         );
         seam.worker
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -9765,6 +9661,7 @@ pub(crate) mod tests {
             "a channel the helper gave up on must have its shell ended -- and this one ignores \
              the hang-up, so only the Close that goes with the refusal can do it",
         );
+        await_cleanup(&seam, &mut state, &config, 1);
         stop_monitors(&mut state);
     }
 
@@ -9874,10 +9771,11 @@ pub(crate) mod tests {
             "and must not hand back the terminal of a process that is already dead"
         );
         assert!(
-            !state.live.contains_key(&1),
-            "and its id must be free again"
+            matches!(state.live.get(&1), Some(ChannelSlot::Cleaning(_))),
+            "the failed outcome must retain its cleanup registration"
         );
 
+        await_cleanup(&seam, &mut state, &test_config(), 1);
         stop_monitors(&mut state);
     }
 
@@ -15096,4 +14994,28 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+
+    #[test]
+    fn open24_failed_start_retains_its_cleanup_registration() {
+        let login = [91; 16];
+        let mut state = state_with_login(&my_account(), login);
+        state
+            .live
+            .insert(101, ChannelSlot::Starting(owner_for(&state, login)));
+        let (helper, worker) = quiet_seam();
+        worker.set_read_timeout(Some(TEST_RECV_TIMEOUT)).unwrap();
+        refuse_starting_channel(&helper, &mut state, 101, "fixture refused".into());
+        assert_eq!(
+            next_response(&worker).0,
+            Response::Failed {
+                id: 101,
+                reason: "fixture refused".into()
+            }
+        );
+        assert!(
+            state.live.contains_key(&101),
+            "a startup verdict must not release the slot before a cleanup receipt"
+        );
+    }
+    include!("server_open_tests.rs");
 }

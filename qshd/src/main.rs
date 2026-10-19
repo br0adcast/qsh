@@ -964,7 +964,9 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         // start-up path. `personal` sweeps away staged files an update that
         // never finished left behind -- all but the one this process may be
         // running from, should its rename have failed.
+        let opens = backend.open_registry();
         backend = backend.with_daemon(Arc::new(update::DaemonSelf::personal(
+            opens,
             None,
             start.binary_path.clone(),
             nix::unistd::Uid::current().as_raw(),

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use transport::auth::Principal;
 use transport::channel::OpenRequest;
-use transport::channel_server::{ChannelSpawner, SpawnedChannel};
+use transport::channel_server::ChannelSpawner;
 use transport::session_manager::{
     BackendFactory, ForgetNothing, LoginEndedReports, LoginId, RandomNonces, ServerAuth,
     SessionManager,
@@ -25,24 +25,30 @@ const HOSTILE: &str = "access denied — résumé 中文 | \x1b]0;QSH_REFUSAL_TI
 const SAFE: &str = "access denied — résumé 中文 | ?]0;QSH_REFUSAL_TITLE? | ?]52;c;UVNIX1JFRlVTQUw=?\\ | ?[2J?[3;4HQSH_REFUSAL_CURSOR | ?0;QSH_REFUSAL_C1??2J | ??? | one forged line end";
 
 struct RefusingSpawner {
+    opens: Arc<transport::channel_open::ChannelOpenRegistry>,
     reason: String,
     identity: String,
     calls: Arc<AtomicUsize>,
 }
 
 impl ChannelSpawner for RefusingSpawner {
+    fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+        self.opens.clone()
+    }
     fn spawn(
         &self,
         owner: &Principal,
         _login: LoginId,
         _request: &OpenRequest,
         _term: Option<&str>,
-    ) -> Result<SpawnedChannel, String> {
+        custody: &transport::channel_open::OpenCustody,
+    ) -> Result<transport::channel_open::UninstalledChannel, transport::channel_open::SpawnFailure>
+    {
         assert_eq!(owner.uid, 4242);
         assert_eq!(owner.name, "refusal-test");
         assert_eq!(owner.identity, self.identity);
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(self.reason.clone())
+        Err(custody.refuse_before_creation(self.reason.clone()))
     }
 }
 
@@ -74,6 +80,7 @@ fn start_peer(
     let reason = reason.to_owned();
     let calls = Arc::new(AtomicUsize::new(0));
     let spawner = RefusingSpawner {
+        opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
         reason,
         identity,
         calls: calls.clone(),

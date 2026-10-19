@@ -30,10 +30,36 @@ Authenticated aliases sharing a uid share its owner pool. Limits are independent
 An OPEN reserves before allocating. A resize reserves the new retained envelope
 and scratch before changing the PTY or emulator; cancellation releases the
 provisional reservation. Commit releases scratch only. Shrinking does not refund
-historical capacity. A close/drop releases the lease. Refused OPEN/RESIZE_REQUEST
+historical capacity. Installed model destruction releases its lease. An uninstalled
+open retains its model lease until cleanup is proved, as described below. Refused OPEN/RESIZE_REQUEST
 requests leave existing models intact and report the refusal. A shrink can need more
 scratch than a grow, and valid dimensions do not guarantee budget admission.
 These are finite storage reservations, **not practical host-memory limits**.
+
+## Outstanding channel creation
+
+Before scheduling a blocking constructor, the daemon admits at most **32 open
+jobs globally and 8 per authenticated numeric uid**. Aliases of the same uid
+share that limit. A session counts installed channels and unresolved opens
+together against its eight-channel limit. Saturation refuses immediately;
+there is no queue of tasks waiting for capacity. Construction and uninstalled
+cleanup do not block the session loop or another session's control traffic.
+
+A cancelled, failed or abandoned constructor keeps its capacity, child custody,
+model and single screen lease until its owner proves either that no child was
+created or that the exact child was reaped. A timeout, EOF, failed response,
+process exit notification or Close request is not that proof. Unknown cleanup
+therefore remains charged across runner replacement; it can reduce available
+capacity indefinitely. The helper separately bounds live plus retired login
+accounting to 256 entries, with at most 16 channel lifecycles per login. A retired
+entry keeps the receipt route until cleanup is proved; it is not an unbounded
+history of login IDs.
+
+A daemon restart cancels uninstalled jobs and fences new admission and adoption.
+The actual exec barrier shares the existing drain deadline and refuses replacement
+while any such cleanup remains unresolved, even with no running session loop.
+Successful adoption transfers ownership once to the installed channel; these
+rules do not add a broader process-group shutdown guarantee for installed jobs.
 
 ## Resize outcomes and retained output
 

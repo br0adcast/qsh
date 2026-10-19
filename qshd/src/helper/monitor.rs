@@ -1171,7 +1171,15 @@ fn serve_request(
                         // the shared `server::REFUSED_REASON`; the real
                         // reason travels in `why`, for the helper's log,
                         // because this process may not write to it.
+                        drop(slave); // no startup descriptor may outlive the proof
                         tell(seam, &MonitorEvent::Refused { id, why });
+                        tell(
+                            seam,
+                            &MonitorEvent::CleanupComplete {
+                                id,
+                                kind: super::protocol::CleanupKind::NoChild,
+                            },
+                        );
                         return false;
                     }
                 }
@@ -1200,13 +1208,23 @@ fn serve_request(
                     report: Some(report),
                     started: false,
                 }),
-                Err(errno) => tell(
-                    seam,
-                    &MonitorEvent::Failed {
-                        id,
-                        errno: errno as i32,
-                    },
-                ),
+                Err(errno) => {
+                    // All fork_shell Err branches precede successful fork.
+                    tell(
+                        seam,
+                        &MonitorEvent::Failed {
+                            id,
+                            errno: errno as i32,
+                        },
+                    );
+                    tell(
+                        seam,
+                        &MonitorEvent::CleanupComplete {
+                            id,
+                            kind: super::protocol::CleanupKind::NoChild,
+                        },
+                    );
+                }
             }
         }
         MonitorRequest::Close { id } => {
@@ -1284,8 +1302,9 @@ fn reap_shells(
 ) {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
-    let mut gone: Vec<usize> = Vec::new();
-    for (index, shell) in shells.iter().enumerate() {
+    let mut index = 0;
+    while index < shells.len() {
+        let shell = &shells[index];
         // A shell whose startup has not been read yet is left alone, even
         // if it has already exited: reaping it here would take its exit
         // before its START has been reported, and the helper would be told
@@ -1299,6 +1318,7 @@ fn reap_shells(
         // in `report_startups` and reaps here, in that order, with no wait
         // in between.
         if shell.report.is_some() {
+            index += 1;
             continue;
         }
         let code = loop {
@@ -1313,8 +1333,12 @@ fn reap_shells(
                 Err(_) => break None,
             }
         };
-        let Some(code) = code else { continue };
-        gone.push(index);
+        let Some(code) = code else {
+            index += 1;
+            continue;
+        };
+        // Retire local callbacks/ownership before publishing the exact proof.
+        let shell = shells.remove(index);
         closing.remove(&shell.id);
         // Only for a shell the helper was told had started: one whose start
         // failed has already been answered, and a second answer for one
@@ -1322,9 +1346,13 @@ fn reap_shells(
         if shell.started {
             tell(seam, &MonitorEvent::Exited { id: shell.id, code });
         }
-    }
-    for index in gone.into_iter().rev() {
-        shells.remove(index);
+        tell(
+            seam,
+            &MonitorEvent::CleanupComplete {
+                id: shell.id,
+                kind: super::protocol::CleanupKind::Reaped,
+            },
+        );
     }
 }
 
@@ -2298,6 +2326,119 @@ mod tests {
             !read_log().contains("after the sweep"),
             "a muted process must write nothing at all; the log is:\n{}",
             read_log()
+        );
+    }
+
+    // This guard owns only this fixture's direct child. ECHILD means it must
+    // never signal that numeric PID again; it is not a product cleanup proof.
+    struct Open24OwnedChild(Pid);
+    impl Drop for Open24OwnedChild {
+        fn drop(&mut self) {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            match waitpid(self.0, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {
+                    let _ = nix::sys::signal::kill(self.0, Signal::SIGKILL);
+                    loop {
+                        match waitpid(self.0, None) {
+                            Err(nix::Error::EINTR) => continue,
+                            Ok(_) | Err(nix::Error::ECHILD) => break,
+                            Err(error) => panic!("fixture wait failed: {error}"),
+                        }
+                    }
+                }
+                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) | Err(nix::Error::ECHILD) => {
+                }
+                other => panic!("unexpected fixture wait result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn open24_failed_start_reports_cleanup_only_after_exact_reap() {
+        let (helper, monitor) = channel::pair().unwrap();
+        helper.set_nonblocking(true).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read marker; exit 7"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let owned = Open24OwnedChild(pid);
+        let (report_read, report_write) = nix::unistd::pipe().unwrap();
+        let raw_report = report_read.as_raw_fd();
+        nix::unistd::write(&report_write, &(nix::Error::EACCES as i32).to_ne_bytes()).unwrap();
+        drop(report_write);
+        let mut shells = vec![Shell {
+            id: 101,
+            pid,
+            report: Some(report_read),
+            started: false,
+        }];
+        report_startups(&monitor, &mut shells, &[raw_report]);
+        let (bytes, fd) = channel::recv(&helper).unwrap().unwrap();
+        assert!(fd.is_none());
+        assert_eq!(
+            decode::<MonitorEvent>(&bytes).unwrap(),
+            MonitorEvent::Failed {
+                id: 101,
+                errno: nix::Error::EACCES as i32
+            }
+        );
+        assert!(shells[0].report.is_none());
+        let mut closing = HashMap::new();
+        reap_shells(&monitor, &mut shells, &mut closing);
+        assert_eq!(shells.len(), 1, "the pipe barrier keeps the child alive");
+        assert!(matches!(channel::recv(&helper), Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shells.is_empty() {
+            reap_shells(&monitor, &mut shells, &mut closing);
+            assert!(Instant::now() < deadline, "owned child was not reaped");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            child.wait().unwrap_err().raw_os_error(),
+            Some(nix::libc::ECHILD),
+            "the product monitor already reaped this exact child"
+        );
+        drop(owned);
+        // Raw JSON keeps this behavioral RED independent of the new enum's
+        // compile-time presence. A failed startup never gets installed Exited.
+        let message = channel::recv(&helper)
+            .expect("exact reap must send a cleanup receipt")
+            .expect("the fixture peer remains open");
+        assert!(message.1.is_none());
+        let value: serde_json::Value = serde_json::from_slice(&message.0).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "CleanupComplete": { "id": 101, "kind": "Reaped" }
+            })
+        );
+        reap_shells(&monitor, &mut shells, &mut closing);
+        assert!(matches!(channel::recv(&helper), Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+    #[test]
+    fn open24_echild_is_not_a_cleanup_receipt() {
+        let (helper, monitor) = channel::pair().unwrap();
+        helper.set_nonblocking(true).unwrap();
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        child.wait().unwrap(); // the monitor did not reap this child
+        let mut shells = vec![Shell {
+            id: 102,
+            pid,
+            report: None,
+            started: true,
+        }];
+        reap_shells(&monitor, &mut shells, &mut HashMap::new());
+        assert_eq!(shells.len(), 1, "missing ownership remains unknown");
+        assert!(
+            matches!(channel::recv(&helper), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
 }

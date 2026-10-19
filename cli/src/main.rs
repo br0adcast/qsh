@@ -1792,6 +1792,7 @@ fn set_stderr_aside(raw: &tty::RawMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("async_open_tests.rs");
 
     fn geometry_session() -> Session {
         Session::new(
