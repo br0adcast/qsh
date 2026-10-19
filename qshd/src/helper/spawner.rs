@@ -874,12 +874,19 @@ impl HelperChannelSpawner {
         // that has never been used before, for as long as the connection
         // lasts.
         let tx = self.tx.lock().expect("the helper socket is never poisoned");
-        let id = self
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| {
+        let mut id = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).ok_or_else(|| {
                 custody.refuse_before_creation("helper channel identity exhausted".into())
             })?;
+            match self
+                .next_id
+                .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
 
         let request = Request::Open {
             id,
