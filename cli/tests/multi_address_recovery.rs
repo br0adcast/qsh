@@ -28,6 +28,76 @@ fn wait_network(mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
+#[cfg(target_os = "linux")]
+fn fixture_status_after_readiness(
+    mut request: impl FnMut() -> qshd::control::ControlReply,
+    mut wait_before_retry: impl FnMut() -> bool,
+) -> Option<String> {
+    loop {
+        match request() {
+            qshd::control::ControlReply::Answered(line) => return Some(line),
+            qshd::control::ControlReply::NoDaemon | qshd::control::ControlReply::TimedOut => {
+                if !wait_before_retry() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_readiness_retries_delayed_status_before_using_its_answer() {
+    use qshd::control::ControlReply;
+    let mut replies = std::collections::VecDeque::from([
+        ControlReply::TimedOut,
+        ControlReply::NoDaemon,
+        ControlReply::Answered("ready status".into()),
+    ]);
+    let mut waits = 0;
+    let answer = fixture_status_after_readiness(
+        || replies.pop_front().expect("no request after readiness"),
+        || {
+            waits += 1;
+            assert!(waits <= 2);
+            true
+        },
+    );
+    assert_eq!(answer.as_deref(), Some("ready status"));
+    assert_eq!(waits, 2);
+    assert!(replies.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_readiness_stops_when_the_setup_deadline_expires() {
+    let mut requests = 0;
+    let mut checks = 0;
+    let answer = fixture_status_after_readiness(
+        || {
+            requests += 1;
+            qshd::control::ControlReply::TimedOut
+        },
+        || {
+            checks += 1;
+            checks < 3
+        },
+    );
+    assert_eq!(answer, None);
+    assert_eq!(requests, 3, "all pre-deadline retries are eligible");
+    assert_eq!(checks, 3, "no request may follow deadline exhaustion");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_readiness_does_not_wait_after_an_immediate_answer() {
+    let answer = fixture_status_after_readiness(
+        || qshd::control::ControlReply::Answered("already ready".into()),
+        || panic!("ready fixture must not consume another wait"),
+    );
+    assert_eq!(answer.as_deref(), Some("already ready"));
+}
+
 struct Session {
     client: Client,
     output: Arc<Mutex<Vec<u8>>>,
@@ -577,7 +647,25 @@ fn replacement_after_same_target_ssh_restart_renews_auth_promptly() {
         };
         qshd::control::StatusResponse::from_line(&line).unwrap().pid
     };
-    let fixture_pid = status_pid();
+    // Initial STATUS can still be hashing the debug executable. Use the same
+    // bounded readiness policy as the owned daemon guard, before recovery or
+    // its acceptance clock starts. The post-pidfd identity check stays strict.
+    let ready_deadline = Instant::now() + support_home::daemon_guard::DAEMON_STATUS_TIMEOUT;
+    let initial_status = fixture_status_after_readiness(
+        || qshd::control::client_request(&socket, &qshd::control::ControlRequest::Status).unwrap(),
+        || {
+            let remaining = ready_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(50)));
+            Instant::now() < ready_deadline
+        },
+    )
+    .expect("fixture STATUS never became ready within the setup deadline");
+    let fixture_pid = qshd::control::StatusResponse::from_line(&initial_status)
+        .unwrap()
+        .pid;
     // SAFETY: pidfd_open has no pointer parameters; the returned descriptor is
     // pinned to the process independently of subsequent PID reuse.
     let pidfd =
