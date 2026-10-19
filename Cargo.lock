@@ -2063,6 +2063,7 @@ dependencies = [
  "dirs",
  "flate2",
  "hmac 0.12.1",
+ "http",
  "knock",
  "libc",
  "log",
