@@ -38,6 +38,10 @@ use std::time::Duration;
 
 use nix::sys::termios::{self, SetArg, Termios};
 
+#[cfg(test)]
+#[path = "tty/panic_tests.rs"]
+mod panic_tests;
+
 /// What a panic hook needs to put the terminal back. A hook runs on
 /// whichever thread panicked, so this cannot live in the guard.
 struct Saved {
@@ -499,6 +503,12 @@ impl RawMode {
                             current.name().unwrap_or("<unnamed>")
                         ));
                         if let Some(saved) = slot.as_mut() {
+                            // A panic can interrupt a paint before its mode
+                            // bookkeeping is updated. Reset the complete set
+                            // directly on the renderer's active descriptor.
+                            if let Some(alt) = saved.alt.filter(|alt| alt.on) {
+                                write_fd(alt.out, render::renderer::RESET_TERMINAL_MODES);
+                            }
                             leave_alt_screen(&mut saved.alt);
                             // SAFETY: the descriptor is the process's own
                             // terminal, open for the life of the process.

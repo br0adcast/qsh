@@ -19,6 +19,13 @@ use terminal::{
 use crate::caps::TermCaps;
 use crate::sgr::{write_sgr, Style};
 
+/// Restore every mode the renderer can enable when its current state is
+/// unknown. Static bytes also let a panic hook write directly to its owned
+/// terminal without allocating or acquiring a stdout lock. Screen switching
+/// and the normal exit's trailing newline remain the caller's responsibility.
+pub const RESET_TERMINAL_MODES: &[u8] =
+    b"\x1b[0m\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h";
+
 /// The cell flags that actually change how a character looks. The width
 /// flags live in the same word but carry no appearance, and letting them
 /// into the style would force a full SGR reset at every wide-character
@@ -336,29 +343,33 @@ impl Renderer {
     /// mirrored modes, a visible cursor and a fresh line to type on.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(b"\x1b[0m");
         self.style = Style::default_style();
         // Undo what we know is on. When the state is unknown, undo
         // everything: "we cannot tell" must not become "nothing to undo",
         // since mouse tracking or bracketed paste left behind would corrupt
         // the shell the user is handed back.
-        let known = self.modes;
-        if known.is_none_or(|m| m.app_cursor) {
-            out.extend_from_slice(b"\x1b[?1l");
+        if let Some(known) = self.modes {
+            out.extend_from_slice(b"\x1b[0m");
+            if known.app_cursor {
+                out.extend_from_slice(b"\x1b[?1l");
+            }
+            if known.app_keypad {
+                out.extend_from_slice(b"\x1b>");
+            }
+            for seq in tracking_off(known.tracking) {
+                out.extend_from_slice(seq);
+            }
+            if known.sgr_mouse {
+                out.extend_from_slice(b"\x1b[?1006l");
+            }
+            if known.bracketed_paste {
+                out.extend_from_slice(b"\x1b[?2004l");
+            }
+            out.extend_from_slice(b"\x1b[?25h");
+        } else {
+            out.extend_from_slice(RESET_TERMINAL_MODES);
         }
-        if known.is_none_or(|m| m.app_keypad) {
-            out.extend_from_slice(b"\x1b>");
-        }
-        for seq in known.map_or(ALL_TRACKING_OFF, |m| tracking_off(m.tracking)) {
-            out.extend_from_slice(seq);
-        }
-        if known.is_none_or(|m| m.sgr_mouse) {
-            out.extend_from_slice(b"\x1b[?1006l");
-        }
-        if known.is_none_or(|m| m.bracketed_paste) {
-            out.extend_from_slice(b"\x1b[?2004l");
-        }
-        out.extend_from_slice(b"\x1b[?25h\r\n");
+        out.extend_from_slice(b"\r\n");
         self.modes = Some(Modes::initial());
         self.last = None;
         out
