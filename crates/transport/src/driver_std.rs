@@ -1145,7 +1145,8 @@ fn run_driver(
         // function is running, since it holds `auth_tx` for its whole
         // lifetime) both mean "nothing more to do this iteration".
         while let Ok(AuthResult { generation, record }) = auth_rx.try_recv() {
-            if generation == auth_generation {
+            // A processed stop also retires results already queued by the signer.
+            if !should_close && generation == auth_generation {
                 match record {
                     Some(bytes) => {
                         let now = Instant::now();
@@ -1165,8 +1166,9 @@ fn run_driver(
                     }
                 }
             }
-            // Else: a result for a handshake generation this driver has
-            // since moved past (see the module doc). Sending it now would
+            // Else: cancellation won, or this driver has moved past the
+            // result's handshake generation (see the module doc). Sending
+            // a stale generation now would
             // offer the server a signature over a hash that no longer
             // describes this session -- worse than sending nothing -- so it
             // is dropped in silence.
@@ -4454,4 +4456,5 @@ mod tests {
         );
     }
     include!("driver_std_auth_tests.rs");
+    include!("driver_std_cancel_tests.rs");
 }
