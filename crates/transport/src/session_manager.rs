@@ -86,6 +86,7 @@ mod channel_bridge;
 mod lifecycle;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 use lifecycle::Lifecycle;
+pub(crate) use lifecycle::WorkerReceipt;
 pub use lifecycle::{Shutdown, ShutdownError};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -610,6 +611,12 @@ impl SessionIo {
             origin,
             reason,
         });
+    }
+    pub(crate) fn spawn_blocking_owned(
+        &self,
+        work: impl FnOnce() + Send + 'static,
+    ) -> WorkerReceipt {
+        self.lifecycle.spawn_blocking(work)
     }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should

@@ -319,6 +319,7 @@ mod open24_tests {
                     Box::new(FakeProcess {
                         greeting: None,
                         feed: rx,
+                        held_reads: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                         reads: Arc::new(AtomicUsize::new(0)),
                         exited: Arc::new(AtomicBool::new(false)),
                     }),

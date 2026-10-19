@@ -1926,6 +1926,7 @@ pub async fn run_channel_session_with(
     opening.clear();
     producer.input_budget.close();
     io.close_send_gates();
+    chan_out_rx.close();
     begin_reap_all(&io, &mut channels, &mut reaps);
     // The transport is gone, but exact cleanup receipts and blocking reaps
     // still own this runner's drain obligation. Unknown never gets a timeout refund.
@@ -2600,6 +2601,61 @@ impl<'a> PreparedInstallation<'a> {
     }
 }
 
+/// A reaped child cannot refund an installed slot while either I/O worker is
+/// still running. Latching the child receipt also forbids later PID signalling.
+struct IoOwnedWait {
+    child: Box<dyn ChannelWait>,
+    reaped: Option<Option<i32>>,
+    workers: [crate::session_manager::WorkerReceipt; 2],
+}
+impl ChannelWait for IoOwnedWait {
+    fn poll_exit(&mut self) -> ChildStatus {
+        if self.reaped.is_none() {
+            match self.child.poll_exit() {
+                ChildStatus::Reaped { code } => self.reaped = Some(code),
+                status => return status,
+            }
+        }
+        for worker in &self.workers {
+            match worker.joined() {
+                None => return ChildStatus::Running,
+                Some(Err(error)) => return ChildStatus::Unknown(error),
+                Some(Ok(())) => {}
+            }
+        }
+        ChildStatus::Reaped {
+            code: self.reaped.unwrap(),
+        }
+    }
+    fn set_reap_notifier(&mut self, notifier: ReapNotifier) {
+        self.child.set_reap_notifier(notifier.clone());
+        for worker in &self.workers {
+            worker.set_notifier(notifier.clone());
+        }
+    }
+    fn kill(&mut self) {
+        if self.reaped.is_none() {
+            self.child.kill();
+        }
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        _authority: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus {
+        // This wrapper is created only after installation. A never-installed
+        // cleanup authority cannot certify its running I/O workers.
+        crate::channel_open::CleanupStatus::Unknown
+    }
+    fn wait(mut self: Box<Self>) -> i32 {
+        loop {
+            if let ChildStatus::Reaped { code } = self.poll_exit() {
+                return code.unwrap_or(-1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 fn start_installed(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
@@ -2628,11 +2684,17 @@ fn start_installed(
     );
     let reader_gate = (!recoverable).then(|| ch.gate.clone());
     let reader_out = chan_out_tx.clone();
-    tokio::task::spawn_blocking(move || {
+    let reader = io.spawn_blocking_owned(move || {
         channel_reader_loop(stream, instance, reader, reader_out, reader_gate)
     });
     let reporter = io.consumption_reporter();
-    tokio::task::spawn_blocking(move || channel_writer_loop(stream, input_rx, writer, reporter));
+    let writer =
+        io.spawn_blocking_owned(move || channel_writer_loop(stream, input_rx, writer, reporter));
+    ch.wait = Some(Box::new(IoOwnedWait {
+        child: ch.wait.take().expect("installed child custody"),
+        reaped: None,
+        workers: [reader, writer],
+    }));
     io.set_stream_resyncable(stream, recoverable);
     io.channel_opened(context.attachment, stream);
     checkpoint(io, ch);
@@ -2754,6 +2816,7 @@ pub(crate) mod tests {
     include!("channel_server_reply_tests.rs");
     include!("channel_server_reply_delivery_tests.rs");
     include!("channel_server_sync_deadline_tests.rs");
+    include!("channel_server_worker_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2877,6 +2940,7 @@ pub(crate) mod tests {
     struct FakeProcess {
         greeting: Option<Vec<u8>>,
         feed: std_mpsc::Receiver<Vec<u8>>,
+        held_reads: Arc<(Mutex<bool>, std::sync::Condvar)>,
         reads: Arc<AtomicUsize>,
         exited: Arc<AtomicBool>,
     }
@@ -2884,11 +2948,26 @@ pub(crate) mod tests {
     impl Read for FakeProcess {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut held = self.held_reads.0.lock().unwrap();
+            while *held {
+                held = self.held_reads.1.wait(held).unwrap();
+            }
+            drop(held);
             if let Some(g) = self.greeting.take() {
                 buf[..g.len()].copy_from_slice(&g);
                 return Ok(g.len());
             }
-            match self.feed.recv() {
+            let received = loop {
+                match self.feed.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Err(std_mpsc::RecvTimeoutError::Timeout)
+                        if !self.exited.load(Ordering::SeqCst) =>
+                    {
+                        continue
+                    }
+                    other => break other,
+                }
+            };
+            match received {
                 Ok(bytes) => {
                     buf[..bytes.len()].copy_from_slice(&bytes);
                     if bytes.is_empty() {
@@ -3091,6 +3170,7 @@ pub(crate) mod tests {
         /// [`FakeSpawner::hold_writes`].
         held: Arc<(Mutex<bool>, std::sync::Condvar)>,
         wait_hold: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        held_reads: Arc<(Mutex<bool>, std::sync::Condvar)>,
         /// Shared with every `FakeWriter` this spawner hands out: see
         /// [`FakeSpawner::break_writes`].
         broken: Arc<AtomicBool>,
@@ -3100,6 +3180,7 @@ pub(crate) mod tests {
         pub(crate) fn new() -> Arc<FakeSpawner> {
             Arc::new(FakeSpawner {
                 opens: crate::channel_open::ChannelOpenRegistry::new(Default::default()),
+                held_reads: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                 write_attempts: Arc::new(AtomicUsize::new(0)),
                 refuse: Mutex::new(None),
                 written: Arc::new(Mutex::new(Vec::new())),
@@ -3195,6 +3276,7 @@ pub(crate) mod tests {
                 reader: Box::new(FakeProcess {
                     greeting: Some(b"hello from the shell".to_vec()),
                     feed: end_rx,
+                    held_reads: self.held_reads.clone(),
                     reads: self.reads.clone(),
                     exited: exited.clone(),
                 }),
