@@ -380,3 +380,131 @@ fn a_server_wanting_two_keys_takes_two_and_refuses_one() {
         other => panic!("expected AuthFailed, got {other:?}"),
     }
 }
+
+#[path = "../../sshauth/tests/support/key_formats.rs"]
+mod key_formats;
+
+#[test]
+fn ordinary_pkcs8_key_files_authenticate_without_prompting() {
+    let Some(()) = sshd_or_skip() else { return };
+    let keys = tempfile::tempdir().unwrap();
+    let mut identities = Vec::new();
+    let mut public = Vec::new();
+    for (index, algorithm) in [
+        ssh_key::Algorithm::Ed25519,
+        ssh_key::Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP256,
+        },
+        ssh_key::Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP384,
+        },
+        ssh_key::Algorithm::Ecdsa {
+            curve: ssh_key::EcdsaCurve::NistP521,
+        },
+        ssh_key::Algorithm::Rsa { hash: None },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            algorithm,
+        )
+        .unwrap();
+        public.push(key.public_key().to_openssh().unwrap());
+        let path = keys.path().join(format!("identity-{index}"));
+        russh::keys::encode_pkcs8_pem(&key, std::fs::File::create(&path).unwrap()).unwrap();
+        identities.push(path);
+    }
+    let sshd = TestSshd::start(&public);
+    for identity in identities {
+        let prompter = Arc::new(CountingPrompter::default());
+        go(
+            params(&sshd, vec![wire_of(&sshd.host_public_key_line())]),
+            plan_with(
+                vec![ssh::AuthMethod::KeyFile(identity)],
+                Arc::clone(&prompter),
+            ),
+        )
+        .expect("the generated PKCS8 key must authenticate");
+        assert_eq!(prompter.passphrase_asked(), 0);
+    }
+    assert_eq!(sshd.log().matches("Accepted publickey").count(), 5);
+}
+
+#[test]
+fn explicit_parameter_sec1_file_retains_upstream_ssh_authentication() {
+    use p256::elliptic_curve::Generate;
+    let Some(()) = sshd_or_skip() else { return };
+    let keys = tempfile::tempdir().unwrap();
+    let private = p256::SecretKey::generate_from_rng(&mut ssh_key::rand_core::UnwrapErr(
+        ssh_key::getrandom::SysRng,
+    ));
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::KeypairData::Ecdsa(ssh_key::private::EcdsaKeypair::NistP256 {
+            public: private.public_key().into(),
+            private: private.clone().into(),
+        }),
+        "generated explicit parameters",
+    )
+    .unwrap();
+    let named = keys.path().join("named");
+    let explicit = keys.path().join("explicit");
+    std::fs::write(
+        &named,
+        private
+            .to_sec1_pem(ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    key_formats::openssl(&named, &explicit, &["ec", "-param_enc", "explicit"]);
+    let sshd = TestSshd::start(&[key.public_key().to_openssh().unwrap()]);
+    let prompter = Arc::new(CountingPrompter::default());
+    go(
+        params(&sshd, vec![wire_of(&sshd.host_public_key_line())]),
+        plan_with(
+            vec![ssh::AuthMethod::KeyFile(explicit)],
+            Arc::clone(&prompter),
+        ),
+    )
+    .expect("the existing upstream explicit-parameter route must remain usable");
+    assert_eq!(prompter.passphrase_asked(), 0);
+    assert_eq!(sshd.log().matches("Accepted publickey").count(), 1);
+}
+
+#[test]
+fn annotated_pkcs8_and_sec1_files_authenticate_without_prompting() {
+    use p256::elliptic_curve::Generate;
+    let Some(()) = sshd_or_skip() else { return };
+    let keys = tempfile::tempdir().unwrap();
+    let private = p256::SecretKey::generate_from_rng(&mut ssh_key::rand_core::UnwrapErr(
+        ssh_key::getrandom::SysRng,
+    ));
+    let key = ssh_key::PrivateKey::new(
+        ssh_key::private::KeypairData::Ecdsa(ssh_key::private::EcdsaKeypair::NistP256 {
+            public: private.public_key().into(),
+            private: private.clone().into(),
+        }),
+        "generated annotated fixture",
+    )
+    .unwrap();
+    let mut pkcs8 = Vec::new();
+    russh::keys::encode_pkcs8_pem(&key, &mut pkcs8).unwrap();
+    let sec1 = private.to_sec1_pem(ssh_key::LineEnding::LF).unwrap();
+    let sshd = TestSshd::start(&[key.public_key().to_openssh().unwrap()]);
+    for (index, encoded) in [pkcs8.as_slice(), sec1.as_bytes()].into_iter().enumerate() {
+        let path = keys.path().join(format!("annotated-{index}"));
+        let mut text = b"Bag Attributes\n    friendlyName: generated fixture\nKey Attributes: <No Attributes>\n".to_vec();
+        text.extend_from_slice(encoded);
+        std::fs::write(&path, &text).unwrap();
+        let prompter = Arc::new(CountingPrompter::default());
+        go(
+            params(&sshd, vec![wire_of(&sshd.host_public_key_line())]),
+            plan_with(vec![ssh::AuthMethod::KeyFile(path)], Arc::clone(&prompter)),
+        )
+        .expect("annotated ordinary files must preserve SSH authentication");
+        assert_eq!(prompter.passphrase_asked(), 0);
+    }
+    assert_eq!(sshd.log().matches("Accepted publickey").count(), 2);
+}

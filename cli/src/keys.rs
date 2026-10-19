@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use sshauth::agent::AgentSigner;
 use sshauth::sign_file::FileSigner;
-use transport::{AuthError, AuthSigner};
+use transport::AuthSigner;
 
 /// Asks for a passphrase. Separate from the decision so the decision is
 /// testable; the real one reads the terminal with echo off.
@@ -275,38 +275,17 @@ fn file_candidates(
 ///
 /// `ask` is `None` when there is nobody to ask on this caller's behalf: an
 /// encrypted file is then reported as [`KeyError::Locked`] instead of
-/// prompting. The detection of "encrypted" stays here, in the one place that
-/// already knows how to make it, rather than being repeated at the call site.
-///
-/// `sshauth::sign_file::FileSigner::load` reports every failure the same
-/// way, as `AuthError::Backend(String)` -- there is no separate variant for
-/// "this key is encrypted" to distinguish from "no such file" or "not a
-/// private key" by matching on the error's shape. Telling them apart
-/// therefore means reconstructing the exact message `sign_file.rs` builds
-/// for the encrypted case and comparing against it. This is a text coupling
-/// to a crate that stays untouched here, so `sign_file.rs` does not grow API
-/// surface just to serve this one caller; the
-/// alternative -- re-parsing the file here with
-/// `PrivateKey::read_openssh_file` and `is_encrypted()` to ask the same
-/// question a second, independent way -- would duplicate `sign_file.rs`'s
-/// own parsing logic in this crate, leaving two places that must agree on
-/// what "encrypted" means instead of one. Prompting on every failure (the
-/// bug this replaces) is worse still: it asks for a password before a
-/// missing file, a garbage file, or a public key has even been ruled out.
+/// prompting. Only the loader's typed PassphraseRequired result enters this
+/// flow; unreadable, invalid and unsupported encrypted formats never ask.
 fn load_file(
     path: &Path,
     ask: Option<&dyn Passphrase>,
     login: &str,
 ) -> Result<(Arc<dyn AuthSigner>, String), KeyError> {
-    let loaded = match FileSigner::load(path, None) {
+    let loaded = match FileSigner::load_classified(path, None) {
         Ok(signer) => signer,
         Err(first) => {
-            let is_encrypted = first
-                == AuthError::Backend(format!(
-                    "{} is encrypted and needs a passphrase",
-                    path.display()
-                ));
-            if !is_encrypted {
+            if !matches!(first, sshauth::keyfile::KeyFileError::PassphraseRequired) {
                 return Err(KeyError::IdentityUnreadable {
                     path: path.to_path_buf(),
                     why: first.to_string(),
@@ -323,9 +302,11 @@ fn load_file(
                     why: first.to_string(),
                 });
             };
-            FileSigner::load(path, Some(&phrase)).map_err(|e| KeyError::IdentityUnreadable {
-                path: path.to_path_buf(),
-                why: e.to_string(),
+            FileSigner::load_classified(path, Some(&phrase)).map_err(|e| {
+                KeyError::IdentityUnreadable {
+                    path: path.to_path_buf(),
+                    why: e.to_string(),
+                }
             })?
         }
     };
@@ -338,7 +319,7 @@ fn load_file(
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use transport::AuthRecord;
+    use transport::{AuthError, AuthRecord};
 
     struct NoPassphrase;
     impl Passphrase for NoPassphrase {
@@ -691,5 +672,47 @@ mod tests {
         let found = assemble(None, Vec::new(), files);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].label, "file-1");
+    }
+    #[test]
+    fn an_encrypted_pkcs8_identity_is_unreadable_without_a_passphrase_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted-pkcs8");
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        russh::keys::encode_pkcs8_pem_encrypted(
+            &key,
+            b"generated-fixture",
+            1000,
+            std::fs::File::create(&path).unwrap(),
+        )
+        .unwrap();
+        let ask = RecordingRefusal::new();
+        let error = candidates(Some(&path), &ask, "fixture").expect_err("unsupported encryption");
+        assert!(matches!(error, KeyError::IdentityUnreadable { .. }));
+        assert!(!ask.asked.get());
+    }
+
+    #[test]
+    fn invalid_bytes_and_directory_identities_do_not_prompt_or_echo_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid");
+        for bytes in [b"PRIVATE_INPUT_SENTINEL\x1b[2J".as_slice(), &[0xff, 0xfe]] {
+            std::fs::write(&path, bytes).unwrap();
+            let ask = RecordingRefusal::new();
+            let error = candidates(Some(&path), &ask, "fixture").expect_err("invalid file");
+            assert!(matches!(error, KeyError::IdentityUnreadable { .. }));
+            assert!(!ask.asked.get());
+            assert!(!error.to_string().contains("PRIVATE_INPUT_SENTINEL"));
+            assert!(!error.to_string().contains('\x1b'));
+        }
+        let ask = RecordingRefusal::new();
+        assert!(matches!(
+            candidates(Some(dir.path()), &ask, "fixture"),
+            Err(KeyError::IdentityUnreadable { .. })
+        ));
+        assert!(!ask.asked.get());
     }
 }

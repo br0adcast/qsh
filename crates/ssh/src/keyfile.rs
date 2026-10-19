@@ -15,6 +15,7 @@ use crate::AuthPrompter;
 const PASSPHRASE_TRIES: usize = 3;
 
 /// Why an encrypted PEM key is skipped, and how to make it usable.
+#[cfg(test)]
 const ENCRYPTED_PEM: &str = "encrypted PEM keys are not supported; convert with ssh-keygen -p";
 
 /// Reads a private key file: OpenSSH format, encrypted or not, or an
@@ -24,14 +25,16 @@ const ENCRYPTED_PEM: &str = "encrypted PEM keys are not supported; convert with 
 /// public half to offer before its passphrase, and is not decoded here.
 pub(crate) fn read(path: &Path) -> Result<PrivateKey, String> {
     let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| e.to_string())?);
-    if text.contains("Proc-Type: 4,ENCRYPTED")
-        || text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")
-    {
-        return Err(ENCRYPTED_PEM.into());
-    }
-    match PrivateKey::from_openssh(text.as_bytes()) {
+    match sshauth::keyfile::decode(&text) {
         Ok(key) => Ok(key),
-        Err(_) => russh::keys::decode_secret_key(&text, None).map_err(|e| e.to_string()),
+        Err(sshauth::keyfile::KeyFileError::ExplicitEcParameters) => {
+            // This disposition positively identifies the rare SEC1 container.
+            // Use the same bytes; rereading the path could change the format
+            // between classification and the upstream decoder.
+            russh::keys::decode_secret_key(&text, None)
+                .map_err(|_| "invalid explicit-parameter EC private key".to_owned())
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 

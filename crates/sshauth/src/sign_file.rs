@@ -19,18 +19,22 @@ impl FileSigner {
     /// the load fails rather than prompting -- asking the user is the caller's
     /// job, since only it knows whether a terminal is even attached.
     pub fn load(path: &Path, passphrase: Option<&str>) -> Result<FileSigner, AuthError> {
-        let key = PrivateKey::read_openssh_file(path)
-            .map_err(|e| AuthError::Backend(format!("reading {}: {e}", path.display())))?;
+        Self::load_classified(path, passphrase)
+            .map_err(|e| AuthError::Backend(format!("reading {}: {e}", path.display())))
+    }
+
+    /// Load a file while retaining the distinction between a locked OpenSSH
+    /// key and failures for which asking a passphrase cannot help.
+    pub fn load_classified(
+        path: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<FileSigner, crate::keyfile::KeyFileError> {
+        use crate::keyfile::KeyFileError;
+        let key = crate::keyfile::read(path)?;
         let key = if key.is_encrypted() {
-            let phrase = passphrase.ok_or_else(|| {
-                AuthError::Backend(format!(
-                    "{} is encrypted and needs a passphrase",
-                    path.display()
-                ))
-            })?;
-            key.decrypt(phrase).map_err(|_| {
-                AuthError::Backend(format!("wrong passphrase for {}", path.display()))
-            })?
+            let phrase = passphrase.ok_or(KeyFileError::PassphraseRequired)?;
+            key.decrypt(phrase)
+                .map_err(|_| KeyFileError::DecryptionFailed)?
         } else {
             key
         };
