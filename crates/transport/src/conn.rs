@@ -343,6 +343,11 @@ struct TrackedChannelOutput {
 pub enum Event {
     /// Handshake finished, transport encryption keys obtained.
     HandshakeDone,
+    /// Server-side, once for this fresh key split: a transport packet passed
+    /// authentication and replay acceptance. This precedes its stream events;
+    /// owners must still drain the whole batch and reject a closing connection.
+    /// Obtaining keys (`HandshakeDone`) alone does not prove fresh possession.
+    PeerKeyConfirmed { peer: SocketAddr },
     /// Freshly delivered in-order bytes of stream `stream_id`.
     StreamData { stream_id: u8, data: Vec<u8> },
     /// Link state change.
@@ -597,6 +602,9 @@ pub struct Connection {
     next_counter: u64,
     /// Anti-replay window for incoming transport datagrams.
     replay: ReplayWindow,
+    /// Server-only latch for the first authenticated, replay-accepted packet
+    /// under this Connection's fresh split. Reattachment uses a new Connection.
+    peer_key_confirmed: bool,
 
     streams: BTreeMap<u8, StreamState>,
     /// The stream number a PONG's one `CREDIT` copy is looked for from
@@ -903,6 +911,7 @@ impl Connection {
             handshake_hash: [0u8; 32],
             next_counter: 1,
             replay: ReplayWindow::default(),
+            peer_key_confirmed: false,
             streams: BTreeMap::new(),
             pong_credit_next: 0,
             acks_due: BTreeMap::new(),
@@ -2513,6 +2522,10 @@ impl Connection {
         if !self.replay.accept(counter) {
             return out; // authenticated replay -- drop it
         }
+        if matches!(self.role, Role::Server) && !self.peer_key_confirmed {
+            self.peer_key_confirmed = true;
+            self.events.push(Event::PeerKeyConfirmed { peer: src });
+        }
         self.last_recv_auth = now;
         // Decoded before the migration decision, not after it: whether this
         // packet may move the session depends on WHAT is in it. A packet
@@ -3757,6 +3770,256 @@ pub(crate) mod tests {
         assert_eq!(client.peer(), Some(saddr));
         assert_eq!(server.peer(), Some(caddr));
         (client, server, caddr, saddr)
+    }
+
+    fn sealed_proof_packet(client: &mut Connection, to: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(client.seal_to(to, payload, &mut out));
+        out.remove(0).bytes
+    }
+
+    #[test]
+    fn fresh_key_proof_accepts_empty_ping_ack_and_data_at_same_instant() {
+        let mut payloads = vec![Vec::new()];
+        for frame in [
+            StreamFrame::Ping { token: 9 },
+            StreamFrame::Ack {
+                stream_id: 0,
+                cum_ack: 0,
+            },
+            StreamFrame::Data {
+                stream_id: 0,
+                offset: 0,
+                data: b"input".to_vec(),
+            },
+        ] {
+            let mut bytes = Vec::new();
+            frame.encode(&mut bytes);
+            payloads.push(bytes);
+        }
+        for (index, payload) in payloads.into_iter().enumerate() {
+            let (mut client, mut server, caddr, saddr) = established_pair();
+            assert!(
+                !server
+                    .poll_events()
+                    .iter()
+                    .any(|event| matches!(event, Event::PeerKeyConfirmed { .. })),
+                "msg1 is not fresh proof"
+            );
+            // Exactly the handshake's Instant: elapsed time cannot identify proof.
+            let now = server.last_recv_auth;
+            let packet = sealed_proof_packet(&mut client, saddr, &payload);
+            server.on_datagram(now, caddr, &packet);
+            let events = server.poll_events();
+            assert_eq!(
+                events.first(),
+                Some(&Event::PeerKeyConfirmed { peer: caddr })
+            );
+            assert_eq!(server.last_recv_auth, now);
+            if index == 3 {
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, Event::StreamData { .. })));
+            }
+            server.on_datagram(now, caddr, &packet);
+            let another = sealed_proof_packet(&mut client, saddr, &payload);
+            server.on_datagram(now, caddr, &another);
+            assert!(
+                !server
+                    .poll_events()
+                    .iter()
+                    .any(|event| matches!(event, Event::PeerKeyConfirmed { .. })),
+                "proof is emitted once"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_key_proof_rejects_wrong_session_bad_tag_and_rejected_counter() {
+        let (mut client, mut server, caddr, saddr) = established_pair();
+        server.poll_events();
+        let now = server.last_recv_auth;
+        let wrong_id = transport_header(server.session_id().wrapping_add(1), 1);
+        let ciphertext = client
+            .keys
+            .as_ref()
+            .unwrap()
+            .encrypt(1, &wrong_id, &[])
+            .unwrap();
+        server.on_datagram(now, caddr, &encode_transport(&wrong_id, &ciphertext));
+        let packet = sealed_proof_packet(&mut client, saddr, &[]);
+        let mut damaged = packet.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        server.on_datagram(now, caddr, &damaged);
+        assert!(server.poll_events().is_empty());
+        // Pin placement after replay acceptance independently of the one-shot
+        // latch: this counter is already rejected before any proof was emitted.
+        assert!(server.replay.accept(1));
+        server.on_datagram(now, caddr, &packet);
+        assert!(server.poll_events().is_empty());
+        let fresh = sealed_proof_packet(&mut client, saddr, &[]);
+        server.on_datagram(now, caddr, &fresh);
+        assert_eq!(
+            server.poll_events(),
+            vec![Event::PeerKeyConfirmed { peer: caddr }]
+        );
+    }
+
+    #[test]
+    fn fresh_key_proof_precedes_data_but_preserves_close_in_same_batch() {
+        let (mut client, mut server, caddr, saddr) = established_pair();
+        server.poll_events();
+        let mut payload = Vec::new();
+        StreamFrame::Data {
+            stream_id: 0,
+            offset: 0,
+            data: b"before close".to_vec(),
+        }
+        .encode(&mut payload);
+        StreamFrame::Close { stream_id: 0 }.encode(&mut payload);
+        let packet = sealed_proof_packet(&mut client, saddr, &payload);
+        server.on_datagram(server.last_recv_auth, caddr, &packet);
+        let events = server.poll_events();
+        assert_eq!(
+            events.first(),
+            Some(&Event::PeerKeyConfirmed { peer: caddr })
+        );
+        assert!(matches!(events.get(1), Some(Event::StreamData { .. })));
+        assert!(events.contains(&Event::StateChanged(LinkState::Closed)));
+        assert_eq!(server.state(), LinkState::Closed);
+    }
+
+    #[test]
+    fn fresh_key_proof_is_server_only_and_uses_authenticated_source() {
+        let (mut client, mut server, _, saddr) = established_pair();
+        let moved = addr("198.51.100.9:40001");
+        client.poll_events();
+        server.poll_events();
+        let packet = sealed_proof_packet(&mut server, moved, &[]);
+        client.on_datagram(client.last_recv_auth, saddr, &packet);
+        assert!(!client
+            .poll_events()
+            .iter()
+            .any(|event| matches!(event, Event::PeerKeyConfirmed { .. })));
+        let packet = sealed_proof_packet(&mut client, saddr, &[]);
+        server.on_datagram(server.last_recv_auth, moved, &packet);
+        assert_eq!(
+            server.poll_events().first(),
+            Some(&Event::PeerKeyConfirmed { peer: moved })
+        );
+    }
+
+    #[test]
+    fn fresh_key_proof_accepts_authenticated_prefix_with_unusable_tail() {
+        let (mut client, mut server, caddr, saddr) = established_pair();
+        server.poll_events();
+        let mut payload = Vec::new();
+        StreamFrame::Data {
+            stream_id: 0,
+            offset: 0,
+            data: b"prefix".to_vec(),
+        }
+        .encode(&mut payload);
+        payload.push(0xff); // Existing decoder accepts the valid prefix.
+        let packet = sealed_proof_packet(&mut client, saddr, &payload);
+        server.on_datagram(server.last_recv_auth, caddr, &packet);
+        let events = server.poll_events();
+        assert_eq!(
+            events.first(),
+            Some(&Event::PeerKeyConfirmed { peer: caddr })
+        );
+        assert!(events.contains(&Event::StreamData {
+            stream_id: 0,
+            data: b"prefix".to_vec()
+        }));
+        assert_eq!(server.state(), LinkState::Live);
+    }
+
+    #[test]
+    fn fresh_key_proof_from_old_split_cannot_confirm_reaccepted_msg1() {
+        let server_key = generate_keypair();
+        let client_key = generate_keypair();
+        let source = addr("198.51.100.7:40000");
+        let now = Instant::now();
+        let mut initiator = Handshake::new_initiator(&client_key.private, &server_key.public);
+        let payload = encode_msg1(&Msg1Payload {
+            offered: Features::NONE,
+            start_kind: StartKind::Warm,
+            token: [0xA7; 16],
+            method: AuthMethod::Allowlist,
+        });
+        let msg1 = initiator.write_msg(&payload);
+        let accept = || {
+            Connection::accept(
+                ConnectionConfig {
+                    required_features: Features::NONE,
+                    features: Features::NONE,
+                    role: Role::Server,
+                    local_static_priv: server_key.private,
+                    remote_static_pub: None,
+                    auth: AuthPolicy::Allowlist(vec![client_key.public]),
+                },
+                now,
+                source,
+                &msg1,
+                &mut |_| {
+                    Some(Msg2Inputs {
+                        resumed: true,
+                        nonce: [0; AUTH_NONCE_LEN],
+                    })
+                },
+            )
+        };
+        let AcceptOutcome::Accepted { mut conn, out, .. } = accept() else {
+            panic!("first msg1 accepted")
+        };
+        let Frame::Handshake {
+            kind: Kind::HandshakeResp,
+            body,
+        } = parse(&out[0].bytes).unwrap()
+        else {
+            panic!("actual msg2")
+        };
+        initiator.read_msg(body).unwrap();
+        let keys = initiator.into_transport(false);
+        let first_header = transport_header(conn.session_id(), 1);
+        let ciphertext = keys.encrypt(1, &first_header, &[]).unwrap();
+        conn.poll_events();
+        conn.on_datagram(now, source, &encode_transport(&first_header, &ciphertext));
+        assert_eq!(
+            conn.poll_events(),
+            vec![Event::PeerKeyConfirmed { peer: source }]
+        );
+        let AcceptOutcome::Accepted {
+            conn: mut replayed, ..
+        } = accept()
+        else {
+            panic!("replayed msg1 accepted into new split")
+        };
+        replayed.poll_events();
+        // No header AAD was negotiated: even rewriting the session id so the
+        // packet reaches the new split cannot make the old ciphertext valid.
+        let next_header = transport_header(replayed.session_id(), 1);
+        replayed.on_datagram(now, source, &encode_transport(&next_header, &ciphertext));
+        assert!(replayed.poll_events().is_empty());
+        assert!(!replayed.peer_key_confirmed);
+    }
+
+    #[test]
+    fn fresh_key_proof_ignores_handshake_and_timer_only_progress() {
+        let (outcome, _, _) = accept_one_handshake([0; AUTH_NONCE_LEN]);
+        let AcceptOutcome::Accepted { mut conn, .. } = outcome else {
+            panic!("accepted msg1")
+        };
+        assert!(!conn
+            .poll_events()
+            .iter()
+            .any(|event| matches!(event, Event::PeerKeyConfirmed { .. })));
+        conn.on_timeout(conn.last_recv_auth + Duration::from_secs(1));
+        assert!(!conn
+            .poll_events()
+            .iter()
+            .any(|event| matches!(event, Event::PeerKeyConfirmed { .. })));
     }
 
     #[test]

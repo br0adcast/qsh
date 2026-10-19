@@ -20,6 +20,8 @@ pub mod handshake_payload;
 pub mod paths;
 #[cfg(feature = "tokio-driver")]
 pub mod probation;
+#[cfg(feature = "tokio-driver")]
+mod raw_admission;
 pub mod reliability;
 mod rtt;
 pub mod send_gate;

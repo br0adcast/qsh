@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::net::UdpSocket;
 
 use crate::conn::{Connection, ConnectionConfig, Datagram, Event, LinkState};
-use crate::wire::{parse, Frame, Kind};
+use crate::raw_admission::{PacketResult, PendingAdmission};
 
 /// Receive buffer size for a single UDP datagram.
 const RECV_BUF_LEN: usize = 64 * 1024;
@@ -35,29 +35,25 @@ enum Wakeup {
 /// server). The function never returns: it runs the receive/send loop until
 /// the task is canceled externally.
 ///
-/// Incoming routing (via `wire::parse`):
-/// - `HandshakeInit` -- RECREATE the server `Connection` from `cfg.clone()`
-///   and feed it the packet. This naturally recovers from a lost handshake
-///   response (msg2): the client retransmits msg1, the server hands back a
-///   fresh msg2.
-/// - `Transport` -- feed the current `Connection` (if there is none yet,
-///   ignore).
-///
-/// Scope limitation (planned debt, NOT fixed here): recreating on any
-/// well-formed `HandshakeInit` means a stray msg1 could reset a live session
-/// (a soft denial of service). Acceptable for this single-client echo
-/// server; multiplexing and protection come later. Handshake retransmit ON
-/// THE CLIENT SIDE is the client timer loop's job, not the server's.
+/// A bounded candidate answers a handshake without replacing the active
+/// connection. Only fresh authenticated transport proof admits it; a closed,
+/// expired or invalid candidate leaves the active echo session untouched.
 pub async fn serve_echo(socket: UdpSocket, cfg: ConnectionConfig) {
     let mut buf = vec![0u8; RECV_BUF_LEN];
     // A single connection for the whole serve_echo call. `None` until the
     // first HandshakeInit and after the session closes (ready for a new
     // client).
     let mut conn: Option<Connection> = None;
+    let mut pending = PendingAdmission::default();
 
     loop {
         // The nearest timer of the current connection (if any).
-        let next = conn.as_ref().and_then(Connection::next_timeout);
+        let next = conn
+            .as_ref()
+            .and_then(Connection::next_timeout)
+            .into_iter()
+            .chain(pending.next_timeout())
+            .min();
 
         let wakeup = match next {
             Some(deadline) => {
@@ -73,34 +69,32 @@ pub async fn serve_echo(socket: UdpSocket, cfg: ConnectionConfig) {
 
         let now = Instant::now();
         let mut out: Vec<Datagram> = Vec::new();
+        let mut admitted_events = Vec::new();
 
         match wakeup {
             Wakeup::Packet(Ok((len, src))) => {
-                match parse(&buf[..len]) {
-                    Ok(Frame::Handshake {
-                        kind: Kind::HandshakeInit,
-                        ..
-                    }) => {
-                        // A fresh server Connection on every msg1.
-                        let mut fresh = Connection::new(cfg.clone());
-                        out.extend(fresh.on_datagram(now, src, &buf[..len]));
-                        conn = Some(fresh);
+                match pending.on_packet(&cfg, now, src, &buf[..len], &mut out) {
+                    PacketResult::Admitted(admitted) => {
+                        let admitted = *admitted;
+                        conn = Some(admitted.conn);
+                        admitted_events = admitted.events;
                     }
-                    Ok(_) => {
+                    PacketResult::Handled => {}
+                    PacketResult::Unrelated => {
                         if let Some(c) = conn.as_mut() {
                             out.extend(c.on_datagram(now, src, &buf[..len]));
                         }
                     }
-                    // Malformed input from the network is silently ignored.
-                    Err(_) => {}
                 }
             }
+
             // Receive error -- nothing to process, the socket is still alive.
             // No `continue`: the timers below run after this wake-up too.
             Wakeup::Packet(Err(_)) => {}
             // Nothing of its own: the timers run after every wake-up, below.
             Wakeup::Timeout => {}
         }
+        pending.on_timeout(now, &mut out);
         // Timers after every wake-up (spec §4.1).
         if let Some(c) = conn.as_mut() {
             out.extend(c.on_timeout_if_due(now));
@@ -111,7 +105,8 @@ pub async fn serve_echo(socket: UdpSocket, cfg: ConnectionConfig) {
         // Core events: echo delivered bytes and reset the session on close.
         let mut reset = false;
         if let Some(c) = conn.as_mut() {
-            let events = c.poll_events();
+            admitted_events.extend(c.poll_events());
+            let events = admitted_events;
             let mut echo: Vec<Datagram> = Vec::new();
             for ev in events {
                 match ev {

@@ -331,7 +331,7 @@ queued application output. These codec defaults are not a way to connect to a
 protocol-1 daemon. AUTH record versions in §3 are a separate format from the
 wire and handshake versions.
 
-The `resumed` flag is provisional on the signature path. It is computed from the decision resolved *inside* `accept` — by the
+The `resumed` flag is provisional on both authentication paths. It is computed from the decision resolved *inside* `accept` — by the
 `resolve_for_msg2` closure `handle_datagram` passes it — because msg2 has to
 be written there. But the decision actually applied is resolved again after
 probation ends, in `on_probation_ended`, against the table as it stands
@@ -585,8 +585,12 @@ at the second retransmit after the cookie, a second or so later.
   any source — and so admits no new client while it is under load. Without
   load it connects as before.
 
-The diagnostic `transport-echo` and `transport-shell` servers have no such
-check: they serve one client and hold no probation table.
+The diagnostic `transport-echo` and `transport-shell` servers do not use the
+cookie table. They keep one bounded pending allowlist candidate alongside the
+active connection. The candidate expires after `AUTH_DEADLINE` and replaces the
+active connection only after fresh transport proof. Its first authenticated
+packet is inspected as a whole: Close, stream exhaustion, or excess early-data
+cost prevents adoption. These raw servers have no SSH-signature verifier.
 
 ---
 
@@ -597,17 +601,29 @@ proof* and *when it arrives*.
 
 ### 3.1 `AuthPolicy::Allowlist(Vec<[u8; 32]>)`
 
-Only the listed client static keys may complete the handshake. The key
-itself is the proof, because it got onto the list over a channel that was
-already trusted: the daemon started over SSH is handed the client's public
+Only the listed client static keys may complete the handshake. An entry
+authorizes the key, but a captured msg1 does not prove possession of this
+handshake's fresh responder keys. The key enters the list over an already
+trusted channel: the daemon started over SSH is handed the client's public
 key on its command line (`transport-ensure --client-pubkey`), and its control
 socket accepts `ADD-CLIENT` to add one while it runs, which is how a second
 `transport-ensure` hands its key to the daemon already up
 (`qshd/src/control.rs`, `transport_daemon::apply_add_client`).
 The list is in memory only.
 
-Under this policy a handshake binds immediately — `accept` succeeds and the
-manager goes straight to its session decision (§4).
+A successful handshake enters probation. Before binding, the server requires
+an AEAD-authenticated transport packet accepted by the replay window under the
+fresh keys. The core emits `PeerKeyConfirmed` once, before that packet's stream
+events; handshake completion alone never emits it. Empty authenticated packets,
+PING, ACK, and DATA can establish possession. Invalid tags, wrong session IDs,
+old ciphertext, and replayed counters cannot. Close in the same event batch
+wins over proof, and no backend receives the packet's data.
+
+The console transport driver sends an immediate existing PING after an
+allowlist handshake, without opening an application channel. If it is lost,
+normal keepalive retries provide another opportunity; no arbitrary settling
+timer is needed to send this proof. This proves possession to the server, not
+committed session admission to the client (§3.4).
 
 The list is self-cleaning. When a session ends, the manager scrubs that
 connection's key off the shared allowlist (`remove_from_allowlist` in
@@ -781,8 +797,9 @@ daemon-level picture, this document's job is only the wire format above.
 
 ### 3.3 Probation
 
-`probation.rs`. A signature handshake does not become a session; it becomes
-a probation.
+`probation.rs`. Both authentication methods enter probation before changing
+a session. Allowlist admission requires fresh transport possession; signature
+admission additionally requires a valid SSH authentication record.
 
 ```
   HandshakeInit
@@ -790,7 +807,7 @@ a probation.
        v
   Connection::accept  --- rejected ---> nothing sent, nothing recorded
        |
-       | accepted, policy = SshSignature
+       | accepted, either authentication policy
        v
   +----------------------------------------------------+
   | PROBATION                                          |
@@ -800,7 +817,7 @@ a probation.
   |  - the backend table is not touched at all         |
   +----------------------------------------------------+
        |                                   |
-       | AUTH record verifies              | bad record / closed / 5 s
+       | policy proof succeeds             | bad proof / closed / deadline
        v                                   v
   the manager resolves the session    route dropped, task exits,
   decision (§4) against the table     nothing else happened
@@ -822,7 +839,7 @@ Its bounds, all of them real numbers in the code:
 | `AUTH_RECORD_MAX` | 8 KiB | the record-reassembly buffer |
 | `EARLY_DATA_MAX` | 64 KiB | pre-proof stream data held for replay |
 | `PROBATION_UNDELIVERED_MAX` | 64 KiB | out-of-order stream data held, all streams together |
-| `AUTH_DEADLINE` | 5 s | how long a slot may be held |
+| `AUTH_DEADLINE` | 5 s | arrival/verification-dispatch deadline; dispatched signature verification retains its bounded permit until completion |
 
 Over the cap, a handshake is dropped in silence: there is nothing to evict,
 because nothing there belongs to anyone yet. The per-source cap uses the
@@ -851,6 +868,18 @@ the bridge reads them in order; a warm reattach empties the queue into the
 `Attach` it hands the running bridge, which runs those datagrams through the
 new connection before reading anything else. A road check sent while the
 proof is verified is answered.
+
+Each pending admission holds a bounded observation of its token's binding
+revision. Effective create, replacement, reattachment, and terminal deletion
+invalidate older observations. Returning to an absent token does not make an
+old result current again. A stale verified result cannot replace a newer
+binding or remove its route. Exact retransmit twins may only reconcile the
+same owner's matching client-key login incarnation and resend cached msg2;
+they do not adopt another connection. Retention transitions and duplicate end
+notifications preserve the binding revision. Revision exhaustion refuses new
+admissions rather than wrapping. Completion effects require the original
+registered probation seat, preventing duplicate or already retired completions
+from changing a binding or releasing a nonce twice.
 
 ### 3.4 There is no "accepted" or "refused" on the wire
 
@@ -917,12 +946,11 @@ repointed to the new `session_id`, and msg2 says `resumed: true`. Each
 backend has exactly one backend task and one bridge task for its whole life;
 only the connection they drive is swapped.
 
-Under the allowlist policy this is safe because a non-allowlisted key is
-rejected before any of it runs. Under the signature policy it is safe
-because none of it runs until probation ends — and the decision is
-**resolved again** at that point, against the table as it stands then, since
-a round trip has passed and the entry may have appeared, been replaced or
-ended in the meantime. The msg2 already sent carries the *earlier*
+Both policies defer binding until probation succeeds. The captured binding
+revision must still be current, and the decision is **resolved again** against
+the current table. A round trip has passed and the entry may have appeared,
+been replaced, or ended in the meantime; stale completion cannot undo that
+newer binding. The msg2 already sent carries the *earlier*
 resolution's `resumed` flag; §2.2 says what a client should make of that.
 
 ### 4.2 How long a session lives

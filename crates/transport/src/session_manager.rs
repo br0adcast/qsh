@@ -3,7 +3,7 @@
 //!
 //! This is the tmux-agnostic multiplex core the rest of the daemon builds
 //! on. The manager owns the UDP socket and, on a `HandshakeInit`, runs
-//! [`Connection::accept`]; on success it spawns:
+//! [`Connection::accept`]; after probation proves the peer it spawns:
 //! - a **backend** (the application-level driver -- a shell, a tmux server,
 //!   an echo, ... -- created by a [`BackendFactory`]), which talks to its
 //!   session only through a [`SessionIo`] handle (no socket, no
@@ -36,17 +36,13 @@
 //! [`Connection::accept`] before any of this runs, so a stranger who knows a
 //! token can never hijack another device's backend.
 //!
-//! **Nothing binds before its peer is proven.** The paragraph above holds
-//! because an allowlist handshake is itself a proof. `AuthPolicy::SshSignature`
-//! admits ANY static key, so a signature handshake proves nothing at accept
-//! time -- and the arms above tear down, repoint and evict. So a signature
-//! handshake does not reach them: it goes into PROBATION (see
-//! [`crate::probation`]), which registers only its datagram route and touches
-//! `backends` not at all, and only when its record on
-//! [`crate::auth::AUTH_STREAM`] verifies does the SAME decision logic run --
-//! resolved afresh against the table as it stands then. The property is
-//! therefore structural: an unproven connection never reaches the decision
-//! logic, rather than being guarded at each of its write sites.
+//! **Nothing binds before its peer is proven.** Both policies enter bounded
+//! probation (see [`crate::probation`]). Allowlist membership requires a fresh
+//! authenticated transport packet; signatures additionally require a verified
+//! record on [`crate::auth::AUTH_STREAM`]. Only the provisional route exists
+//! before proof. A completed proof must retain its original registered seat
+//! and current binding revision, and the manager resolves its decision again
+//! before changing any backend. A captured msg1 cannot replace a live session.
 //!
 //! **Nothing costs work before its return address is known -- under load.**
 //! Every handshake datagram passes `Router::cookies` first (spec §4.16):
@@ -82,8 +78,11 @@
 //! task over an UNbounded channel (a synchronous, non-blocking send), and the
 //! session task -- not the router -- pays any backpressure to the backend.
 
+#[path = "binding_revision.rs"]
+pub(crate) mod binding_revision;
 #[path = "channel_bridge.rs"]
 mod channel_bridge;
+use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -103,10 +102,10 @@ use crate::conn::{
 };
 use crate::cookie::{source_group_key, CookieCheck, Verdict};
 use crate::dgram_queue::{dgram_queue, probation_dgram_queue, DgramRx, DgramTx, DGRAM_QUEUE_BYTES};
-use crate::handshake_payload::{Msg1Payload, StartKind};
+use crate::handshake_payload::{AuthMethod, Msg1Payload, StartKind};
 use crate::probation::{
-    run_probation, BridgeStart, Probation, ProbationEnded, ProvenSession, MAX_PROBATION,
-    MAX_PROBATION_PER_SOURCE,
+    run_probation, BridgeStart, Probation, ProbationEnded, ProofPolicy, ProvenSession,
+    MAX_PROBATION, MAX_PROBATION_PER_SOURCE,
 };
 use crate::send_gate::{GateKind, GateTable, SendGate};
 use crate::wire::{
@@ -1150,8 +1149,8 @@ pub struct ServerAuth {
     /// The server's static public key -- what a discovery request is answered
     /// with.
     pub server_pub: [u8; 32],
-    /// Who the allowlist path's proof is: a static-key handshake IS its own
-    /// proof, so there is no verifier and no `Principal` to ask for one.
+    /// The account for an allowlisted key after fresh transport possession
+    /// is confirmed. This path uses no SSH signature verifier.
     /// This is the daemon's own account, the same `uid`/`name` handed to the
     /// verifier above.
     pub self_principal: Principal,
@@ -1274,6 +1273,7 @@ struct ProbationSeat {
 /// The router's session table, owned solely by the `serve` loop (no shared
 /// lock on the datagram path).
 struct Router {
+    revisions: BindingRevisions,
     /// `session_id` -> router->task datagram sender, for demuxing `Transport`
     /// frames to the owning session task. Holds both bound sessions and the
     /// provisional routes of connections still in probation.
@@ -1306,6 +1306,7 @@ struct Router {
 impl Router {
     fn new() -> Self {
         Router {
+            revisions: BindingRevisions::new(MAX_SESSIONS_TOTAL + MAX_PROBATION),
             sessions: HashMap::new(),
             backends: HashMap::new(),
             probation: HashMap::new(),
@@ -1324,6 +1325,7 @@ impl Router {
     /// link).
     fn forget_backend(&mut self, token: LoginId, why: &str) {
         if self.backends.remove(&token).is_some() {
+            self.revisions.invalidate(token);
             self.ended_logins.push(token);
             log::info!("login ended ({why})");
         }
@@ -1433,6 +1435,7 @@ impl Router {
         // goes when `entry` is dropped at the end of this scope. Doing both
         // covers either state without having to ask which this one is in.
         self.sessions.remove(&entry.session_id);
+        self.revisions.invalidate(token);
         log::info!("login ended (reported over for good from outside the router)");
         true
     }
@@ -1840,7 +1843,7 @@ impl Router {
 /// carrying it says nothing about which life of the login it was proven
 /// under and must not overwrite a number that does. The allowlist path
 /// always carries it: that path has no verifier at all, its principal is the
-/// daemon's own account, and a handshake on it is its own proof. Writing
+/// daemon's own account, and fresh transport proof carries no login epoch. Writing
 /// that 0 over a real number would make the entry claim "no life", which
 /// compares as older than every report and so lets every report through --
 /// the staleness check off, by accident, for that token.
@@ -2236,7 +2239,6 @@ impl SessionManager {
                         &mut resolve_for_msg2,
                     )
                 };
-                let mut accepted_by_signature = false;
                 if matches!(outcome, AcceptOutcome::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
@@ -2254,7 +2256,6 @@ impl SessionManager {
                         body,
                         &mut resolve_for_msg2,
                     );
-                    accepted_by_signature = matches!(outcome, AcceptOutcome::Accepted { .. });
                 }
                 match outcome {
                     AcceptOutcome::Accepted {
@@ -2268,7 +2269,12 @@ impl SessionManager {
                         // client was told about in msg2.
                         let decision = decision
                             .expect("an accepted handshake resolved its decision inside `accept`");
+                        let Some(revision) = router.revisions.capture(msg1.token) else {
+                            ctx.auth.nonces.release(nonce);
+                            return;
+                        };
                         let admission = Admission {
+                            revision,
                             conn,
                             client_key,
                             msg1,
@@ -2277,8 +2283,7 @@ impl SessionManager {
                             src,
                             // Nothing has been consumed off this connection
                             // yet: whatever it queued is still there for the
-                            // bridge (allowlist) or the probation task
-                            // (signature) to drain.
+                            // probation task to drain under either policy.
                             start: BridgeStart::default(),
                             nonce,
                             // A placeholder on the signature path: it goes
@@ -2288,31 +2293,9 @@ impl SessionManager {
                             principal: ctx.auth.self_principal.clone(),
                             route: None,
                         };
-                        if accepted_by_signature {
-                            // The signature policy admits ANY static key, so
-                            // this handshake proves NOTHING. It must not reach
-                            // the decision arms until its peer does.
-                            Self::begin_probation(ctx, router, decision, admission).await;
-                        } else {
-                            // The allowlist checked this client's static key
-                            // during the handshake: it is already proven, and
-                            // binds immediately, exactly as it always has. It
-                            // never sends a v2 auth record (design SS4.4), so
-                            // this nonce will never be spent -- release it
-                            // UNCONDITIONALLY, ResendMsg2 retransmit included.
-                            // `apply_decision` itself never releases (see its
-                            // ResendMsg2 arm's own comment): the very same arm
-                            // is also reached, via `on_probation_ended`'s
-                            // re-resolution, for a PROVEN signature
-                            // connection whose nonce a proof has just
-                            // consumed -- releasing there would be
-                            // spend-then-release. Only this branch (the
-                            // allowlist accept, which never has a proof to
-                            // consume anything) is the right place to release
-                            // unconditionally.
-                            ctx.auth.nonces.release(nonce);
-                            Self::apply_decision(ctx, router, decision, admission).await;
-                        }
+                        // Both policies must prove this fresh responder split
+                        // before any backend or existing route is changed.
+                        Self::begin_probation(ctx, router, decision, admission).await;
                     }
                     // Validation failed -- no response, no registration. This is
                     // the auth gate: a non-allowlisted key (or bad Noise) never
@@ -2382,6 +2365,7 @@ impl SessionManager {
         admission: Admission,
     ) {
         let Admission {
+            revision,
             conn,
             client_key,
             msg1,
@@ -2390,9 +2374,9 @@ impl SessionManager {
             src,
             start: _,
             nonce,
-            // The real principal is not known yet -- it arrives with the
-            // proof, via `ProvenSession::principal`, when probation ends.
-            principal: _,
+            // Allowlist uses the daemon's principal; signature replaces this
+            // placeholder with the verifier's authenticated principal.
+            principal,
             route: _,
         } = admission;
         // A retransmit adopts nothing on either path, and must not create a
@@ -2414,16 +2398,16 @@ impl SessionManager {
             ctx.auth.nonces.release(nonce);
             return;
         }
-        let verifier = match ctx.auth.verifier.clone() {
-            Some(v) => v,
-            // Unreachable: a signature acceptance requires the verifier that
-            // configured the policy. Refuse rather than assert -- an
-            // unauthenticated peer must never be able to panic the daemon.
-            None => {
-                router.probation.remove(&session_id);
-                ctx.auth.nonces.release(nonce);
-                return;
-            }
+        let policy = match msg1.method {
+            AuthMethod::Allowlist => ProofPolicy::Allowlisted { principal },
+            AuthMethod::SshSignature => match ctx.auth.verifier.clone() {
+                Some(verifier) => ProofPolicy::SshSignature { verifier },
+                None => {
+                    router.probation.remove(&session_id);
+                    ctx.auth.nonces.release(nonce);
+                    return;
+                }
+            },
         };
         // A probation's route is small until its connection is proven
         // (spec §4.16); `cold_create` raises it.
@@ -2431,7 +2415,8 @@ impl SessionManager {
         tokio::spawn(run_probation(Probation {
             socket: ctx.socket.clone(),
             conn,
-            verifier,
+            policy,
+            revision,
             dgram_rx: dg_rx,
             client_key,
             msg1,
@@ -2457,26 +2442,30 @@ impl SessionManager {
     /// A probation ended: bind the connection if its peer proved itself, drop
     /// its route if it did not.
     async fn on_probation_ended(ctx: &ManagerCtx<'_>, router: &mut Router, ended: ProbationEnded) {
-        let seat = router.probation.remove(&ended.session_id);
-        // A successful verifier may already have created this helper login.
-        // Bind first: reattach/cold fallback turns the entry Live, so cleanup
-        // cannot revoke the login that the newly adopted session needs.
+        let Some(seat) = router.probation.remove(&ended.session_id) else {
+            // A completion owns effects only while its probation seat exists.
+            // Duplicate/stale results must not remove a route, release another
+            // admission's nonce, or bind a connection after retirement.
+            return;
+        };
+        let revision_guard = ended.revision.clone();
+        // Bind before retirement cleanup so an adopted helper login remains live.
         Self::apply_probation_result(ctx, router, ended).await;
-        if let Some(seat) = seat {
-            let still_ended = router.backends.get(&seat.login).is_some_and(|entry| {
-                matches!(
-                    entry.state,
-                    EntryState::Retained {
-                        reason: RetentionReason::PendingProof,
-                        ..
-                    }
-                )
-            });
-            if still_ended && !router.in_probation(&seat.login) {
-                router.forget_backend(seat.login, "graceful close after last probation");
-                notify_ended_logins(router, ctx.auth);
-            }
+        let still_ended = router.backends.get(&seat.login).is_some_and(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Retained {
+                    reason: RetentionReason::PendingProof,
+                    ..
+                }
+            )
+        });
+        if still_ended && !router.in_probation(&seat.login) {
+            router.forget_backend(seat.login, "graceful close after last probation");
+            notify_ended_logins(router, ctx.auth);
         }
+        drop(revision_guard);
+        router.revisions.prune();
     }
 
     async fn apply_probation_result(
@@ -2502,6 +2491,7 @@ impl SessionManager {
             }
         };
         let ProvenSession {
+            revision,
             conn,
             client_key,
             msg1,
@@ -2513,6 +2503,20 @@ impl SessionManager {
             principal,
             dgram_rx,
         } = proven;
+        if matches!(msg1.method, AuthMethod::Allowlist) {
+            // Fresh key confirmation never consumes the signature nonce.
+            // Release it even if authorization or binding later rejects us.
+            ctx.auth.nonces.release(nonce);
+            if !ctx
+                .auth
+                .allowlist
+                .lock()
+                .expect("allowlist mutex")
+                .contains(&client_key)
+            {
+                return;
+            }
+        }
         // `begin_probation` registered this route and only this method removes
         // it, so a proven probation always finds it. Were it missing, the
         // queue would go with `dgram_rx` below and a cold create would start
@@ -2544,11 +2548,25 @@ impl SessionManager {
         // entry names, so this connection adopts nothing and is dropped, and
         // the cached msg2 goes out in case that is what went missing.
         let decision = router.resolve(&msg1.token, &msg1_body, msg1.start_kind);
+        if !revision.is_current() {
+            // A verified retransmit twin may reconcile the helper's exact
+            // login incarnation, but must never replace the current route.
+            if matches!(decision, AcceptDecision::ResendMsg2)
+                && router.backends.get(&msg1.token).is_some_and(|entry| {
+                    entry.owner == principal.uid && entry.client_key == client_key
+                })
+            {
+                router.note_incarnation(&msg1.token, principal.incarnation);
+                Self::resend_original_msg2(ctx, router, &msg1.token, src).await;
+            }
+            return;
+        }
         Self::apply_decision(
             ctx,
             router,
             decision,
             Admission {
+                revision,
                 conn,
                 client_key,
                 msg1,
@@ -2590,11 +2608,9 @@ impl SessionManager {
     }
 
     /// Bind an accepted, PROVEN connection to a backend according to
-    /// `decision`. Reached directly by the allowlist path (whose handshake is
-    /// its own proof) and, one round trip later, by a signature path that
-    /// finished its probation. Identical either way: the only difference is
-    /// `admission.start`, which carries whatever probation already consumed
-    /// off the connection so the bridge can replay it.
+    /// `decision`. Both authentication policies arrive after successful
+    /// probation. `admission.start` carries the events and stream data already
+    /// consumed so the bridge can replay them after the session-start event.
     async fn apply_decision(
         ctx: &ManagerCtx<'_>,
         router: &mut Router,
@@ -2603,6 +2619,14 @@ impl SessionManager {
     ) {
         let token = admission.msg1.token;
         let new_id = admission.conn.session_id();
+        let change = if matches!(decision, AcceptDecision::ResendMsg2) {
+            None
+        } else {
+            let Some(change) = router.revisions.reserve_change() else {
+                return;
+            };
+            Some(change)
+        };
         match decision {
             AcceptDecision::ResendMsg2 => {
                 // Do NOT adopt this call's fresh conn / new_id -- `admission`
@@ -2612,8 +2636,7 @@ impl SessionManager {
                 // discarded connection's nonce could look unspent from this
                 // arm alone: this same arm is reached from TWO callers with
                 // different answers to "will this nonce be spent". The
-                // allowlist path (`handle_datagram`'s direct call) already
-                // released its own nonce, unconditionally, before ever
+                // allowlist completion already released its own nonce, unconditionally, before ever
                 // reaching here. The signature path
                 // (`on_probation_ended`'s re-resolution, the "fourth
                 // outcome" of a proven twin) hands in a PROVEN connection
@@ -2635,6 +2658,7 @@ impl SessionManager {
             }
             AcceptDecision::WarmReattach => {
                 let Admission {
+                    revision,
                     conn,
                     client_key,
                     msg1,
@@ -2705,6 +2729,9 @@ impl SessionManager {
                         let dg_tx = router
                             .take_stable_route(&token)
                             .expect("live/retained entry must own its dgram route on reattach");
+                        router
+                            .revisions
+                            .commit(token, change.expect("reserved binding change"));
                         let old_key = router.rebind(
                             &token,
                             Rebind {
@@ -2741,7 +2768,9 @@ impl SessionManager {
                         let old_key = Self::cold_create(
                             ctx,
                             router,
+                            change.expect("reserved binding change"),
                             Admission {
+                                revision,
                                 conn: *boxed,
                                 client_key,
                                 msg1,
@@ -2784,7 +2813,13 @@ impl SessionManager {
                     .expect("entry present")
                     .session_id;
                 router.sessions.remove(&old_id);
-                let old_key = Self::cold_create(ctx, router, admission).await;
+                let old_key = Self::cold_create(
+                    ctx,
+                    router,
+                    change.expect("reserved binding change"),
+                    admission,
+                )
+                .await;
                 scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
             }
             AcceptDecision::ColdCreate => {
@@ -2807,7 +2842,13 @@ impl SessionManager {
                 // returns `None` here -- this call is a no-op, kept for
                 // symmetry/safety rather than special-cased away.
                 let client_key = admission.client_key;
-                let old_key = Self::cold_create(ctx, router, admission).await;
+                let old_key = Self::cold_create(
+                    ctx,
+                    router,
+                    change.expect("reserved binding change"),
+                    admission,
+                )
+                .await;
                 scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
             }
         }
@@ -2827,9 +2868,11 @@ impl SessionManager {
     async fn cold_create(
         ctx: &ManagerCtx<'_>,
         router: &mut Router,
+        change: RevisionChange,
         admission: Admission,
     ) -> Option<[u8; 32]> {
         let Admission {
+            revision: _revision,
             conn,
             client_key,
             msg1,
@@ -2901,6 +2944,7 @@ impl SessionManager {
         // Register BEFORE sending msg2, so a fast client reply is routable the
         // instant it arrives.
         router.sessions.insert(session_id, dg_tx);
+        router.revisions.commit(token, change);
         let superseded = router.backends.insert(
             token,
             BackendEntry {
@@ -2933,11 +2977,11 @@ struct ManagerCtx<'a> {
     active_count: &'a Arc<AtomicUsize>,
 }
 
-/// One accepted handshake whose peer is proven, as the decision arms see it.
-/// Reaching a decision arm at all is the proof: an allowlist handshake is
-/// admitted straight from `handle_datagram`, a signature handshake only after
-/// its probation succeeded.
+/// An accepted handshake carried through probation and into the decision arms.
+/// Both policies need fresh transport-key confirmation before a decision arm;
+/// the signature policy additionally needs a verified authentication record.
 struct Admission {
+    revision: BindingRevision,
     conn: Connection,
     client_key: [u8; 32],
     msg1: Msg1Payload,
@@ -2948,24 +2992,21 @@ struct Admission {
     /// The address the handshake arrived from.
     src: SocketAddr,
     /// What a probation stage already consumed off this connection, for the
-    /// bridge to replay. Empty on the allowlist path.
+    /// bridge to replay. Either policy may already have received early events.
     start: BridgeStart,
-    /// The nonce this handshake's msg2 carried. Read by `begin_probation`,
-    /// which carries it into the `AuthGate` that checks a v2 record's proof
-    /// against it; unused past that point (the allowlist path builds no
-    /// gate at all, and once probation has proved a connection the check
-    /// has already happened).
+    /// The nonce carried in msg2. Signature probation verifies a record against
+    /// it; allowlist probation never spends it and releases it on completion.
     nonce: [u8; AUTH_NONCE_LEN],
     /// Who this connection belongs to. On the allowlist path this is
-    /// `ServerAuth::self_principal` from the moment of acceptance -- the
-    /// handshake is its own proof. On the signature path the value set here
+    /// `ServerAuth::self_principal` from acceptance, but binding still waits
+    /// for fresh transport proof. On the signature path the value set here
     /// is a placeholder that `begin_probation` discards: the real value
     /// only exists once probation succeeds, and arrives via
     /// `ProvenSession::principal` when a fresh `Admission` is built for it
     /// in `on_probation_ended`.
     principal: Principal,
-    /// The probation's route and queue, on the signature path only (see
-    /// [`ProvisionalRoute`]). `None` on the allowlist path, which has none.
+    /// The completed probation's route and queue (see [`ProvisionalRoute`]).
+    /// Both policies populate it after proof; it is absent before probation.
     route: Option<ProvisionalRoute>,
 }
 
@@ -5099,6 +5140,8 @@ mod tests {
         let (len, src) = client_sock.recv_from(&mut buf).await.unwrap();
         let out = client.on_datagram(Instant::now(), src, &buf[..len]);
         send_client(&client_sock, &out).await;
+        client.request_ping(Instant::now());
+        send_client(&client_sock, &client.on_timeout(Instant::now())).await;
         (client, client_sock)
     }
 
@@ -5597,7 +5640,8 @@ mod tests {
     /// What `begin_probation` leaves behind for a probation under
     /// `session_id`: its route in the table, and the queue behind it for the
     /// `ProvenSession` a test builds by hand.
-    fn register_provisional_route(router: &mut Router, session_id: u64) -> DgramRx {
+    fn register_provisional_route(router: &mut Router, session_id: u64, token: LoginId) -> DgramRx {
+        assert!(router.admit_probation(session_id, probation_src(session_id), token));
         let (tx, rx) = dgram_queue();
         router.sessions.insert(session_id, tx);
         rx
@@ -5808,7 +5852,13 @@ mod tests {
             StartKind::Cold,
         )
         .await;
-        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spawns.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first proof must admit its backend");
 
         // One byte in: the backend echoes it once -- like the shell's last
         // bit of output -- then ends its own `run` future on the spot.
@@ -5874,6 +5924,13 @@ mod tests {
             StartKind::Warm,
         )
         .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spawns.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second proof must admit its backend");
         assert_eq!(
             spawns.load(Ordering::SeqCst),
             2,
@@ -5905,7 +5962,7 @@ mod tests {
         ));
 
         let token = [42u8; 16];
-        let (first, _s1) = handshake_to_live(
+        let (mut first, s1) = handshake_to_live(
             server_addr,
             server_kp.public,
             client_kp.private,
@@ -5918,6 +5975,8 @@ mod tests {
             "a cold start creates a session, so there is nothing to have resumed"
         );
 
+        // Observe committed admission before asking for a resumed binding.
+        assert_eq!(echo_one(&mut first, &s1, 42).await, vec![42]);
         let (second, _s2) = handshake_to_live(
             server_addr,
             server_kp.public,
@@ -6670,6 +6729,7 @@ mod tests {
         };
 
         let admission = Admission {
+            revision: router.revisions.capture([200u8; 16]).unwrap(),
             conn: Connection::new(ConnectionConfig {
                 required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
@@ -6774,6 +6834,7 @@ mod tests {
         };
 
         let admission = Admission {
+            revision: router.revisions.capture(REFUSED).unwrap(),
             conn: Connection::new(ConnectionConfig {
                 required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
@@ -10717,6 +10778,11 @@ mod tests {
                     .unwrap();
             let out = self.conn.on_datagram(Instant::now(), src, &self.buf[..len]);
             send_client(&self.sock, &out).await;
+            if self.method == AuthMethod::Allowlist && self.conn.state() == LinkState::Live {
+                self.conn.request_ping(Instant::now());
+                let proof = self.conn.on_timeout(Instant::now());
+                send_client(&self.sock, &proof).await;
+            }
         }
 
         /// Play a client built before negotiation and cookies (spec §9.3):
@@ -11126,10 +11192,10 @@ mod tests {
         assert_eq!(spawned.load(Ordering::SeqCst), 0);
     }
 
-    /// The allowlist path is untouched: no verifier, no gate, same behavior
-    /// as before this task existed.
+    /// Allowlisted keys still need no SSH signature: fresh transport proof
+    /// admits the backend, and ordinary data is delivered after admission.
     #[tokio::test]
-    async fn the_allowlist_path_needs_no_proof() {
+    async fn the_allowlist_path_needs_no_ssh_signature() {
         let spawned = Arc::new(AtomicUsize::new(0));
         let mut client = start_manager_with_allowlist(CountingEchoBackend {
             spawns: spawned.clone(),
@@ -11718,16 +11784,19 @@ mod tests {
             active_count: &active_count,
         };
 
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 // Unread on this path (`proven` is `Some` below): only the
                 // `None` arm consults the top-level nonce.
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -11854,14 +11923,17 @@ mod tests {
         // The second twin's proof lands, naming the NEWER life.
         let mut proven = test_principal();
         proven.incarnation = NEW_LIFE;
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -11924,6 +11996,198 @@ mod tests {
         );
     }
 
+    async fn check_stale_verified_twin(owner_matches: bool, key_matches: bool) {
+        const OLD_LIFE: u64 = 5;
+        const NEW_LIFE: u64 = 6;
+        let token = [4u8; 16];
+        let body = b"the same msg1 both connections carried".to_vec();
+
+        // The twin's binding, made under the OLD life of the login.
+        let mut router = Router::new();
+        // Both handshakes observed the token before the competing commit.
+        let revision = router.revisions.capture(token).unwrap();
+        let (mut ctl_rx, mut dg_rx) =
+            synthetic_live_entry_with_key(&mut router, token, 42, [7u8; 32]);
+        {
+            let entry = router.backends.get_mut(&token).expect("entry present");
+            entry.last_msg1_body = body.clone();
+            entry.msg2 = b"the cached msg2 for session 42".to_vec();
+            entry.incarnation = OLD_LIFE;
+            entry.owner = test_principal().uid;
+        }
+        let change = router.revisions.reserve_change().unwrap();
+        router.revisions.commit(token, change);
+        assert!(
+            !revision.is_current(),
+            "the competing commit invalidates the twin"
+        );
+        let original_control = router.backends[&token].control.clone();
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        assert!(router.probation.contains_key(&99));
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tracking = Arc::new(TrackingNonces::default());
+        let spawned = Arc::new(AtomicUsize::new(0));
+
+        let server_kp = generate_keypair();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let auth = ServerAuth {
+            allowlist: Arc::new(Mutex::new(Vec::new())),
+            verifier: Some(Arc::new(FakeVerifier::accepting_good())),
+            server_pub: server_kp.public,
+            self_principal: test_self_principal(),
+            nonces: tracking.clone(),
+            logins: Arc::new(ForgetNothing),
+        };
+        let factory = BackendFactory(Arc::new(CountingEchoBackend {
+            spawns: spawned.clone(),
+        }));
+        let (done_tx, _done_rx) = mpsc::unbounded_channel::<SessionEnded>();
+        let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let ctx = ManagerCtx {
+            socket: &socket,
+            server_priv: &server_kp.private,
+            auth: &auth,
+            factory: &factory,
+            done_tx: &done_tx,
+            probation_tx: &probation_tx,
+            active_count: &active_count,
+        };
+
+        // The second twin's proof lands, naming the NEWER life.
+        let mut proven = test_principal();
+        proven.incarnation = NEW_LIFE;
+        if !owner_matches {
+            proven.uid += 1;
+        }
+        SessionManager::on_probation_ended(
+            &ctx,
+            &mut router,
+            ProbationEnded {
+                revision: revision.clone(),
+                session_id: 99,
+                nonce: [0u8; AUTH_NONCE_LEN],
+                proven: Some(Box::new(ProvenSession {
+                    revision,
+                    conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
+                        features: crate::Features::SUPPORTED,
+                        role: Role::Server,
+                        local_static_priv: server_kp.private,
+                        remote_static_pub: None,
+                        auth: AuthPolicy::SshSignature,
+                    }),
+                    client_key: if key_matches { [7u8; 32] } else { [8u8; 32] },
+                    msg1: Msg1Payload {
+                        offered: crate::Features::SUPPORTED,
+                        start_kind: StartKind::Warm,
+                        token,
+                        method: AuthMethod::SshSignature,
+                    },
+                    msg1_body: body,
+                    out: Vec::new(),
+                    src: client_socket.local_addr().unwrap(),
+                    start: BridgeStart::default(),
+                    nonce: [0u8; AUTH_NONCE_LEN],
+                    principal: proven,
+                    dgram_rx,
+                })),
+            },
+        )
+        .await;
+
+        // Setup, so a resend that wrongly rebound would show as such rather
+        // than as this test's own property.
+        assert_eq!(
+            router
+                .backends
+                .get(&token)
+                .expect("entry present")
+                .session_id,
+            42,
+            "setup: a resend must still adopt no session of its own"
+        );
+
+        let entry = &router.backends[&token];
+        assert!(entry.control.same_channel(&original_control));
+        assert_eq!(entry.client_key, [7u8; 32]);
+        assert_eq!(entry.owner, test_principal().uid);
+        let accepted = owner_matches && key_matches;
+        assert_eq!(
+            entry.incarnation,
+            if accepted { NEW_LIFE } else { OLD_LIFE }
+        );
+        assert_eq!(router.backends.len(), 1);
+        assert_eq!(router.sessions.len(), 1);
+        assert!(router.sessions.contains_key(&42));
+        assert!(router.probation.is_empty());
+        assert!(matches!(
+            dg_rx.try_recv_or_why(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            matches!(ctl_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no Attach or teardown"
+        );
+        // Route a marker through the current map and receive it on the
+        // original queue; retaining only the numeric session ID is not enough.
+        let route_src = client_socket.local_addr().unwrap();
+        assert!(router.sessions[&42].send(route_src, b"same route".to_vec()));
+        let (seen_src, marker) = dg_rx.try_recv_or_why().unwrap();
+        assert_eq!(seen_src, route_src);
+        assert_eq!(marker, b"same route");
+        // A verified signature has spent its nonce. Completion must not release it.
+        assert_eq!(tracking.bad_releases(), 0);
+        tokio::task::yield_now().await;
+        assert_eq!(spawned.load(Ordering::SeqCst), 0);
+        let mut reply = [0u8; 128];
+        if accepted {
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(1), client_socket.recv_from(&mut reply))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&reply[..len], b"the cached msg2 for session 42");
+            assert!(
+                !router.end_login(token, OLD_LIFE),
+                "the queued old login report cannot tear down the reconciled session"
+            );
+            assert!(router.backends.contains_key(&token));
+            assert!(matches!(
+                dg_rx.try_recv_or_why(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                ctl_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        } else {
+            assert_eq!(
+                client_socket.try_recv_from(&mut reply).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(
+                router.end_login(token, OLD_LIFE),
+                "an unrelated twin must not suppress a valid login-ended report"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_verified_twin_reconciles_incarnation_without_adopting_a_route() {
+        check_stale_verified_twin(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_verified_twin_cannot_reconcile_another_owners_incarnation() {
+        check_stale_verified_twin(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn stale_verified_twin_cannot_reconcile_another_client_keys_incarnation() {
+        check_stale_verified_twin(true, false).await;
+    }
+
     /// The whole point of this slice: an account that has authenticated
     /// perfectly well, naming someone else's token, must NOT get their shell.
     #[tokio::test]
@@ -11964,16 +12228,19 @@ mod tests {
         // an msg1 body that does NOT match the entry's -- so `resolve` picks
         // `WarmReattach`, not the retransmit arm, and the owner check is
         // actually exercised.
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 // Unread on this path (`proven` is `Some` below): only the
                 // `None` arm consults the top-level nonce.
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -12070,16 +12337,19 @@ mod tests {
         // A COLD start from an account that is not this token's owner (1001,
         // not 1000), with an msg1 body that does NOT match the entry's -- so
         // `resolve` picks `ColdReplace`, not the retransmit arm.
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 // Unread on this path (`proven` is `Some` below): only the
                 // `None` arm consults the top-level nonce.
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -12174,16 +12444,19 @@ mod tests {
         // never-handshaked `Connection` defaults to `session_id() == 0` (see
         // `Connection::new`), so a successful reattach repoints the entry to
         // 0 -- proving the take-over, distinct from the original 42.
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 // Unread on this path (`proven` is `Some` below): only the
                 // `None` arm consults the top-level nonce.
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -12411,16 +12684,19 @@ mod tests {
             active_count: &active_count,
         };
 
-        let dgram_rx = register_provisional_route(&mut router, 99);
+        let dgram_rx = register_provisional_route(&mut router, 99, token);
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 // Unread on this path (`proven` is `Some` below): only the
                 // `None` arm consults the top-level nonce.
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -12489,6 +12765,7 @@ mod tests {
 
         let (route, dgram_rx) = probation_dgram_queue();
         router.sessions.insert(99, route.clone());
+        assert!(router.admit_probation(99, probation_src(99), token));
         let src: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let entry = vec![0u8; 1024 - DGRAM_ENTRY_COST];
         let mut taken = 0;
@@ -12501,13 +12778,16 @@ mod tests {
             "in probation the route drops past its small bound"
         );
 
+        let revision = router.revisions.capture(token).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
+                    revision,
                     conn: Connection::new(ConnectionConfig {
                         required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
@@ -13108,7 +13388,7 @@ mod tests {
         };
         let factory = BackendFactory(Arc::new(EchoBackend));
         let (done_tx, _done_rx) = mpsc::unbounded_channel::<SessionEnded>();
-        let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
+        let (probation_tx, mut probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
             socket: &socket,
@@ -13120,14 +13400,50 @@ mod tests {
             active_count: &active_count,
         };
 
-        let msg1 = allowlist_msg1(
-            &server_kp.public,
-            client_kp.private,
-            [3u8; 16],
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let src = client_socket.local_addr().unwrap();
+        let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: client_kp.private,
+            remote_static_pub: Some(server_kp.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        let msg1 = client.start_session(
+            Instant::now(),
+            socket.local_addr().unwrap(),
             StartKind::Cold,
+            [3; 16],
         );
-        let src: SocketAddr = "127.0.0.1:9994".parse().unwrap();
-        SessionManager::handle_datagram(&ctx, &mut router, msg1.len(), src, &msg1).await;
+        for dg in msg1 {
+            SessionManager::handle_datagram(&ctx, &mut router, dg.bytes.len(), src, &dg.bytes)
+                .await;
+        }
+        assert!(
+            router.backends.is_empty(),
+            "msg1 alone cannot bind a backend"
+        );
+        assert_eq!(tracking.outstanding_snapshot().len(), 1);
+        let mut buf = vec![0; RECV_BUF_LEN];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(2), client_socket.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let mut out = client.on_datagram(Instant::now(), from, &buf[..n]);
+        client.request_ping(Instant::now());
+        out.extend(client.on_timeout(Instant::now()));
+        for dg in out {
+            SessionManager::handle_datagram(&ctx, &mut router, dg.bytes.len(), src, &dg.bytes)
+                .await;
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(2), probation_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.proven.is_some());
+        SessionManager::on_probation_ended(&ctx, &mut router, ended).await;
 
         assert_eq!(
             router.backends.len(),
@@ -13183,10 +13499,13 @@ mod tests {
             tracking.outstanding_snapshot(),
             [nonce].into_iter().collect()
         );
+        assert!(router.admit_probation(99, probation_src(99), [0; 16]));
+        let revision = router.revisions.capture([0; 16]).unwrap();
         SessionManager::on_probation_ended(
             &ctx,
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: 99,
                 nonce,
                 proven: None,
@@ -13667,10 +13986,12 @@ mod tests {
 
         // The same completion the probation task sends after its deadline.
         // Drive the manager seam directly instead of waiting for a timer.
+        let revision = router.revisions.capture([0; 16]).unwrap();
         SessionManager::on_probation_ended(
             &rig.ctx(),
             &mut router,
             ProbationEnded {
+                revision: revision.clone(),
                 session_id: replacement,
                 nonce: [0; AUTH_NONCE_LEN],
                 proven: None,
@@ -13940,7 +14261,7 @@ mod tests {
         );
     }
 
-    /// A client whose msg2 was lost before the load began sends its plain
+    /// A client whose binding committed before the load began sends its plain
     /// msg1 again, gets a cookie, and behind it its ORIGINAL msg2 --
     /// `ResendMsg2` works through the check.
     #[tokio::test]
@@ -13958,7 +14279,7 @@ mod tests {
         };
         let factory = BackendFactory(Arc::new(EchoBackend));
         let (done_tx, _done_rx) = mpsc::unbounded_channel::<SessionEnded>();
-        let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
+        let (probation_tx, mut probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
             socket: &socket,
@@ -13972,12 +14293,23 @@ mod tests {
         let mut router = Router::new();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let from = client.local_addr().unwrap();
-        let msg1 = allowlist_msg1(
-            &server_kp.public,
-            client_kp.private,
-            [3; 16],
-            StartKind::Cold,
-        );
+        let mut connection = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: client_kp.private,
+            remote_static_pub: Some(server_kp.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        let msg1 = connection
+            .start_session(
+                Instant::now(),
+                socket.local_addr().unwrap(),
+                StartKind::Cold,
+                [3; 16],
+            )
+            .remove(0)
+            .bytes;
         let mut buf = [0u8; 256];
         SessionManager::handle_datagram(&ctx, &mut router, msg1.len(), from, &msg1).await;
         let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
@@ -13985,6 +14317,29 @@ mod tests {
             .expect("msg2")
             .unwrap();
         let first_msg2 = buf[..n].to_vec();
+        let mut out =
+            connection.on_datagram(Instant::now(), socket.local_addr().unwrap(), &first_msg2);
+        connection.request_ping(Instant::now());
+        out.extend(connection.on_timeout(Instant::now()));
+        for dg in out {
+            SessionManager::handle_datagram(&ctx, &mut router, dg.bytes.len(), from, &dg.bytes)
+                .await;
+        }
+        let ended = tokio::time::timeout(Duration::from_secs(2), probation_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.proven.is_some());
+        SessionManager::on_probation_ended(&ctx, &mut router, ended).await;
+        // Drain the proof's PONG before observing the next handshake reply.
+        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            crate::wire::parse(&buf[..n]),
+            Ok(crate::wire::Frame::Transport { .. })
+        ));
 
         router.cookies = CookieCheck::with_limits(
             Instant::now(),
@@ -13994,11 +14349,24 @@ mod tests {
             },
         );
         SessionManager::handle_datagram(&ctx, &mut router, msg1.len(), from, &msg1).await;
-        let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
-            .await
-            .expect("a cookie reply")
-            .unwrap();
-        let cookie = cookie_from(&buf[..n]);
+        let cookie = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let n = client.recv(&mut buf).await.unwrap();
+                if matches!(
+                    crate::wire::parse(&buf[..n]),
+                    Ok(crate::wire::Frame::Handshake {
+                        kind: Kind::CookieReply,
+                        ..
+                    })
+                ) {
+                    break cookie_from(&buf[..n]);
+                }
+                // Admission can retransmit the same msg2 before this cookie.
+                assert_eq!(&buf[..n], first_msg2.as_slice());
+            }
+        })
+        .await
+        .expect("a cookie reply");
         let again = encode_handshake_init_cookie(&cookie, &msg1[2..]);
         SessionManager::handle_datagram(&ctx, &mut router, again.len(), from, &again).await;
         let n = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
@@ -14255,6 +14623,157 @@ mod tests {
         }
     }
 
+    /// Establish through the real router, retaining the exact msg1 and first
+    /// authenticated transport packet for an adversarial replay later.
+    async fn captured_allowlist_connection(
+        wiring: &RouterWiring,
+        router: &mut Router,
+        verdicts: &mut mpsc::UnboundedReceiver<ProbationEnded>,
+        key: [u8; 32],
+        token: LoginId,
+        start_kind: StartKind,
+    ) -> (UdpSocket, Vec<u8>, Vec<u8>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = socket.local_addr().unwrap();
+        let server = wiring.socket.local_addr().unwrap();
+        let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: key,
+            remote_static_pub: Some(wiring.server_pub),
+            auth: AuthPolicy::Allowlist(vec![wiring.server_pub]),
+        });
+        let payload = encode_msg1(&Msg1Payload {
+            offered: crate::Features::SUPPORTED,
+            start_kind,
+            token,
+            method: AuthMethod::Allowlist,
+        });
+        let msg1 = client
+            .start_with_payload(Instant::now(), server, &payload)
+            .remove(0)
+            .bytes;
+        SessionManager::handle_datagram(&wiring.ctx(), router, msg1.len(), source, &msg1).await;
+        let mut buf = vec![0; RECV_BUF_LEN];
+        let (len, from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .expect("legitimate msg2")
+            .unwrap();
+        let mut proof = client.on_datagram(Instant::now(), from, &buf[..len]);
+        client.request_ping(Instant::now());
+        proof.extend(client.on_timeout(Instant::now()));
+        assert!(!proof.is_empty(), "legitimate fresh possession packet");
+        let captured = proof[0].bytes.clone();
+        for datagram in proof {
+            SessionManager::handle_datagram(
+                &wiring.ctx(),
+                router,
+                datagram.bytes.len(),
+                source,
+                &datagram.bytes,
+            )
+            .await;
+        }
+        // The original implementation binds immediately. The fixed one delivers
+        // this same real proof through bounded probation before binding.
+        if router.probation.contains_key(&client.session_id()) {
+            let verdict = tokio::time::timeout(Duration::from_secs(5), verdicts.recv())
+                .await
+                .expect("legitimate proof completion")
+                .expect("verdict channel");
+            assert!(verdict.proven.is_some(), "legitimate proof accepted");
+            SessionManager::on_probation_ended(&wiring.ctx(), router, verdict).await;
+        }
+        assert_eq!(router.backends[&token].session_id, client.session_id());
+        (socket, msg1, captured)
+    }
+
+    async fn captured_allowlist_replay_preserves_current(start_kind: StartKind, replay_data: bool) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let token = [0xA7; 16];
+            let helper = HelperLogins::with(token);
+            let (mut wiring, mut verdicts) = RouterWiring::new(helper).await;
+            wiring.auth.verifier = None;
+            let key = generate_keypair();
+            wiring.auth.allowlist.lock().unwrap().push(key.public);
+            let mut router = Router::new();
+            let (_first, msg1, ciphertext) = captured_allowlist_connection(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                key.private,
+                token,
+                start_kind,
+            )
+            .await;
+            let (_current, _, _) = captured_allowlist_connection(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                key.private,
+                token,
+                StartKind::Warm,
+            )
+            .await;
+            let current_id = router.backends[&token].session_id;
+            let current_control = router.backends[&token].control.clone();
+            let allowlist = wiring.auth.allowlist.lock().unwrap().clone();
+            let backend_count = router.backends.len();
+            let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let source = attacker.local_addr().unwrap();
+            SessionManager::handle_datagram(&wiring.ctx(), &mut router, msg1.len(), source, &msg1)
+                .await;
+            if replay_data {
+                SessionManager::handle_datagram(
+                    &wiring.ctx(),
+                    &mut router,
+                    ciphertext.len(),
+                    source,
+                    &ciphertext,
+                )
+                .await;
+            }
+            assert_eq!(
+                router.backends[&token].session_id, current_id,
+                "captured msg1 must not replace the current connection without fresh possession"
+            );
+            assert!(
+                router.backends[&token]
+                    .control
+                    .same_channel(&current_control),
+                "the original backend must remain installed"
+            );
+            assert!(
+                router.sessions.contains_key(&current_id),
+                "current route must remain"
+            );
+            assert_eq!(router.backends.len(), backend_count);
+            assert_eq!(*wiring.auth.allowlist.lock().unwrap(), allowlist);
+            assert!(
+                matches!(verdicts.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "captured ciphertext cannot prove possession of a fresh responder split"
+            );
+        })
+        .await
+        .expect("bounded replay regression");
+    }
+
+    #[tokio::test]
+    async fn captured_allowlist_warm_msg1_cannot_replace_current_route() {
+        captured_allowlist_replay_preserves_current(StartKind::Warm, false).await;
+    }
+
+    #[tokio::test]
+    async fn captured_allowlist_cold_msg1_cannot_replace_current_route() {
+        captured_allowlist_replay_preserves_current(StartKind::Cold, false).await;
+    }
+
+    #[tokio::test]
+    async fn captured_transport_cannot_confirm_replayed_allowlist_handshake() {
+        captured_allowlist_replay_preserves_current(StartKind::Cold, true).await;
+    }
+
     #[tokio::test]
     async fn shell_replacement_control_manager_rejects_candidates_without_replacing_active_route() {
         let token = [0xA4; 16];
@@ -14383,6 +14902,118 @@ mod tests {
             .expect("the probation channel is open");
         assert!(verdict.proven.is_some(), "setup: the proof verified");
         (verdict, sock)
+    }
+
+    #[tokio::test]
+    async fn a_verified_completion_without_its_seat_cannot_adopt_or_remove_a_route() {
+        let token = [0xAA; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (ended, _socket) =
+            a_proof_already_verified(&wiring, &mut router, &mut verdicts, token, StartKind::Cold)
+                .await;
+        let id = ended.session_id;
+        assert!(router.probation.remove(&id).is_some());
+        assert!(router.sessions.contains_key(&id));
+        // An already retired completion has no authority over a route or
+        // binding. Keep the route present to observe both effects directly.
+        SessionManager::on_probation_ended(&wiring.ctx(), &mut router, ended).await;
+        assert!(
+            router.backends.is_empty(),
+            "a retired completion cannot bind"
+        );
+        assert!(
+            router.sessions.contains_key(&id),
+            "a retired completion cannot remove a route"
+        );
+        assert!(helper.opens_channels_for(token));
+    }
+
+    #[tokio::test]
+    async fn binding_revision_rejects_old_verified_proof_after_new_commit() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let token = [0xA8; 16];
+            let helper = HelperLogins::with(token);
+            let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+            let mut router = Router::new();
+            let (old, _old_socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Cold,
+            )
+            .await;
+            let (new, _new_socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Cold,
+            )
+            .await;
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, new).await;
+            let current = router.backends[&token].session_id;
+            let control = router.backends[&token].control.clone();
+            let key = router.backends[&token].client_key;
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, old).await;
+            assert_eq!(
+                router.backends[&token].session_id, current,
+                "a delayed verified proof cannot replace a later committed binding"
+            );
+            assert!(router.backends[&token].control.same_channel(&control));
+            assert_eq!(router.backends[&token].client_key, key);
+            assert!(router.sessions.contains_key(&current));
+            assert!(
+                helper.opens_channels_for(token),
+                "stale cleanup must not revoke the current login"
+            );
+        })
+        .await
+        .expect("bounded admission revision test");
+    }
+
+    #[tokio::test]
+    async fn binding_revision_rejects_absent_created_deleted_aba() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let token = [0xA9; 16];
+            let helper = HelperLogins::with(token);
+            let (wiring, mut verdicts) = RouterWiring::new(helper).await;
+            let mut router = Router::new();
+            let (old, _old_socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Warm,
+            )
+            .await;
+            let (new, _new_socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Cold,
+            )
+            .await;
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, new).await;
+            let incarnation = router.backends[&token].incarnation;
+            assert!(
+                router.end_login(token, incarnation),
+                "real terminal-deletion path"
+            );
+            assert!(!router.backends.contains_key(&token));
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, old).await;
+            assert!(
+                !router.backends.contains_key(&token),
+                "returning to an absent token cannot make an old proof current again"
+            );
+            assert!(router.sessions.is_empty());
+            assert!(router.probation.is_empty());
+        })
+        .await
+        .expect("bounded admission ABA test");
     }
 
     /// A device comes back to its retained session just as the GC reaches
