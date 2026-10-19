@@ -223,20 +223,31 @@ pub async fn run_transport_daemon(
     // The multi-session router: one UDP socket, per-token sessions, the
     // per-session channel backend. It snapshots the allowlist fresh at every
     // handshake and scrubs an ended session's key off it.
-    let manager_loop = SessionManager::serve(
+    let shutdown = transport::Shutdown::default();
+    let manager_loop = SessionManager::serve_until_shutdown(
         Arc::new(socket),
         server_priv,
         auth,
         BackendFactory(backend),
         active_count,
         LoginEndedReports::none(),
+        shutdown.clone(),
     );
+    tokio::pin!(manager_loop);
 
-    tokio::select! {
-        _ = control_loop => {}
-        _ = manager_loop => {}
-        _ = stop_rx.recv() => {}
-    }
+    let completed = tokio::select! {
+        _ = control_loop => None,
+        result = &mut manager_loop => Some(result),
+        _ = stop_rx.recv() => None,
+    };
+    let result = match completed {
+        Some(result) => result,
+        None => {
+            shutdown.request();
+            manager_loop.await
+        }
+    };
+    result.context("joining transport session shutdown")?;
 
     log::info("qshd", "transport daemon stopped");
     Ok(())
@@ -399,6 +410,10 @@ async fn handle_transport_control_connection(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "transport_shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {
