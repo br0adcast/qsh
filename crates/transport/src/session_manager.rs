@@ -297,8 +297,8 @@ pub fn log_socket_buffers(report: &crate::BufferReport) {
 }
 
 /// Lifecycle state of a backend entry. A `Live` entry has a connected session;
-/// a `Retained` entry outlived its connection (an unexpected death) and is kept
-/// for a warm reconnect until `RETAIN_AFTER_DEATH` elapses.
+/// a `Retained` entry outlived its connection. Unexpected death keeps it for
+/// warm reconnect; a graceful close keeps it only while a proof is pending.
 ///
 /// `since` is a `tokio::time::Instant` (NOT `std::time::Instant`) so retention
 /// and GC deadlines are driven by tokio's test clock in unit tests, without a
@@ -312,7 +312,15 @@ enum EntryState {
     Retained {
         since: tokio::time::Instant,
         reprieved: bool,
+        reason: RetentionReason,
     },
+}
+
+enum RetentionReason {
+    UnexpectedDeath,
+    /// The connection closed gracefully, but a candidate's proof may already
+    /// have created helper state. Resolve that proof before ending the login.
+    PendingProof,
 }
 
 /// The shared, in-memory allowlist of accepted client static public keys.
@@ -1205,8 +1213,8 @@ struct BackendEntry {
     /// an ended connection (graceful teardown or a death/retain) must not
     /// linger, so it can't be reused unless the client is re-added.
     client_key: [u8; 32],
-    /// Lifecycle state: `Live` while a session is attached, `Retained` after an
-    /// unexpected death while the backend waits for a warm reconnect.
+    /// Lifecycle state: `Live` while a session is attached, `Retained` while
+    /// waiting for warm reconnect or resolution of a graceful end's proof.
     state: EntryState,
     /// While `Retained`, the STABLE datagram sender for the parked bridge's
     /// `dgram_rx` -- moved here out of `sessions` on death so the bridge's
@@ -1308,8 +1316,9 @@ impl Router {
     }
 
     /// Every path that drops a backend goes through here: a graceful end, the
-    /// garbage collector past `RETAIN_AFTER_DEATH`, and the eviction of the
-    /// oldest retained entry. The login is over for good at that moment --
+    /// last pending proof after graceful end, garbage collection past
+    /// `RETAIN_AFTER_DEATH`, and eviction of the oldest retained entry. The
+    /// login is over for good at that moment --
     /// not when the connection dropped, because a retained entry is exactly
     /// the promise that the same login may come back (roaming, a flaky
     /// link).
@@ -1350,12 +1359,12 @@ impl Router {
     /// ignores a cold replace's.
     ///
     /// This is the FIRST caller that can reach a `Live` entry: the other
-    /// three removers ([`Router::forget_backend`]'s callers) each run where
+    /// removers ([`Router::forget_backend`]'s callers) each run where
     /// the bridge has already exited or is parked. That is why the route is
     /// removed here and not there.
     ///
     /// Deliberately does NOT record the login in `ended_logins`, unlike
-    /// every one of those three: the news came FROM the sink those ends are
+    /// the other removers: the news came FROM the sink those ends are
     /// forwarded to. Echoing it back would at best be redundant -- and at
     /// worst destructive, because by the time it arrived the client may have
     /// proved itself again under the same token, which gives the helper a
@@ -1554,16 +1563,16 @@ impl Router {
     /// `qshd`'s `an_open_served_after_its_login_ended_does_not_bring_it_back`.
     ///
     /// So a graceful close of a token in probation RETAINS instead of
-    /// forgetting, and the existing machinery takes it from there: the
-    /// reprieve in [`Router::gc_retained`] gives the proof its pass to
-    /// land, and the retention expires on its own afterwards. Retaining a
-    /// backend whose bridge has already exited is safe on the way back:
+    /// forgetting. The last candidate's completion releases this retention
+    /// after its binding decision, unless that decision revived the entry.
+    /// The existing GC reprieve still bounds a candidate that lingers.
+    /// Retaining a backend whose bridge has already exited is safe on the way back:
     /// `apply_decision`'s `WarmReattach` sends to that bridge's control
     /// channel and falls back to a cold create when the send fails, which
     /// is exactly what an exited bridge does.
     ///
     /// This is the same predicate `gc_retained` and `evict_oldest_retained`
-    /// already apply, on the third of the four paths that remove a backend.
+    /// already apply when deciding which retained backends to remove.
     ///
     /// `now` is a `tokio::time::Instant` so retention is measured on tokio's
     /// (test-fast-forwardable) clock.
@@ -1586,6 +1595,11 @@ impl Router {
                     entry.state = EntryState::Retained {
                         since: now,
                         reprieved: false,
+                        reason: if ended.graceful {
+                            RetentionReason::PendingProof
+                        } else {
+                            RetentionReason::UnexpectedDeath
+                        },
                     };
                     entry.parked_dgram = dg_tx;
                 }
@@ -1857,8 +1871,8 @@ struct SessionEnded {
 }
 
 /// Tell `auth`'s [`LoginSink`] about every login the router ended since the
-/// last drain. Private, and called from nowhere but the three paired
-/// wrappers below: a bare call to a `Router` method that can
+/// last drain. Private, and paired with each removal below and the completion
+/// of a gracefully retained probation: a bare call to a `Router` method that can
 /// go through [`Router::forget_backend`] is deliberately NOT enough on its
 /// own to reach a call site -- see those wrappers' own docs for why.
 fn notify_ended_logins(router: &mut Router, auth: &ServerAuth) {
@@ -2424,7 +2438,33 @@ impl SessionManager {
     /// A probation ended: bind the connection if its peer proved itself, drop
     /// its route if it did not.
     async fn on_probation_ended(ctx: &ManagerCtx<'_>, router: &mut Router, ended: ProbationEnded) {
-        router.probation.remove(&ended.session_id);
+        let seat = router.probation.remove(&ended.session_id);
+        // A successful verifier may already have created this helper login.
+        // Bind first: reattach/cold fallback turns the entry Live, so cleanup
+        // cannot revoke the login that the newly adopted session needs.
+        Self::apply_probation_result(ctx, router, ended).await;
+        if let Some(seat) = seat {
+            let still_ended = router.backends.get(&seat.login).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Retained {
+                        reason: RetentionReason::PendingProof,
+                        ..
+                    }
+                )
+            });
+            if still_ended && !router.in_probation(&seat.login) {
+                router.forget_backend(seat.login, "graceful close after last probation");
+                notify_ended_logins(router, ctx.auth);
+            }
+        }
+    }
+
+    async fn apply_probation_result(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        ended: ProbationEnded,
+    ) {
         // Take the provisional route out of the table but keep it: a cold
         // create adopts this very sender and its queue as the bridge's own
         // route, a warm reattach empties the queue into its `Attach` (spec
@@ -14540,6 +14580,311 @@ mod tests {
         })
         .await
         .expect("the test timed out");
+    }
+
+    /// A real candidate, paused before it sends any proof. The router still
+    /// owns its probation seat and the client can send a valid or bad record.
+    async fn pending_ended_proof(
+        wiring: &RouterWiring,
+        router: &mut Router,
+        token: LoginId,
+    ) -> (Connection, UdpSocket) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let src = sock.local_addr().unwrap();
+        let server = wiring.socket.local_addr().unwrap();
+        let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: generate_keypair().private,
+            remote_static_pub: Some(wiring.server_pub),
+            auth: AuthPolicy::SshSignature,
+        });
+        let payload = encode_msg1(&Msg1Payload {
+            offered: crate::Features::SUPPORTED,
+            start_kind: StartKind::Warm,
+            token,
+            method: AuthMethod::SshSignature,
+        });
+        for dg in client.start_with_payload(Instant::now(), server, &payload) {
+            SessionManager::handle_datagram(&wiring.ctx(), router, dg.bytes.len(), src, &dg.bytes)
+                .await;
+        }
+        let mut buf = vec![0; RECV_BUF_LEN];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = client.on_datagram(Instant::now(), from, &buf[..n]);
+        assert!(router.probation.contains_key(&client.session_id()));
+        (client, sock)
+    }
+
+    fn end_for_proof(router: &mut Router, wiring: &RouterWiring, token: LoginId) {
+        let session_id = router.backends[&token].session_id;
+        on_session_ended_and_notify(
+            router,
+            &wiring.auth,
+            SessionEnded {
+                session_id,
+                token,
+                graceful: true,
+            },
+            tokio::time::Instant::now(),
+        );
+        assert!(matches!(
+            router.backends[&token].state,
+            EntryState::Retained { .. }
+        ));
+    }
+
+    async fn finish_failed_ended_proof(
+        wiring: &RouterWiring,
+        router: &mut Router,
+        verdicts: &mut mpsc::UnboundedReceiver<ProbationEnded>,
+        id: u64,
+    ) {
+        let ended = tokio::time::timeout(
+            crate::auth::AUTH_DEADLINE + Duration::from_secs(2),
+            verdicts.recv(),
+        )
+        .await
+        .expect("probation did not finish")
+        .unwrap();
+        assert_eq!(ended.session_id, id);
+        assert!(ended.proven.is_none());
+        SessionManager::on_probation_ended(&wiring.ctx(), router, ended).await;
+        assert!(!router.probation.contains_key(&id));
+        assert!(!router.sessions.contains_key(&id));
+    }
+
+    async fn ended_proof_failure_case(kind: u8) {
+        let token = [0xE1; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (ctl, _dg) = synthetic_live_entry(&mut router, token, 1);
+        let (mut client, socket) = pending_ended_proof(&wiring, &mut router, token).await;
+        end_for_proof(&mut router, &wiring, token);
+        assert!(helper.opens_channels_for(token));
+        match kind {
+            0 => {
+                let bad = encode_auth_record(&AuthRecord {
+                    public_key: b"key".to_vec(),
+                    signature: b"wrong".to_vec(),
+                    v2: None,
+                })
+                .unwrap();
+                for dg in client.send(Instant::now(), AUTH_STREAM, &bad) {
+                    SessionManager::handle_datagram(
+                        &wiring.ctx(),
+                        &mut router,
+                        dg.bytes.len(),
+                        socket.local_addr().unwrap(),
+                        &dg.bytes,
+                    )
+                    .await;
+                }
+            }
+            1 => {
+                router.sessions.remove(&client.session_id());
+            }
+            2 => {} // The real authentication deadline expires; no injected verdict.
+            _ => unreachable!(),
+        }
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, client.session_id()).await;
+        assert!(
+            !router.backends.contains_key(&token),
+            "gracefully ended backend survived its last candidate"
+        );
+        assert!(
+            !helper.opens_channels_for(token),
+            "helper login must end without waiting for GC"
+        );
+        assert!(
+            ctl.is_closed(),
+            "backend control ownership must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_proof_bad_signature_releases_backend_and_helper() {
+        ended_proof_failure_case(0).await;
+    }
+
+    #[tokio::test]
+    async fn ended_proof_cancellation_releases_backend_and_helper() {
+        ended_proof_failure_case(1).await;
+    }
+
+    #[tokio::test]
+    async fn ended_proof_expiry_releases_backend_and_helper() {
+        ended_proof_failure_case(2).await;
+    }
+
+    #[tokio::test]
+    async fn ended_proof_keeps_login_until_the_last_candidate_finishes() {
+        let token = [0xE2; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (_ctl, _dg) = synthetic_live_entry(&mut router, token, 1);
+        let (first, _one) = pending_ended_proof(&wiring, &mut router, token).await;
+        let (last, _two) = pending_ended_proof(&wiring, &mut router, token).await;
+        end_for_proof(&mut router, &wiring, token);
+        router.sessions.remove(&first.session_id());
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, first.session_id()).await;
+        assert!(router.backends.contains_key(&token));
+        assert!(
+            helper.opens_channels_for(token),
+            "remaining candidate can already be verifying"
+        );
+        router.sessions.remove(&last.session_id());
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, last.session_id()).await;
+        assert!(!router.backends.contains_key(&token));
+        assert!(!helper.opens_channels_for(token));
+    }
+
+    #[tokio::test]
+    async fn ended_proof_success_binds_before_any_login_cleanup() {
+        for bridge_alive in [false, true] {
+            let token = [0xE3; 16];
+            let helper = HelperLogins::with(token);
+            let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+            let mut router = Router::new();
+            let (ctl, _dg) = synthetic_live_entry(&mut router, token, 1);
+            router.backends.get_mut(&token).unwrap().owner = test_principal().uid;
+            let (ended, _socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Warm,
+            )
+            .await;
+            let new_id = ended.session_id;
+            end_for_proof(&mut router, &wiring, token);
+            let _keep = bridge_alive.then_some(ctl);
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, ended).await;
+            assert_eq!(router.backends[&token].session_id, new_id);
+            assert!(matches!(router.backends[&token].state, EntryState::Live));
+            assert!(
+                helper.opens_channels_for(token),
+                "a successful proof's helper login must survive both rebind and cold fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ended_proof_rejection_after_verification_releases_ended_login() {
+        let token = [0xE4; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (_ctl, _dg) = synthetic_live_entry(&mut router, token, 1);
+        router.backends.get_mut(&token).unwrap().owner = test_principal().uid + 1;
+        let (ended, _socket) =
+            a_proof_already_verified(&wiring, &mut router, &mut verdicts, token, StartKind::Warm)
+                .await;
+        end_for_proof(&mut router, &wiring, token);
+        SessionManager::on_probation_ended(&wiring.ctx(), &mut router, ended).await;
+        assert!(
+            !router.backends.contains_key(&token),
+            "foreign owner refused; no session adopted the proof"
+        );
+        assert!(!helper.opens_channels_for(token));
+    }
+
+    #[tokio::test]
+    async fn ended_proof_retransmit_without_adoption_releases_ended_login() {
+        let token = [0xE5; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (_ctl, _dg) = synthetic_live_entry(&mut router, token, 1);
+        let (mut ended, _socket) =
+            a_proof_already_verified(&wiring, &mut router, &mut verdicts, token, StartKind::Warm)
+                .await;
+        let proven = ended.proven.as_mut().unwrap();
+        proven.principal.incarnation = 2;
+        router.backends.get_mut(&token).unwrap().last_msg1_body = proven.msg1_body.clone();
+        end_for_proof(&mut router, &wiring, token);
+        SessionManager::on_probation_ended(&wiring.ctx(), &mut router, ended).await;
+        assert!(
+            !router.backends.contains_key(&token),
+            "resending cached msg2 does not adopt a live session"
+        );
+        assert!(!helper.opens_channels_for(token));
+    }
+
+    #[tokio::test]
+    async fn ended_proof_failure_preserves_active_and_unexpected_death_replacements() {
+        for retained in [false, true] {
+            let token = [0xE6; 16];
+            let helper = HelperLogins::with(token);
+            let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+            let mut router = Router::new();
+            let (_old_ctl, _old_dg) = synthetic_live_entry(&mut router, token, 1);
+            let (candidate, _socket) = pending_ended_proof(&wiring, &mut router, token).await;
+            end_for_proof(&mut router, &wiring, token);
+            let (_new_ctl, _new_dg) = synthetic_live_entry(&mut router, token, 2);
+            router.backends.get_mut(&token).unwrap().incarnation = 2;
+            if retained {
+                on_session_ended_and_notify(
+                    &mut router,
+                    &wiring.auth,
+                    SessionEnded {
+                        session_id: 2,
+                        token,
+                        graceful: false,
+                    },
+                    tokio::time::Instant::now(),
+                );
+            }
+            router.sessions.remove(&candidate.session_id());
+            finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, candidate.session_id())
+                .await;
+            assert_eq!(router.backends[&token].session_id, 2);
+            assert_eq!(router.backends[&token].incarnation, 2);
+            assert_eq!(
+                matches!(router.backends[&token].state, EntryState::Retained { .. }),
+                retained
+            );
+            assert!(
+                helper.opens_channels_for(token),
+                "an old candidate cannot end the replacement's helper login"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ended_proof_stale_verdict_without_a_seat_preserves_current_retention() {
+        let token = [0xE7; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (ctl, mut parked) = synthetic_live_entry(&mut router, token, 1);
+        let (candidate, socket) = pending_ended_proof(&wiring, &mut router, token).await;
+        end_for_proof(&mut router, &wiring, token);
+        // Model a stale completion whose seat was already removed. Leave no
+        // other candidate to mask the missing-seat guard under test.
+        assert!(router.probation.remove(&candidate.session_id()).is_some());
+        router.sessions.remove(&candidate.session_id());
+        assert!(router.probation.is_empty());
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, candidate.session_id())
+            .await;
+        let entry = &router.backends[&token];
+        assert_eq!(entry.session_id, 1);
+        assert!(matches!(entry.state, EntryState::Retained { .. }));
+        assert!(helper.opens_channels_for(token));
+        assert!(!ctl.is_closed());
+        let src = socket.local_addr().unwrap();
+        assert!(entry
+            .parked_dgram
+            .as_ref()
+            .unwrap()
+            .send(src, b"still owned".to_vec()));
+        assert_eq!(parked.try_recv(), Some((src, b"still owned".to_vec())));
     }
 
     /// The GC's reprieve is ONE pass for each retention, and no more. A
