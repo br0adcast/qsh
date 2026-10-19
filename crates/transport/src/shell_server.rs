@@ -2,8 +2,8 @@
 //! "blocking PTY <-> reliable transport" bridge for A SINGLE client.
 //!
 //! The shape of the server loop matches [`crate::driver_tokio::serve_echo`]
-//! (select recv/timeout, recreating `Connection` on `HandshakeInit`, sending
-//! outgoing datagrams, dispatching `poll_events`), but two more wakeup
+//! (select recv/timeout, sending outgoing datagrams, dispatching `poll_events`),
+//! with replacement connections admitted before switching. Two more wakeup
 //! sources are added -- PTY output and the `echo_ack` flush timer -- along
 //! with handling of the incoming streams:
 //! - stream `STREAM_IO` (0) -- bidirectional shell I/O: incoming bytes are
@@ -46,11 +46,11 @@
 //! **Roaming vs. a new client.** Address migration (roaming) does NOT create
 //! a new handshake -- the core migrates to the new source on its own within
 //! the same `Connection`, and the shell keeps running. A new `HandshakeInit`
-//! (a different or restarted client) recreates the `Connection`, but does
-//! NOT touch the shell or the PTY -- the new client reconnects to the same
-//! live shell (a simple, safe choice: the transport can't spin up a PTY on
-//! its own anyway). The unfinished control-stream buffer is reset in that
-//! case.
+//! from a different or restarted client replaces the `Connection` only after
+//! the existing Noise and allowlist checks admit it. A rejected or incomplete
+//! candidate leaves the active connection and its control/echo state intact.
+//! An admitted replacement does not touch the shell or PTY: it reconnects to
+//! the same live shell, with fresh control and echo accounting.
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -254,8 +254,8 @@ pub async fn serve_shell(
     let _writer_task = tokio::task::spawn_blocking(move || channel_to_pty(pty_in_rx, writer));
 
     let mut buf = vec![0u8; RECV_BUF_LEN];
-    // A single connection. `None` until the first HandshakeInit and after
-    // the session closes (ready for a new client).
+    // A single connection. `None` until the first admitted handshake and
+    // after the session closes (ready for a new client).
     let mut conn: Option<Connection> = None;
     // Buffer for unfinished control records on stream 1 (a reliable stream
     // can deliver a 5-byte record split across fragments or merged).
@@ -305,16 +305,19 @@ pub async fn serve_shell(
                     kind: Kind::HandshakeInit,
                     ..
                 }) => {
-                    // A fresh server Connection on every msg1. The shell and
-                    // PTY are NOT touched -- a new client reconnects to the
-                    // same live shell; only the previous session's
-                    // unfinished control buffer is reset.
+                    // Validate a candidate without disturbing the active
+                    // connection. Incomplete Noise remains Connecting;
+                    // rejected keys/features become Closed. Only Live passed
+                    // this entry point's existing Noise/allowlist admission.
                     let mut fresh = Connection::new(cfg.clone());
-                    out.extend(fresh.on_datagram(now, src, &buf[..len]));
-                    conn = Some(fresh);
-                    control_buf.clear();
-                    input_consumed = 0;
-                    last_acked = 0;
+                    let reply = fresh.on_datagram(now, src, &buf[..len]);
+                    if fresh.state() == LinkState::Live {
+                        out.extend(reply);
+                        conn = Some(fresh);
+                        control_buf.clear();
+                        input_consumed = 0;
+                        last_acked = 0;
+                    }
                 }
                 Ok(_) => {
                     if let Some(c) = conn.as_mut() {
@@ -542,6 +545,259 @@ mod tests {
     use crate::conn::{AuthPolicy, Connection, ConnectionConfig, Event, LinkState, Role};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
+
+    /// Real serve_shell with blocking I/O, but no child process. The writer
+    /// echoes through the reader so output and ECHO_ACK exercise the full loop.
+    struct ReplacementReader(std::sync::mpsc::Receiver<Vec<u8>>);
+
+    impl std::io::Read for ReplacementReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.recv() {
+                Ok(bytes) => {
+                    assert!(bytes.len() <= buf.len());
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    struct ReplacementWriter(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl std::io::Write for ReplacementWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .send(bytes.to_vec())
+                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SharedResize(std::sync::Arc<RecordingResize>);
+    impl ResizeHandle for SharedResize {
+        fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            self.0.try_resize(cols, rows)
+        }
+    }
+
+    struct ReplacementRig {
+        server: tokio::task::JoinHandle<()>,
+        addr: std::net::SocketAddr,
+        server_pub: [u8; 32],
+        socket: tokio::net::UdpSocket,
+        conn: Connection,
+        parser: crate::shell_frame::ShellDeframer,
+        output: Vec<u8>,
+        ack: u64,
+        resize: std::sync::Arc<RecordingResize>,
+    }
+
+    impl Drop for ReplacementRig {
+        fn drop(&mut self) {
+            // Abort drops pty_in_tx, releasing the blocking writer; its echo
+            // sender then drops and releases the reader. No blocked worker is
+            // left behind even when a RED assertion or timeout unwinds.
+            self.server.abort();
+        }
+    }
+
+    fn replacement_client(server_pub: [u8; 32], private: [u8; 32]) -> Connection {
+        Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: private,
+            remote_static_pub: Some(server_pub),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        })
+    }
+
+    impl ReplacementRig {
+        async fn new(keys: &[crate::handshake::Keypair]) -> Self {
+            let server_key = crate::handshake::generate_keypair();
+            let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = server_socket.local_addr().unwrap();
+            let (echo_tx, echo_rx) = std::sync::mpsc::channel();
+            let resize = std::sync::Arc::new(RecordingResize::new());
+            let server = tokio::spawn(super::serve_shell(
+                server_socket,
+                ConnectionConfig {
+                    required_features: crate::Features::NONE,
+                    features: crate::Features::SUPPORTED,
+                    role: Role::Server,
+                    local_static_priv: server_key.private,
+                    remote_static_pub: None,
+                    auth: AuthPolicy::Allowlist(keys.iter().map(|k| k.public).collect()),
+                },
+                Box::new(ReplacementReader(echo_rx)),
+                Box::new(ReplacementWriter(echo_tx)),
+                Box::new(SharedResize(resize.clone())),
+            ));
+            Self {
+                server,
+                addr,
+                server_pub: server_key.public,
+                socket: tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                conn: replacement_client(server_key.public, keys[0].private),
+                parser: crate::shell_frame::ShellDeframer::new(),
+                output: Vec::new(),
+                ack: 0,
+                resize,
+            }
+        }
+
+        async fn transmit(&self, out: Vec<crate::Datagram>) {
+            for dg in out {
+                self.socket.send_to(&dg.bytes, dg.to).await.unwrap();
+            }
+        }
+
+        async fn until(&mut self, ready: impl Fn(&Self) -> bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut buf = [0; 8192];
+                while !ready(self) {
+                    let deadline = self.conn.next_timeout().unwrap_or_else(|| {
+                        std::time::Instant::now() + std::time::Duration::from_secs(2)
+                    });
+                    let out = tokio::select! {
+                        received = self.socket.recv_from(&mut buf) => {
+                            let (n, from) = received.unwrap();
+                            self.conn.on_datagram(std::time::Instant::now(), from, &buf[..n])
+                        }
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            self.conn.on_timeout(std::time::Instant::now())
+                        }
+                    };
+                    self.transmit(out).await;
+                    for ev in self.conn.poll_events() {
+                        if let Event::StreamData { stream_id: 0, data } = ev {
+                            for record in self.parser.push(&data) {
+                                match record {
+                                    crate::shell_frame::ShellRecord::Data(bytes) => {
+                                        self.output.extend(bytes)
+                                    }
+                                    crate::shell_frame::ShellRecord::EchoAck(offset) => {
+                                        self.ack = offset
+                                    }
+                                    _ => panic!("legacy shell sent a channel record"),
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("active shell did not preserve I/O and echo accounting");
+        }
+
+        async fn connect(&mut self) {
+            let out = self.conn.start(std::time::Instant::now(), self.addr);
+            self.transmit(out).await;
+            self.until(|rig| rig.conn.state() == LinkState::Live).await;
+        }
+
+        async fn send(&mut self, stream: u8, data: &[u8]) {
+            let out = self.conn.send(std::time::Instant::now(), stream, data);
+            self.transmit(out).await;
+        }
+
+        async fn attack(&self, kind: u8) {
+            let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let packet = match kind {
+                0 => crate::wire::encode_handshake(crate::wire::Kind::HandshakeInit, &[]),
+                1 => crate::wire::encode_handshake(crate::wire::Kind::HandshakeInit, &[0; 40]),
+                2 => {
+                    let key = crate::handshake::generate_keypair();
+                    replacement_client(self.server_pub, key.private)
+                        .start(std::time::Instant::now(), self.addr)
+                        .remove(0)
+                        .bytes
+                }
+                _ => unreachable!(),
+            };
+            stranger.send_to(&packet, self.addr).await.unwrap();
+        }
+    }
+
+    async fn rejected_replacement_case(kind: u8) {
+        let key = crate::handshake::generate_keypair();
+        let mut rig = ReplacementRig::new(&[key]).await;
+        rig.connect().await;
+        let id = rig.conn.session_id();
+        let resize = record(123, 45);
+        rig.send(1, &resize[..2]).await;
+        rig.send(0, b"before").await;
+        rig.until(|r| r.output == b"before" && r.ack == 6).await;
+        assert!(rig.resize.taken().is_empty());
+        rig.attack(kind).await;
+        rig.send(1, &resize[2..]).await;
+        rig.send(0, b"after").await;
+        rig.until(|r| r.output == b"beforeafter" && r.ack == 11)
+            .await;
+        assert_eq!(rig.conn.session_id(), id);
+        assert_eq!(
+            rig.resize.taken(),
+            vec![(123, 45)],
+            "the partial control record must survive rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_replacement_empty_msg1_preserves_active_state() {
+        rejected_replacement_case(0).await;
+    }
+    #[tokio::test]
+    async fn shell_replacement_truncated_noise_preserves_active_state() {
+        rejected_replacement_case(1).await;
+    }
+    #[tokio::test]
+    async fn shell_replacement_unlisted_key_preserves_active_state() {
+        rejected_replacement_case(2).await;
+    }
+
+    #[tokio::test]
+    async fn shell_replacement_allowed_key_resets_only_connection_state() {
+        let keys = [
+            crate::handshake::generate_keypair(),
+            crate::handshake::generate_keypair(),
+        ];
+        let mut rig = ReplacementRig::new(&keys).await;
+        // Invalid candidates before the first session must not prevent admission.
+        for kind in 0..3 {
+            rig.attack(kind).await;
+        }
+        rig.connect().await;
+        let partial = record(444, 55);
+        rig.send(1, &partial[..2]).await;
+        rig.send(0, b"old").await;
+        rig.until(|r| r.output == b"old" && r.ack == 3).await;
+        let old_id = rig.conn.session_id();
+        let mut old = std::mem::replace(
+            &mut rig.conn,
+            replacement_client(rig.server_pub, keys[1].private),
+        );
+        let old_socket = std::mem::replace(
+            &mut rig.socket,
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        );
+        rig.parser = crate::shell_frame::ShellDeframer::new();
+        rig.output.clear();
+        rig.ack = 0;
+        rig.connect().await;
+        assert_ne!(rig.conn.session_id(), old_id);
+        // Old stream offsets/partial control must not leak into the new session.
+        for dg in old.send(std::time::Instant::now(), 1, &partial[2..]) {
+            old_socket.send_to(&dg.bytes, dg.to).await.unwrap();
+        }
+        rig.send(1, &record(100, 40)).await;
+        rig.send(0, b"new").await;
+        rig.until(|r| r.output == b"new" && r.ack == 3).await;
+        assert_eq!(rig.resize.taken(), vec![(100, 40)]);
+    }
 
     /// A resize handle for unit tests: records the sizes received.
     struct RecordingResize {
