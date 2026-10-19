@@ -1951,22 +1951,30 @@ queue has no room for waits, in order, in the bridge, and goes as room opens;
 meanwhile the bridge reads datagrams, answers PINGs and runs its timers. A
 backend that stops reading its queue stops every inbound stream -- they share
 the one queue -- but not the connection: its ACKs, PINGs, timers and output
-go on. A channel's process that stops reading stops only its own stream: the
-channel holds the bytes the process has not taken, and the stream's credit
-(§7) stops the client there. What waits in the bridge is bounded per stream
-per connection by its credit window and per session by `PENDING_CAP` =
-8 MiB: a session has up to 256 streams, and every warm reattach brings a
-connection whose streams start with a fresh window while the replaced one's
-bytes still wait, so the windows alone do not bound the session. The same
-goes for what a channel holds that its process has not taken: each warm
-reattach while a process leaves its input unread can add up to one more
-window on that stream, the replaced connection's bytes still queued in the
-channel — bounded by what the client still has to send, and never past
-`PENDING_CAP` for what waits in the bridge. Past `PENDING_CAP` the bridge waits
-for its backend, as every build did. An honest client uses at most 10
-streams -- 5 MiB of windows -- and never gets there. A client without credits
-knows no limits, and the same cap is all that bounds it: an ordinary paste
-never stops its bridge. Bytes are handed over when they enter the backend's
+go on. Stream credit (§7) normally pauses input to a process that stops
+reading. The bridge independently bounds pending inbound data by
+`PENDING_CAP` = 8 MiB per session. Beyond that cap it waits for backend room.
+
+The channel runner also bounds its own queued and writer-held network input:
+8 MiB and 16,384 nonempty chunks per channel instance and per session. A
+reservation stays charged through the actual write or discard. Warm reattach,
+Close and stream reuse do not refund chunks still owned by an old writer;
+new channel instances share that outstanding session debt. Both peers with
+stream credit and peers without it use the same downstream admission rules.
+An 8 MiB paste in chunks of at least 512 bytes fits; tiny fragments can reach
+the item cap before the byte cap.
+
+If either downstream quota cannot admit a chunk, the runner discards that
+chunk and requests termination of its receiving channel's exact process.
+The session remains responsive to other output and control messages. A full
+aggregate quota can also reject another channel's new input until outstanding
+writes release capacity; it does not promise independent input capacity for
+every channel. The final channel result still requires actual process cleanup
+and delivery of retained output. Rejected network bytes are reported consumed
+once, without advancing the admitted-input echo offset. Accepted chunks are
+reported only after their write or discard, with their quota released first.
+
+Bytes are handed over when they enter the backend's
 queue, not when they start to wait: a waiting byte is not counted as taken,
 which is what keeps the wait inside the window. And they are counted for the
 connection that delivered them: bytes a connection delivered that still wait

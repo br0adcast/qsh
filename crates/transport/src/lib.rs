@@ -5,6 +5,8 @@ pub mod auth_acceptance;
 pub mod channel;
 pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]
+mod channel_input;
+#[cfg(feature = "tokio-driver")]
 pub mod channel_open;
 #[cfg(feature = "tokio-driver")]
 pub mod channel_server;
