@@ -31,6 +31,15 @@ impl Discover for DiscoveryAfterSsh {
 
 #[test]
 fn verified_ssh_ready_refuses_a_different_discovery_key_without_prompting() {
+    verify_bootstrap_key(false);
+}
+
+#[test]
+fn a_pkcs8_identity_bootstraps_over_ssh_without_weakening_discovery_trust() {
+    verify_bootstrap_key(true);
+}
+
+fn verify_bootstrap_key(pkcs8: bool) {
     let home = tempfile::tempdir().unwrap();
     let ssh = fake::FakeServer::start(fake::FakeAuth {
         accept_any_key: true,
@@ -46,11 +55,15 @@ fn verified_ssh_ready_refuses_a_different_discovery_key_without_prompting() {
         ssh_key::Algorithm::Ed25519,
     )
     .unwrap();
-    std::fs::write(
-        &identity,
-        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    if pkcs8 {
+        russh::keys::encode_pkcs8_pem(&key, std::fs::File::create(&identity).unwrap()).unwrap();
+    } else {
+        std::fs::write(
+            &identity,
+            key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+    }
     let ssh_hosts = KnownHosts::new(home.path().join("ssh_known_hosts"), None);
     ssh_hosts
         .add(

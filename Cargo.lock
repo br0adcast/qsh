@@ -2915,13 +2915,22 @@ name = "sshauth"
 version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
+ "ed25519-dalek",
+ "hmac 0.12.1",
  "libc",
+ "p256",
+ "p384",
+ "p521",
+ "pkcs8",
+ "rsa",
+ "sec1",
  "sha2 0.10.9",
  "signature",
  "ssh-encoding",
  "ssh-key",
  "tempfile",
  "transport",
+ "zeroize",
 ]
 
 [[package]]

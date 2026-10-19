@@ -8,6 +8,7 @@
 pub mod addr;
 pub mod agent;
 pub mod discover;
+pub mod keyfile;
 pub mod known_hosts;
 pub mod record;
 pub mod sign_file;
