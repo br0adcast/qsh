@@ -252,6 +252,8 @@ pub trait ClientEvents: Send + Sync {
     fn on_features(&self, _features: Features) {}
     /// A bounded authenticated protocol failure, delivered before Closed.
     fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
+    /// Authenticated terminal peer failure, delivered before Closed.
+    fn on_session_aborted(&self, _reason: crate::SessionAbortReason) {}
     /// Committed server admission for this exact active transport.
     fn on_auth_accepted(&self, _accepted: crate::AuthAcceptance) {}
     /// Actual shared-handshake sends and consumed-source selection. The owner
@@ -1630,6 +1632,7 @@ fn dispatch_event(
             events.on_state(s);
         }
         Event::StreamReset { stream_id } => events.on_reset(stream_id),
+        Event::SessionAborted(reason) => events.on_session_aborted(reason),
         Event::SendBufferOverCap { stream_id } => {
             #[cfg(test)]
             OVER_CAP_LOGGED.with(|n| n.set(n.get() + 1));
@@ -4600,4 +4603,34 @@ mod tests {
     include!("driver_std_auth_tests.rs");
     include!("driver_std_cancel_tests.rs");
     include!("driver_std_recovery_tests.rs");
+    #[test]
+    fn capacity_wire_driver_reports_terminal_reason_before_same_batch_closed() {
+        struct Capture(Mutex<Vec<Option<crate::SessionAbortReason>>>);
+        impl ClientEvents for Capture {
+            fn on_bytes(&self, _: u8, _: Vec<u8>) {}
+            fn on_reset(&self, _: u8) {}
+            fn on_stats(&self, _: Stats) {}
+            fn on_state(&self, state: LinkState) {
+                assert_eq!(state, LinkState::Closed);
+                self.0.lock().unwrap().push(None);
+            }
+            fn on_session_aborted(&self, reason: crate::SessionAbortReason) {
+                self.0.lock().unwrap().push(Some(reason));
+            }
+        }
+        let capture = Capture(Mutex::new(Vec::new()));
+        let mut state = LinkState::Live;
+        let mut pending = false;
+        for event in [
+            Event::SessionAborted(crate::SessionAbortReason::ResourceExhausted),
+            Event::StateChanged(LinkState::Closed),
+        ] {
+            dispatch_event(event, &capture, &mut state, &mut pending);
+        }
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![Some(crate::SessionAbortReason::ResourceExhausted), None]
+        );
+        assert_eq!(state, LinkState::Closed);
+    }
 }

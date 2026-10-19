@@ -34,6 +34,8 @@ impl Features {
     pub const AUTH_ACCEPTED: Features = Features(1 << 3);
     /// Bit 4: ordered authoritative channel geometry and atomic lifecycle metadata.
     pub const CHANNEL_GEOMETRY: Features = Features(1 << 4);
+    /// Bit 5: authenticated resource-limit aborts and explicit control failures.
+    pub const RESOURCE_LIMITS: Features = Features(1 << 5);
     /// What this build implements: what it offers as a client and may
     /// enable as a server.
     pub const SUPPORTED: Features = Features(
@@ -41,16 +43,18 @@ impl Features {
             | Features::STREAM_CREDIT.0
             | Features::OFFSET_WRAP.0
             | Features::AUTH_ACCEPTED.0
-            | Features::CHANNEL_GEOMETRY.0,
+            | Features::CHANNEL_GEOMETRY.0
+            | Features::RESOURCE_LIMITS.0,
     );
 
     /// The names the logs and `qshd self-check` use, bit by bit.
-    const NAMES: [(Features, &'static str); 5] = [
+    const NAMES: [(Features, &'static str); 6] = [
         (Features::HEADER_AAD, "header-aad"),
         (Features::STREAM_CREDIT, "stream-credit"),
         (Features::OFFSET_WRAP, "offset-wrap"),
         (Features::AUTH_ACCEPTED, "auth-accepted"),
         (Features::CHANNEL_GEOMETRY, "channel-geometry"),
+        (Features::RESOURCE_LIMITS, "resource-limits"),
     ];
 
     /// The set these bits say, known or not.
@@ -177,6 +181,7 @@ mod tests {
                 | Features::OFFSET_WRAP
                 | Features::AUTH_ACCEPTED
                 | Features::CHANNEL_GEOMETRY
+                | Features::RESOURCE_LIMITS
         );
     }
 
@@ -224,5 +229,23 @@ mod geometry_feature_tests {
             Features::negotiate(Features::AUTH_ACCEPTED, Features::NONE),
             Features::NONE
         );
+    }
+    #[test]
+    fn capacity_wire_resource_feature_is_explicit_and_legacy_negotiation_does_not_enable_it() {
+        assert_eq!(Features::RESOURCE_LIMITS.bits(), 0x20);
+        let previous = Features::HEADER_AAD
+            | Features::STREAM_CREDIT
+            | Features::OFFSET_WRAP
+            | Features::AUTH_ACCEPTED
+            | Features::CHANNEL_GEOMETRY;
+        assert_eq!(previous.bits() & Features::RESOURCE_LIMITS.bits(), 0);
+        assert!(
+            !Features::negotiate(previous, Features::SUPPORTED).contains(Features::RESOURCE_LIMITS)
+        );
+        assert!(
+            Features::negotiate(Features::SUPPORTED, Features::SUPPORTED)
+                .contains(Features::RESOURCE_LIMITS)
+        );
+        assert_eq!(Features::RESOURCE_LIMITS.names(), vec!["resource-limits"]);
     }
 }

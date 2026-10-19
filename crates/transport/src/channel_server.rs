@@ -2754,6 +2754,7 @@ pub(crate) mod tests {
     include!("channel_server_reply_tests.rs");
     include!("channel_server_reply_delivery_tests.rs");
     include!("channel_server_sync_deadline_tests.rs");
+    include!("channel_server_control_bounds_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{

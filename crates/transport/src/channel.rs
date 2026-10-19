@@ -59,6 +59,7 @@ const REC_OPENED: u8 = 0x20;
 const REC_REFUSED: u8 = 0x21;
 const REC_EXIT: u8 = 0x22;
 const REC_EXIT_STATUS_UNAVAILABLE: u8 = 0x2a;
+const REC_ABOUT_UNAVAILABLE: u8 = 0x2b;
 const REC_RETIRED_CHANNELS: u8 = 0x23;
 
 const REC_ABOUT_REQUEST: u8 = 0x14;
@@ -77,6 +78,8 @@ const ANSWER_ARCH_MISMATCH: u8 = 5;
 const ANSWER_TOO_LARGE: u8 = 6;
 const ANSWER_NOT_ALLOWED: u8 = 7;
 const ANSWER_IN_PROGRESS: u8 = 8;
+const ANSWER_RESOURCE_EXHAUSTED: u8 = 9;
+const ANSWER_PROVIDER_FAILED: u8 = 10;
 
 const RESULT_RESTARTING: u8 = 0;
 const RESULT_REJECTED: u8 = 1;
@@ -174,6 +177,10 @@ pub enum UpdateAnswer {
     NotAllowed,
     /// Another update is already under way.
     InProgress,
+    /// No callback/operation capacity was available; nothing was accepted.
+    ResourceExhausted,
+    /// The update provider failed before accepting this update.
+    ProviderFailed,
     /// A code this build does not know -- from a newer daemon.
     Unknown(u8),
 }
@@ -373,6 +380,8 @@ fn answer_payload(answer: &UpdateAnswer) -> Vec<u8> {
         UpdateAnswer::TooLarge => vec![ANSWER_TOO_LARGE],
         UpdateAnswer::NotAllowed => vec![ANSWER_NOT_ALLOWED],
         UpdateAnswer::InProgress => vec![ANSWER_IN_PROGRESS],
+        UpdateAnswer::ResourceExhausted => vec![ANSWER_RESOURCE_EXHAUSTED],
+        UpdateAnswer::ProviderFailed => vec![ANSWER_PROVIDER_FAILED],
         UpdateAnswer::Unknown(code) => vec![*code],
     }
 }
@@ -392,6 +401,11 @@ fn decode_answer(payload: &[u8]) -> Result<UpdateAnswer, ChannelCodecError> {
         ANSWER_TOO_LARGE => UpdateAnswer::TooLarge,
         ANSWER_NOT_ALLOWED => UpdateAnswer::NotAllowed,
         ANSWER_IN_PROGRESS => UpdateAnswer::InProgress,
+        ANSWER_RESOURCE_EXHAUSTED | ANSWER_PROVIDER_FAILED if payload.len() != 1 => {
+            return Err(ChannelCodecError::Malformed)
+        }
+        ANSWER_RESOURCE_EXHAUSTED => UpdateAnswer::ResourceExhausted,
+        ANSWER_PROVIDER_FAILED => UpdateAnswer::ProviderFailed,
         other => UpdateAnswer::Unknown(other),
     })
 }
@@ -563,6 +577,7 @@ pub enum ServerRecord {
     ChannelSnapshot(ChannelSnapshot),
     /// The answer to [`ClientRecord::AboutRequest`].
     About(About),
+    AboutUnavailable(AboutUnavailable),
     /// The answer to [`ClientRecord::UpdateOffer`].
     UpdateAnswer(UpdateAnswer),
     /// How an accepted transfer ended.
@@ -570,6 +585,31 @@ pub enum ServerRecord {
     /// The daemon is about to replace itself: sent to every session, so a
     /// client reconnects at once instead of waiting out a silence.
     Restarting,
+}
+
+/// An explicit answer when daemon metadata could not be obtained. Sent only
+/// with resource-limits; it does not imply a transport or protocol failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AboutUnavailable {
+    ResourceExhausted,
+    ProviderFailed,
+    Unknown(u8),
+}
+impl AboutUnavailable {
+    fn to_wire(self) -> u8 {
+        match self {
+            Self::ResourceExhausted => 1,
+            Self::ProviderFailed => 2,
+            Self::Unknown(code) => code,
+        }
+    }
+    fn from_wire(code: u8) -> Self {
+        match code {
+            1 => Self::ResourceExhausted,
+            2 => Self::ProviderFailed,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
 /// Why a record could not be read.
@@ -804,6 +844,9 @@ pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
             encode_record(REC_EXIT_STATUS_UNAVAILABLE, &[*stream])
         }
         ServerRecord::ChannelSnapshot(snapshot) => snapshot.encode_record(),
+        ServerRecord::AboutUnavailable(reason) => {
+            encode_record(REC_ABOUT_UNAVAILABLE, &[reason.to_wire()])
+        }
         ServerRecord::About(about) => {
             let mut payload = Vec::with_capacity(8 + 32 + 1 + about.arch.len() + 2);
             payload.extend_from_slice(&about.build.to_be_bytes());
@@ -888,6 +931,12 @@ pub fn decode_server(raw: &RawRecord) -> Result<ServerRecord, ChannelCodecError>
         REC_CHANNEL_SNAPSHOT => {
             ChannelSnapshot::decode(&raw.payload).map(ServerRecord::ChannelSnapshot)
         }
+        REC_ABOUT_UNAVAILABLE => match raw.payload.as_slice() {
+            [reason] => Ok(ServerRecord::AboutUnavailable(AboutUnavailable::from_wire(
+                *reason,
+            ))),
+            _ => Err(ChannelCodecError::Malformed),
+        },
         REC_ABOUT => decode_about(&raw.payload).map(ServerRecord::About),
         REC_UPDATE_ANSWER => decode_answer(&raw.payload).map(ServerRecord::UpdateAnswer),
         REC_UPDATE_RESULT => decode_result(&raw.payload).map(ServerRecord::UpdateResult),
@@ -1593,5 +1642,115 @@ mod geometry_invalid_control_tests {
             }),
             vec![0x22, 0, 0, 0, 5, 16, 0, 0, 0, 37]
         );
+    }
+    #[test]
+    fn capacity_wire_about_unavailable_does_not_reuse_exit_status() {
+        assert_eq!(REC_EXIT_STATUS_UNAVAILABLE, 0x2a);
+        let unavailable = decode_server(&RawRecord {
+            kind: 0x2b,
+            payload: vec![1],
+        });
+        assert!(
+            unavailable.is_ok(),
+            "explicit unavailable record must decode: {unavailable:?}"
+        );
+    }
+
+    #[test]
+    fn capacity_wire_update_answer_codes_have_explicit_failure_meanings() {
+        for code in [9, 10] {
+            let record = decode_server(&RawRecord {
+                kind: REC_UPDATE_ANSWER,
+                payload: vec![code],
+            })
+            .unwrap();
+            assert!(
+                !matches!(record, ServerRecord::UpdateAnswer(UpdateAnswer::Unknown(_))),
+                "capacity failure is not an unknown answer: {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_wire_record_and_answer_allocations_do_not_collide_with_existing_or_retired_ids() {
+        let records = [
+            REC_OPEN,
+            REC_RETIRED_RESIZE,
+            REC_CLOSE,
+            REC_TERM,
+            REC_ABOUT_REQUEST,
+            REC_UPDATE_OFFER,
+            REC_RESIZE_REQUEST,
+            REC_OPENED,
+            REC_REFUSED,
+            REC_EXIT,
+            REC_RETIRED_CHANNELS,
+            REC_ABOUT,
+            REC_UPDATE_ANSWER,
+            REC_UPDATE_RESULT,
+            REC_RESTARTING,
+            REC_PROTOCOL_ERROR,
+            REC_CHANNEL_SNAPSHOT,
+            REC_EXIT_STATUS_UNAVAILABLE,
+            REC_ABOUT_UNAVAILABLE,
+        ];
+        assert_eq!(
+            records
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            records.len()
+        );
+        assert_eq!(REC_ABOUT_UNAVAILABLE, 0x2b);
+        assert_eq!(REC_EXIT_STATUS_UNAVAILABLE, 0x2a);
+        let answers = [
+            ANSWER_ACCEPT,
+            ANSWER_UP_TO_DATE,
+            ANSWER_DAEMON_NEWER,
+            ANSWER_BUSY,
+            ANSWER_MANAGED,
+            ANSWER_ARCH_MISMATCH,
+            ANSWER_TOO_LARGE,
+            ANSWER_NOT_ALLOWED,
+            ANSWER_IN_PROGRESS,
+            ANSWER_RESOURCE_EXHAUSTED,
+            ANSWER_PROVIDER_FAILED,
+        ];
+        assert_eq!(
+            answers
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            answers.len()
+        );
+        assert_eq!((ANSWER_RESOURCE_EXHAUSTED, ANSWER_PROVIDER_FAILED), (9, 10));
+        for (reason, code) in [
+            (AboutUnavailable::ResourceExhausted, 1),
+            (AboutUnavailable::ProviderFailed, 2),
+            (AboutUnavailable::Unknown(200), 200),
+        ] {
+            let wire = encode_server(&ServerRecord::AboutUnavailable(reason));
+            assert_eq!(wire, vec![0x2b, 0, 0, 0, 1, code]);
+            assert_eq!(
+                decode_server(&RawRecord {
+                    kind: REC_ABOUT_UNAVAILABLE,
+                    payload: vec![code]
+                }),
+                Ok(ServerRecord::AboutUnavailable(reason))
+            );
+        }
+        for (kind, payload) in [
+            (REC_ABOUT_UNAVAILABLE, vec![]),
+            (REC_ABOUT_UNAVAILABLE, vec![1, 0]),
+            (REC_UPDATE_ANSWER, vec![9, 0]),
+            (REC_UPDATE_ANSWER, vec![10, 0]),
+        ] {
+            assert_eq!(
+                decode_server(&RawRecord { kind, payload }),
+                Err(ChannelCodecError::Malformed)
+            );
+        }
     }
 }

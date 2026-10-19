@@ -15,6 +15,8 @@ pub mod channel_server;
 pub mod channel_timeline;
 mod congestion;
 pub mod conn;
+#[cfg(all(test, feature = "tokio-driver"))]
+mod control_budget;
 pub mod cookie;
 #[cfg(feature = "tokio-driver")]
 mod dgram_queue;
@@ -61,6 +63,7 @@ pub use auth_acceptance::{
 };
 pub use conn::*;
 pub use handshake_payload::*;
+pub use reliability::SessionAbortReason;
 // The negotiable features (spec §5) are named by every layer that builds a
 // connection or says what one agreed: `transport::Features`.
 pub use features::Features;

@@ -17,6 +17,7 @@
 //! - `0x07 PATH_PROBE` : `token(u32)`
 //! - `0x08 PATH_PROBE_ACK` : `token(u32)`
 //! - `0x09 CREDIT`     : `stream_id(1), limit(u32)` -- only with `stream-credit` (spec §6)
+//! - `0x0a SESSION_ABORT` : `reason(1)` -- only with `resource-limits`
 //!
 //! Offsets on the wire are the low 32 bits of a full 64-bit offset; with
 //! `offset-wrap` the reader expands them (`expand`), without it they are the
@@ -41,6 +42,7 @@ const TYPE_RESET: u8 = 0x06;
 const TYPE_PATH_PROBE: u8 = 0x07;
 const TYPE_PATH_PROBE_ACK: u8 = 0x08;
 const TYPE_CREDIT: u8 = 0x09;
+const TYPE_SESSION_ABORT: u8 = 0x0a;
 
 /// Limit on unacknowledged bytes "in flight" (sender window), 256 KiB.
 pub const MAX_IN_FLIGHT: usize = 256 * 1024;
@@ -159,6 +161,28 @@ fn ceiling(limit: u64, wrap: bool) -> u64 {
 /// and crafted ones walk it no farther than here.
 pub(crate) const FULL_OFFSET_MAX: u64 = 1 << 62;
 
+/// Why an authenticated peer terminated the entire session. This is not a
+/// channel exit status, transport outage, or cleanup receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAbortReason {
+    ResourceExhausted,
+    Unknown(u8),
+}
+impl SessionAbortReason {
+    pub(crate) fn to_wire(self) -> u8 {
+        match self {
+            Self::ResourceExhausted => 1,
+            Self::Unknown(code) => code,
+        }
+    }
+    pub(crate) fn from_wire(code: u8) -> Self {
+        match code {
+            1 => Self::ResourceExhausted,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
 /// An internal reliable-stream frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamFrame {
@@ -178,6 +202,8 @@ pub enum StreamFrame {
     Pong { token: u32 },
     /// The sender closing the stream.
     Close { stream_id: u8 },
+    /// Terminal session failure, only with the resource-limits feature.
+    SessionAbort { reason: SessionAbortReason },
     /// The sender discarded its output backlog after a long client absence and
     /// restarts the stream at `new_offset`. The receiver jumps its cumulative
     /// point there -- but only if `new_offset` is actually ahead of where it
@@ -255,6 +281,10 @@ impl StreamFrame {
             StreamFrame::Close { stream_id } => {
                 buf.push(TYPE_CLOSE);
                 buf.push(*stream_id);
+            }
+            StreamFrame::SessionAbort { reason } => {
+                buf.push(TYPE_SESSION_ABORT);
+                buf.push(reason.to_wire());
             }
             StreamFrame::Reset {
                 stream_id,
@@ -341,6 +371,15 @@ impl StreamFrame {
                     }
                     out.push(StreamFrame::Close {
                         stream_id: bytes[i + 1],
+                    });
+                    i += 2;
+                }
+                TYPE_SESSION_ABORT => {
+                    if i + 2 > bytes.len() {
+                        break;
+                    }
+                    out.push(StreamFrame::SessionAbort {
+                        reason: SessionAbortReason::from_wire(bytes[i + 1]),
                     });
                     i += 2;
                 }
@@ -4257,5 +4296,44 @@ mod tests {
 
         // The next repeat is due one rto after THAT announce, not after t0.
         assert_eq!(rx.credit_resend_deadline(rto), Some(t1 + rto));
+    }
+    #[test]
+    fn capacity_wire_abort_has_a_distinct_complete_two_byte_frame() {
+        assert_eq!(StreamFrame::decode_all(&[0x0a, 1]).len(), 1);
+        assert!(StreamFrame::decode_all(&[0x0a]).is_empty());
+    }
+
+    #[test]
+    fn capacity_wire_frame_allocation_is_unique_and_unknown_abort_reason_roundtrips() {
+        let tags = [
+            TYPE_ACK,
+            TYPE_DATA,
+            TYPE_PING,
+            TYPE_PONG,
+            TYPE_CLOSE,
+            TYPE_RESET,
+            TYPE_PATH_PROBE,
+            TYPE_PATH_PROBE_ACK,
+            TYPE_CREDIT,
+            TYPE_SESSION_ABORT,
+        ];
+        assert_eq!(
+            tags.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            tags.len()
+        );
+        assert_eq!(TYPE_SESSION_ABORT, 0x0a);
+        for reason in [
+            SessionAbortReason::ResourceExhausted,
+            SessionAbortReason::Unknown(200),
+        ] {
+            let frame = StreamFrame::SessionAbort { reason };
+            let mut bytes = Vec::new();
+            frame.encode(&mut bytes);
+            assert_eq!(bytes, vec![0x0a, reason.to_wire()]);
+            assert_eq!(StreamFrame::decode_all(&bytes), vec![frame]);
+        }
     }
 }

@@ -31,6 +31,11 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundEnd {
+    /// Explicit authenticated terminal failure, not another failed round.
+    SessionAborted {
+        addr: usize,
+        reason: u8,
+    },
     /// Back in the session, at this address.
     Connected {
         addr: usize,
@@ -60,6 +65,7 @@ pub enum Order {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
+    SessionAborted { addr: usize, reason: u8 },
     KeyChanged { addr: usize },
     SessionGone { addr: usize },
 }
@@ -124,6 +130,9 @@ impl Reconnect {
                         until: now + pause_after(self.failed),
                     };
                     Order::Nothing
+                }
+                RoundEnd::SessionAborted { addr, reason } => {
+                    self.stop(Stop::SessionAborted { addr, reason })
                 }
                 RoundEnd::KeyChanged { addr } => self.stop(Stop::KeyChanged { addr }),
                 RoundEnd::SessionGone { addr } => self.stop(Stop::SessionGone { addr }),
@@ -335,5 +344,24 @@ mod tests {
         r.on(Event::LinkDead, secs(0));
         r.on(Event::RoundOver(RoundEnd::SessionGone { addr: 0 }), secs(1));
         r.on(Event::Tick, secs(2));
+    }
+    #[test]
+    fn capacity_recovery_abort_stops_instead_of_waiting_for_another_round() {
+        let mut reconnect = Reconnect::new(0);
+        reconnect.on(Event::LinkDead, secs(0));
+        assert_eq!(
+            reconnect.on(
+                Event::RoundOver(RoundEnd::SessionAborted {
+                    addr: 0,
+                    reason: 200
+                }),
+                secs(1)
+            ),
+            Order::Stop(Stop::SessionAborted {
+                addr: 0,
+                reason: 200
+            })
+        );
+        assert_eq!(reconnect.phase(), Phase::Over);
     }
 }
