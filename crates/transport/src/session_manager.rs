@@ -1540,6 +1540,11 @@ impl Router {
     ///   mints a fresh key via `ADD-CLIENT` before its handshake, so removing
     ///   the OLD key on death does not block it.
     ///
+    /// Repeated end-signals keep the first retention time, GC reprieve and
+    /// parked route. A later graceful backend exit still tears down when no
+    /// proof is pending, or upgrades retention to wait for that proof; a later
+    /// death cannot undo the graceful end.
+    ///
     /// Returns `Some(client_key)` when this end-signal matched the current
     /// entry (so the caller must scrub that key), `None` for a stale
     /// end-signal (nothing to scrub -- the entry it belonged to is already
@@ -1592,16 +1597,30 @@ impl Router {
                 if ended.graceful && !proving {
                     self.forget_backend(ended.token, "graceful close");
                 } else {
-                    entry.state = EntryState::Retained {
-                        since: now,
-                        reprieved: false,
-                        reason: if ended.graceful {
-                            RetentionReason::PendingProof
-                        } else {
-                            RetentionReason::UnexpectedDeath
-                        },
-                    };
-                    entry.parked_dgram = dg_tx;
+                    match &mut entry.state {
+                        EntryState::Live => {
+                            entry.state = EntryState::Retained {
+                                since: now,
+                                reprieved: false,
+                                reason: if ended.graceful {
+                                    RetentionReason::PendingProof
+                                } else {
+                                    RetentionReason::UnexpectedDeath
+                                },
+                            };
+                            entry.parked_dgram = dg_tx;
+                        }
+                        EntryState::Retained { reason, .. } => {
+                            // The first end already parked the stable route.
+                            // Repeats cannot drop it or restart age/reprieve.
+                            // A parked backend can subsequently exit: preserve
+                            // that graceful end until its pending proof lands,
+                            // even if another death notification follows it.
+                            if ended.graceful {
+                                *reason = RetentionReason::PendingProof;
+                            }
+                        }
+                    }
                 }
                 Some(client_key)
             }
@@ -3562,12 +3581,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             // returns at once instead of looping back to poll anything.
             // `conn.close(now)` is a no-op by its own guard if `conn` is
             // already `Closed` (a `parked` bridge, retained after an earlier
-            // death for a possible warm reattach): that case is a
-            // pre-existing wart (a retained entry can outlive a backend that
-            // has nothing left to reattach to) and is not fixed here -- this
-            // only makes sure a live peer, if there still is one, learns the
-            // session ended instead of the connection idling forever with no
-            // backend behind it.
+            // death for a possible warm reattach). The graceful end below
+            // still tells the router to remove that parked entry, or hold it
+            // only until a pending proof finishes. A proof that succeeds after
+            // this bridge exits takes the ordinary cold-create fallback.
             Wakeup::Backend(None) => {
                 deactivate(&mut was_active, &active_count);
                 out.extend(conn.close(now));
@@ -14885,6 +14902,318 @@ mod tests {
             .unwrap()
             .send(src, b"still owned".to_vec()));
         assert_eq!(parked.try_recv(), Some((src, b"still owned".to_vec())));
+    }
+
+    fn repeated_end_signal(
+        wiring: &RouterWiring,
+        router: &mut Router,
+        token: LoginId,
+        session_id: u64,
+        graceful: bool,
+        now: tokio::time::Instant,
+    ) {
+        on_session_ended_and_notify(
+            router,
+            &wiring.auth,
+            SessionEnded {
+                session_id,
+                token,
+                graceful,
+            },
+            now,
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_end_preserves_route_first_age_and_spent_reprieve() {
+        let token = [0xF1; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (_ctl, mut route) = synthetic_live_entry(&mut router, token, 1);
+        let (candidate, socket) = pending_ended_proof(&wiring, &mut router, token).await;
+        let first = tokio::time::Instant::now();
+        repeated_end_signal(&wiring, &mut router, token, 1, false, first);
+        let later = first + RETAIN_AFTER_DEATH;
+        gc_retained_and_notify(&mut router, &wiring.auth, later);
+        assert!(matches!(
+            router.backends[&token].state,
+            EntryState::Retained {
+                reprieved: true,
+                ..
+            }
+        ));
+        repeated_end_signal(&wiring, &mut router, token, 1, false, later);
+        let entry = &router.backends[&token];
+        let src = socket.local_addr().unwrap();
+        assert!(entry
+            .parked_dgram
+            .as_ref()
+            .expect("repeat must preserve parked route")
+            .send(src, b"marker".to_vec()));
+        assert_eq!(route.try_recv(), Some((src, b"marker".to_vec())));
+        assert!(
+            matches!(entry.state, EntryState::Retained { since, reprieved: true, reason: RetentionReason::UnexpectedDeath } if since == first)
+        );
+        // The repeat must not buy another retention interval or GC reprieve.
+        gc_retained_and_notify(&mut router, &wiring.auth, later);
+        assert!(!router.backends.contains_key(&token));
+        assert!(!helper.opens_channels_for(token));
+        router.sessions.remove(&candidate.session_id());
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, candidate.session_id())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn repeated_end_verified_attach_keeps_the_original_route_and_ignores_stale_ends() {
+        for signals in [
+            &[false, false][..],
+            &[false, true, false][..],
+            &[true, true, false][..],
+        ] {
+            let token = [0xF2; 16];
+            let helper = HelperLogins::with(token);
+            let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+            let mut router = Router::new();
+            let (mut control, mut route) = synthetic_live_entry(&mut router, token, 1);
+            router.backends.get_mut(&token).unwrap().owner = test_principal().uid;
+            // Real verified proof, deliberately held before its manager decision.
+            let (verdict, socket) = a_proof_already_verified(
+                &wiring,
+                &mut router,
+                &mut verdicts,
+                token,
+                StartKind::Warm,
+            )
+            .await;
+            let new_id = verdict.session_id;
+            let now = tokio::time::Instant::now();
+            for &graceful in signals {
+                repeated_end_signal(&wiring, &mut router, token, 1, graceful, now);
+            }
+            // Keep control alive: cold fallback must not hide missing stable ownership.
+            SessionManager::on_probation_ended(&wiring.ctx(), &mut router, verdict).await;
+            assert!(
+                matches!(control.try_recv(), Ok(BridgeControl::Attach(conn, _, _)) if conn.session_id() == new_id)
+            );
+            let entry = &router.backends[&token];
+            assert_eq!(entry.session_id, new_id);
+            assert!(matches!(entry.state, EntryState::Live));
+            assert!(entry.parked_dgram.is_none());
+            let key = entry.client_key;
+            let incarnation = entry.incarnation;
+            wiring.auth.allowlist.lock().unwrap().push(key);
+            for graceful in [false, true] {
+                repeated_end_signal(&wiring, &mut router, token, 1, graceful, now);
+            }
+            let entry = &router.backends[&token];
+            assert_eq!(
+                (entry.session_id, entry.incarnation, entry.client_key),
+                (new_id, incarnation, key)
+            );
+            assert!(matches!(entry.state, EntryState::Live));
+            assert!(wiring.auth.allowlist.lock().unwrap().contains(&key));
+            assert!(helper.opens_channels_for(token));
+            let src = socket.local_addr().unwrap();
+            assert!(router.sessions[&new_id].send(src, b"new session".to_vec()));
+            assert_eq!(route.try_recv(), Some((src, b"new session".to_vec())));
+            assert!(
+                control.try_recv().is_err(),
+                "stale ends cannot attach or replace again"
+            );
+        }
+    }
+
+    async fn repeated_end_failed_upgrade(cancel: bool) {
+        let token = [0xF3; 16];
+        let helper = HelperLogins::with(token);
+        let (wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+        let mut router = Router::new();
+        let (control, _route) = synthetic_live_entry(&mut router, token, 1);
+        let (mut candidate, socket) = pending_ended_proof(&wiring, &mut router, token).await;
+        let first = tokio::time::Instant::now();
+        for (i, graceful) in [false, true, true, false].into_iter().enumerate() {
+            repeated_end_signal(
+                &wiring,
+                &mut router,
+                token,
+                1,
+                graceful,
+                first + Duration::from_secs(i as u64),
+            );
+        }
+        assert!(
+            helper.opens_channels_for(token),
+            "pending proof still owns the login"
+        );
+        if cancel {
+            router.sessions.remove(&candidate.session_id());
+        } else {
+            let bad = encode_auth_record(&AuthRecord {
+                public_key: b"key".to_vec(),
+                signature: b"wrong".to_vec(),
+                v2: None,
+            })
+            .unwrap();
+            for dg in candidate.send(Instant::now(), AUTH_STREAM, &bad) {
+                SessionManager::handle_datagram(
+                    &wiring.ctx(),
+                    &mut router,
+                    dg.bytes.len(),
+                    socket.local_addr().unwrap(),
+                    &dg.bytes,
+                )
+                .await;
+            }
+        }
+        finish_failed_ended_proof(&wiring, &mut router, &mut verdicts, candidate.session_id())
+            .await;
+        assert!(
+            !router.backends.contains_key(&token),
+            "late death must not downgrade a graceful end's pending-proof cleanup"
+        );
+        assert!(!helper.opens_channels_for(token));
+        assert!(control.is_closed());
+    }
+
+    #[tokio::test]
+    async fn repeated_end_graceful_upgrade_cancellation_releases_login() {
+        repeated_end_failed_upgrade(true).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_end_graceful_upgrade_bad_proof_releases_login() {
+        repeated_end_failed_upgrade(false).await;
+    }
+
+    /// Forces a real bridge death at the offset frontier, then ends its backend
+    /// only when the test releases the cue. No timer or fabricated end verdict.
+    struct EndAfterParking(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+    impl SessionBackend for EndAfterParking {
+        fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let cue = self.0.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                io.send(17, vec![1; 11]);
+                let _ = cue.await;
+                drop(io);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_end_real_parked_backend_exit_removes_or_allows_proven_cold_fallback() {
+        for pending in [false, true] {
+            let token = [0xF4; 16];
+            let helper = HelperLogins::with(token);
+            let (mut wiring, mut verdicts) = RouterWiring::new(helper.clone()).await;
+            let keys = crate::handshake::Keypair {
+                private: wiring.server_priv,
+                public: wiring.server_pub,
+            };
+            let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (_client, mut conn, _) = accepted_connection_with(
+                &keys,
+                token,
+                client_socket.local_addr().unwrap(),
+                crate::Features::HEADER_AAD,
+            );
+            let old_id = conn.session_id();
+            conn.start_stream_at_for_test(17, OFFSET_LIMIT - 10);
+            let mut router = Router::new();
+            let (control, route) = synthetic_live_entry(&mut router, token, old_id);
+            router.backends.get_mut(&token).unwrap().owner = test_principal().uid;
+            let (cue_tx, cue_rx) = tokio::sync::oneshot::channel();
+            let gates = Arc::new(GateTable::new());
+            let (in_tx, in_rx) = mpsc::channel(INBOUND_CAP);
+            let (out_tx, out_rx) = mpsc::unbounded_channel();
+            let bridge = tokio::spawn(run_backend_bridge(BridgeSpawn {
+                socket: wiring.socket.clone(),
+                conn,
+                token,
+                channels: BridgeChannels {
+                    dgram_rx: route,
+                    io_inbound_tx: in_tx,
+                    backend_out_rx: out_rx,
+                    control_rx: control,
+                    done_tx: wiring.done_tx.clone(),
+                },
+                backend: Arc::new(EndAfterParking(Mutex::new(Some(cue_rx)))),
+                io: SessionIo {
+                    resume_snapshots: channel_bridge::SnapshotMailbox::default(),
+                    inbound: in_rx,
+                    outbound: out_tx,
+                    principal: test_principal(),
+                    login: token,
+                    gates: gates.clone(),
+                },
+                start: BridgeStart::default(),
+                active_count: wiring.active_count.clone(),
+                gates,
+            }));
+            let death = tokio::time::timeout(Duration::from_secs(2), wiring._done_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!death.graceful);
+            on_session_ended_and_notify(
+                &mut router,
+                &wiring.auth,
+                death,
+                tokio::time::Instant::now(),
+            );
+            let proof = if pending {
+                Some(
+                    a_proof_already_verified(
+                        &wiring,
+                        &mut router,
+                        &mut verdicts,
+                        token,
+                        StartKind::Warm,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            cue_tx.send(()).unwrap();
+            let ended = tokio::time::timeout(Duration::from_secs(2), wiring._done_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                ended.graceful,
+                "Backend(None) must upgrade a parked connection's death"
+            );
+            tokio::time::timeout(Duration::from_secs(2), bridge)
+                .await
+                .unwrap()
+                .unwrap();
+            on_session_ended_and_notify(
+                &mut router,
+                &wiring.auth,
+                ended,
+                tokio::time::Instant::now(),
+            );
+            if let Some((verdict, _socket)) = proof {
+                assert!(helper.opens_channels_for(token));
+                assert!(matches!(
+                    router.backends[&token].state,
+                    EntryState::Retained {
+                        reason: RetentionReason::PendingProof,
+                        ..
+                    }
+                ));
+                let new_id = verdict.session_id;
+                SessionManager::on_probation_ended(&wiring.ctx(), &mut router, verdict).await;
+                assert_eq!(router.backends[&token].session_id, new_id);
+                assert!(matches!(router.backends[&token].state, EntryState::Live));
+                assert!(helper.opens_channels_for(token));
+            } else {
+                assert!(!router.backends.contains_key(&token));
+                assert!(!helper.opens_channels_for(token));
+            }
+        }
     }
 
     /// The GC's reprieve is ONE pass for each retention, and no more. A
