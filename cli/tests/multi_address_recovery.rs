@@ -183,6 +183,48 @@ impl Session {
 }
 
 #[test]
+fn shared_recovery_sends_to_returning_path_before_blackhole_deadline() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let network = RecoveryNetwork::new(daemon.port);
+    network.switch_mapping([Some(daemon.port), None]);
+    let mut session = Session::start(&network, &key);
+    network.grant(session.home.path());
+    network.switch_mapping([None, Some(daemon.port)]);
+    let started = Instant::now();
+    session.reconnect();
+    // Observe msg1, not discovery or existing authenticated path probes. The
+    // first path is a packet-dropping relay, so ICMP cannot shorten its wait.
+    let deadline = started + Duration::from_secs(3);
+    let second = loop {
+        let sent = network.handshakes();
+        if let Some(second) = sent[1].iter().find(|sent| **sent >= started) {
+            break Some(*second);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let sent = network.handshakes();
+    assert!(
+        sent[0].iter().any(|sent| *sent >= started),
+        "first path had no recovery msg1"
+    );
+    assert!(
+        second.is_some(),
+        "second path was starved behind the silent first handshake"
+    );
+    assert_eq!(
+        network.ssh_connections(),
+        0,
+        "unfinished QSH checks cannot admit SSH"
+    );
+    session.shell("SHARED_RECOVERY");
+    session.exit();
+}
+
+#[test]
 fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
     let _serial = serialised();
     let (daemon, key) = start_daemon();

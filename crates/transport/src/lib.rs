@@ -29,6 +29,7 @@ pub mod paths;
 pub mod probation;
 #[cfg(feature = "tokio-driver")]
 mod raw_admission;
+pub mod recovery_handshake;
 pub mod reliability;
 mod rtt;
 pub mod send_gate;

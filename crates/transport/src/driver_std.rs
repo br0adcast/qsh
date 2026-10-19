@@ -39,7 +39,17 @@
 //! client's ephemeral for the whole handshake (standard behavior), making
 //! every retransmit byte-identical and therefore truly idempotent on the
 //! server -- the daemon takes a cookie off before it compares. Retransmit
-//! stops once `Live` or `Closed` is reached.
+//! stops once `Live` or `Closed` is reached on the single-endpoint API.
+//!
+//! Shared recovery. `connect_recovery_with` gives that same initiator the
+//! full endpoint catalog. The recovery scheduler limits ordinary and immediate
+//! cookie sends together, retaining endpoint-local cookies and acknowledging
+//! each actual socket send. Only a successfully contacted source can consume
+//! msg2, and the selected source becomes the peer before queued output or proof
+//! can leave. Other endpoints keep receiving the unchanged msg1 while admission
+//! is unresolved; their late msg2 cannot start another proof. AuthAccepted,
+//! cancellation or closure retires scheduling. Sweep completion and selection
+//! turnover belong to the recovery owner, not to the driver's Live event.
 //!
 //! Graceful stop vs. detach. `Command::Close` (`StdClient::close`) emits the
 //! client's `Close` frame (`Connection::close`) and flushes it to the socket
@@ -153,6 +163,7 @@ use crate::conn::{
 use crate::features::Features;
 use crate::handshake_payload::StartKind;
 use crate::paths::RoadInfo;
+use crate::recovery_handshake::RecoveryEndpoint;
 use crate::send_gate::{GateKind, GateTable, GateWait};
 use crate::udp_buffers::{tune_udp_buffers, BufferReport};
 
@@ -414,6 +425,11 @@ pub struct StdClient {
     driver_thread: Option<ThreadId>,
 }
 
+enum HandshakeTarget {
+    Single(SocketAddr),
+    Recovery(Vec<RecoveryEndpoint>),
+}
+
 impl StdClient {
     /// Spin up the driver: create a command channel and start a thread with a
     /// socket and a client `Connection`. Socket creation errors don't fail
@@ -431,6 +447,29 @@ impl StdClient {
     #[allow(clippy::too_many_arguments)]
     pub fn connect_with(
         server: SocketAddr,
+        cfg: ConnectionConfig,
+        session_token: [u8; 16],
+        start_kind: StartKind,
+        binder: Arc<dyn Binder>,
+        events: Arc<dyn ClientEvents>,
+        signer: Option<Arc<dyn AuthSigner>>,
+        setup: DriverSetup,
+    ) -> StdClient {
+        Self::connect_target(
+            HandshakeTarget::Single(server),
+            cfg,
+            session_token,
+            start_kind,
+            binder,
+            events,
+            signer,
+            setup,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_target(
+        target: HandshakeTarget,
         cfg: ConnectionConfig,
         session_token: [u8; 16],
         start_kind: StartKind,
@@ -460,7 +499,7 @@ impl StdClient {
         let last_send_error_thread = Arc::clone(&last_send_error);
         let handle = thread::spawn(move || {
             run_driver(
-                server,
+                target,
                 cfg,
                 session_token,
                 start_kind,
@@ -495,6 +534,30 @@ impl StdClient {
             handle: Mutex::new(Some(handle)),
             driver_thread,
         }
+    }
+
+    /// Start one recovery attempt across the complete eligible endpoint catalog.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_recovery_with(
+        endpoints: Vec<RecoveryEndpoint>,
+        cfg: ConnectionConfig,
+        session_token: [u8; 16],
+        start_kind: StartKind,
+        binder: Arc<dyn Binder>,
+        events: Arc<dyn ClientEvents>,
+        signer: Option<Arc<dyn AuthSigner>>,
+        setup: DriverSetup,
+    ) -> StdClient {
+        Self::connect_target(
+            HandshakeTarget::Recovery(endpoints),
+            cfg,
+            session_token,
+            start_kind,
+            binder,
+            events,
+            signer,
+            setup,
+        )
     }
 
     /// [`StdClient::connect_with`] with the default setup: every stream
@@ -858,6 +921,29 @@ fn send_all(socket: &UdpSocket, dgrams: &[Datagram], record: &mut SendRecord) {
     }
 }
 
+/// A queued handshake becomes an endpoint check only after this actual send.
+/// Cookie retries returned by on_datagram use the same acknowledgement path.
+fn send_recovery_aware(
+    socket: &UdpSocket,
+    dgrams: &[Datagram],
+    record: &mut SendRecord,
+    conn: &mut Connection,
+) {
+    for dg in dgrams {
+        let result = socket.send_to(&dg.bytes, dg.to);
+        if matches!(
+            crate::wire::parse(&dg.bytes),
+            Ok(crate::wire::Frame::Handshake {
+                kind: crate::wire::Kind::HandshakeInit | crate::wire::Kind::HandshakeInitCookie,
+                ..
+            })
+        ) {
+            conn.recovery_handshake_sent(Instant::now(), dg.to, result.is_ok());
+        }
+        record.note(dg.to, result);
+    }
+}
+
 /// What the driver remembers about its sends failing: the latest outcome,
 /// published for [`StdClient::last_send_error`], and the last failure the
 /// owner was told about, so a retransmit failing the same way every half
@@ -952,7 +1038,7 @@ impl Drop for CloseGatesOnExit {
 /// The driver thread body.
 #[allow(clippy::too_many_arguments)]
 fn run_driver(
-    server: SocketAddr,
+    target: HandshakeTarget,
     cfg: ConnectionConfig,
     session_token: [u8; 16],
     start_kind: StartKind,
@@ -1008,8 +1094,15 @@ fn run_driver(
     // arrived (spec §4.16). msg1 carries the start kind, the token, the
     // method `cfg.auth` announces and the features `cfg.features` offers
     // (spec §5.2).
-    let first_msg1 = conn.start_session(start, server, start_kind, session_token);
-    send_all(&socket, &first_msg1, &mut sends);
+    let first_msg1 = match target {
+        HandshakeTarget::Single(server) => {
+            conn.start_session(start, server, start_kind, session_token)
+        }
+        HandshakeTarget::Recovery(endpoints) => {
+            conn.start_recovery(start, endpoints, start_kind, session_token)
+        }
+    };
+    send_recovery_aware(&socket, &first_msg1, &mut sends, &mut conn);
 
     // The handshake retransmit timer is driven by the driver: during
     // `Connecting` the core doesn't ask to be woken for it.
@@ -1195,12 +1288,13 @@ fn run_driver(
         //    timer, clamped above by the command poll interval.
         let now = Instant::now();
         let mut deadline = conn.next_timeout();
-        if handshake_pending {
-            let hs_deadline = handshake_sent_at + HANDSHAKE_RETRANSMIT;
-            deadline = Some(match deadline {
-                Some(d) => d.min(hs_deadline),
-                None => hs_deadline,
-            });
+        let handshake_deadline = if let Some(schedule) = conn.recovery_handshake() {
+            schedule.next_deadline()
+        } else {
+            handshake_pending.then_some(handshake_sent_at + HANDSHAKE_RETRANSMIT)
+        };
+        if let Some(hs_deadline) = handshake_deadline {
+            deadline = Some(deadline.map_or(hs_deadline, |d| d.min(hs_deadline)));
         }
         let cap = now + COMMAND_POLL_INTERVAL;
         let effective = match deadline {
@@ -1276,14 +1370,16 @@ fn run_driver(
         // itself clears only when the events are handed out below, and msg2
         // may have arrived in THIS pass: the state says whether the
         // handshake is still waiting.
-        if handshake_pending
+        if conn.recovery_handshake().is_some() {
+            out.extend(conn.poll_recovery_handshake(now));
+        } else if handshake_pending
             && conn.state() == LinkState::Connecting
             && now >= handshake_sent_at + HANDSHAKE_RETRANSMIT
         {
             send_all(&socket, &conn.retransmit_handshake(), &mut sends);
             handshake_sent_at = now;
         }
-        send_all(&socket, &out, &mut sends);
+        send_recovery_aware(&socket, &out, &mut sends, &mut conn);
 
         // The active path is settled by now (roaming re-points `conn`'s peer
         // synchronously inside `on_datagram`, above) -- published BEFORE the
@@ -1330,13 +1426,17 @@ fn run_driver(
             if matches!(ev, Event::StateChanged(LinkState::Closed)) {
                 closed_gracefully_flag.store(conn.closed_gracefully(), Ordering::SeqCst);
             }
-            if let Err(reason) = dispatch_authenticated_event(
+            let acceptance = dispatch_authenticated_event(
                 ev,
                 events.as_ref(),
                 &mut state,
                 &mut handshake_pending,
                 &mut acceptance_parser,
-            ) {
+            );
+            if matches!(acceptance, Ok(true)) {
+                conn.stop_recovery_handshake();
+            }
+            if let Err(reason) = acceptance {
                 events
                     .on_protocol_failure(crate::ProtocolFailure::InvalidAuthentication { reason });
                 // Do not send Close: a malformed admission response must not
@@ -1440,7 +1540,8 @@ thread_local! {
 }
 
 /// Routes one core event to the external callbacks, updating the driver's
-/// local `state`/`handshake_pending` bookkeeping along the way. Pulled out of
+/// local `state`/`handshake_pending` bookkeeping along the way. Returns true
+/// only when this event delivers authenticated acceptance. Pulled out of
 /// the driver loop as its own function so the routing itself (which event
 /// reaches which callback) is unit-testable without spinning up sockets.
 fn dispatch_authenticated_event(
@@ -1449,7 +1550,7 @@ fn dispatch_authenticated_event(
     state: &mut LinkState,
     handshake_pending: &mut bool,
     parser: &mut Option<crate::auth_acceptance::AuthAcceptanceParser>,
-) -> Result<(), crate::AuthAcceptanceError> {
+) -> Result<bool, crate::AuthAcceptanceError> {
     match ev {
         Event::StreamData {
             stream_id: AUTH_STREAM,
@@ -1460,6 +1561,7 @@ fn dispatch_authenticated_event(
                 .ok_or(crate::AuthAcceptanceError::Unnegotiated)?;
             if let Some(accepted) = parser.feed(&data)? {
                 events.on_auth_accepted(accepted);
+                return Ok(true);
             }
         }
         Event::StreamReset {
@@ -1469,7 +1571,7 @@ fn dispatch_authenticated_event(
         }
         other => dispatch_event(other, events, state, handshake_pending),
     }
-    Ok(())
+    Ok(false)
 }
 
 fn dispatch_event(
@@ -3004,7 +3106,7 @@ mod tests {
         let signer: Option<Arc<dyn AuthSigner>> = Some(Arc::new(StubSigner));
         let handle = thread::spawn(move || {
             run_driver(
-                server_addr,
+                HandshakeTarget::Single(server_addr),
                 client_cfg,
                 [13u8; 16],
                 StartKind::Cold,
@@ -4457,4 +4559,5 @@ mod tests {
     }
     include!("driver_std_auth_tests.rs");
     include!("driver_std_cancel_tests.rs");
+    include!("driver_std_recovery_tests.rs");
 }

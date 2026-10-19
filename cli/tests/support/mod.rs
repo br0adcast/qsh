@@ -497,6 +497,7 @@ pub struct UdpRelay {
     cut: Arc<AtomicBool>,
     upstream: UdpSocket,
     received: Arc<AtomicUsize>,
+    handshakes: Arc<Mutex<std::collections::VecDeque<Instant>>>,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -518,12 +519,14 @@ impl UdpRelay {
         let client: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
 
         let received = Arc::new(AtomicUsize::new(0));
+        let handshakes = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let upstream = back.try_clone().expect("clone upstream");
         let forward = {
             let front = front.try_clone().expect("clone front");
             let back = back.try_clone().expect("clone back");
             let (cut, stop, client) = (cut.clone(), stop.clone(), client.clone());
             let received = received.clone();
+            let handshakes = handshakes.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 while !stop.load(Ordering::SeqCst) {
@@ -531,6 +534,20 @@ impl UdpRelay {
                         continue;
                     };
                     received.fetch_add(1, Ordering::SeqCst);
+                    if matches!(
+                        transport::wire::parse(&buf[..n]),
+                        Ok(transport::wire::Frame::Handshake {
+                            kind: transport::wire::Kind::HandshakeInit
+                                | transport::wire::Kind::HandshakeInitCookie,
+                            ..
+                        })
+                    ) {
+                        let mut times = handshakes.lock().unwrap_or_else(|p| p.into_inner());
+                        if times.len() == 64 {
+                            times.pop_front();
+                        }
+                        times.push_back(Instant::now());
+                    }
                     *client.lock().unwrap_or_else(|p| p.into_inner()) = Some(from);
                     if !cut.load(Ordering::SeqCst) {
                         let _ = back.send(&buf[..n]);
@@ -559,6 +576,7 @@ impl UdpRelay {
             cut,
             upstream,
             received,
+            handshakes,
             stop,
             threads: vec![forward, backward],
         }
@@ -568,6 +586,16 @@ impl UdpRelay {
     /// path probes cannot be distinguished from other authenticated traffic.
     pub fn received(&self) -> usize {
         self.received.load(Ordering::SeqCst)
+    }
+
+    /// Bounded observations of actual msg1 sends, without retaining payloads.
+    pub fn handshakes(&self) -> Vec<Instant> {
+        self.handshakes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Move this test endpoint to another daemon without replacing the relay.

@@ -54,6 +54,9 @@ impl RecoveryNetwork {
     pub fn probes(&self) -> [usize; 2] {
         std::array::from_fn(|i| self.roads[i].received())
     }
+    pub fn handshakes(&self) -> [Vec<std::time::Instant>; 2] {
+        std::array::from_fn(|i| self.roads[i].handshakes())
+    }
     pub fn pin_qsh(&self, home: &Path) {
         let store = sshauth::known_hosts::KnownHosts::open(home.join("qsh/known_hosts"));
         for road in &self.roads {

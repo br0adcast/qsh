@@ -22,6 +22,7 @@ use crate::handshake_payload::{
     HsPayloadError, Msg1Payload, StartKind, SESSION_TOKEN_LEN,
 };
 use crate::paths::{PathTable, RoadInfo, PROBE_URGENT};
+use crate::recovery_handshake::{RecoveryEndpoint, RecoveryHandshake};
 use crate::reliability::{StreamFrame, StreamReceiver, StreamSender};
 use crate::rtt::RttEstimator;
 use crate::wire::{
@@ -748,6 +749,8 @@ pub struct Connection {
     /// Client: the Noise msg1 this handshake sent, kept so it can go out
     /// again -- as it was, or behind a cookie (spec §4.16).
     msg1_body: Option<Vec<u8>>,
+    /// Full cold-recovery catalog, separate from the bounded live path table.
+    recovery_handshake: Option<RecoveryHandshake>,
     /// Client: the cookie the server last handed out for this msg1.
     cookie: Option<[u8; COOKIE_LEN]>,
     /// Client: whether the next retransmit goes out plain rather than
@@ -931,6 +934,7 @@ impl Connection {
             msg1_sent_at: None,
             handshake_retransmitted: false,
             msg1_body: None,
+            recovery_handshake: None,
             cookie: None,
             plain_turn: false,
             retransmits: 0,
@@ -1066,6 +1070,7 @@ impl Connection {
         peer: SocketAddr,
         msg1_payload: &[u8],
     ) -> Vec<Datagram> {
+        self.recovery_handshake = None;
         self.last_recv_auth = now;
         // Both liveness clocks start here, for the same reason
         // [`Connection::request_ping`] restarts both: whatever reads
@@ -1133,6 +1138,70 @@ impl Connection {
         self.start_with_payload(now, peer, &payload)
     }
 
+    /// Start one recovery handshake over the complete eligible catalog.
+    pub fn start_recovery(
+        &mut self,
+        now: Instant,
+        endpoints: Vec<RecoveryEndpoint>,
+        start_kind: StartKind,
+        token: [u8; SESSION_TOKEN_LEN],
+    ) -> Vec<Datagram> {
+        let Some(first) = endpoints.first() else {
+            self.set_state(LinkState::Closed);
+            return Vec::new();
+        };
+        // Construct the initiator once. Its initial datagram is replaced by
+        // the bounded scheduler's dispatches, not sent a second time.
+        let initial = self.start_session(now, first.endpoint, start_kind, token);
+        if initial.is_empty() {
+            return initial;
+        }
+        self.msg1_sent_at = None;
+        self.recovery_handshake = Some(RecoveryHandshake::new(now, endpoints));
+        self.poll_recovery_handshake(now)
+    }
+
+    /// Acknowledge the actual I/O attempt for one scheduled msg1 datagram.
+    pub fn recovery_handshake_sent(&mut self, now: Instant, to: SocketAddr, success: bool) {
+        if let Some(schedule) = &mut self.recovery_handshake {
+            schedule.sent(now, to, success);
+        }
+    }
+
+    /// Scheduled copies keep the same initiator body, even after one responder
+    /// was selected. Other responders are never read through that initiator.
+    pub fn poll_recovery_handshake(&mut self, now: Instant) -> Vec<Datagram> {
+        if self.state == LinkState::Closed {
+            return Vec::new();
+        }
+        let (Some(schedule), Some(msg1)) = (&mut self.recovery_handshake, &self.msg1_body) else {
+            return Vec::new();
+        };
+        schedule
+            .poll(now)
+            .into_iter()
+            .map(|dispatch| Datagram {
+                to: dispatch.endpoint,
+                bytes: match dispatch.cookie {
+                    Some(cookie) => encode_handshake_init_cookie(&cookie, msg1),
+                    None => encode_handshake(Kind::HandshakeInit, msg1),
+                },
+            })
+            .collect()
+    }
+
+    pub fn recovery_handshake(&self) -> Option<&RecoveryHandshake> {
+        self.recovery_handshake.as_ref()
+    }
+
+    /// Accepted authentication or cancellation stops recovery scheduling. It
+    /// does not alter the selected transport or claim remote rollback.
+    pub fn stop_recovery_handshake(&mut self) {
+        if let Some(schedule) = &mut self.recovery_handshake {
+            schedule.retire();
+        }
+    }
+
     /// Handle an incoming datagram from address `src`. Malformed input (too
     /// short, unknown kind, forged, replayed) does not crash the connection -- it
     /// is silently ignored.
@@ -1155,11 +1224,11 @@ impl Connection {
             Frame::Handshake {
                 kind: Kind::HandshakeResp,
                 body,
-            } => self.on_handshake_resp(now, body),
+            } => self.on_handshake_resp(now, src, body),
             Frame::Handshake {
                 kind: Kind::CookieReply,
                 body,
-            } => self.on_cookie_reply(src, body),
+            } => self.on_cookie_reply(now, src, body),
             // What a `Connection` never answers: a msg1 behind a cookie
             // (`HandshakeInitCookie` -- the session manager takes the cookie
             // off and hands `accept` the plain msg1, spec §4.16) and
@@ -2353,9 +2422,17 @@ impl Connection {
         out
     }
 
-    fn on_handshake_resp(&mut self, now: Instant, body: &[u8]) -> Vec<Datagram> {
+    fn on_handshake_resp(&mut self, now: Instant, src: SocketAddr, body: &[u8]) -> Vec<Datagram> {
         let mut out = Vec::new();
-        if !matches!(self.role, Role::Client) || !matches!(self.state, LinkState::Connecting) {
+        // Reject an ineligible source before reading Noise: even a valid msg2
+        // consumes the only initiator and can release queued proof/data.
+        if !matches!(self.role, Role::Client)
+            || !matches!(self.state, LinkState::Connecting)
+            || !self
+                .recovery_handshake
+                .as_ref()
+                .map_or(self.peer == Some(src), |schedule| schedule.can_select(src))
+        {
             return out;
         }
         let payload = {
@@ -2368,6 +2445,16 @@ impl Connection {
                 Err(_) => return out,
             }
         };
+        // A successful Noise read consumes this initiator even if the
+        // authenticated payload is invalid. Retain that exact source for
+        // endpoint accounting; peer/keys/proof still wait for validation.
+        if let Some(schedule) = &mut self.recovery_handshake {
+            if !schedule.select(src) {
+                self.handshake = None;
+                self.set_state(LinkState::Closed);
+                return out;
+            }
+        }
         let msg2 = match parse_msg2(&payload) {
             Ok(m) => m,
             Err(reason) => {
@@ -2398,6 +2485,15 @@ impl Connection {
             });
             self.set_state(LinkState::Closed);
             return out;
+        }
+        if let Some(schedule) = &self.recovery_handshake {
+            self.msg1_sent_at = schedule.first_checked(src);
+            self.handshake_retransmitted = schedule.retransmitted(src);
+            let paths = schedule.addresses().collect();
+            self.peer = Some(src);
+            // set_paths pins the selected source before its table limit. This
+            // must precede flush_senders and every proof-producing callback.
+            self.set_paths(paths);
         }
         self.session_id = msg2.session_id;
         self.resumed = msg2.resumed;
@@ -2438,13 +2534,8 @@ impl Connection {
     /// retransmits then take turns with the plain msg1
     /// ([`Connection::retransmit_handshake`]). A client playing an old build
     /// does not know the kind at all.
-    fn on_cookie_reply(&mut self, src: SocketAddr, body: &[u8]) -> Vec<Datagram> {
-        if self.legacy_peer
-            || !matches!(self.role, Role::Client)
-            || self.state != LinkState::Connecting
-            || self.handshake.is_none()
-            || self.peer != Some(src)
-        {
+    fn on_cookie_reply(&mut self, now: Instant, src: SocketAddr, body: &[u8]) -> Vec<Datagram> {
+        if self.legacy_peer || !matches!(self.role, Role::Client) {
             return Vec::new();
         }
         let Some((echo, cookie)) = parse_cookie_reply(body) else {
@@ -2455,6 +2546,16 @@ impl Connection {
             .as_ref()
             .is_some_and(|msg1| msg1.get(..COOKIE_ECHO_LEN) == Some(&echo[..]));
         if !answers_this_msg1 {
+            return Vec::new();
+        }
+        if let Some(schedule) = &mut self.recovery_handshake {
+            if schedule.on_cookie(now, src, cookie) {
+                return self.poll_recovery_handshake(now);
+            }
+            return Vec::new();
+        }
+        if self.state != LinkState::Connecting || self.handshake.is_none() || self.peer != Some(src)
+        {
             return Vec::new();
         }
         let first = self.cookie.is_none();
@@ -3680,6 +3781,10 @@ impl Connection {
 }
 
 #[cfg(test)]
+#[path = "recovery_connection_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::handshake::generate_keypair;
@@ -4549,6 +4654,38 @@ pub(crate) mod tests {
         let response = encode_handshake(Kind::HandshakeResp, &responder.write_msg(payload));
         client.poll_events();
         (client, response, now, peer)
+    }
+
+    #[test]
+    fn shared_recovery_unrequested_source_cannot_consume_the_initiator() {
+        let (mut client, response, now, peer) = response_fixture(&encode_msg2(
+            9,
+            false,
+            &[0; AUTH_NONCE_LEN],
+            Features::SUPPORTED,
+        ));
+        assert!(client.send(now, 16, b"queued until selection").is_empty());
+        let stranger = addr("198.51.100.99:41000");
+        assert!(client.on_datagram(now, stranger, &response).is_empty());
+        assert_eq!(client.state(), LinkState::Connecting);
+        assert!(client.poll_events().is_empty());
+        assert!(client.keys.is_none());
+
+        let output = client.on_datagram(now, peer, &response);
+        assert_eq!(client.state(), LinkState::Live);
+        assert!(
+            !output.is_empty(),
+            "the eligible response releases queued data"
+        );
+        assert!(output.iter().all(|datagram| datagram.to == peer));
+        assert_eq!(
+            client
+                .poll_events()
+                .iter()
+                .filter(|event| **event == Event::HandshakeDone)
+                .count(),
+            1
+        );
     }
 
     #[test]
