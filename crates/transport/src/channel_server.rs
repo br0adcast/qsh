@@ -16,10 +16,14 @@
 //! arms as channels come and go, so instead every channel's reader task
 //! shares ONE output channel, tagging each chunk with the stream it came
 //! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that instance's
-//! output EOF, which does not prove its process has ended). Input stays one UNbounded channel PER
-//! channel, same as `serve_shell` and for the same reason: a synchronous
-//! send from the async loop must never block it (see that module's docs for
-//! the full argument).
+//! output EOF, which does not prove its process has ended). Each input FIFO
+//! uses nonblocking sends with owned admission permits: queued and writer-held
+//! payloads share an 8 MiB / 16,384-item cap per channel and per session.
+//! Warm attachment, channel closure and stream reuse never refund live chunks.
+//! An input that exceeds either cap stops its receiving channel; other output
+//! and control processing continues. Aggregate exhaustion can refuse another
+//! channel's new input until retained debt is released. This also bounds peers
+//! without stream credit; it does not change the raw diagnostic shell runner.
 //!
 //! **Opening stays off the loop.** The factory registry admits finite work
 //! before the blocking executor calls a spawner. Pending jobs count against the
@@ -820,11 +824,10 @@ impl Drop for PendingExit {
 struct Channel {
     _open_slot: Option<crate::channel_open::InstalledSlot>,
     producer: ProducerState,
-    /// Sends keystrokes to this channel's process. Unbounded: a synchronous
-    /// send from the loop must never block it (see `shell_server`'s module
-    /// docs for the full reasoning, which applies verbatim here, once per
-    /// channel instead of once per session).
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Every queued or writer-held chunk owns channel and session quota.
+    /// Admission bounds this nonblocking FIFO independently of transport credit.
+    input_tx: mpsc::UnboundedSender<crate::channel_input::InputChunk>,
+    input_budget: crate::channel_input::ChannelInputBudget,
     resize: Box<dyn ResizeHandle>,
     screen: Box<dyn SessionScreen>,
     /// Echo-ack accounting, exactly as in `serve_shell`, but tracked per
@@ -861,6 +864,7 @@ struct ProducerContext {
     attachment: AttachmentContext,
     ready: Arc<tokio::sync::Notify>,
     opens: OpenScope,
+    input_budget: crate::channel_input::SessionInputBudget,
 }
 struct OpenScope {
     registry: Arc<crate::channel_open::ChannelOpenRegistry>,
@@ -1269,6 +1273,7 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
 /// Natural EOF observes without signalling; an explicit stop also reaches a
 /// process already being observed by the registered reaper.
 fn begin_channel_ending(ch: &mut Channel, reaps: &mut ReapSet, stop: bool) {
+    ch.input_budget.close();
     ch.producer.deferred = None;
     if let Some(wait) = ch.wait.take() {
         reaps.start(
@@ -1351,6 +1356,7 @@ pub async fn run_channel_session_with(
     let mut next_instance: u64 = 1;
     let mut producer = ProducerContext {
         opens: OpenScope::new(spawner.open_registry()),
+        input_budget: crate::channel_input::SessionInputBudget::new(),
         attachment: AttachmentContext::default(),
         ready: Arc::new(tokio::sync::Notify::new()),
     };
@@ -1441,14 +1447,21 @@ pub async fn run_channel_session_with(
                         io.consumed(stream_id, n);
                         continue;
                     }
-                    // The offset of consumed input grows BEFORE the write --
-                    // same reasoning as `serve_shell`.
-                    ch.input_consumed += n as u64;
-                    // The writer reports it once the process has it (see
-                    // `channel_writer_loop`); a writer that is gone never
-                    // will, so it is taken here.
-                    if ch.input_tx.send(data).is_err() {
-                        io.consumed(stream_id, n);
+                    match ch.input_budget.try_network(data) {
+                        Ok(Some(chunk)) => {
+                            // Echo offsets cover admitted network input only.
+                            ch.input_consumed += n as u64;
+                            if ch.input_tx.send(chunk).is_err() {
+                                io.consumed(stream_id, n);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            // Refuse the offending chunk, stop only its exact
+                            // process owner, and keep draining real output/exit.
+                            io.consumed(stream_id, n);
+                            begin_channel_ending(ch, &mut reaps, true);
+                        }
                     }
                 } else {
                     // Bytes for a stream that names no open channel -- the
@@ -1710,6 +1723,7 @@ pub async fn run_channel_session_with(
     // reader waiting on its shut gate wakes and ends instead of waiting for
     // a bridge that is gone.
     opening.clear();
+    producer.input_budget.close();
     io.close_send_gates();
     begin_reap_all(&io, &mut channels, &mut reaps);
     // The transport is gone, but exact cleanup receipts and blocking reaps
@@ -2289,8 +2303,9 @@ fn open_channel(
 pub(crate) struct PreparedInstallation<'a> {
     entry: std::collections::hash_map::VacantEntry<'a, u8, Channel>,
     producer: ProducerState,
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    input_tx: mpsc::UnboundedSender<crate::channel_input::InputChunk>,
+    input_budget: crate::channel_input::ChannelInputBudget,
+    input_rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
     gate: Arc<SendGate>,
     request: OpenRequest,
     instance: u64,
@@ -2300,7 +2315,7 @@ pub(crate) struct InstalledBridges {
     instance: u64,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
-    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    input_rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
 }
 impl<'a> PreparedInstallation<'a> {
     fn new(
@@ -2318,6 +2333,7 @@ impl<'a> PreparedInstallation<'a> {
         Some(Self {
             entry,
             producer: ProducerState::new(instance, context),
+            input_budget: context.input_budget.channel(),
             input_tx,
             input_rx,
             // This inert gate is replaced with the bridge's shared gate before any
@@ -2357,6 +2373,7 @@ impl<'a> PreparedInstallation<'a> {
             _open_slot: Some(slot),
             producer: self.producer,
             input_tx: self.input_tx,
+            input_budget: self.input_budget,
             resize,
             screen,
             input_consumed: 0,
@@ -2491,16 +2508,21 @@ fn channel_reader_loop(
 /// window.
 fn channel_writer_loop(
     stream: u8,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
     mut writer: Box<dyn Write + Send>,
     reporter: ConsumptionReporter,
 ) {
     let mut broken = false;
     while let Some(chunk) = rx.blocking_recv() {
-        if !broken && writer.write_all(&chunk).is_err() {
+        if !broken && writer.write_all(chunk.bytes()).is_err() {
             broken = true;
         }
-        reporter.consumed(stream, chunk.len());
+        let network_bytes = chunk.network_bytes();
+        // Release retained payload/quota before advertising receive capacity.
+        drop(chunk);
+        if network_bytes != 0 {
+            reporter.consumed(stream, network_bytes);
+        }
     }
 }
 
@@ -2663,6 +2685,7 @@ pub(crate) mod tests {
     #[allow(clippy::type_complexity)]
     struct FakeWriter {
         stream: u8,
+        attempts: Arc<AtomicUsize>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
         /// While set, a write waits -- a process that does not read.
         held: Arc<(Mutex<bool>, std::sync::Condvar)>,
@@ -2672,6 +2695,7 @@ pub(crate) mod tests {
 
     impl Write for FakeWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             let (lock, cond) = &*self.held;
             let mut held = lock.lock().unwrap();
             while *held {
@@ -2792,6 +2816,7 @@ pub(crate) mod tests {
     #[allow(clippy::type_complexity)]
     pub(crate) struct FakeSpawner {
         opens: Arc<crate::channel_open::ChannelOpenRegistry>,
+        write_attempts: Arc<AtomicUsize>,
         /// When set, every `spawn` refuses with this reason.
         refuse: Mutex<Option<String>>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
@@ -2834,6 +2859,7 @@ pub(crate) mod tests {
         pub(crate) fn new() -> Arc<FakeSpawner> {
             Arc::new(FakeSpawner {
                 opens: crate::channel_open::ChannelOpenRegistry::new(Default::default()),
+                write_attempts: Arc::new(AtomicUsize::new(0)),
                 refuse: Mutex::new(None),
                 written: Arc::new(Mutex::new(Vec::new())),
                 sizes: Arc::new(Mutex::new(Vec::new())),
@@ -2932,6 +2958,7 @@ pub(crate) mod tests {
                 }),
                 writer: Box::new(FakeWriter {
                     stream: req.stream,
+                    attempts: self.write_attempts.clone(),
                     written: self.written.clone(),
                     held: self.held.clone(),
                     broken: self.broken.clone(),
@@ -3146,6 +3173,7 @@ pub(crate) mod tests {
             };
             let channel = Channel {
                 _open_slot: None,
+                input_budget: producer.input_budget.channel(),
                 input_tx,
                 resize: Box::new(TransactionPty {
                     fail: ioctl_fails,
@@ -4613,6 +4641,303 @@ pub(crate) mod tests {
         );
         drop(inbound);
         let _ = runner.await;
+    }
+
+    /// Downstream input retention must stay bounded without transport credit.
+    #[tokio::test]
+    async fn input25_overflow_stops_only_the_held_channel_without_stream_credit() {
+        input25_overflow(false, false, 4096, 2048).await;
+    }
+
+    #[tokio::test]
+    async fn input25_overflow_stays_bounded_with_stream_credit() {
+        input25_overflow(true, false, 4096, 2048).await;
+    }
+
+    #[tokio::test]
+    async fn input25_warm_attach_does_not_refund_held_network_input() {
+        input25_overflow(true, true, 4096, 2048).await;
+    }
+
+    #[tokio::test]
+    async fn input25_tiny_fragments_hit_item_limit_before_byte_limit() {
+        input25_overflow(false, false, 1, 16_384).await;
+    }
+
+    async fn input25_overflow(credit: bool, warm: bool, chunk: usize, items: usize) {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        let mut context = channel_context();
+        if credit {
+            context.features = context.features | crate::Features::STREAM_CREDIT;
+        }
+        inbound.send(SessionInbound::Live(context)).await.unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        spawner.hold_writes(true);
+        let release = ReleaseHeldWrites(spawner.clone());
+
+        // The same downstream budget applies independently of negotiated credit.
+        // Keep the real writer and its queue occupied, including across reattach.
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 16,
+                data: vec![b'x'; chunk],
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while spawner.write_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the actual writer must own the first chunk");
+        for _ in 0..(items - 1) {
+            inbound
+                .send(SessionInbound::Data(StreamData {
+                    stream_id: 16,
+                    data: vec![b'x'; chunk],
+                }))
+                .await
+                .unwrap();
+        }
+        if warm {
+            context.generation += 1;
+            inbound
+                .send(SessionInbound::ResumeReset(context))
+                .await
+                .unwrap();
+            let _ = next_snapshot(&mut outbound, &snapshots).await;
+        } else {
+            inbound
+                .send(open(24, ChannelKind::Shell, false))
+                .await
+                .unwrap();
+            assert_eq!(
+                next_control(&mut outbound).await,
+                ServerRecord::Opened { stream: 24 }
+            );
+        }
+        assert!(
+            spawner.killed.lock().unwrap().is_empty(),
+            "the exact configured byte/item boundary fits"
+        );
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 16,
+                data: vec![b'x'; chunk],
+            }))
+            .await
+            .unwrap();
+        // This record follows every data item in the same inbound FIFO. Its
+        // response proves the session handled the backlog and stayed responsive.
+        inbound
+            .send(open(20, ChannelKind::Shell, false))
+            .await
+            .unwrap();
+        let sibling = loop {
+            let record = next_control(&mut outbound).await;
+            if matches!(record, ServerRecord::Exit { stream: 16, .. }) {
+                continue;
+            }
+            break record;
+        };
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if spawner.killed.lock().unwrap().contains(&16) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let sibling_stopped = spawner.killed.lock().unwrap().contains(&20);
+
+        // Release all owned blocking I/O before reporting the behavioral result.
+        spawner.break_writes();
+        drop(release);
+        spawner.end_channel(16);
+        spawner.end_channel(20);
+        spawner.end_channel(24);
+        drop(inbound);
+        runner.await.unwrap();
+        assert_eq!(sibling, ServerRecord::Opened { stream: 20 });
+        assert!(
+            !sibling_stopped,
+            "overload must not stop an unrelated channel"
+        );
+        assert!(
+            stopped,
+            "input above the retained budget must stop the overloaded channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn input25_aggregate_exhaustion_rejects_incoming_channel_then_recovers() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        inbound
+            .send(open(20, ChannelKind::Shell, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_control(&mut outbound).await,
+            ServerRecord::Opened { stream: 20 }
+        );
+        spawner.hold_writes(true);
+        let release = ReleaseHeldWrites(spawner.clone());
+        const HALF: usize = 4 * 1024 * 1024;
+        for stream in [16, 20] {
+            inbound
+                .send(SessionInbound::Data(StreamData {
+                    stream_id: stream,
+                    data: vec![b'x'; HALF],
+                }))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while spawner.write_attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        inbound
+            .send(open(24, ChannelKind::Shell, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_control(&mut outbound).await,
+            ServerRecord::Opened { stream: 24 }
+        );
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 24,
+                data: vec![b'y'],
+            }))
+            .await
+            .unwrap();
+        let refused = consumed_until(&mut outbound, 24, 1).await;
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !spawner.killed.lock().unwrap().contains(&24) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let prior_stopped = spawner.killed.lock().unwrap().iter().any(|s| *s != 24);
+        drop(release);
+        // Both actual writes release their payload quota before reporting it.
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut total = 0;
+            while total < 2 * HALF {
+                if let Some(SessionOutbound::Consumed {
+                    stream_id: 16 | 20,
+                    n,
+                }) = outbound.recv().await
+                {
+                    total += n;
+                }
+            }
+            total
+        })
+        .await
+        .unwrap();
+        inbound
+            .send(open(28, ChannelKind::Shell, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_control(&mut outbound).await,
+            ServerRecord::Opened { stream: 28 }
+        );
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 28,
+                data: vec![b'z'],
+            }))
+            .await
+            .unwrap();
+        let recovered = consumed_until(&mut outbound, 28, 1).await;
+        let wrote = spawner
+            .written
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(s, b)| *s == 28 && b == b"z");
+        for stream in [16, 20, 24, 28] {
+            spawner.end_channel(stream);
+        }
+        drop(inbound);
+        runner.await.unwrap();
+        assert_eq!(refused.get(&24), Some(&1));
+        assert!(stopped && !prior_stopped);
+        assert_eq!(completed, 2 * HALF);
+        assert_eq!(recovered.get(&28), Some(&1));
+        assert!(
+            wrote,
+            "release must restore admission and actual sibling input"
+        );
+    }
+
+    #[tokio::test]
+    async fn input25_reused_stream_keeps_retired_writer_debt() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        spawner.hold_writes(true);
+        let release = ReleaseHeldWrites(spawner.clone());
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 16,
+                data: vec![b'x'; 8 * 1024 * 1024],
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while spawner.write_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: encode_client(&ClientRecord::Close { stream: 16 }),
+            }))
+            .await
+            .unwrap();
+        // A new channel instance has its own quota, but shares the old debt.
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: 16,
+                data: vec![b'y'],
+            }))
+            .await
+            .unwrap();
+        let rejected = consumed_until(&mut outbound, 16, 1).await;
+        spawner.break_writes();
+        drop(release);
+        let retired = consumed_until(&mut outbound, 16, 8 * 1024 * 1024).await;
+        spawner.end_channel(16);
+        drop(inbound);
+        runner.await.unwrap();
+        assert_eq!(
+            rejected.get(&16),
+            Some(&1),
+            "new input cannot bypass retired debt"
+        );
+        assert_eq!(retired.get(&16), Some(&(8 * 1024 * 1024)));
+        assert!(spawner.written.lock().unwrap().is_empty());
     }
 
     /// Spec §4.10.3: a channel's input is taken once its process has it --
