@@ -8,12 +8,15 @@
 //! palette snapshot to resolve them, attributes, cursor).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 mod limits;
 mod replay;
 mod replies;
 #[cfg(test)]
 mod reply_tests;
+#[cfg(test)]
+mod sync_deadline_tests;
 mod tracking;
 
 pub use limits::TerminalOptions;
@@ -433,7 +436,34 @@ impl TerminalCore {
         Ok(bytes.map(|bytes| TerminalRepaint { bytes, replies }))
     }
 
-    fn flush_pending_output(&mut self) {
+    /// The parser's current synchronized-update deadline, if output is buffered.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    /// Apply due buffered output for a passive display replica.
+    pub fn flush_due_output(&mut self, now: Instant) -> bool {
+        if !self.sync_deadline().is_some_and(|deadline| now >= deadline) {
+            return false;
+        }
+        self.flush_pending_output();
+        true
+    }
+
+    /// Apply due fresh output for the authoritative application-input owner.
+    pub fn flush_due_with_replies(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<Vec<u8>>, TerminalReplyError> {
+        if !self.sync_deadline().is_some_and(|deadline| now >= deadline) {
+            return Ok(None);
+        }
+        self.flush_with_replies().map(Some)
+    }
+
+    /// Apply buffered output at an explicit passive display boundary.
+    /// Authoritative owners must use [`Self::flush_with_replies`] instead.
+    pub fn flush_pending_output(&mut self) {
         if self.parser.sync_timeout().sync_timeout().is_some() {
             self.parser.stop_sync(&mut tracking::Tracking {
                 term: &mut self.term,

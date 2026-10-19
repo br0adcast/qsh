@@ -3,17 +3,27 @@ mod terminal_replies {
     use crate::channel_geometry::OutputGapCause;
     use crate::shell_server::{ScreenRepaint, ScreenReplyError};
 
-    pub(super) struct QueryScreen;
+    #[derive(Default)]
+    pub(super) struct QueryScreen {
+        deadline: Option<std::time::Instant>,
+    }
     impl SessionScreen for QueryScreen {
         fn absorb(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError> {
             match bytes {
                 b"query" => Ok(b"reply".to_vec()),
+                b"deferred-query" => {
+                    self.deadline = Some(std::time::Instant::now());
+                    Ok(Vec::new())
+                }
                 b"fail" => Err(ScreenReplyError::Overflow),
                 _ => Ok(Vec::new()),
             }
         }
+        fn sync_deadline(&self) -> Option<std::time::Instant> {
+            self.deadline
+        }
         fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError> {
-            Ok(Vec::new())
+            Ok(self.deadline.take().map(|_| b"reply".to_vec()).unwrap_or_default())
         }
         fn repaint(&mut self) -> Result<ScreenRepaint, ScreenReplyError> {
             Ok(ScreenRepaint {

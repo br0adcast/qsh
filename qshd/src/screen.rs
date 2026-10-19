@@ -91,6 +91,19 @@ impl SessionScreen for PtyScreen {
         })
     }
 
+    fn sync_deadline(&self) -> Option<std::time::Instant> {
+        self.term.sync_deadline()
+    }
+
+    fn flush_due_output(&mut self, now: std::time::Instant) -> Result<Vec<u8>, ScreenReplyError> {
+        self.term
+            .flush_due_with_replies(now)
+            .map(|replies| replies.unwrap_or_default())
+            .map_err(|error| match error {
+                terminal::TerminalReplyError::Overflow => ScreenReplyError::Overflow,
+            })
+    }
+
     fn prepare_resize(
         &mut self,
         size: TerminalSize,
@@ -837,5 +850,25 @@ mod tests {
             history,
             "no line pushed into history"
         );
+    }
+    #[test]
+    fn sync111_screen_due_flush_updates_model_and_answers_once() {
+        let mut screen = screen(80, 24);
+        assert!(screen
+            .absorb(b"\x1b[?2026hDEADLINE\x1b[5n")
+            .unwrap()
+            .is_empty());
+        let due = screen.sync_deadline().unwrap();
+        assert!(screen
+            .flush_due_output(due - std::time::Duration::from_nanos(1))
+            .unwrap()
+            .is_empty());
+        assert_eq!(screen.frame().cell(0, 0).ch, ' ');
+        assert_eq!(screen.flush_due_output(due).unwrap(), b"\x1b[0n");
+        let frame = screen.frame();
+        let text: String = frame.cells.iter().map(|cell| cell.ch).collect();
+        assert!(text.contains("DEADLINE"));
+        assert!(screen.flush_due_output(due).unwrap().is_empty());
+        assert!(screen.absorb(b"\x1b[?2026l").unwrap().is_empty());
     }
 }
