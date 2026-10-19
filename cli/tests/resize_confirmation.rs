@@ -619,3 +619,116 @@ fn default_budget_refusal_is_visible_with_chrome_off_and_renders_after_reconnect
     );
     drop(slave);
 }
+
+fn assert_pty_replies(client: &mut Harness, query: &[u8], answer: &[u8], label: &str) {
+    let octal: String = query.iter().map(|b| format!("\\0{b:03o}")).collect();
+    let expected: String = answer.iter().map(|b| format!("{b:02x}")).collect();
+    let script = format!(
+        "stty -echo -icanon min 0 time 10; printf '%b' '{octal}'; \
+         got=$(dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+         extra=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+         stty sane -echo; if [ \"$got\" = '{expected}' ] && [ -z \"$extra\" ]; \
+         then printf '\\nQUERY-{label}-PASS\\n'; else printf '\\nQUERY-{label}-FAIL\\n'; fi",
+        answer.len()
+    );
+    // Assemble the readiness marker in the child: command echo cannot satisfy
+    // this wait or expose the literal pass marker in the following script.
+    client.command(
+        &format!("stty -echo; printf '\\nECHO-%s\\n' {label}"),
+        &format!("ECHO-{label}"),
+    );
+    client.owner.send(16, format!("{script}\n").as_bytes());
+    let passed = format!("QUERY-{label}-PASS");
+    let failed = format!("QUERY-{label}-FAIL");
+    client.wait(|s| s.text().contains(&passed) || s.text().contains(&failed));
+    assert!(
+        client.text().contains(&passed),
+        "the PTY did not receive the exact one-time {label} replies"
+    );
+}
+
+#[test]
+fn authoritative_pty_model_answers_da_dsr_and_cpr_once() {
+    let _serial = support::serialised();
+    let (daemon, key) = support::start_daemon();
+    let private = generate_keypair().private;
+    let mut client = Harness::connect(&daemon, &key, private, StartKind::Cold, None);
+    client.wait(|s| s.live);
+    assert_eq!(client.owner.open_shell(80, 24), Some(16));
+    client.wait(|s| s.owner.is_ready(16));
+    let instance = client.owner.committed_geometry(16).unwrap().instance;
+
+    // The actual child PTY consumes answers. Neither this passive frontend nor
+    // the fixture sends fabricated terminal responses to the daemon.
+    assert_pty_replies(
+        &mut client,
+        b"\x1b[c\x1b[5n\x1b[7;11H\x1b[6n",
+        b"\x1b[?6c\x1b[0n\x1b[7;11R",
+        "INITIAL",
+    );
+    assert_eq!(client.owner.resize(16, 60, 20), ResizeDisposition::Sent);
+    client.wait(|s| {
+        s.owner
+            .committed_geometry(16)
+            .is_some_and(|g| (g.cols, g.rows) == (60, 20))
+    });
+    assert_pty_replies(
+        &mut client,
+        b"\x1b[18t\x1b[7;11H\x1b[6n",
+        b"\x1b[8;20;60t\x1b[7;11R",
+        "RESIZED",
+    );
+
+    let intent = client.owner.into_attachment_intent();
+    drop(client.connection);
+    let mut resumed = Harness::connect(&daemon, &key, private, StartKind::Warm, Some(intent));
+    resumed.wait(|s| s.owner.is_ready(16));
+    assert_eq!(
+        resumed.owner.committed_geometry(16).unwrap().instance,
+        instance
+    );
+    assert_pty_replies(
+        &mut resumed,
+        b"\x1b[c\x1b[5n\x1b[18t",
+        b"\x1b[?6c\x1b[0n\x1b[8;20;60t",
+        "RESUMED",
+    );
+}
+
+#[test]
+fn a_query_spanning_warm_replay_gets_one_authoritative_reply() {
+    let _serial = support::serialised();
+    let (daemon, key) = support::start_daemon();
+    let private = generate_keypair().private;
+    let mut client = Harness::connect(&daemon, &key, private, StartKind::Cold, None);
+    client.wait(|s| s.live);
+    assert_eq!(client.owner.open_shell(80, 24), Some(16));
+    client.wait(|s| s.owner.is_ready(16));
+    let instance = client.owner.committed_geometry(16).unwrap().instance;
+    client.command("stty -echo; printf '\\nECHO-%s\\n' PARTIAL", "ECHO-PARTIAL");
+    let script = "stty -echo -icanon min 1 time 0; \
+        printf '\\033[2J\\033[HREADY\\033['; dd bs=1 count=1 >/dev/null 2>&1; \
+        stty min 0 time 10; printf '6n'; \
+        got=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+        extra=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+        stty sane -echo; if [ \"$got\" = '1b5b313b3652' ] && [ -z \"$extra\" ]; \
+        then printf '\\nPARTIAL-PASS\\n'; else printf '\\nPARTIAL-FAIL\\n'; fi";
+    client.owner.send(16, format!("{script}\n").as_bytes());
+    client.wait(|s| s.text().contains("READY"));
+    let intent = client.owner.into_attachment_intent();
+    drop(client.connection);
+    let mut resumed = Harness::connect(&daemon, &key, private, StartKind::Warm, Some(intent));
+    resumed.wait(|s| s.owner.is_ready(16) && s.text().contains("READY"));
+    assert_eq!(
+        resumed.owner.committed_geometry(16).unwrap().instance,
+        instance
+    );
+    // The only application input from the client is a trigger for the child to
+    // complete CSI6n; it is not a CPR answer. Replay restored the unfinished CSI.
+    resumed.owner.send(16, b"x");
+    resumed.wait(|s| s.text().contains("PARTIAL-PASS") || s.text().contains("PARTIAL-FAIL"));
+    assert!(
+        resumed.text().contains("PARTIAL-PASS"),
+        "warm replay duplicated or lost the CPR reply"
+    );
+}

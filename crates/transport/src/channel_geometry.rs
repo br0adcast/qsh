@@ -138,12 +138,15 @@ impl GeometryRecord {
 #[repr(u8)]
 pub enum OutputGapCause {
     PreviousConnectionOutputUnconfirmed = 1,
+    /// Required terminal replies could not be delivered; the channel is ending.
+    TerminalReplyFailure = 2,
 }
 
 impl OutputGapCause {
     pub(crate) fn from_wire(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::PreviousConnectionOutputUnconfirmed),
+            2 => Some(Self::TerminalReplyFailure),
             _ => None,
         }
     }

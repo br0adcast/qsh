@@ -11,13 +11,17 @@ use std::sync::Arc;
 
 mod limits;
 mod replay;
+mod replies;
+#[cfg(test)]
+mod reply_tests;
 mod tracking;
 
 pub use limits::TerminalOptions;
 pub use replay::StateSnapshot;
+use replies::ReplyListener;
+pub use replies::{TerminalRepaint, TerminalReplyError, MAX_TERMINAL_REPLY_BYTES};
 use terminal_size::{TerminalSize, ViewportSize};
 
-use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -271,10 +275,11 @@ pub struct Frame {
 }
 
 /// The emulator core: the `Term` screen grid plus the `Processor` control
-/// sequence parser. We don't emit events outward - the `VoidListener`
-/// listener swallows them (bell, title change, and the rest aren't needed yet).
+/// sequence parser. Ordinary feeds are passive; an explicit fresh-output feed
+/// can collect bounded replies for the owner of the application input stream.
 pub struct TerminalCore {
-    term: Term<VoidListener>,
+    term: Term<ReplyListener>,
+    replies: ReplyListener,
     parser: Processor,
     /// Only in a core made to replay itself ([`TerminalCore::with_replay`]):
     /// the daemon's model of a screen. Everywhere else -- the app, the
@@ -304,16 +309,18 @@ impl TerminalCore {
     /// Creates a model with validated geometry and bounded history before allocation.
     pub fn with_options(size: TerminalSize, options: TerminalOptions) -> Self {
         let dimensions = TermSize::new(size.cols() as usize, size.rows() as usize);
+        let replies = ReplyListener::default();
         let term = Term::new(
             Config {
                 scrolling_history: limits::effective_history(options.history_lines, size),
                 ..Config::default()
             },
             &dimensions,
-            VoidListener,
+            replies.clone(),
         );
         Self {
             term,
+            replies,
             parser: Processor::new(),
             replay: options.replay.then(|| ReplayState {
                 tracked: tracking::Tracked::new(size.cols() as usize, size.rows() as usize),
@@ -388,6 +395,53 @@ impl TerminalCore {
         }
     }
 
+    /// Feed fresh application output and return its ordered terminal replies.
+    ///
+    /// Only the authoritative owner of the application input stream may use
+    /// this method. Display replicas, prediction and restored replay must use
+    /// [`Self::feed`] instead. Pixel-size, clipboard and color requests remain
+    /// unsupported because this model does not own those resources.
+    ///
+    /// An overflow returns no reply prefix. The owner must end the affected
+    /// channel rather than continue after silently losing required responses.
+    pub fn feed_with_replies(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TerminalReplyError> {
+        let capture = self.replies.capture();
+        self.feed(bytes);
+        capture.finish()
+    }
+
+    /// Flush buffered fresh output before an authoritative geometry change.
+    ///
+    /// This executes pending synchronized-update bytes at the current geometry.
+    /// It is an explicit flush boundary, not an operation to perform after every
+    /// feed. The owner must admit the returned replies or end the channel.
+    pub fn flush_with_replies(&mut self) -> Result<Vec<u8>, TerminalReplyError> {
+        let capture = self.replies.capture();
+        self.flush_pending_output();
+        capture.finish()
+    }
+
+    /// Build a repaint while returning replies from buffered fresh output.
+    ///
+    /// The repaint bytes themselves never generate application replies here.
+    /// Only previously buffered fresh bytes executed by the parser can do so.
+    /// A passive replica must consume the repaint through ordinary [`Self::feed`].
+    pub fn replay_with_replies(&mut self) -> Result<Option<TerminalRepaint>, TerminalReplyError> {
+        let capture = self.replies.capture();
+        let bytes = self.replay();
+        let replies = capture.finish()?;
+        Ok(bytes.map(|bytes| TerminalRepaint { bytes, replies }))
+    }
+
+    fn flush_pending_output(&mut self) {
+        if self.parser.sync_timeout().sync_timeout().is_some() {
+            self.parser.stop_sync(&mut tracking::Tracking {
+                term: &mut self.term,
+                tracked: self.replay.as_mut().map(|replay| &mut replay.tracked),
+            });
+        }
+    }
+
     /// Changes the terminal size (columns by rows), e.g. on screen rotation
     /// or a window resize on the client side.
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -425,15 +479,14 @@ impl TerminalCore {
     /// A synchronized update this emulator is holding back is applied first:
     /// its bytes are already part of the state the other one must reach.
     ///
+    /// This is the passive form. An authoritative application-input owner must
+    /// use [`Self::replay_with_replies`] to answer buffered fresh queries.
+    ///
     /// `None` from a core not made [`TerminalCore::with_replay`].
     pub fn replay(&mut self) -> Option<Vec<u8>> {
-        let replay = self.replay.as_mut()?;
-        if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(&mut tracking::Tracking {
-                term: &mut self.term,
-                tracked: Some(&mut replay.tracked),
-            });
-        }
+        self.replay.as_ref()?;
+        self.flush_pending_output();
+        let replay = self.replay.as_ref().expect("replay policy is unchanged");
         Some(replay::write(
             &mut self.term,
             &replay.tracked,

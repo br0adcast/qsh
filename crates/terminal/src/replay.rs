@@ -41,7 +41,7 @@ use std::fmt::Write as _;
 
 use unicode_width::UnicodeWidthChar;
 
-use alacritty_terminal::event::VoidListener;
+use crate::replies::ReplyListener;
 use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell as AlacrittyCell, Flags};
@@ -649,7 +649,7 @@ fn modes(out: &mut Out, mode: TermMode, style: alacritty_terminal::vte::ansi::Cu
 }
 
 /// The palette: back to the defaults, then every color the model changed.
-fn palette(out: &mut Out, term: &Term<VoidListener>) {
+fn palette(out: &mut Out, term: &Term<ReplyListener>) {
     out.push(b"\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07");
     let colors = term.colors();
     for index in 0..=LAST_SETTABLE_COLOR {
@@ -690,7 +690,7 @@ fn tabs(out: &mut Out, tabs: &[bool]) {
 /// clamps the saved one); either way the client, whose own entry sets the
 /// same, agrees with the model after this.
 pub(crate) fn with_primary<R>(
-    term: &mut Term<VoidListener>,
+    term: &mut Term<ReplyListener>,
     f: impl FnOnce(&Grid<AlacrittyCell>) -> R,
 ) -> R {
     debug_assert!(term.mode().contains(TermMode::ALT_SCREEN));
@@ -703,7 +703,7 @@ pub(crate) fn with_primary<R>(
 }
 
 /// See the module docs.
-pub(crate) fn write(term: &mut Term<VoidListener>, tracked: &Tracked, tail: &[u8]) -> Vec<u8> {
+pub(crate) fn write(term: &mut Term<ReplyListener>, tracked: &Tracked, tail: &[u8]) -> Vec<u8> {
     let mut out = Out {
         bytes: Vec::new(),
         style: None,
@@ -956,7 +956,7 @@ fn grid_state(grid: &Grid<AlacrittyCell>, with_saved: bool) -> GridState {
     }
 }
 
-pub(crate) fn snapshot(term: &mut Term<VoidListener>, tracked: &Tracked) -> StateSnapshot {
+pub(crate) fn snapshot(term: &mut Term<ReplyListener>, tracked: &Tracked) -> StateSnapshot {
     let primary = term
         .mode()
         .contains(TermMode::ALT_SCREEN)
@@ -1338,7 +1338,11 @@ a\tb\tc\r\n\
         for script in [TMUX, SHELL, VIM, MODES] {
             let mut core = TerminalCore::with_replay(30, 8);
             core.feed(script);
-            let mut term = Term::new(Config::default(), &TermSize::new(30, 8), VoidListener);
+            let mut term = Term::new(
+                Config::default(),
+                &TermSize::new(30, 8),
+                ReplyListener::default(),
+            );
             Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
                 .advance(&mut term, script);
             assert_eq!(

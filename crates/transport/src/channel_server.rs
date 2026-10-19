@@ -18,7 +18,9 @@
 //! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that instance's
 //! output EOF, which does not prove its process has ended). Each input FIFO
 //! uses nonblocking sends with owned admission permits: queued and writer-held
-//! payloads share an 8 MiB / 16,384-item cap per channel and per session.
+//! network payloads share an 8 MiB / 16,384-item cap per channel and per session.
+//! Generated terminal replies use separate 64 KiB / 64-item channel quotas and
+//! 512 KiB / 512-item session quotas in that same FIFO, without input credit.
 //! Warm attachment, channel closure and stream reuse never refund live chunks.
 //! An input that exceeds either cap stops its receiving channel; other output
 //! and control processing continues. Aggregate exhaustion can refuse another
@@ -820,13 +822,57 @@ impl Drop for PendingExit {
     }
 }
 
+/// Input retains its payload quota until actual write or discard. A local
+/// receipt additionally prevents EOF from overtaking its write outcome.
+enum WriterInput {
+    Network(crate::channel_input::InputChunk),
+    LocalReply {
+        // Settle failure before releasing quota if a queued item is dropped.
+        receipt: crate::channel_reply_delivery::ReplyReceipt,
+        chunk: crate::channel_input::InputChunk,
+    },
+}
+impl std::fmt::Debug for WriterInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Network(_) => "WriterInput::Network",
+            Self::LocalReply { .. } => "WriterInput::LocalReply",
+        })
+    }
+}
+impl WriterInput {
+    fn into_parts(
+        self,
+    ) -> (
+        crate::channel_input::InputChunk,
+        Option<crate::channel_reply_delivery::ReplyReceipt>,
+    ) {
+        match self {
+            Self::Network(chunk) => (chunk, None),
+            Self::LocalReply { receipt, chunk } => (chunk, Some(receipt)),
+        }
+    }
+    #[cfg(test)]
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Network(chunk) | Self::LocalReply { chunk, .. } => chunk.bytes(),
+        }
+    }
+    #[cfg(test)]
+    fn network_bytes(&self) -> usize {
+        match self {
+            Self::Network(chunk) | Self::LocalReply { chunk, .. } => chunk.network_bytes(),
+        }
+    }
+}
+
 /// One open channel, as the runner keeps track of it.
 struct Channel {
     _open_slot: Option<crate::channel_open::InstalledSlot>,
     producer: ProducerState,
     /// Every queued or writer-held chunk owns channel and session quota.
     /// Admission bounds this nonblocking FIFO independently of transport credit.
-    input_tx: mpsc::UnboundedSender<crate::channel_input::InputChunk>,
+    input_tx: mpsc::UnboundedSender<WriterInput>,
     input_budget: crate::channel_input::ChannelInputBudget,
     resize: Box<dyn ResizeHandle>,
     screen: Box<dyn SessionScreen>,
@@ -913,6 +959,7 @@ struct ResizeIntent {
     origin: AttachmentContext,
 }
 struct ProducerState {
+    reply_delivery: crate::channel_reply_delivery::ReplyDelivery,
     origin: AttachmentContext,
     timeline: TimelineBudget,
     deferred: Option<ResizeIntent>,
@@ -927,6 +974,9 @@ struct ProducerState {
     exit_permit: Option<TimelinePermit>,
     // One fixed allowance for bridge gap/bootstrap, independent of requests.
     gap_reserve: Option<TimelinePermit>,
+    // Reply failure is permanent for this instance, including after reattachment.
+    reply_failed: bool,
+    reply_failure_permit: Option<TimelinePermit>,
 }
 impl ProducerState {
     fn new(instance: ChannelInstance, context: &ProducerContext) -> Self {
@@ -942,7 +992,13 @@ impl ProducerState {
                 crate::channel_timeline::BRIDGE_LIFECYCLE_BYTES,
             )
             .expect("fixed lifecycle reserve");
+        let reply_failure_permit = timeline
+            .try_reserve(EntryClass::Lifecycle, 14)
+            .expect("fixed terminal failure reserve");
         Self {
+            reply_delivery: crate::channel_reply_delivery::ReplyDelivery::new(
+                context.ready.clone(),
+            ),
             origin: context.attachment,
             timeline,
             deferred: None,
@@ -956,7 +1012,101 @@ impl ProducerState {
             final_marker,
             exit_permit,
             gap_reserve: Some(gap_permit),
+            reply_failed: false,
+            reply_failure_permit: Some(reply_failure_permit),
         }
+    }
+}
+
+/// Disclose an unrecoverable model/reply failure without poisoning the session.
+/// The runner transfers the exact process to its reaper after this event.
+fn fail_terminal_reply(io: &SessionIo, ch: &mut Channel) {
+    if ch.producer.reply_failed {
+        return;
+    }
+    ch.producer.reply_failed = true;
+    ch.producer.deferred = None;
+    ch.stale = false;
+    ch.input_budget.close();
+    ch.gate.set_metadata_blocked(ch.producer.checkpoint_due);
+    let permit = ch
+        .producer
+        .reply_failure_permit
+        .take()
+        .expect("one terminal failure");
+    io.send_channel_output(
+        ch.request.stream,
+        ChannelInstance::new(ch.instance).unwrap(),
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::OutputGap(
+            crate::channel_geometry::OutputGapCause::TerminalReplyFailure,
+            permit,
+        ),
+        ch.producer.gap_reserve.take(),
+    );
+    log::warn!(
+        "terminal reply failed; stopping channel {}/{}",
+        ch.request.stream,
+        ch.instance
+    );
+}
+
+fn admit_terminal_reply(
+    io: &SessionIo,
+    ch: &mut Channel,
+    reply: Result<Vec<u8>, crate::shell_server::ScreenReplyError>,
+) -> bool {
+    if ch.producer.reply_failed {
+        return false;
+    }
+    if let Ok(bytes) = reply {
+        if bytes.is_empty() {
+            return true;
+        }
+        match ch.input_budget.try_local_reply(bytes) {
+            Ok(None) => return true,
+            Ok(Some(chunk)) => {
+                if let Some(receipt) = ch.producer.reply_delivery.try_reserve() {
+                    if ch
+                        .input_tx
+                        .send(WriterInput::LocalReply { receipt, chunk })
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fail_terminal_reply(io, ch);
+    false
+}
+
+fn emit_screen_repaint(io: &SessionIo, ch: &mut Channel) -> bool {
+    if ch.producer.reply_failed {
+        return false;
+    }
+    match ch.screen.repaint() {
+        Ok(repaint) => {
+            if !admit_terminal_reply(io, ch, Ok(repaint.replies)) {
+                return false;
+            }
+            emit_data(io, ch, &repaint.bytes);
+            true
+        }
+        Err(error) => admit_terminal_reply(io, ch, Err(error)),
+    }
+}
+
+fn absorb_output(io: &SessionIo, ch: &mut Channel, chunk: &[u8]) {
+    if ch.producer.reply_failed {
+        return;
+    }
+    let replies = ch.screen.absorb(chunk);
+    if admit_terminal_reply(io, ch, replies) {
+        forward_output(io, ch.request.stream, ch, chunk);
     }
 }
 fn fail_resize(io: &SessionIo, ch: &mut Channel, code: Option<ProtocolErrorCode>) -> bool {
@@ -1017,6 +1167,9 @@ fn emit_ack(io: &SessionIo, ch: &mut Channel) {
     ch.last_acked = ch.input_consumed;
 }
 fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bool {
+    if ch.producer.reply_failed {
+        return true;
+    }
     if ch.producer.failed {
         return false;
     }
@@ -1065,6 +1218,11 @@ fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bo
         return true;
     };
     // The complete outcome is owned before validation, preparation or ioctl.
+    // Synchronized output queries belong to the geometry before this resize.
+    let replies = ch.screen.flush_pending_output();
+    if !admit_terminal_reply(io, ch, replies) {
+        return true;
+    }
     let previous = (ch.request.cols, ch.request.rows);
     let result = if previous.0 == 0 || previous.1 == 0 {
         Err(ResizeRefusal::NoPty)
@@ -1092,8 +1250,9 @@ fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bo
     } else {
         emit_geometry(io, ch, record, permit);
         if ch.screened && result.is_ok() && previous != (record.cols, record.rows) {
-            let bytes = ch.screen.repaint();
-            emit_data(io, ch, &bytes);
+            if !emit_screen_repaint(io, ch) {
+                return true;
+            }
             emit_ack(io, ch);
             ch.stale = false;
         }
@@ -1148,6 +1307,14 @@ fn checkpoint(io: &SessionIo, ch: &mut Channel) -> bool {
     }
 }
 fn resume_producer(io: &SessionIo, ch: &mut Channel) {
+    if ch.producer.reply_failed {
+        // A failure may race a capacity-blocked attachment bootstrap. Its
+        // committed geometry is still valid, but its model must never replay.
+        if ch.producer.checkpoint_due {
+            checkpoint(io, ch);
+        }
+        return;
+    }
     if ch.producer.failed {
         return;
     }
@@ -1156,8 +1323,9 @@ fn resume_producer(io: &SessionIo, ch: &mut Channel) {
         return;
     }
     if checkpoint_was_due && ch.screened && ch.stale {
-        let bytes = ch.screen.repaint();
-        emit_data(io, ch, &bytes);
+        if !emit_screen_repaint(io, ch) {
+            return;
+        }
         emit_ack(io, ch);
         ch.stale = false;
     }
@@ -1212,7 +1380,7 @@ fn reset_attachment_outputs(
         // client originally asked for) -- see
         // `SessionScreen::has_screen`'s own doc for why the two
         // can disagree.
-        io.set_stream_resyncable(ch.request.stream, ch.screen.has_screen());
+        io.set_stream_resyncable(ch.request.stream, ch.screened && !ch.producer.reply_failed);
     }
     for pending in exits.values_mut() {
         pending.reset(context);
@@ -1451,7 +1619,7 @@ pub async fn run_channel_session_with(
                         Ok(Some(chunk)) => {
                             // Echo offsets cover admitted network input only.
                             ch.input_consumed += n as u64;
-                            if ch.input_tx.send(chunk).is_err() {
+                            if ch.input_tx.send(WriterInput::Network(chunk)).is_err() {
                                 io.consumed(stream_id, n);
                             }
                         }
@@ -1605,8 +1773,7 @@ pub async fn run_channel_session_with(
                     .filter(|ch| ch.instance == instance)
                 {
                     // The model sees every byte the process wrote, sent or not.
-                    ch.screen.absorb(&chunk);
-                    forward_output(&io, stream, ch, &chunk);
+                    absorb_output(&io, ch, &chunk);
                 }
                 // Else: output for a channel that already closed -- nobody
                 // is listening for it any more.
@@ -1617,11 +1784,17 @@ pub async fn run_channel_session_with(
                     .filter(|ch| ch.instance == instance)
                 {
                     ch.producer.eof = true;
-                    begin_channel_ending(ch, &mut reaps, false);
-                    if ch.stale || ch.screened {
+                    if !ch.producer.reply_failed {
+                        let replies = ch.screen.flush_pending_output();
+                        admit_terminal_reply(&io, ch, replies);
+                    }
+                    if !ch.producer.reply_failed && (ch.stale || ch.screened) {
                         // The model cannot repaint once EOF moves to PendingExit.
                         repaint_stale(&io, stream, ch);
                     }
+                    ch.producer.reply_delivery.seal();
+                    let stop = ch.producer.reply_failed;
+                    begin_channel_ending(ch, &mut reaps, stop);
                 }
             }
             Wakeup::ChannelOut(None) => {
@@ -1684,15 +1857,27 @@ pub async fn run_channel_session_with(
             &update,
             &producer,
         );
-        let finished: Vec<_> = channels
-            .iter()
-            .filter_map(|(&stream, ch)| {
-                (ch.producer.eof
-                    && !ch.producer.checkpoint_due
-                    && ch.producer.queued_data.is_empty())
-                .then_some(stream)
-            })
-            .collect();
+        let mut finished = Vec::new();
+        for (&stream, ch) in channels.iter_mut() {
+            // Failure and pending ownership must come from ONE snapshot: a
+            // late writer failure cannot slip behind the final marker. Once
+            // sealed with no receipts, this instance cannot acquire new ones.
+            let replies = ch.producer.reply_delivery.snapshot();
+            if replies.failed {
+                fail_terminal_reply(&io, ch);
+            }
+            if ch.producer.reply_failed {
+                begin_channel_ending(ch, &mut reaps, true);
+            }
+            if ch.producer.eof
+                && replies.sealed
+                && replies.pending == 0
+                && !ch.producer.checkpoint_due
+                && ch.producer.queued_data.is_empty()
+            {
+                finished.push(stream);
+            }
+        }
         for stream in finished {
             let ch = channels.remove(&stream).expect("finished channel");
             let pending = finish_channel(&io, ch, &mut reaps);
@@ -1757,12 +1942,17 @@ pub async fn run_channel_session_with(
 /// would corrupt the conversation.
 fn repaint_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
     for ch in channels.values_mut() {
+        if ch.producer.reply_failed {
+            resume_producer(io, ch);
+            continue;
+        }
         if !checkpoint(io, ch) {
             ch.stale = ch.screened;
             continue;
         }
-        let bytes = ch.screen.repaint();
-        emit_data(io, ch, &bytes);
+        if !emit_screen_repaint(io, ch) {
+            continue;
+        }
         ch.stale = false;
     }
 }
@@ -1807,12 +1997,16 @@ fn send_echo_ack_if_moved(io: &SessionIo, _stream: u8, ch: &mut Channel) {
 /// keystroke's echo, and the next ack would otherwise wait for the next
 /// keystroke, the client's prediction hanging unconfirmed until then.
 fn repaint_stale(io: &SessionIo, _stream: u8, ch: &mut Channel) {
+    if ch.producer.reply_failed {
+        return;
+    }
     if !checkpoint(io, ch) {
         ch.stale = true;
         return;
     }
-    let bytes = ch.screen.repaint();
-    emit_data(io, ch, &bytes);
+    if !emit_screen_repaint(io, ch) {
+        return;
+    }
     emit_ack(io, ch);
     ch.stale = false;
 }
@@ -2303,9 +2497,9 @@ fn open_channel(
 pub(crate) struct PreparedInstallation<'a> {
     entry: std::collections::hash_map::VacantEntry<'a, u8, Channel>,
     producer: ProducerState,
-    input_tx: mpsc::UnboundedSender<crate::channel_input::InputChunk>,
+    input_tx: mpsc::UnboundedSender<WriterInput>,
     input_budget: crate::channel_input::ChannelInputBudget,
-    input_rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
+    input_rx: mpsc::UnboundedReceiver<WriterInput>,
     gate: Arc<SendGate>,
     request: OpenRequest,
     instance: u64,
@@ -2315,7 +2509,7 @@ pub(crate) struct InstalledBridges {
     instance: u64,
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
-    input_rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
+    input_rx: mpsc::UnboundedReceiver<WriterInput>,
 }
 impl<'a> PreparedInstallation<'a> {
     fn new(
@@ -2508,16 +2702,23 @@ fn channel_reader_loop(
 /// window.
 fn channel_writer_loop(
     stream: u8,
-    mut rx: mpsc::UnboundedReceiver<crate::channel_input::InputChunk>,
+    mut rx: mpsc::UnboundedReceiver<WriterInput>,
     mut writer: Box<dyn Write + Send>,
     reporter: ConsumptionReporter,
 ) {
     let mut broken = false;
-    while let Some(chunk) = rx.blocking_recv() {
+    while let Some(input) = rx.blocking_recv() {
+        let (chunk, receipt) = input.into_parts();
         if !broken && writer.write_all(chunk.bytes()).is_err() {
             broken = true;
         }
         let network_bytes = chunk.network_bytes();
+        if let Some(receipt) = receipt {
+            // A required reply discarded after any prior write error is also
+            // failure. Settle before quota release so receipts stay bounded
+            // by admitted payload ownership, even during concurrent refill.
+            receipt.finish(!broken);
+        }
         // Release retained payload/quota before advertising receive capacity.
         drop(chunk);
         if network_bytes != 0 {
@@ -2534,6 +2735,8 @@ fn channel_writer_loop(
 pub(crate) mod tests {
     include!("channel_server_open_tests.rs");
     include!("channel_server_reap_tests.rs");
+    include!("channel_server_reply_tests.rs");
+    include!("channel_server_reply_delivery_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2578,6 +2781,10 @@ pub(crate) mod tests {
             ChannelOutput::Data(bytes) => Some(ShellRecord::Data(bytes)),
             ChannelOutput::EchoAck(offset, _) => Some(ShellRecord::EchoAck(offset)),
             ChannelOutput::Geometry(record, _) => Some(ShellRecord::Geometry(record)),
+            ChannelOutput::OutputGap(cause, _) => Some(ShellRecord::OutputGap {
+                instance: ChannelInstance::new(1).unwrap(),
+                cause,
+            }),
             ChannelOutput::DeliveryMarker(..) => None,
         }
     }
@@ -2742,7 +2949,17 @@ pub(crate) mod tests {
     }
 
     impl SessionScreen for FakeScreen {
-        fn absorb(&mut self, _bytes: &[u8]) {}
+        fn absorb(
+            &mut self,
+            _bytes: &[u8],
+        ) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
+        fn flush_pending_output(
+            &mut self,
+        ) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
         fn prepare_resize(
             &mut self,
             size: TerminalSize,
@@ -2753,9 +2970,15 @@ pub(crate) mod tests {
             let _ = size;
             Ok(Box::new(FakePreparedResize))
         }
-        fn repaint(&mut self) -> Vec<u8> {
+        fn repaint(
+            &mut self,
+        ) -> Result<crate::shell_server::ScreenRepaint, crate::shell_server::ScreenReplyError>
+        {
             self.repaints.lock().unwrap().push(self.stream);
-            b"REPAINT".to_vec()
+            Ok(crate::shell_server::ScreenRepaint {
+                bytes: b"REPAINT".to_vec(),
+                replies: Vec::new(),
+            })
         }
     }
 
@@ -2839,6 +3062,7 @@ pub(crate) mod tests {
         /// model from: when set, every spawned channel gets `NoScreen`, no
         /// matter what `req.screen` asked for.
         force_no_screen: Mutex<bool>,
+        reply_queries: AtomicBool,
         /// The terminal type each spawn was handed, per channel, in spawn
         /// order.
         terms: Arc<Mutex<Vec<(u8, Option<String>)>>>,
@@ -2870,6 +3094,7 @@ pub(crate) mod tests {
                 killed: Arc::new(Mutex::new(Vec::new())),
                 waited: Arc::new(Mutex::new(Vec::new())),
                 force_no_screen: Mutex::new(false),
+                reply_queries: AtomicBool::new(false),
                 terms: Arc::new(Mutex::new(Vec::new())),
                 owners: Arc::new(Mutex::new(Vec::new())),
                 logins: Mutex::new(Vec::new()),
@@ -2967,7 +3192,9 @@ pub(crate) mod tests {
                     stream: req.stream,
                     sizes: self.sizes.clone(),
                 }),
-                screen: if req.screen && !*self.force_no_screen.lock().unwrap() {
+                screen: if req.screen && self.reply_queries.load(Ordering::SeqCst) {
+                    Box::new(terminal_replies::QueryScreen)
+                } else if req.screen && !*self.force_no_screen.lock().unwrap() {
                     Box::new(FakeScreen {
                         stream: req.stream,
                         repaints: self.repaints.clone(),
@@ -3438,11 +3665,11 @@ pub(crate) mod tests {
                 ..
             }
         ));
-        assert_eq!(shared.usage(EntryClass::Lifecycle), (5, 137));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (6, 151));
         drop(first); // cancellation releases exactly checkpoint + gap
-        assert_eq!(shared.usage(EntryClass::Lifecycle), (3, 69));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (4, 83));
         drop(second);
-        assert_eq!(shared.usage(EntryClass::Lifecycle), (2, 42));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (3, 56));
     }
 
     #[tokio::test]
@@ -3466,23 +3693,23 @@ pub(crate) mod tests {
         assert!(
             matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:Some(0),..} if instance.get()==1 && origin.generation==1)
         );
-        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 83));
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (4, 97));
         drop(exit);
-        assert_eq!(timeline.usage(EntryClass::Lifecycle), (2, 73));
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 87));
     }
 
     #[test]
     fn lifecycle_inventory_keeps_gap_and_final_state_reserved() {
         let rig = ResizeRig::new(false, false);
         let budget = &rig.channel.producer.timeline;
-        // Marker 32, Exit 10, gap/bootstrap 41 remain reserved independently of requests.
-        assert_eq!(budget.usage(EntryClass::Lifecycle), (3, 83));
+        // Marker 32, Exit 10, gap/bootstrap 41, terminal failure 14 stay reserved.
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (4, 97));
         let mut checkpoints = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..4 {
             checkpoints.push(budget.try_reserve(EntryClass::Lifecycle, 27).unwrap());
         }
         assert!(budget.try_reserve(EntryClass::Lifecycle, 27).is_none());
-        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 218));
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 205));
         assert_eq!(std::mem::size_of::<DeliveryMarker>(), 8);
         assert!(std::mem::size_of::<DeliveryMarker>() <= DELIVERY_MARKER_BYTES);
         // Entry count bounds retained wrappers separately from wire-byte costs.
@@ -3651,7 +3878,7 @@ pub(crate) mod tests {
     fn lifecycle_saturation_holds_bounded_data_until_capacity_wakes() {
         let mut rig = ResizeRig::new(false, false);
         let mut held = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..4 {
             held.push(
                 rig.channel
                     .producer
@@ -3688,7 +3915,7 @@ pub(crate) mod tests {
     fn assert_repaint_capacity_wake_order(resize_first: bool) {
         let mut rig = ResizeRig::new(false, false);
         let mut held = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..4 {
             held.push(
                 rig.channel
                     .producer
@@ -3759,7 +3986,7 @@ pub(crate) mod tests {
         ));
         assert_eq!(owned.len(), 4);
         assert!(ch.producer.queued_data.is_empty());
-        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 218));
+        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 205));
         // Both DATA charges remain owned after the queue entries are drained.
         ch.gate.update(crate::send_gate::PIPE_HIGH);
         ch.gate.update(crate::send_gate::PIPE_LOW);
@@ -3886,6 +4113,7 @@ pub(crate) mod tests {
                             seen.push("snapshot");
                         }
                         ChannelOutput::EchoAck(..) => seen.push("ack"),
+                        ChannelOutput::OutputGap(..) => panic!("unexpected terminal failure"),
                         ChannelOutput::DeliveryMarker(..) => {
                             seen.push("marker");
                             break seen;
@@ -4006,7 +4234,7 @@ pub(crate) mod tests {
             .try_reserve(EntryClass::Ordinary, 8192)
             .unwrap();
         let mut held = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             held.push(
                 rig.channel
                     .producer
@@ -4056,7 +4284,7 @@ pub(crate) mod tests {
         assert!(channels[&16].producer.queued_data.is_empty());
         assert_eq!(
             channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
-            (8, 218)
+            (8, 205)
         );
         assert_eq!(
             channels[&16].producer.timeline.usage(EntryClass::Ordinary),
@@ -4076,7 +4304,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
-            (6, 150)
+            (6, 137)
         );
         drop(ordinary);
     }
@@ -4104,9 +4332,25 @@ pub(crate) mod tests {
         }
     }
     impl SessionScreen for TransactionScreen {
-        fn absorb(&mut self, _bytes: &[u8]) {}
-        fn repaint(&mut self) -> Vec<u8> {
-            vec![]
+        fn absorb(
+            &mut self,
+            _bytes: &[u8],
+        ) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
+        fn flush_pending_output(
+            &mut self,
+        ) -> Result<Vec<u8>, crate::shell_server::ScreenReplyError> {
+            Ok(Vec::new())
+        }
+        fn repaint(
+            &mut self,
+        ) -> Result<crate::shell_server::ScreenRepaint, crate::shell_server::ScreenReplyError>
+        {
+            Ok(crate::shell_server::ScreenRepaint {
+                bytes: Vec::new(),
+                replies: Vec::new(),
+            })
         }
         fn prepare_resize(
             &mut self,

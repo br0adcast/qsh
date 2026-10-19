@@ -20,7 +20,9 @@ use crate::screen_budget::{ResizeReservation, ScreenBudget, ScreenLease};
 use std::sync::Arc;
 use terminal::{Frame, TerminalCore, TerminalOptions};
 use terminal_size::TerminalSize;
-use transport::shell_server::{PreparedScreenResize, ScreenPreparationError, SessionScreen};
+use transport::shell_server::{
+    PreparedScreenResize, ScreenPreparationError, ScreenRepaint, ScreenReplyError, SessionScreen,
+};
 
 /// A shell session's screen: the emulator that follows the output.
 pub struct PtyScreen {
@@ -75,8 +77,18 @@ impl PreparedScreenResize for ScreenResize<'_> {
 }
 
 impl SessionScreen for PtyScreen {
-    fn absorb(&mut self, bytes: &[u8]) {
-        self.term.feed(bytes);
+    fn absorb(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError> {
+        self.term
+            .feed_with_replies(bytes)
+            .map_err(|error| match error {
+                terminal::TerminalReplyError::Overflow => ScreenReplyError::Overflow,
+            })
+    }
+
+    fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError> {
+        self.term.flush_with_replies().map_err(|error| match error {
+            terminal::TerminalReplyError::Overflow => ScreenReplyError::Overflow,
+        })
     }
 
     fn prepare_resize(
@@ -102,10 +114,18 @@ impl SessionScreen for PtyScreen {
     /// both. On the primary screen the rows are rewritten in place: nothing
     /// scrolls, and the client's scrollback keeps what it had. It starts
     /// with ESC, which ends any sequence the client was left inside.
-    fn repaint(&mut self) -> Vec<u8> {
-        self.term
-            .replay()
-            .expect("the model is made to replay (`PtyScreen::try_new`)")
+    fn repaint(&mut self) -> Result<ScreenRepaint, ScreenReplyError> {
+        let repaint = self
+            .term
+            .replay_with_replies()
+            .map_err(|error| match error {
+                terminal::TerminalReplyError::Overflow => ScreenReplyError::Overflow,
+            })?
+            .expect("the model is made to replay (`PtyScreen::try_new`)");
+        Ok(ScreenRepaint {
+            bytes: repaint.bytes,
+            replies: repaint.replies,
+        })
     }
 }
 
@@ -129,6 +149,64 @@ mod tests {
             .prepare_resize(TerminalSize::new(cols, rows).unwrap())
             .unwrap()
             .commit();
+    }
+
+    #[test]
+    fn replies_follow_committed_size_and_cancelled_resizes_stay_silent() {
+        let budget = Arc::new(ScreenBudget::new(crate::screen_budget::BudgetLimits {
+            global_cells: 100_000,
+            owner_cells: 100_000,
+            ..Default::default()
+        }));
+        let mut screen = PtyScreen::try_new(TerminalSize::new(80, 24).unwrap(), 1, budget).unwrap();
+        assert!(screen
+            .prepare_resize(TerminalSize::new(512, 256).unwrap())
+            .is_err());
+        drop(
+            screen
+                .prepare_resize(TerminalSize::new(60, 20).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(screen.absorb(b"\x1b[18t").unwrap(), b"\x1b[8;24;80t");
+        resize(&mut screen, 60, 20);
+        assert_eq!(
+            screen.absorb(b"\x1b[18t\x1b[7;11H\x1b[6n").unwrap(),
+            b"\x1b[8;20;60t\x1b[7;11R"
+        );
+        screen.repaint().unwrap();
+        screen.snapshot();
+        assert!(screen.absorb(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn repaint_flushes_buffered_fresh_queries_once() {
+        let mut screen = screen(80, 24);
+        assert!(screen.absorb(b"\x1b[?2026h\x1b[5n").unwrap().is_empty());
+        let repaint = screen.repaint().unwrap();
+        assert_eq!(repaint.replies, b"\x1b[0n");
+        let mut passive = TerminalCore::new(80, 24);
+        passive.feed(&repaint.bytes);
+        assert!(passive.feed_with_replies(b"").unwrap().is_empty());
+        assert!(screen.repaint().unwrap().replies.is_empty());
+    }
+
+    #[test]
+    fn explicit_flush_answers_at_old_geometry_before_preparation() {
+        let mut screen = screen(80, 24);
+        assert!(screen.absorb(b"\x1b[?2026h\x1b[18t").unwrap().is_empty());
+        assert_eq!(screen.flush_pending_output().unwrap(), b"\x1b[8;24;80t");
+        resize(&mut screen, 60, 20);
+        assert!(screen.repaint().unwrap().replies.is_empty());
+        assert_eq!(screen.absorb(b"\x1b[18t").unwrap(), b"\x1b[8;20;60t");
+    }
+
+    #[test]
+    fn reply_overflow_is_typed_and_raw_channels_have_no_hidden_responder() {
+        let mut screen = screen(80, 24);
+        let queries = b"\x1b[5n".repeat(terminal::MAX_TERMINAL_REPLY_BYTES / 4 + 1);
+        assert_eq!(screen.absorb(&queries), Err(ScreenReplyError::Overflow));
+        let mut raw = transport::shell_server::NoScreen;
+        assert_eq!(raw.absorb(&queries), Ok(Vec::new()));
     }
 
     /// Cell equality for the round trip: every field. The replay makes a
@@ -191,9 +269,9 @@ mod tests {
     fn round_trip(case: &str, cols: u16, rows: u16, script: &[&[u8]]) {
         let mut screen = screen(cols, rows);
         for chunk in script {
-            screen.absorb(chunk);
+            screen.absorb(chunk).unwrap();
         }
-        let repaint = screen.repaint();
+        let repaint = screen.repaint().unwrap().bytes;
         let mut client = terminal::TerminalCore::new(cols, rows);
         client.feed(&repaint);
         assert_frames_match(&screen.frame(), &client.frame(), case);
@@ -202,11 +280,11 @@ mod tests {
     #[test]
     fn zero_history_does_not_restore_scrolled_content_after_growth() {
         let mut screen = screen(8, 2);
-        screen.absorb(b"LOST\r\nkept\r\nlast");
+        screen.absorb(b"LOST\r\nkept\r\nlast").unwrap();
         resize(&mut screen, 8, 4);
         assert!((0..screen.frame().rows).all(|r| row_text(&screen.frame(), r) != "LOST"));
         let mut client = TerminalCore::new(8, 4);
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
         assert_frames_match(&screen.frame(), &client.frame(), "zero history growth");
     }
 
@@ -217,7 +295,7 @@ mod tests {
         ));
         let mut screen =
             PtyScreen::try_new(TerminalSize::new(2, 1).unwrap(), 1, budget.clone()).unwrap();
-        screen.absorb(b"ok");
+        screen.absorb(b"ok").unwrap();
         let before = budget.used();
         let frame = screen.frame();
         drop(
@@ -304,8 +382,8 @@ mod tests {
     #[test]
     fn a_repaint_overwrites_a_stale_screen() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[2J\x1b[HFRESH");
-        let repaint = screen.repaint();
+        screen.absorb(b"\x1b[2J\x1b[HFRESH").unwrap();
+        let repaint = screen.repaint().unwrap().bytes;
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[2J\x1b[HSTALE CONTENT FROM BEFORE THE GAP\r\nsecond line");
@@ -319,11 +397,11 @@ mod tests {
     #[test]
     fn repainting_twice_is_stable() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"one\r\ntwo\r\nthree");
+        screen.absorb(b"one\r\ntwo\r\nthree").unwrap();
         let mut client = terminal::TerminalCore::new(40, 10);
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
         let after_first = client.frame();
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
         assert_frames_match(&after_first, &client.frame(), "second repaint");
     }
 
@@ -334,11 +412,11 @@ mod tests {
     fn the_model_follows_a_resize() {
         let mut screen = screen(40, 10);
         resize(&mut screen, 100, 30);
-        screen.absorb(b"wide after the resize");
+        screen.absorb(b"wide after the resize").unwrap();
         let frame = screen.frame();
         assert_eq!((frame.cols, frame.rows), (100, 30));
 
-        let repaint = screen.repaint();
+        let repaint = screen.repaint().unwrap().bytes;
         let mut client = terminal::TerminalCore::new(100, 30);
         client.feed(&repaint);
         assert_frames_match(&screen.frame(), &client.frame(), "after resize");
@@ -365,11 +443,11 @@ mod tests {
 
         for (cols, rows) in [(100u16, 30u16), (20, 5), (40, 30), (100, 6), (40, 10)] {
             let mut screen = screen(40, 10);
-            screen.absorb(&script);
+            screen.absorb(&script).unwrap();
             resize(&mut screen, cols, rows);
 
             let mut client = terminal::TerminalCore::new(cols, rows);
-            client.feed(&screen.repaint());
+            client.feed(&screen.repaint().unwrap().bytes);
             assert_frames_match(
                 &screen.frame(),
                 &client.frame(),
@@ -400,12 +478,12 @@ mod tests {
         for line in 1..=24u16 {
             script.extend_from_slice(format!("\x1b[{line};1Hline-{line}").as_bytes());
         }
-        screen.absorb(&script);
+        screen.absorb(&script).unwrap();
 
         // The client came back smaller, and the repaint went out ahead of
         // its resize record.
         let mut small = terminal::TerminalCore::new(60, 20);
-        small.feed(&screen.repaint());
+        small.feed(&screen.repaint().unwrap().bytes);
         let shown = small.frame();
         assert_eq!(
             row_text(&shown, 0),
@@ -423,7 +501,7 @@ mod tests {
         // ...and once the model follows the size, the client is exact again.
         resize(&mut screen, 60, 20);
         let mut small = terminal::TerminalCore::new(60, 20);
-        small.feed(&screen.repaint());
+        small.feed(&screen.repaint().unwrap().bytes);
         assert_frames_match(&screen.frame(), &small.frame(), "repaint after the resize");
     }
 
@@ -502,11 +580,11 @@ mod tests {
     #[test]
     fn a_repaint_pulls_the_client_out_of_the_alternate_screen() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[2J\x1b[Hshell prompt");
+        screen.absorb(b"\x1b[2J\x1b[Hshell prompt").unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[?1049h\x1b[2J\x1b[Hvim was here");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
 
         assert_frames_match(&screen.frame(), &client.frame(), "leaving the alt screen");
     }
@@ -516,11 +594,13 @@ mod tests {
     #[test]
     fn a_repaint_pushes_the_client_into_the_alternate_screen() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[?1049h\x1b[2J\x1b[Hinside the app");
+        screen
+            .absorb(b"\x1b[?1049h\x1b[2J\x1b[Hinside the app")
+            .unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[2J\x1b[Hold shell output");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
 
         assert_frames_match(&screen.frame(), &client.frame(), "entering the alt screen");
     }
@@ -532,16 +612,18 @@ mod tests {
     #[test]
     fn a_repaint_of_the_alternate_screen_onto_the_alternate_screen_is_stable() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[2J\x1b[Hshell\x1b[?1049h\x1b[2J\x1b[Happ");
+        screen
+            .absorb(b"\x1b[2J\x1b[Hshell\x1b[?1049h\x1b[2J\x1b[Happ")
+            .unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[2J\x1b[Hshell\x1b[?1049h\x1b[2J\x1b[Hstale app");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
         assert_frames_match(&screen.frame(), &client.frame(), "alt onto alt");
 
         // And leaving restores a primary screen with the shell on it, on both
         // sides, rather than a blank one on the client.
-        screen.absorb(b"\x1b[?1049l");
+        screen.absorb(b"\x1b[?1049l").unwrap();
         client.feed(b"\x1b[?1049l");
         assert_frames_match(&screen.frame(), &client.frame(), "after leaving");
     }
@@ -560,11 +642,11 @@ mod tests {
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_before_placing_the_cursor() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
+        screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside").unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[5;9rstale content left over in an old region");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
 
         assert_frames_match(&screen.frame(), &client.frame(), "stale scroll region");
     }
@@ -588,11 +670,13 @@ mod tests {
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_on_the_alternate_screen() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
+        screen
+            .absorb(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[3;8r\x1b[?6h\x1b[2;3Hinside")
+            .unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[?1049h\x1b[5;9rstale content left over in an old region");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
 
         assert_frames_match(
             &screen.frame(),
@@ -608,11 +692,11 @@ mod tests {
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_while_leaving_the_alternate_screen() {
         let mut screen = screen(40, 10);
-        screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
+        screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside").unwrap();
 
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(b"\x1b[?1049h\x1b[5;9rstale content left over in an old region");
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
 
         assert_frames_match(
             &screen.frame(),
@@ -643,9 +727,11 @@ mod tests {
     fn a_repaint_after_output_cut_inside_an_escape_sequence_restores_the_screen() {
         let seen: &[u8] = b"\x1b[2J\x1b[Hbefore the gate closed\x1b[3";
         let mut screen = screen(40, 10);
-        screen.absorb(seen);
-        screen.absorb(b"1mdropped while the gate was closed\x1b[0m");
-        let repaint = screen.repaint();
+        screen.absorb(seen).unwrap();
+        screen
+            .absorb(b"1mdropped while the gate was closed\x1b[0m")
+            .unwrap();
+        let repaint = screen.repaint().unwrap().bytes;
         assert_eq!(repaint.first(), Some(&0x1b), "a repaint starts with ESC");
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(seen);
@@ -659,9 +745,9 @@ mod tests {
     fn a_repaint_after_output_cut_inside_a_utf8_character_restores_the_screen() {
         let seen: &[u8] = b"\x1b[2J\x1b[Hprice: \xE2\x82";
         let mut screen = screen(40, 10);
-        screen.absorb(seen);
-        screen.absorb(b"\xAC and more");
-        let repaint = screen.repaint();
+        screen.absorb(seen).unwrap();
+        screen.absorb(b"\xAC and more").unwrap();
+        let repaint = screen.repaint().unwrap().bytes;
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(seen);
         client.feed(&repaint);
@@ -674,12 +760,12 @@ mod tests {
     /// modes (`TerminalCore::snapshot`).
     fn live_after_repaint(case: &str, seen: &[u8], dropped: &[u8], live: &[u8]) {
         let mut screen = screen(40, 10);
-        screen.absorb(seen);
-        screen.absorb(dropped);
+        screen.absorb(seen).unwrap();
+        screen.absorb(dropped).unwrap();
         let mut client = terminal::TerminalCore::with_replay(40, 10);
         client.feed(seen);
-        client.feed(&screen.repaint());
-        screen.absorb(live);
+        client.feed(&screen.repaint().unwrap().bytes);
+        screen.absorb(live).unwrap();
         client.feed(live);
         assert!(
             Some(screen.snapshot()) == client.snapshot(),
@@ -737,14 +823,14 @@ mod tests {
             .flat_map(|i| format!("line {i}\r\n").into_bytes())
             .collect();
         let mut screen = screen(40, 10);
-        screen.absorb(&lines);
-        screen.absorb(b"dropped\r\n");
+        screen.absorb(&lines).unwrap();
+        screen.absorb(b"dropped\r\n").unwrap();
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(&lines);
         client.scroll(i32::MAX);
         let history = client.display_offset();
         client.scroll_to_bottom();
-        client.feed(&screen.repaint());
+        client.feed(&screen.repaint().unwrap().bytes);
         client.scroll(i32::MAX);
         assert_eq!(
             client.display_offset(),

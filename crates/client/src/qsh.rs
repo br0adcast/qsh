@@ -821,6 +821,36 @@ mod geometry_profile_tests {
         }
     }
     #[test]
+    fn reply44_failure_reaches_the_client_in_order_at_every_split() {
+        let bytes = [
+            encode_record(REC_DATA, b"before"),
+            vec![3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7, 2],
+            encode_record(REC_DATA, b"after"),
+        ]
+        .concat();
+        for split in 0..=bytes.len() {
+            let mut sub = QshSubstrate::new(|_, _| {});
+            let mut events = sub.on_stream(16, &bytes[..split]);
+            events.extend(sub.on_stream(16, &bytes[split..]));
+            assert_eq!(
+                events.len(),
+                3,
+                "all records survive split {split}: {events:?}"
+            );
+            assert!(
+                matches!(&events[0], SubstrateEvent::Data { ch: 16, bytes } if bytes == b"before")
+            );
+            assert!(
+                matches!(&events[1], SubstrateEvent::OutputGap { ch: 16, instance, cause } if instance.get() == 7 && *cause as u8 == 2),
+                "typed reason survives split {split}: {events:?}"
+            );
+            assert!(
+                matches!(&events[2], SubstrateEvent::Data { ch: 16, bytes } if bytes == b"after")
+            );
+        }
+    }
+
+    #[test]
     fn geometry_and_gap_keep_order_at_every_split() {
         let instance = ChannelInstance::new(1).unwrap();
         let geometry = GeometryRecord {

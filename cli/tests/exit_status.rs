@@ -21,14 +21,22 @@ use transport::session_manager::{
 
 const NOTICE: &str = "qsh: the remote process ended, but its exit status is unavailable";
 const FINAL_OUTPUT: &[u8] = b"FINAL-STATUS-OUTPUT\r\n";
+const REPLY_NOTICE: &str = "qsh: the server could not deliver terminal replies; the channel was stopped and some output may be missing";
 
-struct MissingStatusWait;
+struct MissingStatusWait {
+    reply_failure: bool,
+}
 impl transport::channel_server::ChannelWait for MissingStatusWait {
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
-        transport::channel_server::ChildStatus::Reaped { code: None }
+        transport::channel_server::ChildStatus::Reaped {
+            code: self.reply_failure.then_some(23),
+        }
     }
     fn kill(&mut self) {
-        panic!("an exactly reaped fixture child must not be signalled");
+        assert!(
+            self.reply_failure,
+            "an exactly reaped fixture child must not be signalled"
+        );
     }
     fn wait(self: Box<Self>) -> i32 {
         panic!("retirement must preserve unavailable status");
@@ -51,6 +59,7 @@ struct MissingStatusSpawner {
     opens: Arc<transport::channel_open::ChannelOpenRegistry>,
     identity: String,
     calls: Arc<AtomicUsize>,
+    reply_failure: bool,
 }
 
 impl ChannelSpawner for MissingStatusSpawner {
@@ -61,7 +70,7 @@ impl ChannelSpawner for MissingStatusSpawner {
         &self,
         owner: &Principal,
         _login: LoginId,
-        _request: &OpenRequest,
+        request: &OpenRequest,
         _term: Option<&str>,
         custody: &transport::channel_open::OpenCustody,
     ) -> Result<transport::channel_open::UninstalledChannel, transport::channel_open::SpawnFailure>
@@ -70,13 +79,36 @@ impl ChannelSpawner for MissingStatusSpawner {
         assert_eq!(owner.name, "exit-status-test");
         assert_eq!(owner.identity, self.identity);
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut output = FINAL_OUTPUT.to_vec();
+        let screen: Box<dyn transport::shell_server::SessionScreen> = if self.reply_failure {
+            // The real authoritative parser accumulates synchronized queries.
+            // Its single flush exceeds the bounded reply collector; the child
+            // fixture supplies queries, never manufactures replies or a gap.
+            output.extend_from_slice(b"\x1b[?2026h");
+            for _ in 0..16_385 {
+                output.extend_from_slice(b"\x1b[5n");
+            }
+            output.extend_from_slice(b"\x1b[?2026l");
+            Box::new(
+                qshd::screen::PtyScreen::try_new(
+                    terminal_size::TerminalSize::new(request.cols, request.rows).unwrap(),
+                    owner.uid,
+                    Arc::new(qshd::screen_budget::ScreenBudget::new(Default::default())),
+                )
+                .unwrap(),
+            )
+        } else {
+            Box::new(transport::shell_server::NoScreen)
+        };
         Ok(custody
             .protect(
-                Box::new(MissingStatusWait),
-                Box::new(transport::shell_server::NoScreen),
+                Box::new(MissingStatusWait {
+                    reply_failure: self.reply_failure,
+                }),
+                screen,
             )
             .finish(
-                Box::new(std::io::Cursor::new(FINAL_OUTPUT)),
+                Box::new(std::io::Cursor::new(output)),
                 Box::new(std::io::sink()),
                 Box::new(Resize),
             ))
@@ -105,6 +137,7 @@ impl Drop for Peer {
 fn start_peer(
     authorized: &Path,
     identity: String,
+    reply_failure: bool,
 ) -> (Peer, SocketAddr, [u8; 32], Arc<AtomicUsize>) {
     let authorized = authorized.to_owned();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -112,6 +145,7 @@ fn start_peer(
         opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
         identity,
         calls: calls.clone(),
+        reply_failure,
     };
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -184,6 +218,15 @@ fn drain_available(reader: &mut std::fs::File, output: &mut Vec<u8>) {
 
 #[test]
 fn unavailable_remote_status_preserves_final_output_and_restores_the_qsh_pty() {
+    assert_channel_exit(false);
+}
+
+#[test]
+fn reply44_terminal_failure_is_visible_after_actual_qsh_pty_restoration() {
+    assert_channel_exit(true);
+}
+
+fn assert_channel_exit(reply_failure: bool) {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let identity = ssh_key::PrivateKey::random(
@@ -206,6 +249,7 @@ fn unavailable_remote_status_preserves_final_output_and_restores_the_qsh_pty() {
     let (_peer, addr, public, calls) = start_peer(
         &authorized,
         sshauth::verify::fingerprint(identity.public_key()),
+        reply_failure,
     );
     let pins = home.path().join("qsh/known_hosts");
     std::fs::create_dir_all(pins.parent().unwrap()).unwrap();
@@ -246,7 +290,10 @@ fn unavailable_remote_status_preserves_final_output_and_restores_the_qsh_pty() {
             .collect::<String>()
     );
     drain_available(&mut client.master, &mut output);
-    assert_eq!(status.unwrap().code(), Some(1));
+    assert_eq!(
+        status.unwrap().code(),
+        Some(if reply_failure { 23 } else { 1 })
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -259,16 +306,17 @@ fn unavailable_remote_status_preserves_final_output_and_restores_the_qsh_pty() {
     );
 
     let text = String::from_utf8(output).expect("UTF-8 PTY output");
+    let notice = if reply_failure { REPLY_NOTICE } else { NOTICE };
     let notice_start = text
-        .find(NOTICE)
-        .expect("specific unavailable-status notice");
+        .find(notice)
+        .expect("specific channel termination notice");
     assert_eq!(
-        text.matches(NOTICE).count(),
+        text.matches(notice).count(),
         1,
         "one terminal status notice"
     );
     let line = text[notice_start..].split(['\r', '\n']).next().unwrap();
-    assert_eq!(line, NOTICE);
+    assert_eq!(line, notice);
     let final_output = text
         .find("FINAL-STATUS-OUTPUT")
         .expect("final process output rendered");

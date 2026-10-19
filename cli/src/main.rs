@@ -1307,9 +1307,9 @@ fn channel_events(
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 sess.on_channel_draining(ch);
             }
-            SessionEvent::OutputContinuityLost { ch, .. } if *shell_channel == Some(ch) => {
+            SessionEvent::OutputContinuityLost { ch, cause, .. } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                actions.extend(sess.on_output_gap(now_ms()));
+                actions.extend(sess.on_output_gap(cause, now_ms()));
             }
             SessionEvent::ProtocolFailure(error) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
@@ -1794,8 +1794,12 @@ mod tests {
     include!("async_open_tests.rs");
 
     fn geometry_session() -> Session {
+        geometry_session_with_cols(20)
+    }
+
+    fn geometry_session_with_cols(cols: u16) -> Session {
         Session::new(
-            20,
+            cols,
             5,
             render::TermCaps::truecolor(),
             args::PredictMode::Never,
@@ -1887,6 +1891,50 @@ mod tests {
         )));
         assert_eq!(sess.size(), before);
         assert_eq!(sess.desired_size(), before);
+    }
+
+    #[test]
+    fn reply44_terminal_failure_notice_precedes_exit_and_survives_restoration() {
+        use transport::channel_geometry::{ChannelInstance, OutputGapCause};
+        let mut sess = geometry_session_with_cols(80);
+        sess.on_channel_ready(16, 0);
+        let gap = |ch| SessionEvent::OutputContinuityLost {
+            ch,
+            instance: ChannelInstance::new(1).unwrap(),
+            cause: OutputGapCause::TerminalReplyFailure,
+        };
+        let ignored = channel_events(
+            vec![gap(99)],
+            &mut Some(16),
+            &mut sess,
+            &mut Vec::new(),
+            &|| 1,
+        );
+        assert!(ignored.is_empty());
+        let actions = channel_events(
+            vec![gap(16), gap(16), SessionEvent::Exit { ch: 16, code: 23 }],
+            &mut Some(16),
+            &mut sess,
+            &mut Vec::new(),
+            &|| 1,
+        );
+        let notice_positions: Vec<_> = actions.iter().enumerate().filter_map(|(index, action)| {
+            matches!(action, Action::Notice(text) if text.contains("could not deliver terminal replies"))
+                .then_some(index)
+        }).collect();
+        assert_eq!(
+            notice_positions.len(),
+            1,
+            "retain one diagnostic for stderr after TTY restoration"
+        );
+        let exit = actions
+            .iter()
+            .position(|a| matches!(a, Action::Exit(23)))
+            .unwrap();
+        assert!(notice_positions[0] < exit);
+        assert!(actions[..exit].iter().any(|a| matches!(a, Action::Write(bytes)
+            if bytes.windows(b"Terminal replies failed".len()).any(|s| s == b"Terminal replies failed"))));
+        assert!(matches!(actions.last(), Some(Action::Exit(23))));
     }
 
     #[test]

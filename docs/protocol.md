@@ -2166,8 +2166,8 @@ repaint or warm reconnect; changing away and back is a new revision. Request-ID
 exhaustion fails explicitly. DATA before a boundary is rendered before geometry
 changes, even when both arrive in one callback batch.
 
-`OUTPUT_GAP` has a nine-byte payload `instance(u64) cause(1)`; cause 1 is
-PreviousConnectionOutputUnconfirmed. It marks an abandoned unacknowledged DATA
+`OUTPUT_GAP` has a nine-byte payload `instance(u64) cause(1)` (14 bytes framed).
+Cause 1, PreviousConnectionOutputUnconfirmed, marks an abandoned unacknowledged DATA
 frontier from the previous connection: those bytes may or may not have reached
 the application. Metadata-only replacement does not create a gap. An
 unacknowledged gap survives another attachment without intervening DATA. Screen
@@ -2175,10 +2175,45 @@ snapshots can replace obsolete output; NoScreen records require
 complete-record credit admission and retain their bytes across attach. These
 bounds do not promise exactly-once replay.
 
+Cause 2, TerminalReplyFailure, means the authoritative terminal could not collect
+or deliver a required reply. The server stops only that channel, preserves its
+already-admitted output, and suppresses subsequent output from that model.
+Collection or admission failure also suppresses the offending output chunk;
+an asynchronous write failure cannot retract output already admitted.
+Earlier bytes retained only in the screen model may be unavailable. The gap follows previously admitted output; actual reader EOF,
+process cleanup, and final delivery are still required before the terminal
+record. No remote exit code is inferred from this failure.
+
+The terminal-failure descriptor retains one 14-byte lifecycle permit until Exit
+or scoped teardown, including after acknowledgement. Each later attachment
+receives the same cause after committed bootstrap geometry and before the final
+delivery marker. This uses the existing lifecycle limit of eight entries and
+256 bytes: four fixed entries reserve 97 bytes, leaving four 27-byte checkpoints
+within that limit. Failed models never supply a replacement screen.
+
+Only the authoritative model interprets fresh PTY output for terminal replies.
+Passive client models and replay do not answer queries. Synchronized pending
+queries are flushed under the old geometry before a resize. A collection is
+bounded to 64 KiB; overflow rejects the whole reply batch. Generated replies
+share the channel's input FIFO with network input, but never increase transport
+input consumption or echo acknowledgement. Local reply quotas are separate:
+64 KiB and 64 batches per channel, 512 KiB and 512 batches per session, including
+queued, writer-held, and retired-instance payloads. Failure to admit a batch,
+write it to the process, or retain its writer custody produces cause 2. Admission
+never waits for capacity on the session loop. Reader EOF seals reply admission
+after flushing fresh buffered output; the final delivery marker waits for all
+previously admitted local replies to complete or fail. Failure and pending
+ownership are observed atomically, so a write failure cannot arrive after the
+final marker. Network-only writes retain their existing retirement semantics;
+other channels continue while a local reply is outstanding.
+Character-based status and size queries follow the terminal parser. Pixel-size,
+clipboard, and color callbacks are not synthesized from unavailable data.
+
 At cutover, bootstrap geometry precedes retained output. Old correlated outcomes
 become uncorrelated Established checkpoints; retained DATA keeps its geometry
-boundaries, followed by the current checkpoint and new output. A gap follows
-initial geometry and precedes the affected DATA. Only Screen DATA may drain in
+boundaries, followed by the current checkpoint and new output. Both gap causes
+follow initial geometry; cause 1 precedes affected retained DATA, while cause 2
+preserves previously admitted output before its failure boundary. Only Screen DATA may drain in
 byte slices. A NoScreen DATA record is at most 8197 bytes (8192 payload plus
 framing); it needs room for the entire record under peer credit, offset headroom
 and the 512 KiB local unacknowledged-output cap. Geometry and gaps also require
