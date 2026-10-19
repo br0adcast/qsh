@@ -401,10 +401,16 @@ mod tests {
     }
 
     fn write_encrypted_key(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .expect("generate");
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .expect("generate");
         let encrypted = key
-            .encrypt(&mut rand_core::OsRng, "hunter2")
+            .encrypt(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                "hunter2",
+            )
             .expect("encrypt");
         let path = dir.join(name);
         std::fs::write(
@@ -419,8 +425,11 @@ mod tests {
     }
 
     fn write_key(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .expect("generate");
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .expect("generate");
         let path = dir.join(name);
         std::fs::write(
             &path,

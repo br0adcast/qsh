@@ -123,12 +123,10 @@ enum AlgorithmDecision {
     /// would produce, so a client learns nothing about which of the two it
     /// hit.
     Refused,
-    /// An algorithm we would accept in principle, but this binary has no
-    /// crypto backend linked in for it (only the p256/p384 curves are built,
-    /// not p521). This is not a failed verification -- we never attempted
-    /// one -- so it gets its own [`AuthError::Backend`] rather than being
-    /// folded into `Refused`.
-    NotCompiledIn(&'static str),
+    /// A curve QSH does not support, even if another workspace consumer
+    /// enables its crypto backend. Preserve the distinct Backend error
+    /// rather than pretending that verification was attempted and failed.
+    UnsupportedCurve(&'static str),
 }
 
 /// Classifies a signature's algorithm. `ssh-rsa` (RSA with SHA-1) is refused:
@@ -146,11 +144,17 @@ fn classify_algorithm(algorithm: &Algorithm) -> AlgorithmDecision {
         } => AlgorithmDecision::Accepted,
         Algorithm::Ecdsa {
             curve: EcdsaCurve::NistP521,
-        } => AlgorithmDecision::NotCompiledIn("nistp521"),
+        } => AlgorithmDecision::UnsupportedCurve("nistp521"),
         Algorithm::Rsa { hash: Some(_) } => AlgorithmDecision::Accepted,
         Algorithm::Rsa { hash: None } => AlgorithmDecision::Refused,
         _ => AlgorithmDecision::Refused,
     }
+}
+
+/// The local agent must obey the same accepted set as the remote verifier,
+/// regardless of which algorithms a dependency feature union enables.
+pub(crate) fn signature_algorithm_allowed(algorithm: &Algorithm) -> bool {
+    matches!(classify_algorithm(algorithm), AlgorithmDecision::Accepted)
 }
 
 /// A key's OpenSSH SHA-256 fingerprint -- what goes in the log and in the
@@ -191,8 +195,8 @@ pub fn algorithm_label(key: &PublicKey) -> &'static str {
 /// Verify that `record`'s signature is a genuine signature, by SOME key,
 /// over `record_challenge(handshake_hash, record)` -- applying the same
 /// algorithm allow-list [`AuthorizedKeysVerifier::verify`] always has
-/// (`ssh-rsa`/SHA-1, DSA and security keys refused; a curve this build has
-/// no crypto backend for reported as [`AuthError::Backend`], not folded into
+/// (`ssh-rsa`/SHA-1, DSA and security keys refused; a curve unsupported by
+/// QSH reported as [`AuthError::Backend`], not folded into
 /// a bare signature failure). On success returns the parsed public key;
 /// this function says nothing about whether that key is LISTED anywhere --
 /// see [`key_is_listed`] for that, a separate question by design (checking
@@ -215,9 +219,9 @@ pub fn verify_record_signature(
     match classify_algorithm(&signature.algorithm()) {
         AlgorithmDecision::Accepted => {}
         AlgorithmDecision::Refused => return Err(AuthError::BadSignature),
-        AlgorithmDecision::NotCompiledIn(curve) => {
+        AlgorithmDecision::UnsupportedCurve(curve) => {
             return Err(AuthError::Backend(format!(
-                "signature uses curve {curve}, which this build has no crypto backend for"
+                "QSH does not support signatures using curve {curve}"
             )));
         }
     }
@@ -275,7 +279,11 @@ mod tests {
     use crate::record::{encode_public_key, encode_signature};
 
     fn key() -> PrivateKey {
-        PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen")
+        PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
     }
 
     fn record_for(key: &PrivateKey, hash: &[u8; 32]) -> transport::auth::AuthRecord {
@@ -507,14 +515,7 @@ mod tests {
         );
     }
 
-    /// `ssh-rsa` (RSA with SHA-1) is the one algorithm the brief specifically
-    /// forbids. Nothing else exercises this arm of `classify_algorithm`, and
-    /// an accepted `ssh-rsa` signature would be a critical defect, so it gets
-    /// its own direct test of the classifier rather than trusting the arm by
-    /// inspection. (`ssh_key::Signature` cannot even represent an
-    /// `Rsa { hash: None }`-labeled signature via its public constructors --
-    /// both `Signature::new` and `Signature::decode` refuse to build one --
-    /// so the classifier is the only place left to pin this against.)
+    /// QSH refuses SHA-1 even when another consumer enables it in ssh-key.
     #[test]
     fn ssh_rsa_sha1_is_not_an_acceptable_signature_algorithm() {
         assert!(matches!(
@@ -541,40 +542,18 @@ mod tests {
     /// produce (which is always SHA-512, never SHA-256).
     #[test]
     fn an_rsa_sha2_256_signature_is_accepted() {
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::RsaPrivateKey;
-        use sha2::Sha256;
-        use ssh_key::public::KeyData;
-        use ssh_key::HashAlg;
+        use ssh_key::{private::RsaKeypair, public::KeyData, HashAlg};
 
-        // Built directly with the `rsa` crate's own key generation, not via
-        // `ssh_key::private::RsaKeypair::random`: ssh-key 0.6.7 has an
-        // upstream bug in `TryFrom<&RsaKeypair> for rsa::RsaPrivateKey` (it
-        // passes `p` twice to `from_components` instead of `p, q`), which
-        // makes it impossible to build a *signing* key from a freshly
-        // generated `RsaKeypair` in this pinned version -- confirmed by
-        // hitting it directly while writing this test. That bug never
-        // reaches production, because verification only ever needs the
-        // public components (n, e), which this conversion never touches;
-        // `ssh_key::public::RsaPublicKey`'s own `TryFrom<&rsa::RsaPublicKey>`
-        // is unaffected and is exactly what production verification uses.
-        let rsa_private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
-        let ssh_public: ssh_key::public::RsaPublicKey = (&rsa_private.to_public_key())
-            .try_into()
-            .expect("public key conversion");
-        let public_key = PublicKey::new(KeyData::Rsa(ssh_public), "");
-        let hash = [9u8; 32];
-
-        let signing_key = SigningKey::<Sha256>::new(rsa_private);
-        let raw_sig: rsa::pkcs1v15::Signature =
-            signature::Signer::try_sign(&signing_key, &auth_challenge(&hash)).expect("sign");
-        let sig = ssh_key::Signature::new(
-            Algorithm::Rsa {
-                hash: Some(HashAlg::Sha256),
-            },
-            signature::SignatureEncoding::to_vec(&raw_sig),
+        let pair = RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
         )
-        .expect("well-formed rsa-sha2-256 signature");
+        .expect("RSA fixture");
+        let public_key = PublicKey::new(KeyData::Rsa(pair.public().clone()), "");
+        let hash = [9u8; 32];
+        let sig =
+            signature::Signer::try_sign(&(&pair, Some(HashAlg::Sha256)), &auth_challenge(&hash))
+                .expect("sign with upstream RSA conversion");
 
         let file = write_authorized_keys_lines(&format!("{}\n", public_key.to_openssh().unwrap()));
         let v = AuthorizedKeysVerifier::new(file.path().to_path_buf(), 1000, "test".to_string());
@@ -592,7 +571,7 @@ mod tests {
     #[test]
     fn an_ecdsa_p256_signature_is_accepted() {
         let k = PrivateKey::random(
-            &mut rand_core::OsRng,
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             Algorithm::Ecdsa {
                 curve: EcdsaCurve::NistP256,
             },
@@ -608,14 +587,8 @@ mod tests {
         assert_eq!(principal.identity, fingerprint(k.public_key()));
     }
 
-    /// P-521 is in the algorithm allow-list in principle, but this build
-    /// links only the p256/p384 crypto backends. A signature naming it must
-    /// fail closed -- but as `AuthError::Backend`, not `BadSignature`: the
-    /// true reason is "this build cannot try", not "the bytes are wrong",
-    /// and the two should not be indistinguishable in the log. The key and
-    /// signature below are structurally valid SSH encodings (right lengths,
-    /// right tags) but not cryptographically meaningful -- classification
-    /// happens before any crypto is attempted, so that is enough.
+    /// Unsupported P-521 remains a Backend error even when feature union
+    /// enables its backend. Classification precedes cryptographic verification.
     #[test]
     fn a_p521_ecdsa_signature_is_refused_as_unsupported_not_as_bad() {
         use ssh_encoding::Encode;
@@ -623,8 +596,8 @@ mod tests {
 
         // SEC1 uncompressed point tag (0x04) followed by two 66-byte (P-521
         // field size) coordinates. `EcdsaPublicKey::from_sec1_bytes` only
-        // checks this shape; it never touches curve arithmetic that would
-        // need the (absent) `p521` crate.
+        // checks this shape; classification below must refuse it before
+        // any curve arithmetic, regardless of enabled dependency features.
         let mut point = vec![0x04u8];
         point.extend(std::iter::repeat_n(0u8, 2 * 66));
         let ecdsa_key = EcdsaPublicKey::from_sec1_bytes(&point).expect("sec1 point shape");
@@ -632,11 +605,10 @@ mod tests {
 
         // Two SSH mpints encoding the value 1 (r = s = 1): shaped like a
         // real ECDSA signature blob, satisfying `Signature::new`'s size
-        // check, without needing a real signing operation for a curve we
-        // cannot run. (An mpint encoding zero is rejected by
+        // check, without needing a signing operation for an unsupported curve. (An mpint encoding zero is rejected by
         // `as_positive_bytes` as "not positive", so 1 is the simplest value
         // that passes the shape check.)
-        let one = ssh_key::Mpint::from_positive_bytes(&[1]).expect("mpint");
+        let one = ssh_key::Mpint::from_positive_bytes(&[1]);
         let mut sig_data = Vec::new();
         one.encode(&mut sig_data).expect("encode r");
         one.encode(&mut sig_data).expect("encode s");
@@ -723,7 +695,11 @@ mod tests {
     #[test]
     fn a_v2_record_verifies_and_yields_the_daemons_own_account() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let path = write_authorized_keys(dir.path(), &key);
         let verifier = AuthorizedKeysVerifier::new(path, 1000, "alice".to_string());
 
@@ -751,7 +727,11 @@ mod tests {
     #[test]
     fn a_v2_record_signed_over_the_v1_challenge_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let path = write_authorized_keys(dir.path(), &key);
         let verifier = AuthorizedKeysVerifier::new(path, 1000, "alice".to_string());
 
@@ -777,7 +757,11 @@ mod tests {
     #[test]
     fn a_v1_record_still_verifies() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let path = write_authorized_keys(dir.path(), &key);
         let verifier = AuthorizedKeysVerifier::new(path, 1000, "alice".to_string());
 

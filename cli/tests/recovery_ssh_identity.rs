@@ -7,8 +7,11 @@ use std::{
 };
 fn attempt(home: &Path, server: &fake::Server, grants: &[Vec<u8>]) {
     let identity = home.join("identity");
-    let key =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     std::fs::write(
         &identity,
         key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),

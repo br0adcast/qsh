@@ -51,8 +51,11 @@ fn the_system_mode_serves_a_shell_over_the_seam() {
         WHAT_THIS_TEST_DOES,
         || {
             let dir = tempfile::tempdir().expect("tempdir");
-            let key =
-                PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+            let key = PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                Algorithm::Ed25519,
+            )
+            .expect("keygen");
 
             // The listed key, at the location `start_daemon` points `$HOME`
             // to.

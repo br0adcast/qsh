@@ -261,8 +261,11 @@ pub fn drain_into(mut reader: impl Read + Send + 'static, sink: std::sync::Arc<M
 /// A daemon with one authorized key, and the key's path.
 pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
     let home = tempfile::tempdir().expect("tempdir");
-    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate");
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate");
     let key_path = home.path().join("id_ed25519");
     std::fs::write(
         &key_path,

@@ -91,8 +91,10 @@ mod tests {
 
     /// Wire bytes of a fresh ecdsa-sha2-nistp256 public key.
     fn ecdsa_wire() -> Vec<u8> {
-        let key = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
-        let point = key.verifying_key().to_encoded_point(false);
+        let key = <p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate_from_rng(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        );
+        let point = key.verifying_key().to_sec1_point(false);
         let mut out = Vec::new();
         for part in [&b"ecdsa-sha2-nistp256"[..], b"nistp256", point.as_bytes()] {
             out.extend_from_slice(&(part.len() as u32).to_be_bytes());

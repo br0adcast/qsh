@@ -71,8 +71,11 @@ impl Screen {
 
 /// A fresh ed25519 key for `qsh -i`, in `dir`: its path and its public line.
 fn client_key(dir: &Path) -> (PathBuf, String) {
-    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate");
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate");
     let path = dir.join("id_test");
     std::fs::write(
         &path,

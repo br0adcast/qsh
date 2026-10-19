@@ -195,8 +195,11 @@ fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
 
 fn start_daemon_with_ready_timeout(qshd: &Path, timeout: Duration) -> (Daemon, PathBuf) {
     let home = tempfile::tempdir().expect("tempdir");
-    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate");
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate");
     let key_path = home.path().join("id_ed25519");
     std::fs::write(
         &key_path,

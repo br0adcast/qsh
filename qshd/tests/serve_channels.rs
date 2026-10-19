@@ -91,7 +91,11 @@ impl Drop for Daemon {
 /// Generates an ed25519 key pair, writes the private half to `dir/name` in
 /// OpenSSH format, and returns the key (for its public half) and the path.
 fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathBuf) {
-    let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+    let key = PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        Algorithm::Ed25519,
+    )
+    .expect("keygen");
     let path = dir.join(name);
     std::fs::write(
         &path,

@@ -49,14 +49,14 @@ tempfile = "3"
 # `crates/sshauth`'s own pin, for the same reason: parsing/encoding key
 # material is security-relevant, and a version bump could silently change
 # what is accepted.
-ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "ed25519", "encryption"] }
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "std", "alloc", "ed25519", "encryption"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # `tests/ladder.rs` includes bringup's sandbox (a private sshd, its home, the
 # shared daemon guard) by path; these are what it needs, as in
 # `crates/bringup`. `libc` and `base64` it takes from the normal dependencies.
 russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 qshd = { path = "../qshd" }
 
 # Two packages come out of this one crate, in the shape `openssh-client` and

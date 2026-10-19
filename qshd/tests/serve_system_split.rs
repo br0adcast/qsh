@@ -936,8 +936,11 @@ fn a_monitor_holds_no_seam_and_the_worker_still_sees_the_end() {
         // at all.
         common::install_service_file(include_str!("../../packaging/pam.d/qshd.debian"));
         let dir = tempfile::tempdir().expect("tempdir");
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .expect("keygen");
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .expect("keygen");
         common::write_authorized_keys(dir.path(), &key);
         let (mut daemon, server_pub, port) = common::start_daemon(dir.path());
         let helper_pid = daemon.child.id();

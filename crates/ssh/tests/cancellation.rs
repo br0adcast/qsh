@@ -263,8 +263,11 @@ fn cancellation_during_private_key_offer_prevents_automatic_signature_dispatch()
             publickey_offer_gate: Some(gate.clone()),
             ..Default::default()
         });
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .unwrap();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
         let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string();
         let parameters = params(&server);
         let cancel = knock::Cancel::new();

@@ -8,8 +8,11 @@ use support::{free_udp_port, serialised, spawn_qsh};
 fn a_closed_port_with_a_pinned_key_reaches_ssh_promptly() {
     let _serial = serialised();
     let home = tempfile::tempdir().unwrap();
-    let identity =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let identity = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let key = home.path().join("identity");
     std::fs::write(
         &key,

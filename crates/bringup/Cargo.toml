@@ -19,12 +19,12 @@ log = "0.4"
 
 [dev-dependencies]
 sshauth = { path = "../sshauth" }
-ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "p256"] }
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "std", "alloc", "p256"] }
 # The private sshd and its helpers are shared with crates/ssh's tests
 # (included by path); these are what they need.
 russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tempfile = "3"
 qshd = { path = "../../qshd" }

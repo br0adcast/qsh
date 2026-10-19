@@ -2314,7 +2314,11 @@ pub(crate) mod tests {
     }
 
     fn verified_worker() -> Worker {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let TestHelper {
             channels,
             auth,
@@ -2830,7 +2834,11 @@ pub(crate) mod tests {
     /// takes the helper's answer, both ways.
     #[test]
     fn the_verifier_forwards_to_the_helper_and_returns_its_verdict() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         // The same throwaway-helper harness the verification tests use, so
         // the two sides are exercised against each other rather than
         // against a stub.
@@ -2869,7 +2877,11 @@ pub(crate) mod tests {
     /// refused there": the stub's end must hold nothing afterwards.
     #[test]
     fn a_version_1_record_is_refused_without_asking_the_helper() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         let verifier = HelperAuth::with_timeout(worker, SHORT_ANSWER_TIMEOUT)
             .expect("the authentication client");
@@ -2910,7 +2922,11 @@ pub(crate) mod tests {
     /// than dropped, so the seam stays open until the assertions are done.
     #[test]
     fn a_late_answer_is_never_taken_for_the_next_one() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub_end) = super::channel::pair().expect("socketpair");
         stub_end
             .set_read_timeout(Some(TEST_RECV_TIMEOUT))
@@ -2970,7 +2986,11 @@ pub(crate) mod tests {
     /// must fail, not admit.
     #[test]
     fn an_answer_ahead_of_its_request_fails_the_call() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub_end) = super::channel::pair().expect("socketpair");
         stub_end
             .set_read_timeout(Some(TEST_RECV_TIMEOUT))
@@ -3260,7 +3280,11 @@ pub(crate) mod tests {
         const BUDGET: Duration = Duration::from_millis(200);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         // Both looks at the stub's end are non-blocking: `bounded` returns
         // only once each call has finished, so whatever that call sent is
@@ -3449,7 +3473,11 @@ pub(crate) mod tests {
     /// once the login has ended it must not.
     #[test]
     fn a_login_that_ends_is_reported_to_the_helper() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let TestHelper {
             channels,
             auth,
@@ -4019,7 +4047,11 @@ pub(crate) mod tests {
         const BUDGET: Duration = Duration::from_secs(5);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -4089,7 +4121,11 @@ pub(crate) mod tests {
         const PROOFS: u8 = 4;
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting_a_slow_database(&key, running_as_root());
         let me = h.me.clone();
         let auth = Arc::new(
@@ -4153,7 +4189,11 @@ pub(crate) mod tests {
         const BUDGET: Duration = Duration::from_secs(5);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -4301,7 +4341,11 @@ pub(crate) mod tests {
         const BUDGET: Duration = Duration::from_secs(5);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -4444,7 +4488,11 @@ pub(crate) mod tests {
             "setup: the verdict must come inside the helper's own deadline"
         );
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub_end) = super::channel::pair().expect("socketpair");
         stub_end
             .set_read_timeout(Some(TEST_RECV_TIMEOUT))
@@ -4532,7 +4580,11 @@ pub(crate) mod tests {
         const HASH: [u8; 32] = [7u8; 32];
 
         let config = daemon_config();
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -5370,7 +5422,11 @@ pub(crate) mod tests {
         const WOKEN_WITHIN: Duration = Duration::from_secs(1);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -5657,7 +5713,11 @@ pub(crate) mod tests {
         const HOLD: Duration = Duration::from_secs(3);
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         stub.set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
@@ -5865,7 +5925,11 @@ pub(crate) mod tests {
     fn a_request_too_large_to_send_leaves_no_entry_behind() {
         const HASH: [u8; 32] = [7u8; 32];
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let (worker, stub) = super::channel::pair().expect("socketpair");
         let auth = HelperAuth::with_timeout(worker, SHORT_ANSWER_TIMEOUT)
             .expect("the authentication client");

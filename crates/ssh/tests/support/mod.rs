@@ -312,11 +312,15 @@ pub struct SoftSigner(pub p256::ecdsa::SigningKey);
 
 impl SoftSigner {
     pub fn random() -> Self {
-        SoftSigner(p256::ecdsa::SigningKey::random(&mut rand_core::OsRng))
+        SoftSigner(
+            <p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate_from_rng(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ),
+        )
     }
 
     pub fn public_wire(&self) -> Vec<u8> {
-        let point = self.0.verifying_key().to_encoded_point(false);
+        let point = self.0.verifying_key().to_sec1_point(false);
         let mut out = Vec::new();
         for part in [&b"ecdsa-sha2-nistp256"[..], b"nistp256", point.as_bytes()] {
             out.extend_from_slice(&(part.len() as u32).to_be_bytes());
