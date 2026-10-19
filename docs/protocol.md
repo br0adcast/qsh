@@ -914,7 +914,9 @@ callback. A callback already emitted cannot be retracted.
 
 The CLI starts consented application work only after this explicit acceptance.
 Neither Live, unrelated DATA nor an elapsed timeout establishes success. The
-5.5-second acceptance timeout bounds failure only. Refused proofs remain silent:
+5.5-second acceptance timeout starts at the first completed handshake and bounds
+failure only; later path recovery does not renew it. Time spent waiting for msg2
+belongs to the separate handshake budget. Refused proofs remain silent:
 the manager removes their provisional routes without an acceptance or a
 key-specific refusal record. Load cookies (§2.7) also prove no admission.
 

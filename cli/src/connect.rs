@@ -116,6 +116,8 @@ impl Binder for NoopBinder {
 pub struct Events {
     pub tx: Sender<crate::session::UiEvent>,
     pub reached_live: AtomicBool,
+    /// First completed handshake; later path recovery must not renew this budget.
+    first_live_at: std::sync::OnceLock<std::time::Instant>,
     pub closed: AtomicBool,
     acceptance: Mutex<Option<transport::AuthAcceptance>>,
     /// Whether the connection runs with stream credits (spec §4.13).
@@ -133,6 +135,7 @@ impl Events {
         Events {
             tx,
             reached_live: AtomicBool::new(false),
+            first_live_at: std::sync::OnceLock::new(),
             closed: AtomicBool::new(false),
             acceptance: Mutex::new(None),
             credits: AtomicBool::new(false),
@@ -204,6 +207,7 @@ impl ClientEvents for Events {
     fn on_state(&self, state: LinkState) {
         match state {
             LinkState::Live => {
+                self.first_live_at.get_or_init(std::time::Instant::now);
                 self.reached_live.store(true, Ordering::SeqCst);
             }
             LinkState::PathDown => {}
@@ -461,11 +465,23 @@ impl Attempt {
                 return Verdict::Unreachable(Some(error));
             }
         }
+        // A late handshake has not yet had time to produce its proof or receive
+        // acceptance. Count that phase from its first Live, not from msg1; path
+        // recovery cannot extend it because first_live_at is written only once.
+        let phase_started = if reached_live {
+            self.events
+                .first_live_at
+                .get()
+                .copied()
+                .unwrap_or(self.started)
+        } else {
+            self.started
+        };
         attempt_verdict(
-            self.events.reached_live.load(Ordering::SeqCst),
+            reached_live,
             self.acceptance(),
             self.events.closed.load(Ordering::SeqCst),
-            self.started.elapsed().as_millis() as i64,
+            phase_started.elapsed().as_millis() as i64,
             self.client.last_send_error(),
         )
     }
@@ -945,6 +961,7 @@ mod tests {
     fn auth17_live_without_acceptance_never_invokes_channel_open_callback() {
         let mut attempt = unstarted_attempt();
         attempt.started = std::time::Instant::now() - StdDuration::from_secs(6);
+        attempt.events.first_live_at.set(attempt.started).unwrap();
         attempt.events.on_state(LinkState::Live);
         let mut opened = 0;
         let verdict = attempt.settle_until(|| opened += 1, || false);
@@ -997,5 +1014,36 @@ mod tests {
         stale.events.release();
         stale.events.on_auth_accepted(test_acceptance());
         assert_eq!(stale.acceptance(), None);
+    }
+    #[test]
+    fn auth17_late_handshake_gets_its_own_acceptance_budget() {
+        let mut attempt = unstarted_attempt();
+        attempt.started = std::time::Instant::now() - StdDuration::from_secs(9);
+        assert_eq!(
+            attempt.verdict(),
+            Verdict::StillTrying,
+            "handshake still has its own ten-second budget"
+        );
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(
+            attempt.verdict(),
+            Verdict::StillTrying,
+            "time spent waiting for msg2 cannot spend the proof/acceptance budget"
+        );
+        attempt.events.on_auth_accepted(test_acceptance());
+        assert_eq!(attempt.verdict(), Verdict::Working);
+    }
+
+    #[test]
+    fn auth17_path_recovery_cannot_renew_the_acceptance_deadline() {
+        let attempt = unstarted_attempt();
+        let first_live = std::time::Instant::now() - StdDuration::from_secs(6);
+        attempt.events.first_live_at.set(first_live).unwrap();
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(attempt.verdict(), Verdict::AuthRefused);
+        attempt.events.on_state(LinkState::PathDown);
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(attempt.events.first_live_at.get(), Some(&first_live));
+        assert_eq!(attempt.verdict(), Verdict::AuthRefused);
     }
 }
