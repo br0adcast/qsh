@@ -82,3 +82,73 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
         "reliable control debt retained {peak} bytes beyond existing cap {SEND_HARD_CAP}"
     );
 }
+
+#[test]
+fn capacity_owned_callback_survives_retired_receiver_and_registration_during_drain() {
+    use std::future::poll_fn;
+    use std::task::Poll;
+    use tokio::sync::oneshot;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pending_parent, pending_worker) = runtime.block_on(async {
+        let (io, inbound, outbound) = SessionIo::test_pair();
+        let lifecycle = io.lifecycle.clone();
+        let (parent_release, parent_held) = oneshot::channel::<()>();
+        // Dropping this sender releases the real blocking callback on all exits.
+        let (worker_release, worker_held) = std::sync::mpsc::sync_channel::<()>(0);
+        let (entered_tx, entered_rx) = oneshot::channel::<()>();
+        let (result_tx, result_rx) = oneshot::channel::<()>();
+        let (joined_tx, joined_rx) = oneshot::channel::<()>();
+        drop(result_rx);
+        drop(inbound);
+        drop(outbound);
+        lifecycle.spawn(async move {
+            let _ = parent_held.await;
+            io.spawn_owned(async move {
+                let work = tokio::task::spawn_blocking(move || {
+                    let _ = entered_tx.send(());
+                    let _ = worker_held.recv();
+                });
+                // A stale result receiver must not cancel or detach this join.
+                work.await.unwrap();
+                let _ = result_tx.send(());
+                let _ = joined_tx.send(());
+            });
+        });
+        let mut drain = Box::pin(lifecycle.drain());
+        let pending_parent = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await;
+        lifecycle.shutdown.request();
+        drop(parent_release);
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("real callback entered")
+            .unwrap();
+        // The registered parent has now returned; only the supervisor can retain custody.
+        let pending_worker = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await;
+        drop(worker_release);
+        // Join even on the old implementation before checking the RED outcome.
+        tokio::time::timeout(Duration::from_secs(5), joined_rx)
+            .await
+            .expect("released callback was actually joined")
+            .unwrap();
+        if pending_worker {
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("owned callback drain completes after actual join")
+                .unwrap();
+        }
+        (pending_parent, pending_worker)
+    });
+    drop(runtime);
+    assert!(
+        pending_parent,
+        "drain cannot pass an already registered publisher"
+    );
+    assert!(
+        pending_worker,
+        "retired result receiver detached a still-running callback from drain"
+    );
+}

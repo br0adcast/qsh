@@ -587,6 +587,15 @@ pub struct SessionIo {
 }
 
 impl SessionIo {
+    /// Register descendant cleanup synchronously from this owned backend.
+    /// The backend's registered parent stays alive through this registration,
+    /// so drain cannot observe an empty owner between admission and publication.
+    /// Already admitted work remains owned even after a shutdown request; the
+    /// supervisor must await its actual worker, regardless of stale receivers.
+    pub(crate) fn spawn_owned(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.lifecycle.spawn(future);
+    }
+
     pub(crate) fn publish_resume_snapshot(
         &self,
         origin: AttachmentContext,
