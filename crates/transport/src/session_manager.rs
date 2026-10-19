@@ -82,7 +82,11 @@
 pub(crate) mod binding_revision;
 #[path = "channel_bridge.rs"]
 mod channel_bridge;
+#[path = "session_lifecycle.rs"]
+mod lifecycle;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
+use lifecycle::Lifecycle;
+pub use lifecycle::{Shutdown, ShutdownError};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -564,6 +568,7 @@ pub type LoginId = [u8; 16];
 /// outbound [`SessionOutbound`]. The backend never sees the socket or the
 /// `Connection`.
 pub struct SessionIo {
+    lifecycle: Arc<Lifecycle>,
     resume_snapshots: channel_bridge::SnapshotMailbox,
     inbound: mpsc::Receiver<SessionInbound>,
     outbound: mpsc::UnboundedSender<SessionOutbound>,
@@ -610,7 +615,16 @@ impl SessionIo {
     /// (the connection closed or the manager shut down) -- the backend should
     /// then wind down.
     pub async fn recv(&mut self) -> Option<SessionInbound> {
-        self.inbound.recv().await
+        tokio::select! {
+            biased;
+            _ = self.lifecycle.shutdown.requested() => {
+                self.gates.close_all();
+                self.inbound.close();
+                while self.inbound.try_recv().is_ok() {}
+                None
+            }
+            inbound = self.inbound.recv() => inbound,
+        }
     }
 
     /// Whose session this is. A backend that spawns a process runs it as
@@ -840,6 +854,7 @@ impl SessionIo {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         (
             SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -2052,8 +2067,35 @@ impl SessionManager {
         auth: ServerAuth,
         factory: BackendFactory,
         active_count: Arc<AtomicUsize>,
-        mut login_ends: LoginEndedReports,
+        login_ends: LoginEndedReports,
     ) {
+        // Legacy callers cancel this never-ending future. Cancellation is not
+        // a joined cleanup receipt; daemon STOP uses the explicit API below.
+        let _ = Self::serve_until_shutdown(
+            socket,
+            server_priv,
+            auth,
+            factory,
+            active_count,
+            login_ends,
+            Shutdown::default(),
+        )
+        .await;
+    }
+
+    /// Stop accepting input on a sticky request and retain every registered
+    /// task until it completes. Backend completion must itself own any process
+    /// or blocking-I/O obligations; this API cannot invent those receipts.
+    pub async fn serve_until_shutdown(
+        socket: Arc<UdpSocket>,
+        server_priv: [u8; 32],
+        auth: ServerAuth,
+        factory: BackendFactory,
+        active_count: Arc<AtomicUsize>,
+        mut login_ends: LoginEndedReports,
+        shutdown: Shutdown,
+    ) -> Result<(), ShutdownError> {
+        let lifecycle = Lifecycle::new(shutdown.clone());
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut router = Router::new();
         // Per-session tasks signal their end here; the router holds `done_tx`
@@ -2068,6 +2110,7 @@ impl SessionManager {
         // ticks.
         let mut gc = gc_timer();
         let ctx = ManagerCtx {
+            lifecycle: lifecycle.clone(),
             socket: &socket,
             server_priv: &server_priv,
             auth: &auth,
@@ -2078,7 +2121,14 @@ impl SessionManager {
         };
 
         loop {
+            // One ready datagram cannot postpone a sticky stop to another
+            // turn. Keep ordinary arms fair under sustained input.
+            if shutdown.is_requested() {
+                break;
+            }
             tokio::select! {
+                _ = shutdown.requested() => break,
+                _ = lifecycle.next(), if !lifecycle.is_empty() => {}
                 recv = socket.recv_from(&mut buf) => {
                     let (len, src) = match recv {
                         Ok(v) => v,
@@ -2116,6 +2166,31 @@ impl SessionManager {
                 }
             }
         }
+
+        // No new manager admission can publish from this point. Every task
+        // capable of registering a descendant already owns a registered slot.
+        // Route removal wakes probation; shutdown reaches parked bridges and
+        // backends independently of transport input or a full bounded queue.
+        let mut logins: std::collections::HashSet<_> = router.backends.keys().copied().collect();
+        logins.extend(router.probation.values().map(|seat| seat.login));
+        router.sessions.clear();
+        router.backends.clear();
+        let result = lifecycle.drain().await;
+        // Verification that was already dispatched retains real completion
+        // custody. Its result cannot create a new backend after shutdown.
+        while let Ok(ended) = probation_rx.try_recv() {
+            if ended
+                .proven
+                .as_ref()
+                .is_none_or(|proven| matches!(proven.msg1.method, AuthMethod::Allowlist))
+            {
+                auth.nonces.release(ended.nonce);
+            }
+        }
+        for login in logins {
+            auth.logins.login_ended(login);
+        }
+        result
     }
 
     /// Handle one received datagram against the router table. Split out of the
@@ -2449,7 +2524,7 @@ impl SessionManager {
         // A probation's route is small until its connection is proven
         // (spec §4.16); `cold_create` raises it.
         let (dg_tx, dg_rx) = probation_dgram_queue();
-        tokio::spawn(run_probation(Probation {
+        ctx.lifecycle.spawn(run_probation(Probation {
             socket: ctx.socket.clone(),
             conn,
             policy,
@@ -2969,6 +3044,7 @@ impl SessionManager {
         // The send gates live as long as the io: across every warm reattach.
         let gates = Arc::new(GateTable::new());
         let io = SessionIo {
+            lifecycle: ctx.lifecycle.clone(),
             resume_snapshots: channel_bridge::SnapshotMailbox::default(),
             inbound: in_rx,
             outbound: out_tx,
@@ -3044,6 +3120,7 @@ impl SessionManager {
 /// about the particular connection being bound. Borrowed for the life of
 /// `serve`, so the per-datagram path passes ONE reference instead of seven.
 struct ManagerCtx<'a> {
+    lifecycle: Arc<Lifecycle>,
     socket: &'a Arc<UdpSocket>,
     server_priv: &'a [u8; 32],
     auth: &'a ServerAuth,
@@ -3403,16 +3480,17 @@ thread_local! {
 }
 
 fn spawn_committed_bridge(spawn: BridgeSpawn) {
+    let lifecycle = spawn.io.lifecycle.clone();
     #[cfg(test)]
     if POLL_COLD_BRIDGE_INLINE.with(|flag| flag.get()) {
         let mut future = Box::pin(run_backend_bridge(spawn));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         if future.as_mut().poll(&mut context).is_pending() {
-            tokio::spawn(future);
+            lifecycle.spawn(future);
         }
         return;
     }
-    tokio::spawn(run_backend_bridge(spawn));
+    lifecycle.spawn(run_backend_bridge(spawn));
 }
 
 /// The PERSISTENT per-backend bridge task: it owns ONE backend's io channels
@@ -3516,7 +3594,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // The backend runs for the bridge's whole life. `io` is MOVED into it and
     // is not `Clone`, so there is no second spawn to guard against.
     let resume_snapshots = io.resume_snapshots.clone();
-    tokio::spawn(async move { backend.run(io).await });
+    let lifecycle = io.lifecycle.clone();
+    lifecycle.spawn(async move { backend.run(io).await });
     let mut link = BackendLink::new(io_inbound_tx, consumption);
     link.channel_output.snapshots = resume_snapshots;
 
@@ -3602,6 +3681,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // (below), whichever arm won.
         let wakeup = tokio::select! {
             biased;
+            _ = lifecycle.shutdown.requested() => break,
             c = control_rx.recv(), if control_open => Wakeup::Control(c),
             w = async {
                 tokio::select! {
@@ -3779,7 +3859,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 });
                 // Whatever waited goes to the backend first; a backend whose
                 // io is gone with it takes nothing, and this ends at once.
-                link.finish();
+                link.finish(lifecycle.clone());
                 return;
             }
             // Warm reattach (see `apply_control`); also revives a parked bridge.
@@ -3841,7 +3921,11 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // Past the per-session cap the bridge waits for its backend, as
         // before credits (spec §4.10.5, §4.10.7); below it this returns at
         // once.
-        link.wait_below_pending_cap(&mut conn, &mut out).await;
+        tokio::select! {
+            biased;
+            _ = lifecycle.shutdown.requested() => break,
+            _ = link.wait_below_pending_cap(&mut conn, &mut out) => {}
+        }
         if !out.is_empty() {
             send_all(&socket, &out).await;
             out.clear();
@@ -3876,7 +3960,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     token,
                     graceful: true,
                 });
-                link.finish();
+                link.finish(lifecycle.clone());
                 return;
             }
             CloseKind::Death => {
@@ -3954,6 +4038,9 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     }
 
     // Exited via a manager teardown (`Dgram(None)` / parked `Control(None)`).
+    if lifecycle.shutdown.is_requested() {
+        gates.close_all();
+    }
     // Withdraw this bridge's contribution to the active count -- `deactivate`
     // is a no-op here if a prior exit point (graceful close, or parking on
     // death) already cleared it.
@@ -4721,14 +4808,19 @@ impl BackendLink {
     /// to a closed connection, which sends nothing, and nothing reads the
     /// ledger after the bridge (a graceful end is never reattached), so there
     /// is no bookkeeping left to do.
-    fn finish(self) {
+    fn finish(self, lifecycle: Arc<Lifecycle>) {
         let BackendLink { mut inbound, .. } = self;
         if !inbound.has_pending() {
             return;
         }
-        tokio::spawn(async move {
+        let owner = lifecycle.clone();
+        owner.spawn(async move {
             while inbound.has_pending() {
-                let _ = inbound.room().await;
+                tokio::select! {
+                    biased;
+                    _ = lifecycle.shutdown.requested() => break,
+                    _ = inbound.room() => {}
+                }
             }
         });
     }
@@ -4744,6 +4836,9 @@ pub(crate) async fn send_all(socket: &UdpSocket, dgrams: &[Datagram]) {
 
 #[cfg(test)]
 mod tests {
+    mod shutdown_tests {
+        include!("session_shutdown_tests.rs");
+    }
     use super::*;
     use crate::auth::{encode_auth_record, AuthError, AuthRecord, Principal};
     use crate::channel::{encode_client, ChannelKind, ClientRecord, OpenRequest, CONTROL_STREAM};
@@ -6870,6 +6965,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -6975,6 +7071,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -7812,7 +7909,9 @@ mod tests {
         let (_ctl_tx, ctl_rx) = mpsc::unbounded_channel::<BridgeControl>();
         let (done_tx, mut done_rx) = mpsc::unbounded_channel::<SessionEnded>();
         let active = Arc::new(AtomicUsize::new(0));
-        tokio::spawn(run_backend_bridge(BridgeSpawn {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let bridge_owner = lifecycle.clone();
+        lifecycle.spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             committed: CommittedAdmission(AuthAcceptance {
                 session_id: conn.session_id(),
@@ -7829,6 +7928,7 @@ mod tests {
             token: [11u8; 16],
             backend: Arc::new(EchoBackend),
             io: SessionIo {
+                lifecycle: bridge_owner,
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -7879,6 +7979,14 @@ mod tests {
              wakes the bridge to recompute, so it would stay 'active' until GC tears it down up \
              to RETAIN_AFTER_DEATH later"
         );
+        // The retained route and control sender remain held above: only the
+        // sticky shutdown can wake this actually parked bridge now.
+        lifecycle.shutdown.request();
+        tokio::time::timeout(Duration::from_secs(2), lifecycle.drain())
+            .await
+            .expect("parked owned tasks joined after shutdown")
+            .unwrap();
+        assert!(lifecycle.is_empty());
     }
 
     /// `drain_events` must forward a server-side `Event::OutputResync` to the
@@ -8202,6 +8310,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8292,6 +8401,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8378,6 +8488,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8490,6 +8601,7 @@ mod tests {
             token,
             backend,
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -11659,6 +11771,7 @@ mod tests {
             token: [0u8; 16],
             backend: Arc::new(ChattyBackend { log: log.clone() }),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -11945,6 +12058,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12081,6 +12195,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12215,6 +12330,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12385,6 +12501,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12495,6 +12612,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12601,6 +12719,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12845,6 +12964,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -12924,6 +13044,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13054,6 +13175,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13124,6 +13246,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13210,6 +13333,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13260,6 +13384,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13370,6 +13495,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13501,6 +13627,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13561,6 +13688,7 @@ mod tests {
         let (probation_tx, mut probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13655,6 +13783,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13717,6 +13846,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13784,6 +13914,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -13849,6 +13980,7 @@ mod tests {
         let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -14329,6 +14461,7 @@ mod tests {
     /// allowlist, a verifier that accepts `good`), owned in one place, for
     /// tests that hand `handle_datagram` datagrams themselves.
     struct SignatureRig {
+        lifecycle: Arc<Lifecycle>,
         socket: Arc<UdpSocket>,
         server_priv: [u8; 32],
         server_pub: [u8; 32],
@@ -14347,6 +14480,7 @@ mod tests {
             let (done_tx, _done_rx) = mpsc::unbounded_channel::<SessionEnded>();
             let (probation_tx, _probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
             SignatureRig {
+                lifecycle: Arc::new(Lifecycle::default()),
                 socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
                 server_priv: server_kp.private,
                 server_pub: server_kp.public,
@@ -14369,6 +14503,7 @@ mod tests {
 
         fn ctx(&self) -> ManagerCtx<'_> {
             ManagerCtx {
+                lifecycle: self.lifecycle.clone(),
                 socket: &self.socket,
                 server_priv: &self.server_priv,
                 auth: &self.auth,
@@ -14452,6 +14587,7 @@ mod tests {
         let (probation_tx, mut probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let active_count = Arc::new(AtomicUsize::new(0));
         let ctx = ManagerCtx {
+            lifecycle: Arc::new(Lifecycle::default()),
             socket: &socket,
             server_priv: &server_kp.private,
             auth: &auth,
@@ -14741,6 +14877,7 @@ mod tests {
     /// `serve` loop, gives each `ProbationEnded` to the router, and so
     /// decides what the router does before it sees a verdict.
     struct RouterWiring {
+        lifecycle: Arc<Lifecycle>,
         socket: Arc<UdpSocket>,
         server_priv: [u8; 32],
         server_pub: [u8; 32],
@@ -14760,6 +14897,7 @@ mod tests {
             let (done_tx, done_rx) = mpsc::unbounded_channel::<SessionEnded>();
             let (probation_tx, probation_rx) = mpsc::unbounded_channel::<ProbationEnded>();
             let wiring = RouterWiring {
+                lifecycle: Arc::new(Lifecycle::default()),
                 socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
                 server_priv: server_kp.private,
                 server_pub: server_kp.public,
@@ -14782,6 +14920,7 @@ mod tests {
 
         fn ctx(&self) -> ManagerCtx<'_> {
             ManagerCtx {
+                lifecycle: self.lifecycle.clone(),
                 socket: &self.socket,
                 server_priv: &self.server_priv,
                 auth: &self.auth,
@@ -16015,6 +16154,7 @@ mod tests {
                 },
                 backend: Arc::new(EndAfterParking(Mutex::new(Some(cue_rx)))),
                 io: SessionIo {
+                    lifecycle: Arc::new(Lifecycle::default()),
                     resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
@@ -16666,6 +16806,7 @@ mod tests {
                 token,
                 backend: Arc::new(ForwardingBackend(heard_tx)),
                 io: SessionIo {
+                    lifecycle: Arc::new(Lifecycle::default()),
                     resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
@@ -16999,6 +17140,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -17226,6 +17368,7 @@ mod tests {
             token,
             backend: Arc::new(ForwardingBackend(heard_tx)),
             io: SessionIo {
+                lifecycle: Arc::new(Lifecycle::default()),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
