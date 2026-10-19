@@ -102,6 +102,11 @@ def compiler(args):
         raise ValueError('compiler is not executable: ' + name)
     path = str(Path(path).absolute())
     flags = list(args.cflag)
+    if args.target == 'aarch64-unknown-linux-musl':
+        # Distro musl-gcc wrappers reuse a GNU libgcc whose outlined atomic
+        # helpers can require glibc's __getauxval. Inline baseline ARMv8 atomics
+        # keep this target libc-independent without requiring ARMv8.1 LSE.
+        flags.append('-mno-outline-atomics')
     if args.target.endswith('-apple-darwin'):
         arch = 'arm64' if args.target.startswith('aarch64-') else 'x86_64'
         flags += ['-arch', arch, '-isysroot', output(['xcrun', '--show-sdk-path'])]

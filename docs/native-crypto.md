@@ -50,6 +50,11 @@ and explicit `--cflag=-idirafter --cflag=...` arguments used for both native
 Linux architectures. `--cc`, `--ar`, and `--ranlib` each name one executable;
 flags are repeated `--cflag` arguments, never a shell command string.
 
+For ARM musl, the helper selects inline baseline ARMv8 atomics with
+[`-mno-outline-atomics`](https://gcc.gnu.org/onlinedocs/gcc/AArch64-Options.html).
+This avoids GNU libgcc helpers that can require glibc symbols when a distribution's
+`musl-gcc` wrapper reuses them, without requiring ARMv8.1 LSE instructions.
+
 The helper checks architecture and libc using the selected compiler. A GNU
 compiler is rejected for a musl target. Native jobs are limited to one or two.
 The qualifier generates an ephemeral RSA key in private temporary storage and
