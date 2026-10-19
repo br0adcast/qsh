@@ -619,10 +619,8 @@ authentication).
 
 ### What a log line looks like
 
-Every line of `qshd.log` has one shape — the same one the `qsh` client's
-own log uses — and `qshd serve` writes every line to standard error as
-well, so the journal holds the same lines (with the journal's own
-timestamp in front of them):
+Every line of `qshd.log` has the same header shape as the `qsh` client's
+log. `qshd serve` also writes diagnostics to standard error for the journal:
 
 ```
 2026-09-30 20:15:03.123 UTC [4242] INFO  helper: Accepted signature for alice from 203.0.113.7:2222 key ED25519 SHA256:...
@@ -631,8 +629,7 @@ timestamp in front of them):
 ```
 
 That is: the time in UTC with milliseconds; the pid of the process that
-wrote the line (in system mode the privileged helper and the
-network-facing worker write to the same file); the level — `INFO`,
+wrote the record; the level — `INFO`,
 `WARN` (a refusal, or something that failed but the daemon carries on
 past) or `ERROR` (a failure that ends a process or a login), padded to
 five characters; the component; and the text. The components are `qshd`
@@ -656,6 +653,24 @@ groups small (as you would for `sshd`, which logs the same things
 there). And as with `sshd`, the write to standard error is a blocking
 one: a journal that stops reading its input stalls the daemon until it
 reads again.
+
+In system mode only the privileged helper holds the log file descriptor.
+The worker sends bounded diagnostic records over a separate nonblocking local
+socket. The helper stamps these file copies with the worker PID it forked,
+receipt time, and fixed `INFO worker` provenance; the worker's reported level,
+component and escaped message appear as payload. A worker cannot use this path
+to manufacture a trusted `helper` authentication record. Journal output remains
+the worker's own stderr stream, without a duplicate from the helper; consult
+the journal's process metadata when distinguishing trusted helper events.
+
+The relay drops file copies when its bounded queue is full or unavailable;
+it never delays channel or authentication requests waiting for queue space.
+File writes and existing stderr writes can still block on their destinations.
+Formatted records are capped at 8 KiB, with a truncation marker. The current
+file and its single rotation each stay within the 2 MiB rotation threshold;
+failed rotation drops further file records until it can succeed. This bound
+assumes files created by this daemon and no external concurrent writer; an
+already oversized file is rotated on the next write, not erased at startup.
 
 A `fail2ban`-style filter for the system mode's login lines anchors on
 `helper: Failed signature for ... from <HOST>:\d+` after that header.

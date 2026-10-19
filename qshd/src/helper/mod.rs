@@ -377,7 +377,7 @@ fn arm_and_verify_pdeathsig(helper_pid: nix::unistd::Pid) -> anyhow::Result<()> 
 ///   kernel closes every descriptor a dead process held -- no cooperation
 ///   from the helper is needed for that half.
 /// - The helper already sees the same when the worker's copy of either seam
-///   closes (`server::run`'s loop ends the moment `recv` on either reports
+///   closes (`server::run_with_diagnostics`'s loop ends the moment `recv` on either reports
 ///   the peer gone).
 ///
 /// A worker cannot rely on the same kernel mechanism to notice a dead
@@ -473,6 +473,8 @@ pub fn split_and_run(
         channel::pair().context("creating the channel seam's socket pair")?;
     let (worker_auth, helper_auth) =
         channel::pair().context("creating the authentication seam's socket pair")?;
+    let (worker_log, mut helper_log) =
+        crate::log::relay::pair().context("creating the diagnostic socket pair")?;
 
     // The pid that becomes the child's parent, captured before the fork so
     // the child can tell a helper that died in the narrow window between
@@ -486,14 +488,16 @@ pub fn split_and_run(
     // -- so the fork happens single-threaded, and the child inherits no
     // lock held by a thread that does not exist in it.
     match unsafe { nix::unistd::fork() }.context("splitting into helper and worker")? {
-        nix::unistd::ForkResult::Parent { .. } => {
+        nix::unistd::ForkResult::Parent { child } => {
             // The helper has no business with the network: drop the worker's
             // ends of both pairs here and let the worker own them alone.
             drop(worker_channels);
             drop(worker_auth);
+            drop(worker_log);
+            helper_log.set_worker_pid(child.as_raw() as u32);
             // `run_worker` closes over the UDP socket (bound before this
             // split, in `serve.rs`, and moved in by the caller) even though
-            // the helper never calls it. `server::run` below never returns
+            // the helper never calls it. `server::run_with_diagnostics` below never returns
             // -- it ends the process itself -- so the normal end-of-scope
             // drop glue that would release `run_worker` never runs either.
             // Dropping it here, explicitly, is what actually closes the
@@ -501,11 +505,14 @@ pub fn split_and_run(
             // invariant this whole split exists for is that the privileged
             // process holds no network descriptor at all.
             drop(run_worker);
-            server::run(helper_channels, helper_auth, config)
+            server::run_with_diagnostics(helper_channels, helper_auth, config, helper_log)
         }
         nix::unistd::ForkResult::Child => {
             drop(helper_channels);
             drop(helper_auth);
+            drop(helper_log);
+            crate::log::use_worker_relay(worker_log)
+                .context("releasing the worker's privileged log descriptor")?;
 
             // Armed once now, right after the fork, and again after the
             // drop below -- see `arm_and_verify_pdeathsig`'s docs and this
