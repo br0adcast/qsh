@@ -206,7 +206,9 @@ Read the [trust model](docs/cli-guide.md#authentication-and-host-trust) and
 
 ## Building and CI
 
-Build both binaries from source with Rust:
+Prepare the verified static OpenSSL prefix described in the
+[native build prerequisites](docs/native-crypto.md), then build both binaries
+from source with Rust:
 
 ```sh
 cargo build --release --locked -p qsh -p qshd

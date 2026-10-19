@@ -1,10 +1,10 @@
 # Native crypto build prerequisite
 
-The native build helper prepares a verified OpenSSL prefix for the planned RSA
-backend migration. It currently adds no OpenSSL dependency to the Rust products
-and does not resolve the RustCrypto RSA timing advisory by itself. Correct
-signatures and reproducible source selection do not establish constant-time
-execution.
+The native build helper prepares the verified OpenSSL prefix used for local RSA
+private operations. The shared key owner and bounded SSH workers use that
+backend without a RustCrypto private fallback. Public verification and external
+signers remain separate. Correct signatures and reproducible source selection
+alone do not establish constant-time execution.
 
 ## Source and provenance
 
@@ -94,17 +94,51 @@ staging/home paths. The manifest contains local toolchain paths as provenance
 and is not a release artifact.
 
 The prefix exposes `include`, `lib/libcrypto.a`, `lib/libssl.a`, the version
-probe, and the qualification CLI. A subsequent production integration must use
-this exact prefix explicitly, with static linking and vendored downloading
-**disabled** in Cargo; it must not discover arbitrary system OpenSSL instead.
-Use the prefix directly (for example the appropriate target-specific
-`OPENSSL_DIR` contract) rather than its logical-prefix pkg-config files. That
-Rust integration is a separate reviewed change, including application key
-handling and cancellation tests.
+probe, and the qualification CLI. Rust products use this prefix explicitly:
+
+```sh
+native_prefix=$(bash scripts/build-openssl.sh \
+  --target "$(rustc -vV | sed -n 's/^host: //p')" \
+  --cache "$PWD/target/native-crypto" --jobs 2)
+export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
+cargo build --locked -p qsh -p qshd
+```
+
+Cross builds use the target-prefixed environment variables, for example
+`X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR` and
+`X86_64_UNKNOWN_LINUX_MUSL_OPENSSL_STATIC=1`. The shared adapter rejects a missing
+manifest, changed artifact, different target/source pin, native version mismatch,
+Cargo-vendored replacement, or library/include overrides. It does not discover a
+system fallback. Use the prefix directly rather than its logical-prefix
+pkg-config files. Packaged products carry the upstream OpenSSL license.
+
+RSA keys are validated once per loaded owner and signed by this native backend.
+Plain PKCS1/PKCS8 use upstream native decoders; OpenSSH/PPK components use secure
+BigNums and the upstream builder. No application CRT computation, private DER
+serializer, or RustCrypto private fallback is involved. Existing two-prime
+acceptance remains unchanged. SSH retains SHA-1/SHA-256/SHA-512 negotiation;
+QSH retains its explicit SHA-2-only policy and signs file proofs with SHA-512.
+Public verification and external/agent signing remain separate; an agent is
+not certified timing-safe by this change.
+
+SSH decrypts, prepares and signs local keys on two process-owned workers with
+four queued places. Cancellation closes the result receiver; an active native
+operation retains its place and secrets until completion, and a cancelled queued
+operation is dropped before entering cryptography. Connection runtime teardown
+does not join the native operation. Saturation returns typed `CryptoBusy` for
+the caller's existing retry policy; it does not try another credential or
+create a new timer. Initial discovery may still reject an unusable configured
+candidate and continue with independently configured candidates. After PK_OK,
+a local preparation or signing failure terminates authentication without
+selecting another identity. Existing wrong or missing passphrase handling is
+unchanged. This limits accepted worker jobs, not all key-file bytes or
+all application memory. OpenSSL's secure BigNums do not imply that a locked
+secure heap has been configured.
 
 ## CI and release qualification
 
-Ordinary CI runs the generated miniature-build orchestration tests:
+Ordinary CI prepares its host prefix and runs product checks plus the generated
+miniature-build orchestration tests:
 
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
@@ -116,13 +150,17 @@ verifier and generated C archives test orchestration only; they do not replace
 real signed-source qualification.
 
 The `Native crypto prerequisite` workflow runs for changes to these scripts,
-source metadata, package build images, or relevant workflows, and can run
-manually. The release workflow calls the same qualification and requires its
+source metadata, native adapter/worker code, package build images, or relevant
+workflows, and can run manually. Portable jobs also build the actual products
+and execute generated RSA key-format and digest checks, including the large-key
+envelope, against the qualified prefix. The release workflow calls the same qualification and requires its
 success before publication. Unrelated pull requests do not run the full native
 matrix.
 
 Qualification covers native x86_64/aarch64 musl Linux and Intel/Apple Silicon
 macOS, plus both GNU architectures in each existing Debian/RPM package-floor
 image. GNU ARM probes run through explicit QEMU with that image's target
-sysroot. Qualification emits no new release artifact and publishes no release.
+sysroot. Each floor job also runs the existing server package builder for both
+architectures, including linked system-daemon, glibc and PAM checks. Generated
+qualification packages stay within that job; no release is published.
 Passing one local target is not evidence that the complete CI matrix passed.

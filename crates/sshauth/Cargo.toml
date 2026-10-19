@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 transport = { path = "../transport" }
-# Pinned to the upstream RSA conversion already used by russh. This restores
-# file signing; it does not resolve the separate RSA timing advisory (#59).
+# The upstream SSH formats are shared with russh. RSA private operations use
+# the separately pinned native backend; verification retains upstream support.
 # Algorithm acceptance is explicit in verify.rs, independent of feature union.
 ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "alloc", "ed25519", "p256", "p384", "p521", "rsa", "encryption", "ppk"] }
 ssh-encoding = "=0.3.0"
@@ -26,7 +26,9 @@ sha2 = "0.10"
 libc = "0.2"
 
 # Shared private-file decoding uses upstream format and key conversions.
-rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
+openssl = "=0.10.81"
+# Direct metadata edge for the exact native version check in build.rs.
+openssl-sys = "=0.9.117"
 ed25519-dalek = { version = "3", default-features = false, features = ["pem", "zeroize"] }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "pem"] }
 pkcs8 = { version = "0.11", features = ["pem"] }
@@ -36,9 +38,15 @@ p384 = { version = "0.14", default-features = false, features = ["arithmetic", "
 p521 = { version = "0.14", default-features = false, features = ["arithmetic", "pem"] }
 
 [dev-dependencies]
+serde_json = "1"
+rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
 tempfile = "3"
 # Exercise the same SHA-1-capable decoder as the workspace's russh feature union.
 # QSH must reject legacy RSA signatures explicitly, independently of this backend.
 ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "sha1", "p521"] }
 
 hmac = "0.12"
+
+[build-dependencies]
+serde_json = "1"
+sha2 = "0.10"

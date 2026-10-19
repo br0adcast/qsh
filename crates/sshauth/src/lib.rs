@@ -10,6 +10,8 @@ pub mod agent;
 pub mod discover;
 pub mod keyfile;
 pub mod known_hosts;
+mod native_rsa;
+pub mod prepared_key;
 pub mod record;
 pub mod sign_file;
 pub mod verify;

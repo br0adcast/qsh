@@ -541,7 +541,9 @@ impl Session {
             Arc::new(NoopBinder),
             events.clone(),
             Some(Arc::new(
-                FileSigner::from_key(key.clone()).with_login(login.to_string()),
+                FileSigner::from_key(key.clone())
+                    .expect("prepare generated key")
+                    .with_login(login.to_string()),
             )),
         );
         let session = Session { client, events };

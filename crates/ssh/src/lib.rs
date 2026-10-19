@@ -7,6 +7,7 @@
 //! the core itself reads neither `SSH_AUTH_SOCK` nor `~/.ssh`.
 
 mod auth;
+mod crypto_worker;
 mod host_key;
 mod keyfile;
 mod session;
@@ -202,6 +203,8 @@ pub enum SshError {
     Cancelled,
     Connect(String),
     ResourceLimit(String),
+    /// Local private-key workers are saturated; retry through the caller policy.
+    CryptoBusy,
     /// The OS refused the TCP connect to `target`: its kind and own words.
     /// Kept as data so a caller can tell what it may mean on its system (a
     /// denied Local Network permission on macOS).
@@ -224,6 +227,7 @@ impl std::fmt::Display for SshError {
             | SshError::ResourceLimit(r)
             | SshError::AuthFailed(r)
             | SshError::Protocol(r) => write!(f, "{r}"),
+            SshError::CryptoBusy => write!(f, "private-key workers are busy; retry the connection"),
             SshError::Cancelled => write!(f, "the connection was cancelled"),
             SshError::Unreachable {
                 target, os_error, ..

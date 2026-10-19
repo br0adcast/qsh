@@ -386,5 +386,60 @@ esac
                 child.communicate(timeout=5)
 
 
+class ProductEntrypointTests(unittest.TestCase):
+    def test_product_callers_execute_the_nonexecutable_checkout_wrapper(self):
+        import re
+        import shutil
+        callers = {
+            '.github/workflows/ci.yml': 3,
+            '.github/workflows/native-crypto.yml': 1,
+            '.github/workflows/release.yml': 2,
+            'packaging/build-server-packages.sh': 1,
+            'packaging/acceptance.sh': 1,
+        }
+        # Execute each real prefix assignment, not a reconstructed command.
+        # Only the Python backend is replaced: no download, crypto or build.
+        pattern = re.compile(
+            r'(?m)^[ \t]*(?P<name>(?:native_)?prefix)=\$\('
+            r'(?P<command>[^\n]*build-openssl\.sh[\s\S]*?)\)')
+        with tempfile.TemporaryDirectory(prefix='qsh-native-entrypoint-') as temp:
+            root = Path(temp) / 'checkout with spaces'
+            scripts = root / 'scripts'
+            scripts.mkdir(parents=True)
+            wrapper = scripts / 'build-openssl.sh'
+            shutil.copyfile(SCRIPT, wrapper)
+            wrapper.chmod(0o644)  # The tracked mode, including a fresh CI checkout.
+            record = root / 'arguments.json'
+            (scripts / 'build_openssl.py').write_text(
+                'import json,os,sys\nfrom pathlib import Path\n'
+                'Path(os.environ["QSH_TEST_ARGUMENTS"]).write_text(json.dumps(sys.argv[1:]))\n'
+                'print(os.environ["QSH_TEST_PREFIX"])\n')
+            expected = str(root / 'qualified prefix')
+            target = 'x86_64-unknown-linux-gnu'
+            env = dict(os.environ, HISTFILE='/dev/null', root=str(root),
+                       target=target, triple=target, client_target=target,
+                       NATIVE_TARGET=target, RUNNER_TEMP=temp, ImageOS='fixture',
+                       ImageVersion='1', fmt='deb', target_dir=temp,
+                       native_uapi=temp, uapi=temp, CARGO_TARGET_DIR=temp,
+                       QSH_TEST_ARGUMENTS=str(record), QSH_TEST_PREFIX=expected)
+            for caller, count in callers.items():
+                assignments = list(pattern.finditer((ROOT / caller).read_text()))
+                self.assertEqual(len(assignments), count, caller)
+                for index, assignment in enumerate(assignments):
+                    with self.subTest(caller=caller, invocation=index):
+                        record.unlink(missing_ok=True)
+                        script = ('set -euo pipefail\nargs=()\nnative_args=()\n'
+                                  + assignment.group(0).strip()
+                                  + '\nprintf "%s" "$' + assignment['name'] + '"\n')
+                        result = subprocess.run(['bash', '-c', script], cwd=root,
+                                                env=env, text=True, capture_output=True,
+                                                timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, expected)
+                        argv = json.loads(record.read_text())
+                        self.assertEqual(argv[:2], ['--target', target])
+                        self.assertIn('--cache', argv)
+
+
 if __name__ == '__main__':
     unittest.main()

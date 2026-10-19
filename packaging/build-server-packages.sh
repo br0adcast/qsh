@@ -246,6 +246,14 @@ check_floor() {
 for row in "${targets[@]}"; do
   read -r triple deb_arch rpm_arch strip_tool machine <<<"$row"
 
+  native_args=()
+  if [[ $triple == aarch64-unknown-linux-gnu ]]; then
+    native_args+=(--cc aarch64-linux-gnu-gcc --ar aarch64-linux-gnu-ar --ranlib aarch64-linux-gnu-ranlib)
+  fi
+  native_prefix=$(bash "$root/scripts/build-openssl.sh" --target "$triple" \
+    --cache "$target_dir/native-crypto" --toolchain-id "package-floor-$fmt" \
+    --jobs 2 "${native_args[@]}")
+  export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
   say "$fmt/$triple: building qshd with --features system"
   cargo build --release --locked -p qshd --features system --target "$triple"
   bin=$target_dir/$triple/release/qshd

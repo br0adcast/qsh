@@ -120,10 +120,18 @@ pub enum DirectOutcome {
 /// Why the SSH step failed: its own words, and whether the failure looks
 /// like a denied Local Network permission (macOS, no route to a local
 /// address) -- a fact for the caller to word once, not a suffix of `why`.
+/// The local condition callers may preserve for their existing retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureCause {
+    Other,
+    CryptoBusy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshFailure {
     pub why: String,
     pub local_network_hint: bool,
+    pub cause: SshFailureCause,
 }
 
 impl SshFailure {
@@ -132,6 +140,7 @@ impl SshFailure {
         SshFailure {
             why: why.into(),
             local_network_hint: false,
+            cause: SshFailureCause::Other,
         }
     }
 }

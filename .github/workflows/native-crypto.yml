@@ -3,6 +3,13 @@ name: Native crypto prerequisite
 on:
   pull_request:
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'packaging/build-server-packages.sh'
+      - 'packaging/acceptance.sh'
+      - 'scripts/check-pam-linkage.sh'
+      - 'crates/sshauth/**'
+      - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
@@ -12,6 +19,13 @@ on:
   push:
     branches: [main]
     paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'packaging/build-server-packages.sh'
+      - 'packaging/acceptance.sh'
+      - 'scripts/check-pam-linkage.sh'
+      - 'crates/sshauth/**'
+      - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
@@ -27,6 +41,7 @@ permissions:
 env:
   CARGO_BUILD_JOBS: '2'
   HISTFILE: /dev/null
+  RUSTUP_TOOLCHAIN: '1.99.1'
 
 jobs:
   portable:
@@ -75,11 +90,46 @@ jobs:
           bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" \
             --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}"
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}")
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Install qualified Rust for linked product checks
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add '${{ matrix.target }}'
+          scripts/check-qualified-rust.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: native-products-${{ matrix.target }}
+      - name: Qualify the linked products and generated RSA operations
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
+          cargo build --locked -p qsh -p qshd --target "$NATIVE_TARGET"
+          cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
+            --test rsa_file_signing --test native_rsa_backend -- --include-ignored
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            if grep -q NEEDED <<< "$dynamic"; then
+              echo 'musl products import dynamic libraries' >&2
+              exit 1
+            fi
+          else
+            dynamic=$(otool -L "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
+              echo 'products import an unqualified dynamic native backend' >&2
+              exit 1
+            fi
+          fi
 
   system-floors:
     name: Native system floor (${{ matrix.format }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -102,17 +152,32 @@ jobs:
             -v "$PWD:/work:ro" -v "$RUNNER_TEMP/native-floor:/native" \
             -v /usr/bin/qemu-aarch64-static:/usr/local/bin/qemu-aarch64-static:ro \
             qsh-native-floor bash -euc '
+              export HOME=/native/home CARGO_HOME=/native/cargo CARGO_TARGET_DIR=/native/products
+              mkdir -p "$HOME" "$CARGO_HOME" /native/source
+              cp -a /work/. /native/source/
+              cd /native/source
               bash scripts/qualify-openssl.sh --target x86_64-unknown-linux-gnu \
-                --cache /native --toolchain-id "package-floor-$FORMAT"
+                --cache /native/products/native-crypto --toolchain-id "package-floor-$FORMAT"
               if [ "$FORMAT" = deb ]; then
                 sysroot=/usr/aarch64-linux-gnu
               else
                 sysroot=/usr/aarch64-linux-gnu/sys-root
               fi
               bash scripts/qualify-openssl.sh --target aarch64-unknown-linux-gnu \
-                --cache /native --cc aarch64-linux-gnu-gcc \
+                --cache /native/products/native-crypto --cc aarch64-linux-gnu-gcc \
                 --ar aarch64-linux-gnu-ar --ranlib aarch64-linux-gnu-ranlib \
                 --toolchain-id "package-floor-$FORMAT" \
                 --runner /usr/local/bin/qemu-aarch64-static \
                 --runner-arg=-L --runner-arg="$sysroot"
+              # Use the existing package build and its exact glibc/PAM checks
+              # to qualify linked system products, not only the native C probe.
+              packaging/build-server-packages.sh --in-container "$FORMAT"
+              for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+                binary="$CARGO_TARGET_DIR/$target/release/qshd"
+                dynamic=$(readelf -d "$binary")
+                if grep -E "NEEDED.*lib(ssl|crypto)\.so" <<< "$dynamic"; then
+                  echo "system product imports an unqualified native backend" >&2
+                  exit 1
+                fi
+              done
             '

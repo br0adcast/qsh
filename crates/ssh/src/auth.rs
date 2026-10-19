@@ -371,9 +371,16 @@ async fn run_method<H: russh::client::Handler>(
             answered(sent)?
         }
         AuthMethod::PrivateKeyPem(pem) => {
-            let key = russh::keys::decode_secret_key(&pem, None).map_err(|e| {
-                SshError::AuthFailed(format!("the private key could not be read: {e}"))
-            })?;
+            let key = wait
+                .on(crate::crypto_worker::run(move || {
+                    keyfile::decode(&pem)
+                        .and_then(|key| key.into_prepared(None).map_err(|e| e.to_string()))
+                }))
+                .await?
+                .map_err(crypto_error)?
+                .map_err(|e| {
+                    SshError::AuthFailed(format!("the private key could not be read: {e}"))
+                })?;
             offer_private_key(login, &wait, key, offered).await?
         }
         AuthMethod::Signer(signer) => {
@@ -401,16 +408,24 @@ async fn run_method<H: russh::client::Handler>(
         }
         AuthMethod::Agent(socket) => return offer_agent_keys(login, &wait, &socket, offered).await,
         AuthMethod::KeyFile(path) => {
-            let key = match keyfile::read(&path) {
+            let read_path = path.clone();
+            let key = match wait
+                .on(crate::crypto_worker::run(move || keyfile::read(&read_path)))
+                .await?
+                .map_err(crypto_error)?
+            {
                 Ok(key) => key,
                 Err(why) => {
                     return Ok(vec![Attempt::Skipped(format!("{}: {why}", path.display()))])
                 }
             };
-            if !key.is_encrypted() {
-                offer_private_key(login, &wait, key, offered).await?
-            } else {
-                return offer_locked_key(login, &wait, &path, &key, prompter, offered).await;
+            match key {
+                sshauth::keyfile::DecodedKey::Prepared(key) => {
+                    offer_private_key(login, &wait, key, offered).await?
+                }
+                sshauth::keyfile::DecodedKey::Locked(key) => {
+                    return offer_locked_key(login, &wait, &path, &key, prompter, offered).await
+                }
             }
         }
         AuthMethod::AskPassword => {
@@ -511,8 +526,9 @@ fn canonical(public: &PublicKey) -> Result<Vec<u8>, SshError> {
         .map_err(|e| SshError::AuthFailed(format!("the key is unusable: {e}")))
 }
 
-/// RSA keys need a SHA-2 signature algorithm the server accepts; other key
-/// types take none. The outer `None`: the session is gone.
+/// RSA uses the negotiated SHA-256 or SHA-512 digest, or legacy SHA-1 when
+/// the server offers neither. Other key types take none. The outer `None`
+/// means the session is gone.
 async fn hash_for<H: russh::client::Handler>(
     login: &mut Login<'_, H>,
     wait: &Wait,
@@ -527,11 +543,11 @@ async fn hash_for<H: russh::client::Handler>(
     }
 }
 
-/// A decrypted private key russh signs with itself.
+/// Offer a prepared key and sign through the bounded crypto service.
 async fn offer_private_key<H: russh::client::Handler>(
     login: &mut Login<'_, H>,
     wait: &Wait,
-    key: russh::keys::PrivateKey,
+    key: sshauth::prepared_key::PreparedKey,
     offered: &mut std::collections::HashSet<Vec<u8>>,
 ) -> Result<Attempt, SshError> {
     if !offered.insert(canonical(key.public_key())?) {
@@ -544,7 +560,11 @@ async fn offer_private_key<H: russh::client::Handler>(
     // task after PK_OK, outside our cancellation checks. Keep that action in
     // the same guarded signer path as platform, encrypted-file and agent keys.
     let public = key.public_key().clone();
-    let mut signer = PrivateSigner(key);
+    let mut signer = PrivateSigner {
+        key: Arc::new(key),
+        #[cfg(test)]
+        before_sign: None,
+    };
     let sent = wait
         .on(login.handle.authenticate_publickey_with(
             login.username,
@@ -684,6 +704,10 @@ fn signed(sent: Result<AuthResult, SignError>) -> Result<Attempt, SshError> {
         Ok(result) => Ok(outcome(result)),
         Err(SignError::Dropped) => Ok(Attempt::Gone),
         Err(SignError::Cancelled) => Err(SshError::Cancelled),
+        Err(SignError::Busy) => Err(SshError::CryptoBusy),
+        Err(SignError::Unavailable) => Err(SshError::Protocol(
+            "private-key worker service is unavailable".into(),
+        )),
         Err(SignError::Signer(reason)) => Err(SshError::AuthFailed(reason)),
     }
 }
@@ -717,7 +741,11 @@ impl<S: russh::Signer<Error = SignError> + Send> russh::Signer for GuardedSigner
     }
 }
 
-struct PrivateSigner(russh::keys::PrivateKey);
+struct PrivateSigner {
+    key: Arc<sshauth::prepared_key::PreparedKey>,
+    #[cfg(test)]
+    before_sign: Option<Arc<dyn Fn() + Send + Sync>>,
+}
 impl russh::Signer for PrivateSigner {
     type Error = SignError;
     fn auth_sign(
@@ -726,11 +754,22 @@ impl russh::Signer for PrivateSigner {
         hash_alg: Option<HashAlg>,
         to_sign: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
-        std::future::ready(
-            keyfile::sign_with_hash_alg(&self.0, hash_alg, &to_sign)
-                .map(|blob| keyfile::append_signature(to_sign, &blob))
-                .map_err(SignError::Signer),
-        )
+        let key = self.key.clone();
+        #[cfg(test)]
+        let before = self.before_sign.clone();
+        async move {
+            crate::crypto_worker::run(move || {
+                #[cfg(test)]
+                if let Some(before) = before {
+                    before();
+                }
+                keyfile::sign_with_hash_alg(&key, hash_alg, &to_sign)
+                    .map(|blob| keyfile::append_signature(to_sign, &blob))
+                    .map_err(SignError::Signer)
+            })
+            .await
+            .map_err(SignError::from)?
+        }
     }
 }
 
@@ -741,12 +780,31 @@ struct SignerBridge(Arc<dyn ExternalSigner>);
 #[derive(Debug)]
 pub(crate) enum SignError {
     Cancelled,
+    Busy,
+    Unavailable,
     /// russh could not hand the request or the signature to its session:
     /// the session is gone. Why -- the server's goodbye or a lost network --
     /// is read from the handler (see `ended`).
     Dropped,
     /// The platform signer failed or returned an unusable signature.
     Signer(String),
+}
+
+impl From<crate::crypto_worker::Error> for SignError {
+    fn from(error: crate::crypto_worker::Error) -> Self {
+        match error {
+            crate::crypto_worker::Error::Busy => Self::Busy,
+            crate::crypto_worker::Error::Unavailable => Self::Unavailable,
+        }
+    }
+}
+fn crypto_error(error: crate::crypto_worker::Error) -> SshError {
+    match error {
+        crate::crypto_worker::Error::Busy => SshError::CryptoBusy,
+        crate::crypto_worker::Error::Unavailable => {
+            SshError::Protocol("private-key worker service is unavailable".into())
+        }
+    }
 }
 
 impl From<russh::SendError> for SignError {
@@ -808,5 +866,80 @@ impl russh::Signer for AgentSigner<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod native_worker_tests {
+    use super::*;
+    use russh::Signer;
+    use std::sync::{mpsc, Condvar, Mutex};
+
+    #[test]
+    fn native_rsa_cancel_drops_connection_runtime_while_owned_signing_is_held() {
+        let pair = ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .unwrap();
+        let key = sshauth::prepared_key::PreparedKey::from_key(
+            ssh_key::PrivateKey::new(
+                ssh_key::private::KeypairData::Rsa(pair),
+                "generated cancellation fixture",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let identity = AgentIdentity::from(key.public_key().clone());
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let held = gate.clone();
+        let mut signer = PrivateSigner {
+            key: Arc::new(key),
+            before_sign: Some(Arc::new(move || {
+                entered_tx.send(()).unwrap();
+                let (lock, changed) = &*held;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            })),
+        };
+        let cancel = knock::Cancel::new();
+        let worker_cancel = cancel.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            let runtime = crate::runtime();
+            let result = runtime.block_on(async {
+                let mut guarded = GuardedSigner {
+                    signer: &mut signer,
+                    cancel: &worker_cancel,
+                };
+                crate::with_cancel(
+                    guarded.auth_sign(&identity, Some(HashAlg::Sha512), vec![7; 32]),
+                    &worker_cancel,
+                )
+                .await
+            });
+            drop(runtime);
+            done_tx
+                .send(matches!(result, Err(SshError::Cancelled)))
+                .unwrap();
+        });
+        // Always release and join before asserting, including on the RED path.
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        cancel.cancel();
+        let cancelled_before_release = done_rx.recv_timeout(Duration::from_secs(1));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        owner.join().unwrap();
+        assert!(
+            entered,
+            "the actual signing owner must reach the held operation"
+        );
+        assert!(
+            matches!(cancelled_before_release, Ok(true)),
+            "cancellation and runtime drop must complete while native work remains held"
+        );
     }
 }

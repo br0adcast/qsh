@@ -624,6 +624,7 @@ mod tests {
         let failure = SshFailure {
             why: "192.168.0.200:22: No route to host (os error 65)".into(),
             local_network_hint: true,
+            cause: ::connect::SshFailureCause::Other,
         };
         assert_eq!(
             ssh_failed("h", &failure),
@@ -656,6 +657,7 @@ mod tests {
                     Reason::Ssh(SshFailure {
                         why: "192.168.0.200:2222: No route to host (os error 65)".into(),
                         local_network_hint: true,
+                        cause: ::connect::SshFailureCause::Other,
                     }),
                 ],
             },
