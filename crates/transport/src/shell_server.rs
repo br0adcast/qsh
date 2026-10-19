@@ -109,6 +109,12 @@ impl std::fmt::Display for ScreenPreparationError {
     }
 }
 
+/// Required terminal responses could not be produced within the model bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenReplyError {
+    Overflow,
+}
+
 /// A model resize reserved before PTY ioctl; cancellation leaves it unchanged.
 pub trait PreparedScreenResize: Send {
     fn commit(self: Box<Self>);
@@ -131,9 +137,10 @@ impl PreparedScreenResize for EmptyResize {
 /// The bytes `repaint` returns are consumed by the CLIENT's emulator, not by
 /// a real terminal: they may use everything our own emulator understands.
 pub trait SessionScreen: Send {
-    /// Feed the shell's output through the model. Called for every chunk,
-    /// with exactly the bytes that also go on the wire.
-    fn absorb(&mut self, bytes: &[u8]);
+    /// Feed fresh shell output once and return ordered application-input replies.
+    /// Display replicas and replay must not call this authoritative response path.
+    /// A failed batch returns no prefix; the owner must end this channel.
+    fn absorb(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError>;
 
     /// Reserve model storage before touching the PTY. Drop cancels; commit
     /// applies the model only after the PTY accepted the same geometry.
@@ -174,7 +181,9 @@ pub trait SessionScreen: Send {
 pub struct NoScreen;
 
 impl SessionScreen for NoScreen {
-    fn absorb(&mut self, _bytes: &[u8]) {}
+    fn absorb(&mut self, _bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError> {
+        Ok(Vec::new())
+    }
     fn prepare_resize(
         &mut self,
         _size: TerminalSize,
