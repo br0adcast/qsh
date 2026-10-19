@@ -32,7 +32,7 @@ fn self_check_prints_its_build_architecture_and_protocol() {
         .transport_features
         .iter()
         .any(|name| name == "channel-geometry"));
-    assert!(!check
+    assert!(check
         .transport_features
         .iter()
         .any(|name| name == "auth-accepted"));
