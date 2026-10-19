@@ -6364,9 +6364,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Closes channel `id` and waits for its `Exited` notice -- so a
-    /// following `Open` that reuses the same id is never refused merely
-    /// because the previous process has not been reaped yet.
+    /// Closes channel `id` and waits for both its exit and exact reaped-child
+    /// receipt. Exit alone leaves cleanup custody charged against the cap,
+    /// so a following `Open` must wait for the cleanup acknowledgement.
     fn close_channel(channels: &UnixStream, id: ChannelId) {
         super::channel::send(
             channels,
@@ -6374,10 +6374,94 @@ pub(crate) mod tests {
             None,
         )
         .expect("send close");
-        let (exit, _fd) = answer_to_or_fail(channels, id, "the helper must report this exit");
+        let mut exited = false;
+        let mut reaped = false;
+        while !exited || !reaped {
+            let (response, fd) = next_response(channels);
+            match response {
+                Response::Exited {
+                    id: response_id, ..
+                } if response_id == id => {
+                    assert!(fd.is_none(), "exit must not carry a terminal descriptor");
+                    exited = true;
+                }
+                Response::CleanupComplete {
+                    id: response_id,
+                    kind,
+                } if response_id == id => {
+                    assert!(fd.is_none(), "cleanup must not carry a terminal descriptor");
+                    assert_eq!(
+                        kind,
+                        super::super::protocol::CleanupKind::Reaped,
+                        "an installed channel requires exact reaped-child proof"
+                    );
+                    reaped = true;
+                }
+                Response::Opened { id: response_id }
+                | Response::Failed {
+                    id: response_id, ..
+                } if response_id == id => {
+                    panic!("expected exit and cleanup for the closed channel, got {response:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn close_barrier_consumes_exact_reaped_receipt_before_returning() {
+        use super::super::protocol::CleanupKind;
+        let seam = DirectSeam::new();
+        for response in [
+            Response::Exited { id: 7, code: 0 },
+            Response::CleanupComplete {
+                id: 8,
+                kind: CleanupKind::Reaped,
+            },
+            Response::CleanupComplete {
+                id: 7,
+                kind: CleanupKind::Reaped,
+            },
+            Response::NonceUnavailable,
+        ] {
+            reply(&seam.helper, &response);
+        }
+        close_channel(&seam.worker, 7);
+        let (next, fd) = next_response(&seam.worker);
         assert!(
-            matches!(exit, Response::Exited { .. }),
-            "expected Exited for the closed channel, got {exit:?}"
+            matches!(next, Response::NonceUnavailable),
+            "close-and-reuse must consume the exact cleanup receipt, got {next:?}"
+        );
+        assert!(fd.is_none());
+        let (request, fd) = super::channel::recv(&seam.helper).unwrap().unwrap();
+        assert!(matches!(
+            decode::<Request>(&request).unwrap(),
+            Request::Close { id: 7 }
+        ));
+        assert!(fd.is_none());
+    }
+
+    #[test]
+    fn close_barrier_rejects_no_child_proof_for_an_installed_channel() {
+        let seam = DirectSeam::new();
+        reply(&seam.helper, &Response::Exited { id: 7, code: 0 });
+        reply(
+            &seam.helper,
+            &Response::CleanupComplete {
+                id: 7,
+                kind: super::super::protocol::CleanupKind::NoChild,
+            },
+        );
+        let failure = std::panic::catch_unwind(|| close_channel(&seam.worker, 7))
+            .expect_err("NoChild cannot prove cleanup of an installed channel");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .expect("the rejection must carry a diagnostic");
+        assert!(
+            message.contains("an installed channel requires exact reaped-child proof"),
+            "expected immediate proof rejection, got {message}"
         );
     }
 
