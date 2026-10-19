@@ -1,13 +1,15 @@
 # Terminal resource policy
 
 qsh accepts logical terminals with **2–512 columns and 1–256 rows**, at most
-131,072 cells. Network OPEN and RESIZE reject invalid geometry before model or
-PTY allocation. A no-PTY channel does not create a terminal model or lease.
+131,072 cells. Network OPEN and RESIZE_REQUEST reject invalid geometry before
+model or PTY allocation. A no-PTY channel does not create a terminal model or lease.
 Local display sizes are adapted to these limits. A zero-sized physical display
 suppresses wire resizes; one-column displays clip the two-column logical model.
 Larger displays show a bounded top-left viewport (at most 512×257 including the
-chrome row), without allocating for the full physical size. Prediction, rendering,
-model construction and wire requests use the same effective logical geometry.
+chrome row), without allocating for the full physical size. Desired window size
+and committed remote geometry are separate: prediction and terminal parsing use
+the committed geometry, while rendering crops/pads it into the current viewport.
+A pending or refused resize does not reshape the authoritative model.
 
 Daemon replay models have zero scrollback from construction. Client history is
 limited to min(requested lines, 10,000, floor(1,048,576 / columns)); width growth
@@ -28,10 +30,68 @@ Authenticated aliases sharing a uid share its owner pool. Limits are independent
 An OPEN reserves before allocating. A resize reserves the new retained envelope
 and scratch before changing the PTY or emulator; cancellation releases the
 provisional reservation. Commit releases scratch only. Shrinking does not refund
-historical capacity. A close/drop releases the lease. Refused OPEN/RESIZE requests
-leave existing models intact and report the refusal. A shrink can need more
+historical capacity. A close/drop releases the lease. Refused OPEN/RESIZE_REQUEST
+requests leave existing models intact and report the refusal. A shrink can need more
 scratch than a grow, and valid dimensions do not guarantee budget admission.
 These are finite storage reservations, **not practical host-memory limits**.
+
+## Resize outcomes and retained output
+
+A resize first reserves and prepares the new model and scratch, then performs
+the PTY ioctl, and only on success commits the model and stored request. Failure
+releases provisional ownership and emits a correlated refusal with unchanged
+geometry. Geometry shares the ordered output stream with DATA: old output is
+parsed/rendered before the boundary and new output afterward. The CLI shows a
+bounded live refusal notice even with `--status off`; that notice does not reduce
+the remote geometry or generate another resize. A refused desired revision stays
+latched across repaint and warm reconnect. Changing away and back allows retry.
+The client keeps one request in flight and coalesces newer intent; reconnect
+transfers intent/refusal state only to the same channel instance.
+
+At the default uid limit, an initially 512×255 screen can refuse growth to
+512×256 while remaining usable. A subsequent same-width shrink to 512×254 uses
+2,097,136 simultaneous row slots, within the 2,097,152 limit. Acceptance tests
+check the real PTY, authoritative outcome, repaint after warm reconnect and
+addressed/wrapped rendering. A refusal is not evidence that all smaller sizes
+will fit: retained high water and scratch still determine admission.
+
+SSH resize has a different observable result: successfully sending a
+`window-change` request is **Unconfirmed**, because SSH provides no remote ioctl
+acknowledgement for it. A write failure is returned as an error; it is never
+reported as confirmed remote geometry.
+
+Each channel has one metadata budget shared by its producer and retained-output
+bridge: 128 ordinary entries / 8192 declared bytes, plus a fixed lifecycle
+allowance of 8 entries / 256 bytes (the concrete marker inventory uses 8 / 218).
+DATA retains its existing per-channel output-gate charge.
+Permits and DATA charges move with ownership through producer, bridge and bounded
+transport admission; queue insertion or serialization alone does not release
+them. The initial allowance includes both gap and bootstrap Geometry. Only Screen
+DATA records may be sliced or replaced by a newer snapshot. NoScreen DATA requires
+full-record admission and retains its bytes when credit is insufficient.
+
+Stream identity maps are bounded by the 240 application stream IDs, not by an
+append-only generation history. Teardown cannot debit a replacement instance.
+Ended Screen output cannot regenerate from a destroyed model: its bounded final
+snapshot/prefix and completion marker remain owned across attachment, together
+with active/draining lifecycle metadata. Abandoning an unacknowledged DATA
+frontier emits OutputGap: delivery to the application is uncertain, not proven
+lost. Metadata replacement alone does not create a gap. Repeated attach preserves
+an unacknowledged gap even without new DATA. Transport ACK is not application
+display.
+
+Before metadata/initial geometry, client retention is at most 64 KiB of DATA
+payload / 256 events per channel. Unclassified channels additionally share a
+512 KiB declared-byte / 2048-event limit across at most 240 unknown IDs. Declared
+length checks precede bulk parser allocations. Active snapshot entries are at
+most eight, but ended draining entries can occupy all remaining IDs. A partial
+output record survives an early Exit until drained; replacing an instance retires
+its parser, and repeated metadata cannot resurrect a completed instance.
+
+These declared queue charges exclude heap wrappers and allocator overhead. The
+model lease below does not bound all retained output, transport buffers, client
+history or process RSS. Broad queue/RSS accounting and stronger abandoned-tail
+continuity remain separate work; bounded retention is not exactly-once replay.
 
 ## Qualified storage implementation
 
@@ -255,8 +315,8 @@ this ledger is a full-process memory ceiling. Client scrollback, caller-owned
 input fixtures, daemon infrastructure, external logs and other tasks have their
 own storage lifetimes outside this per-model bound.
 
-Clients released before these limits do not enforce the combining-mark cap.
-They may retain extra marks in over-limit live output or replay; exact cell
-equivalence for that input requires a client with the same limits. The replay
-repair preserves cursor position and the last input scalar, but does not impose
-the new client memory policy on an older executable.
+These bounds apply to executables with the same terminal policy. Older clients
+can retain additional combining marks; replay repair preserves cursor position
+and the last input scalar but cannot impose a new memory policy on another
+executable. Protocol-1 clients cannot establish QSH sessions with the current
+protocol-2 daemon.

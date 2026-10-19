@@ -1,9 +1,8 @@
-//! Spec §9.3 (2): the console client across versions, with real binaries on
-//! a real pseudo-terminal. The current-client/current-daemon case runs by
-//! default. Cross-version cases are ignored and require `ab40ae6`'s `qsh`
-//! and `qshd` built in a separate clone:
-//!
-//! `QSH_OLD_QSH=<old qsh> QSH_OLD_QSHD=<old qshd> cargo test -p qsh --test mixed_versions -- --ignored --nocapture --test-threads=1`
+//! Published v0.5.0 (protocol 1) versus the current protocol 2, on real PTYs.
+//! Opt-in fixtures are the unchanged binaries from the published release:
+//! `QSH_OLD_QSH=<v0.5.0 qsh> QSH_OLD_QSHD=<v0.5.0 qshd> cargo test -p qsh --test mixed_versions -- --ignored --nocapture --test-threads=1`
+//! Incompatible peers must never start a shell; compatible pairs prove the
+//! shell-start counter and real I/O. Current-peer flood/paste coverage stays active.
 
 use std::io::{Read, Write};
 use std::net::UdpSocket;
@@ -33,8 +32,12 @@ fn free_udp_port() -> u16 {
 
 /// Waits for `probe` to hold, or gives up. Generous on purpose: a slow
 /// machine must make this test slower, never red.
-fn wait_until(mut probe: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
+fn wait_until(probe: impl FnMut() -> bool) -> bool {
+    wait_within(Duration::from_secs(20), probe)
+}
+
+fn wait_within(timeout: Duration, mut probe: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if probe() {
             return true;
@@ -187,6 +190,10 @@ fn drain_into(mut reader: impl Read + Send + 'static, sink: std::sync::Arc<Mutex
 
 /// A daemon from `qshd` with one authorized key, and the key's path.
 fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
+    start_daemon_with_ready_timeout(qshd, Duration::from_secs(20))
+}
+
+fn start_daemon_with_ready_timeout(qshd: &Path, timeout: Duration) -> (Daemon, PathBuf) {
     let home = tempfile::tempdir().expect("tempdir");
     let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
         .expect("generate");
@@ -206,6 +213,18 @@ fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
     )
     .expect("write authorized_keys");
 
+    use std::os::unix::fs::PermissionsExt;
+    let shell = home.path().join("tracked-shell");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nexec /bin/sh \"$@\"\n",
+            home.path().join("shell-starts").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+    qshd::load_or_create_transport_key(&home.path().join("host_key")).unwrap();
     let port = free_udp_port();
     let mut child = Command::new(qshd)
         .args([
@@ -224,6 +243,11 @@ fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
         // typed commands to their real shell history.
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .env("SHELL", &shell)
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -232,16 +256,18 @@ fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
     let output = std::sync::Arc::new(Mutex::new(Vec::new()));
     drain_into(child.stdout.take().expect("piped stdout"), output.clone());
     drain_into(child.stderr.take().expect("piped stderr"), output.clone());
-
-    (
-        Daemon {
-            child,
-            port,
-            output,
-            home,
-        },
-        key_path,
-    )
+    let daemon = Daemon {
+        child,
+        port,
+        output,
+        home,
+    };
+    assert!(
+        wait_within(timeout, || daemon.output_text().contains("server-pubkey:")),
+        "daemon did not bind its port: {}",
+        daemon.output_text()
+    );
+    (daemon, key_path)
 }
 
 /// Runs `qsh` (the binary at `qsh`) on a pseudo-terminal, with `extra`
@@ -274,7 +300,7 @@ fn spawn_qsh(
         key_path.to_str().expect("utf-8"),
     ];
     args.extend_from_slice(extra);
-    args.push("127.0.0.1");
+    args.push("127.0.0.1,nossh");
     let mut command = Command::new(qsh);
     command
         .args(&args)
@@ -283,6 +309,8 @@ fn spawn_qsh(
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_CACHE_HOME", config_home)
         .env("TERM", "xterm-256color")
+        .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AGENT_PID")
         .stdin(Stdio::from(slave.try_clone().expect("clone")))
         .stdout(Stdio::from(slave.try_clone().expect("clone")))
         .stderr(Stdio::from(slave.try_clone().expect("clone")));
@@ -329,9 +357,11 @@ fn wait_for_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
 }
 
 fn old_binary(var: &str) -> PathBuf {
-    PathBuf::from(std::env::var(var).unwrap_or_else(|_| {
-        panic!("{var} names the binary built from ab40ae6 (see the module doc)")
-    }))
+    PathBuf::from(
+        std::env::var(var).unwrap_or_else(|_| {
+            panic!("{var} names the published v0.5.0 binary (see the module doc)")
+        }),
+    )
 }
 
 fn this_qsh() -> PathBuf {
@@ -440,17 +470,73 @@ fn paste_a_megabyte(client: &mut Client, seen: &Arc<Mutex<Vec<u8>>>, daemon: &Da
 
 fn leave(mut client: Client) {
     client.master.write_all(b"exit\n").expect("type exit");
-    let _ = wait_for_exit(&mut client.child);
+    assert_eq!(
+        wait_for_exit(&mut client.child)
+            .expect("client exits")
+            .code(),
+        Some(0)
+    );
 }
 
-/// §8.1, row 5: the old `qsh` with this daemon -- sign-in, echo, 8 MB of
-/// output as screen repaints, Ctrl-C.
+fn shell_starts(daemon: &Daemon) -> usize {
+    std::fs::read_to_string(daemon.home.path().join("shell-starts"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn incompatible(client_bin: &Path, daemon_bin: &Path, current_client: bool) {
+    let (mut daemon, key) = start_daemon_from(daemon_bin);
+    let config = tempfile::tempdir().unwrap();
+    let server = qshd::load_or_create_transport_key(&daemon.home.path().join("host_key")).unwrap();
+    sshauth::known_hosts::KnownHosts::open(config.path().join("qsh/known_hosts"))
+        .pin("127.0.0.1", daemon.port, &server.public)
+        .unwrap();
+    let mut client = spawn_qsh(
+        client_bin,
+        &daemon,
+        &key,
+        config.path(),
+        &["--status", "off"],
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    drain_into(client.master.try_clone().unwrap(), seen.clone());
+    let status = wait_for_exit(&mut client.child)
+        .unwrap_or_else(|| panic!("incompatible attempt must terminate: {}", text(&seen)));
+    assert_eq!(
+        status.code(),
+        Some(12),
+        "expected connection refusal, not a crash or unrelated failure"
+    );
+    let output = text(&seen);
+    assert!(
+        output.contains("qsh: could not connect:"),
+        "missing connection diagnostic: {output}"
+    );
+    assert!(
+        !output.contains("\x1b[?1049h"),
+        "application terminal was entered: {output}"
+    );
+    assert_eq!(
+        shell_starts(&daemon),
+        0,
+        "incompatible attempt started a shell"
+    );
+    if current_client {
+        assert!(output.contains("protocol 2"), "{output}");
+    }
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "daemon died during rejection"
+    );
+}
+
 #[test]
-#[ignore = "needs QSH_OLD_QSH, the qsh built from ab40ae6; see the module doc"]
-fn an_old_qsh_works_with_this_daemon() {
+#[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSH and QSH_OLD_QSHD"]
+fn published_v050_pair_is_a_real_shell_start_positive_control() {
     let _serial = serialised();
-    let (daemon, key) = start_daemon_from(&qshd_path());
-    let config = tempfile::tempdir().expect("tempdir");
+    let (daemon, key) = start_daemon_from(&old_binary("QSH_OLD_QSHD"));
+    let config = tempfile::tempdir().unwrap();
     let mut client = spawn_qsh(
         &old_binary("QSH_OLD_QSH"),
         &daemon,
@@ -459,36 +545,24 @@ fn an_old_qsh_works_with_this_daemon() {
         &[],
     );
     let seen = Arc::new(Mutex::new(Vec::new()));
-    drain_into(
-        client.master.try_clone().expect("clone master"),
-        seen.clone(),
-    );
+    drain_into(client.master.try_clone().unwrap(), seen.clone());
     sign_in(&mut client, &seen, &daemon);
-    follow_8_mb_of_output_as_repaints_and_interrupt(&mut client, &seen, &daemon);
+    assert_eq!(shell_starts(&daemon), 1);
     leave(client);
 }
 
-/// §8.1, row 3: this `qsh` with an old daemon -- sign-in and echo, in the
-/// old mode, which the verbose log names.
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn this_qsh_works_with_an_old_daemon_in_the_old_mode() {
+#[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSH"]
+fn published_v050_client_cannot_mutate_protocol2_daemon() {
     let _serial = serialised();
-    let (daemon, key) = start_daemon_from(&old_binary("QSH_OLD_QSHD"));
-    let config = tempfile::tempdir().expect("tempdir");
-    let mut client = spawn_qsh(&this_qsh(), &daemon, &key, config.path(), &["--verbose"]);
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    drain_into(
-        client.master.try_clone().expect("clone master"),
-        seen.clone(),
-    );
-    sign_in(&mut client, &seen, &daemon);
-    let log = std::fs::read_to_string(config.path().join("qsh").join("log")).unwrap_or_default();
-    assert!(
-        log.contains("transport features: none (peer predates negotiation)"),
-        "the verbose log: {log}"
-    );
-    leave(client);
+    incompatible(&old_binary("QSH_OLD_QSH"), &qshd_path(), false);
+}
+
+#[test]
+#[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSHD"]
+fn protocol2_client_cannot_mutate_published_v050_daemon() {
+    let _serial = serialised();
+    incompatible(&this_qsh(), &old_binary("QSH_OLD_QSHD"), true);
 }
 
 /// §8.1, row 6 with real binaries: this `qsh` and this daemon, the header
@@ -506,77 +580,95 @@ fn this_qsh_follows_a_flood_as_screen_repaints_with_the_header_under_aead() {
         seen.clone(),
     );
     sign_in(&mut client, &seen, &daemon);
+    assert_eq!(shell_starts(&daemon), 1);
     follow_8_mb_of_output_as_repaints_and_interrupt(&mut client, &seen, &daemon);
     let log = std::fs::read_to_string(config.path().join("qsh").join("log")).unwrap_or_default();
     assert!(
-        log.contains("transport features: header-aad stream-credit offset-wrap"),
+        log.contains("transport features: header-aad stream-credit offset-wrap channel-geometry"),
         "all three, credits among them: {log}"
     );
     leave(client);
 }
 
-/// §8.1, row 3 with a flood (spec §4.13): this `qsh` against an old daemon,
-/// which has neither credits nor a screen channel's collapsing and sends
-/// all 8 MB. The client's driver waits whenever more than 1 MiB waits for
-/// the terminal, and goes on as the terminal takes it: all of it arrives,
-/// the shell answers after it, and Ctrl-C gets through.
+/// Bulk input remains supported between geometry-capable peers.
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn this_qsh_follows_a_flood_from_an_old_daemon_through_its_bounded_queue() {
-    let _serial = serialised();
-    let (daemon, key) = start_daemon_from(&old_binary("QSH_OLD_QSHD"));
-    let config = tempfile::tempdir().expect("tempdir");
-    let mut client = spawn_qsh(&this_qsh(), &daemon, &key, config.path(), &[]);
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    drain_into(
-        client.master.try_clone().expect("clone master"),
-        seen.clone(),
-    );
-    sign_in(&mut client, &seen, &daemon);
-    follow_8_mb_of_output_as_repaints_and_interrupt(&mut client, &seen, &daemon);
-    leave(client);
-}
-
-/// §8.1, row 5 with a paste: the old `qsh` -- a sender without credits,
-/// against this daemon's receive bound for such senders -- pastes 1 MiB.
-#[test]
-#[ignore = "needs QSH_OLD_QSH, the qsh built from ab40ae6; see the module doc"]
-fn an_old_qsh_pastes_a_megabyte_into_this_daemon() {
+fn current_qsh_pastes_a_megabyte_into_current_daemon() {
     let _serial = serialised();
     let (daemon, key) = start_daemon_from(&qshd_path());
-    let config = tempfile::tempdir().expect("tempdir");
-    let mut client = spawn_qsh(
-        &old_binary("QSH_OLD_QSH"),
-        &daemon,
-        &key,
-        config.path(),
-        &[],
-    );
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_qsh(&this_qsh(), &daemon, &key, config.path(), &[]);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    drain_into(
-        client.master.try_clone().expect("clone master"),
-        seen.clone(),
-    );
+    drain_into(client.master.try_clone().unwrap(), seen.clone());
     sign_in(&mut client, &seen, &daemon);
+    assert_eq!(shell_starts(&daemon), 1);
     paste_a_megabyte(&mut client, &seen, &daemon);
     leave(client);
 }
 
-/// §8.1, row 3 with a paste: this `qsh`, without credits against an old
-/// daemon, pastes 1 MiB.
+fn fixture_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn this_qsh_pastes_a_megabyte_into_an_old_daemon() {
+fn fixture_readiness_timeout_kills_and_reaps_its_owned_daemon() {
     let _serial = serialised();
-    let (daemon, key) = start_daemon_from(&old_binary("QSH_OLD_QSHD"));
-    let config = tempfile::tempdir().expect("tempdir");
-    let mut client = spawn_qsh(&this_qsh(), &daemon, &key, config.path(), &[]);
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    drain_into(
-        client.master.try_clone().expect("clone master"),
-        seen.clone(),
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fixture_executable(
+        dir.path(),
+        "silent-daemon",
+        r#"printf '%s\n' "$$" > "$0.pid"
+exec sleep 60"#,
     );
-    sign_in(&mut client, &seen, &daemon);
-    paste_a_megabyte(&mut client, &seen, &daemon);
-    leave(client);
+    let outcome =
+        std::panic::catch_unwind(|| start_daemon_with_ready_timeout(&fake, Duration::from_secs(1)));
+    assert!(outcome.is_err(), "silent fixture unexpectedly became ready");
+    let pid: libc::pid_t = std::fs::read_to_string(dir.path().join("silent-daemon.pid"))
+        .expect("the fixture actually executed")
+        .trim()
+        .parse()
+        .unwrap();
+    let mut status = 0;
+    // SAFETY: this PID belongs to the direct child this fixture spawned. A
+    // successful waitpid probe establishes ownership before the RED cleanup.
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    if waited == 0 {
+        // The failed implementation must not leak a process even on RED.
+        // Our still-unreaped child cannot have its PID reused before waitpid.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    assert_eq!(
+        (waited, error),
+        (-1, Some(libc::ECHILD)),
+        "readiness unwind must kill and reap its child before returning"
+    );
+}
+
+#[test]
+fn fixture_incompatible_oracle_rejects_an_unrelated_client_failure() {
+    let _serial = serialised();
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fixture_executable(
+        dir.path(),
+        "failed-client",
+        r#"printf 'ran' > "$0.ran"
+exit 1"#,
+    );
+    let outcome = std::panic::catch_unwind(|| incompatible(&fake, &qshd_path(), false));
+    assert_eq!(
+        std::fs::read(dir.path().join("failed-client.ran")).unwrap(),
+        b"ran",
+        "the client must have run; a setup failure cannot satisfy this oracle"
+    );
+    assert!(
+        outcome.is_err(),
+        "unrelated exit 1 was accepted as protocol rejection"
+    );
 }

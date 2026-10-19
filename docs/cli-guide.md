@@ -177,7 +177,22 @@ coordinates are adjusted accordingly.
 The status line shows the active address when there are several, latency, and
 silence duration or the recovery stage. `--status off` hides it initially; a
 temporary status display still appears during connection loss, recovery, or
-history browsing.
+history browsing. A resize refusal also stays visible while the connection is
+live, even with status hidden. The notice does not take another remote row.
+
+Window changes request a new remote size. Until the server confirms it, qsh
+keeps parsing output at the last committed dimensions and crops or pads that
+screen into the physical window. A refusal leaves the remote PTY and model
+unchanged and names the reason. While this client keeps the same channel,
+repainting or reconnecting does not retry that refused request. Change the
+window size to retry; moving away and back also counts as a new request.
+Zero-sized windows suspend resize requests. SSH sessions can only
+report that `window-change` was sent, not that the remote PTY applied it.
+
+QSH requires protocol 2 with channel geometry. The published v0.5.0 protocol-1
+client and daemon cannot open a QSH session with these peers; update the peer
+through its normal installation path. An unanswered UDP attempt does not prove
+which version is at the address. Configured SSH recovery remains available.
 
 Press `Ctrl-]`, then one key:
 

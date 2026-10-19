@@ -1,16 +1,8 @@
-//! Spec §9.3 (2): this build against the build from before negotiation
-//! (`ab40ae6`, the qshd the app ships today), with real binaries. Ignored:
-//! run before the app's submodule pointer moves, with the old qshd built from
-//! `ab40ae6` in a clone of its own (or the app's `qshd-0.2.0-x86_64`, the
-//! same commit):
-//!
-//! `QSH_OLD_QSHD=<old qshd> cargo test -p qshd --test mixed_versions -- --ignored --nocapture --test-threads=1`
-//!
-//! Here: this build's client against an old personal daemon -- it signs in
-//! and works in the old mode -- and the old daemon updated over qsh to this
-//! build, after which the same client negotiates; and the same image through
-//! a road that reorders past the old daemon's replay window of 64. The
-//! console client's pairs are in `cli/tests/mixed_versions.rs`.
+//! Protocol-2 boundary and current-peer update tests using real daemons.
+//! The released-peer negative case requires the unchanged published v0.5.0
+//! QSH_OLD_QSHD. Image transfer is tested only between protocol-2 peers; a
+//! protocol-1 session cannot carry a protocol-2 daemon update.
+//! Run explicitly with `cargo test -p qshd --test mixed_versions -- --ignored --test-threads=1`.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
@@ -100,7 +92,13 @@ fn self_check(bin: &Path) -> SelfCheck {
 }
 
 /// Start `transport-ensure` from `bin`, return the server's Noise key.
-fn start_daemon(bin: &Path, home: &Path, port: u16, client_pub: [u8; 32]) -> [u8; 32] {
+fn start_daemon(
+    bin: &Path,
+    home: &Path,
+    port: u16,
+    client_pub: [u8; 32],
+    labels: &str,
+) -> [u8; 32] {
     let mut child = Command::new(bin)
         .args([
             "transport-ensure",
@@ -112,6 +110,12 @@ fn start_daemon(bin: &Path, home: &Path, port: u16, client_pub: [u8; 32]) -> [u8
             &BASE64.encode(client_pub),
         ])
         .env("XDG_CACHE_HOME", home)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env("SHELL", "/bin/sh")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .env(TEST_BUILD_LABELS_ENV, labels)
         .env("HISTFILE", "/dev/null")
         .env("TMUX_TMPDIR", home)
         .env_remove("TMUX")
@@ -210,7 +214,7 @@ fn connect(
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
-            required_features: transport::Features::NONE,
+            required_features: transport::Features::CHANNEL_GEOMETRY,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -275,7 +279,7 @@ fn send_image(client: &StdClient, image: &[u8]) {
 /// new binary over the one the daemon runs from.
 fn old_qshd_copy() -> (tempfile::TempDir, PathBuf) {
     let from = std::env::var("QSH_OLD_QSHD")
-        .expect("QSH_OLD_QSHD names the qshd built from ab40ae6 (see the module doc)");
+        .expect("QSH_OLD_QSHD names the unchanged published v0.5.0 qshd");
     let dir = tempfile::tempdir().expect("binary dir");
     let bin = dir.path().join("qshd");
     copy_executable(Path::new(&from), &bin);
@@ -298,28 +302,37 @@ fn this_qshd_image() -> (tempfile::TempDir, PathBuf, Vec<u8>) {
     (dir, path, bytes)
 }
 
-/// §8.1, row 2: this build's client signs in to an old personal daemon, in
-/// the old mode, and a channel opens.
+/// Even an explicitly allowlisted key cannot cross the wire-version boundary.
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn this_client_signs_in_to_an_old_personal_daemon_in_the_old_mode() {
+#[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSHD"]
+fn protocol2_client_cannot_allocate_a_connection_on_published_v050() {
     let _serial = serialised();
     let (_bin_dir, bin) = old_qshd_copy();
-    let home = tempfile::tempdir().expect("home");
-    let sock = home.path().join("qsh").join("control.sock");
+    let home = tempfile::tempdir().unwrap();
+    let sock = home.path().join("qsh/control.sock");
     let kp = generate_keypair();
     let port = free_udp_port();
     let _guard = DaemonGuard::new(sock.clone());
-    let server_pub = start_daemon(&bin, home.path(), port, kp.public);
+    let server_pub = start_daemon(&bin, home.path(), port, kp.public, "");
     assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
-
-    let (client, events) = connect(home.path(), port, server_pub, kp.private, [1; 16]);
-    assert_eq!(
-        client.features(),
-        Some(Features::NONE),
-        "an old daemon enables nothing"
+    assert_eq!(status(&sock).unwrap().total_connections, 0);
+    let events = Arc::new(Events::default());
+    let client = StdClient::connect(
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
+        ConnectionConfig {
+            required_features: Features::CHANNEL_GEOMETRY,
+            features: Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: kp.private,
+            remote_static_pub: Some(server_pub),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        },
+        [1; 16],
+        StartKind::Cold,
+        Arc::new(NoopBinder),
+        events.clone(),
+        None,
     );
-    let _ = ask_about(home.path(), &client, &events);
     client.send_bytes(
         CONTROL_STREAM,
         encode_client(&ClientRecord::Open(OpenRequest {
@@ -327,43 +340,51 @@ fn this_client_signs_in_to_an_old_personal_daemon_in_the_old_mode() {
             kind: ChannelKind::Shell,
             cols: 80,
             rows: 24,
-            screen: false,
+            screen: true,
             command: Vec::new(),
         })),
     );
-    assert!(
-        wait_for(Duration::from_secs(15), || events.has(|r| *r
-            == ServerRecord::Opened {
-                stream: FIRST_CHANNEL_STREAM
-            })),
-        "log:\n{}",
-        daemon_log(home.path())
-    );
-    client.close();
+    assert!(!wait_for(Duration::from_secs(3), || events
+        .records
+        .lock()
+        .unwrap()
+        .live));
+    assert!(events.control().is_empty());
+    assert_eq!(status(&sock).unwrap().total_connections, 0);
+    client.detach();
 }
 
-/// §8.1, row 2 and device acceptance 4: an old personal daemon takes this
-/// build over qsh -- the image goes up in the old mode -- and the same key
-/// then negotiates with the daemon it became.
+fn current_qshd_copy() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("qshd");
+    copy_executable(Path::new(env!("CARGO_BIN_EXE_qshd")), &bin);
+    (dir, bin)
+}
+
+/// A current personal daemon accepts a newer image over the current protocol.
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn an_old_personal_daemon_takes_this_build_over_qsh_and_then_negotiates() {
+#[ignore = "opt-in real self-reexec image transfer; needs strip (binutils)"]
+fn current_personal_daemon_takes_a_newer_image_over_protocol2() {
     let _serial = serialised();
-    let (_bin_dir, bin) = old_qshd_copy();
+    let (_bin_dir, bin) = current_qshd_copy();
     let (_image_dir, image_path, image) = this_qshd_image();
-    let new_build = self_check(&image_path).build;
+    let new_build = self_check(&image_path).build + 1;
+    let labels = format!("{}={new_build}", hex::encode(sha256(&image)));
     let home = tempfile::tempdir().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
     let kp = generate_keypair();
     let port = free_udp_port();
     let _guard = DaemonGuard::new(sock.clone());
-    let server_pub = start_daemon(&bin, home.path(), port, kp.public);
+    let server_pub = start_daemon(&bin, home.path(), port, kp.public, &labels);
     assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
 
     let (client, events) = connect(home.path(), port, server_pub, kp.private, [1; 16]);
-    assert_eq!(client.features(), Some(Features::NONE));
+    assert_eq!(client.features(), Some(Features::SUPPORTED));
     let old = ask_about(home.path(), &client, &events);
-    assert!(old.build < new_build, "this build is newer than ab40ae6");
+    assert!(
+        old.build < new_build,
+        "the image has a newer test build label"
+    );
     offer(&client, &image, new_build);
     assert!(
         wait_for(Duration::from_secs(15), || events
@@ -419,16 +440,13 @@ struct Passed {
 const LARGE: usize = 1000;
 /// Every this many large datagrams, one is held back...
 const HOLD_EVERY: u64 = 25;
-/// ...until this many more have passed it: further back than an old
-/// receiver's replay window of 64 reaches.
+/// ...until this many more have passed it, inside the current replay window.
 const HOLD_BEHIND: u64 = 100;
 
 /// A loopback road between a client and a daemon that holds every
 /// [`HOLD_EVERY`]-th large datagram towards the daemon back behind
 /// [`HOLD_BEHIND`] later ones, and counts what passes each way. A daemon
-/// from before this slice discards such a datagram as a replay, so its
-/// bytes have to be sent again; a daemon of this build (a window of 32 704)
-/// would take it late.
+/// with the current 32,704-packet replay window must accept the delayed data.
 struct Relay {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -525,33 +543,27 @@ impl Drop for Relay {
     }
 }
 
-/// §8.1, row 2, with the old side's replay window of 64 and its ACK for
-/// every DATA met by this build's sender (spec §9.3; the in-process old
-/// peer models neither). The road holds every 25th datagram of the image
-/// behind 100 later ones, so the old daemon discards it and the client
-/// sends its bytes again; the image still arrives whole -- the daemon
-/// checks its sha256 before it restarts. The old daemon answers each DATA
-/// it takes with an ACK of its own, one datagram each, and the datagrams
-/// held past its window draw none: that is what the counts on the road
-/// show.
+/// Delayed image datagrams remain within the current replay window. The
+/// receiver verifies the complete image checksum before successful reexec.
 #[test]
-#[ignore = "needs QSH_OLD_QSHD, the qshd built from ab40ae6; see the module doc"]
-fn an_old_daemon_takes_this_build_through_a_road_that_reorders_past_its_replay_window() {
+#[ignore = "opt-in real self-reexec image transfer; needs strip (binutils)"]
+fn current_daemon_takes_an_image_through_a_reordering_road() {
     let _serial = serialised();
-    let (_bin_dir, bin) = old_qshd_copy();
+    let (_bin_dir, bin) = current_qshd_copy();
     let (_image_dir, image_path, image) = this_qshd_image();
-    let new_build = self_check(&image_path).build;
+    let new_build = self_check(&image_path).build + 1;
+    let labels = format!("{}={new_build}", hex::encode(sha256(&image)));
     let home = tempfile::tempdir().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
     let kp = generate_keypair();
     let port = free_udp_port();
     let _guard = DaemonGuard::new(sock.clone());
-    let server_pub = start_daemon(&bin, home.path(), port, kp.public);
+    let server_pub = start_daemon(&bin, home.path(), port, kp.public, &labels);
     assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
     let relay = Relay::start(port);
 
     let (client, events) = connect(home.path(), relay.port, server_pub, kp.private, [1; 16]);
-    assert_eq!(client.features(), Some(Features::NONE));
+    assert_eq!(client.features(), Some(Features::SUPPORTED));
     let _ = ask_about(home.path(), &client, &events);
     offer(&client, &image, new_build);
     assert!(
@@ -582,25 +594,15 @@ fn an_old_daemon_takes_this_build_through_a_road_that_reorders_past_its_replay_w
     let answers = after.down - before.down;
     println!(
         "{} image bytes in {took:?}: {data} large datagrams up ({held} held back \
-         past the window), {answers} datagrams down",
+         behind later packets), {answers} datagrams down",
         image.len()
     );
-    assert!(
-        held > 0,
-        "the road pushed datagrams out of the window: {after:?}"
-    );
+    assert!(held > 0, "the road actually reordered datagrams: {after:?}");
     assert!(
         data > image.len() as u64 / 1500,
         "the image went up in datagrams: {after:?}"
     );
-    assert!(
-        answers >= (data - held) * 9 / 10,
-        "the old daemon answers every DATA it takes: {answers} for {data}"
-    );
-    assert!(
-        answers + held / 2 <= data,
-        "the datagrams held past its window draw no answer: {answers} for {data}, {held} held"
-    );
+    assert!(answers > 0, "the receiver answered through the relay");
     assert!(
         wait_for(Duration::from_secs(15), || status(&sock)
             .is_some_and(|s| s.build == new_build)),
