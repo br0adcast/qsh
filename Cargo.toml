@@ -1,6 +1,7 @@
 [workspace]
+exclude = ["vendor/vte"]
 resolver = "2"
-members = ["qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
+members = ["crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
 
 [workspace.package]
 edition = "2021"
@@ -18,3 +19,6 @@ license = "AGPL-3.0-only"
 opt-level = 1
 debug-assertions = true
 overflow-checks = true
+
+[patch.crates-io]
+vte = { path = "vendor/vte" }

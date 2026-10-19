@@ -411,8 +411,7 @@ fn a_daemon_that_gives_its_key_but_not_the_login_is_said_so() {
         screen.text()
     );
     let line = format!(
-        "qsh:   127.0.0.1:{p}: qshd answered the key request but not the login -- a different \
-         qsh version, or the daemon is overloaded; its log says more"
+        "qsh:   127.0.0.1:{p}: No compatible response; this client requires QSH protocol 2"
     );
     assert!(
         screen.next("qsh: could not connect:") && screen.next(&line),
@@ -1002,7 +1001,7 @@ fn an_address_with_another_server_key_than_its_neighbour_ends_the_run() {
 
 /// Spec §4a rule 3, the other answer: the key request at the silent
 /// address offers the neighbour's very key, so the silence has another
-/// cause -- the ordinary "answered the key request but not the login",
+/// cause -- the ordinary protocol-2 compatibility diagnostic,
 /// and nothing pinned on that offer alone. The neighbour is a name that
 /// does not resolve: its pin is all it contributes, and it fails at once.
 #[test]
@@ -1032,10 +1031,8 @@ fn the_neighbour_s_key_offered_back_is_the_ordinary_silence() {
         "{}",
         screen.text()
     );
-    let line = format!(
-        "qsh:   {first}: qshd answered the key request but not the login -- a different \
-         qsh version, or the daemon is overloaded; its log says more"
-    );
+    let line =
+        format!("qsh:   {first}: No compatible response; this client requires QSH protocol 2");
     assert!(
         screen.next("qsh: could not connect:") && screen.next(&line),
         "missing {line:?}; client saw: {}",

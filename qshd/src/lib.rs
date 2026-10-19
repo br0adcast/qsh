@@ -67,6 +67,7 @@ pub mod log;
 pub mod nonce_pool;
 pub mod pty;
 pub mod screen;
+pub mod screen_budget;
 pub mod serve;
 pub mod state;
 pub mod transport_daemon;
@@ -130,3 +131,6 @@ pub(crate) mod test_support {
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
+
+#[cfg(all(test, feature = "system"))]
+mod test_allocator;

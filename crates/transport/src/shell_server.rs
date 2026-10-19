@@ -55,6 +55,7 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::time::Instant;
+use terminal_size::TerminalSize;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -90,7 +91,32 @@ const STREAM_CONTROL: u8 = 1;
 /// over the PTY master side.
 pub trait ResizeHandle: Send {
     /// Resize the terminal to `cols` columns by `rows` rows.
-    fn resize(&self, cols: u16, rows: u16);
+    fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String>;
+}
+
+/// Preparation failed before any PTY or model mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenPreparationError {
+    ResourceLimit(String),
+    PreparationFailed(String),
+}
+
+impl std::fmt::Display for ScreenPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceLimit(detail) | Self::PreparationFailed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+/// A model resize reserved before PTY ioctl; cancellation leaves it unchanged.
+pub trait PreparedScreenResize: Send {
+    fn commit(self: Box<Self>);
+}
+
+struct EmptyResize;
+impl PreparedScreenResize for EmptyResize {
+    fn commit(self: Box<Self>) {}
 }
 
 /// The session's own model of what is on the screen.
@@ -109,9 +135,12 @@ pub trait SessionScreen: Send {
     /// with exactly the bytes that also go on the wire.
     fn absorb(&mut self, bytes: &[u8]);
 
-    /// The terminal changed size. Called with the size just applied to the
-    /// PTY, so the model and the PTY never disagree about geometry.
-    fn resize(&mut self, cols: u16, rows: u16);
+    /// Reserve model storage before touching the PTY. Drop cancels; commit
+    /// applies the model only after the PTY accepted the same geometry.
+    fn prepare_resize(
+        &mut self,
+        size: TerminalSize,
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError>;
 
     /// Bytes that rebuild the current screen from scratch: content, cursor
     /// and modes. An empty answer means "nothing to say" and puts nothing on
@@ -146,7 +175,12 @@ pub struct NoScreen;
 
 impl SessionScreen for NoScreen {
     fn absorb(&mut self, _bytes: &[u8]) {}
-    fn resize(&mut self, _cols: u16, _rows: u16) {}
+    fn prepare_resize(
+        &mut self,
+        _size: TerminalSize,
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError> {
+        Ok(Box::new(EmptyResize))
+    }
     fn repaint(&mut self) -> Vec<u8> {
         Vec::new()
     }
@@ -164,6 +198,12 @@ enum Wakeup {
     Timeout,
     PtyOut(Option<Vec<u8>>),
     AckTick,
+}
+
+fn legacy_shell_config(mut cfg: ConnectionConfig) -> ConnectionConfig {
+    cfg.features =
+        crate::Features::from_bits(cfg.features.bits() & !crate::Features::CHANNEL_GEOMETRY.bits());
+    cfg
 }
 
 /// Serve a single interactive shell on socket `socket` with config `cfg`
@@ -203,6 +243,7 @@ pub async fn serve_shell(
     writer: Box<dyn Write + Send>,
     resize: Box<dyn ResizeHandle>,
 ) {
+    let cfg = legacy_shell_config(cfg);
     // The PTY bridge: two blocking tasks + two channels. The PTY reader puts
     // chunks into `pty_out`, the PTY writer pulls chunks from `pty_in`.
     let (pty_out_tx, mut pty_out_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
@@ -447,8 +488,9 @@ fn apply_resize_records(buf: &mut Vec<u8>, resize: &dyn ResizeHandle) -> Option<
         }
         let cols = u16::from_be_bytes([buf[consumed + 1], buf[consumed + 2]]);
         let rows = u16::from_be_bytes([buf[consumed + 3], buf[consumed + 4]]);
-        resize.resize(cols, rows);
-        applied = Some((cols, rows));
+        if TerminalSize::new(cols, rows).is_ok() && resize.try_resize(cols, rows).is_ok() {
+            applied = Some((cols, rows));
+        }
         consumed += RECORD_LEN;
     }
     buf.drain(..consumed);
@@ -519,8 +561,9 @@ mod tests {
     }
 
     impl ResizeHandle for RecordingResize {
-        fn resize(&self, cols: u16, rows: u16) {
+        fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
             self.sizes.lock().unwrap().push((cols, rows));
+            Ok(())
         }
     }
 
@@ -529,6 +572,47 @@ mod tests {
         v.extend_from_slice(&cols.to_be_bytes());
         v.extend_from_slice(&rows.to_be_bytes());
         v
+    }
+
+    struct FailingResize;
+    impl ResizeHandle for FailingResize {
+        fn try_resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Err("ioctl failed".into())
+        }
+    }
+    #[test]
+    fn legacy_shell_cannot_advertise_channel_geometry() {
+        let cfg = super::legacy_shell_config(ConnectionConfig {
+            required_features: crate::Features::NONE,
+            features: crate::Features::SUPPORTED | crate::Features::CHANNEL_GEOMETRY,
+            role: Role::Server,
+            local_static_priv: [7; 32],
+            remote_static_pub: None,
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        });
+        assert!(!cfg.features.contains(crate::Features::CHANNEL_GEOMETRY));
+        assert_eq!(
+            cfg.features.bits(),
+            crate::Features::SUPPORTED.bits() & !crate::Features::CHANNEL_GEOMETRY.bits()
+        );
+    }
+
+    #[test]
+    fn failed_legacy_ioctl_is_not_reported_as_applied() {
+        let mut buf = record(2, 2);
+        assert_eq!(apply_resize_records(&mut buf, &FailingResize), None);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn invalid_resize_records_never_reach_the_pty() {
+        let r = RecordingResize::new();
+        for (cols, rows) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)] {
+            let mut buf = record(cols, rows);
+            assert_eq!(apply_resize_records(&mut buf, &r), None);
+            assert!(buf.is_empty());
+        }
+        assert!(r.taken().is_empty());
     }
 
     #[test]
@@ -613,6 +697,7 @@ mod tests {
     fn an_exhausted_stream_ends_the_session_without_a_close() {
         let kp = crate::handshake::generate_keypair();
         let mut c = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,

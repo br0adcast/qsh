@@ -225,6 +225,8 @@ pub trait ClientEvents: Send + Sync {
     /// What the handshake agreed (spec §5.5), once per handshake, before
     /// `Live` reaches `on_state`. The default takes no notice.
     fn on_features(&self, _features: Features) {}
+    /// A bounded authenticated protocol failure, delivered before Closed.
+    fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
     /// The OS refused to send a datagram to `to`: its kind and its own
     /// words (e.g. `No route to host (os error 65)`). Called once per change
     /// of the error, not on every retransmit that fails the same way; the
@@ -1419,9 +1421,23 @@ fn dispatch_event(
             );
         }
         Event::InvalidHandshakeResponse { reason } => {
+            events.on_protocol_failure(if reason == crate::HsPayloadError::BadVersion {
+                crate::ProtocolFailure::UnsupportedProtocol {
+                    supported: crate::handshake_payload::HS_VERSION,
+                }
+            } else {
+                crate::ProtocolFailure::InvalidHandshake { reason }
+            });
             log::warn!("server sent an invalid authenticated handshake response: {reason}");
         }
+        Event::MissingRequiredFeatures { required, enabled } => {
+            events.on_protocol_failure(crate::ProtocolFailure::MissingRequiredFeatures {
+                required,
+                enabled,
+            });
+        }
         Event::UnofferedFeatureEnabled { enabled } => {
+            events.on_protocol_failure(crate::ProtocolFailure::UnofferedFeatures { enabled });
             #[cfg(test)]
             UNOFFERED_LOGGED.with(|n| n.set(n.get() + 1));
             log::warn!(
@@ -1518,6 +1534,56 @@ mod tests {
             "nothing changed and the second is not up: nothing to say"
         );
         assert!(stats_are_due(same, same, STATS_HEARTBEAT));
+    }
+
+    #[test]
+    fn authenticated_protocol_errors_reach_owner_before_closed() {
+        struct Capture(Mutex<Vec<Option<crate::ProtocolFailure>>>);
+        impl ClientEvents for Capture {
+            fn on_bytes(&self, _: u8, _: Vec<u8>) {}
+            fn on_stats(&self, _: Stats) {}
+            fn on_reset(&self, _: u8) {}
+            fn on_state(&self, state: LinkState) {
+                assert_eq!(state, LinkState::Closed);
+                self.0.lock().unwrap().push(None);
+            }
+            fn on_protocol_failure(&self, failure: crate::ProtocolFailure) {
+                self.0.lock().unwrap().push(Some(failure));
+            }
+        }
+        for (event, expected) in [
+            (
+                Event::InvalidHandshakeResponse {
+                    reason: crate::HsPayloadError::BadVersion,
+                },
+                crate::ProtocolFailure::UnsupportedProtocol {
+                    supported: crate::handshake_payload::HS_VERSION,
+                },
+            ),
+            (
+                Event::MissingRequiredFeatures {
+                    required: Features::CHANNEL_GEOMETRY,
+                    enabled: Features::NONE,
+                },
+                crate::ProtocolFailure::MissingRequiredFeatures {
+                    required: Features::CHANNEL_GEOMETRY,
+                    enabled: Features::NONE,
+                },
+            ),
+        ] {
+            let owner = Capture(Mutex::new(vec![]));
+            let mut state = LinkState::Connecting;
+            let mut pending = true;
+            dispatch_event(event, &owner, &mut state, &mut pending);
+            dispatch_event(
+                Event::StateChanged(LinkState::Closed),
+                &owner,
+                &mut state,
+                &mut pending,
+            );
+            assert_eq!(*owner.0.lock().unwrap(), vec![Some(expected), None]);
+            assert!(!pending);
+        }
     }
 
     struct OkBinder;
@@ -1762,6 +1828,7 @@ mod tests {
         let client = StdClient::connect(
             "255.255.255.255:9".parse().expect("addr"),
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -1845,6 +1912,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel::<bool>();
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -1880,6 +1948,7 @@ mod tests {
             tx: Mutex::new(state_tx),
         });
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -1951,6 +2020,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel::<Option<bool>>();
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -1992,6 +2062,7 @@ mod tests {
             tx: Mutex::new(state_tx),
         });
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2065,6 +2136,7 @@ mod tests {
         // its stats heartbeat to keep ticking.
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2134,6 +2206,7 @@ mod tests {
 
         let binder: Arc<dyn Binder> = Arc::new(OkBinder);
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2209,6 +2282,7 @@ mod tests {
         let binder: Arc<dyn Binder> = Arc::new(OkBinder);
         let events: Arc<dyn ClientEvents> = Arc::new(NullEvents);
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2286,6 +2360,7 @@ mod tests {
         let stop_seen = Arc::clone(&stop);
         let server = thread::spawn(move || {
             let mut conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2344,6 +2419,7 @@ mod tests {
         let client = StdClient::connect(
             server_addr,
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -2414,6 +2490,7 @@ mod tests {
                 },
             );
             let mut conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2470,6 +2547,7 @@ mod tests {
         let client = StdClient::connect(
             server_addr,
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -2542,6 +2620,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel::<(u8, Vec<u8>, [u8; 32])>();
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2577,6 +2656,7 @@ mod tests {
         let binder: Arc<dyn Binder> = Arc::new(OkBinder);
         let events: Arc<dyn ClientEvents> = Arc::new(NullEvents);
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2659,6 +2739,7 @@ mod tests {
         let client_pub = client_kp.public;
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2699,6 +2780,7 @@ mod tests {
             tx: Mutex::new(state_tx),
         });
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2795,6 +2877,7 @@ mod tests {
         let client_pub = client_kp.public;
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2830,6 +2913,7 @@ mod tests {
             tx: Mutex::new(state_tx),
         });
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -2936,6 +3020,7 @@ mod tests {
         let client_pub = client_kp.public;
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -2979,6 +3064,7 @@ mod tests {
             tx: Mutex::new(state_tx),
         });
         let client_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_kp.private,
@@ -3174,6 +3260,7 @@ mod tests {
     /// pumped over a std socket.
     fn server_conn(server_priv: [u8; 32], client_pub: [u8; 32]) -> Connection {
         Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Server,
             local_static_priv: server_priv,
@@ -3184,6 +3271,7 @@ mod tests {
 
     fn client_cfg(client_priv: [u8; 32], server_pub: [u8; 32]) -> ConnectionConfig {
         ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: crate::conn::Role::Client,
             local_static_priv: client_priv,
@@ -3531,6 +3619,7 @@ mod tests {
         let client_pub = client_kp.public;
         thread::spawn(move || {
             let mut server_conn = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Server,
                 local_static_priv: server_kp.private,
@@ -3567,6 +3656,7 @@ mod tests {
         let client = StdClient::connect(
             server_addr,
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -3631,6 +3721,7 @@ mod tests {
         let client = StdClient::connect(
             addr,
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -3726,6 +3817,7 @@ mod tests {
         let client = Arc::new(StdClient::connect(
             silent.local_addr().expect("addr"),
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,
@@ -3806,6 +3898,7 @@ mod tests {
         let client = Arc::new(StdClient::connect(
             silent.local_addr().expect("addr"),
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: crate::conn::Role::Client,
                 local_static_priv: client_kp.private,

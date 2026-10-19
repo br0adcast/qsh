@@ -33,6 +33,7 @@ fn pair() -> Pair {
     let caddr: SocketAddr = "198.51.100.7:40000".parse().expect("a literal address");
     let saddr: SocketAddr = "198.51.100.1:41000".parse().expect("a literal address");
     let mut client = Connection::new(ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Client,
         local_static_priv: client_kp.private,
@@ -40,6 +41,7 @@ fn pair() -> Pair {
         auth: AuthPolicy::Allowlist(Vec::new()),
     });
     let mut server = Connection::new(ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Server,
         local_static_priv: server_kp.private,

@@ -41,6 +41,8 @@ const UNREACHABLE_AFTER_MS: i64 = transport::HANDSHAKE_GIVE_UP_AFTER.as_millis()
 pub enum Verdict {
     /// Data flowed: this key is the right one.
     Working,
+    /// Authenticated protocol rejection; another key cannot repair it.
+    ProtocolFailure(transport::ProtocolFailure),
     /// The handshake succeeded and the session did not: the proof was not
     /// accepted. Worth trying the next key.
     AuthRefused,
@@ -156,6 +158,7 @@ pub struct Events {
     pub live_now: AtomicBool,
     /// Whether the connection runs with stream credits (spec §4.13).
     credits: AtomicBool,
+    protocol_failure: Mutex<Option<transport::ProtocolFailure>>,
     /// Bytes handed to the main loop and not written to the terminal yet.
     queued: Mutex<usize>,
     room: Condvar,
@@ -172,6 +175,7 @@ impl Events {
             closed: AtomicBool::new(false),
             live_now: AtomicBool::new(false),
             credits: AtomicBool::new(false),
+            protocol_failure: Mutex::new(None),
             queued: Mutex::new(0),
             room: Condvar::new(),
             released: AtomicBool::new(false),
@@ -217,6 +221,13 @@ impl ClientEvents for Events {
             stream: stream_id,
             bytes: data,
         });
+    }
+
+    fn on_protocol_failure(&self, failure: transport::ProtocolFailure) {
+        self.protocol_failure
+            .lock()
+            .expect("protocol failure")
+            .get_or_insert(failure);
     }
 
     fn on_features(&self, features: transport::Features) {
@@ -355,6 +366,7 @@ impl Attempt {
         let client = Arc::new(StdClient::connect_with(
             addr,
             transport::ConnectionConfig {
+                required_features: transport::Features::CHANNEL_GEOMETRY,
                 features: transport::Features::SUPPORTED,
                 role: transport::Role::Client,
                 local_static_priv: local_priv,
@@ -462,6 +474,14 @@ impl Attempt {
     }
 
     pub fn verdict(&self) -> Verdict {
+        if let Some(failure) = *self
+            .events
+            .protocol_failure
+            .lock()
+            .expect("protocol failure")
+        {
+            return Verdict::ProtocolFailure(failure);
+        }
         let refused = self.port_refusal();
         let reached_live = self.events.reached_live.load(Ordering::SeqCst);
         // Authenticated progress takes precedence over an unauthenticated
@@ -558,6 +578,26 @@ mod tests {
             started: std::time::Instant::now(),
             refusal_probe: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn authenticated_protocol_failure_is_a_terminal_attempt_verdict() {
+        let attempt = unstarted_attempt();
+        attempt
+            .events
+            .on_protocol_failure(transport::ProtocolFailure::MissingRequiredFeatures {
+                required: transport::Features::CHANNEL_GEOMETRY,
+                enabled: transport::Features::NONE,
+            });
+        attempt.events.on_state(LinkState::Closed);
+        assert_eq!(
+            attempt.verdict(),
+            Verdict::ProtocolFailure(transport::ProtocolFailure::MissingRequiredFeatures {
+                required: transport::Features::CHANNEL_GEOMETRY,
+                enabled: transport::Features::NONE
+            })
+        );
+        assert!(!attempt.events.reached_live.load(Ordering::SeqCst));
     }
 
     #[test]

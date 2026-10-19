@@ -1027,13 +1027,28 @@ fn replacement_starts_at_the_road_that_confirmed_loss() {
 }
 
 #[test]
-fn missing_shell_on_authenticated_resume_offers_replacement() {
+fn ended_shell_on_authenticated_resume_delivers_its_retained_exit() {
     let _serial = serialised();
     let (daemon, key) = start_daemon();
     let relay = UdpRelay::start(daemon.port);
     let config = tempfile::tempdir().unwrap();
     let mut client = spawn_to(relay.port, &key, config.path());
-    let screen = Screen::of(&client);
+    // Observe the complete stream through EOF before excluding error diagnostics:
+    // those notices can be printed after alternate-screen restoration.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let screen = Screen { seen: seen.clone() };
+    let mut reader = client.master.try_clone().unwrap();
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.lock().unwrap().extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = drained_tx.send(());
+    });
     answer_yes(&mut client, &screen, &daemon);
     mark_the_shell(&mut client, &screen, &daemon);
     let pid_path = config.path().join("test-shell-pid");
@@ -1051,23 +1066,24 @@ fn missing_shell_on_authenticated_resume_offers_replacement() {
         Err(nix::errno::Errno::ESRCH)
     )));
     relay.restore();
-    assert!(
-        wait_until(|| screen.has("Start a new session?")),
-        "authenticated missing shell must offer a replacement: {}",
-        screen.text()
+    // The process is gone, but its retained output/Exit lifecycle is still
+    // authoritative. Resuming it must finish that lifecycle, not misclassify it
+    // as an absent shell and offer to replace it.
+    let status = wait_for_exit(&mut client.child)
+        .expect("the retained final Exit must end the resumed client");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "portable-pty maps SIGKILL to exit 1"
     );
-    assert!(screen.has("the shell on the server ended while the link was down"));
-    client.master.write_all(b"y\n").unwrap();
-    assert!(
-        wait_until(|| screen.text().matches("\x1b[?1049h").count() == 2),
-        "{}",
-        screen.text()
-    );
-    client.type_line("echo AFTER'MISSING'SHELL-$((6*7))");
-    assert!(
-        wait_until(|| screen.has("AFTERMISSINGSHELL-42")),
-        "{}",
-        screen.text()
-    );
-    exit_cleanly(&mut client, &screen, &daemon);
+    drained_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("client output must reach EOF after its process exits");
+    drain.join().unwrap();
+    assert!(screen.has("\x1b[?1049l"));
+    assert_eq!(screen.text().matches("\x1b[?1049h").count(), 1);
+    assert!(!screen.has("channel protocol failure"));
+    assert!(!screen.has("resumed attachment already admitted channel metadata"));
+    assert!(!screen.has("Start a new session?"));
+    assert!(!screen.has("the shell on the server ended while the link was down"));
 }

@@ -20,6 +20,7 @@ log = "0.4"
 logging = { path = "../crates/logging" }
 transport = { path = "../crates/transport", features = ["tokio-driver"] }
 sshauth = { path = "../crates/sshauth" }
+terminal-size = { path = "../crates/terminal-size" }
 terminal = { path = "../crates/terminal" }
 tempfile = "3"
 
@@ -38,6 +39,7 @@ system = ["nix/process", "nix/socket", "nix/signal", "nix/fs", "nix/poll", "nix/
 test-build-labels = []
 
 [dev-dependencies]
+transport = { path = "../crates/transport", features = ["tokio-driver", "testnet"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -54,3 +56,5 @@ signature = "=2.2.0"
 # `SIGKILL` of the helper, so that test can isolate the parent-death-signal
 # path from the worker's own reader-thread EOF hook.
 libc = "0.2"
+# Source-qualified allocation observer uses the actual upstream heap element layouts.
+alacritty_terminal = "=0.26.0"

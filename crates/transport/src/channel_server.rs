@@ -15,7 +15,7 @@
 //! Doing the same per channel here would mean a growing number of `select!`
 //! arms as channels come and go, so instead every channel's reader task
 //! shares ONE output channel, tagging each chunk with the stream it came
-//! from (`(u8, Option<Vec<u8>>)`; a `None` chunk marks that one channel's
+//! from (`(u8, u64, Option<Vec<u8>>)`; a `None` chunk marks that one channel's
 //! process ending, not the session's). Input stays one UNbounded channel PER
 //! channel, same as `serve_shell` and for the same reason: a synchronous
 //! send from the async loop must never block it (see that module's docs for
@@ -63,12 +63,11 @@
 //! screen model to repaint and puts any non-empty answer on that channel's
 //! own stream; a channel with no screen model (`NoScreen`) always answers
 //! empty, so no separate "has a screen" bookkeeping is needed. `ResumeReset`
-//! (a warm reattach) resets every channel's echo_ack accounting, announces
-//! `ServerRecord::Channels` with what is still running -- geometry included,
-//! so a client can tell whether the size it wants is already applied -- and
-//! only then repaints. `Channels` is never sent on `Live` (a cold start): an
-//! empty list would be indistinguishable from a server that forgot to
-//! answer.
+//! (a warm reattach) resets every channel's echo_ack accounting and publishes
+//! one atomic lifecycle snapshot before replay. The geometry profile separates
+//! active channels from draining EOF owners and retains exact OPEN classification;
+//! only ordered GEOMETRY confirms a size. The snapshot
+//! is not sent on `Live` (a cold start), where no retained channels are expected.
 //!
 //! **Send gates (spec §4.7.2).** Every channel takes a gate on its stream
 //! when it opens, and gives it up when it goes. A channel with a screen
@@ -99,6 +98,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use terminal_size::TerminalSize;
 
 use tokio::sync::mpsc;
 
@@ -116,10 +116,19 @@ use crate::channel::{
 // keep it out of a non-test build so it doesn't sit there unused.
 #[cfg(test)]
 use crate::channel::FIRST_CHANNEL_STREAM;
+use crate::channel_geometry::{
+    ChannelInstance, GeometryOutcome, GeometryRecord, ProtocolErrorCode, ResizeRefusal,
+    ResizeRequestId,
+};
+use crate::channel_timeline::{
+    EntryClass, TimelineBudget, TimelinePermit, WaitRegistration, DELIVERY_MARKER_BYTES,
+    GEOMETRY_BYTES,
+};
 use crate::conn::StreamClass;
 use crate::send_gate::{GateKind, SendGate};
+use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
-use crate::shell_frame::{encode_record, RawRecord, RecordDeframer, REC_DATA, REC_ECHO_ACK};
+use crate::shell_frame::{RawRecord, RecordDeframer};
 use crate::shell_server::{ResizeHandle, SessionScreen};
 
 /// Buffer size for a single channel read. Matches `shell_server::CHUNK_SIZE`.
@@ -700,6 +709,11 @@ async fn join_update(task: &mut Option<tokio::task::JoinHandle<UpdateTaskEnd>>) 
 async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
     let mut reaps = Vec::new();
     for (stream, ch) in channels.drain() {
+        io.channel_closed(
+            stream,
+            ChannelInstance::new(ch.instance).unwrap(),
+            ch.producer.origin,
+        );
         forget_channel_stream(io, stream);
         let Channel {
             input_tx, mut wait, ..
@@ -717,7 +731,8 @@ async fn reap_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
 
 /// A channel is gone -- its process ended, the client closed it, or the
 /// runner reaped it -- and its stream number is free for another. What the
-/// channel had on the stream goes with it: its send gate is closed for good,
+/// channel still owns in the typed bridge survives until handoff or explicit
+/// teardown. Its registered send gate is closed for good,
 /// which wakes a line channel's reader waiting on it (it then ends instead
 /// of reading on), and its class goes back to interactive, every stream's
 /// default. The bridge declares every class it kept again after a warm
@@ -736,10 +751,31 @@ struct PendingExit {
     /// client closed and opened again -- must not release this one.
     instance: u64,
     code: i32,
+    geometry: GeometryRecord,
+    open: crate::channel::OpenClassification,
+    gate: Arc<SendGate>,
+    final_marker: DeliveryMarker,
+    producer: ProducerState,
+}
+impl PendingExit {
+    fn reset(&mut self, origin: AttachmentContext) {
+        self.producer
+            .timeline
+            .reset_attachment(self.geometry.instance, origin.generation);
+        self.producer.origin = origin;
+        self.geometry.request_id = 0;
+        self.geometry.outcome = GeometryOutcome::Established;
+    }
+}
+impl Drop for PendingExit {
+    fn drop(&mut self) {
+        self.gate.close();
+    }
 }
 
 /// One open channel, as the runner keeps track of it.
 struct Channel {
+    producer: ProducerState,
     /// Sends keystrokes to this channel's process. Unbounded: a synchronous
     /// send from the loop must never block it (see `shell_server`'s module
     /// docs for the full reasoning, which applies verbatim here, once per
@@ -765,12 +801,283 @@ struct Channel {
     instance: u64,
     /// The request that opened this channel, kept up to date by `Resize` so
     /// it always reflects the geometry actually applied. Used to build
-    /// `ServerRecord::Channels` on a warm reattach.
+    /// active lifecycle metadata on a warm reattach; EOF retains only classification.
     request: OpenRequest,
     /// Reaps the channel's process: fetches its exit code when the reader
     /// hits EOF, or is forced down if the session ends first (see the
     /// module docs).
     wait: Box<dyn ChannelWait>,
+}
+
+/// The runner's ordered attachment scope and one coalescing capacity signal.
+#[derive(Default)]
+struct ProducerContext {
+    attachment: AttachmentContext,
+    ready: Arc<tokio::sync::Notify>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResizeIntent {
+    instance: ChannelInstance,
+    request_id: ResizeRequestId,
+    cols: u16,
+    rows: u16,
+    origin: AttachmentContext,
+}
+struct ProducerState {
+    origin: AttachmentContext,
+    timeline: TimelineBudget,
+    deferred: Option<ResizeIntent>,
+    last_request: Option<ResizeIntent>,
+    last_outcome: Option<GeometryRecord>,
+    failed: bool,
+    checkpoint_due: bool,
+    data_since_checkpoint: bool,
+    queued_data: std::collections::VecDeque<Vec<u8>>,
+    eof: bool,
+    final_marker: Option<TimelinePermit>,
+    exit_permit: Option<TimelinePermit>,
+    // One fixed allowance for bridge gap/bootstrap, independent of requests.
+    gap_reserve: Option<TimelinePermit>,
+}
+impl ProducerState {
+    fn new(instance: ChannelInstance, context: &ProducerContext) -> Self {
+        let ready = context.ready.clone();
+        let timeline = TimelineBudget::new(instance, context.attachment.generation, move |_| {
+            ready.notify_one()
+        });
+        let final_marker = timeline.try_reserve(EntryClass::Lifecycle, DELIVERY_MARKER_BYTES);
+        let exit_permit = timeline.try_reserve(EntryClass::Lifecycle, 10);
+        let gap_permit = timeline
+            .try_reserve(
+                EntryClass::Lifecycle,
+                crate::channel_timeline::BRIDGE_LIFECYCLE_BYTES,
+            )
+            .expect("fixed lifecycle reserve");
+        Self {
+            origin: context.attachment,
+            timeline,
+            deferred: None,
+            last_request: None,
+            last_outcome: None,
+            failed: false,
+            checkpoint_due: false,
+            data_since_checkpoint: false,
+            queued_data: Default::default(),
+            eof: false,
+            final_marker,
+            exit_permit,
+            gap_reserve: Some(gap_permit),
+        }
+    }
+}
+fn fail_resize(io: &SessionIo, ch: &mut Channel, code: Option<ProtocolErrorCode>) -> bool {
+    if !ch.producer.failed {
+        ch.producer.failed = true;
+        ch.producer.deferred = None;
+        io.protocol_failure(ch.producer.origin, code);
+    }
+    false
+}
+fn current_geometry(ch: &Channel) -> GeometryRecord {
+    ch.producer.last_outcome.unwrap_or(GeometryRecord {
+        instance: ChannelInstance::new(ch.instance).expect("nonzero channel instance"),
+        request_id: 0,
+        outcome: GeometryOutcome::Established,
+        cols: ch.request.cols,
+        rows: ch.request.rows,
+    })
+}
+fn emit_geometry(io: &SessionIo, ch: &mut Channel, record: GeometryRecord, permit: TimelinePermit) {
+    let gap_reserve = ch.producer.gap_reserve.take();
+    io.send_channel_output(
+        ch.request.stream,
+        record.instance,
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::Geometry(record, permit),
+        gap_reserve,
+    );
+    ch.producer.data_since_checkpoint = false;
+}
+fn emit_data(io: &SessionIo, ch: &mut Channel, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    ch.producer.data_since_checkpoint = true;
+    io.send_channel_output(
+        ch.request.stream,
+        ChannelInstance::new(ch.instance).unwrap(),
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::Data(bytes.to_vec()),
+        None,
+    );
+}
+fn emit_ack(io: &SessionIo, ch: &mut Channel) {
+    let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) else {
+        return;
+    };
+    io.send_channel_output(
+        ch.request.stream,
+        ChannelInstance::new(ch.instance).unwrap(),
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::EchoAck(ch.input_consumed, permit),
+        None,
+    );
+    ch.last_acked = ch.input_consumed;
+}
+fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bool {
+    if ch.producer.failed {
+        return false;
+    }
+    if ch.producer.eof {
+        return fail_resize(io, ch, None);
+    }
+    if request.instance.get() != ch.instance || request.origin != ch.producer.origin {
+        return fail_resize(io, ch, None);
+    }
+    if let Some(deferred) = ch.producer.deferred {
+        if deferred == request {
+            return true;
+        }
+        return fail_resize(io, ch, Some(ProtocolErrorCode::ResizePipelineOverflow));
+    }
+    if ch.producer.last_request == Some(request) {
+        return true;
+    }
+    let expected = ch
+        .producer
+        .last_request
+        .map_or(Some(1), |r| r.request_id.get().checked_add(1));
+    if expected != Some(request.request_id.get()) {
+        return fail_resize(io, ch, None);
+    }
+    let permit = if ch.producer.checkpoint_due {
+        None
+    } else {
+        ch.producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, GEOMETRY_BYTES)
+    };
+    let Some(permit) = permit else {
+        ch.producer.deferred = Some(request);
+        ch.gate.set_metadata_blocked(true);
+        if !ch.producer.checkpoint_due
+            && ch
+                .producer
+                .timeline
+                .register_waiter_and_recheck(request.instance, request.origin.generation)
+                == WaitRegistration::Ready
+        {
+            ch.producer.deferred = None;
+            return process_resize(io, ch, request);
+        }
+        return true;
+    };
+    // The complete outcome is owned before validation, preparation or ioctl.
+    let previous = (ch.request.cols, ch.request.rows);
+    let result = if previous.0 == 0 || previous.1 == 0 {
+        Err(ResizeRefusal::NoPty)
+    } else {
+        TerminalSize::new(request.cols, request.rows)
+            .map_err(|_| ResizeRefusal::InvalidSize)
+            .and_then(|size| resize_channel(ch, size))
+    };
+    let record = GeometryRecord {
+        instance: request.instance,
+        request_id: request.request_id.get(),
+        outcome: match result {
+            Ok(()) => GeometryOutcome::Applied,
+            Err(reason) => GeometryOutcome::Refused(reason),
+        },
+        cols: ch.request.cols,
+        rows: ch.request.rows,
+    };
+    ch.producer.last_request = Some(request);
+    ch.producer.last_outcome = Some(record);
+    ch.gate.set_metadata_blocked(false);
+    if ch.screened && !ch.gate.is_open() {
+        ch.stale = true; // the fixed last_outcome is the Screen replacement
+        drop(permit);
+    } else {
+        emit_geometry(io, ch, record, permit);
+        if ch.screened && result.is_ok() && previous != (record.cols, record.rows) {
+            let bytes = ch.screen.repaint();
+            emit_data(io, ch, &bytes);
+            emit_ack(io, ch);
+            ch.stale = false;
+        }
+    }
+    true
+}
+fn reset_producer(ch: &mut Channel, origin: AttachmentContext) {
+    ch.producer.timeline.reset_attachment(
+        ChannelInstance::new(ch.instance).unwrap(),
+        origin.generation,
+    );
+    ch.producer.origin = origin;
+    ch.producer.deferred = None;
+    ch.producer.last_request = None;
+    ch.producer.last_outcome = None;
+    ch.producer.failed = false;
+    ch.gate.set_metadata_blocked(ch.producer.checkpoint_due);
+}
+/// A missing lifecycle slot holds only one current checkpoint and bounded
+/// reader overshoot. Ordinary resize results cannot consume this allowance.
+fn checkpoint(io: &SessionIo, ch: &mut Channel) -> bool {
+    let instance = ChannelInstance::new(ch.instance).unwrap();
+    let class = if ch.producer.data_since_checkpoint {
+        EntryClass::Ordinary
+    } else {
+        EntryClass::Lifecycle
+    };
+    loop {
+        if let Some(permit) = ch.producer.timeline.try_reserve(class, GEOMETRY_BYTES) {
+            emit_geometry(io, ch, current_geometry(ch), permit);
+            // Every checkpoint caller must finish the hold before admitting
+            // newer output or a resize. Repaint can win the runner select
+            // before the capacity notification that resumes this producer.
+            while let Some(bytes) = ch.producer.queued_data.pop_front() {
+                emit_data(io, ch, &bytes);
+            }
+            ch.producer.checkpoint_due = false;
+            ch.gate.set_metadata_blocked(ch.producer.deferred.is_some());
+            return true;
+        }
+        ch.producer.checkpoint_due = true;
+        ch.gate.set_metadata_blocked(true);
+        match ch.producer.timeline.register_waiter_for(
+            instance,
+            ch.producer.origin.generation,
+            class,
+            GEOMETRY_BYTES,
+        ) {
+            WaitRegistration::Ready => continue,
+            _ => return false,
+        }
+    }
+}
+fn resume_producer(io: &SessionIo, ch: &mut Channel) {
+    if ch.producer.failed {
+        return;
+    }
+    let checkpoint_was_due = ch.producer.checkpoint_due;
+    if checkpoint_was_due && !checkpoint(io, ch) {
+        return;
+    }
+    if checkpoint_was_due && ch.screened && ch.stale {
+        let bytes = ch.screen.repaint();
+        emit_data(io, ch, &bytes);
+        emit_ack(io, ch);
+        ch.stale = false;
+    }
+    if let Some(request) = ch.producer.deferred.take() {
+        process_resize(io, ch, request);
+    }
+    if ch.screened && ch.stale && ch.gate.is_open() {
+        repaint_stale(io, ch.request.stream, ch);
+    }
 }
 
 /// What woke the runner loop.
@@ -780,15 +1087,123 @@ enum Wakeup {
     Inbound(Option<SessionInbound>),
     /// Output tagged with which channel produced it (`None` chunk = that
     /// channel's reader hit EOF, i.e. its process ended).
-    ChannelOut(Option<(u8, Option<Vec<u8>>)>),
+    ChannelOut(Option<(u8, u64, Option<Vec<u8>>)>),
     /// The short echo_ack flush timer, as in `serve_shell`.
     AckTick,
+    OutputReady,
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
     Reply(DaemonReply),
     /// This session's update task ended.
     Update(UpdateTaskEnd),
+}
+
+fn reset_attachment_outputs(
+    io: &SessionIo,
+    channels: &mut HashMap<u8, Channel>,
+    exits: &mut HashMap<u8, PendingExit>,
+    context: AttachmentContext,
+) {
+    for ch in channels.values_mut() {
+        // These bounded reader chunks use geometry already established in the
+        // old timeline. A capacity-blocked repaint checkpoint did not resize
+        // that model. Transfer the bytes under their old origin before closing
+        // that producer scope; Stage 4 supplies the new attachment bootstrap.
+        while let Some(bytes) = ch.producer.queued_data.pop_front() {
+            emit_data(io, ch, &bytes);
+        }
+        reset_producer(ch, context);
+        ch.input_consumed = 0;
+        ch.last_acked = 0;
+        // The same rule `open_channel` uses: ask the channel's
+        // OWN screen model, not `ch.request.screen` (what the
+        // client originally asked for) -- see
+        // `SessionScreen::has_screen`'s own doc for why the two
+        // can disagree.
+        io.set_stream_resyncable(ch.request.stream, ch.screen.has_screen());
+    }
+    for pending in exits.values_mut() {
+        pending.reset(context);
+    }
+    // The barrier cannot wait for producer/metadata gates. Its snapshot is
+    // published in one replaceable mailbox, never copied into the output FIFO.
+    io.publish_resume_snapshot(context, || {
+        use crate::channel::{ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification};
+        let mut active = Vec::with_capacity(channels.len());
+        let mut draining = Vec::with_capacity(exits.len() + channels.len());
+        for (&stream, ch) in channels.iter() {
+            let instance = ChannelInstance::new(ch.instance).expect("channel instance");
+            if ch.producer.eof {
+                draining.push(DrainingChannel {
+                    stream,
+                    instance,
+                    open: OpenClassification::from_open(&ch.request),
+                });
+            } else {
+                active.push(ActiveChannel {
+                    instance,
+                    request: ch.request.clone(),
+                });
+            }
+        }
+        draining.extend(exits.iter().map(|(&stream, pending)| DrainingChannel {
+            stream,
+            instance: pending.geometry.instance,
+            open: pending.open,
+        }));
+        ChannelSnapshot::new(active, draining)
+    });
+    // The new client's screens are empty until this repaints
+    // them -- see this module's own docs above ("Repaint and the
+    // live-channel list") for the fuller rationale.
+    repaint_all(io, channels);
+}
+
+fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
+    let code = pending.code;
+    forget_channel_stream(io, stream);
+    let permit = pending.producer.exit_permit.take().expect("one final Exit");
+    io.send_channel_exit(
+        crate::channel::DrainingChannel {
+            stream,
+            instance: pending.geometry.instance,
+            open: pending.open,
+        },
+        pending.producer.origin,
+        code,
+        permit,
+    );
+}
+
+async fn finish_channel(io: &SessionIo, mut ch: Channel) -> PendingExit {
+    let geometry = current_geometry(&ch);
+    let open = crate::channel::OpenClassification::from_open(&ch.request);
+    let final_marker = DeliveryMarker { token: ch.instance };
+    drop(ch.input_tx);
+    let code = tokio::task::spawn_blocking(move || ch.wait.wait())
+        .await
+        .unwrap_or(-1);
+    io.send_channel_output(
+        ch.request.stream,
+        geometry.instance,
+        ch.producer.origin,
+        ch.gate.clone(),
+        ChannelOutput::DeliveryMarker(
+            final_marker,
+            ch.producer.final_marker.take().expect("one final marker"),
+        ),
+        None,
+    );
+    PendingExit {
+        instance: ch.instance,
+        code,
+        geometry,
+        open,
+        gate: ch.gate,
+        final_marker,
+        producer: ch.producer,
+    }
 }
 
 /// [`run_channel_session_with`] with nobody behind it speaking for the
@@ -822,9 +1237,12 @@ pub async fn run_channel_session_with(
     let mut exits: HashMap<u8, PendingExit> = HashMap::new();
     // Numbers every channel opened, so a delivery answer names the channel
     // it was asked for (see `PendingExit`).
-    let mut next_instance: u64 = 0;
+    let mut next_instance: u64 = 1;
+    let mut producer = ProducerContext::default();
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
+    // A protocol failure stops further application input for this attachment.
+    let mut unsupported_control = false;
     // The client's terminal type, once it says: every channel opened after
     // that is spawned with it. `None` until then, and for a client that
     // never says at all -- the spawner decides what to do with that.
@@ -833,7 +1251,8 @@ pub async fn run_channel_session_with(
 
     // Every open channel's reader bridge task sends into this ONE shared
     // channel, tagged with its stream -- see the module docs for why.
-    let (chan_out_tx, mut chan_out_rx) = mpsc::channel::<(u8, Option<Vec<u8>>)>(CHANNEL_CAPACITY);
+    let (chan_out_tx, mut chan_out_rx) =
+        mpsc::channel::<(u8, u64, Option<Vec<u8>>)>(CHANNEL_CAPACITY);
 
     // Short echo_ack flush timer -- as in `serve_shell`, but swept over every
     // open channel each tick rather than a single counter.
@@ -845,6 +1264,7 @@ pub async fn run_channel_session_with(
             ev = io.recv() => Wakeup::Inbound(ev),
             c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
             _ = ack_tick.tick() => Wakeup::AckTick,
+            _ = producer.ready.notified() => Wakeup::OutputReady,
             signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
             reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
             end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
@@ -853,6 +1273,15 @@ pub async fn run_channel_session_with(
         match wakeup {
             Wakeup::Inbound(Some(SessionInbound::Data(StreamData { stream_id, data }))) => {
                 let n = data.len();
+                if !producer.attachment.has_geometry() {
+                    io.consumed(stream_id, n);
+                    io.protocol_failure(producer.attachment, None);
+                    break;
+                }
+                if unsupported_control {
+                    io.consumed(stream_id, n);
+                    continue;
+                }
                 if stream_id == CONTROL_STREAM {
                     let records = control_buf.push(&data);
                     if control_buf.overflowed() && !control_overflow_logged {
@@ -863,7 +1292,7 @@ pub async fn run_channel_session_with(
                         );
                     }
                     for raw in records {
-                        apply_control_record(
+                        if !apply_control_record(
                             &io,
                             &mut channels,
                             &mut exits,
@@ -873,7 +1302,15 @@ pub async fn run_channel_session_with(
                             raw,
                             &mut term,
                             &mut update,
-                        );
+                            &producer,
+                        ) {
+                            unsupported_control = true;
+                            for ch in channels.values_mut() {
+                                ch.producer.failed = true;
+                                ch.producer.deferred = None;
+                            }
+                            break;
+                        }
                     }
                     // Applied, held as an unfinished record, or dropped:
                     // taken (spec §4.10.3).
@@ -898,17 +1335,25 @@ pub async fn run_channel_session_with(
                     io.consumed(stream_id, n);
                 }
             }
-            Wakeup::Inbound(Some(SessionInbound::Live)) => {
-                // A cold start: nothing is running yet from the client's
-                // point of view, so nothing is announced. Sending an empty
-                // `ServerRecord::Channels` here would be indistinguishable
-                // from a server that forgot to answer.
+            Wakeup::Inbound(Some(SessionInbound::Live(context))) => {
+                if !context.has_geometry() {
+                    io.protocol_failure(context, None);
+                    break;
+                }
+                producer.attachment = context;
+                // A cold attachment has no retained lifecycle inventory.
             }
-            Wakeup::Inbound(Some(SessionInbound::ResumeReset)) => {
+            Wakeup::Inbound(Some(SessionInbound::ResumeReset(context))) => {
+                if !context.has_geometry() {
+                    io.protocol_failure(context, None);
+                    break;
+                }
+                producer.attachment = context;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
                 control_buf = RecordDeframer::for_control();
                 control_overflow_logged = false;
+                unsupported_control = false;
                 // A warm reattach is a new client connection: its echo_ack
                 // accounting starts over, exactly as `serve_shell` resets its
                 // own on a fresh `HandshakeInit` -- the same cue there: a new
@@ -922,24 +1367,16 @@ pub async fn run_channel_session_with(
                 // screen model would then stop getting the desync/resync
                 // treatment after this reattach, and the next long absence
                 // would replay its full backlog instead of a single repaint.
-                for ch in channels.values_mut() {
-                    ch.input_consumed = 0;
-                    ch.last_acked = 0;
-                    // The same rule `open_channel` uses: ask the channel's
-                    // OWN screen model, not `ch.request.screen` (what the
-                    // client originally asked for) -- see
-                    // `SessionScreen::has_screen`'s own doc for why the two
-                    // can disagree.
-                    io.set_stream_resyncable(ch.request.stream, ch.screen.has_screen());
+                reset_attachment_outputs(&io, &mut channels, &mut exits, context);
+            }
+            Wakeup::Inbound(Some(SessionInbound::RepaintCutover {
+                generation,
+                sequence,
+            })) => {
+                if generation == producer.attachment.generation {
+                    io.repaint_barrier(generation, sequence);
+                    repaint_all(&io, &mut channels);
                 }
-                let mut live: Vec<OpenRequest> =
-                    channels.values().map(|ch| ch.request.clone()).collect();
-                live.sort_by_key(|req| req.stream);
-                io.send(CONTROL_STREAM, encode_server(&ServerRecord::Channels(live)));
-                // The new client's screens are empty until this repaints
-                // them -- see this module's own docs above ("Repaint and the
-                // live-channel list") for the fuller rationale.
-                repaint_all(&io, &mut channels);
             }
             Wakeup::Inbound(Some(SessionInbound::Repaint)) => {
                 // A hot-roam resync: the client's picture is stale, and the
@@ -961,21 +1398,55 @@ pub async fn run_channel_session_with(
             // An ended channel's output is delivered: its `Exit` now, unless
             // the client closed the channel (or opened the number again)
             // meanwhile.
-            Wakeup::Inbound(Some(SessionInbound::Delivered { stream, token })) => {
+            Wakeup::Inbound(Some(SessionInbound::Delivered {
+                stream,
+                token,
+                generation,
+            })) => {
                 // An answer to an earlier channel's request on this number
                 // -- one the client closed, then opened again -- is not this
                 // channel's.
-                if exits.get(&stream).is_some_and(|e| e.instance == token) {
-                    let code = exits.remove(&stream).expect("just found").code;
-                    io.send(
-                        CONTROL_STREAM,
-                        encode_server(&ServerRecord::Exit { stream, code }),
-                    );
+                if exits.get(&stream).is_some_and(|e| {
+                    e.instance == token
+                        && e.final_marker.token == token
+                        && e.producer.origin.generation == generation
+                }) {
+                    let mut pending = exits.remove(&stream).expect("just found");
+                    send_pending_exit(&io, stream, &mut pending);
+                }
+            }
+            Wakeup::Inbound(Some(SessionInbound::OutputReady {
+                stream,
+                instance,
+                generation,
+            })) => {
+                if let Some(ch) = channels.get_mut(&stream) {
+                    if ch.instance == instance.get()
+                        && ch.producer.origin.generation == generation
+                        && ch.producer.timeline.take_notification(instance, generation)
+                    {
+                        resume_producer(&io, ch);
+                    }
+                }
+            }
+            Wakeup::OutputReady => {
+                for ch in channels.values_mut() {
+                    let instance = ChannelInstance::new(ch.instance).unwrap();
+                    if ch
+                        .producer
+                        .timeline
+                        .take_notification(instance, ch.producer.origin.generation)
+                    {
+                        resume_producer(&io, ch);
+                    }
                 }
             }
             Wakeup::Inbound(None) => break,
-            Wakeup::ChannelOut(Some((stream, Some(chunk)))) => {
-                if let Some(ch) = channels.get_mut(&stream) {
+            Wakeup::ChannelOut(Some((stream, instance, Some(chunk)))) => {
+                if let Some(ch) = channels
+                    .get_mut(&stream)
+                    .filter(|ch| ch.instance == instance)
+                {
                     // The model sees every byte the process wrote, sent or not.
                     ch.screen.absorb(&chunk);
                     forward_output(&io, stream, ch, &chunk);
@@ -983,42 +1454,19 @@ pub async fn run_channel_session_with(
                 // Else: output for a channel that already closed -- nobody
                 // is listening for it any more.
             }
-            Wakeup::ChannelOut(Some((stream, None))) => {
-                // The channel's reader hit EOF (its process ended). Every
-                // `Some(chunk)` this same reader task sent earlier is already
-                // ahead of this `None` in the shared (FIFO) output channel
-                // and has already been handled by an earlier loop iteration.
-                // The `Exit` waits until the channel's stream is delivered
-                // (see the module docs): the order of `io.send` calls is not
-                // the order the client hears them in.
-                if let Some(mut ch) = channels.remove(&stream) {
-                    // What it dropped behind its gate ends in a last frame
-                    // the client would otherwise never see. Behind a shut
-                    // gate too: one screenful.
-                    if ch.stale {
-                        repaint_stale(&io, stream, &mut ch);
+            Wakeup::ChannelOut(Some((stream, instance, None))) => {
+                if let Some(ch) = channels
+                    .get_mut(&stream)
+                    .filter(|ch| ch.instance == instance)
+                {
+                    ch.producer.eof = true;
+                    // Lifecycle termination wins over an unexecuted intent.
+                    ch.producer.deferred = None;
+                    if ch.stale || ch.screened {
+                        // The model cannot repaint once EOF moves to PendingExit.
+                        repaint_stale(&io, stream, ch);
                     }
-                    forget_channel_stream(&io, stream);
-                    // `-1` only if the blocking task itself panicked --
-                    // `ch.wait.wait()` never returning a real exit code is
-                    // not a reason to withhold the `Exit` the client is
-                    // owed for a channel it opened.
-                    let wait = ch.wait;
-                    let code = tokio::task::spawn_blocking(move || wait.wait())
-                        .await
-                        .unwrap_or(-1);
-                    io.notify_delivered(stream, ch.instance);
-                    exits.insert(
-                        stream,
-                        PendingExit {
-                            instance: ch.instance,
-                            code,
-                        },
-                    );
                 }
-                // Else: the channel was already closed by the client (a
-                // `Close` record) before its EOF made it through -- nothing
-                // left to report.
             }
             Wakeup::ChannelOut(None) => {
                 // The loop keeps its own clone of `chan_out_tx` for its whole
@@ -1059,6 +1507,20 @@ pub async fn run_channel_session_with(
             Wakeup::Reply(reply) => update.on_reply(&io, reply),
             Wakeup::Update(end) => update.on_task_end(&io, end),
         }
+        let finished: Vec<_> = channels
+            .iter()
+            .filter_map(|(&stream, ch)| {
+                (ch.producer.eof
+                    && !ch.producer.checkpoint_due
+                    && ch.producer.queued_data.is_empty())
+                .then_some(stream)
+            })
+            .collect();
+        for stream in finished {
+            let ch = channels.remove(&stream).expect("finished channel");
+            let pending = finish_channel(&io, ch).await;
+            exits.insert(stream, pending);
+        }
     }
 
     // The manager tore the session down (`io.recv()` returned `None`), but
@@ -1094,12 +1556,13 @@ pub async fn run_channel_session_with(
 /// needed to avoid asking a line protocol like `tmux -C` to repaint, which
 /// would corrupt the conversation.
 fn repaint_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
-    for (stream, ch) in channels.iter_mut() {
-        let bytes = ch.screen.repaint();
-        if !bytes.is_empty() {
-            io.send(*stream, encode_record(REC_DATA, &bytes));
+    for ch in channels.values_mut() {
+        if !checkpoint(io, ch) {
+            ch.stale = ch.screened;
+            continue;
         }
-        // A repaint covers whatever was dropped before it.
+        let bytes = ch.screen.repaint();
+        emit_data(io, ch, &bytes);
         ch.stale = false;
     }
 }
@@ -1112,6 +1575,12 @@ fn repaint_all(io: &SessionIo, channels: &mut HashMap<u8, Channel>) {
 /// and the channel is stale; the first chunk after the gate reopens goes out
 /// as one repaint (the model already holds it).
 fn forward_output(io: &SessionIo, stream: u8, ch: &mut Channel, chunk: &[u8]) {
+    if ch.producer.checkpoint_due && !ch.screened {
+        // The reader already observed its gate. At most the bounded shared
+        // reader queue plus one current read per channel can overshoot a hold.
+        ch.producer.queued_data.push_back(chunk.to_vec());
+        return;
+    }
     if ch.screened {
         if !ch.gate.is_open() {
             ch.stale = true;
@@ -1122,18 +1591,14 @@ fn forward_output(io: &SessionIo, stream: u8, ch: &mut Channel, chunk: &[u8]) {
             return;
         }
     }
-    io.send(stream, encode_record(REC_DATA, chunk));
+    emit_data(io, ch, chunk);
     send_echo_ack_if_moved(io, stream, ch);
 }
 
 /// The echo ack, when input was consumed since the last one.
-fn send_echo_ack_if_moved(io: &SessionIo, stream: u8, ch: &mut Channel) {
+fn send_echo_ack_if_moved(io: &SessionIo, _stream: u8, ch: &mut Channel) {
     if ch.input_consumed != ch.last_acked {
-        io.send(
-            stream,
-            encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
-        );
-        ch.last_acked = ch.input_consumed;
+        emit_ack(io, ch);
     }
 }
 
@@ -1141,16 +1606,14 @@ fn send_echo_ack_if_moved(io: &SessionIo, stream: u8, ch: &mut Channel) {
 /// consumed -- unconditionally: the dropped output may have carried a
 /// keystroke's echo, and the next ack would otherwise wait for the next
 /// keystroke, the client's prediction hanging unconfirmed until then.
-fn repaint_stale(io: &SessionIo, stream: u8, ch: &mut Channel) {
-    let bytes = ch.screen.repaint();
-    if !bytes.is_empty() {
-        io.send(stream, encode_record(REC_DATA, &bytes));
+fn repaint_stale(io: &SessionIo, _stream: u8, ch: &mut Channel) {
+    if !checkpoint(io, ch) {
+        ch.stale = true;
+        return;
     }
-    io.send(
-        stream,
-        encode_record(REC_ECHO_ACK, &ch.input_consumed.to_be_bytes()),
-    );
-    ch.last_acked = ch.input_consumed;
+    let bytes = ch.screen.repaint();
+    emit_data(io, ch, &bytes);
+    emit_ack(io, ch);
     ch.stale = false;
 }
 
@@ -1170,25 +1633,69 @@ fn apply_control_record(
     exits: &mut HashMap<u8, PendingExit>,
     next_instance: &mut u64,
     spawner: &Arc<dyn ChannelSpawner>,
-    chan_out_tx: &mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     raw: RawRecord,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
-) {
+    context: &ProducerContext,
+) -> bool {
     match decode_client(&raw) {
+        Ok(ClientRecord::ResizeRequest {
+            stream,
+            instance,
+            request_id,
+            cols,
+            rows,
+        }) => {
+            if !context.attachment.has_geometry() {
+                log::warn!("correlated resize received without channel-geometry support; application input stopped");
+                return false;
+            }
+            let Some(ch) = channels.get_mut(&stream) else {
+                io.protocol_failure(context.attachment, None);
+                return false;
+            };
+            return process_resize(
+                io,
+                ch,
+                ResizeIntent {
+                    instance,
+                    request_id,
+                    cols,
+                    rows,
+                    origin: context.attachment,
+                },
+            );
+        }
         Ok(ClientRecord::Open(req)) => {
             // A client opens a number it considers free: whatever ended on
             // it before, it is not waiting for that `Exit` any more, and it
             // must not end the new channel.
-            exits.remove(&req.stream);
+            if let Some(pending) = exits.remove(&req.stream) {
+                io.channel_closed(
+                    req.stream,
+                    pending.geometry.instance,
+                    pending.producer.origin,
+                );
+                forget_channel_stream(io, req.stream);
+            }
             if update.restarting() {
                 // Its process would outlive the drain and become a child of
                 // the new binary, which never waits for it.
-                refuse(io, req.stream, "the daemon is restarting".to_string());
+                refuse(
+                    io,
+                    req.stream,
+                    "the daemon is restarting".to_string(),
+                    context.attachment,
+                );
             } else {
                 // Numbered whether or not it opens: only uniqueness matters.
                 let instance = *next_instance;
-                *next_instance += 1;
+                let Some(next) = next_instance.checked_add(1) else {
+                    io.protocol_failure(context.attachment, None);
+                    return false;
+                };
+                *next_instance = next;
                 open_channel(
                     io,
                     channels,
@@ -1197,6 +1704,7 @@ fn apply_control_record(
                     req,
                     term.as_deref(),
                     instance,
+                    context,
                 )
             }
         }
@@ -1207,24 +1715,14 @@ fn apply_control_record(
             // suggesting it had.
             *term = Some(name);
         }
-        Ok(ClientRecord::Resize { stream, cols, rows }) => {
-            if let Some(ch) = channels.get_mut(&stream) {
-                ch.resize.resize(cols, rows);
-                ch.screen.resize(cols, rows);
-                // Kept current so a later `ServerRecord::Channels` reports
-                // the geometry actually applied, not the one the channel was
-                // opened with.
-                ch.request.cols = cols;
-                ch.request.rows = rows;
-            }
-            // A resize for a channel that isn't open (yet, or any more) has
-            // nothing to apply to -- ignored for the same reason stray data
-            // is.
-        }
+
         Ok(ClientRecord::Close { stream }) => {
             // An `Exit` still waiting for its channel's output is not owed
             // either: the client closed the channel first.
-            exits.remove(&stream);
+            if let Some(pending) = exits.remove(&stream) {
+                io.channel_closed(stream, pending.geometry.instance, pending.producer.origin);
+                forget_channel_stream(io, stream);
+            }
             // Removing the entry frees the slot for a future OPEN and drops
             // its resize/screen handles. The reader bridge task, if still
             // blocked inside the process's own I/O, is left to end on its
@@ -1244,6 +1742,11 @@ fn apply_control_record(
             // follows: the client already knows it closed the channel, and
             // a record after its own CLOSE would only be confusing.
             if let Some(ch) = channels.remove(&stream) {
+                io.channel_closed(
+                    stream,
+                    ChannelInstance::new(ch.instance).unwrap(),
+                    ch.producer.origin,
+                );
                 forget_channel_stream(io, stream);
                 let Channel {
                     input_tx, mut wait, ..
@@ -1258,6 +1761,15 @@ fn apply_control_record(
         Ok(ClientRecord::AboutRequest) => update.about(),
         Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
         Err(ChannelCodecError::UnknownKind(_)) => {}
+        Err(ChannelCodecError::Malformed)
+            if matches!(raw.kind, 0x11 | crate::channel::REC_RESIZE_REQUEST) =>
+        {
+            if context.attachment.has_geometry() {
+                io.protocol_failure(context.attachment, None);
+            }
+            log::warn!("malformed correlated resize; application input stopped");
+            return false;
+        }
         Err(ChannelCodecError::Malformed) => {
             log::warn!(
                 "malformed control record from client (kind {:#04x}, {} bytes) -- \
@@ -1267,20 +1779,46 @@ fn apply_control_record(
             );
         }
     }
+    true
+}
+
+/// All fallible steps precede model/request mutation. A failed ioctl drops
+/// the reservation, releasing provisional storage without changing the model.
+fn resize_channel(ch: &mut Channel, size: TerminalSize) -> Result<(), ResizeRefusal> {
+    if (ch.request.cols, ch.request.rows) == (size.cols(), size.rows()) {
+        return Ok(());
+    }
+    let prepared = ch.screen.prepare_resize(size).map_err(|e| match e {
+        crate::shell_server::ScreenPreparationError::ResourceLimit(_) => {
+            ResizeRefusal::ResourceLimit
+        }
+        crate::shell_server::ScreenPreparationError::PreparationFailed(_) => {
+            ResizeRefusal::ScreenPreparationFailed
+        }
+    })?;
+    ch.resize
+        .try_resize(size.cols(), size.rows())
+        .map_err(|_| ResizeRefusal::PtyResizeFailed)?;
+    prepared.commit();
+    ch.request.cols = size.cols();
+    ch.request.rows = size.rows();
+    Ok(())
 }
 
 /// Open one channel: refuse past the cap or on a re-used stream number,
 /// otherwise ask `spawner` to spawn it, wire up its bridge tasks, declare its
 /// recoverability to the connection, and answer `OPENED`/`REFUSED` on
 /// [`CONTROL_STREAM`].
+#[allow(clippy::too_many_arguments)] // Runner dependencies plus scoped producer identity.
 fn open_channel(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
     spawner: &Arc<dyn ChannelSpawner>,
-    chan_out_tx: &mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     req: OpenRequest,
     term: Option<&str>,
     instance: u64,
+    context: &ProducerContext,
 ) {
     let stream = req.stream;
     if channels.contains_key(&stream) {
@@ -1290,12 +1828,30 @@ fn open_channel(
         // Checked BEFORE the cap: a session at the limit that gets a
         // re-used number deserves the precise reason, not "too many
         // channels".
-        refuse(io, stream, "channel already open".to_string());
+        refuse(
+            io,
+            stream,
+            "channel already open".to_string(),
+            context.attachment,
+        );
         return;
     }
     if channels.len() >= MAX_CHANNELS {
-        refuse(io, stream, "too many channels".to_string());
+        refuse(
+            io,
+            stream,
+            "too many channels".to_string(),
+            context.attachment,
+        );
         return;
+    }
+
+    // Either zero dimension preserves the generic no-PTY request exactly.
+    if req.cols != 0 && req.rows != 0 {
+        if let Err(reason) = TerminalSize::new(req.cols, req.rows) {
+            refuse(io, stream, reason.to_string(), context.attachment);
+            return;
+        }
     }
 
     // The session's own principal and login, never a placeholder: a spawner
@@ -1305,7 +1861,7 @@ fn open_channel(
     let spawned = match spawner.spawn(io.principal(), io.login(), &req, term) {
         Ok(spawned) => spawned,
         Err(reason) => {
-            refuse(io, stream, reason);
+            refuse(io, stream, reason, context.attachment);
             return;
         }
     };
@@ -1350,7 +1906,7 @@ fn open_channel(
     // A blocking task: the reader blocks in `read`, and a line channel's also
     // on its gate -- never on the runtime's own threads.
     tokio::task::spawn_blocking(move || {
-        channel_reader_loop(stream, reader, reader_out, reader_gate)
+        channel_reader_loop(stream, instance, reader, reader_out, reader_gate)
     });
     let reporter = io.consumption_reporter();
     tokio::task::spawn_blocking(move || channel_writer_loop(stream, input_rx, writer, reporter));
@@ -1358,6 +1914,10 @@ fn open_channel(
     channels.insert(
         stream,
         Channel {
+            producer: ProducerState::new(
+                ChannelInstance::new(instance).expect("nonzero channel instance"),
+                context,
+            ),
             input_tx,
             resize,
             screen,
@@ -1379,19 +1939,14 @@ fn open_channel(
     // `Connection::is_bulk_output_stream`, which the connection falls back
     // to for a stream nobody declared).
     io.set_stream_resyncable(stream, recoverable);
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::Opened { stream }),
-    );
+    io.channel_opened(context.attachment, stream);
+    checkpoint(io, channels.get_mut(&stream).expect("opened channel"));
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
 /// [`CONTROL_STREAM`].
-fn refuse(io: &SessionIo, stream: u8, reason: String) {
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::Refused { stream, reason }),
-    );
+fn refuse(io: &SessionIo, stream: u8, reason: String, origin: AttachmentContext) {
+    io.channel_refused(origin, stream, reason);
 }
 
 /// The blocking loop for one channel's reader: forwards chunks read from its
@@ -1404,8 +1959,9 @@ fn refuse(io: &SessionIo, stream: u8, reason: String) {
 /// nothing, once the gate closes for good: the channel is gone then.
 fn channel_reader_loop(
     stream: u8,
+    instance: u64,
     mut reader: Box<dyn Read + Send>,
-    tx: mpsc::Sender<(u8, Option<Vec<u8>>)>,
+    tx: mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     gate: Option<Arc<SendGate>>,
 ) {
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -1419,11 +1975,14 @@ fn channel_reader_loop(
         }
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => {
-                let _ = tx.blocking_send((stream, None));
+                let _ = tx.blocking_send((stream, instance, None));
                 return;
             }
             Ok(n) => {
-                if tx.blocking_send((stream, Some(buf[..n].to_vec()))).is_err() {
+                if tx
+                    .blocking_send((stream, instance, Some(buf[..n].to_vec())))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1467,13 +2026,108 @@ pub(crate) mod tests {
     };
     use crate::send_gate::{GateKind, GateWait};
     use crate::session_manager::{SessionInbound, SessionIo, SessionOutbound, StreamData};
-    use crate::shell_frame::{RecordDeframer, ShellDeframer, ShellRecord, CONTROL_RECORD_MAX};
+    use crate::shell_frame::{
+        encode_record, RecordDeframer, ShellDeframer, ShellRecord, CONTROL_RECORD_MAX,
+    };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
+
+    fn channel_context() -> AttachmentContext {
+        AttachmentContext {
+            features: crate::Features::CHANNEL_GEOMETRY,
+            ..AttachmentContext::default()
+        }
+    }
+    fn channel_producer() -> ProducerContext {
+        ProducerContext {
+            attachment: channel_context(),
+            ..ProducerContext::default()
+        }
+    }
+    fn established_checkpoint() -> ShellRecord {
+        ShellRecord::Geometry(GeometryRecord {
+            instance: ChannelInstance::new(1).unwrap(),
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols: 80,
+            rows: 24,
+        })
+    }
+    fn shell_record(output: ChannelOutput) -> Option<ShellRecord> {
+        match output {
+            ChannelOutput::Data(bytes) => Some(ShellRecord::Data(bytes)),
+            ChannelOutput::EchoAck(offset, _) => Some(ShellRecord::EchoAck(offset)),
+            ChannelOutput::Geometry(record, _) => Some(ShellRecord::Geometry(record)),
+            ChannelOutput::DeliveryMarker(..) => None,
+        }
+    }
+    fn delivery_marker(msg: &SessionOutbound) -> Option<(u8, u64, u64)> {
+        match msg {
+            SessionOutbound::ChannelOutput {
+                stream,
+                origin,
+                output: ChannelOutput::DeliveryMarker(marker, _),
+                ..
+            } => Some((*stream, marker.token, origin.generation)),
+            _ => None,
+        }
+    }
+    type Fixture = (
+        SessionIo,
+        mpsc::Sender<SessionInbound>,
+        mpsc::UnboundedReceiver<SessionOutbound>,
+    );
+    fn channel_pair() -> Fixture {
+        let fixture = SessionIo::test_pair();
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    fn channel_pair_for(principal: Principal, login: LoginId) -> Fixture {
+        let fixture = SessionIo::test_pair_for(principal, login);
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    fn channel_pair_with_gates() -> (
+        SessionIo,
+        mpsc::Sender<SessionInbound>,
+        mpsc::UnboundedReceiver<SessionOutbound>,
+        Arc<crate::send_gate::GateTable>,
+    ) {
+        let fixture = SessionIo::test_pair_with_gates();
+        fixture
+            .1
+            .try_send(SessionInbound::Live(channel_context()))
+            .unwrap();
+        fixture
+    }
+    async fn next_snapshot(
+        rx: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+        read: &impl Fn(u64) -> Option<crate::channel::ChannelSnapshot>,
+    ) -> ServerRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let SessionOutbound::ResumeBarrier { generation } =
+                    rx.recv().await.expect("runner alive")
+                {
+                    return ServerRecord::ChannelSnapshot(
+                        read(generation).expect("matching snapshot mailbox"),
+                    );
+                }
+            }
+        })
+        .await
+        .expect("snapshot before deadline")
+    }
 
     /// A channel's "process", standing in for a pseudo-terminal: it emits
     /// `greeting` once, then whatever the test feeds it, one read per chunk,
@@ -1543,8 +2197,9 @@ pub(crate) mod tests {
     }
 
     impl ResizeHandle for FakeResize {
-        fn resize(&self, cols: u16, rows: u16) {
+        fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
             self.sizes.lock().unwrap().push((self.stream, cols, rows));
+            Ok(())
         }
     }
 
@@ -1556,9 +2211,23 @@ pub(crate) mod tests {
         repaints: Arc<Mutex<Vec<u8>>>,
     }
 
+    struct FakePreparedResize;
+    impl crate::shell_server::PreparedScreenResize for FakePreparedResize {
+        fn commit(self: Box<Self>) {}
+    }
+
     impl SessionScreen for FakeScreen {
         fn absorb(&mut self, _bytes: &[u8]) {}
-        fn resize(&mut self, _cols: u16, _rows: u16) {}
+        fn prepare_resize(
+            &mut self,
+            size: TerminalSize,
+        ) -> Result<
+            Box<dyn crate::shell_server::PreparedScreenResize + '_>,
+            crate::shell_server::ScreenPreparationError,
+        > {
+            let _ = size;
+            Ok(Box::new(FakePreparedResize))
+        }
         fn repaint(&mut self) -> Vec<u8> {
             self.repaints.lock().unwrap().push(self.stream);
             b"REPAINT".to_vec()
@@ -1593,7 +2262,7 @@ pub(crate) mod tests {
         /// When set, every `spawn` refuses with this reason.
         refuse: Mutex<Option<String>>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
-        sizes: Arc<Mutex<Vec<(u8, u16, u16)>>>,
+        pub(crate) sizes: Arc<Mutex<Vec<(u8, u16, u16)>>>,
         repaints: Arc<Mutex<Vec<u8>>>,
         /// One sender per opened channel: it feeds the channel's process
         /// output ([`FakeSpawner::feed`]), and dropping it ends the process,
@@ -1663,7 +2332,7 @@ pub(crate) mod tests {
         }
 
         /// Ends the process behind `stream`, so its reader reports EOF.
-        fn end_channel(&self, stream: u8) {
+        pub(crate) fn end_channel(&self, stream: u8) {
             self.enders.lock().unwrap().retain(|(s, _)| *s != stream);
         }
 
@@ -1778,6 +2447,18 @@ pub(crate) mod tests {
                 .await
                 .expect("the runner must answer within five seconds")
                 .expect("the runner must not drop its outbound channel");
+            let msg = match msg {
+                SessionOutbound::ChannelExit { stream, code, .. } => {
+                    return ServerRecord::Exit { stream, code }
+                }
+                SessionOutbound::ChannelOpened { stream, .. } => {
+                    return ServerRecord::Opened { stream }
+                }
+                SessionOutbound::ChannelRefused { stream, reason, .. } => {
+                    return ServerRecord::Refused { stream, reason }
+                }
+                other => other,
+            };
             let SessionOutbound::Data(sd) = msg else {
                 continue;
             };
@@ -1883,11 +2564,1324 @@ pub(crate) mod tests {
         }
     }
 
+    // These tests observe the actual producer transaction and owned outbound
+    // records. No bridge passthrough or remote delivery guarantee is assumed.
+    struct ResizeRig {
+        io: SessionIo,
+        _inbound: mpsc::Sender<SessionInbound>,
+        outbound: mpsc::UnboundedReceiver<SessionOutbound>,
+        channel: Channel,
+        geometry: Arc<Mutex<(u16, u16)>>,
+        pending: Arc<AtomicUsize>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl ResizeRig {
+        fn new(prepare_fails: bool, ioctl_fails: bool) -> Self {
+            let (io, inbound, outbound) = channel_pair();
+            let geometry = Arc::new(Mutex::new((80, 24)));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(vec![]));
+            let (input_tx, _) = mpsc::unbounded_channel();
+            let producer = ProducerContext {
+                attachment: AttachmentContext {
+                    generation: 1,
+                    session_id: 11,
+                    features: crate::Features::CHANNEL_GEOMETRY,
+                },
+                ..channel_producer()
+            };
+            let channel = Channel {
+                input_tx,
+                resize: Box::new(TransactionPty {
+                    fail: ioctl_fails,
+                    events: events.clone(),
+                }),
+                screen: Box::new(TransactionScreen {
+                    geometry: geometry.clone(),
+                    pending: pending.clone(),
+                    fail: prepare_fails,
+                    events: events.clone(),
+                }),
+                input_consumed: 0,
+                last_acked: 0,
+                gate: Arc::new(SendGate::new(GateKind::Pipe)),
+                screened: false,
+                stale: false,
+                instance: 1,
+                request: OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: vec![],
+                },
+                wait: Box::new(FakeWait {
+                    stream: 16,
+                    code: 0,
+                    killed: Arc::default(),
+                    waited: Arc::default(),
+                }),
+                producer: ProducerState::new(ChannelInstance::new(1).unwrap(), &producer),
+            };
+            Self {
+                io,
+                _inbound: inbound,
+                outbound,
+                channel,
+                geometry,
+                pending,
+                events,
+            }
+        }
+        fn intent(&self, id: u64, cols: u16, rows: u16) -> ResizeIntent {
+            ResizeIntent {
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(id).unwrap(),
+                cols,
+                rows,
+                origin: self.channel.producer.origin,
+            }
+        }
+        fn resize(&mut self, id: u64, cols: u16, rows: u16) -> bool {
+            let request = self.intent(id, cols, rows);
+            process_resize(&self.io, &mut self.channel, request)
+        }
+        fn next_geometry(&mut self) -> GeometryRecord {
+            match self.outbound.try_recv().expect("one correlated outcome") {
+                SessionOutbound::ChannelOutput {
+                    stream: 16,
+                    instance,
+                    origin,
+                    output: ChannelOutput::Geometry(record, _),
+                    ..
+                } => {
+                    assert_eq!(instance.get(), 1);
+                    assert_eq!(origin.generation, 1);
+                    record
+                }
+                _ => panic!("resize returns geometry, never OPEN refusal or Exit"),
+            }
+        }
+        fn assert_geometry(&self, cols: u16, rows: u16) {
+            assert_eq!(*self.geometry.lock().unwrap(), (cols, rows));
+            assert_eq!(
+                (self.channel.request.cols, self.channel.request.rows),
+                (cols, rows)
+            );
+            assert_eq!(self.pending.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn resize_refusal_preserves_all_geometry() {
+        let mut rig = ResizeRig::new(true, false);
+        assert!(rig.resize(1, 100, 30));
+        rig.assert_geometry(80, 24);
+        assert_eq!(*rig.events.lock().unwrap(), vec!["prepare"]);
+        assert_eq!(
+            rig.next_geometry().outcome,
+            GeometryOutcome::Refused(ResizeRefusal::ResourceLimit)
+        );
+    }
+    #[test]
+    fn resize_ioctl_failure_releases_preparation() {
+        let mut rig = ResizeRig::new(false, true);
+        assert!(rig.resize(1, 100, 30));
+        rig.assert_geometry(80, 24);
+        assert_eq!(*rig.events.lock().unwrap(), vec!["prepare", "ioctl"]);
+        assert_eq!(
+            rig.next_geometry().outcome,
+            GeometryOutcome::Refused(ResizeRefusal::PtyResizeFailed)
+        );
+    }
+    #[test]
+    fn resize_success_orders_geometry_before_data() {
+        let mut rig = ResizeRig::new(false, false);
+        forward_output(&rig.io, 16, &mut rig.channel, b"old");
+        assert!(rig.resize(1, 100, 30));
+        forward_output(&rig.io, 16, &mut rig.channel, b"new");
+        rig.assert_geometry(100, 30);
+        assert_eq!(
+            *rig.events.lock().unwrap(),
+            vec!["prepare", "ioctl", "commit"]
+        );
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput { output:ChannelOutput::Data(ref b), .. } if b==b"old")
+        );
+        let record = rig.next_geometry();
+        assert_eq!((record.request_id, record.cols, record.rows), (1, 100, 30));
+        assert_eq!(record.outcome, GeometryOutcome::Applied);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput { output:ChannelOutput::Data(ref b), .. } if b==b"new")
+        );
+    }
+    #[test]
+    fn resize_outcome_reserved_before_effect() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.events.lock().unwrap().is_empty());
+        rig.assert_geometry(80, 24);
+        assert!(rig.outbound.try_recv().is_err());
+        drop(held);
+        resume_producer(&rig.io, &mut rig.channel);
+        rig.assert_geometry(100, 30);
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+    }
+    #[test]
+    fn one_deferred_resize_waits_without_failure() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.channel.producer.deferred.is_some());
+        assert!(!rig.channel.gate.is_open());
+        assert!(!rig.channel.producer.failed);
+        drop(held);
+        assert!(rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+        resume_producer(&rig.io, &mut rig.channel);
+        assert!(rig.channel.producer.deferred.is_none());
+        assert!(rig.channel.gate.is_open());
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+    }
+    #[test]
+    fn second_distinct_deferred_resize_fails_once() {
+        let mut rig = ResizeRig::new(false, false);
+        let _held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        assert!(!rig.resize(2, 101, 31));
+        assert!(!rig.resize(3, 102, 32));
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ProtocolFailure {
+                code: Some(ProtocolErrorCode::ResizePipelineOverflow),
+                ..
+            }
+        ));
+        assert!(rig.outbound.try_recv().is_err());
+    }
+    #[test]
+    fn duplicate_deferred_resize_allocates_nothing() {
+        let mut rig = ResizeRig::new(false, false);
+        let _held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        let allocated = crate::conn::tests::allocation_probe::measure(|| {
+            for _ in 0..1000 {
+                assert!(rig.resize(1, 100, 30));
+            }
+        });
+        assert_eq!(allocated, 0);
+        assert!(rig.outbound.try_recv().is_err());
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Ordinary),
+            (1, 8192)
+        );
+    }
+    #[test]
+    fn reset_cancels_unexecuted_deferred_resize() {
+        let mut rig = ResizeRig::new(false, false);
+        let held = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        assert!(rig.resize(1, 100, 30));
+        let origin = AttachmentContext {
+            generation: 2,
+            session_id: 12,
+            ..rig.channel.producer.origin
+        };
+        reset_producer(&mut rig.channel, origin);
+        drop(held);
+        resume_producer(&rig.io, &mut rig.channel);
+        assert!(rig.channel.producer.deferred.is_none());
+        assert!(rig.events.lock().unwrap().is_empty());
+        rig.assert_geometry(80, 24);
+        assert!(!rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+    }
+    #[test]
+    fn first_checkpoint_transfers_single_gap_reserve_with_shared_budget() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let first = rig.outbound.try_recv().unwrap();
+        let shared = match &first {
+            SessionOutbound::ChannelOutput {
+                gap_reserve: Some(gap),
+                ..
+            } => gap.budget(),
+            _ => panic!("first checkpoint must transfer its reserved gap slot"),
+        };
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let second = rig.outbound.try_recv().unwrap();
+        assert!(matches!(
+            &second,
+            SessionOutbound::ChannelOutput {
+                gap_reserve: None,
+                ..
+            }
+        ));
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (5, 137));
+        drop(first); // cancellation releases exactly checkpoint + gap
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (3, 69));
+        drop(second);
+        assert_eq!(shared.usage(EntryClass::Lifecycle), (2, 42));
+    }
+
+    #[tokio::test]
+    async fn typed_exit_keeps_reservation_until_bridge_handoff_or_drop() {
+        let rig = ResizeRig::new(false, false);
+        let timeline = rig.channel.producer.timeline.clone();
+        let mut outbound = rig.outbound;
+        let mut pending = finish_channel(&rig.io, rig.channel).await;
+        let _marker = outbound.try_recv().unwrap();
+        send_pending_exit(&rig.io, 16, &mut pending);
+        assert!(matches!(
+            outbound.try_recv().unwrap(),
+            SessionOutbound::StreamClass {
+                stream_id: 16,
+                class: StreamClass::Interactive
+            }
+        ));
+        let exit = outbound.try_recv().unwrap();
+        assert!(
+            matches!(&exit,SessionOutbound::ChannelExit {stream:16,instance,origin,code:0,..} if instance.get()==1 && origin.generation==1)
+        );
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (3, 83));
+        drop(exit);
+        assert_eq!(timeline.usage(EntryClass::Lifecycle), (2, 73));
+    }
+
+    #[test]
+    fn lifecycle_inventory_keeps_gap_and_final_state_reserved() {
+        let rig = ResizeRig::new(false, false);
+        let budget = &rig.channel.producer.timeline;
+        // Marker 32, Exit 10, gap/bootstrap 41 remain reserved independently of requests.
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (3, 83));
+        let mut checkpoints = Vec::new();
+        for _ in 0..5 {
+            checkpoints.push(budget.try_reserve(EntryClass::Lifecycle, 27).unwrap());
+        }
+        assert!(budget.try_reserve(EntryClass::Lifecycle, 27).is_none());
+        assert_eq!(budget.usage(EntryClass::Lifecycle), (8, 218));
+        assert_eq!(std::mem::size_of::<DeliveryMarker>(), 8);
+        assert!(std::mem::size_of::<DeliveryMarker>() <= DELIVERY_MARKER_BYTES);
+        // Entry count bounds retained wrappers separately from wire-byte costs.
+        assert!(std::mem::size_of::<ChannelOutput>() <= 64);
+        assert!(std::mem::size_of::<crate::session_manager::OutputCharge>() <= 24);
+        assert!(std::mem::size_of::<SessionOutbound>() <= 160);
+    }
+
+    #[tokio::test]
+    async fn stage6_activation_runner_refuses_open_before_geometry_profile() {
+        for live in [false, true] {
+            let spawner = FakeSpawner::new();
+            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+            if live {
+                inbound
+                    .send(SessionInbound::Live(AttachmentContext::default()))
+                    .await
+                    .unwrap();
+            }
+            let _ = inbound.send(open(16, ChannelKind::Shell, false)).await;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let msg = outbound.recv().await;
+                    if matches!(msg, Some(SessionOutbound::Consumed { .. })) {
+                        continue;
+                    }
+                    break msg;
+                }
+            })
+            .await;
+            drop(inbound);
+            runner.await.unwrap();
+            spawner.end_channel(16);
+            assert!(
+                spawner.owners.lock().unwrap().is_empty(),
+                "missing profile must never spawn"
+            );
+            assert!(
+                matches!(reply, Ok(Some(SessionOutbound::ProtocolFailure { .. }))),
+                "explicit scoped failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_retains_typed_marker_and_gate_until_delivery() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let gate = io.send_gate(16, GateKind::Pipe);
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 1,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        spawner.end_channel(16);
+        let marker = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match outbound.recv().await.unwrap() {
+                    SessionOutbound::ChannelOutput {
+                        output: ChannelOutput::DeliveryMarker(marker, _),
+                        ..
+                    } => break Some(marker),
+                    SessionOutbound::NotifyDelivered { .. } => break None,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let open_before_delivery = gate.is_open();
+        if let Some(marker) = marker {
+            inbound
+                .send(SessionInbound::Delivered {
+                    stream: 16,
+                    token: marker.token,
+                    generation: 1,
+                })
+                .await
+                .unwrap();
+        }
+        drop(inbound);
+        runner.await.unwrap();
+        assert!(marker.is_some(), "EOF needs a typed final-position marker");
+        assert!(open_before_delivery, "PendingExit must retain the gate");
+    }
+    #[test]
+    fn correlated_same_size_resize_applies_without_preparation_or_repaint() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(rig.resize(1, 80, 24));
+        assert!(rig.events.lock().unwrap().is_empty());
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+        assert!(rig.outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn resize_rejects_bad_identity_and_replays_exact_duplicate_without_effect() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(rig.resize(1, 100, 30));
+        let _ = rig.next_geometry();
+        assert!(rig.resize(1, 100, 30));
+        assert!(rig.outbound.try_recv().is_err());
+        assert_eq!(
+            *rig.events.lock().unwrap(),
+            vec!["prepare", "ioctl", "commit"]
+        );
+        assert!(!rig.resize(1, 101, 30));
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ProtocolFailure { code: None, .. }
+        ));
+        for (instance, id) in [(2, 1), (1, 2)] {
+            let mut rig = ResizeRig::new(false, false);
+            let request = ResizeIntent {
+                instance: ChannelInstance::new(instance).unwrap(),
+                ..rig.intent(id, 100, 30)
+            };
+            assert!(!process_resize(&rig.io, &mut rig.channel, request));
+            rig.assert_geometry(80, 24);
+            assert!(rig.events.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn invalid_size_and_no_pty_use_reserved_refusals() {
+        for no_pty in [false, true] {
+            let mut rig = ResizeRig::new(false, false);
+            if no_pty {
+                rig.channel.request.cols = 0;
+            }
+            assert!(rig.resize(1, 0, 30));
+            assert!(rig.events.lock().unwrap().is_empty());
+            let geometry = rig.next_geometry();
+            assert_eq!(
+                geometry.outcome,
+                GeometryOutcome::Refused(if no_pty {
+                    ResizeRefusal::NoPty
+                } else {
+                    ResizeRefusal::InvalidSize
+                })
+            );
+            assert_eq!(geometry.cols, if no_pty { 0 } else { 80 });
+        }
+    }
+    #[test]
+    fn no_screen_checkpoint_after_data_uses_ordinary_capacity() {
+        let mut rig = ResizeRig::new(false, false);
+        forward_output(&rig.io, 16, &mut rig.channel, b"before");
+        let _data = rig.outbound.try_recv().unwrap();
+        let lifecycle = rig.channel.producer.timeline.usage(EntryClass::Lifecycle);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Ordinary),
+            (1, 27)
+        );
+        assert_eq!(
+            rig.channel.producer.timeline.usage(EntryClass::Lifecycle),
+            lifecycle
+        );
+    }
+    #[test]
+    fn lifecycle_saturation_holds_bounded_data_until_capacity_wakes() {
+        let mut rig = ResizeRig::new(false, false);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, 27)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"held");
+        assert!(!rig.channel.gate.is_open());
+        assert!(rig.outbound.try_recv().is_err());
+        drop(held.pop());
+        assert!(rig
+            .channel
+            .producer
+            .timeline
+            .take_notification(ChannelInstance::new(1).unwrap(), 1));
+        resume_producer(&rig.io, &mut rig.channel);
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Established);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput{output:ChannelOutput::Data(ref bytes),..} if bytes==b"held")
+        );
+        assert!(rig.channel.producer.queued_data.is_empty());
+    }
+    #[test]
+    fn repaint_capacity_wake_preserves_data_first_order() {
+        assert_repaint_capacity_wake_order(false);
+    }
+    #[test]
+    fn repaint_capacity_wake_preserves_resize_first_order() {
+        assert_repaint_capacity_wake_order(true);
+    }
+    fn assert_repaint_capacity_wake_order(resize_first: bool) {
+        let mut rig = ResizeRig::new(false, false);
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, GEOMETRY_BYTES)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"older");
+        drop(held.pop());
+        let mut channels = HashMap::from([(16, rig.channel)]);
+        // Repaint wins the runner select before the pending OutputReady wake.
+        repaint_all(&rig.io, &mut channels);
+        let ch = channels.get_mut(&16).unwrap();
+        if !resize_first {
+            forward_output(&rig.io, 16, ch, b"newer");
+        }
+        let request = ResizeIntent {
+            instance: ChannelInstance::new(ch.instance).unwrap(),
+            origin: ch.producer.origin,
+            request_id: ResizeRequestId::new(1).unwrap(),
+            cols: 100,
+            rows: 30,
+        };
+        assert!(process_resize(&rig.io, ch, request));
+        if resize_first {
+            forward_output(&rig.io, 16, ch, b"newer");
+        }
+        // The delayed wake must not replay those bytes under changed geometry.
+        resume_producer(&rig.io, ch);
+        let mut owned = Vec::new();
+        while let Ok(message) = rig.outbound.try_recv() {
+            owned.push(message);
+        }
+        let data: Vec<_> = owned
+            .iter()
+            .filter_map(|message| match message {
+                SessionOutbound::ChannelOutput {
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data, vec![b"older".as_slice(), b"newer".as_slice()]);
+        assert!(matches!(
+            &owned[0],
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::Geometry(_, _),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &owned[if resize_first { 2 } else { 3 }],
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::Geometry(
+                    GeometryRecord {
+                        outcome: GeometryOutcome::Applied,
+                        cols: 100,
+                        rows: 30,
+                        ..
+                    },
+                    _
+                ),
+                ..
+            }
+        ));
+        assert_eq!(owned.len(), 4);
+        assert!(ch.producer.queued_data.is_empty());
+        assert_eq!(ch.producer.timeline.usage(EntryClass::Lifecycle), (8, 218));
+        // Both DATA charges remain owned after the queue entries are drained.
+        ch.gate.update(crate::send_gate::PIPE_HIGH);
+        ch.gate.update(crate::send_gate::PIPE_LOW);
+        assert!(!ch.gate.is_open());
+    }
+    #[test]
+    fn screen_resize_outputs_checkpoint_then_authoritative_repaint() {
+        let mut rig = ResizeRig::new(false, false);
+        rig.channel.screened = true;
+        rig.channel.screen = Box::new(FakeScreen {
+            stream: 16,
+            repaints: Arc::default(),
+        });
+        assert!(rig.resize(1, 100, 30));
+        assert_eq!(rig.next_geometry().outcome, GeometryOutcome::Applied);
+        assert!(
+            matches!(rig.outbound.try_recv().unwrap(),SessionOutbound::ChannelOutput{output:ChannelOutput::Data(ref bytes),..} if bytes==b"REPAINT")
+        );
+        assert!(matches!(
+            rig.outbound.try_recv().unwrap(),
+            SessionOutbound::ChannelOutput {
+                output: ChannelOutput::EchoAck(0, _),
+                ..
+            }
+        ));
+    }
+    #[tokio::test]
+    async fn coalesced_resize_records_each_admit_before_effect_and_fail_once() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 1,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        let mut bytes = Vec::new();
+        for id in 1..=135 {
+            bytes.extend(encode_client(&ClientRecord::ResizeRequest {
+                stream: 16,
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(id).unwrap(),
+                cols: 80 + id as u16,
+                rows: 24,
+            }));
+        }
+        let n = bytes.len();
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: bytes,
+            }))
+            .await
+            .unwrap();
+        let mut owned = Vec::new();
+        let mut failures = 0;
+        let mut outcomes = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                let message=outbound.recv().await.unwrap();
+                let finished=matches!(&message,SessionOutbound::Consumed{stream_id:CONTROL_STREAM,n:bytes} if *bytes==n);
+                match &message {
+                    SessionOutbound::ProtocolFailure{code:Some(ProtocolErrorCode::ResizePipelineOverflow),..}=>failures+=1,
+                    SessionOutbound::ChannelOutput{output:ChannelOutput::Geometry(g,_),..} if g.request_id>0=>outcomes+=1,
+                    _=>{}
+                }
+                owned.push(message); // keep permits while the entire batch runs
+                if finished {break;}
+            }
+        }).await.unwrap();
+        drop(inbound);
+        spawner.end_channel(16);
+        runner.await.unwrap();
+        assert_eq!(outcomes, 128);
+        assert_eq!(failures, 1);
+        assert_eq!(spawner.sizes.lock().unwrap().len(), 128);
+    }
+    #[tokio::test]
+    async fn geometry_screen_eof_owns_final_snapshot_before_marker() {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        inbound
+            .send(SessionInbound::Live(AttachmentContext {
+                generation: 0,
+                session_id: 11,
+                features: crate::Features::CHANNEL_GEOMETRY,
+            }))
+            .await
+            .unwrap();
+        let open = encode_client(&ClientRecord::Open(OpenRequest {
+            stream: 16,
+            kind: crate::channel::ChannelKind::Shell,
+            cols: 80,
+            rows: 24,
+            screen: true,
+            command: Vec::new(),
+        }));
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: open,
+            }))
+            .await
+            .unwrap();
+        while !matches!(outbound.recv().await.unwrap(),SessionOutbound::ChannelOutput {output:ChannelOutput::Data(ref bytes),..} if bytes==b"hello from the shell")
+        {
+        }
+        spawner.end_channel(16);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                if let SessionOutbound::ChannelOutput { output, .. } =
+                    outbound.recv().await.unwrap()
+                {
+                    match output {
+                        ChannelOutput::Geometry(..) => seen.push("geometry"),
+                        ChannelOutput::Data(data) => {
+                            assert_eq!(data, b"REPAINT");
+                            seen.push("snapshot");
+                        }
+                        ChannelOutput::EchoAck(..) => seen.push("ack"),
+                        ChannelOutput::DeliveryMarker(..) => {
+                            seen.push("marker");
+                            break seen;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(inbound);
+        runner.await.unwrap();
+        assert_eq!(seen, vec!["geometry", "snapshot", "ack", "marker"]);
+    }
+    #[tokio::test]
+    async fn complete_old_resize_precedes_resume_reset() {
+        assert_correlated_resize_reset_order(false).await;
+    }
+    #[tokio::test]
+    async fn partial_old_resize_never_crosses_reset() {
+        assert_correlated_resize_reset_order(true).await;
+    }
+    async fn assert_correlated_resize_reset_order(partial: bool) {
+        let spawner = FakeSpawner::new();
+        let (io, inbound, mut outbound) = channel_pair();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        let old = AttachmentContext {
+            generation: 1,
+            session_id: 11,
+            features: crate::Features::CHANNEL_GEOMETRY,
+        };
+        inbound.send(SessionInbound::Live(old)).await.unwrap();
+        open_a_shell_channel(&inbound, &mut outbound).await;
+        let request = |cols| {
+            encode_client(&ClientRecord::ResizeRequest {
+                stream: 16,
+                instance: ChannelInstance::new(1).unwrap(),
+                request_id: ResizeRequestId::new(1).unwrap(),
+                cols,
+                rows: 30,
+            })
+        };
+        let mut bytes = request(100);
+        if partial {
+            bytes.truncate(bytes.len() - 1);
+        }
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: bytes,
+            }))
+            .await
+            .unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(AttachmentContext {
+                generation: 2,
+                session_id: 12,
+                ..old
+            }))
+            .await
+            .unwrap();
+        inbound
+            .send(SessionInbound::Data(StreamData {
+                stream_id: CONTROL_STREAM,
+                data: request(120),
+            }))
+            .await
+            .unwrap();
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut seen = Vec::new();
+            loop {
+                match outbound.recv().await.unwrap() {
+                    SessionOutbound::ResumeBarrier { generation } => seen.push((generation, 0, 0)),
+                    SessionOutbound::ChannelOutput {
+                        origin,
+                        output: ChannelOutput::Geometry(g, _),
+                        ..
+                    } => {
+                        if g.request_id > 0 {
+                            seen.push((origin.generation, g.request_id, g.cols));
+                        }
+                        if origin.generation == 2 && g.request_id == 1 {
+                            break seen;
+                        }
+                    }
+                    SessionOutbound::ProtocolFailure { .. } => {
+                        panic!("reset must start fresh framing and request scope")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(inbound);
+        spawner.end_channel(16);
+        runner.await.unwrap();
+        if partial {
+            assert_eq!(seen, vec![(2, 0, 0), (2, 1, 120)]);
+            assert_eq!(*spawner.sizes.lock().unwrap(), vec![(16, 120, 30)]);
+        } else {
+            assert_eq!(seen, vec![(1, 1, 100), (2, 0, 0), (2, 1, 120)]);
+            assert_eq!(
+                *spawner.sizes.lock().unwrap(),
+                vec![(16, 100, 30), (16, 120, 30)]
+            );
+        }
+    }
+    #[test]
+    fn reset_flushes_already_read_bytes_in_old_scope_before_barrier() {
+        let mut rig = ResizeRig::new(false, false);
+        assert!(checkpoint(&rig.io, &mut rig.channel));
+        let initial = rig.outbound.try_recv().unwrap();
+        let ordinary = rig
+            .channel
+            .producer
+            .timeline
+            .try_reserve(EntryClass::Ordinary, 8192)
+            .unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                rig.channel
+                    .producer
+                    .timeline
+                    .try_reserve(EntryClass::Lifecycle, 27)
+                    .unwrap(),
+            );
+        }
+        assert!(!checkpoint(&rig.io, &mut rig.channel));
+        forward_output(&rig.io, 16, &mut rig.channel, b"old read");
+        let origin = AttachmentContext {
+            generation: 2,
+            session_id: 12,
+            ..rig.channel.producer.origin
+        };
+        let mut channels = HashMap::from([(16, rig.channel)]);
+        reset_attachment_outputs(&rig.io, &mut channels, &mut HashMap::new(), origin);
+        let gate = channels[&16].gate.clone();
+        let mut visible = vec![(1, b"geometry".to_vec())];
+        let mut owned = vec![initial];
+        while let Ok(message) = rig.outbound.try_recv() {
+            match &message {
+                SessionOutbound::ChannelOutput {
+                    origin,
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } => visible.push((origin.generation, bytes.clone())),
+                SessionOutbound::ResumeBarrier { generation } => {
+                    visible.push((*generation, b"barrier".to_vec()))
+                }
+                SessionOutbound::ChannelOutput {
+                    output: ChannelOutput::Geometry(..),
+                    ..
+                } => panic!("new boundary is still capacity blocked"),
+                _ => {}
+            }
+            owned.push(message);
+        }
+        assert_eq!(
+            visible,
+            vec![
+                (1, b"geometry".to_vec()),
+                (1, b"old read".to_vec()),
+                (2, b"barrier".to_vec())
+            ]
+        );
+        assert!(channels[&16].producer.queued_data.is_empty());
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
+            (8, 218)
+        );
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Ordinary),
+            (1, 8192)
+        );
+        gate.update(crate::send_gate::PIPE_HIGH);
+        gate.update(crate::send_gate::PIPE_LOW);
+        gate.set_metadata_blocked(false);
+        assert!(
+            !gate.is_open(),
+            "queued DATA and geometry still own framed pending bytes"
+        );
+        drop(owned);
+        assert!(
+            gate.is_open(),
+            "dropping owned output releases the pending charge exactly once"
+        );
+        assert_eq!(
+            channels[&16].producer.timeline.usage(EntryClass::Lifecycle),
+            (6, 150)
+        );
+        drop(ordinary);
+    }
+    // Transactions are observed independently of the implementation: a pending
+    // resource and a model frame stay unchanged when either admission or PTY fails.
+    struct TransactionScreen {
+        geometry: Arc<Mutex<(u16, u16)>>,
+        pending: Arc<AtomicUsize>,
+        fail: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    struct TransactionResize<'a> {
+        screen: &'a mut TransactionScreen,
+        size: TerminalSize,
+    }
+    impl Drop for TransactionResize<'_> {
+        fn drop(&mut self) {
+            self.screen.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl crate::shell_server::PreparedScreenResize for TransactionResize<'_> {
+        fn commit(self: Box<Self>) {
+            self.screen.events.lock().unwrap().push("commit");
+            *self.screen.geometry.lock().unwrap() = (self.size.cols(), self.size.rows());
+        }
+    }
+    impl SessionScreen for TransactionScreen {
+        fn absorb(&mut self, _bytes: &[u8]) {}
+        fn repaint(&mut self) -> Vec<u8> {
+            vec![]
+        }
+        fn prepare_resize(
+            &mut self,
+            size: TerminalSize,
+        ) -> Result<
+            Box<dyn crate::shell_server::PreparedScreenResize + '_>,
+            crate::shell_server::ScreenPreparationError,
+        > {
+            self.events.lock().unwrap().push("prepare");
+            if self.fail {
+                return Err(crate::shell_server::ScreenPreparationError::ResourceLimit(
+                    "budget refused".into(),
+                ));
+            }
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(TransactionResize { screen: self, size }))
+        }
+    }
+    struct TransactionPty {
+        fail: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+    impl ResizeHandle for TransactionPty {
+        fn try_resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            self.events.lock().unwrap().push("ioctl");
+            if self.fail {
+                Err("ioctl failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn same_size_resize_has_no_ioctl() {
+        let spawner = FakeSpawner::new();
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        let (io, _inbound, _outbound) = channel_pair();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut channels = HashMap::new();
+        open_channel(
+            &io,
+            &mut channels,
+            &dyn_spawner,
+            &tx,
+            OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: vec![],
+            },
+            None,
+            1,
+            &channel_producer(),
+        );
+        let result = resize_channel(
+            channels.get_mut(&16).unwrap(),
+            TerminalSize::new(80, 24).unwrap(),
+        );
+        spawner.end_channel(16);
+        drop(channels);
+        assert!(result.is_ok());
+        assert!(
+            spawner.sizes.lock().unwrap().is_empty(),
+            "equal geometry must not invoke ioctl"
+        );
+    }
+
+    #[tokio::test]
+    async fn resize_transaction_commits_only_after_successful_ioctl() {
+        for (fail_prepare, fail_ioctl, want) in [
+            (true, false, vec!["prepare"]),
+            (false, true, vec!["prepare", "ioctl"]),
+            (false, false, vec!["prepare", "ioctl", "commit"]),
+        ] {
+            let spawner = FakeSpawner::new();
+            let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+            let (io, _inbound, _outbound) = channel_pair();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut channels = HashMap::new();
+            open_channel(
+                &io,
+                &mut channels,
+                &dyn_spawner,
+                &tx,
+                OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols: 2,
+                    rows: 1,
+                    screen: false,
+                    command: vec![],
+                },
+                None,
+                1,
+                &channel_producer(),
+            );
+            let geometry = Arc::new(Mutex::new((2, 1)));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let events = Arc::new(Mutex::new(vec![]));
+            let ch = channels.get_mut(&16).unwrap();
+            ch.screen = Box::new(TransactionScreen {
+                geometry: geometry.clone(),
+                pending: pending.clone(),
+                fail: fail_prepare,
+                events: events.clone(),
+            });
+            ch.resize = Box::new(TransactionPty {
+                fail: fail_ioctl,
+                events: events.clone(),
+            });
+            let result = resize_channel(ch, TerminalSize::new(2, 2).unwrap());
+            assert_eq!(result.is_ok(), !fail_prepare && !fail_ioctl);
+            assert_eq!(*events.lock().unwrap(), want);
+            assert_eq!(
+                pending.load(Ordering::SeqCst),
+                0,
+                "cancel or commit returns scratch"
+            );
+            let expected = if result.is_ok() { (2, 2) } else { (2, 1) };
+            assert_eq!(*geometry.lock().unwrap(), expected);
+            assert_eq!(
+                (ch.request.cols, ch.request.rows),
+                expected,
+                "lifecycle metadata must report committed geometry"
+            );
+            spawner.end_channel(16);
+            drop(channels);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_open_keeps_generic_no_pty_fields_and_resize_cannot_change_mode() {
+        for (cols, rows) in [(0, 0), (0, 700), (900, 0)] {
+            let spawner = FakeSpawner::new();
+            let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+            let (io, _inbound, _outbound) = channel_pair();
+            let (tx, _rx) = mpsc::channel(8);
+            let mut channels = HashMap::new();
+            let request = OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols,
+                rows,
+                screen: false,
+                command: vec![],
+            };
+            open_channel(
+                &io,
+                &mut channels,
+                &dyn_spawner,
+                &tx,
+                request.clone(),
+                None,
+                1,
+                &channel_producer(),
+            );
+            assert_eq!(channels[&16].request, request);
+            let raw = crate::shell_frame::RecordDeframer::for_control().push(&encode_client(
+                &ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(1).unwrap(),
+                    stream: 16,
+                    cols: 2,
+                    rows: 1,
+                },
+            ));
+            for record in raw {
+                apply_control_record(
+                    &io,
+                    &mut channels,
+                    &mut HashMap::new(),
+                    &mut 2,
+                    &dyn_spawner,
+                    &tx,
+                    record,
+                    &mut None,
+                    &mut SessionUpdate::new(None),
+                    &channel_producer(),
+                );
+            }
+            assert_eq!(channels[&16].request, request);
+            assert!(spawner.sizes.lock().unwrap().is_empty());
+            spawner.end_channel(16);
+            drop(channels);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_resize_never_reaches_model_or_pty() {
+        let spawner = FakeSpawner::new();
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        let (io, _inbound, _outbound) = channel_pair();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut channels = HashMap::new();
+        let request = OpenRequest {
+            stream: 16,
+            kind: ChannelKind::Shell,
+            cols: 2,
+            rows: 1,
+            screen: true,
+            command: vec![],
+        };
+        open_channel(
+            &io,
+            &mut channels,
+            &dyn_spawner,
+            &tx,
+            request.clone(),
+            None,
+            1,
+            &channel_producer(),
+        );
+        let events = Arc::new(Mutex::new(vec![]));
+        channels.get_mut(&16).unwrap().screen = Box::new(TransactionScreen {
+            geometry: Arc::new(Mutex::new((2, 1))),
+            pending: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            events: events.clone(),
+        });
+        for (index, (cols, rows)) in [(0, 1), (2, 0), (1, 1), (513, 1), (2, 257)]
+            .into_iter()
+            .enumerate()
+        {
+            for record in
+                RecordDeframer::for_control().push(&encode_client(&ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(index as u64 + 1).unwrap(),
+                    stream: 16,
+                    cols,
+                    rows,
+                }))
+            {
+                apply_control_record(
+                    &io,
+                    &mut channels,
+                    &mut HashMap::new(),
+                    &mut 2,
+                    &dyn_spawner,
+                    &tx,
+                    record,
+                    &mut None,
+                    &mut SessionUpdate::new(None),
+                    &channel_producer(),
+                );
+            }
+        }
+        assert_eq!(channels[&16].request, request);
+        assert!(spawner.sizes.lock().unwrap().is_empty());
+        assert!(events.lock().unwrap().is_empty());
+        spawner.end_channel(16);
+        drop(channels);
+    }
+
+    #[tokio::test]
+    async fn invalid_nonzero_open_never_calls_spawner() {
+        let spawner = FakeSpawner::new();
+        *spawner.refuse.lock().unwrap() = Some("spy must not run".into());
+        let (io, _inbound, _outbound) = channel_pair();
+        let (tx, _rx) = mpsc::channel(1);
+        let dyn_spawner: Arc<dyn ChannelSpawner> = spawner.clone();
+        for (cols, rows) in [(1, 1), (513, 1), (2, 257), (u16::MAX, u16::MAX)] {
+            open_channel(
+                &io,
+                &mut HashMap::new(),
+                &dyn_spawner,
+                &tx,
+                OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols,
+                    rows,
+                    screen: true,
+                    command: vec![],
+                },
+                None,
+                1,
+                &channel_producer(),
+            );
+        }
+        assert!(
+            spawner.owners.lock().unwrap().is_empty(),
+            "validate before invoking a spawner"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_or_malformed_resize_stops_suffix_until_attachment_reset() {
+        for (kind, payload) in [
+            (0x11, vec![16, 0, 80, 0, 24]),
+            (0x11, vec![]),
+            (0x16, vec![]),
+        ] {
+            let spawner = FakeSpawner::new();
+            let (io, inbound, mut outbound) = channel_pair();
+            let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+            let SessionInbound::Data(prefix) = open(16, ChannelKind::Shell, false) else {
+                unreachable!()
+            };
+            let SessionInbound::Data(suffix) = open(17, ChannelKind::Shell, false) else {
+                unreachable!()
+            };
+            let bytes = [
+                prefix.data,
+                crate::shell_frame::encode_record(kind, &payload),
+                suffix.data,
+            ]
+            .concat();
+            let n = bytes.len();
+            inbound
+                .send(SessionInbound::Data(StreamData {
+                    stream_id: CONTROL_STREAM,
+                    data: bytes,
+                }))
+                .await
+                .unwrap();
+            consumed_until(&mut outbound, CONTROL_STREAM, n).await;
+            let before_reset = spawner
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            inbound
+                .send(SessionInbound::ResumeReset(channel_context()))
+                .await
+                .unwrap();
+            let event = open(18, ChannelKind::Shell, false);
+            let SessionInbound::Data(ref data) = event else {
+                unreachable!()
+            };
+            let n = data.data.len();
+            inbound.send(event).await.unwrap();
+            consumed_until(&mut outbound, CONTROL_STREAM, n).await;
+            let after_reset = spawner
+                .owners
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            for stream in [16, 17, 18] {
+                spawner.end_channel(stream);
+            }
+            drop(inbound);
+            runner.await.unwrap();
+            assert_eq!(
+                before_reset,
+                vec![16],
+                "no application input after retired/malformed resize"
+            );
+            assert_eq!(after_reset, vec![16, 18]);
+            assert!(spawner.sizes.lock().unwrap().is_empty());
+        }
+    }
+
     /// Spec §4.10.3: a control record is taken once applied.
     #[tokio::test]
     async fn control_records_are_taken_once_applied() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let record = open(16, ChannelKind::Shell, false);
         let SessionInbound::Data(ref sd) = record else {
@@ -1911,7 +3905,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_control_record_past_the_limit_is_dropped_whole_and_reported() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let payload_len = CONTROL_RECORD_MAX + 1;
         // An unknown record kind -- not 0x10 (OPEN): zeros under OPEN could
@@ -1967,7 +3961,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_starts_the_control_stream_afresh() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let mut cut = vec![0x10];
         cut.extend_from_slice(&100u32.to_be_bytes());
@@ -1979,10 +3974,15 @@ pub(crate) mod tests {
             }))
             .await
             .unwrap();
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
         assert_eq!(
-            next_control(&mut outbound).await,
-            ServerRecord::Channels(Vec::new())
+            next_snapshot(&mut outbound, &snapshots).await,
+            ServerRecord::ChannelSnapshot(
+                crate::channel::ChannelSnapshot::new(vec![], vec![]).unwrap()
+            )
         );
         inbound
             .send(open(16, ChannelKind::Shell, false))
@@ -2007,12 +4007,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_renews_the_controls_record_cap() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
         assert_eq!(
-            next_control(&mut outbound).await,
-            ServerRecord::Channels(Vec::new())
+            next_snapshot(&mut outbound, &snapshots).await,
+            ServerRecord::ChannelSnapshot(
+                crate::channel::ChannelSnapshot::new(vec![], vec![]).unwrap()
+            )
         );
 
         let payload_len = CONTROL_RECORD_MAX + 1;
@@ -2045,7 +4051,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_channels_input_is_taken_once_its_process_has_it() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         open_a_shell_channel(&inbound, &mut outbound).await;
         spawner.hold_writes(true);
@@ -2074,7 +4080,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn input_the_runner_drops_is_reported_at_once() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(SessionInbound::Data(StreamData {
@@ -2096,7 +4102,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn input_left_in_a_closed_channels_queue_is_reported() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         open_a_shell_channel(&inbound, &mut outbound).await;
         spawner.hold_writes(true);
@@ -2138,6 +4144,14 @@ pub(crate) mod tests {
                 .await
                 .expect("the channel must produce output within five seconds")
                 .expect("the runner must not drop its outbound channel");
+            let msg = match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id,
+                    output: ChannelOutput::Data(bytes),
+                    ..
+                } if id == stream => return bytes,
+                other => other,
+            };
             let SessionOutbound::Data(sd) = msg else {
                 continue;
             };
@@ -2194,7 +4208,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn opening_a_channel_declares_whether_its_backlog_is_recoverable() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2231,7 +4245,7 @@ pub(crate) mod tests {
     ) {
         let spawner = FakeSpawner::new();
         *spawner.force_no_screen.lock().unwrap() = true;
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2258,7 +4272,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_opened_channel_carries_bytes_both_ways() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2309,7 +4323,7 @@ pub(crate) mod tests {
             identity: "SHA256:alice".to_string(),
             incarnation: 0,
         };
-        let (io, inbound, mut outbound) = SessionIo::test_pair_for(alice.clone(), [0u8; 16]);
+        let (io, inbound, mut outbound) = channel_pair_for(alice.clone(), [0u8; 16]);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2335,7 +4349,7 @@ pub(crate) mod tests {
     /// each its own PAM session.
     #[tokio::test]
     async fn a_channel_carries_the_login_that_asked_for_it() {
-        let (io, inbound, mut outbound) = SessionIo::test_pair_for(
+        let (io, inbound, mut outbound) = channel_pair_for(
             Principal {
                 uid: 1000,
                 name: "alice".into(),
@@ -2364,7 +4378,7 @@ pub(crate) mod tests {
     async fn a_refused_channel_reports_why_and_stays_closed() {
         let spawner = FakeSpawner::new();
         *spawner.refuse.lock().unwrap() = Some("shell not found".to_string());
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2402,7 +4416,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn opening_past_the_cap_is_refused_without_disturbing_the_rest() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         for n in 0..MAX_CHANNELS {
@@ -2454,7 +4468,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_closed_channel_frees_its_slot() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         for n in 0..MAX_CHANNELS {
@@ -2501,7 +4515,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn reopening_a_stream_that_is_already_open_is_refused() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2556,7 +4570,7 @@ pub(crate) mod tests {
     async fn a_finished_channel_reports_its_exit_code() {
         let mut spawner = FakeSpawner::new();
         Arc::get_mut(&mut spawner).unwrap().exit_code = 130;
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
@@ -2594,7 +4608,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn one_channel_ending_leaves_the_others_running() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
@@ -2651,7 +4665,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_resize_applies_to_one_channel_only() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2674,7 +4688,9 @@ pub(crate) mod tests {
         inbound
             .send(SessionInbound::Data(StreamData {
                 stream_id: CONTROL_STREAM,
-                data: encode_client(&ClientRecord::Resize {
+                data: encode_client(&ClientRecord::ResizeRequest {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: ResizeRequestId::new(1).unwrap(),
                     stream: 16,
                     cols: 120,
                     rows: 40,
@@ -2701,7 +4717,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_repaint_reaches_only_the_channels_that_asked_for_a_screen() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2747,7 +4763,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_warm_reattach_announces_the_live_channels_first() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2763,10 +4780,19 @@ pub(crate) mod tests {
             b"hello from the shell"
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
 
-        match next_control(&mut outbound).await {
-            ServerRecord::Channels(list) => {
+        match next_snapshot(&mut outbound, &snapshots).await {
+            ServerRecord::ChannelSnapshot(snapshot) => {
+                assert!(snapshot.draining().is_empty());
+                let list: Vec<_> = snapshot
+                    .active()
+                    .iter()
+                    .map(|entry| &entry.request)
+                    .collect();
                 assert_eq!(list.len(), 1, "one channel is running, one is announced");
                 assert_eq!(list[0].stream, 16);
                 assert_eq!(list[0].kind, ChannelKind::Shell);
@@ -2788,7 +4814,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_terminal_type_reaches_the_spawner_of_every_later_channel() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         // A channel opened before the announcement: nothing to pass on.
@@ -2838,7 +4864,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_refused_terminal_type_leaves_the_spawner_with_none() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2873,10 +4899,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_cold_start_sends_no_channel_list() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
-        inbound.send(SessionInbound::Live).await.unwrap();
+        inbound
+            .send(SessionInbound::Live(channel_context()))
+            .await
+            .unwrap();
         inbound
             .send(open(16, ChannelKind::Shell, false))
             .await
@@ -2903,7 +4932,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_still_running_channel_is_killed_and_waited_when_the_session_ends() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -2941,7 +4970,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_closed_channel_is_killed_and_waited_even_though_its_process_is_still_running() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -3002,7 +5031,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_channel_that_goes_away_puts_its_stream_back_in_the_interactive_class() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
+        let mut outbound = auto_deliver(&inbound, outbound);
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
             .send(open(16, ChannelKind::Shell, false))
@@ -3045,13 +5075,14 @@ pub(crate) mod tests {
     }
 
     /// A warm reattach announces EVERY live channel, not just the first --
-    /// the whole reason `ServerRecord::Channels` is a list, and each entry
+    /// the atomic snapshot preserves a bounded list, and each entry
     /// keeps its own identity, kind, geometry and screen flag rather than
     /// collapsing into a count.
     #[tokio::test]
     async fn a_warm_reattach_announces_every_live_channel_with_its_own_details() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -3075,10 +5106,19 @@ pub(crate) mod tests {
             ServerRecord::Opened { stream: 17 }
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
 
-        match next_control(&mut outbound).await {
-            ServerRecord::Channels(list) => {
+        match next_snapshot(&mut outbound, &snapshots).await {
+            ServerRecord::ChannelSnapshot(snapshot) => {
+                assert!(snapshot.draining().is_empty());
+                let list: Vec<_> = snapshot
+                    .active()
+                    .iter()
+                    .map(|entry| &entry.request)
+                    .collect();
                 assert_eq!(list.len(), 2, "both live channels are announced");
                 assert_eq!(list[0].stream, 16);
                 assert_eq!(list[0].kind, ChannelKind::Shell);
@@ -3118,7 +5158,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn resume_reset_redeclares_every_live_channels_recoverability() {
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -3145,7 +5185,10 @@ pub(crate) mod tests {
         // Everything above already drained the two OPEN-time declarations as
         // a side effect of `next_control`/`next_channel_data` skipping past
         // them -- what is collected below can only be fresh ones.
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
 
         let mut redeclared = collect_declarations(&mut outbound, 2).await;
         redeclared.sort_by_key(|(stream, _)| *stream);
@@ -3172,7 +5215,7 @@ pub(crate) mod tests {
     async fn resume_reset_redeclares_off_the_actual_screen_model_not_the_request() {
         let spawner = FakeSpawner::new();
         *spawner.force_no_screen.lock().unwrap() = true;
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
 
         inbound
@@ -3188,7 +5231,10 @@ pub(crate) mod tests {
             b"hello from the shell"
         );
 
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
 
         let redeclared = collect_declarations(&mut outbound, 1).await;
         assert_eq!(
@@ -3392,7 +5438,7 @@ pub(crate) mod tests {
     /// the session carries on: the next request is answered as usual.
     #[tokio::test]
     async fn a_session_without_a_daemon_behind_it_leaves_about_unanswered() {
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session(io, FakeSpawner::new()));
         inbound
             .send(control(ClientRecord::AboutRequest))
@@ -3414,7 +5460,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_about_request_is_answered_with_what_the_daemon_says() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3438,7 +5484,7 @@ pub(crate) mod tests {
     async fn a_refused_offer_is_answered_and_stray_image_bytes_are_dropped() {
         let daemon = FakeDaemon::new();
         *daemon.answer.lock().unwrap() = Some(UpdateAnswer::Managed);
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3475,7 +5521,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_accepted_image_is_written_verified_and_restarted() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3527,13 +5573,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_second_offer_while_one_is_in_flight_gets_in_progress() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
             with_daemon(&daemon),
         ));
-        let (io2, inbound2, mut outbound2) = SessionIo::test_pair();
+        let (io2, inbound2, mut outbound2) = channel_pair();
         let runner2 = tokio::spawn(run_channel_session_with(
             io2,
             FakeSpawner::new(),
@@ -3566,7 +5612,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_stalled_transfer_is_rejected_and_frees_the_slot() {
         let daemon = FakeDaemon::with_stall(std::time::Duration::from_millis(200));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3600,7 +5646,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_session_that_ends_mid_transfer_drops_its_transfer() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3626,7 +5672,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn update_bytes_are_taken_once_the_image_has_them() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3656,7 +5702,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn update_bytes_nobody_writes_are_reported_too() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3696,8 +5742,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_restart_announcement_reaches_every_session() {
         let daemon = FakeDaemon::new();
-        let (io1, inbound1, mut outbound1) = SessionIo::test_pair();
-        let (io2, inbound2, mut outbound2) = SessionIo::test_pair();
+        let (io1, inbound1, mut outbound1) = channel_pair();
+        let (io2, inbound2, mut outbound2) = channel_pair();
         let r1 = tokio::spawn(run_channel_session_with(
             io1,
             FakeSpawner::new(),
@@ -3737,7 +5783,7 @@ pub(crate) mod tests {
     async fn draining_ends_and_reaps_every_channel_then_says_so() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -3768,7 +5814,7 @@ pub(crate) mod tests {
     async fn a_session_that_only_sees_the_drain_reaps_but_does_not_confirm() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -3799,6 +5845,18 @@ pub(crate) mod tests {
             loop {
                 let Some(msg) = rx.recv().await else {
                     return std::future::pending::<ServerRecord>().await;
+                };
+                let msg = match msg {
+                    SessionOutbound::ChannelOpened { stream, .. } => {
+                        return ServerRecord::Opened { stream }
+                    }
+                    SessionOutbound::ChannelRefused { stream, reason, .. } => {
+                        return ServerRecord::Refused { stream, reason }
+                    }
+                    SessionOutbound::ChannelExit { stream, code, .. } => {
+                        return ServerRecord::Exit { stream, code }
+                    }
+                    other => other,
                 };
                 let SessionOutbound::Data(sd) = msg else {
                     continue;
@@ -3837,7 +5895,7 @@ pub(crate) mod tests {
         for signal in [RestartSignal::announced(1), RestartSignal::draining(1)] {
             let daemon = FakeDaemon::new();
             let spawner = FakeSpawner::new();
-            let (io, inbound, mut outbound) = SessionIo::test_pair();
+            let (io, inbound, mut outbound) = channel_pair();
             let runner = tokio::spawn(run_channel_session_with(
                 io,
                 spawner.clone(),
@@ -3870,7 +5928,7 @@ pub(crate) mod tests {
     async fn a_session_that_starts_during_an_announced_restart_tells_and_confirms() {
         let daemon = FakeDaemon::new();
         daemon.restart_tx.send_replace(RestartSignal::announced(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3902,7 +5960,7 @@ pub(crate) mod tests {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
         daemon.restart_tx.send_replace(RestartSignal::draining(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -3926,7 +5984,7 @@ pub(crate) mod tests {
         // Stays for the next restart.
         let daemon = FakeDaemon::new();
         daemon.restart_tx.send_replace(RestartSignal::draining(1));
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -3956,7 +6014,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn two_restarts_in_a_row_are_each_announced_once() {
         let daemon = FakeDaemon::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             FakeSpawner::new(),
@@ -4000,7 +6058,7 @@ pub(crate) mod tests {
     async fn a_session_that_ends_during_a_restart_still_confirms_its_drain() {
         let daemon = FakeDaemon::new();
         let spawner = FakeSpawner::new();
-        let (io, inbound, mut outbound) = SessionIo::test_pair();
+        let (io, inbound, mut outbound) = channel_pair();
         let runner = tokio::spawn(run_channel_session_with(
             io,
             spawner.clone(),
@@ -4026,6 +6084,15 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         let deadline = tokio::time::Instant::now() + window;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let msg = match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id, output, ..
+                } if id == stream => {
+                    out.extend(shell_record(output));
+                    continue;
+                }
+                other => other,
+            };
             if let SessionOutbound::Data(sd) = msg {
                 if sd.stream_id == stream {
                     out.extend(d.push(&sd.data));
@@ -4048,7 +6115,7 @@ pub(crate) mod tests {
     /// of everything consumed, unconditionally.
     #[tokio::test]
     async fn a_screen_channel_behind_a_closed_gate_drops_output_and_repaints_once_open() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4081,6 +6148,7 @@ pub(crate) mod tests {
         assert_eq!(
             after,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(2)
             ]
@@ -4091,7 +6159,7 @@ pub(crate) mod tests {
     /// model already holds it.
     #[tokio::test]
     async fn the_first_chunk_after_a_screen_gate_reopens_is_sent_as_a_repaint() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4113,6 +6181,7 @@ pub(crate) mod tests {
         assert_eq!(
             after,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(0)
             ]
@@ -4126,7 +6195,7 @@ pub(crate) mod tests {
     /// second repaint.
     #[tokio::test]
     async fn a_resume_reset_repaint_clears_a_stale_screen_channel() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4143,7 +6212,10 @@ pub(crate) mod tests {
         spawner.feed(16, b"dropped");
         let _ = records_within(&mut outbound, 16, std::time::Duration::from_millis(200)).await;
         let _ = gate.force_open();
-        inbound.send(SessionInbound::ResumeReset).await.unwrap();
+        inbound
+            .send(SessionInbound::ResumeReset(channel_context()))
+            .await
+            .unwrap();
         assert_eq!(next_channel_data(&mut outbound, 16).await, b"REPAINT");
         spawner.feed(16, b"live");
         assert_eq!(next_channel_data(&mut outbound, 16).await, b"live");
@@ -4154,7 +6226,7 @@ pub(crate) mod tests {
     /// the gate opens.
     #[tokio::test]
     async fn a_line_channels_reader_stops_reading_behind_a_closed_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4199,7 +6271,8 @@ pub(crate) mod tests {
         let counted = Arc::clone(&count);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if matches!(&msg, SessionOutbound::Data(sd) if sd.stream_id == stream) {
+                if matches!(&msg, SessionOutbound::ChannelOutput { stream: id, output: ChannelOutput::Data(_), .. } if *id == stream)
+                {
                     counted.fetch_add(1, Ordering::SeqCst);
                 }
                 if tx.send(msg).is_err() {
@@ -4216,7 +6289,7 @@ pub(crate) mod tests {
     /// of forty chunks at most the one its reader had under way goes out.
     #[tokio::test]
     async fn a_closed_line_gate_does_not_hold_back_a_screen_channel() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4260,7 +6333,7 @@ pub(crate) mod tests {
     /// process is reaped.
     #[tokio::test]
     async fn closing_a_line_channel_wakes_its_reader_off_a_closed_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4319,7 +6392,7 @@ pub(crate) mod tests {
     /// reaps -- and the reader lets go of its process.
     #[tokio::test]
     async fn a_session_that_ends_wakes_a_line_reader_waiting_on_its_gate() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let gate =
@@ -4346,7 +6419,7 @@ pub(crate) mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         rt.block_on(async {
             tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -4378,10 +6451,11 @@ pub(crate) mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(msg) = outbound.recv().await {
-                if let SessionOutbound::NotifyDelivered { stream_id, token } = msg {
+                if let Some((stream_id, token, generation)) = delivery_marker(&msg) {
                     if let Some(inbound) = weak.upgrade() {
                         let _ = inbound
                             .send(SessionInbound::Delivered {
+                                generation,
                                 stream: stream_id,
                                 token,
                             })
@@ -4420,8 +6494,8 @@ pub(crate) mod tests {
         let seen = Arc::clone(&requests);
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let SessionOutbound::NotifyDelivered { stream_id, token } = &msg {
-                    seen.lock().unwrap().push((*stream_id, *token));
+                if let Some((stream_id, token, _)) = delivery_marker(&msg) {
+                    seen.lock().unwrap().push((stream_id, token));
                 }
                 if tx.send(msg).is_err() {
                     return;
@@ -4455,6 +6529,17 @@ pub(crate) mod tests {
         let deadline = tokio::time::Instant::now() + window;
         while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             match msg {
+                SessionOutbound::ChannelOutput {
+                    stream: id,
+                    output: ChannelOutput::DeliveryMarker(..),
+                    ..
+                } if id == stream => out.push(Seen::NotifyDelivered(id)),
+                SessionOutbound::ChannelOutput {
+                    stream: id, output, ..
+                } if id == stream => out.extend(shell_record(output).map(Seen::Record)),
+                SessionOutbound::ChannelExit { stream, code, .. } => {
+                    out.push(Seen::Control(ServerRecord::Exit { stream, code }))
+                }
                 SessionOutbound::Data(sd) if sd.stream_id == stream => {
                     out.extend(records.push(&sd.data).into_iter().map(Seen::Record));
                 }
@@ -4479,7 +6564,7 @@ pub(crate) mod tests {
     /// delivered, and says `Exit` only then.
     #[tokio::test]
     async fn a_channel_that_exits_says_so_only_once_its_output_is_delivered() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -4497,6 +6582,7 @@ pub(crate) mod tests {
         assert_eq!(
             before,
             vec![
+                Seen::Record(established_checkpoint()),
                 Seen::Record(ShellRecord::Data(b"hello from the shell".to_vec())),
                 Seen::Record(ShellRecord::Data(b"last words".to_vec())),
                 Seen::NotifyDelivered(16),
@@ -4505,6 +6591,7 @@ pub(crate) mod tests {
         );
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: token_for(&requests, 16),
             })
@@ -4524,7 +6611,7 @@ pub(crate) mod tests {
     /// channel goes -- and the `Exit` waits for that to be delivered too.
     #[tokio::test]
     async fn a_stale_screen_channel_that_exits_repaints_and_then_says_so() {
-        let (io, inbound, outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, outbound, gates) = channel_pair_with_gates();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -4546,6 +6633,7 @@ pub(crate) mod tests {
         assert_eq!(
             before,
             vec![
+                Seen::Record(established_checkpoint()),
                 Seen::Record(ShellRecord::Data(b"REPAINT".to_vec())),
                 Seen::Record(ShellRecord::EchoAck(1)),
                 Seen::NotifyDelivered(16),
@@ -4553,6 +6641,7 @@ pub(crate) mod tests {
         );
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: token_for(&requests, 16),
             })
@@ -4572,7 +6661,7 @@ pub(crate) mod tests {
     /// it opens again is a new channel no old `Exit` may end.
     #[tokio::test]
     async fn an_exit_still_waiting_is_dropped_by_a_close_or_a_reopen() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -4606,6 +6695,7 @@ pub(crate) mod tests {
         for stream in [16, 17] {
             inbound
                 .send(SessionInbound::Delivered {
+                    generation: 0,
                     stream,
                     token: token_for(&requests, stream),
                 })
@@ -4621,7 +6711,7 @@ pub(crate) mod tests {
     /// own request does.
     #[tokio::test]
     async fn a_late_answer_for_an_earlier_channel_never_releases_a_later_exit() {
-        let (io, inbound, outbound) = SessionIo::test_pair();
+        let (io, inbound, outbound) = channel_pair();
         let (mut outbound, requests) = delivery_requests(outbound);
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
@@ -4657,6 +6747,7 @@ pub(crate) mod tests {
         assert_ne!(earlier, later, "each channel asks with its own token");
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: earlier,
             })
@@ -4665,6 +6756,7 @@ pub(crate) mod tests {
         assert_no_control(&mut outbound).await;
         inbound
             .send(SessionInbound::Delivered {
+                generation: 0,
                 stream: 16,
                 token: later,
             })
@@ -4685,7 +6777,7 @@ pub(crate) mod tests {
     /// right after the repaint.
     #[tokio::test]
     async fn the_ack_tick_waits_while_a_repaint_is_pending() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4716,6 +6808,7 @@ pub(crate) mod tests {
         assert_eq!(
             records_within(&mut outbound, 16, std::time::Duration::from_millis(300)).await,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(2)
             ]
@@ -4727,7 +6820,7 @@ pub(crate) mod tests {
     /// the next one does.
     #[tokio::test]
     async fn a_writable_that_finds_the_gate_shut_again_waits_for_the_next() {
-        let (io, inbound, mut outbound, gates) = SessionIo::test_pair_with_gates();
+        let (io, inbound, mut outbound, gates) = channel_pair_with_gates();
         let spawner = FakeSpawner::new();
         tokio::spawn(run_channel_session(io, spawner.clone()));
         inbound
@@ -4757,6 +6850,7 @@ pub(crate) mod tests {
         assert_eq!(
             records_within(&mut outbound, 16, std::time::Duration::from_millis(300)).await,
             vec![
+                established_checkpoint(),
                 ShellRecord::Data(b"REPAINT".to_vec()),
                 ShellRecord::EchoAck(0)
             ]

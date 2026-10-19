@@ -397,10 +397,21 @@ pub fn spawn_qsh_os_on(
     config_home: &Path,
     argv0: Option<&OsStr>,
 ) -> (Client, std::os::fd::OwnedFd) {
+    spawn_qsh_os_at(args, config_home, argv0, 80, 24)
+}
+
+/// Start at the requested physical dimensions before the client opens its shell.
+pub fn spawn_qsh_os_at(
+    args: &[OsString],
+    config_home: &Path,
+    argv0: Option<&OsStr>,
+    cols: u16,
+    rows: u16,
+) -> (Client, std::os::fd::OwnedFd) {
     let pty = nix::pty::openpty(
         Some(&nix::pty::Winsize {
-            ws_row: 24,
-            ws_col: 80,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),

@@ -38,6 +38,7 @@ use transport::shell_server::ResizeHandle;
 use anyhow::Context;
 
 use crate::channel_backend::make_screen;
+use crate::screen_budget::{BudgetLimits, ScreenBudget};
 
 use super::channel;
 use super::config::HelperConfig;
@@ -304,8 +305,11 @@ pub(super) fn worker_clients(
     // router's own caps, and `HELPER_LOGIN_ENDS_OVERFLOW_REASON` for why
     // the worker ends rather than drop one.
     let (reporter, reports) = login_end_channel(MAX_QUEUED_LOGIN_ENDS);
-    let spawner = HelperChannelSpawner::new_with_hook(
+    // One pool for this serving worker; every session/backend shares its spawner.
+    let budget = Arc::new(ScreenBudget::new(BudgetLimits::default()));
+    let spawner = HelperChannelSpawner::with_budget_hook(
         worker_channels,
+        budget,
         || super::end_the_worker(HELPER_GONE_REASON),
         Box::new(
             move |login, incarnation| match reporter.report(login, incarnation) {
@@ -328,6 +332,7 @@ pub(super) fn worker_clients(
 /// Asks a privileged helper to open channels, over one `socketpair` shared
 /// with it.
 pub struct HelperChannelSpawner {
+    budget: Arc<ScreenBudget>,
     /// The sending side. A mutex, not a channel: `spawn` is synchronous (the
     /// trait is), the message is tiny, and the helper answers in
     /// microseconds.
@@ -399,13 +404,29 @@ impl HelperChannelSpawner {
     /// half-alive state this module's docs call worse than a clean exit.
     ///
     /// Private: [`worker_clients`] is the one caller outside tests.
+    #[cfg(test)]
     fn new_with_hook(
         sock: UnixStream,
         on_helper_gone: impl FnOnce() + Send + 'static,
         login_ended: LoginEndedSink,
     ) -> io::Result<HelperChannelSpawner> {
+        Self::with_budget_hook(
+            sock,
+            Arc::new(ScreenBudget::new(BudgetLimits::default())),
+            on_helper_gone,
+            login_ended,
+        )
+    }
+
+    fn with_budget_hook(
+        sock: UnixStream,
+        budget: Arc<ScreenBudget>,
+        on_helper_gone: impl FnOnce() + Send + 'static,
+        login_ended: LoginEndedSink,
+    ) -> io::Result<HelperChannelSpawner> {
         Self::build(
             sock,
+            budget,
             on_helper_gone,
             login_ended,
             CHANNEL_SEND_TIMEOUT,
@@ -423,6 +444,7 @@ impl HelperChannelSpawner {
     ) -> io::Result<HelperChannelSpawner> {
         Self::build(
             sock,
+            Arc::new(ScreenBudget::new(BudgetLimits::default())),
             || {},
             Box::new(|_, _| {}),
             send_timeout,
@@ -443,6 +465,7 @@ impl HelperChannelSpawner {
     ) -> io::Result<HelperChannelSpawner> {
         Self::build(
             sock,
+            Arc::new(ScreenBudget::new(BudgetLimits::default())),
             || {},
             Box::new(|_, _| {}),
             CHANNEL_SEND_TIMEOUT,
@@ -452,6 +475,7 @@ impl HelperChannelSpawner {
 
     fn build(
         sock: UnixStream,
+        budget: Arc<ScreenBudget>,
         on_helper_gone: impl FnOnce() + Send + 'static,
         login_ended: LoginEndedSink,
         send_timeout: Duration,
@@ -478,6 +502,7 @@ impl HelperChannelSpawner {
                 )
             })?;
         Ok(HelperChannelSpawner {
+            budget,
             tx: Mutex::new(sock),
             next_id: AtomicU64::new(1),
             waiting,
@@ -694,6 +719,8 @@ impl ChannelSpawner for HelperChannelSpawner {
         if req.cols == 0 || req.rows == 0 {
             return Err("a channel without a terminal is not supported yet".to_string());
         }
+        terminal_size::TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))?;
         let (shell, command) = match req.kind {
             // The helper runs the account's login shell, from passwd as it
             // verified the account (`helper::server::login_shell`) -- never
@@ -834,7 +861,7 @@ impl ChannelSpawner for HelperChannelSpawner {
             reader,
             writer,
             resize: Box::new(MasterResize(clone("resizing the channel")?)),
-            screen: make_screen(req),
+            screen,
             wait: Box::new(HelperWait {
                 id,
                 exits: exited_rx,
@@ -928,17 +955,24 @@ impl ChannelWait for HelperWait {
 struct MasterResize(std::fs::File);
 
 impl ResizeHandle for MasterResize {
-    fn resize(&self, cols: u16, rows: u16) {
+    fn try_resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        terminal_size::TerminalSize::new(cols, rows).map_err(|e| e.to_string())?;
         let winsize = nix::pty::Winsize {
             ws_row: rows,
             ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: a plain ioctl on a descriptor this process owns; a failure
-        // means the far end is already gone, which the reader will notice.
-        unsafe {
-            nix::libc::ioctl(self.0.as_raw_fd(), nix::libc::TIOCSWINSZ as _, &winsize);
+        // SAFETY: a winsize pointer and descriptor owned by this process.
+        let result =
+            unsafe { nix::libc::ioctl(self.0.as_raw_fd(), nix::libc::TIOCSWINSZ as _, &winsize) };
+        if result == -1 {
+            Err(format!(
+                "resizing the terminal: {}",
+                io::Error::last_os_error()
+            ))
+        } else {
+            Ok(())
         }
     }
 }
@@ -2328,6 +2362,74 @@ pub(crate) mod tests {
             None,
         )
         .expect("reply");
+    }
+
+    #[test]
+    fn screen_budget_helper_refusal_and_failure_do_not_leak_or_send_extra_open() {
+        let budget = Arc::new(ScreenBudget::new(BudgetLimits {
+            owner_models: 1,
+            ..BudgetLimits::default()
+        }));
+        let (worker, helper) = channel::pair().unwrap();
+        helper.set_read_timeout(Some(TEST_RECV_TIMEOUT)).unwrap();
+        let spawner = HelperChannelSpawner::with_budget_hook(
+            worker,
+            budget.clone(),
+            || {},
+            Box::new(|_, _| {}),
+        )
+        .unwrap();
+        let mut req = shell_request();
+        req.cols = 2;
+        req.rows = 1;
+        req.screen = true;
+        let lease = budget
+            .reserve(
+                anyone().uid,
+                terminal_size::TerminalSize::new(2, 1).unwrap(),
+            )
+            .unwrap();
+        assert!(spawner
+            .spawn(&anyone(), any_login(), &req, None)
+            .err()
+            .unwrap()
+            .contains("screen budget"));
+        helper.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(channel::recv(&helper),Err(e) if e.kind()==io::ErrorKind::WouldBlock),
+            "refusal starts no helper OPEN"
+        );
+        helper.set_nonblocking(false).unwrap();
+        drop(lease);
+        let stub = std::thread::spawn(move || {
+            let (bytes, _) = channel::recv(&helper).unwrap().unwrap();
+            let Request::Open { id, .. } = decode::<Request>(&bytes).unwrap() else {
+                panic!("OPEN")
+            };
+            channel::send(
+                &helper,
+                &encode(&Response::Failed {
+                    id,
+                    reason: "test helper failed".into(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        });
+        assert!(spawner.spawn(&anyone(), any_login(), &req, None).is_err());
+        stub.join().unwrap();
+        assert_eq!(budget.used(), crate::screen_budget::Usage::default());
+    }
+
+    #[test]
+    fn master_resize_returns_the_actual_ioctl_error() {
+        let handle = MasterResize(tempfile::tempfile().unwrap());
+        assert!(
+            handle.try_resize(2, 1).is_err(),
+            "a regular file is not a PTY"
+        );
+        assert!(handle.try_resize(1, 1).unwrap_err().contains("columns"));
     }
 
     /// A channel opened through the helper reads and writes like any other.

@@ -82,6 +82,9 @@
 //! task over an UNbounded channel (a synchronous, non-blocking send), and the
 //! session task -- not the router -- pays any backpressure to the backend.
 
+#[path = "channel_bridge.rs"]
+mod channel_bridge;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -334,57 +337,200 @@ pub struct StreamData {
     pub data: Vec<u8>,
 }
 
+/// Context ordered before the input delivered by this attachment. Backend owners
+/// keep the last event they processed, never a mutable bridge-side latest value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentContext {
+    pub generation: u64,
+    pub session_id: u64,
+    pub features: crate::Features,
+}
+impl AttachmentContext {
+    fn for_connection(conn: &Connection, generation: u64) -> Self {
+        Self {
+            generation,
+            session_id: conn.session_id(),
+            features: conn.features(),
+        }
+    }
+    pub fn has_geometry(self) -> bool {
+        self.features.contains(crate::Features::CHANNEL_GEOMETRY)
+    }
+}
+
+/// A fixed final output position; the surrounding emission identifies its
+/// instance and attachment. Exactly one marker exists per ended instance.
+#[derive(Clone, Copy, Debug)]
+pub struct DeliveryMarker {
+    pub token: u64,
+}
+
+/// Channel records stay typed until the bridge admits their complete encoding.
+/// Metadata permits move with the record, and are never cloned at queue moves.
+pub enum ChannelOutput {
+    Data(Vec<u8>),
+    Geometry(
+        crate::channel_geometry::GeometryRecord,
+        crate::channel_timeline::TimelinePermit,
+    ),
+    EchoAck(u64, crate::channel_timeline::TimelinePermit),
+    DeliveryMarker(DeliveryMarker, crate::channel_timeline::TimelinePermit),
+}
+impl ChannelOutput {
+    pub fn framed_len(&self) -> usize {
+        match self {
+            Self::Data(bytes) => 5 + bytes.len(),
+            Self::Geometry(..) => 27,
+            Self::EchoAck(..) => 13,
+            Self::DeliveryMarker(..) => crate::channel_timeline::DELIVERY_MARKER_BYTES,
+        }
+    }
+}
+
+/// Pending bytes belong to the original instance's gate, even after its stream
+/// number is reused. Dropping an unsent emission withdraws once; successful
+/// bridge admission transfers the charge atomically to that Connection tail.
+pub struct OutputCharge {
+    gate: Arc<SendGate>,
+    bytes: u64,
+}
+impl OutputCharge {
+    pub fn transfer(mut self, tail: u64) -> bool {
+        let opened = self.gate.transfer(self.bytes, tail);
+        self.bytes = 0;
+        opened
+    }
+}
+impl Drop for OutputCharge {
+    fn drop(&mut self) {
+        self.gate.withdraw(self.bytes);
+    }
+}
+
 /// What the manager delivers to a backend over its [`SessionIo`].
 pub enum SessionInbound {
     /// Freshly delivered in-order stream bytes.
     Data(StreamData),
     /// The connection reached `Live` for the FIRST time (a cue to start
     /// writing to the tty). Sent once per session.
-    Live,
+    Live(AttachmentContext),
     /// The session was reattached by a NEW client connection (a warm reconnect
     /// on the same token): the backend must reset its per-connection state
     /// (echo_ack / tty / control buffers). The persistent bridge emits this
     /// into the SAME `io` when it swaps in the new `Connection`, so the backend
     /// (and, later, its PTYs) keep running across the reattach.
-    ResumeReset,
+    ResumeReset(AttachmentContext),
     /// Repaint the current screen (a hot-roam resync after a long absence: the
     /// server dropped its output backlog and the client just returned). Unlike
     /// `ResumeReset`, this must NOT reset per-connection echo/tty/input
     /// accounting -- a hot-roam resync continues on the SAME connection, so
     /// `input_consumed`/echo_ack stay valid; only the screen needs repainting.
     Repaint,
+    /// Ordered hot-reset cutover, without resetting input/request correlation.
+    RepaintCutover { generation: u64, sequence: u64 },
     /// Stream `stream`'s send gate just opened (spec §4.7.2) -- sent only for
     /// screen gates: a screen channel that dropped output behind the closed
     /// gate repaints now.
     Writable { stream: u8 },
+    /// One coalesced metadata-capacity wake; stale scopes cannot resume work.
+    OutputReady {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        generation: u64,
+    },
     /// Everything the backend had sent on `stream` when it asked
     /// ([`SessionIo::notify_delivered`]) has been acknowledged by the peer --
     /// or will never be: a warm reattach brought a connection that holds
     /// none of it. `token` is the one the backend asked with, so it can tell
     /// an answer to an earlier request on the same stream from this one.
-    Delivered { stream: u8, token: u64 },
+    /// Geometry-profile owners additionally match the delivery generation.
+    Delivered {
+        stream: u8,
+        token: u64,
+        generation: u64,
+    },
 }
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    ChannelOpened {
+        stream: u8,
+        origin: AttachmentContext,
+    },
+    ChannelRefused {
+        stream: u8,
+        origin: AttachmentContext,
+        reason: String,
+    },
+    RepaintBarrier {
+        generation: u64,
+        sequence: u64,
+    },
+    ChannelClosed {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+    },
+    ChannelOutput {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        output: ChannelOutput,
+        charge: OutputCharge,
+        /// One pre-reserved 41-byte gap/bootstrap allowance accompanies the first checkpoint.
+        /// The bridge takes ownership even if it discards that Screen record;
+        /// both fixed states reuse it; pending byte charges still track each actual record.
+        gap_reserve: Option<crate::channel_timeline::TimelinePermit>,
+    },
+    /// A final control record whose permit survives the outbound queue. Stage 4
+    /// admits it on CONTROL_STREAM only for its current instance/attachment.
+    ChannelExit {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        code: i32,
+        open: crate::channel::OpenClassification,
+        permit: crate::channel_timeline::TimelinePermit,
+    },
+    ResumeBarrier {
+        generation: u64,
+    },
+    /// End only the originating attempt; a late old-generation failure cannot
+    /// close a replacement connection. At most one diagnostic per attempt.
+    ProtocolFailure {
+        origin: AttachmentContext,
+        code: Option<crate::channel_geometry::ProtocolErrorCode>,
+    },
     /// Bytes for a stream.
     Data(StreamData),
     /// Whether this stream's backlog may be dropped after a long absence and
     /// rebuilt from scratch afterwards. A backend declares this when it opens
     /// a stream; a connection that never hears about a stream falls back to
     /// the old protocol's rule (see [`Connection::is_bulk_output_stream`]).
-    Resyncable { stream_id: u8, resyncable: bool },
+    Resyncable {
+        stream_id: u8,
+        resyncable: bool,
+    },
     /// This stream's class for the fairness rule and the congestion window
     /// (spec §4.8). Kept by the bridge and declared again to every
     /// connection a warm reattach brings.
-    StreamClass { stream_id: u8, class: StreamClass },
+    StreamClass {
+        stream_id: u8,
+        class: StreamClass,
+    },
     /// Say [`SessionInbound::Delivered`], with `token`, once everything sent
     /// on this stream so far is acknowledged.
-    NotifyDelivered { stream_id: u8, token: u64 },
+    NotifyDelivered {
+        stream_id: u8,
+        token: u64,
+    },
     /// The backend took `n` bytes of `stream_id` (spec §4.10.3): only a
     /// backend whose [`SessionBackend::consumption`] is `Explicit` sends it,
     /// and only such a backend's are counted.
-    Consumed { stream_id: u8, n: usize },
+    Consumed {
+        stream_id: u8,
+        n: usize,
+    },
 }
 
 /// The router's own token for one device (see [`Router`]'s `backends` map):
@@ -402,6 +548,7 @@ pub type LoginId = [u8; 16];
 /// outbound [`SessionOutbound`]. The backend never sees the socket or the
 /// `Connection`.
 pub struct SessionIo {
+    resume_snapshots: channel_bridge::SnapshotMailbox,
     inbound: mpsc::Receiver<SessionInbound>,
     outbound: mpsc::UnboundedSender<SessionOutbound>,
     /// Who this session belongs to. Set once, when the session is created:
@@ -419,6 +566,30 @@ pub struct SessionIo {
 }
 
 impl SessionIo {
+    pub(crate) fn publish_resume_snapshot(
+        &self,
+        origin: AttachmentContext,
+        build: impl FnOnce()
+            -> Result<crate::channel::ChannelSnapshot, crate::channel::ChannelCodecError>,
+    ) {
+        match self.resume_snapshots.publish(origin.generation, build) {
+            Ok(true) => self.resume_barrier(origin.generation),
+            Ok(false) => {}
+            Err(_) => self.protocol_failure(origin, None),
+        }
+    }
+    pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ChannelOpened { stream, origin });
+    }
+    pub(crate) fn channel_refused(&self, origin: AttachmentContext, stream: u8, reason: String) {
+        let _ = self.outbound.send(SessionOutbound::ChannelRefused {
+            stream,
+            origin,
+            reason,
+        });
+    }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should
     /// then wind down.
@@ -459,6 +630,75 @@ impl SessionIo {
                 gate.withdraw(n);
             }
         }
+    }
+
+    pub(crate) fn send_channel_output(
+        &self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+        gate: Arc<SendGate>,
+        output: ChannelOutput,
+        gap_reserve: Option<crate::channel_timeline::TimelinePermit>,
+    ) {
+        let bytes = output.framed_len() as u64;
+        gate.admit(bytes);
+        let _ = self.outbound.send(SessionOutbound::ChannelOutput {
+            stream,
+            instance,
+            origin,
+            output,
+            charge: OutputCharge { gate, bytes },
+            gap_reserve,
+        });
+    }
+    pub(crate) fn channel_closed(
+        &self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        origin: AttachmentContext,
+    ) {
+        let _ = self.outbound.send(SessionOutbound::ChannelClosed {
+            stream,
+            instance,
+            origin,
+        });
+    }
+    pub(crate) fn send_channel_exit(
+        &self,
+        descriptor: crate::channel::DrainingChannel,
+        origin: AttachmentContext,
+        code: i32,
+        permit: crate::channel_timeline::TimelinePermit,
+    ) {
+        let _ = self.outbound.send(SessionOutbound::ChannelExit {
+            stream: descriptor.stream,
+            instance: descriptor.instance,
+            origin,
+            code,
+            open: descriptor.open,
+            permit,
+        });
+    }
+    pub(crate) fn repaint_barrier(&self, generation: u64, sequence: u64) {
+        let _ = self.outbound.send(SessionOutbound::RepaintBarrier {
+            generation,
+            sequence,
+        });
+    }
+    pub(crate) fn resume_barrier(&self, generation: u64) {
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ResumeBarrier { generation });
+    }
+    pub(crate) fn protocol_failure(
+        &self,
+        origin: AttachmentContext,
+        code: Option<crate::channel_geometry::ProtocolErrorCode>,
+    ) {
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ProtocolFailure { origin, code });
     }
 
     /// Tell the connection whether `stream_id`'s backlog may be dropped
@@ -559,12 +799,20 @@ impl SessionIo {
         )
     }
 
-    /// Test-only: [`SessionIo::test_pair`], owned by `principal` and
-    /// `login` -- for a test that checks the session's principal or login is
-    /// what reaches the code that acts on it, which a fixed placeholder
-    /// could satisfy by coincidence.
-    #[cfg(test)]
-    pub(crate) fn test_pair_for(
+    /// Observe the actual replaceable mailbox in runner fixtures without a bridge.
+    #[cfg(any(test, feature = "testnet"))]
+    pub fn snapshot_reader_for_test(
+        &self,
+    ) -> impl Fn(u64) -> Option<crate::channel::ChannelSnapshot> + Send + 'static {
+        let snapshots = self.resume_snapshots.clone();
+        move |generation| snapshots.take(generation)
+    }
+
+    /// Build an in-process session fixture owned by `principal` and `login`.
+    /// Available only for crate tests and the explicit `testnet` fixture feature,
+    /// so consumers can test real backend lifetime without starting a daemon.
+    #[cfg(any(test, feature = "testnet"))]
+    pub fn test_pair_for(
         principal: Principal,
         login: LoginId,
     ) -> (
@@ -576,6 +824,7 @@ impl SessionIo {
         let (out_tx, out_rx) = mpsc::unbounded_channel::<SessionOutbound>();
         (
             SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal,
@@ -642,6 +891,11 @@ impl Drop for SessionIo {
 /// a fresh [`SessionIo`]; the returned future lives for the session. Boxed
 /// future rather than `async_trait` to keep the crate dependency-free.
 pub trait SessionBackend: Send + Sync + 'static {
+    /// Mandatory application profile, checked before resolving or creating a session.
+    fn required_features(&self) -> crate::Features {
+        crate::Features::NONE
+    }
+
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
     /// Who says when a stream's bytes are consumed (spec §4.10.3), fixed
@@ -1936,6 +2190,7 @@ impl SessionManager {
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
                     Connection::accept(
                         ConnectionConfig {
+                            required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
                             role: Role::Server,
                             local_static_priv: *ctx.server_priv,
@@ -1954,6 +2209,7 @@ impl SessionManager {
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
                     outcome = Connection::accept(
                         ConnectionConfig {
+                            required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
                             role: Role::Server,
                             local_static_priv: *ctx.server_priv,
@@ -2541,6 +2797,7 @@ impl SessionManager {
         // The send gates live as long as the io: across every warm reattach.
         let gates = Arc::new(GateTable::new());
         let io = SessionIo {
+            resume_snapshots: channel_bridge::SnapshotMailbox::default(),
             inbound: in_rx,
             outbound: out_tx,
             principal,
@@ -2804,7 +3061,9 @@ fn apply_control(
     // that were never drained to the backend (review Important 1, fix round
     // 1: two `Attach`es applied back to back on one `on_routed_datagram`
     // turn skip `drain_events` between them).
+    link.channel_output.observe_discards(conn);
     link.ledger.carry();
+    link.channel_output.attach(conn, link.ledger.generation());
     *conn = *new_conn;
     // The new connection has heard none of this session's declarations of
     // class; recoverability the backend declares again on `ResumeReset`.
@@ -2813,7 +3072,8 @@ fn apply_control(
     // proven peer's cap on out-of-order data replaces probation's.
     adopt_connection(conn, classes);
     *parked = false;
-    link.hand_over(conn, now, SessionInbound::ResumeReset, out);
+    let context = AttachmentContext::for_connection(conn, link.ledger.generation());
+    link.hand_over(conn, now, SessionInbound::ResumeReset(context), out);
     // Then whatever the new peer had already sent before it was bound here --
     // after the reset, never before it.
     for sd in early {
@@ -2885,6 +3145,8 @@ enum Wakeup {
     Dgram(Option<(SocketAddr, Vec<u8>)>),
     /// A core timer fired.
     Timeout,
+    /// One coalesced continuation after a finite channel-output drain turn.
+    Drain,
     /// The backend produced an outbound message -- data or a declaration
     /// (`None` = backend finished).
     Backend(Option<SessionOutbound>),
@@ -3018,8 +3280,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let consumption = backend.consumption();
     // The backend runs for the bridge's whole life. `io` is MOVED into it and
     // is not `Clone`, so there is no second spawn to guard against.
+    let resume_snapshots = io.resume_snapshots.clone();
     tokio::spawn(async move { backend.run(io).await });
     let mut link = BackendLink::new(io_inbound_tx, consumption);
+    link.channel_output.snapshots = resume_snapshots;
 
     // `first_live_sent` is BRIDGE-level, spanning every connection this
     // backend drives: a reattach never re-sends `Live` (it sends
@@ -3044,6 +3308,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // Streams the backend waits to hear are delivered, in the order it
     // asked (see `take_delivered`).
     let mut awaiting_delivery: Vec<(u8, u64)> = Vec::new();
+    let mut drain_pending = false;
     // A proven connection: probation's cap does not follow it here.
     adopt_connection(&mut conn, &classes);
 
@@ -3054,7 +3319,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let mut out: Vec<Datagram> = Vec::new();
     if start.saw_live {
         first_live_sent = true;
-        link.hand_over(&mut conn, now, SessionInbound::Live, &mut out);
+        let context = AttachmentContext::for_connection(&conn, link.ledger.generation());
+        link.hand_over(&mut conn, now, SessionInbound::Live(context), &mut out);
     }
     for sd in start.early {
         link.hand_over(&mut conn, now, SessionInbound::Data(sd), &mut out);
@@ -3108,7 +3374,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
                     _ = timer => Wakeup::Timeout,
-                    o = backend_out_rx.recv() => Wakeup::Backend(o),
+                    o = backend_out_rx.recv(), if !link.channel_output.receive_fenced() => Wakeup::Backend(o),
+                    _ = std::future::ready(()), if drain_pending => Wakeup::Drain,
                     // Room in the backend's queue for what waits (spec
                     // §4.10.2): the bridge never stands on its backend.
                     h = link.inbound.room(), if link.inbound.has_pending() => Wakeup::Room(h),
@@ -3141,7 +3408,76 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             // The manager dropped the datagram channel -- shut the backend down.
             Wakeup::Dgram(None) => break,
             // Nothing of its own: the timers run after every wake-up, below.
-            Wakeup::Timeout => {}
+            Wakeup::Timeout | Wakeup::Drain => {}
+            Wakeup::Backend(Some(
+                message @ (SessionOutbound::ChannelOutput { .. }
+                | SessionOutbound::ChannelExit { .. }
+                | SessionOutbound::ChannelClosed { .. }
+                | SessionOutbound::ResumeBarrier { .. }
+                | SessionOutbound::RepaintBarrier { .. }),
+            )) => {
+                if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                    link.channel_output.push(message);
+                    link.channel_output.seal_ended(&mut conn);
+                } else {
+                    log::error!("typed channel output without negotiated geometry profile");
+                    out.extend(conn.close(now));
+                }
+            }
+            Wakeup::Backend(Some(SessionOutbound::ProtocolFailure { origin, code })) => {
+                if origin.session_id == conn.session_id()
+                    && origin.generation == link.ledger.generation()
+                {
+                    if let Some(code) = code {
+                        out.extend(conn.send(
+                            now,
+                            crate::channel::CONTROL_STREAM,
+                            &crate::channel::encode_server(
+                                &crate::channel::ServerRecord::ProtocolError { code },
+                            ),
+                        ));
+                    }
+                    out.extend(conn.close(now));
+                }
+            }
+            Wakeup::Backend(Some(
+                message @ (SessionOutbound::ChannelOpened { .. }
+                | SessionOutbound::ChannelRefused { .. }),
+            )) => {
+                let (origin, record) = match message {
+                    SessionOutbound::ChannelOpened { stream, origin } => {
+                        (origin, crate::channel::ServerRecord::Opened { stream })
+                    }
+                    SessionOutbound::ChannelRefused {
+                        stream,
+                        origin,
+                        reason,
+                    } => (
+                        origin,
+                        crate::channel::ServerRecord::Refused { stream, reason },
+                    ),
+                    _ => unreachable!(),
+                };
+                if origin.generation == link.ledger.generation()
+                    && origin.session_id == conn.session_id()
+                {
+                    if !conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                        out.extend(conn.close(now));
+                    } else {
+                        writable.extend(take_backend_data(
+                            &mut conn,
+                            &gates,
+                            parked,
+                            now,
+                            StreamData {
+                                stream_id: crate::channel::CONTROL_STREAM,
+                                data: crate::channel::encode_server(&record),
+                            },
+                            &mut out,
+                        ));
+                    }
+                }
+            }
             Wakeup::Backend(Some(SessionOutbound::Data(sd))) => {
                 writable.extend(take_backend_data(
                     &mut conn, &gates, parked, now, sd, &mut out,
@@ -3155,6 +3491,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 resyncable,
             })) => {
                 conn.set_stream_resyncable(stream_id, resyncable);
+                link.channel_output.declare(stream_id, resyncable);
             }
             // Like a recoverability declaration, metadata on `conn`, and
             // always applied; kept by the bridge as well (see `declare_class`).
@@ -3241,7 +3578,15 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         out.extend(conn.on_timeout_if_due(now));
         // Delivered bytes go to the backend -- and what it is counted as
         // taking may send a CREDIT -- before this turn's datagrams go out.
-        let closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        let mut closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        // A hot Reset changes framing before any queued channel bytes may be
+        // admitted. Its event must reach the typed owner before this drain.
+        drain_pending = link.channel_output.drain(&mut conn, now, parked, &mut out);
+        // Typed admission can discover permanent offset exhaustion. Observe its
+        // abandonment in this turn so parking never waits for another event.
+        if matches!(closed, CloseKind::None) && conn.state() == LinkState::Closed {
+            closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
+        }
         send_all(&socket, &out).await;
         out.clear();
         // Past the per-session cap the bridge waits for its backend, as
@@ -3319,7 +3664,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // wakes it -- no timers, and a producer behind a closed gate sends
         // nothing -- until a reattach. A screen gate that just opened tells
         // its channel, which repaints if it dropped output.
-        writable.extend(refresh_gates(&gates, &conn, parked));
+        if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+            link.channel_output.refresh(&conn, parked);
+            // Geometry pipes retain pending bytes and frozen tails while parked.
+            writable.extend(gates.refresh(|stream| conn.stream_progress(stream).unacked));
+        } else {
+            writable.extend(refresh_gates(&gates, &conn, parked));
+        }
+        for event in link.channel_output.notifications() {
+            link.hand_over(&mut conn, now, event, &mut out);
+        }
         for stream in writable {
             link.hand_over(
                 &mut conn,
@@ -3335,7 +3689,11 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             link.hand_over(
                 &mut conn,
                 now,
-                SessionInbound::Delivered { stream, token },
+                SessionInbound::Delivered {
+                    stream,
+                    token,
+                    generation: link.ledger.generation(),
+                },
                 &mut out,
             );
         }
@@ -3388,6 +3746,7 @@ fn drain_events(
 ) -> CloseKind {
     let mut closed = false;
     let mut exhausted = false;
+    link.channel_output.observe_discards(conn);
     for ev in conn.poll_events() {
         match ev {
             Event::StreamData { stream_id, data } => {
@@ -3410,7 +3769,8 @@ fn drain_events(
             Event::StateChanged(LinkState::Live) => {
                 if !*first_live_sent {
                     *first_live_sent = true;
-                    link.hand_over(conn, now, SessionInbound::Live, out);
+                    let context = AttachmentContext::for_connection(conn, link.ledger.generation());
+                    link.hand_over(conn, now, SessionInbound::Live(context), out);
                 }
             }
             Event::StateChanged(LinkState::Closed) => {
@@ -3421,7 +3781,13 @@ fn drain_events(
                 // the client just returned -- tell the backend to repaint the
                 // current screen, WITHOUT resetting per-connection echo/tty
                 // accounting (unlike `ResumeReset`; see `SessionInbound::Repaint`).
-                link.hand_over(conn, now, SessionInbound::Repaint, out);
+                if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                    if !link.channel_output.hot_reset() {
+                        exhausted = true;
+                    }
+                } else {
+                    link.hand_over(conn, now, SessionInbound::Repaint, out);
+                }
             }
             Event::OffsetSpaceExhausted { stream_id } => {
                 log::warn!(
@@ -4033,6 +4399,7 @@ thread_local! {
 struct BackendLink {
     inbound: Inbound,
     ledger: ConsumptionLedger,
+    channel_output: channel_bridge::ChannelBridge,
 }
 
 impl BackendLink {
@@ -4040,6 +4407,7 @@ impl BackendLink {
         BackendLink {
             inbound: Inbound::new(tx),
             ledger: ConsumptionLedger::new(consumption),
+            channel_output: channel_bridge::ChannelBridge::default(),
         }
     }
 
@@ -4243,6 +4611,7 @@ mod tests {
 
         // A real client Connection driven manually over UDP.
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4364,6 +4733,7 @@ mod tests {
     ) -> (Vec<u8>, u64) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -4421,6 +4791,7 @@ mod tests {
     ) -> (Connection, UdpSocket) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -4651,6 +5022,7 @@ mod tests {
     ) -> (Connection, UdpSocket) {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -4778,7 +5150,7 @@ mod tests {
                         SessionInbound::Data(StreamData { stream_id: 0, data }) => {
                             io.send(0, data);
                         }
-                        SessionInbound::ResumeReset => {
+                        SessionInbound::ResumeReset(_) => {
                             logins.lock().unwrap().push(io.login());
                         }
                         _ => {}
@@ -4995,6 +5367,7 @@ mod tests {
         // byte-identical -- a true retransmit.
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -6241,6 +6614,7 @@ mod tests {
 
         let admission = Admission {
             conn: Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -6344,6 +6718,7 @@ mod tests {
 
         let admission = Admission {
             conn: Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -6958,6 +7333,7 @@ mod tests {
         ));
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7113,6 +7489,7 @@ mod tests {
         // A real msg1 from a real client, so the server connection below is
         // one `accept` produced rather than one assembled by hand.
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7143,6 +7520,7 @@ mod tests {
         };
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -7178,6 +7556,7 @@ mod tests {
             token: [11u8; 16],
             backend: Arc::new(EchoBackend),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7240,6 +7619,7 @@ mod tests {
     async fn output_resync_event_forwards_repaint_to_backend() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -7280,6 +7660,7 @@ mod tests {
     async fn a_hard_cap_report_is_logged_and_forwards_nothing() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -7313,6 +7694,7 @@ mod tests {
     fn a_quiet_server_connection() -> Connection {
         let kp = generate_keypair();
         Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -7541,6 +7923,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7626,6 +8009,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7707,6 +8091,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7818,6 +8203,7 @@ mod tests {
             token,
             backend,
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -7939,6 +8325,141 @@ mod tests {
                 .unwrap();
             self.client = client;
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_receive_fence_survives_two_attaches_and_wakes_on_credit_alone() {
+        use crate::channel::{ChannelSnapshot, ServerRecord, CONTROL_STREAM};
+        struct SnapshotBackend(mpsc::UnboundedSender<u64>);
+        impl SessionBackend for SnapshotBackend {
+            fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                let observed = self.0.clone();
+                Box::pin(async move {
+                    while let Some(event) = io.recv().await {
+                        if let SessionInbound::ResumeReset(origin) = event {
+                            io.publish_resume_snapshot(origin, || {
+                                ChannelSnapshot::new(vec![], vec![])
+                            });
+                            io.channel_opened(origin, 16 + origin.generation as u8);
+                            io.channel_refused(
+                                origin,
+                                32 + origin.generation as u8,
+                                "fixture".into(),
+                            );
+                            observed.send(origin.generation).unwrap();
+                        }
+                    }
+                })
+            }
+        }
+        let features = crate::Features::SUPPORTED | crate::Features::CHANNEL_GEOMETRY;
+        let (observed, mut generations) = mpsc::unbounded_channel();
+        let mut rig = delivery_rig_with(features, Arc::new(SnapshotBackend(observed)), |conn| {
+            conn.enable_geometry_for_test()
+        })
+        .await;
+        let occupied = crate::reliability::STREAM_WINDOW as usize - 6;
+        for generation in 1..=2 {
+            let (mut client, mut conn, msg2) =
+                accepted_connection_with(&rig.server_kp, rig.token, rig.peer, features);
+            client.on_datagram(Instant::now(), rig.peer, &msg2[0].bytes);
+            client.enable_geometry_for_test();
+            conn.enable_geometry_for_test();
+            client.set_default_consumption(Consumption::Explicit);
+            // Six bytes admit Opened, but cannot admit even the empty atomic
+            // snapshot (seven bytes). Consume the filler only after Attach #2.
+            let mut now = Instant::now();
+            let mut out = conn.send(now, CONTROL_STREAM, &vec![0; occupied]);
+            for _ in 0..100 {
+                for dg in std::mem::take(&mut out) {
+                    for ack in client.on_datagram(now, rig.peer, &dg.bytes) {
+                        out.extend(conn.on_datagram(now, rig.peer, &ack.bytes));
+                    }
+                }
+                client.poll_events();
+                now += Duration::from_millis(20);
+                for ack in client.on_timeout(now) {
+                    out.extend(conn.on_datagram(now, rig.peer, &ack.bytes));
+                }
+                out.extend(conn.on_timeout(now));
+                if out.is_empty() && conn.stream_progress(CONTROL_STREAM).unacked == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                client.unconsumed_streams(),
+                vec![(CONTROL_STREAM, occupied as u64)]
+            );
+            assert_eq!(
+                conn.stream_write_room(CONTROL_STREAM, crate::send_gate::PIPE_HIGH as usize),
+                6
+            );
+            assert_eq!(conn.state(), LinkState::Live);
+            assert!(conn.features().contains(crate::Features::CHANNEL_GEOMETRY));
+            rig.ctl_tx
+                .send(BridgeControl::Attach(Box::new(conn), vec![], vec![]))
+                .unwrap();
+            rig.client = client;
+            rig.run(Duration::from_millis(100)).await;
+            assert_eq!(generations.try_recv().unwrap(), generation);
+            assert!(
+                rig.done_rx.try_recv().is_err(),
+                "bridge ended during blocked generation {generation}; client state {:?}",
+                rig.client.state()
+            );
+            assert!(
+                !rig.client.poll_events().iter().any(|event| matches!(
+                    event,
+                    Event::StreamData {
+                        stream_id: CONTROL_STREAM,
+                        ..
+                    }
+                )),
+                "no later lifecycle control bypasses the blocked snapshot"
+            );
+        }
+        // No backend event is produced after this point. Transport credit must
+        // independently wake admission and the receive fence must then reopen.
+        for dg in rig
+            .client
+            .on_consumed(Instant::now(), CONTROL_STREAM, occupied)
+        {
+            assert!(rig.dg_tx.send(rig.peer, dg.bytes));
+        }
+        rig.run(Duration::from_millis(200)).await;
+        let mut frames = crate::shell_frame::RecordDeframer::for_control();
+        let mut records = Vec::new();
+        for event in rig.client.poll_events() {
+            if let Event::StreamData {
+                stream_id: CONTROL_STREAM,
+                data,
+            } = event
+            {
+                records.extend(
+                    frames
+                        .push(&data)
+                        .iter()
+                        .map(|raw| crate::channel::decode_server(raw).unwrap()),
+                );
+            }
+        }
+        assert_eq!(
+            records,
+            vec![
+                ServerRecord::ChannelSnapshot(ChannelSnapshot::new(vec![], vec![]).unwrap()),
+                ServerRecord::Opened { stream: 18 },
+                ServerRecord::Refused {
+                    stream: 34,
+                    reason: "fixture".into()
+                },
+            ],
+            "old-generation controls are discarded; new controls follow the atomic snapshot"
+        );
+        drop(rig.dg_tx);
+        tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// A backend that takes every inbound event, counts the stream bytes it
@@ -8665,7 +9186,7 @@ mod tests {
         assert_eq!(data_len(&rx.try_recv().expect("A's second")), 3000);
         let handed = link.inbound.room().await;
         link.took(&mut conn, now, handed, &mut out);
-        assert!(matches!(rx.try_recv(), Ok(SessionInbound::ResumeReset)));
+        assert!(matches!(rx.try_recv(), Ok(SessionInbound::ResumeReset(_))));
         let handed = link.inbound.room().await;
         link.took(&mut conn, now, handed, &mut out);
         assert_eq!(unconsumed_of(&conn, 20), 0, "B's own bytes credit B");
@@ -9483,6 +10004,25 @@ mod tests {
         out
     }
 
+    #[tokio::test]
+    async fn unnegotiated_geometry_output_fails_closed() {
+        let (heard_tx, _heard_rx) = mpsc::unbounded_channel();
+        let mut rig = delivery_rig_with(
+            crate::Features::NONE,
+            Arc::new(InboundKindsBackend(heard_tx)),
+            |_| {},
+        )
+        .await;
+        rig.backend_sends(SessionOutbound::ResumeBarrier { generation: 0 });
+        rig.run(Duration::from_millis(100)).await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.graceful);
+        assert_eq!(rig.client.state(), LinkState::Closed);
+    }
+
     /// Review, Important 2, at the bridge: `NotifyDelivered` is answered
     /// only once the client has acknowledged everything sent on the stream
     /// before it -- not when the bytes merely went out.
@@ -9803,11 +10343,11 @@ mod tests {
                                 Some(SessionInbound::Data(StreamData { data, .. })) => {
                                     log.extend_from_slice(&data);
                                 }
-                                Some(SessionInbound::Live) => log.extend_from_slice(b"<live>"),
-                                Some(SessionInbound::ResumeReset) => {
+                                Some(SessionInbound::Live(_)) => log.extend_from_slice(b"<live>"),
+                                Some(SessionInbound::ResumeReset(_)) => {
                                     log.extend_from_slice(b"<reset>");
                                 }
-                                Some(SessionInbound::Repaint) => {
+                                Some(SessionInbound::Repaint | SessionInbound::RepaintCutover { .. }) => {
                                     log.extend_from_slice(b"<repaint>");
                                 }
                                 Some(SessionInbound::Writable { .. }) => {
@@ -9816,6 +10356,7 @@ mod tests {
                                 Some(SessionInbound::Delivered { .. }) => {
                                     log.extend_from_slice(b"<delivered>");
                                 }
+                                Some(SessionInbound::OutputReady { .. }) => log.extend_from_slice(b"<output-ready>"),
                                 None => return,
                             }
                         }
@@ -10065,6 +10606,7 @@ mod tests {
         ) -> TestClient {
             TestClient {
                 conn: Connection::new(ConnectionConfig {
+                    required_features: crate::Features::NONE,
                     features: crate::Features::SUPPORTED,
                     role: Role::Client,
                     local_static_priv: client_priv,
@@ -10799,6 +11341,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let kp = generate_keypair();
         let conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -10823,6 +11366,7 @@ mod tests {
             token: [0u8; 16],
             backend: Arc::new(ChattyBackend { log: log.clone() }),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -11128,6 +11672,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11261,6 +11806,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11372,6 +11918,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11477,6 +12024,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11580,6 +12128,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11816,6 +12365,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -11902,6 +12452,7 @@ mod tests {
                 nonce: [0u8; AUTH_NONCE_LEN],
                 proven: Some(Box::new(ProvenSession {
                     conn: Connection::new(ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -12261,6 +12812,7 @@ mod tests {
         method: AuthMethod,
     ) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -12809,6 +13361,7 @@ mod tests {
     /// fresh client key the server has never seen.
     fn signature_msg1(server_pub: &[u8; 32], token: [u8; 16], start_kind: StartKind) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -12838,6 +13391,7 @@ mod tests {
         start_kind: StartKind,
     ) -> Vec<u8> {
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,
@@ -13660,6 +14214,7 @@ mod tests {
         let client_addr = sock.local_addr().unwrap();
         let server_addr = wiring.socket.local_addr().unwrap();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -14451,7 +15006,7 @@ mod tests {
     }
 
     /// The same, with both ends offering and allowing `features`.
-    fn accepted_connection_with(
+    pub(super) fn accepted_connection_with(
         server_kp: &crate::handshake::Keypair,
         token: [u8; 16],
         peer: SocketAddr,
@@ -14459,6 +15014,7 @@ mod tests {
     ) -> (Connection, Connection, Vec<Datagram>) {
         let client_kp = generate_keypair();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -14486,6 +15042,7 @@ mod tests {
         };
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -14556,6 +15113,7 @@ mod tests {
                 token,
                 backend: Arc::new(ForwardingBackend(heard_tx)),
                 io: SessionIo {
+                    resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
                     principal: test_principal(),
@@ -14653,7 +15211,10 @@ mod tests {
             "the Attach taken on the datagram arm declares the classes again too"
         );
         assert!(!parked);
-        assert!(matches!(in_rx.try_recv(), Ok(SessionInbound::ResumeReset)));
+        assert!(matches!(
+            in_rx.try_recv(),
+            Ok(SessionInbound::ResumeReset(_))
+        ));
         let data: Vec<u8> = conn
             .poll_events()
             .into_iter()
@@ -14807,6 +15368,7 @@ mod tests {
     async fn a_stream_out_of_offset_space_drops_the_connection_without_a_close() {
         let kp = generate_keypair();
         let mut conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: kp.private,
@@ -14844,11 +15406,14 @@ mod tests {
                 while let Some(ev) = io.recv().await {
                     let kind = match ev {
                         SessionInbound::Data(_) => "data",
-                        SessionInbound::Live => "live",
-                        SessionInbound::ResumeReset => "resume-reset",
-                        SessionInbound::Repaint => "repaint",
+                        SessionInbound::Live(_) => "live",
+                        SessionInbound::ResumeReset(_) => "resume-reset",
+                        SessionInbound::Repaint | SessionInbound::RepaintCutover { .. } => {
+                            "repaint"
+                        }
                         SessionInbound::Writable { .. } => "writable",
                         SessionInbound::Delivered { .. } => "delivered",
+                        SessionInbound::OutputReady { .. } => "output-ready",
                     };
                     let _ = tx.send(kind);
                 }
@@ -14894,6 +15459,7 @@ mod tests {
             token,
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),
@@ -15101,6 +15667,7 @@ mod tests {
             token,
             backend: Arc::new(ForwardingBackend(heard_tx)),
             io: SessionIo {
+                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
                 principal: test_principal(),

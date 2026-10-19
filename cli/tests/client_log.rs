@@ -78,10 +78,13 @@ fn a_run_on_a_silent_address_is_logged_without_verbose() {
         "{log}"
     );
     let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
-    let no_answer = at(&format!("127.0.0.1:{silent}: no answer"));
+    let no_answer = at(&format!("127.0.0.1:{silent}: No compatible response; this client requires QSH protocol 2 (waited 5 s)"));
     let summary = at("could not connect");
     let exiting = at("INFO  qsh: qsh exiting with code 12");
-    assert!(no_answer.is_some(), "no `no answer` line: {log}");
+    assert!(
+        no_answer.is_some(),
+        "no protocol-2 compatibility diagnostic: {log}"
+    );
     assert!(summary.is_some(), "no exit-12 summary: {log}");
     assert_eq!(
         exiting,

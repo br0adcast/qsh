@@ -19,7 +19,7 @@ use render::{ColorDepth, TermCaps};
 use ::connect::reconnect::{Event, Order, Phase, Reconnect, RoundEnd, Stop};
 use ::connect::recovery_gate::{AddressId, RecoveryEpoch};
 use ::connect::Address;
-use client::channel::{ChannelId, ChannelSession, SessionEvent};
+use client::channel::{AttachmentIntent, ChannelId, ChannelSession, SessionEvent};
 use client::qsh::QshSubstrate;
 use qsh::port_probe::{PortProbe, RefusalWindow};
 use qsh::road_catalog::{BoundedResolver, RoadCatalog, RoadWork};
@@ -174,7 +174,10 @@ fn run(a: args::Args) -> i32 {
     }
     let mut connected = connected;
     let mut events = link_rx;
-    let mut terminal_size = (cols, rows);
+    let mut display = DisplaySize {
+        physical: (cols, rows),
+        logical: (shell_cols, shell_rows),
+    };
     let mut addresses = setup.args().addresses.clone();
     let mut epoch = RecoveryEpoch {
         connection: 0,
@@ -186,7 +189,7 @@ fn run(a: args::Args) -> i32 {
             setup.clone(),
             connected,
             events,
-            terminal_size,
+            &mut display,
             addresses,
             epoch,
             resolver,
@@ -226,9 +229,14 @@ fn run(a: args::Args) -> i32 {
             }
         };
         setup = Arc::new(setup.replacement(token));
-        terminal_size = tty::window_size(std::io::stdout().as_raw_fd()).unwrap_or(terminal_size);
-        let shell_size =
-            session::shell_size(terminal_size.0, terminal_size.1, setup.args().status_line);
+        if let Some(physical) = tty::window_size(std::io::stdout().as_raw_fd()) {
+            display.physical = physical;
+            if physical.0 != 0 && physical.1 != 0 {
+                display.logical =
+                    session::shell_size(physical.0, physical.1, setup.args().status_line);
+            }
+        }
+        let shell_size = display.logical;
         let start_round = |epoch, catalog: &RoadCatalog| {
             let (progress, _) = mpsc::channel();
             background::spawn_catalog_round(
@@ -288,12 +296,17 @@ fn run(a: args::Args) -> i32 {
     }
 }
 
+struct DisplaySize {
+    physical: (u16, u16),
+    logical: (u16, u16),
+}
+
 /// Everything before this point uses the restored controlling terminal.
 fn connected_session(
     setup: Arc<Setup>,
     connected: Connected,
     events: Receiver<UiEvent>,
-    (cols, rows): (u16, u16),
+    display: &mut DisplaySize,
     mut addresses: Vec<Address>,
     road_epoch: RecoveryEpoch,
     resolver: BoundedResolver,
@@ -341,6 +354,7 @@ fn connected_session(
             link: 0,
         }),
         shell_channel: opened_ch,
+        attachment_intent: None,
         next_link: 1,
         reconnect: Reconnect::new(addr),
         addresses,
@@ -363,7 +377,7 @@ fn connected_session(
         replacement_at: None,
         tx: tx.clone(),
     };
-    interactive(setup, links, (cols, rows), tx, rx)
+    interactive(setup, links, display, tx, rx)
 }
 
 /// Keep the same bounded resolver pool across shell lifetimes, including the
@@ -541,6 +555,7 @@ struct Links {
     /// record does. After a return, `Ready` sets it for the channel the
     /// server still had.
     shell_channel: Option<ChannelId>,
+    attachment_intent: Option<AttachmentIntent>,
     /// The number the next connection gets.
     next_link: u64,
     reconnect: Reconnect,
@@ -720,16 +735,16 @@ impl Links {
                 // to say, so this only waits for its thread.
                 if let Some(live) = self.live.take() {
                     live.attempt.detach();
+                    self.attachment_intent = Some(live.channel_session.into_attachment_intent());
                 }
                 self.advance_epoch(false);
-                self.shell_channel = None;
                 let actions = sess.on_link_gone(now_ms);
                 self.rounds += 1;
                 self.round = Some(background::spawn_catalog_round(
                     self.setup.clone(),
                     self.addresses.clone(),
                     first,
-                    sess.size(),
+                    sess.desired_size(),
                     self.rounds,
                     self.tx.clone(),
                     self.road_epoch,
@@ -779,11 +794,34 @@ impl Links {
     ) -> Vec<Action> {
         let Connected {
             attempt,
-            trial,
+            mut trial,
             addr,
             port,
             remote,
         } = connected;
+        if trial.opened_ch.is_none() {
+            if let Some(intent) = self.attachment_intent.take() {
+                if trial
+                    .channel_session
+                    .import_attachment_intent(intent)
+                    .is_err()
+                {
+                    attempt.detach();
+                    return vec![
+                        Action::Notice(
+                            "qsh: resumed attachment already admitted channel metadata".into(),
+                        ),
+                        Action::Exit(1),
+                    ];
+                }
+            }
+            if let Some(ch) = self.shell_channel {
+                let (cols, rows) = sess.deferred_size();
+                trial.channel_session.defer_resize(ch, cols, rows);
+            }
+        } else {
+            self.attachment_intent = None;
+        }
         log::log(&format!("reconnected at address {addr}, qsh port {port}"));
         log::log(&connect::features_line(attempt.client.features()));
         self.addresses[addr].qsh_port = port;
@@ -800,7 +838,7 @@ impl Links {
         let link = self.next_link;
         self.next_link += 1;
         background::forward(link, events, self.tx.clone());
-        self.shell_channel = trial.opened_ch;
+        self.shell_channel = trial.opened_ch.or(self.shell_channel);
         self.live = Some(Live {
             attempt,
             channel_session: trial.channel_session,
@@ -1158,6 +1196,15 @@ fn apply_actions(
             // Carried out on the way out (`Links::leave`).
             Action::Keep => links.keep = true,
             Action::UseRoad(addr) => queue.extend(links.use_road(addr, sess, now_ms)),
+            Action::DeferResize { cols, rows } => {
+                if let Some(ch) = links.shell_channel {
+                    if let Some(live) = &mut links.live {
+                        live.channel_session.defer_resize(ch, cols, rows);
+                    } else if let Some(intent) = &mut links.attachment_intent {
+                        intent.defer_resize(ch, cols, rows);
+                    }
+                }
+            }
             channel_action => {
                 // Between two connections there is no channel to drive:
                 // `Session` asks for nothing then (and drops what is typed
@@ -1188,7 +1235,7 @@ fn apply_actions(
                     }
                     Action::SendChannel { ch, bytes } => live.channel_session.send(ch, &bytes),
                     Action::ResizeChannel { ch, cols, rows } => {
-                        live.channel_session.resize(ch, cols, rows)
+                        live.channel_session.resize(ch, cols, rows);
                     }
                     _ => unreachable!("every other action is handled above"),
                 }
@@ -1209,26 +1256,80 @@ fn on_wire(
     shell_bytes: &mut Vec<u8>,
     now_ms: &impl Fn() -> i64,
 ) -> Vec<Action> {
-    let mut actions = Vec::new();
+    let actions = Vec::new();
     // `current` only lets the live connection's events through.
     let Some(live) = links.live.as_mut() else {
         return actions;
     };
-    for se in live.channel_session.on_bytes(stream, bytes) {
+    channel_events(
+        live.channel_session.on_bytes(stream, bytes),
+        &mut links.shell_channel,
+        sess,
+        shell_bytes,
+        now_ms,
+    )
+}
+
+fn channel_events(
+    events: Vec<SessionEvent>,
+    shell_channel: &mut Option<ChannelId>,
+    sess: &mut Session,
+    shell_bytes: &mut Vec<u8>,
+    now_ms: &impl Fn() -> i64,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for se in events {
         match se {
-            SessionEvent::Ready(ch) => {
+            SessionEvent::Ready(ch) if shell_channel.is_none_or(|shell| shell == ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                links.shell_channel = Some(ch);
+                *shell_channel = Some(ch);
                 actions.extend(sess.on_channel_ready(ch, now_ms()));
             }
-            SessionEvent::Announced { live } => {
-                actions.extend(sess.on_announced(&live, now_ms()));
+            SessionEvent::Announced { active, draining } => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                if shell_channel.is_none() {
+                    *shell_channel = active.first().or(draining.first()).copied();
+                }
+                actions.extend(sess.on_snapshot(&active, &draining, now_ms()));
             }
-            SessionEvent::Exit { ch, code } => {
+            SessionEvent::Geometry { ch, record }
+                if shell_channel.is_none_or(|shell| shell == ch) =>
+            {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                *shell_channel = Some(ch);
+                actions.extend(sess.on_geometry(record, now_ms()));
+            }
+            SessionEvent::ResizeRefused { ch, reason, .. } if *shell_channel == Some(ch) => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(sess.on_resize_refused(reason, now_ms()));
+            }
+            SessionEvent::DrainingReady(ch) if *shell_channel == Some(ch) => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                sess.on_channel_draining(ch);
+            }
+            SessionEvent::OutputContinuityLost { ch, .. } if *shell_channel == Some(ch) => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(sess.on_output_gap(now_ms()));
+            }
+            SessionEvent::ProtocolFailure(error) => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.push(Action::Notice(format!(
+                    "qsh: channel protocol failure: {error:?}"
+                )));
+                actions.push(Action::Exit(1));
+                return actions;
+            }
+            SessionEvent::Geometry { .. }
+            | SessionEvent::ResizeRefused { .. }
+            | SessionEvent::DrainingReady(_)
+            | SessionEvent::OutputContinuityLost { .. } => {}
+            SessionEvent::Exit { ch, code } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_channel_exit(ch, code, now_ms()));
             }
-            SessionEvent::Refused { ch, reason } => {
+            SessionEvent::Refused { ch, reason }
+                if shell_channel.is_none_or(|shell| shell == ch) =>
+            {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 // `log::log` alone is not enough: the person would just see
                 // a bare exit code and a closed terminal, with no idea why
@@ -1239,7 +1340,7 @@ fn on_wire(
                 log::log(&format!("channel refused by server: {reason}"));
                 actions.extend(sess.on_channel_exit(ch, 1, now_ms()));
             }
-            SessionEvent::Vanished { ch } => {
+            SessionEvent::Vanished { ch } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 // Unlike `Refused`/`Exit`, there is no reason to report: the
                 // server simply no longer lists this channel (typically
@@ -1262,7 +1363,7 @@ fn on_wire(
             // `ShellState` through the exact pipeline it always has.
             // Accumulated, not sent right away -- see `shell_bytes`'s own
             // doc in `interactive`.
-            SessionEvent::Data { bytes, .. } => {
+            SessionEvent::Data { ch, bytes } if *shell_channel == Some(ch) => {
                 shell_bytes.extend(encode_record(REC_DATA, &bytes));
             }
             // This console path consumes qsh, whose wire format has no SSH
@@ -1273,9 +1374,15 @@ fn on_wire(
                     "unexpected SSH extended data type {data_type} on qsh channel"
                 ));
             }
-            SessionEvent::InputConsumed { offset, .. } => {
+            SessionEvent::InputConsumed { ch, offset } if *shell_channel == Some(ch) => {
                 shell_bytes.extend(encode_record(REC_ECHO_ACK, &offset.to_be_bytes()));
             }
+            SessionEvent::Ready(_)
+            | SessionEvent::Data { .. }
+            | SessionEvent::InputConsumed { .. }
+            | SessionEvent::Exit { .. }
+            | SessionEvent::Refused { .. }
+            | SessionEvent::Vanished { .. } => {}
         }
     }
     actions
@@ -1284,7 +1391,7 @@ fn on_wire(
 fn interactive(
     setup: Arc<Setup>,
     mut links: Links,
-    (cols, rows): (u16, u16),
+    display: &mut DisplaySize,
     tx: mpsc::Sender<UiEvent>,
     rx: mpsc::Receiver<UiEvent>,
 ) -> (i32, Links) {
@@ -1342,7 +1449,14 @@ fn interactive(
         },
         several: a.addresses.len() > 1,
     };
-    let mut sess = Session::new(cols, rows, caps, a.predict, chrome);
+    let mut sess = Session::new_with_logical_size(
+        display.physical,
+        terminal_size::TerminalSize::new(display.logical.0, display.logical.1)
+            .expect("adapted shell size"),
+        caps,
+        a.predict,
+        chrome,
+    );
     sess.set_history_limit(a.history);
     // The climb's trial already opened the shell channel, the moment the link
     // came alive, so its `Opened` confirmation could flip the verdict fast
@@ -1405,7 +1519,7 @@ fn interactive(
         }
         let mut events = Vec::new();
         if pending.resized {
-            let (c, r) = tty::window_size(out_fd).unwrap_or((cols, rows));
+            let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
             events.push(UiEvent::Resized { cols: c, rows: r });
         }
         if pending.resumed {
@@ -1593,6 +1707,8 @@ fn interactive(
     for notice in &notices {
         eprintln!("{notice}");
     }
+    display.physical = sess.physical_size();
+    display.logical = sess.size();
     (code, links)
 }
 
@@ -1676,6 +1792,102 @@ fn set_stderr_aside(raw: &tty::RawMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn geometry_session() -> Session {
+        Session::new(
+            20,
+            5,
+            render::TermCaps::truecolor(),
+            args::PredictMode::Never,
+            Chrome {
+                prefix: qsh::escape::DEFAULT_PREFIX,
+                line: false,
+                glyphs: qsh::window::Glyphs {
+                    utf8: true,
+                    colour: true,
+                },
+                several: false,
+            },
+        )
+    }
+
+    #[test]
+    fn batched_output_flushes_before_geometry() {
+        use transport::channel_geometry::{ChannelInstance, GeometryOutcome, GeometryRecord};
+        use transport::shell_frame::{encode_shell, ShellRecord};
+        let mut channels = ChannelSession::new(QshSubstrate::new(|_, _| {}));
+        let ch = channels.open_shell(20, 5).unwrap();
+        channels.on_event(client::channel::SubstrateEvent::Opened(ch));
+        let initial = GeometryRecord {
+            instance: ChannelInstance::new(1).unwrap(),
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols: 20,
+            rows: 5,
+        };
+        channels.on_bytes(ch, &encode_shell(&ShellRecord::Geometry(initial)).unwrap());
+        channels.resize(ch, 40, 5);
+        let old = b"abcdefghijklmnopqrstu";
+        let mut batch = encode_shell(&ShellRecord::Data(old.to_vec())).unwrap();
+        batch.extend(
+            encode_shell(&ShellRecord::Geometry(GeometryRecord {
+                request_id: 1,
+                outcome: GeometryOutcome::Applied,
+                cols: 40,
+                ..initial
+            }))
+            .unwrap(),
+        );
+        batch.extend(encode_shell(&ShellRecord::Data(b"new data".to_vec())).unwrap());
+        let mut sess = geometry_session();
+        sess.on_channel_ready(ch, 0);
+        let mut reference = geometry_session();
+        reference.on_channel_ready(ch, 0);
+        let expected_prefix = reference.handle(UiEvent::Stream0(encode_record(REC_DATA, old)), 1);
+        let mut pending = Vec::new();
+        let actions = channel_events(
+            channels.on_bytes(ch, &batch),
+            &mut Some(ch),
+            &mut sess,
+            &mut pending,
+            &|| 1,
+        );
+        assert!(
+            actions.starts_with(&expected_prefix),
+            "old DATA must paint at old geometry: {actions:?}"
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::Exit(_))));
+        assert_eq!(sess.size(), (40, 5));
+        assert_eq!(pending, encode_record(REC_DATA, b"new data"));
+    }
+
+    #[test]
+    fn resize_refusal_visible_without_status_line_and_without_geometry_feedback() {
+        use transport::channel_geometry::{ResizeRefusal, ResizeRequestId};
+        let mut sess = geometry_session();
+        sess.on_channel_ready(16, 0);
+        let before = sess.size();
+        let actions = channel_events(
+            vec![SessionEvent::ResizeRefused {
+                ch: 16,
+                request_id: ResizeRequestId::new(1).unwrap(),
+                requested: terminal_size::TerminalSize::new(100, 30).unwrap(),
+                reason: ResizeRefusal::ResourceLimit,
+            }],
+            &mut Some(16),
+            &mut sess,
+            &mut Vec::new(),
+            &|| 1,
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::Write(bytes) if bytes.windows(14).any(|w| w == b"Resize refused"))),
+            "refusal must be painted during the session: {actions:?}");
+        assert!(actions.iter().all(|a| !matches!(
+            a,
+            Action::Exit(_) | Action::Notice(_) | Action::ResizeChannel { .. }
+        )));
+        assert_eq!(sess.size(), before);
+        assert_eq!(sess.desired_size(), before);
+    }
 
     fn addr(literal: &str) -> SocketAddr {
         literal.parse().expect("a literal address")

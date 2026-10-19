@@ -30,16 +30,26 @@ impl Features {
     /// Bit 2: stream offsets modulo 2^32 (spec §4.14): a stream goes on past
     /// 4 GiB.
     pub const OFFSET_WRAP: Features = Features(1 << 2);
+    /// Reserved for explicit post-proof authentication acceptance; not enabled yet.
+    pub const AUTH_ACCEPTED: Features = Features(1 << 3);
+    /// Bit 4: ordered authoritative channel geometry and atomic lifecycle metadata.
+    pub const CHANNEL_GEOMETRY: Features = Features(1 << 4);
     /// What this build implements: what it offers as a client and may
     /// enable as a server.
-    pub const SUPPORTED: Features =
-        Features(Features::HEADER_AAD.0 | Features::STREAM_CREDIT.0 | Features::OFFSET_WRAP.0);
+    pub const SUPPORTED: Features = Features(
+        Features::HEADER_AAD.0
+            | Features::STREAM_CREDIT.0
+            | Features::OFFSET_WRAP.0
+            | Features::CHANNEL_GEOMETRY.0,
+    );
 
     /// The names the logs and `qshd self-check` use, bit by bit.
-    const NAMES: [(Features, &'static str); 3] = [
+    const NAMES: [(Features, &'static str); 5] = [
         (Features::HEADER_AAD, "header-aad"),
         (Features::STREAM_CREDIT, "stream-credit"),
         (Features::OFFSET_WRAP, "offset-wrap"),
+        (Features::AUTH_ACCEPTED, "auth-accepted"),
+        (Features::CHANNEL_GEOMETRY, "channel-geometry"),
     ];
 
     /// The set these bits say, known or not.
@@ -144,7 +154,7 @@ mod tests {
     #[test]
     fn negotiation_needs_the_offer_the_permission_and_the_implementation() {
         let unknown = Features::from_bits(1 << 20);
-        let all = Features::HEADER_AAD | Features::STREAM_CREDIT | Features::OFFSET_WRAP | unknown;
+        let all = Features::SUPPORTED | unknown;
         assert_eq!(Features::negotiate(all, all), Features::SUPPORTED);
         assert_eq!(
             Features::negotiate(Features::HEADER_AAD, Features::NONE),
@@ -161,7 +171,10 @@ mod tests {
         );
         assert_eq!(
             Features::SUPPORTED,
-            Features::HEADER_AAD | Features::STREAM_CREDIT | Features::OFFSET_WRAP
+            Features::HEADER_AAD
+                | Features::STREAM_CREDIT
+                | Features::OFFSET_WRAP
+                | Features::CHANNEL_GEOMETRY
         );
     }
 
@@ -173,5 +186,28 @@ mod tests {
         assert!(!two.contains(Features::STREAM_CREDIT));
         assert!(!Features::HEADER_AAD.contains(two));
         assert_eq!(two & Features::OFFSET_WRAP, Features::OFFSET_WRAP);
+    }
+}
+
+#[cfg(test)]
+mod geometry_feature_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_bit_does_not_claim_auth_acceptance() {
+        assert_eq!(Features::AUTH_ACCEPTED.bits(), 8);
+        assert_eq!(Features::CHANNEL_GEOMETRY.bits(), 16);
+        assert!(!Features::CHANNEL_GEOMETRY.contains(Features::AUTH_ACCEPTED));
+        let reserved = Features::AUTH_ACCEPTED | Features::CHANNEL_GEOMETRY;
+        assert_eq!(
+            Features::negotiate(reserved, reserved),
+            Features::CHANNEL_GEOMETRY
+        );
+        assert_eq!(
+            Features::negotiate(Features::from_bits(u32::MAX), Features::from_bits(u32::MAX)),
+            Features::SUPPORTED
+        );
+        assert_eq!(Features::SUPPORTED & reserved, Features::CHANNEL_GEOMETRY);
+        assert_eq!(reserved.names(), vec!["auth-accepted", "channel-geometry"]);
     }
 }

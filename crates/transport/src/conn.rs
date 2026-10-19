@@ -288,6 +288,27 @@ pub struct ConnectionConfig {
     /// it and this set allows it. Production passes `Features::SUPPORTED`;
     /// tests pass `Features::NONE` to play a peer built before negotiation.
     pub features: Features,
+    /// Mandatory negotiated features for this application profile. Generic
+    /// transport tools may choose NONE; channel owners require CHANNEL_GEOMETRY.
+    pub required_features: Features,
+}
+
+/// An authenticated handshake cannot satisfy this application profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolFailure {
+    UnsupportedProtocol {
+        supported: u8,
+    },
+    MissingRequiredFeatures {
+        required: Features,
+        enabled: Features,
+    },
+    InvalidHandshake {
+        reason: HsPayloadError,
+    },
+    UnofferedFeatures {
+        enabled: Features,
+    },
 }
 
 /// Link state.
@@ -297,6 +318,23 @@ pub enum LinkState {
     Live,
     PathDown,
     Closed,
+}
+
+/// A bounded send did not take ownership of any bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendBlocked {
+    NotLive,
+    Desynced,
+    OffsetSpaceExhausted,
+    WouldBlock,
+}
+
+// One current owner/frontier and one coalesced loss flag per u8 stream.
+// Reuse replaces the owner; repeated discards cannot erase an earlier loss.
+struct TrackedChannelOutput {
+    instance: crate::channel_geometry::ChannelInstance,
+    continuity_end: u64,
+    lost: bool,
 }
 
 /// Event for the caller. Accumulates in an internal queue and is handed out
@@ -342,6 +380,12 @@ pub enum Event {
     /// Client-side: an authenticated msg2 payload could not be parsed.
     /// Reported once; reading msg2 spent the handshake, so the attempt closes.
     InvalidHandshakeResponse { reason: HsPayloadError },
+    /// Authenticated msg2 omitted mandatory application features. No Live or
+    /// queued application writes follow; the consumed attempt ends once.
+    MissingRequiredFeatures {
+        required: Features,
+        enabled: Features,
+    },
 }
 
 /// Outgoing datagram: where to send it and what to send.
@@ -486,6 +530,7 @@ pub struct Connection {
     auth: AuthPolicy,
     /// What this side's configuration allows (`ConnectionConfig::features`).
     allowed_features: Features,
+    required_features: Features,
     /// Client: what this handshake's msg1 offered, read back from the payload
     /// it was started with (`NONE` for one that does not parse, like the
     /// empty payload of `start`), less what this build does not implement.
@@ -592,6 +637,7 @@ pub struct Connection {
     /// Bounded by the stream-number space (256 entries); a reused number
     /// overwrites its predecessor's declaration.
     stream_resyncable: BTreeMap<u8, bool>,
+    channel_output: BTreeMap<u8, TrackedChannelOutput>,
     /// What the session layer declared about each stream's class (spec
     /// §4.8). A stream nobody declared is `Interactive`. Bounded by the
     /// stream-number space.
@@ -836,6 +882,7 @@ impl Connection {
             remote_pub: cfg.remote_static_pub,
             auth: cfg.auth,
             allowed_features: cfg.features,
+            required_features: cfg.required_features,
             offered_features: Features::NONE,
             features: Features::NONE,
             legacy_peer: false,
@@ -865,6 +912,7 @@ impl Connection {
             data_since_ack: 0,
             events: Vec::new(),
             stream_resyncable: BTreeMap::new(),
+            channel_output: BTreeMap::new(),
             stream_class: BTreeMap::new(),
             default_consumption: Consumption::OnDelivery,
             stream_consumption: BTreeMap::new(),
@@ -954,6 +1002,10 @@ impl Connection {
         if msg1.method != conn.auth.method() {
             return AcceptOutcome::Rejected;
         }
+        let features = Features::negotiate(msg1.offered, conn.allowed_features);
+        if !features.contains(conn.required_features) {
+            return AcceptOutcome::Rejected;
+        }
         // The only call to `resolve`, and the last point at which this
         // handshake can still be refused -- see this function's docs.
         let Msg2Inputs { resumed, nonce } = match resolve(&msg1) {
@@ -963,7 +1015,6 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let features = Features::negotiate(msg1.offered, conn.allowed_features);
         let session_id: u64 = rand::thread_rng().gen();
         conn.session_id = session_id;
         let msg2 = conn
@@ -1133,6 +1184,81 @@ impl Connection {
         }
     }
 
+    /// Register the current typed owner without carrying a predecessor's loss.
+    pub(crate) fn declare_channel_output(
+        &mut self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+    ) {
+        if self
+            .channel_output
+            .get(&stream)
+            .is_none_or(|state| state.instance != instance)
+        {
+            self.channel_output.insert(
+                stream,
+                TrackedChannelOutput {
+                    instance,
+                    continuity_end: 0,
+                    lost: false,
+                },
+            );
+        }
+    }
+
+    /// Called after successful DATA admission or a warning disclosing prior DATA loss.
+    pub(crate) fn track_channel_continuity_end(
+        &mut self,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        continuity_end: u64,
+    ) {
+        self.declare_channel_output(stream, instance);
+        self.channel_output.get_mut(&stream).unwrap().continuity_end = continuity_end;
+    }
+
+    /// Coalesced DATA loss or an unconfirmed warning about earlier DATA loss,
+    /// classified against ACK state at discard time.
+    /// Taking observations clears flags, never the current continuity frontier.
+    pub(crate) fn take_discarded_output(
+        &mut self,
+    ) -> Vec<(u8, crate::channel_geometry::ChannelInstance)> {
+        self.channel_output
+            .iter_mut()
+            .filter_map(|(&stream, state)| {
+                std::mem::take(&mut state.lost).then_some((stream, state.instance))
+            })
+            .collect()
+    }
+
+    /// The model has ended: this stream can no longer regenerate a snapshot.
+    /// If a discard already happened, arm its existing Reset exactly once.
+    pub(crate) fn retain_stream_output(&mut self, stream: u8) -> bool {
+        self.set_stream_resyncable(stream, false);
+        if let Some(state) = self.streams.get_mut(&stream) {
+            if state.sender.is_desynced() {
+                state.sender.begin_resync();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn discard_stream_output(&mut self, stream: u8) {
+        let sender = &mut self.stream_mut(stream).sender;
+        if sender.is_desynced() {
+            return;
+        }
+        let queued = sender.queued_total();
+        let acknowledged = queued - sender.unacked_len() as u64;
+        sender.mark_desynced();
+        if let Some(state) = self.channel_output.get_mut(&stream) {
+            state.lost |= state.continuity_end > acknowledged && state.continuity_end <= queued;
+            state.continuity_end = 0;
+        }
+        self.cc.forget_stream(stream);
+    }
+
     /// Declare whether `stream_id`'s backlog may be dropped after a long
     /// absence. Called by the session layer when it opens a stream whose
     /// recoverability it knows.
@@ -1261,6 +1387,71 @@ impl Connection {
             .unwrap_or_default()
     }
 
+    /// Bytes a whole-record handoff can admit now without exceeding the local
+    /// unacked cap, negotiated credit or offset space. Does not create a stream.
+    /// The existing global hard cap remains an additional ceiling.
+    pub fn stream_write_room(&self, stream: u8, max_unacked: usize) -> usize {
+        if self.state != LinkState::Live {
+            return 0;
+        }
+        let cap = max_unacked.min(SEND_HARD_CAP);
+        if let Some(state) = self.streams.get(&stream) {
+            state.sender.write_room(cap)
+        } else {
+            let mut sender = StreamSender::new(stream);
+            sender.set_features(self.features);
+            sender.write_room(cap)
+        }
+    }
+
+    /// Distinguish permanent framing exhaustion from recoverable credit pressure.
+    pub(crate) fn stream_offset_room(&self, stream: u8) -> u64 {
+        self.streams.get(&stream).map_or_else(
+            || {
+                let mut sender = StreamSender::new(stream);
+                sender.set_features(self.features);
+                sender.offset_room()
+            },
+            |state| state.sender.offset_room(),
+        )
+    }
+
+    /// Atomically admit the complete slice before sender allocation. Err leaves
+    /// every byte with its caller: no stream creation, event, flush or partial
+    /// append. Producers retain their permit/charge until this returns Ok.
+    pub fn try_send_bounded(
+        &mut self,
+        now: Instant,
+        stream: u8,
+        bytes: &[u8],
+        max_unacked: usize,
+    ) -> Result<Vec<Datagram>, SendBlocked> {
+        if self.state != LinkState::Live {
+            return Err(SendBlocked::NotLive);
+        }
+        if let Some(state) = self.streams.get(&stream) {
+            if state.sender.is_desynced() {
+                return Err(SendBlocked::Desynced);
+            }
+            if bytes.len() as u64 > state.sender.offset_room() {
+                return Err(SendBlocked::OffsetSpaceExhausted);
+            }
+        }
+        if bytes.len() > self.stream_write_room(stream, max_unacked) {
+            return Err(SendBlocked::WouldBlock);
+        }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.stream_mut(stream)
+            .sender
+            .push(bytes)
+            .map_err(|_| SendBlocked::OffsetSpaceExhausted)?;
+        let mut out = Vec::new();
+        self.flush_senders(now, &mut out);
+        Ok(out)
+    }
+
     /// Queue bytes of stream `stream_id` for reliable sending. Before reaching
     /// `Live`, no datagrams are emitted -- bytes accumulate and go out on the
     /// transition.
@@ -1289,10 +1480,8 @@ impl Connection {
             return;
         }
         if matches!(self.role, Role::Server) && self.is_bulk_output_stream(stream_id) {
-            let sender = &mut self.stream_mut(stream_id).sender;
-            sender.mark_desynced();
-            sender.begin_resync();
-            self.cc.forget_stream(stream_id);
+            self.discard_stream_output(stream_id);
+            self.stream_mut(stream_id).sender.begin_resync();
             self.events.push(Event::OutputResync);
         } else if self.over_cap_reported.insert(stream_id) {
             self.events.push(Event::SendBufferOverCap { stream_id });
@@ -1392,11 +1581,7 @@ impl Connection {
                 .filter(|stream_id| self.is_bulk_output_stream(*stream_id))
                 .collect();
             for stream_id in desyncable {
-                let st = self.stream_mut(stream_id);
-                if !st.sender.is_desynced() {
-                    st.sender.mark_desynced();
-                    self.cc.forget_stream(stream_id);
-                }
+                self.discard_stream_output(stream_id);
             }
         }
         // Control before data (spec §4.8): on a slow uplink a PING behind a
@@ -2118,6 +2303,11 @@ impl Connection {
         } else {
             Features::negotiate(offered, self.allowed_features)
         };
+        if !features.contains(self.required_features) {
+            self.handshake = None;
+            self.set_state(LinkState::Closed);
+            return out;
+        }
         // Random session id in the authenticated, versioned msg2 payload.
         let session_id: u64 = rand::thread_rng().gen();
         self.session_id = session_id;
@@ -2198,6 +2388,15 @@ impl Connection {
         if !self.offered_features.contains(msg2.enabled) {
             self.handshake = None;
             self.events.push(Event::UnofferedFeatureEnabled {
+                enabled: msg2.enabled,
+            });
+            self.set_state(LinkState::Closed);
+            return out;
+        }
+        if !msg2.enabled.contains(self.required_features) {
+            self.handshake = None;
+            self.events.push(Event::MissingRequiredFeatures {
+                required: self.required_features,
                 enabled: msg2.enabled,
             });
             self.set_state(LinkState::Closed);
@@ -3124,6 +3323,12 @@ impl Connection {
             .or_insert_with(|| StreamState::new(stream_id, features))
     }
 
+    /// Select the ordered profile explicitly in generic transport fixtures.
+    #[cfg(test)]
+    pub(crate) fn enable_geometry_for_test(&mut self) {
+        self.apply_features(self.features | Features::CHANNEL_GEOMETRY);
+    }
+
     /// Take `features` as this connection's (spec §5.4): on every stream it
     /// has already -- a client may have queued bytes before its handshake
     /// ended -- as on those it makes later.
@@ -3444,6 +3649,12 @@ impl Connection {
         self.ping_unanswered
     }
 
+    #[cfg(test)]
+    pub(crate) fn limit_channel_offset_for_test(&mut self, stream: u8, remaining: u32) {
+        self.stream_mut(stream).sender =
+            StreamSender::starting_at(stream, crate::reliability::OFFSET_LIMIT - remaining);
+    }
+
     /// Test-only shortcut: fabricate a server-side desync+resync on stream 0
     /// directly, without waiting out `RESYNC_AFTER` via `on_timeout`. Arms a
     /// `Reset` that goes out with the next `send`/`flush_senders`.
@@ -3468,7 +3679,7 @@ impl Connection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::handshake::generate_keypair;
     use crate::handshake_payload::{encode_msg1_without_tail, StartKind};
@@ -3512,6 +3723,7 @@ mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -3519,6 +3731,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -3540,6 +3753,279 @@ mod tests {
         assert_eq!(client.peer(), Some(saddr));
         assert_eq!(server.peer(), Some(caddr));
         (client, server, caddr, saddr)
+    }
+
+    #[test]
+    fn geometry_discard_observation_uses_real_ack_frontier_and_instance() {
+        let (_, mut server, _, _) = established_pair();
+        let instance = crate::channel_geometry::ChannelInstance::new(1).unwrap();
+        server.stream_mut(16).sender.push(b"data+metadata").unwrap();
+        server.track_channel_continuity_end(16, instance, 5);
+        server
+            .stream_mut(16)
+            .sender
+            .frames_to_send(Instant::now(), Duration::from_millis(200));
+        assert!(server.stream_mut(16).sender.on_ack(5));
+        server.discard_stream_output(16);
+        assert!(
+            server.take_discarded_output().is_empty(),
+            "metadata-only loss"
+        );
+        server.retain_stream_output(16);
+        server.stream_mut(16).sender.push(b"new DATA").unwrap();
+        server.track_channel_continuity_end(16, instance, server.stream_progress(16).queued);
+        server.discard_stream_output(16);
+        assert_eq!(server.take_discarded_output(), vec![(16, instance)]);
+        assert!(server.take_discarded_output().is_empty());
+        server.retain_stream_output(16);
+        server
+            .stream_mut(16)
+            .sender
+            .push(b"old owner DATA")
+            .unwrap();
+        server.track_channel_continuity_end(16, instance, server.stream_progress(16).queued);
+        server.discard_stream_output(16);
+        let newer = crate::channel_geometry::ChannelInstance::new(2).unwrap();
+        server.declare_channel_output(16, newer);
+        assert!(
+            server.take_discarded_output().is_empty(),
+            "replacement cannot inherit lost predecessor DATA"
+        );
+        assert_eq!(server.channel_output.len(), 1);
+    }
+    #[test]
+    fn geometry_sealing_desynced_eof_arms_one_reset_and_preserves_output() {
+        let (_, mut server, _, _) = established_pair();
+        server.set_stream_resyncable(16, true);
+        server.stream_mut(16).sender.push(b"final").unwrap();
+        server.discard_stream_output(16);
+        assert!(server.retain_stream_output(16));
+        assert!(!server.stream_mut(16).sender.is_desynced());
+        assert!(!server.is_bulk_output_stream(16));
+        assert!(
+            !server.retain_stream_output(16),
+            "one Reset for the discarded tail"
+        );
+        assert!(server
+            .try_send_bounded(Instant::now(), 16, b"retained", 1024)
+            .is_ok());
+    }
+
+    #[test]
+    fn bounded_send_refuses_before_push() {
+        let (mut client, _, _, _) = established_pair();
+        let before = client.stream_progress(16);
+        assert_eq!(client.stream_write_room(16, 4), 4);
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 16, b"12345", 4),
+            Err(SendBlocked::WouldBlock)
+        ));
+        assert_eq!(client.stream_progress(16), before);
+        assert!(
+            !client.streams.contains_key(&16),
+            "a refused send must not create a stream"
+        );
+    }
+
+    #[test]
+    fn bounded_send_obeys_credit_and_local_tail() {
+        let (mut client, _, _, _) = established_pair();
+        let sender = &mut client.stream_mut(16).sender;
+        // Queue without pumping, so credit must include unsent bytes too.
+        sender
+            .push(&vec![0; STREAM_WINDOW as usize - 8196])
+            .unwrap();
+        let now = Instant::now();
+        let record = [0; 8197];
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize),
+            8196
+        );
+        let before = client.stream_progress(16);
+        assert!(matches!(
+            client.try_send_bounded(now, 16, &record, crate::send_gate::PIPE_HIGH as usize),
+            Err(SendBlocked::WouldBlock)
+        ));
+        assert_eq!(client.stream_progress(16), before);
+        client
+            .stream_mut(16)
+            .sender
+            .on_credit((STREAM_WINDOW + 1) as u32);
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize),
+            8196,
+            "local cap still applies"
+        );
+        assert_eq!(
+            client.stream_write_room(16, crate::send_gate::PIPE_HIGH as usize + 1),
+            8197
+        );
+        assert!(client
+            .try_send_bounded(now, 16, &record, crate::send_gate::PIPE_HIGH as usize + 1)
+            .is_ok());
+        assert_eq!(client.stream_progress(16).queued, STREAM_WINDOW + 1);
+        assert_eq!(
+            client.stream_write_room(16, usize::MAX),
+            0,
+            "all negotiated credit is queued"
+        );
+        assert!(
+            client.stream_write_room(18, crate::send_gate::PIPE_HIGH as usize) >= record.len(),
+            "initial production credit fits a full framed reader chunk"
+        );
+
+        let (mut legacy, _, _, _) = handshake_with_features(Features::NONE, Features::NONE, false);
+        assert_eq!(legacy.stream_write_room(16, 7), 7);
+        assert!(legacy.try_send_bounded(now, 16, b"1234567", 7).is_ok());
+        assert_eq!(legacy.stream_write_room(16, 7), 0);
+        assert!(matches!(
+            legacy.try_send_bounded(now, 16, b"x", 7),
+            Err(SendBlocked::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn bounded_send_admits_whole_record_after_ack_and_credit_recovery() {
+        let (mut client, _, _, _) = established_pair();
+        let now = Instant::now();
+        let cap = crate::send_gate::PIPE_HIGH as usize;
+        let sender = &mut client.stream_mut(16).sender;
+        sender.push(&vec![0; cap - 8196]).unwrap();
+        sender.frames_to_send(now, Duration::from_secs(1));
+        assert!(sender.on_ack(1));
+        assert_eq!(
+            client.stream_write_room(16, cap),
+            8196,
+            "ACK alone does not return consumer credit"
+        );
+        client
+            .stream_mut(16)
+            .sender
+            .on_credit((STREAM_WINDOW + 1) as u32);
+        assert_eq!(client.stream_write_room(16, cap), 8197);
+        assert!(client.try_send_bounded(now, 16, &[0; 8197], cap).is_ok());
+        assert_eq!(client.stream_progress(16).unacked, cap as u64);
+    }
+
+    #[test]
+    fn bounded_send_rejects_nonlive_desynced_and_exhausted_without_mutation() {
+        let (mut client, _, _, _) = established_pair();
+        for state in [
+            LinkState::Connecting,
+            LinkState::PathDown,
+            LinkState::Closed,
+        ] {
+            client.state = state;
+            let count = client.streams.len();
+            assert_eq!(client.stream_write_room(16, 100), 0);
+            assert!(matches!(
+                client.try_send_bounded(Instant::now(), 16, b"x", 100),
+                Err(SendBlocked::NotLive)
+            ));
+            assert_eq!(client.streams.len(), count);
+        }
+        client.state = LinkState::Live;
+        client.stream_mut(16).sender.mark_desynced();
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 16, b"x", 100),
+            Err(SendBlocked::Desynced)
+        ));
+        assert_eq!(client.stream_progress(16).queued, 0);
+        client.stream_mut(17).sender = StreamSender::starting_at(17, OFFSET_LIMIT - 3);
+        assert_eq!(client.stream_write_room(17, 100), 3);
+        assert!(matches!(
+            client.try_send_bounded(Instant::now(), 17, b"four", 100),
+            Err(SendBlocked::OffsetSpaceExhausted)
+        ));
+        assert_eq!(
+            client.stream_progress(17).queued,
+            u64::from(OFFSET_LIMIT - 3)
+        );
+        assert_eq!(
+            client.stream_write_room(18, usize::MAX),
+            STREAM_WINDOW as usize
+        );
+    }
+
+    #[test]
+    fn bounded_send_does_not_allocate_on_zero_room() {
+        let (mut client, _, _, _) = established_pair();
+        client.poll_events();
+        client
+            .stream_mut(16)
+            .sender
+            .push(&vec![0; STREAM_WINDOW as usize])
+            .unwrap();
+        let before = client.stream_progress(16);
+        let now = Instant::now();
+        let count = client.streams.len();
+        let allocated = allocation_probe::measure(|| {
+            for _ in 0..1000 {
+                assert!(matches!(
+                    client.try_send_bounded(now, 16, b"x", usize::MAX),
+                    Err(SendBlocked::WouldBlock)
+                ));
+                assert!(matches!(
+                    client.try_send_bounded(now, 17, b"x", 0),
+                    Err(SendBlocked::WouldBlock)
+                ));
+                assert_eq!(client.stream_write_room(17, 0), 0);
+            }
+        });
+        assert_eq!(allocated, 0);
+        assert_eq!(client.stream_progress(16), before);
+        assert_eq!(client.streams.len(), count);
+        assert!(client.poll_events().is_empty());
+    }
+
+    // Per-thread observation only; other transport tests use the unchanged
+    // System allocator. No production allocator or allocation policy changes.
+    pub(crate) mod allocation_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        thread_local! { static COUNT: Cell<Option<usize>> = const { Cell::new(None) }; }
+        struct Probe;
+        #[global_allocator]
+        static ALLOCATOR: Probe = Probe;
+        fn record() {
+            let _ = COUNT.try_with(|n| {
+                if let Some(count) = n.get() {
+                    n.set(Some(count + 1));
+                }
+            });
+        }
+        unsafe impl GlobalAlloc for Probe {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                record();
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+        pub fn measure(f: impl FnOnce()) -> usize {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    COUNT.with(|n| n.set(None));
+                }
+            }
+            COUNT.with(|n| {
+                assert!(n.get().is_none());
+                n.set(Some(0));
+            });
+            let _reset = Reset;
+            f();
+            COUNT.with(|n| n.get().unwrap())
+        }
     }
 
     fn collect_stream_data(events: &[Event]) -> Vec<u8> {
@@ -3583,6 +4069,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: offer,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -3590,6 +4077,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let server_cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: allow,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -3665,6 +4153,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_geometry_feature_is_rejected_before_resolve_or_direct_live() {
+        for direct in [false, true] {
+            let server = generate_keypair();
+            let client_key = generate_keypair();
+            let now = Instant::now();
+            let src = addr("198.51.100.7:40000");
+            let peer = addr("198.51.100.1:41000");
+            let mut client = Connection::new(ConnectionConfig {
+                required_features: Features::NONE,
+                features: Features::NONE,
+                role: Role::Client,
+                local_static_priv: client_key.private,
+                remote_static_pub: Some(server.public),
+                auth: AuthPolicy::Allowlist(Vec::new()),
+            });
+            let msg1 = client.start_session(now, peer, StartKind::Cold, [5; 16]);
+            let config = ConnectionConfig {
+                required_features: Features::CHANNEL_GEOMETRY,
+                features: Features::SUPPORTED,
+                role: Role::Server,
+                local_static_priv: server.private,
+                remote_static_pub: None,
+                auth: AuthPolicy::Allowlist(vec![client_key.public]),
+            };
+            if direct {
+                let mut server = Connection::new(config);
+                assert!(server.on_datagram(now, src, &msg1[0].bytes).is_empty());
+                assert_ne!(server.state(), LinkState::Live);
+                assert!(server.keys.is_none());
+            } else {
+                let Frame::Handshake { body, .. } = parse(&msg1[0].bytes).unwrap() else {
+                    panic!("msg1")
+                };
+                let mut calls = 0;
+                let outcome = Connection::accept(config, now, src, body, &mut |_| {
+                    calls += 1;
+                    Some(Msg2Inputs {
+                        resumed: false,
+                        nonce: [0; AUTH_NONCE_LEN],
+                    })
+                });
+                assert_eq!(
+                    calls, 0,
+                    "incompatible client must not mutate the session router"
+                );
+                assert!(matches!(outcome, AcceptOutcome::Rejected));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_geometry_feature_closes_authenticated_client_before_live_or_flush() {
+        let (mut client, response, now, peer) =
+            response_fixture(&encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::NONE));
+        client.required_features = Features::CHANNEL_GEOMETRY;
+        assert!(client
+            .send(now, 16, b"must not reach the application")
+            .is_empty());
+        assert!(client.on_datagram(now, peer, &response).is_empty());
+        assert_eq!(client.state(), LinkState::Closed);
+        assert!(client.keys.is_none());
+        assert!(client.handshake.is_none());
+        assert_eq!(
+            client.poll_events(),
+            vec![
+                Event::MissingRequiredFeatures {
+                    required: Features::CHANNEL_GEOMETRY,
+                    enabled: Features::NONE,
+                },
+                Event::StateChanged(LinkState::Closed)
+            ]
+        );
+        assert!(client.on_datagram(now, peer, &response).is_empty());
+        assert!(client.poll_events().is_empty());
+    }
+
     /// Spec §5.2: a msg2 that turns on what msg1 did not offer is a protocol
     /// violation. The client says so once and closes: reading msg2 spent its
     /// Noise state, so no later copy could be read either.
@@ -3679,6 +4244,7 @@ mod tests {
             let client_kp = generate_keypair();
             let saddr = addr("198.51.100.1:41000");
             let mut client = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: offer,
                 role: Role::Client,
                 local_static_priv: client_kp.private,
@@ -3716,6 +4282,7 @@ mod tests {
         let peer = addr("198.51.100.1:41000");
         let now = Instant::now();
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_key.private,
@@ -3737,8 +4304,14 @@ mod tests {
     fn authenticated_invalid_msg2_retires_attempt_without_flushing() {
         for (payload, reason) in [
             (vec![], HsPayloadError::BadVersion),
-            (vec![2; 30], HsPayloadError::BadVersion),
-            (vec![1; 8], HsPayloadError::TooShort),
+            (
+                vec![crate::handshake_payload::HS_VERSION + 1; 30],
+                HsPayloadError::BadVersion,
+            ),
+            (
+                vec![crate::handshake_payload::HS_VERSION; 8],
+                HsPayloadError::TooShort,
+            ),
         ] {
             let (mut client, response, now, peer) = response_fixture(&payload);
             assert!(client.send(now, 0, b"pending application data").is_empty());
@@ -3814,6 +4387,7 @@ mod tests {
             let client_kp = generate_keypair();
             let saddr = addr("198.51.100.1:41000");
             let mut client = Connection::new(ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: Features::SUPPORTED,
                 role: Role::Client,
                 local_static_priv: client_kp.private,
@@ -3863,6 +4437,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -3870,6 +4445,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -3914,6 +4490,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -3921,6 +4498,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4455,6 +5033,7 @@ mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4462,6 +5041,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4496,6 +5076,7 @@ mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4503,6 +5084,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4558,6 +5140,7 @@ mod tests {
             });
         let m1_body = ini.write_msg(&payload);
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4633,6 +5216,7 @@ mod tests {
             });
         let m1_body = ini.write_msg(&payload);
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4658,6 +5242,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:9100".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4678,6 +5263,7 @@ mod tests {
 
         let accepted = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -4701,6 +5287,7 @@ mod tests {
 
         let rejected = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -4738,6 +5325,7 @@ mod tests {
         let now = Instant::now();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4757,6 +5345,7 @@ mod tests {
         };
 
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -4790,6 +5379,7 @@ mod tests {
             matches!(
                 Connection::accept(
                     ConnectionConfig {
+                        required_features: crate::Features::NONE,
                         features: crate::Features::SUPPORTED,
                         role: Role::Server,
                         local_static_priv: server_kp.private,
@@ -4824,6 +5414,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:9200".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4846,6 +5437,7 @@ mod tests {
 
         let outcome = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -4879,6 +5471,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -4903,6 +5496,7 @@ mod tests {
 
         let accepted = Connection::accept(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: server_kp.private,
@@ -4994,6 +5588,7 @@ mod tests {
             },
         ));
         let cfg = ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -6345,6 +6940,7 @@ mod tests {
         );
 
         let mut unstarted = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -7450,6 +8046,7 @@ mod tests {
         let saddr = addr("198.51.100.1:41000");
 
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7457,6 +8054,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -7588,6 +8186,7 @@ mod tests {
         let at = Instant::now() + Duration::from_secs(3600);
         let conn = Connection::new_at(
             ConnectionConfig {
+                required_features: crate::Features::NONE,
                 features: crate::Features::SUPPORTED,
                 role: Role::Server,
                 local_static_priv: kp.private,
@@ -7811,6 +8410,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -7818,6 +8418,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -8062,6 +8663,7 @@ mod tests {
         let client_kp = generate_keypair();
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8247,6 +8849,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8254,6 +8857,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,
@@ -8288,6 +8892,7 @@ mod tests {
         let caddr = addr("198.51.100.7:40000");
         let saddr = addr("198.51.100.1:41000");
         let mut client = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_kp.private,
@@ -8295,6 +8900,7 @@ mod tests {
             auth: AuthPolicy::Allowlist(Vec::new()),
         });
         let mut server = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server_kp.private,

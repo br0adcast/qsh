@@ -138,16 +138,21 @@ pub fn overlay(frame: &Frame, text: &str) -> Frame {
     if out.cols == 0 || out.rows == 0 {
         return out;
     }
-    for (i, ch) in text.chars().take(out.cols as usize).enumerate() {
-        let cell = &mut out.cells[i];
-        cell.ch = ch;
-        cell.flags |= FLAG_REVERSE;
-        // A wide glyph left over from the frame underneath would leave its
-        // spacer behind and shift the row; the overlay writes plain cells.
+    for (cell, source) in out
+        .cells
+        .iter_mut()
+        .take(usize::from(out.cols))
+        .zip(crate::statusline::text_cells(text, true))
+    {
+        cell.ch = source.ch;
         cell.flags &= !(terminal::FLAG_WIDE
             | terminal::FLAG_WIDE_SPACER
             | terminal::FLAG_LEADING_WIDE_SPACER);
+        cell.flags |= FLAG_REVERSE | source.flags;
     }
+    // Text and the surviving underlying cells can both end with half a pair.
+    let size = terminal_size::ViewportSize::new(out.cols, out.rows);
+    out = crate::viewport::project(&out, size);
     out
 }
 

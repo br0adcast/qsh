@@ -12,20 +12,40 @@
 //! output stream and asks the backend to repaint; [`PtyScreen::repaint`] is
 //! the answer.
 
-use terminal::{Frame, TerminalCore};
-use transport::shell_server::SessionScreen;
+//! Daemon models keep zero scrollback history: scrollback belongs to clients.
+//! Content scrolled out or dropped by a smaller height does not return when
+//! the model grows. Repaints describe the retained visible state at its size.
+
+use crate::screen_budget::{ResizeReservation, ScreenBudget, ScreenLease};
+use std::sync::Arc;
+use terminal::{Frame, TerminalCore, TerminalOptions};
+use terminal_size::TerminalSize;
+use transport::shell_server::{PreparedScreenResize, ScreenPreparationError, SessionScreen};
 
 /// A shell session's screen: the emulator that follows the output.
 pub struct PtyScreen {
     term: TerminalCore,
+    lease: ScreenLease,
 }
 
 impl PtyScreen {
-    /// A model of a `cols` x `rows` terminal, matching the PTY it follows.
-    pub fn new(cols: u16, rows: u16) -> PtyScreen {
-        PtyScreen {
-            term: TerminalCore::with_replay(cols, rows),
-        }
+    /// Reserve the shared daemon budget before allocating an emulator.
+    pub fn try_new(
+        size: TerminalSize,
+        uid: u32,
+        budget: Arc<ScreenBudget>,
+    ) -> Result<Self, String> {
+        let lease = budget.reserve(uid, size)?;
+        Ok(Self {
+            term: TerminalCore::with_options(
+                size,
+                TerminalOptions {
+                    history_lines: 0,
+                    replay: true,
+                },
+            ),
+            lease,
+        })
     }
 
     /// The screen as the model sees it. For tests and for callers that want
@@ -41,13 +61,37 @@ impl PtyScreen {
     }
 }
 
+struct ScreenResize<'a> {
+    term: &'a mut TerminalCore,
+    reservation: ResizeReservation<'a>,
+    size: TerminalSize,
+}
+
+impl PreparedScreenResize for ScreenResize<'_> {
+    fn commit(self: Box<Self>) {
+        self.term.resize_to(self.size);
+        self.reservation.commit();
+    }
+}
+
 impl SessionScreen for PtyScreen {
     fn absorb(&mut self, bytes: &[u8]) {
         self.term.feed(bytes);
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.resize(cols, rows);
+    fn prepare_resize(
+        &mut self,
+        size: TerminalSize,
+    ) -> Result<Box<dyn PreparedScreenResize + '_>, ScreenPreparationError> {
+        let reservation = self
+            .lease
+            .prepare(size)
+            .map_err(ScreenPreparationError::ResourceLimit)?;
+        Ok(Box::new(ScreenResize {
+            term: &mut self.term,
+            reservation,
+            size,
+        }))
     }
 
     /// The model's replay (`TerminalCore::replay`): the client's emulator,
@@ -61,13 +105,31 @@ impl SessionScreen for PtyScreen {
     fn repaint(&mut self) -> Vec<u8> {
         self.term
             .replay()
-            .expect("the model is made to replay (`PtyScreen::new`)")
+            .expect("the model is made to replay (`PtyScreen::try_new`)")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen(cols: u16, rows: u16) -> PtyScreen {
+        PtyScreen::try_new(
+            TerminalSize::new(cols, rows).unwrap(),
+            1,
+            Arc::new(ScreenBudget::new(
+                crate::screen_budget::BudgetLimits::default(),
+            )),
+        )
+        .unwrap()
+    }
+
+    fn resize(screen: &mut PtyScreen, cols: u16, rows: u16) {
+        screen
+            .prepare_resize(TerminalSize::new(cols, rows).unwrap())
+            .unwrap()
+            .commit();
+    }
 
     /// Cell equality for the round trip: every field. The replay makes a
     /// wide character's placeholder at the end of a row the way the model
@@ -127,7 +189,7 @@ mod tests {
     /// the same. This is the property the repaint mechanism rests on:
     /// whatever the shell did during the gap, the repaint reconstructs it.
     fn round_trip(case: &str, cols: u16, rows: u16, script: &[&[u8]]) {
-        let mut screen = PtyScreen::new(cols, rows);
+        let mut screen = screen(cols, rows);
         for chunk in script {
             screen.absorb(chunk);
         }
@@ -135,6 +197,43 @@ mod tests {
         let mut client = terminal::TerminalCore::new(cols, rows);
         client.feed(&repaint);
         assert_frames_match(&screen.frame(), &client.frame(), case);
+    }
+
+    #[test]
+    fn zero_history_does_not_restore_scrolled_content_after_growth() {
+        let mut screen = screen(8, 2);
+        screen.absorb(b"LOST\r\nkept\r\nlast");
+        resize(&mut screen, 8, 4);
+        assert!((0..screen.frame().rows).all(|r| row_text(&screen.frame(), r) != "LOST"));
+        let mut client = TerminalCore::new(8, 4);
+        client.feed(&screen.repaint());
+        assert_frames_match(&screen.frame(), &client.frame(), "zero history growth");
+    }
+
+    #[test]
+    fn screen_budget_model_resize_cancellation_preserves_frame_and_credits() {
+        let budget = Arc::new(ScreenBudget::new(
+            crate::screen_budget::BudgetLimits::default(),
+        ));
+        let mut screen =
+            PtyScreen::try_new(TerminalSize::new(2, 1).unwrap(), 1, budget.clone()).unwrap();
+        screen.absorb(b"ok");
+        let before = budget.used();
+        let frame = screen.frame();
+        drop(
+            screen
+                .prepare_resize(TerminalSize::new(2, 2).unwrap())
+                .unwrap(),
+        );
+        assert_eq!(budget.used(), before);
+        assert_frames_match(&frame, &screen.frame(), "cancel resize");
+        screen
+            .prepare_resize(TerminalSize::new(2, 2).unwrap())
+            .unwrap()
+            .commit();
+        assert_eq!((screen.frame().cols, screen.frame().rows), (2, 2));
+        drop(screen);
+        assert_eq!(budget.used(), crate::screen_budget::Usage::default());
     }
 
     #[test]
@@ -204,7 +303,7 @@ mod tests {
     /// the prediction, not the screen.
     #[test]
     fn a_repaint_overwrites_a_stale_screen() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[2J\x1b[HFRESH");
         let repaint = screen.repaint();
 
@@ -219,7 +318,7 @@ mod tests {
     /// leave the same screen, not double anything up.
     #[test]
     fn repainting_twice_is_stable() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"one\r\ntwo\r\nthree");
         let mut client = terminal::TerminalCore::new(40, 10);
         client.feed(&screen.repaint());
@@ -233,8 +332,8 @@ mod tests {
     /// trip just like any other.
     #[test]
     fn the_model_follows_a_resize() {
-        let mut screen = PtyScreen::new(40, 10);
-        screen.resize(100, 30);
+        let mut screen = screen(40, 10);
+        resize(&mut screen, 100, 30);
         screen.absorb(b"wide after the resize");
         let frame = screen.frame();
         assert_eq!((frame.cols, frame.rows), (100, 30));
@@ -247,14 +346,14 @@ mod tests {
 
     /// Content laid out at the OLD geometry and then reflowed by the resize
     /// -- the path `the_model_follows_a_resize` above never takes, because
-    /// it resizes an EMPTY screen and only then writes. Shrinking pushes
-    /// rows into history, growing pulls them back, and a wide character or
+    /// it resizes an EMPTY screen and only then writes. Zero-history shrinking drops
+    /// scrolled-out rows permanently; and a wide character or
     /// a raw `\t` cell can land anywhere in the reflowed grid; the round
     /// trip has to survive all of that, in both directions and in each
     /// dimension separately.
     #[test]
     fn content_laid_out_before_a_resize_still_round_trips() {
-        // Newlines (so the screen scrolls and history fills up), tabs (the
+        // Newlines (so the zero-history screen scrolls), tabs (the
         // `\t` cell `repaint` recovers by hand), wide characters and color.
         let mut script = Vec::new();
         for i in 1..=14 {
@@ -265,9 +364,9 @@ mod tests {
         script.extend_from_slice(b"\x1b[31mtail with no newline\x1b[0m");
 
         for (cols, rows) in [(100u16, 30u16), (20, 5), (40, 30), (100, 6), (40, 10)] {
-            let mut screen = PtyScreen::new(40, 10);
+            let mut screen = screen(40, 10);
             screen.absorb(&script);
-            screen.resize(cols, rows);
+            resize(&mut screen, cols, rows);
 
             let mut client = terminal::TerminalCore::new(cols, rows);
             client.feed(&screen.repaint());
@@ -296,7 +395,7 @@ mod tests {
     /// model has been told the new size, the same round trip is exact again.
     #[test]
     fn a_repaint_at_the_wrong_geometry_loses_rows_and_a_resized_one_does_not() {
-        let mut screen = PtyScreen::new(80, 24);
+        let mut screen = screen(80, 24);
         let mut script = Vec::new();
         for line in 1..=24u16 {
             script.extend_from_slice(format!("\x1b[{line};1Hline-{line}").as_bytes());
@@ -322,7 +421,7 @@ mod tests {
         }
 
         // ...and once the model follows the size, the client is exact again.
-        screen.resize(60, 20);
+        resize(&mut screen, 60, 20);
         let mut small = terminal::TerminalCore::new(60, 20);
         small.feed(&screen.repaint());
         assert_frames_match(&screen.frame(), &small.frame(), "repaint after the resize");
@@ -402,7 +501,7 @@ mod tests {
     /// screen.
     #[test]
     fn a_repaint_pulls_the_client_out_of_the_alternate_screen() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[2J\x1b[Hshell prompt");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -416,7 +515,7 @@ mod tests {
     /// the app started during the gap.
     #[test]
     fn a_repaint_pushes_the_client_into_the_alternate_screen() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[?1049h\x1b[2J\x1b[Hinside the app");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -432,7 +531,7 @@ mod tests {
     /// the client's saved shell screen.
     #[test]
     fn a_repaint_of_the_alternate_screen_onto_the_alternate_screen_is_stable() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[2J\x1b[Hshell\x1b[?1049h\x1b[2J\x1b[Happ");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -460,7 +559,7 @@ mod tests {
     /// the comment on `ORIGIN_ON`).
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_before_placing_the_cursor() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -488,7 +587,7 @@ mod tests {
     /// of reasoning about which combinations matter.
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_on_the_alternate_screen() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -508,7 +607,7 @@ mod tests {
     /// stale region in the same repaint.
     #[test]
     fn a_repaint_resets_a_stale_scroll_region_while_leaving_the_alternate_screen() {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(b"\x1b[3;8r\x1b[?6h\x1b[2;3Hinside");
 
         let mut client = terminal::TerminalCore::new(40, 10);
@@ -543,7 +642,7 @@ mod tests {
     #[test]
     fn a_repaint_after_output_cut_inside_an_escape_sequence_restores_the_screen() {
         let seen: &[u8] = b"\x1b[2J\x1b[Hbefore the gate closed\x1b[3";
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(seen);
         screen.absorb(b"1mdropped while the gate was closed\x1b[0m");
         let repaint = screen.repaint();
@@ -559,7 +658,7 @@ mod tests {
     #[test]
     fn a_repaint_after_output_cut_inside_a_utf8_character_restores_the_screen() {
         let seen: &[u8] = b"\x1b[2J\x1b[Hprice: \xE2\x82";
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(seen);
         screen.absorb(b"\xAC and more");
         let repaint = screen.repaint();
@@ -574,7 +673,7 @@ mod tests {
     /// screens, the cursor, the pen, the region, the character sets or the
     /// modes (`TerminalCore::snapshot`).
     fn live_after_repaint(case: &str, seen: &[u8], dropped: &[u8], live: &[u8]) {
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(seen);
         screen.absorb(dropped);
         let mut client = terminal::TerminalCore::with_replay(40, 10);
@@ -637,7 +736,7 @@ mod tests {
         let lines: Vec<u8> = (0..30)
             .flat_map(|i| format!("line {i}\r\n").into_bytes())
             .collect();
-        let mut screen = PtyScreen::new(40, 10);
+        let mut screen = screen(40, 10);
         screen.absorb(&lines);
         screen.absorb(b"dropped\r\n");
         let mut client = terminal::TerminalCore::new(40, 10);

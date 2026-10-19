@@ -365,6 +365,7 @@ fn a_session_moves_to_a_live_road_when_its_own_goes_away() {
     let client = StdClient::connect(
         relay.front,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -464,6 +465,7 @@ fn a_session_moved_by_hand_stays_on_the_chosen_road_and_the_daemon_follows() {
     let client = StdClient::connect(
         relay.front,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,

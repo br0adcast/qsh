@@ -30,24 +30,31 @@ use transport::session_manager::{LoginId, SessionBackend, SessionIo};
 use transport::shell_server::{NoScreen, SessionScreen};
 
 use crate::pty;
+use crate::screen_budget::ScreenBudget;
+use terminal_size::TerminalSize;
 
 /// Opens a channel by spawning a pseudo-terminal through `portable-pty`.
-pub struct PtyChannelSpawner;
+pub struct PtyChannelSpawner {
+    budget: Arc<ScreenBudget>,
+}
+
+impl PtyChannelSpawner {
+    pub fn new(budget: Arc<ScreenBudget>) -> Self {
+        Self { budget }
+    }
+}
 
 impl ChannelSpawner for PtyChannelSpawner {
-    /// `_owner` is ignored on purpose: this spawner belongs to the personal
-    /// mode, where everything -- the daemon, and every channel it opens --
-    /// runs as the one account that started it. There is no other account a
-    /// channel could be opened for, so there is nothing to select.
+    /// Owner uid keys the shared screen budget, including aliases.
     ///
-    /// `_login` is ignored too: the personal mode has exactly one login, for
+    /// `_login` is ignored: the personal mode has exactly one login, for
     /// the process's whole life, and opens no PAM session for it -- that
     /// machinery belongs to the system mode's spawner
     /// (`helper::spawner::HelperChannelSpawner`), where several logins share
     /// one daemon.
     fn spawn(
         &self,
-        _owner: &Principal,
+        owner: &Principal,
         _login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
@@ -55,6 +62,8 @@ impl ChannelSpawner for PtyChannelSpawner {
         if req.cols == 0 || req.rows == 0 {
             return Err("a channel without a terminal is not supported yet".to_string());
         }
+        TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))?;
         let size = PtySize {
             rows: req.rows,
             cols: req.cols,
@@ -92,7 +101,7 @@ impl ChannelSpawner for PtyChannelSpawner {
             reader,
             writer,
             resize: Box::new(pty::PtyResizeHandle::new(master)),
-            screen: make_screen(req),
+            screen,
             wait: Box::new(ChildWait(child)),
         })
     }
@@ -182,11 +191,18 @@ impl ChannelWait for ChildWait {
 /// `pub(crate)`: the system mode's worker (`helper::spawner`) builds a
 /// screen model the same way, off the same request, so a channel looks the
 /// same to a reattaching client whichever mode opened it.
-pub(crate) fn make_screen(req: &OpenRequest) -> Box<dyn SessionScreen> {
+pub(crate) fn make_screen(
+    req: &OpenRequest,
+    owner: &Principal,
+    budget: Arc<ScreenBudget>,
+) -> Result<Box<dyn SessionScreen>, String> {
     if req.screen {
-        Box::new(crate::screen::PtyScreen::new(req.cols, req.rows))
+        let size = TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
+        Ok(Box::new(crate::screen::PtyScreen::try_new(
+            size, owner.uid, budget,
+        )?))
     } else {
-        Box::new(NoScreen)
+        Ok(Box::new(NoScreen))
     }
 }
 
@@ -205,9 +221,9 @@ pub struct ChannelSessionBackend {
 
 impl ChannelSessionBackend {
     /// The personal mode: this process opens its own pseudo-terminals.
-    pub fn new() -> ChannelSessionBackend {
+    pub fn new(budget: Arc<ScreenBudget>) -> ChannelSessionBackend {
         ChannelSessionBackend {
-            spawner: Arc::new(PtyChannelSpawner),
+            spawner: Arc::new(PtyChannelSpawner::new(budget)),
             daemon: None,
         }
     }
@@ -227,13 +243,11 @@ impl ChannelSessionBackend {
     }
 }
 
-impl Default for ChannelSessionBackend {
-    fn default() -> ChannelSessionBackend {
-        ChannelSessionBackend::new()
-    }
-}
-
 impl SessionBackend for ChannelSessionBackend {
+    fn required_features(&self) -> transport::Features {
+        transport::Features::CHANNEL_GEOMETRY
+    }
+
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         // Logged here once per session; the runner hands the same principal
         // to the spawner with every channel it asks for, and the system
@@ -264,6 +278,14 @@ impl SessionBackend for ChannelSessionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn budget() -> Arc<ScreenBudget> {
+        Arc::new(ScreenBudget::new(
+            crate::screen_budget::BudgetLimits::default(),
+        ))
+    }
+    fn spawner() -> PtyChannelSpawner {
+        PtyChannelSpawner::new(budget())
+    }
     use crate::test_support::suppress_shell_history;
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -328,8 +350,7 @@ mod tests {
         }
     }
 
-    /// Whose session asks: ignored by `PtyChannelSpawner` (see its `spawn`),
-    /// so any principal will do.
+    /// Whose session asks: its uid owns the screen reservation.
     fn owner() -> Principal {
         Principal {
             uid: nix::unistd::Uid::current().as_raw(),
@@ -356,13 +377,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn screen_budget_no_screen_and_failed_spawn_release_all_credits() {
+        let budget = budget();
+        let spawner = PtyChannelSpawner::new(budget.clone());
+        let mut req = request(ChannelKind::Command, 2, 1, b"'");
+        assert!(!make_screen(&req, &owner(), budget.clone())
+            .unwrap()
+            .has_screen());
+        assert_eq!(budget.used(), crate::screen_budget::Usage::default());
+        req.screen = true;
+        assert!(spawner.spawn(&owner(), login(), &req, None).is_err());
+        assert_eq!(
+            budget.used(),
+            crate::screen_budget::Usage::default(),
+            "command parsing after admission failed"
+        );
+    }
+
+    #[test]
+    fn screen_budget_separate_spawners_and_uid_aliases_share_model_limits_before_spawn() {
+        let budget = Arc::new(ScreenBudget::new(crate::screen_budget::BudgetLimits {
+            owner_models: 1,
+            global_models: 2,
+            ..crate::screen_budget::BudgetLimits::default()
+        }));
+        let mut req = request(ChannelKind::Command, 2, 1, b"'");
+        req.screen = true;
+        let a = make_screen(&req, &owner(), budget.clone()).unwrap();
+        let mut alias = owner();
+        alias.name = "same-uid-alias".into();
+        alias.identity = "other-key".into();
+        let first = PtyChannelSpawner::new(budget.clone());
+        let second = PtyChannelSpawner::new(budget.clone());
+        for spawner in [&first, &second] {
+            let reason = spawner.spawn(&alias, login(), &req, None).err().unwrap();
+            assert!(
+                reason.contains("owner terminal screen budget"),
+                "refuse before command parsing / child: {reason}"
+            );
+        }
+        alias.uid = alias.uid.wrapping_add(1);
+        let b = make_screen(&req, &alias, budget.clone()).unwrap();
+        alias.uid = alias.uid.wrapping_add(1);
+        let reason = second.spawn(&alias, login(), &req, None).err().unwrap();
+        assert!(reason.contains("global terminal screen budget"));
+        drop((a, b));
+        assert_eq!(budget.used(), crate::screen_budget::Usage::default());
+    }
+
     /// A shell channel opens `$SHELL` at the size asked for, not at the
     /// pseudo-terminal default. Opening at 80x24 and resizing a moment later
     /// is what makes tmux reflow a pane and leave a blank line behind.
     #[test]
     fn a_shell_channel_opens_at_the_size_requested() {
         suppress_shell_history();
-        let mut ch = PtyChannelSpawner
+        let mut ch = spawner()
             .spawn(
                 &owner(),
                 login(),
@@ -392,7 +462,7 @@ mod tests {
     #[test]
     fn a_command_channel_runs_the_command() {
         suppress_shell_history();
-        let mut ch = PtyChannelSpawner
+        let mut ch = spawner()
             .spawn(
                 &owner(),
                 login(),
@@ -416,7 +486,7 @@ mod tests {
         let window = crate::update::exec_window_for_test();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let ch = PtyChannelSpawner.spawn(
+            let ch = spawner().spawn(
                 &owner(),
                 login(),
                 &request(ChannelKind::Command, 80, 24, b"sh -c 'echo ready-$((6*7))'"),
@@ -445,7 +515,7 @@ mod tests {
     #[test]
     fn the_announced_terminal_type_becomes_the_childs_term() {
         suppress_shell_history();
-        let mut ch = PtyChannelSpawner
+        let mut ch = spawner()
             .spawn(
                 &owner(),
                 login(),
@@ -467,7 +537,7 @@ mod tests {
     #[test]
     fn a_client_that_announced_nothing_gets_the_default_term() {
         suppress_shell_history();
-        let mut ch = PtyChannelSpawner
+        let mut ch = spawner()
             .spawn(
                 &owner(),
                 login(),
@@ -492,7 +562,7 @@ mod tests {
         // friends) that implement neither `Debug` nor `Clone`, so
         // `Result::expect_err` -- which needs the `Ok` side to be `Debug` for
         // its panic message -- cannot be used here; match instead.
-        let err = match PtyChannelSpawner.spawn(
+        let err = match spawner().spawn(
             &owner(),
             login(),
             &request(ChannelKind::Shell, 0, 0, b""),
@@ -570,7 +640,7 @@ mod tests {
     fn the_channel_backend_reports_what_it_takes() {
         use transport::session_manager::SessionBackend;
         assert_eq!(
-            ChannelSessionBackend::new().consumption(),
+            ChannelSessionBackend::new(budget()).consumption(),
             transport::conn::Consumption::Explicit
         );
     }

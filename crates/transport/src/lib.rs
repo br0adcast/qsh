@@ -2,8 +2,10 @@
 
 pub mod auth;
 pub mod channel;
+pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]
 pub mod channel_server;
+pub mod channel_timeline;
 mod congestion;
 pub mod conn;
 pub mod cookie;

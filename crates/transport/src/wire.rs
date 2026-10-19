@@ -35,7 +35,7 @@ pub enum Kind {
 }
 
 /// Wire format version, fixed for the whole project.
-pub const VERSION: u8 = 0x01;
+pub const VERSION: u8 = 0x02;
 
 /// Length of the transport datagram header: version(1) + kind(1) +
 /// session_id(8) + counter(8). The associated data of the AEAD when
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn transport_roundtrip_header() {
         let dg = encode_transport(&transport_header(0xABCD, 5), &[9, 9, 9]);
-        assert_eq!(dg[0], 0x01); // version
+        assert_eq!(dg[0], 0x02); // protocol 2
         assert_eq!(dg[1], 0x02); // kind=Transport
         match parse(&dg).unwrap() {
             Frame::Transport {

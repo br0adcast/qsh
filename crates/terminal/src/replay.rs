@@ -447,6 +447,12 @@ fn reprint_last_column(
     for &z in zerowidth {
         out.print(z);
     }
+    if zerowidth.len() == 16 && last_input.is_some_and(|p| p.width() == Some(0)) {
+        // The capped handler records this character for REP but drops its
+        // addition to the already full target. Pending wrap remains intact.
+        out.print(last_input.unwrap());
+        return true;
+    }
     as_last || (last_input.is_some() && zerowidth.last().copied() == last_input)
 }
 
@@ -498,6 +504,31 @@ fn set_last_printed(out: &mut Out, grid: &Grid<AlacrittyCell>, p: char) {
     let cols = grid.columns();
     // As `Term::input` measures it.
     let w = UnicodeWidthChar::width(p).unwrap_or(0);
+    if p.width() == Some(0) {
+        for row in 0..rows {
+            for col in 0..cols {
+                let cell = &grid[Line(row as i32)][Column(col)];
+                if cell.zerowidth().is_some_and(|z| z.len() == 16) {
+                    // At column zero, zero-width input targets column zero;
+                    // otherwise place immediately after the target.
+                    out.cup(row, (col + 1).min(cols - 1));
+                    if col == cols - 1 {
+                        // A wide input refused at the last column with wrap
+                        // disabled sets pending wrap without rewriting the
+                        // cell (or clearing its WRAPLINE flag). This makes
+                        // zero-width input target this column. modes() below
+                        // restores the model's wrap setting.
+                        out.push(b"\x1b[?7l");
+                        out.print('界');
+                        out.print(p);
+                    } else {
+                        out.print(p);
+                    }
+                    return;
+                }
+            }
+        }
+    }
     if w > 0 {
         for row in 0..rows {
             let cells = &grid[Line(row as i32)];

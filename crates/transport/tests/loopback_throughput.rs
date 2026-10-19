@@ -87,6 +87,7 @@ fn start_echo_server() -> (SocketAddr, [u8; 32], [u8; 32]) {
         .expect("non-blocking for tokio");
     let addr = socket.local_addr().expect("its address");
     let cfg = ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Server,
         local_static_priv: server_kp.private,
@@ -112,6 +113,7 @@ fn one_run(mib: usize) -> Duration {
     let client = StdClient::connect(
         addr,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,

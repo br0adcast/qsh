@@ -11,12 +11,76 @@ use transport::channel::{
     ChannelKind, OpenRequest, ServerRecord, FIRST_CHANNEL_STREAM, MAX_COMMAND_LEN,
 };
 
+#[path = "channel_ordered.rs"]
+mod ordered;
+pub use ordered::{
+    AttachmentIntent, ChannelProtocolError, ResizeDisposition, ResizeRejection, ResizeSemantics,
+};
+use transport::channel_geometry::{
+    ChannelInstance, GeometryRecord, OutputGapCause, ResizeRefusal, ResizeRequestId,
+};
+
 /// A channel's identity, which is also the transport stream it uses.
 pub type ChannelId = u8;
+
+/// Capacity available to one not-yet-decoded record. Reservations in other
+/// streams and decoded early events have already been subtracted by the owner.
+#[derive(Clone, Copy)]
+pub struct InputLimits {
+    pub payload: usize,
+    pub bytes: usize,
+    pub events: usize,
+}
+impl InputLimits {
+    pub const UNLIMITED: Self = Self {
+        payload: usize::MAX,
+        bytes: usize::MAX,
+        events: usize::MAX,
+    };
+}
+#[derive(Clone, Copy, Default)]
+pub struct InputUsage {
+    pub bytes: usize,
+    pub events: usize,
+}
 
 /// What the session needs from whatever carries the bytes. Implemented for
 /// qsh in `crate::qsh` and for SSH in the SSH library.
 pub trait ChannelSubstrate: Send {
+    fn input_usage(&self, _ch: ChannelId) -> InputUsage {
+        InputUsage::default()
+    }
+    /// Ordered substrates decode at most one envelope, so owner admission runs
+    /// before allocating the next record. Unframed substrates use one delivery.
+    fn on_bytes_step(
+        &mut self,
+        stream: u8,
+        bytes: &[u8],
+        _limits: InputLimits,
+    ) -> (usize, Vec<SubstrateEvent>) {
+        (bytes.len(), self.on_bytes(stream, bytes))
+    }
+    fn resize_semantics(&self) -> ResizeSemantics {
+        ResizeSemantics::Unconfirmed
+    }
+    fn resize_correlated(
+        &mut self,
+        _ch: ChannelId,
+        _instance: ChannelInstance,
+        _id: ResizeRequestId,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), ChannelProtocolError> {
+        Err(ChannelProtocolError::UnsupportedProfile)
+    }
+    /// The owner retires framing only after its final ordered output is released.
+    fn retire_channel(&mut self, _ch: ChannelId) {}
+    fn has_partial_input(&self, _ch: ChannelId) -> bool {
+        false
+    }
+    fn reset_attachment(&mut self) {}
+    fn protocol_failed(&mut self, _error: ChannelProtocolError) {}
+
     fn open(&mut self, req: &OpenRequest);
     /// Tell the far side what terminal this client's emulator is, for every
     /// channel opened after this. SSH carries the same fact in `pty-req`;
@@ -46,6 +110,17 @@ pub trait ChannelSubstrate: Send {
 /// it, which is exactly why prediction cannot run there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubstrateEvent {
+    Geometry {
+        ch: ChannelId,
+        record: GeometryRecord,
+    },
+    OutputGap {
+        ch: ChannelId,
+        instance: ChannelInstance,
+        cause: OutputGapCause,
+    },
+    Snapshot(transport::channel::ChannelSnapshot),
+    ProtocolFailure(ChannelProtocolError),
     Opened(ChannelId),
     Refused {
         ch: ChannelId,
@@ -80,6 +155,23 @@ pub enum SubstrateEvent {
 /// What the session tells its owner after taking an event in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
+    Geometry {
+        ch: ChannelId,
+        record: GeometryRecord,
+    },
+    ResizeRefused {
+        ch: ChannelId,
+        request_id: ResizeRequestId,
+        requested: terminal_size::TerminalSize,
+        reason: ResizeRefusal,
+    },
+    DrainingReady(ChannelId),
+    OutputContinuityLost {
+        ch: ChannelId,
+        instance: ChannelInstance,
+        cause: OutputGapCause,
+    },
+    ProtocolFailure(ChannelProtocolError),
     Ready(ChannelId),
     Refused {
         ch: ChannelId,
@@ -118,7 +210,8 @@ pub enum SessionEvent {
     /// running" is an answer, and a client that waits for its channels to be
     /// announced would otherwise wait forever for it.
     Announced {
-        live: Vec<ChannelId>,
+        active: Vec<ChannelId>,
+        draining: Vec<ChannelId>,
     },
     /// The daemon talking about itself -- see [`SubstrateEvent::Daemon`].
     Daemon(ServerRecord),
@@ -163,13 +256,21 @@ enum ChannelState {
 pub struct ChannelSession<S: ChannelSubstrate> {
     substrate: S,
     channels: HashMap<ChannelId, ChannelState>,
+    ordered: Option<ordered::OrderedSession>,
+    failure: Option<ChannelProtocolError>,
+    admission_started: bool,
 }
 
 impl<S: ChannelSubstrate> ChannelSession<S> {
     pub fn new(substrate: S) -> Self {
+        let ordered = (substrate.resize_semantics() == ResizeSemantics::ConfirmedOrdered)
+            .then(ordered::OrderedSession::default);
         ChannelSession {
             substrate,
             channels: HashMap::new(),
+            ordered,
+            failure: None,
+            admission_started: false,
         }
     }
 
@@ -225,10 +326,22 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         cols: u16,
         rows: u16,
     ) -> Option<ChannelId> {
-        if command.len() > MAX_COMMAND_LEN {
+        self.admission_started = true;
+        if self.failure.is_some() || command.len() > MAX_COMMAND_LEN {
             return None;
         }
-        let ch = self.free_stream()?;
+        // Zero OPEN dimensions retain their no-PTY meaning. Nonzero local
+        // dimensions use the same adapter as the shell model.
+        let (cols, rows) = if cols != 0 && rows != 0 {
+            let size = terminal_size::TerminalSize::for_viewport(cols, rows);
+            (size.cols(), size.rows())
+        } else {
+            (cols, rows)
+        };
+        let ch = self
+            .ordered
+            .as_ref()
+            .map_or_else(|| self.free_stream(), |state| state.free_stream())?;
         let req = OpenRequest {
             stream: ch,
             kind,
@@ -238,6 +351,10 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
             command,
         };
         self.substrate.open(&req);
+        if let Some(state) = &mut self.ordered {
+            state.open(req);
+            return Some(ch);
+        }
         self.channels.insert(
             ch,
             ChannelState::Opening {
@@ -275,6 +392,12 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
 
     /// Whether the far side has confirmed this channel.
     pub fn is_ready(&self, ch: ChannelId) -> bool {
+        if let Some(state) = &self.ordered {
+            return state.is_ready(ch);
+        }
+        if self.failure.is_some() {
+            return false;
+        }
         matches!(self.channels.get(&ch), Some(ChannelState::Ready(_)))
     }
 
@@ -288,13 +411,38 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         }
     }
 
-    /// A no-op unless `ch` is `Ready`, for the same reason as [`Self::send`].
-    pub fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) {
+    /// Update physical intent without making it eligible for a wire request.
+    /// Ordered channels also accept this before metadata/initial readiness;
+    /// unconfirmed substrates reject it without sending anything.
+    pub fn defer_resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
+        self.ordered.as_mut().map_or(
+            ResizeDisposition::Rejected(ResizeRejection::NotReady),
+            |state| state.defer_resize(ch, cols, rows),
+        )
+    }
+
+    pub fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
+        if let Some(state) = &mut self.ordered {
+            return state.resize(&mut self.substrate, ch, cols, rows);
+        }
+        if self.failure.is_some() {
+            return ResizeDisposition::Rejected(ResizeRejection::Failed);
+        }
+        if cols == 0 || rows == 0 {
+            return ResizeDisposition::Rejected(ResizeRejection::ZeroViewport);
+        }
         if let Some(ChannelState::Ready(req)) = self.channels.get_mut(&ch) {
+            if req.cols == 0 || req.rows == 0 {
+                return ResizeDisposition::Rejected(ResizeRejection::NoPty);
+            }
+            let size = terminal_size::TerminalSize::for_viewport(cols, rows);
+            let (cols, rows) = (size.cols(), size.rows());
             req.cols = cols;
             req.rows = rows;
             self.substrate.resize(ch, cols, rows);
+            return ResizeDisposition::Sent;
         }
+        ResizeDisposition::Rejected(ResizeRejection::NotReady)
     }
 
     /// A no-op unless `ch` is `Ready`, for the same reason as [`Self::send`].
@@ -303,6 +451,10 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// before it is confirmed is simply ignored rather than left to race
     /// with a later `Opened`.
     pub fn close(&mut self, ch: ChannelId) {
+        if let Some(state) = &mut self.ordered {
+            state.close(&mut self.substrate, ch);
+            return;
+        }
         if self.is_ready(ch) {
             self.substrate.close(ch);
             self.channels.insert(ch, ChannelState::Gone);
@@ -313,6 +465,27 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// this session. The session owns the substrate, so a caller needs no
     /// second instance of it.
     pub fn on_bytes(&mut self, stream: u8, bytes: &[u8]) -> Vec<SessionEvent> {
+        self.admission_started |= !bytes.is_empty();
+        if let Some(state) = &mut self.ordered {
+            if state.ignore_input(stream) {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let limits = state.input_limits(&self.substrate, stream);
+                let (used, events) = self.substrate.on_bytes_step(stream, remaining, limits);
+                for event in events {
+                    out.extend(state.on_event(&mut self.substrate, event));
+                }
+                if used == 0 {
+                    break;
+                }
+                remaining = &remaining[used..];
+            }
+            out.extend(state.finish_exits(&mut self.substrate));
+            return out;
+        }
         let events = self.substrate.on_bytes(stream, bytes);
         events.into_iter().flat_map(|e| self.on_event(e)).collect()
     }
@@ -324,10 +497,65 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// concrete type's whole surface.
     pub fn reset_stream(&mut self, ch: ChannelId) {
         self.substrate.reset_stream(ch);
+        if let Some(state) = &mut self.ordered {
+            state.reset_stream(ch);
+        }
     }
 
-    /// The substrate itself, for what the seam does not cover: forgetting a
-    /// whole link's half-read state when the session moves to a new one.
+    /// True after a disclosed output gap, including after real process Exit.
+    pub fn continuity_lost(&self, ch: ChannelId) -> bool {
+        self.ordered
+            .as_ref()
+            .is_some_and(|state| state.continuity_lost(ch))
+    }
+    pub fn committed_geometry(&self, ch: ChannelId) -> Option<GeometryRecord> {
+        self.ordered.as_ref().and_then(|state| state.committed(ch))
+    }
+    /// Consume this attachment and retain only same-instance user intent.
+    /// Pending IDs, lifecycle authority and framing never cross this boundary.
+    pub fn into_attachment_intent(self) -> AttachmentIntent {
+        self.ordered
+            .map_or_else(AttachmentIntent::default, |state| state.into_intent())
+    }
+    /// Import portable intent before any local OPEN or received metadata.
+    pub fn import_attachment_intent(
+        &mut self,
+        intent: AttachmentIntent,
+    ) -> Result<(), ChannelProtocolError> {
+        if self.admission_started {
+            return Err(ChannelProtocolError::Metadata);
+        }
+        let Some(state) = &mut self.ordered else {
+            return Err(ChannelProtocolError::UnsupportedProfile);
+        };
+        state.import_intent(intent);
+        self.admission_started = true;
+        Ok(())
+    }
+
+    /// Start a fresh attachment; wire metadata must re-establish each instance.
+    pub fn with_attachment_intent(substrate: S, intent: AttachmentIntent) -> Self {
+        let mut session = Self::new(substrate);
+        if let Some(state) = &mut session.ordered {
+            state.import_intent(intent);
+            session.admission_started = true;
+        }
+        session
+    }
+    /// Start a new attachment on this substrate, retaining only portable intent.
+    /// Hot per-stream reset is separate and preserves current pending IDs.
+    pub fn reset_attachment(&mut self) {
+        self.substrate.reset_attachment();
+        if let Some(state) = &mut self.ordered {
+            state.reset_attachment();
+        }
+        self.failure = None;
+        self.admission_started = false;
+    }
+
+    /// Access for substrate-specific operations. Attachment transitions must
+    /// use reset_attachment or transfer AttachmentIntent into a new session;
+    /// clearing framing alone would leave stale resize correlation alive.
     pub fn substrate_mut(&mut self) -> &mut S {
         &mut self.substrate
     }
@@ -350,12 +578,9 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         }
     }
 
-    /// Appends `event` to a still-`Opening` channel's buffer, unless doing
-    /// so would push its combined buffered output payload past
-    /// [`MAX_BUFFERED_BEFORE_READY`] -- in which case `event` is dropped in
-    /// silence, the same way [`Self::send`]/[`Self::resize`]/[`Self::close`]
-    /// already drop a call this session cannot yet act on.
-    fn buffer_before_ready(&mut self, ch: ChannelId, event: SessionEvent) {
+    /// Early payload and event wrappers share explicit limits. A failed
+    /// attachment cannot later publish Ready or a truncated successful prefix.
+    fn buffer_before_ready(&mut self, ch: ChannelId, mut event: SessionEvent) -> Vec<SessionEvent> {
         if let Some(ChannelState::Opening {
             buffered,
             buffered_bytes,
@@ -368,17 +593,49 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                 }
                 _ => 0,
             };
-            if *buffered_bytes + event_bytes > MAX_BUFFERED_BEFORE_READY {
-                return;
+            if event_bytes > MAX_BUFFERED_BEFORE_READY.saturating_sub(*buffered_bytes)
+                || buffered.len() >= ordered::EARLY_EVENTS
+            {
+                return self.fail_unconfirmed(ChannelProtocolError::EarlyOutputOverflow);
+            }
+            if let SessionEvent::Data { bytes, .. } | SessionEvent::ExtendedData { bytes, .. } =
+                &mut event
+            {
+                *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
             }
             *buffered_bytes += event_bytes;
             buffered.push(event);
         }
+        Vec::new()
+    }
+    fn fail_unconfirmed(&mut self, error: ChannelProtocolError) -> Vec<SessionEvent> {
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        self.failure = Some(error);
+        self.channels.clear();
+        self.substrate.protocol_failed(error);
+        vec![SessionEvent::ProtocolFailure(error)]
     }
 
     /// Takes an event from the substrate and says what it means.
     pub fn on_event(&mut self, event: SubstrateEvent) -> Vec<SessionEvent> {
+        self.admission_started = true;
+        if let Some(state) = &mut self.ordered {
+            let mut out = state.on_event(&mut self.substrate, event);
+            out.extend(state.finish_exits(&mut self.substrate));
+            return out;
+        }
+        if self.failure.is_some() {
+            return Vec::new();
+        }
         match event {
+            SubstrateEvent::Geometry { .. }
+            | SubstrateEvent::OutputGap { .. }
+            | SubstrateEvent::Snapshot(_) => {
+                self.fail_unconfirmed(ChannelProtocolError::UnsupportedProfile)
+            }
+            SubstrateEvent::ProtocolFailure(error) => self.fail_unconfirmed(error),
             SubstrateEvent::Opened(ch) => {
                 // `get_mut` never removes the entry, so a stale or duplicate
                 // `Opened` for a channel that is not `Opening` (already
@@ -416,8 +673,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                     // Not ready yet: buffer it if `ch` is still `Opening`
                     // (a no-op for `Gone` or an unknown stream, same as
                     // every other call this session cannot yet act on).
-                    self.buffer_before_ready(ch, SessionEvent::Data { ch, bytes });
-                    Vec::new()
+                    self.buffer_before_ready(ch, SessionEvent::Data { ch, bytes })
                 }
             }
             SubstrateEvent::ExtendedData {
@@ -433,16 +689,14 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                 if self.is_ready(ch) {
                     vec![event]
                 } else {
-                    self.buffer_before_ready(ch, event);
-                    Vec::new()
+                    self.buffer_before_ready(ch, event)
                 }
             }
             SubstrateEvent::InputConsumed { ch, offset } => {
                 if self.is_ready(ch) {
                     vec![SessionEvent::InputConsumed { ch, offset }]
                 } else {
-                    self.buffer_before_ready(ch, SessionEvent::InputConsumed { ch, offset });
-                    Vec::new()
+                    self.buffer_before_ready(ch, SessionEvent::InputConsumed { ch, offset })
                 }
             }
             SubstrateEvent::Exit { ch, code } => {
@@ -464,7 +718,8 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                     })
                     .collect();
                 let mut events: Vec<SessionEvent> = vec![SessionEvent::Announced {
-                    live: {
+                    draining: Vec::new(),
+                    active: {
                         let mut live: Vec<ChannelId> = announced.iter().copied().collect();
                         live.sort_unstable();
                         live
@@ -504,6 +759,9 @@ mod tests {
     }
 
     impl ChannelSubstrate for FakeSubstrate {
+        fn resize_semantics(&self) -> ResizeSemantics {
+            ResizeSemantics::Unconfirmed
+        }
         fn open(&mut self, req: &OpenRequest) {
             self.calls
                 .lock()
@@ -557,6 +815,70 @@ mod tests {
         let sub = FakeSubstrate::default();
         let opens = sub.opens.clone();
         (ChannelSession::new(sub), opens)
+    }
+
+    #[test]
+    fn ordered_qsh_opened_alone_does_not_release_ready() {
+        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let ch = session.open_shell(80, 24).unwrap();
+        let events = session.on_bytes(
+            transport::channel::CONTROL_STREAM,
+            &transport::channel::encode_server(&ServerRecord::Opened { stream: ch }),
+        );
+        assert!(events.is_empty(), "lifecycle confirmation cannot release output before authoritative geometry: {events:?}");
+        assert!(!session.is_ready(ch));
+    }
+
+    #[test]
+    fn ordered_qsh_resize_does_not_commit_before_a_correlated_result() {
+        use transport::channel_geometry::{ChannelInstance, GeometryOutcome, GeometryRecord};
+        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let ch = session.open_shell(80, 24).unwrap();
+        session.on_bytes(
+            transport::channel::CONTROL_STREAM,
+            &transport::channel::encode_server(&ServerRecord::Opened { stream: ch }),
+        );
+        session.on_bytes(
+            ch,
+            &transport::shell_frame::encode_shell(&transport::shell_frame::ShellRecord::Geometry(
+                GeometryRecord {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: 0,
+                    outcome: GeometryOutcome::Established,
+                    cols: 80,
+                    rows: 24,
+                },
+            ))
+            .unwrap(),
+        );
+        session.resize(ch, 100, 30);
+        assert!(session.is_ready(ch));
+        let geometry = session.committed_geometry(ch).unwrap();
+        assert_eq!(
+            (geometry.cols, geometry.rows),
+            (80, 24),
+            "queuing a request cannot claim that the remote geometry changed"
+        );
+    }
+
+    #[test]
+    fn local_shell_adapts_open_and_resize_but_never_sends_zero_resize() {
+        let substrate = FakeSubstrate::default();
+        let opens = substrate.opens.clone();
+        let calls = substrate.calls.clone();
+        let mut s = ChannelSession::new(substrate);
+        let ch = s.open_shell(1, 2).unwrap();
+        let req = opens.lock().unwrap()[0].clone();
+        assert_eq!((req.cols, req.rows), (2, 2));
+        s.on_event(SubstrateEvent::Opened(ch));
+        calls.lock().unwrap().clear();
+        s.resize(ch, 0, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        s.resize(ch, 1, 65535);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[format!("resize {ch} 2x256")]
+        );
     }
 
     /// The session reports a channel usable only once the far side has
@@ -643,6 +965,52 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_early_combined_overflow_is_terminal_instead_of_truncated() {
+        let (mut session, _) = session();
+        let ch = session.open_command(b"command", 0, 0).unwrap();
+        assert!(session
+            .on_event(SubstrateEvent::Data {
+                ch,
+                bytes: vec![0; MAX_BUFFERED_BEFORE_READY]
+            })
+            .is_empty());
+        assert_eq!(
+            session.on_event(SubstrateEvent::ExtendedData {
+                ch,
+                data_type: 77,
+                bytes: vec![1]
+            }),
+            vec![SessionEvent::ProtocolFailure(
+                ChannelProtocolError::EarlyOutputOverflow
+            )]
+        );
+        assert!(session.on_event(SubstrateEvent::Opened(ch)).is_empty());
+        assert!(!session.is_ready(ch));
+        assert_eq!(
+            session.open_shell(80, 24),
+            None,
+            "failed attempt cannot open another channel"
+        );
+    }
+    #[test]
+    fn unconfirmed_early_zero_payload_events_are_bounded() {
+        let (mut session, _) = session();
+        let ch = session.open_shell(80, 24).unwrap();
+        for offset in 0..256 {
+            assert!(session
+                .on_event(SubstrateEvent::InputConsumed { ch, offset })
+                .is_empty());
+        }
+        assert_eq!(
+            session.on_event(SubstrateEvent::InputConsumed { ch, offset: 256 }),
+            vec![SessionEvent::ProtocolFailure(
+                ChannelProtocolError::EarlyOutputOverflow
+            )]
+        );
+        assert!(session.on_event(SubstrateEvent::Opened(ch)).is_empty());
+    }
+
+    #[test]
     fn extended_data_keeps_type_order_and_shared_pre_ready_limit() {
         let (mut session, _) = session();
         let ch = session.open_command(b"command", 0, 0).unwrap();
@@ -657,13 +1025,6 @@ mod tests {
                 ch,
                 data_type: 1,
                 bytes: b"b".to_vec()
-            })
-            .is_empty());
-        assert!(session
-            .on_event(SubstrateEvent::ExtendedData {
-                ch,
-                data_type: 77,
-                bytes: b"over".to_vec()
             })
             .is_empty());
         let events = session.on_event(SubstrateEvent::Opened(ch));
@@ -714,27 +1075,24 @@ mod tests {
             .expect("a fresh session always has a free stream");
 
         let chunk = vec![b'x'; 4096];
-        for _ in 0..32 {
-            // 32 * 4096 = 128 KiB, well past any reasonable cap.
+        for i in 0..32 {
             let events = s.on_event(SubstrateEvent::Data {
                 ch,
                 bytes: chunk.clone(),
             });
-            assert!(events.is_empty(), "still not ready");
+            if i == 16 {
+                assert_eq!(
+                    events,
+                    vec![SessionEvent::ProtocolFailure(
+                        ChannelProtocolError::EarlyOutputOverflow
+                    )]
+                );
+            } else {
+                assert!(events.is_empty());
+            }
         }
-
-        let events = s.on_event(SubstrateEvent::Opened(ch));
-        let buffered_bytes: usize = events
-            .iter()
-            .filter_map(|e| match e {
-                SessionEvent::Data { bytes, .. } => Some(bytes.len()),
-                _ => None,
-            })
-            .sum();
-        assert!(
-            buffered_bytes < 128 * 1024,
-            "buffered output must be capped rather than growing without bound, got {buffered_bytes} bytes"
-        );
+        assert!(s.on_event(SubstrateEvent::Opened(ch)).is_empty());
+        assert!(!s.is_ready(ch));
     }
 
     /// A refusal preserves the original reason; terminal-safe formatting belongs
@@ -775,7 +1133,10 @@ mod tests {
         let events = s.on_event(SubstrateEvent::Announced(Vec::new()));
         assert_eq!(
             events,
-            vec![SessionEvent::Announced { live: Vec::new() }],
+            vec![SessionEvent::Announced {
+                active: Vec::new(),
+                draining: Vec::new()
+            }],
             "an empty list is an answer, not silence"
         );
     }
@@ -799,7 +1160,10 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                SessionEvent::Announced { live: vec![16] },
+                SessionEvent::Announced {
+                    active: vec![16],
+                    draining: Vec::new()
+                },
                 SessionEvent::Ready(16)
             ],
             "the announcement itself is reported, then what it implies"
@@ -1151,3 +1515,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "channel_ordered_tests.rs"]
+mod ordered_tests;

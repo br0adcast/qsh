@@ -389,6 +389,14 @@ mod tests {
         crate::wire::transport_header(0x0102_0304_0506_0708, counter)
     }
 
+    // The audited golden vectors include a protocol-1 AAD byte. Keep that
+    // exact fixture while normal connection/header tests exercise protocol 2.
+    fn pinned_header(counter: u64) -> [u8; 18] {
+        let mut header = header(counter);
+        header[0] = 1;
+        header
+    }
+
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -525,7 +533,9 @@ mod tests {
                 "initiator+header" => &new_i,
                 other => panic!("unknown sender {other}"),
             };
-            let ct = keys.encrypt(c, &header(c), &plaintext(len)).expect("seals");
+            let ct = keys
+                .encrypt(c, &pinned_header(c), &plaintext(len))
+                .expect("seals");
             assert_eq!(fingerprint(&ct), want, "{sender}, counter {c}, {len} bytes");
         }
     }
@@ -564,7 +574,7 @@ mod tests {
         let (new_i, _) = ours_and_snows(ini, true);
         for len in [0, 1] {
             let ct = new_i
-                .encrypt(1, &header(1), &plaintext(len))
+                .encrypt(1, &pinned_header(1), &plaintext(len))
                 .expect("seals");
             println!(
                 "    (\"initiator+header\", 1, {len}, \"{}\"),",

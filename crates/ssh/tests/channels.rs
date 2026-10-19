@@ -3,7 +3,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use client::channel::{ChannelSubstrate, SubstrateEvent};
+use client::channel::{ChannelSubstrate, ResizeSemantics, SubstrateEvent};
 use support::*;
 use transport::channel::{ChannelKind, OpenRequest};
 
@@ -104,6 +104,7 @@ fn a_shell_channel_has_a_pty_of_the_requested_size_and_follows_a_resize() {
     let Some((_sshd, _conn, mut sub, rec)) = up() else {
         return;
     };
+    assert_eq!(sub.resize_semantics(), ResizeSemantics::Unconfirmed);
     sub.announce_term("xterm-256color");
     sub.open(&shell(16, 90, 30));
     assert!(rec.wait_for(
@@ -126,6 +127,14 @@ fn a_shell_channel_has_a_pty_of_the_requested_size_and_follows_a_resize() {
     sub.send(16, b"stty size; echo DO'NE'2\n");
     assert!(rec.wait_for(|r| r.output(16).contains("DONE2"), Duration::from_secs(5)));
     assert!(rec.output(16).contains("40 120"));
+    assert!(
+        !rec.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, SubstrateEvent::Geometry { .. })),
+        "successful SSH transmission is not a correlated remote resize result"
+    );
 }
 
 #[test]

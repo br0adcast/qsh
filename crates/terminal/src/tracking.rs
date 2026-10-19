@@ -7,14 +7,16 @@
 //! replay that does not restore it leaves a client that draws the same
 //! screen and then parses the next bytes differently. [`Tracking`] sits
 //! between the parser and the `Term`: every call goes through to the `Term`
-//! unchanged, and the few that touch private state are also recorded in
+//! through bounded payload handling, and changes to private state are recorded in
 //! [`Tracked`], by the same rule the `Term` applies (`alacritty_terminal`
 //! 0.26, pinned exactly). [`PendingSequence`] keeps the bytes of an escape
 //! sequence (or UTF-8 character) the input has started and not finished.
 
+use alacritty_terminal::term::cell::Flags;
 use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
@@ -86,13 +88,52 @@ fn default_tabs(from: usize, to: usize) -> impl Iterator<Item = bool> {
 /// date alongside. Every method of the trait is forwarded -- a method the
 /// trait gives a default body and this impl forgot would silently do nothing
 /// -- so the list below is the trait's, in its order.
-pub(crate) struct Tracking<'a> {
-    pub term: &'a mut Term<VoidListener>,
-    pub tracked: &'a mut Tracked,
+pub(crate) struct Tracking<'a, T> {
+    pub term: &'a mut Term<T>,
+    pub tracked: Option<&'a mut Tracked>,
 }
 
-impl Handler for Tracking<'_> {
+/// Mirror the pinned Term::input target selection, including pending wrap
+/// and the trailing cell of a wide glyph. Only additional marks are dropped.
+pub(crate) fn accept_input<T>(term: &Term<T>, c: char) -> bool {
+    if c.width() != Some(0) {
+        return true;
+    }
+    let grid = term.grid();
+    let mut column = grid.cursor.point.column;
+    if !grid.cursor.input_needs_wrap {
+        column.0 = column.saturating_sub(1);
+    }
+    let line = grid.cursor.point.line;
+    if grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+        column.0 = column.saturating_sub(1);
+    }
+    grid[line][column]
+        .zerowidth()
+        .is_none_or(|marks| marks.len() < 16)
+}
+
+fn bounded_title(title: String) -> String {
+    let mut end = title.len().min(1024);
+    while !title.is_char_boundary(end) {
+        end -= 1;
+    }
+    title[..end].to_owned()
+}
+fn bounded_hyperlink(h: Hyperlink) -> Option<Hyperlink> {
+    // Alacritty's absent-id counter is u32 plus the nine-byte suffix.
+    if h.uri.len() + h.id.as_ref().map_or(19, String::len) > 4096 {
+        return None;
+    }
+    Some(Hyperlink {
+        id: h.id.map(|id| id.as_str().to_owned()),
+        uri: h.uri.as_str().to_owned(),
+    })
+}
+
+impl<T: EventListener> Handler for Tracking<'_, T> {
     fn set_title(&mut self, title: Option<String>) {
+        let title = title.map(bounded_title);
         self.term.set_title(title)
     }
     fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
@@ -102,8 +143,12 @@ impl Handler for Tracking<'_> {
         self.term.set_cursor_shape(shape)
     }
     fn input(&mut self, c: char) {
-        self.term.input(c);
-        self.tracked.last_input = Some(c);
+        if accept_input(self.term, c) {
+            self.term.input(c);
+        }
+        if let Some(tracked) = &mut self.tracked {
+            tracked.last_input = Some(c);
+        }
     }
     fn goto(&mut self, line: i32, col: usize) {
         self.term.goto(line, col)
@@ -165,7 +210,9 @@ impl Handler for Tracking<'_> {
     fn set_horizontal_tabstop(&mut self) {
         let column = self.term.grid().cursor.point.column.0;
         self.term.set_horizontal_tabstop();
-        self.tracked.tabs[column] = true;
+        if let Some(tracked) = &mut self.tracked {
+            tracked.tabs[column] = true;
+        }
     }
     fn scroll_up(&mut self, lines: usize) {
         self.term.scroll_up(lines)
@@ -205,9 +252,11 @@ impl Handler for Tracking<'_> {
     }
     fn clear_tabs(&mut self, mode: TabulationClearMode) {
         let column = self.term.grid().cursor.point.column.0;
-        match mode {
-            TabulationClearMode::Current => self.tracked.tabs[column] = false,
-            TabulationClearMode::All => self.tracked.tabs.iter_mut().for_each(|t| *t = false),
+        if let Some(tracked) = &mut self.tracked {
+            match mode {
+                TabulationClearMode::Current => tracked.tabs[column] = false,
+                TabulationClearMode::All => tracked.tabs.iter_mut().for_each(|t| *t = false),
+            }
         }
         self.term.clear_tabs(mode);
     }
@@ -216,8 +265,9 @@ impl Handler for Tracking<'_> {
     }
     fn reset_state(&mut self) {
         self.term.reset_state();
-        self.tracked
-            .reset(self.term.columns(), self.term.screen_lines());
+        if let Some(tracked) = &mut self.tracked {
+            tracked.reset(self.term.columns(), self.term.screen_lines());
+        }
     }
     fn reverse_index(&mut self) {
         self.term.reverse_index()
@@ -257,7 +307,9 @@ impl Handler for Tracking<'_> {
     }
     fn set_active_charset(&mut self, index: CharsetIndex) {
         self.term.set_active_charset(index);
-        self.tracked.active_charset = index;
+        if let Some(tracked) = &mut self.tracked {
+            tracked.active_charset = index;
+        }
     }
     fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
         self.term.configure_charset(index, charset)
@@ -293,6 +345,7 @@ impl Handler for Tracking<'_> {
         self.term.text_area_size_chars()
     }
     fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
+        let hyperlink = hyperlink.and_then(bounded_hyperlink);
         self.term.set_hyperlink(hyperlink)
     }
     fn set_mouse_cursor_icon(&mut self, icon: CursorIcon) {
@@ -321,7 +374,7 @@ impl Handler for Tracking<'_> {
     }
 }
 
-impl Tracking<'_> {
+impl<T> Tracking<'_, T> {
     /// `Term::set_scrolling_region`'s own rule: an empty or inverted region
     /// is ignored, both ends are clamped to the screen.
     fn note_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
@@ -333,14 +386,18 @@ impl Tracking<'_> {
         let lines = lines as i32;
         let start = (top as i32 - 1).min(lines);
         let end = (bottom as i32).min(lines);
-        self.tracked.scroll_region = start..end;
+        if let Some(tracked) = &mut self.tracked {
+            tracked.scroll_region = start..end;
+        }
     }
 
     /// DECCOLM (`?3`), set or reset: `Term` ignores the width but clears the
     /// screen and resets the region, which is what matters here.
     fn note_column_mode(&mut self, mode: PrivateMode) {
         if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
-            self.tracked.scroll_region = 0..self.term.screen_lines() as i32;
+            if let Some(tracked) = &mut self.tracked {
+                tracked.scroll_region = 0..self.term.screen_lines() as i32;
+            }
         }
     }
 }
@@ -392,6 +449,12 @@ const MAX_PENDING: usize = 1 << 20;
 
 impl PendingSequence {
     pub fn push(&mut self, chunk: &[u8]) {
+        for slice in chunk.chunks(CHECK_INTERVAL) {
+            self.push_slice(slice);
+        }
+    }
+
+    fn push_slice(&mut self, chunk: &[u8]) {
         match memchr::memrchr(0x1b, chunk) {
             Some(at) => {
                 self.bytes.clear();
@@ -413,6 +476,9 @@ impl PendingSequence {
             }
             None => self.bytes.extend_from_slice(chunk),
         }
+        // A caller chunk is sliced before appending, including near-cap
+        // geometric check thresholds. This checks the actual transient size.
+        debug_assert!(self.bytes.len() <= MAX_PENDING + CHECK_INTERVAL);
         if self.bytes.len() > self.check_at {
             self.trim();
         }
@@ -447,7 +513,7 @@ impl PendingSequence {
             }
             State::InSequence => {}
         }
-        self.check_at = (self.bytes.len() * 2).max(CHECK_INTERVAL);
+        self.check_at = (self.bytes.len() * 2).clamp(CHECK_INTERVAL, MAX_PENDING);
     }
 }
 
@@ -469,12 +535,14 @@ enum State {
 fn classify(bytes: &[u8]) -> State {
     let mut parser: Parser = Parser::new();
     let mut probe = Probe::default();
-    parser.advance(&mut probe, bytes);
-    probe.calls.clear();
+    for chunk in bytes.chunks(CHECK_INTERVAL) {
+        parser.advance(&mut probe, chunk);
+    }
+    probe.record = true;
     parser.advance(&mut probe, b"A");
-    match probe.calls.as_slice() {
-        [Call::Print('A')] => State::Ground,
-        [Call::Print(char::REPLACEMENT_CHARACTER), Call::Print('A')] => {
+    match &probe.calls[..probe.len] {
+        [Some(Call::Print('A'))] => State::Ground,
+        [Some(Call::Print(char::REPLACEMENT_CHARACTER)), Some(Call::Print('A'))] => {
             State::InUtf8(unfinished_utf8(bytes))
         }
         _ => State::InSequence,
@@ -503,39 +571,152 @@ enum Call {
 
 #[derive(Default)]
 struct Probe {
-    calls: Vec<Call>,
+    calls: [Option<Call>; 3],
+    len: usize,
+    record: bool,
+}
+
+impl Probe {
+    fn note(&mut self, call: Call) {
+        if self.record && self.len < self.calls.len() {
+            self.calls[self.len] = Some(call);
+            self.len += 1;
+        }
+    }
 }
 
 impl Perform for Probe {
     fn print(&mut self, c: char) {
-        self.calls.push(Call::Print(c));
+        self.note(Call::Print(c));
     }
     fn execute(&mut self, _byte: u8) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn put(&mut self, _byte: u8) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn unhook(&mut self) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
-        self.calls.push(Call::Other);
+        self.note(Call::Other);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_threshold_never_exceeds_cap() {
+        let mut p = PendingSequence::default();
+        p.push(b"\x1bPq");
+        let chunk = vec![b'x'; 4096];
+        for _ in 0..300 {
+            p.push(&chunk);
+            assert!(p.bytes.len() <= MAX_PENDING);
+        }
+    }
+
+    #[test]
+    fn huge_pending_caller_chunk_and_probe_storage_are_bounded() {
+        let mut p = PendingSequence::default();
+        let mut bytes = b"\x1bPq".to_vec();
+        bytes.extend(vec![b'x'; MAX_PENDING * 3]);
+        p.push(&bytes);
+        assert!(p.bytes.len() <= MAX_PENDING);
+        assert!(p.lost);
+        let mut parser = Parser::new();
+        let mut probe = Probe::default();
+        parser.advance(&mut probe, &vec![b'x'; 100_000]);
+        assert_eq!(probe.len, 0);
+        probe.record = true;
+        parser.advance(&mut probe, b"A");
+        assert_eq!(probe.len, 1);
+        for (bytes, expected) in [
+            (b"\xff".as_slice(), State::Ground),
+            (b"\xef\xbf\xbd", State::Ground),
+            (b"\xe2\x82", State::InUtf8(2)),
+            (b"\x1bPqabc\x1b\\", State::Ground),
+            (b"\x1b]0;abc\x18", State::Ground),
+            (b"\x1b[", State::InSequence),
+        ] {
+            assert_eq!(classify(bytes), expected);
+        }
+    }
+
+    #[test]
+    fn title_and_hyperlink_strings_release_excess_capacity() {
+        let mut title = String::with_capacity(8192);
+        title.push_str(&"é".repeat(600));
+        let title = bounded_title(title);
+        assert_eq!(title.len(), 1024);
+        assert_eq!(title.capacity(), 1024);
+        let mut title = "a".repeat(1023);
+        title.push('é');
+        assert_eq!(bounded_title(title).len(), 1023);
+        let mut uri = String::with_capacity(8192);
+        uri.push_str("ok");
+        let mut id = String::with_capacity(8192);
+        id.push('x');
+        let link = bounded_hyperlink(Hyperlink { id: Some(id), uri }).unwrap();
+        assert_eq!(link.uri.capacity(), 2);
+        assert_eq!(link.id.unwrap().capacity(), 1);
+    }
+
+    #[test]
+    fn title_stack_restores_only_bounded_utf8_titles() {
+        use alacritty_terminal::event::Event;
+        use alacritty_terminal::term::Config;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Listener(Arc<Mutex<Vec<String>>>);
+        impl EventListener for Listener {
+            fn send_event(&self, event: Event) {
+                if let Event::Title(title) = event {
+                    self.0.lock().unwrap().push(title);
+                }
+            }
+        }
+        struct Size;
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                1
+            }
+            fn screen_lines(&self) -> usize {
+                1
+            }
+            fn columns(&self) -> usize {
+                2
+            }
+        }
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let mut term = Term::new(Config::default(), &Size, Listener(titles.clone()));
+        let mut handler = Tracking {
+            term: &mut term,
+            tracked: None,
+        };
+        handler.set_title(Some("é".repeat(4096)));
+        handler.push_title();
+        handler.set_title(Some("next".to_owned()));
+        handler.pop_title();
+        let titles = titles.lock().unwrap();
+        assert_eq!(
+            titles.iter().map(String::len).collect::<Vec<_>>(),
+            [1024, 4, 1024]
+        );
+        assert!(titles.iter().all(|title| title.capacity() <= 1024));
+        assert_eq!(titles[0], titles[2]);
+    }
 
     fn tail_after(chunks: &[&[u8]]) -> Vec<u8> {
         let mut p = PendingSequence::default();

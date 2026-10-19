@@ -243,6 +243,7 @@ fn connect_and_open_shell(
     let client = StdClient::connect(
         server_addr,
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client_priv,

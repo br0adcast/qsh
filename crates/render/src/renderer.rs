@@ -64,6 +64,7 @@ impl Modes {
 /// Draws frames into a terminal, remembering what is already on screen.
 pub struct Renderer {
     caps: TermCaps,
+    physical_scroll_eligible: bool,
     /// What the terminal is currently showing, as far as we know. `None`
     /// means "unknown" -- the next frame is painted from scratch.
     last: Option<Frame>,
@@ -85,10 +86,17 @@ impl Renderer {
     pub fn new(caps: TermCaps) -> Renderer {
         Renderer {
             caps,
+            physical_scroll_eligible: true,
             last: None,
             style: Style::default_style(),
             modes: None,
         }
+    }
+
+    /// Permit physical scrolling only when the frame reaches the actual
+    /// terminal bottom. Cropped viewports must redraw rows in place.
+    pub fn set_physical_scroll_eligible(&mut self, eligible: bool) {
+        self.physical_scroll_eligible = eligible;
     }
 
     /// Forget what is on screen: the next `render` repaints in full and
@@ -125,7 +133,7 @@ impl Renderer {
             // still line up as a shift by coincidence (`cat file; less file`,
             // then `q`), and a newline here would feed that coincidence into
             // the user's scrollback.
-            if !frame.alt_screen && !previous.alt_screen {
+            if self.physical_scroll_eligible && !frame.alt_screen && !previous.alt_screen {
                 if let Some(lines) = scrolled_by(&previous, frame) {
                     self.scroll_up(&mut out, lines, frame);
                     previous = shift_up(&previous, lines);
@@ -562,8 +570,8 @@ fn rows_equal(a: &Frame, b: &Frame, a_row: u16, b_row: u16) -> bool {
 fn shift_up(previous: &Frame, lines: u16) -> Frame {
     let mut shifted = Frame::blank(previous.cols, previous.rows);
     shifted.palette = std::sync::Arc::clone(&previous.palette);
-    for row in 0..(previous.rows - lines) {
-        for col in 0..previous.cols {
+    for row in 0..shifted.rows.saturating_sub(lines) {
+        for col in 0..shifted.cols {
             *shifted.cell_mut(row, col) = *previous.cell(row + lines, col);
         }
     }

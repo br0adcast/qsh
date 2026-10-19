@@ -140,6 +140,8 @@ fi
 [[ ${#formats[@]} -eq 1 ]] || die "--in-container takes exactly one format"
 fmt=${formats[0]}
 cd "$root"
+export RUSTUP_TOOLCHAIN=1.98.1
+"$root/scripts/check-qualified-rust.sh"
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 mkdir -p "$dist"
 

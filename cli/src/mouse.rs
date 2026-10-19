@@ -80,6 +80,12 @@ impl MouseShift {
         MouseShift::default()
     }
 
+    /// Shift reports and discard coordinates outside the visible shell.
+    /// Releases on the status line retain the ordinary drag-to-top behavior.
+    pub fn apply_bounded(&mut self, input: &[u8], shift: u16, cols: u16, rows: u16) -> Vec<u8> {
+        self.apply_inside(input, shift, Some((cols, rows)))
+    }
+
     /// `bytes` with every mouse report moved up by `shift` rows: a press at
     /// or above row `shift` is dropped, a release or a motion there lands on
     /// row 1. With `shift == 0` nothing changes, though a paste is still
@@ -93,6 +99,10 @@ impl MouseShift {
     /// paste's text is then not kept from being moved, which is all it
     /// costs: the end marker still ends the paste.
     pub fn apply(&mut self, input: &[u8], shift: u16) -> Vec<u8> {
+        self.apply_inside(input, shift, None)
+    }
+
+    fn apply_inside(&mut self, input: &[u8], shift: u16, bounds: Option<(u16, u16)>) -> Vec<u8> {
         let shift = u32::from(shift);
         let mut bytes = std::mem::take(&mut self.held);
         bytes.extend_from_slice(input);
@@ -109,8 +119,25 @@ impl MouseShift {
                 self.held = rest.to_vec();
                 break;
             }
-            if shift > 0 && !self.in_paste {
+            if (shift > 0 || bounds.is_some()) && !self.in_paste {
                 if let Some(r) = report(rest) {
+                    let x = match r.form {
+                        Form::Sgr { x, .. } => std::str::from_utf8(x)
+                            .ok()
+                            .and_then(|x| x.parse::<u32>().ok())
+                            .unwrap_or(0),
+                        Form::X10 { c2, .. } => u32::from(c2).saturating_sub(32),
+                    };
+                    if bounds.is_some_and(|(cols, rows)| {
+                        x == 0
+                            || x > u32::from(cols)
+                            || r.y == 0
+                            || r.y > shift + u32::from(rows)
+                            || rows == 0
+                    }) {
+                        i += r.len;
+                        continue;
+                    }
                     if r.y > shift {
                         out.extend(r.at_row(r.y - shift));
                     } else if !r.is_press() {
@@ -253,6 +280,16 @@ fn x10(rest: &[u8]) -> Option<Report<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_reports_outside_shell_bounds_are_excluded() {
+        let mut m = MouseShift::new();
+        assert_eq!(
+            m.apply_bounded(b"a\x1b[<0;2;2M\x1b[<0;1;3M\x1b[<0;1;2Mb", 1, 1, 1),
+            b"a\x1b[<0;1;1Mb"
+        );
+        assert_eq!(m.apply_bounded(b"\x1b[<0;0;2M", 1, 1, 1), b"");
+    }
 
     #[test]
     fn sgr_reports_move_up_one_row() {

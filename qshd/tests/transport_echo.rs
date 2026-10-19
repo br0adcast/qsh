@@ -50,6 +50,7 @@ async fn transport_echo_round_trip() {
     let server_addr = server_socket.local_addr().expect("local server address");
 
     let server_cfg = ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Server,
         local_static_priv: server_kp.private,
@@ -65,6 +66,7 @@ async fn transport_echo_round_trip() {
         .await
         .expect("binding the client socket");
     let mut client = Connection::new(ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: Role::Client,
         local_static_priv: client_kp.private,

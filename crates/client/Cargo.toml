@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+terminal-size = { path = "../terminal-size" }
 terminal = { path = "../terminal" }
 prediction = { path = "../prediction" }
 transport = { path = "../transport" }

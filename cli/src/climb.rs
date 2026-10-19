@@ -1136,6 +1136,14 @@ impl<'a> Climb<'a> {
                 self.proved(host, port, &server);
             }
             match verdict {
+                Verdict::ProtocolFailure(failure) => {
+                    self.forget(&att);
+                    let why = protocol_why(failure);
+                    return Ok((
+                        DirectOutcome::NoAnswer(why.clone()),
+                        Some(report::no_answer(host, port, &why)),
+                    ));
+                }
                 Verdict::Working => {
                     won = Some((att, trial));
                     break;
@@ -1185,6 +1193,14 @@ impl<'a> Climb<'a> {
             self.proved(host, port, &server);
         }
         match verdict {
+            Verdict::ProtocolFailure(failure) => {
+                self.forget(&att);
+                let why = protocol_why(failure);
+                (
+                    DirectOutcome::NoAnswer(why.clone()),
+                    Some(report::no_answer(host, port, &why)),
+                )
+            }
             Verdict::Working => self.logged_in(att, trial, sockaddr, server.key),
             Verdict::AuthRefused => {
                 self.forget(&att);
@@ -1461,6 +1477,22 @@ impl<'a> Climb<'a> {
 /// the private half of the key it was made with. A Noise IK handshake
 /// completes only against that holder, so a refused login proves it as
 /// well as a working one; only an attempt that never got that far does not.
+fn protocol_why(failure: transport::ProtocolFailure) -> NoAnswerWhy {
+    match failure {
+        transport::ProtocolFailure::UnsupportedProtocol { supported } => {
+            NoAnswerWhy::UnsupportedProtocol { supported }
+        }
+        transport::ProtocolFailure::MissingRequiredFeatures { required, enabled } => {
+            NoAnswerWhy::MissingRequiredFeatures {
+                required: required.bits(),
+                enabled: enabled.bits(),
+            }
+        }
+        transport::ProtocolFailure::InvalidHandshake { .. }
+        | transport::ProtocolFailure::UnofferedFeatures { .. } => NoAnswerWhy::InvalidProtocol,
+    }
+}
+
 fn handshake_done(verdict: &Verdict) -> bool {
     matches!(verdict, Verdict::Working | Verdict::AuthRefused)
 }

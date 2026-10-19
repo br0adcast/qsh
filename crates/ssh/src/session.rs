@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 
-use client::channel::{ChannelId, ChannelSubstrate, SubstrateEvent};
+use client::channel::{ChannelId, ChannelSubstrate, ResizeSemantics, SubstrateEvent};
 use russh::ChannelMsg;
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use transport::channel::{ChannelKind, OpenRequest};
@@ -126,6 +126,14 @@ impl SshSubstrate {
 }
 
 impl ChannelSubstrate for SshSubstrate {
+    fn protocol_failed(&mut self, error: client::channel::ChannelProtocolError) {
+        self.commands
+            .stop
+            .request(format!("the SSH channel admission failed: {error:?}"));
+    }
+    fn resize_semantics(&self) -> ResizeSemantics {
+        ResizeSemantics::Unconfirmed
+    }
     fn open(&mut self, req: &OpenRequest) {
         if let Some(permit) = self.commands.reserve(req.command.len()) {
             self.commands
@@ -370,7 +378,10 @@ async fn write_channel(
                 }
             }
             Write::Resize(cols, rows) => {
-                let _ = write.window_change(cols.into(), rows.into(), 0, 0).await;
+                if let Err(error) = write.window_change(cols.into(), rows.into(), 0, 0).await {
+                    stop.request(format!("the SSH resize write failed: {error}"));
+                    return;
+                }
             }
             Write::Close => {
                 let _ = write.close().await;
@@ -824,6 +835,98 @@ mod tests {
         .unwrap();
         let handle = Arc::new(handle);
         (sshd, handle, gate, credits)
+    }
+
+    #[test]
+    fn client_early_output_failure_requests_bounded_connection_stop() {
+        let (commands, _incoming) = commands();
+        let stop = commands.stop.clone();
+        let sub = SshSubstrate {
+            commands,
+            cancel: knock::Cancel::new(),
+        };
+        let mut session = client::channel::ChannelSession::new(sub);
+        let ch = session.open_shell(80, 24).unwrap();
+        let events = session.on_event(SubstrateEvent::Data {
+            ch,
+            bytes: vec![0; 65537],
+        });
+        assert!(matches!(
+            events.as_slice(),
+            [client::channel::SessionEvent::ProtocolFailure(_)]
+        ));
+        assert!(stop
+            .reason
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|reason| reason.contains("EarlyOutputOverflow")));
+    }
+
+    #[test]
+    fn resize_writer_failure_requests_one_real_connection_close() {
+        runtime().block_on(async {
+            let (_sshd, handle, _gate, credits) = gated_handle().await;
+            let channel = handle.channel_open_session().await.unwrap();
+            let (_read, write) = channel.split();
+            handle
+                .disconnect(russh::Disconnect::ByApplication, "test done", "")
+                .await
+                .unwrap();
+            let mut handle = Arc::try_unwrap(handle).ok().expect("sole handle");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+                .await
+                .unwrap();
+            let stop = Arc::new(Stop::default());
+            let (tx, rx) = mpsc::channel(2);
+            tx.send(Write::Resize(100, 30)).await.unwrap();
+            tx.send(Write::Resize(101, 31)).await.unwrap();
+            drop(tx);
+            write_channel(
+                write,
+                rx,
+                credits.clone(),
+                Arc::clone(&stop),
+                knock::Cancel::new(),
+            )
+            .await;
+            let reason = stop
+                .reason
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("window_change failure must stop the connection");
+            assert!(reason.contains("SSH resize write failed"), "{reason}");
+            let events = Arc::new(ChannelEvents::default());
+            let close = Arc::new(CloseOnce {
+                events: events.clone(),
+                closed: Arc::new(AtomicBool::new(false)),
+            });
+            let (_commands, incoming) = commands();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                run(
+                    Arc::new(handle),
+                    incoming,
+                    events.clone(),
+                    close.clone(),
+                    RunLimits {
+                        stop,
+                        budget: Arc::new(Semaphore::new(MAX_QUEUED_BYTES)),
+                        credits,
+                        request_timeout: std::time::Duration::from_secs(2),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            close.close(reason);
+            assert_eq!(events.closed_count.load(Ordering::SeqCst), 1);
+            assert!(
+                events.events.lock().unwrap().is_empty(),
+                "no remote Geometry is invented"
+            );
+        });
     }
 
     #[test]

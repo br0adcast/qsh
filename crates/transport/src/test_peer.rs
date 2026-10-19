@@ -82,6 +82,7 @@ where
     let client_pub = client.public;
     thread::spawn(move || {
         let conn = Connection::new(ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Server,
             local_static_priv: server.private,
@@ -94,6 +95,7 @@ where
     let std_client = StdClient::connect_with(
         addr,
         ConnectionConfig {
+            required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: client.private,

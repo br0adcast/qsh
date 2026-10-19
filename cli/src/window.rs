@@ -223,7 +223,7 @@ fn plain(ch: char) -> Cell {
 }
 
 fn cells(text: &str) -> Vec<Cell> {
-    text.chars().map(plain).collect()
+    crate::statusline::text_cells(text, true)
 }
 
 struct Frame {
@@ -262,6 +262,8 @@ fn vertical_padding(height: u16) -> usize {
 
 /// Number of visible road rows, after borders and vertical padding.
 pub fn road_capacity(cols: u16, height: u16) -> usize {
+    let size = terminal_size::ViewportSize::new(cols, height);
+    let (cols, height) = (size.cols(), size.rows());
     if cols < MIN_COLS || height < MIN_HEIGHT {
         0
     } else {
@@ -356,6 +358,8 @@ fn dot_cell(dot: Dot, g: Glyphs) -> Cell {
 
 /// The connection-state window, or `None` when the terminal is too small.
 pub fn roads_box(rows: &[Row], state: &Roads, cols: u16, height: u16, g: Glyphs) -> Option<Boxed> {
+    let size = terminal_size::ViewportSize::new(cols, height);
+    let (cols, height) = (size.cols(), size.rows());
     if cols < MIN_COLS || height < MIN_HEIGHT {
         return None;
     }
@@ -374,7 +378,7 @@ pub fn roads_box(rows: &[Row], state: &Roads, cols: u16, height: u16, g: Glyphs)
         .unwrap_or(0);
     let mut addr_width = rows
         .iter()
-        .map(|r| r.label.chars().count())
+        .map(|r| crate::statusline::text_cells(&r.label, g.utf8).len())
         .max()
         .unwrap_or(0);
     // Dot, space, address, two spaces, "in use", two spaces, value.
@@ -387,10 +391,16 @@ pub fn roads_box(rows: &[Row], state: &Roads, cols: u16, height: u16, g: Glyphs)
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let mut label: Vec<char> = r.label.chars().take(addr_width).collect();
-            label.resize(addr_width, ' ');
+            let mut label = crate::statusline::text_cells(&r.label, g.utf8);
+            label.truncate(addr_width);
+            label.resize(addr_width, plain(' '));
+            if let Some(last) = label.last_mut() {
+                if last.flags & terminal::FLAG_WIDE != 0 {
+                    *last = plain(' ');
+                }
+            }
             let mut line = vec![dot_cell(r.dot, g), plain(' ')];
-            line.extend(label.into_iter().map(plain));
+            line.extend(label);
             let kind = if r.in_use { "in use" } else { "spare " };
             line.extend(cells(&format!("  {kind}  ")));
             let value = value_of(i);
@@ -422,6 +432,7 @@ pub fn roads_box(rows: &[Row], state: &Roads, cols: u16, height: u16, g: Glyphs)
 /// Wrapped recovery details are read-only. Selection is a line viewport, not
 /// an address index; Enter must never turn a diagnostic into a road switch.
 pub fn recovery_lines(details: &[String], cols: u16, utf8: bool) -> Vec<Vec<Cell>> {
+    let cols = terminal_size::ViewportSize::new(cols, 0).cols();
     let width = usize::from(cols.saturating_sub(6)).max(2);
     let mut rows = Vec::new();
     for text in details {
@@ -452,6 +463,8 @@ pub fn recovery_box(
     if cols < MIN_COLS || height < MIN_HEIGHT {
         return None;
     }
+    let size = terminal_size::ViewportSize::new(cols, height);
+    let (cols, height) = (size.cols(), size.rows());
     let all = recovery_lines(details, cols, g.utf8);
     let capacity = road_capacity(cols, height);
     let start = state.selected.min(all.len().saturating_sub(capacity));
@@ -480,6 +493,8 @@ pub fn recovery_box(
 
 /// The help window, or `None` when the terminal is too small.
 pub fn help_box(prefix_name: &str, cols: u16, height: u16, g: Glyphs) -> Option<Boxed> {
+    let size = terminal_size::ViewportSize::new(cols, height);
+    let (cols, height) = (size.cols(), size.rows());
     if cols < MIN_COLS || height < MIN_HEIGHT {
         return None;
     }
@@ -535,6 +550,21 @@ mod tests {
             state,
             ewma_ms: ewma,
             failed_ago_ms: failed,
+        }
+    }
+
+    #[test]
+    fn oversized_layout_uses_bounded_top_left_viewport() {
+        let g = Glyphs {
+            utf8: true,
+            colour: true,
+        };
+        for b in [
+            help_box("Ctrl-]", 65535, 65535, g).unwrap(),
+            recovery_box(&["details".into()], &Roads::new(), 65535, 65535, g).unwrap(),
+        ] {
+            assert!(usize::from(b.left) + b.lines[0].len() <= 512);
+            assert!(usize::from(b.top) + b.lines.len() <= 257);
         }
     }
 

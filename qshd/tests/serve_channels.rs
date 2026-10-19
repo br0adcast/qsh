@@ -288,6 +288,7 @@ fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -407,6 +408,7 @@ fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -490,6 +492,7 @@ fn serve_sends_a_command_channel_in_full_with_the_header_under_aead() {
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,
@@ -599,6 +602,7 @@ fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
     let client = StdClient::connect(
         SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
         ConnectionConfig {
+            required_features: transport::Features::NONE,
             features: transport::Features::SUPPORTED,
             role: Role::Client,
             local_static_priv: generate_keypair().private,

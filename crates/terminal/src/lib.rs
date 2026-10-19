@@ -9,10 +9,13 @@
 
 use std::sync::Arc;
 
+mod limits;
 mod replay;
 mod tracking;
 
+pub use limits::TerminalOptions;
 pub use replay::StateSnapshot;
+use terminal_size::{TerminalSize, ViewportSize};
 
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -227,22 +230,50 @@ struct ReplayState {
 impl TerminalCore {
     /// Creates a terminal of size `cols` by `rows` (columns by rows).
     pub fn new(cols: u16, rows: u16) -> Self {
-        // `TermSize` implements the `Dimensions` trait that `Term::new` expects.
-        let size = TermSize::new(cols as usize, rows as usize);
-        let term = Term::new(Config::default(), &size, VoidListener);
+        Self::with_options(
+            TerminalSize::for_viewport(cols, rows),
+            TerminalOptions::default(),
+        )
+    }
+
+    /// Creates a model with validated geometry and bounded history before allocation.
+    pub fn with_options(size: TerminalSize, options: TerminalOptions) -> Self {
+        let dimensions = TermSize::new(size.cols() as usize, size.rows() as usize);
+        let term = Term::new(
+            Config {
+                scrolling_history: limits::effective_history(options.history_lines, size),
+                ..Config::default()
+            },
+            &dimensions,
+            VoidListener,
+        );
         Self {
             term,
             parser: Processor::new(),
-            replay: None,
-            history_limit: 10_000,
+            replay: options.replay.then(|| ReplayState {
+                tracked: tracking::Tracked::new(size.cols() as usize, size.rows() as usize),
+                pending: tracking::PendingSequence::default(),
+            }),
+            history_limit: options.history_lines,
         }
+    }
+
+    /// Current validated model dimensions.
+    pub fn size(&self) -> TerminalSize {
+        TerminalSize::new(self.term.columns() as u16, self.term.screen_lines() as u16)
+            .expect("terminal model geometry is bounded")
+    }
+
+    /// History rows allowed by the requested limit and current width.
+    pub fn effective_history_limit(&self) -> usize {
+        limits::effective_history(self.history_limit, self.size())
     }
 
     /// Sets the primary screen's history capacity, including zero to disable it.
     pub fn set_history_limit(&mut self, lines: usize) {
         self.history_limit = lines;
         self.term.set_options(Config {
-            scrolling_history: lines,
+            scrolling_history: self.effective_history_limit(),
             ..Config::default()
         });
     }
@@ -266,47 +297,55 @@ impl TerminalCore {
     /// in. That costs some time on every `feed`, which only the daemon's
     /// model of a screen needs to pay.
     pub fn with_replay(cols: u16, rows: u16) -> Self {
-        Self {
-            replay: Some(ReplayState {
-                tracked: tracking::Tracked::new(cols as usize, rows as usize),
-                pending: tracking::PendingSequence::default(),
-            }),
-            ..Self::new(cols, rows)
-        }
+        Self::with_options(
+            TerminalSize::for_viewport(cols, rows),
+            TerminalOptions {
+                replay: true,
+                ..TerminalOptions::default()
+            },
+        )
     }
 
     /// Feeds bytes to the parser: printable characters land in the grid,
     /// while control sequences move the cursor and change modes.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // In vte 0.15, `advance` takes the whole slice at once, not byte by byte.
-        match &mut self.replay {
-            None => self.parser.advance(&mut self.term, bytes),
-            Some(replay) => {
+        for bytes in bytes.chunks(4096) {
+            if let Some(replay) = &mut self.replay {
                 replay.pending.push(bytes);
-                self.parser.advance(
-                    &mut tracking::Tracking {
-                        term: &mut self.term,
-                        tracked: &mut replay.tracked,
-                    },
-                    bytes,
-                );
             }
+            self.parser.advance(
+                &mut tracking::Tracking {
+                    term: &mut self.term,
+                    tracked: self.replay.as_mut().map(|replay| &mut replay.tracked),
+                },
+                bytes,
+            );
         }
     }
 
     /// Changes the terminal size (columns by rows), e.g. on screen rotation
     /// or a window resize on the client side.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let size = TermSize::new(cols as usize, rows as usize);
-        match &mut self.replay {
-            None => self.term.resize(size),
-            Some(replay) => {
-                let (old_cols, old_rows) = (self.term.columns(), self.term.screen_lines());
-                self.term.resize(size);
-                replay
-                    .tracked
-                    .resize(old_cols, old_rows, cols as usize, rows as usize);
-            }
+        self.resize_to(TerminalSize::for_viewport(cols, rows));
+    }
+
+    /// Resizes the model, shrinking history before any width growth.
+    pub fn resize_to(&mut self, size: TerminalSize) {
+        let (old_cols, old_rows) = (self.term.columns(), self.term.screen_lines());
+        // Alacritty set_options targets the primary grid even while it is inactive.
+        self.term.set_options(Config {
+            scrolling_history: limits::effective_history(self.history_limit, size),
+            ..Config::default()
+        });
+        self.term
+            .resize(TermSize::new(size.cols() as usize, size.rows() as usize));
+        if let Some(replay) = &mut self.replay {
+            replay.tracked.resize(
+                old_cols,
+                old_rows,
+                size.cols() as usize,
+                size.rows() as usize,
+            );
         }
     }
 
@@ -327,7 +366,7 @@ impl TerminalCore {
         if self.parser.sync_timeout().sync_timeout().is_some() {
             self.parser.stop_sync(&mut tracking::Tracking {
                 term: &mut self.term,
-                tracked: &mut replay.tracked,
+                tracked: Some(&mut replay.tracked),
             });
         }
         Some(replay::write(
@@ -473,6 +512,8 @@ impl Frame {
     /// (tests, the renderer's "nothing drawn yet" state) start here, so
     /// adding a field to `Frame` doesn't ripple through every call site.
     pub fn blank(cols: u16, rows: u16) -> Frame {
+        let size = ViewportSize::new(cols, rows);
+        let (cols, rows) = (size.cols(), size.rows());
         Frame {
             cols,
             rows,
@@ -818,6 +859,95 @@ impl TerminalCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_geometry_wide_wrap_replay() {
+        let mut source = TerminalCore::with_replay(0, 0);
+        source.feed("日a日".as_bytes());
+        let mut target = TerminalCore::with_replay(1, 0);
+        target.feed(&source.replay().unwrap());
+        assert_eq!(source.snapshot(), target.snapshot());
+        assert_eq!((source.frame().cols, source.frame().rows), (2, 1));
+    }
+
+    #[test]
+    fn history_cell_budget_tracks_width() {
+        for alternate in [false, true] {
+            let mut t = TerminalCore::new(2, 2);
+            for _ in 0..5000 {
+                t.feed(b"x\r\n");
+            }
+            if alternate {
+                t.feed(b"\x1b[?1049h");
+            }
+            t.resize(512, 2);
+            if alternate {
+                t.feed(b"\x1b[?1049l");
+            }
+            assert_eq!(t.effective_history_limit(), 2048);
+            assert!(t.history_size() <= 2048);
+            let retained = t.history_size();
+            t.resize(2, 2);
+            assert_eq!(t.effective_history_limit(), 10000);
+            assert!(t.history_size() <= retained);
+            for _ in 0..11000 {
+                t.feed(b"x\r\n");
+            }
+            assert_eq!(t.history_size(), 10000);
+        }
+    }
+
+    #[test]
+    fn history_zero_from_construction() {
+        let mut t = TerminalCore::with_options(
+            TerminalSize::new(512, 1).unwrap(),
+            TerminalOptions {
+                history_lines: 0,
+                replay: true,
+            },
+        );
+        assert_eq!(t.effective_history_limit(), 0);
+        for _ in 0..3000 {
+            t.feed(b"x\r\n");
+        }
+        assert_eq!(t.history_size(), 0);
+        t.set_history_limit(usize::MAX);
+        for _ in 0..3000 {
+            t.feed(b"x\r\n");
+        }
+        assert!(t.history_size() <= 2048);
+        t.set_history_limit(0);
+        t.clear_history();
+        t.feed(b"x\r\n");
+        assert_eq!(t.history_size(), 0);
+    }
+
+    #[test]
+    fn raw_geometry_adapters_are_bounded() {
+        // Check the adapter before exercising maximum values to avoid a raw allocation.
+        let mut t = TerminalCore::new(0, 0);
+        assert_eq!((t.frame().cols, t.frame().rows), (2, 1));
+        for replay in [false, true] {
+            t = if replay {
+                TerminalCore::with_replay(u16::MAX, u16::MAX)
+            } else {
+                TerminalCore::new(u16::MAX, u16::MAX)
+            };
+            assert_eq!((t.frame().cols, t.frame().rows), (512, 256));
+            t.resize(u16::MAX, u16::MAX);
+            assert_eq!((t.frame().cols, t.frame().rows), (512, 256));
+        }
+    }
+
+    #[test]
+    fn presentation_frame_accepts_one_and_zero() {
+        for (cols, rows) in [(0, 0), (1, 1), (0, 257)] {
+            let f = Frame::blank(cols, rows);
+            assert_eq!((f.cols, f.rows), (cols, rows));
+        }
+        let f = Frame::blank(513, 258);
+        assert_eq!((f.cols, f.rows), (512, 257));
+    }
 
     #[test]
     fn feed_puts_char_into_grid() {
@@ -1187,5 +1317,200 @@ mod tests {
         assert!(!t.frame().cursor_visible);
         t.feed(b"\x1b[?25h");
         assert!(t.frame().cursor_visible);
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line};
+
+    #[test]
+    fn combining_payload_is_bounded_on_both_screens_and_replay() {
+        for replay in [false, true] {
+            let mut t = TerminalCore::with_options(
+                TerminalSize::new(2, 1).unwrap(),
+                TerminalOptions {
+                    history_lines: 0,
+                    replay,
+                },
+            );
+            for switch in [b"".as_slice(), b"\x1b[?1049h".as_slice()] {
+                t.feed(switch);
+                t.feed("界".as_bytes());
+                for _ in 0..100_000 {
+                    t.feed("\u{301}".as_bytes());
+                }
+                t.feed("\u{302}".as_bytes());
+                assert_eq!(
+                    t.term.grid()[Line(0)][Column(0)].zerowidth().unwrap().len(),
+                    16
+                );
+                if replay {
+                    let mut other = TerminalCore::with_replay(2, 1);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(t.snapshot(), other.snapshot());
+                    t.feed(b"\x1b[3b");
+                    other.feed(b"\x1b[3b");
+                    assert_eq!(t.snapshot(), other.snapshot());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combining_replay_preserves_cursor_saved_cursor_and_rep() {
+        for alternate in [false, true] {
+            for initial in ["abcd", "ab界", "界界"] {
+                for cursor in [
+                    "",
+                    "\x1b[1;2H",
+                    "\x1b[1;4H",
+                    "\x1b[?7l",
+                    "\x1b[2;2r\x1b[?6h",
+                ] {
+                    let mut t = TerminalCore::with_replay(4, 2);
+                    if alternate {
+                        t.feed(b"\x1b[?1049h");
+                    }
+                    t.feed(initial.as_bytes());
+                    t.feed(cursor.as_bytes());
+                    t.feed(b"\x1b7");
+                    t.feed("\u{301}".repeat(16).as_bytes());
+                    t.feed("\u{302}".as_bytes());
+                    let mut other = TerminalCore::with_replay(4, 2);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(t.snapshot(), other.snapshot(), "{initial:?} {cursor:?}");
+                    for bytes in [
+                        b"\x1b[3b".as_slice(),
+                        b"\x1b8",
+                        "z\u{303}".as_bytes(),
+                        b"\x1b[2b",
+                    ] {
+                        t.feed(bytes);
+                        other.feed(bytes);
+                        assert_eq!(
+                            t.snapshot(),
+                            other.snapshot(),
+                            "{initial:?} {cursor:?} {bytes:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_combining_replay_preserves_wrapped_saturated_last_column() {
+        let mut t = TerminalCore::with_replay(4, 2);
+        t.feed(b"abcd");
+        t.feed("\u{301}".repeat(16).as_bytes());
+        t.feed(b"x");
+        t.feed("\u{301}".repeat(16).as_bytes());
+        t.feed("\u{302}".as_bytes());
+        let mut other = TerminalCore::with_replay(4, 2);
+        other.feed(&t.replay().unwrap());
+        assert_eq!(t.snapshot(), other.snapshot());
+        for bytes in [b"\x1b[3b".as_slice(), b"yz", b"\x1b[2b"] {
+            t.feed(bytes);
+            other.feed(bytes);
+            assert_eq!(t.snapshot(), other.snapshot());
+        }
+    }
+
+    #[test]
+    fn dropped_combining_last_column_target_does_not_rewrite_cells() {
+        for alternate in [false, true] {
+            for wrapped in [false, true] {
+                for wrap_enabled in [false, true] {
+                    let mut t = TerminalCore::with_replay(4, 2);
+                    if alternate {
+                        t.feed(b"\x1b[?1049h");
+                    }
+                    t.feed(b"abcd");
+                    t.feed("\u{301}".repeat(16).as_bytes());
+                    if wrapped {
+                        t.feed(b"x\x1b[1;4H\x1b[?7l");
+                        // Refused wide input sets pending wrap without
+                        // replacing the wrapped last-column cell.
+                        t.feed("界".as_bytes());
+                    }
+                    t.feed("\u{302}".as_bytes());
+                    t.feed(b"\x1b[2;2H\x1b7\x1b[2;3H");
+                    t.feed(if wrap_enabled {
+                        b"\x1b[?7h"
+                    } else {
+                        b"\x1b[?7l"
+                    });
+                    let mut other = TerminalCore::with_replay(4, 2);
+                    other.feed(&t.replay().unwrap());
+                    assert_eq!(
+                        t.snapshot(),
+                        other.snapshot(),
+                        "alt={alternate} wrapped={wrapped} wrap={wrap_enabled}"
+                    );
+                    for bytes in [
+                        b"\x1b[3b".as_slice(),
+                        b"\x1b8",
+                        "z界".as_bytes(),
+                        b"\x1b[2b",
+                    ] {
+                        t.feed(bytes);
+                        other.feed(bytes);
+                        assert_eq!(t.snapshot(), other.snapshot());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combining_caps_apply_to_split_utf8_and_synchronized_update_flush() {
+        let mut t = TerminalCore::with_replay(2, 1);
+        t.feed(b"\x1b[?2026h");
+        t.feed(b"a");
+        for byte in "\u{301}".repeat(100_000).as_bytes() {
+            t.feed(&[*byte]);
+        }
+        let replay = t.replay().unwrap(); // stop_sync flushes the buffered input.
+        assert_eq!(
+            t.term.grid()[Line(0)][Column(0)].zerowidth().unwrap().len(),
+            16
+        );
+        let mut other = TerminalCore::with_replay(2, 1);
+        other.feed(&replay);
+        assert_eq!(t.snapshot(), other.snapshot());
+    }
+
+    #[test]
+    fn hyperlink_boundaries_and_malformed_chunks() {
+        for (id, uri_len, accepted) in [
+            ("id=x", 4095, true),
+            ("id=x", 4096, false),
+            ("", 4077, true),
+            ("", 4078, false),
+        ] {
+            let mut t = TerminalCore::new(2, 1);
+            let bytes = format!("\x1b]8;{id};{}\x07", "u".repeat(uri_len));
+            for byte in bytes.as_bytes() {
+                t.feed(&[*byte]);
+            }
+            let link = t.term.grid().cursor.template.hyperlink();
+            assert_eq!(link.is_some(), accepted, "{id} {uri_len}");
+            if let Some(link) = link {
+                assert!(link.id().len() + link.uri().len() <= 4096);
+            }
+            t.feed(b"\x1b]8;id=bad;\xff\x07");
+            t.feed(b"\x1b]8;;\x07");
+            assert!(t.term.grid().cursor.template.hyperlink().is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_hyperlink_clears_the_pen() {
+        let mut t = TerminalCore::new(2, 1);
+        t.feed(b"\x1b]8;id=ok;ok\x07");
+        t.feed(format!("\x1b]8;id=x;{}\x07", "u".repeat(4096)).as_bytes());
+        assert!(t.term.grid().cursor.template.hyperlink().is_none());
     }
 }

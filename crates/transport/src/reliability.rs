@@ -578,6 +578,31 @@ impl StreamSender {
             .map_or(buf_end, |limit| buf_end.min(limit))
     }
 
+    /// Remaining bounded admission before allocating a new byte. Peer credit
+    /// is measured from queued end, not the already transmitted frontier.
+    pub(crate) fn write_room(&self, max_unacked: usize) -> usize {
+        if self.desynced {
+            return 0;
+        }
+        let end = self.queued_total();
+        let credit = self
+            .credit_limit
+            .map_or(u64::MAX, |limit| limit.saturating_sub(end));
+        let offset = self.offset_room();
+        max_unacked
+            .saturating_sub(self.buf.len())
+            .min(usize::try_from(credit.min(offset)).unwrap_or(usize::MAX))
+    }
+
+    pub(crate) fn offset_room(&self) -> u64 {
+        let limit = if self.wrap {
+            FULL_OFFSET_MAX
+        } else {
+            u64::from(OFFSET_LIMIT)
+        };
+        limit.saturating_sub(self.queued_total())
+    }
+
     /// Queue bytes for reliable sending. Refused whole, and nothing queued,
     /// when, without `offset-wrap`, they would reach past [`OFFSET_LIMIT`];
     /// bytes already queued stay.
@@ -1677,6 +1702,24 @@ mod tests {
     /// Spec §4.14: a 32-bit field names the full offset nearest where its
     /// reader stands -- across 2^32 either way, never below zero -- and,
     /// without `offset-wrap`, the field itself.
+    #[test]
+    fn bounded_write_room_stops_at_full_offset_limit_and_counts_queued_credit() {
+        let mut sender = StreamSender::new(16);
+        sender.set_features(Features::OFFSET_WRAP);
+        sender.base_offset = FULL_OFFSET_MAX - 7;
+        sender.sent_up_to = sender.base_offset;
+        assert_eq!(sender.write_room(100), 7);
+        sender.push(b"123").unwrap();
+        assert_eq!(sender.write_room(100), 4);
+        sender.credit_limit = Some(FULL_OFFSET_MAX - 1);
+        assert_eq!(sender.write_room(100), 3);
+        assert_eq!(sender.write_room(5), 2);
+        sender.credit_limit = Some(FULL_OFFSET_MAX - 10);
+        assert_eq!(sender.write_room(100), 0);
+        sender.mark_desynced();
+        assert_eq!(sender.write_room(100), 0);
+    }
+
     #[test]
     fn a_wire_offset_names_the_nearest_full_offset() {
         const EDGE: u64 = 1 << 32;

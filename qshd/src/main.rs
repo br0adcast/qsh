@@ -227,6 +227,7 @@ fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
     std::io::stdout().flush().context("flushing stdout")?;
 
     let cfg = transport::ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: transport::Role::Server,
         local_static_priv: keypair.private,
@@ -341,6 +342,7 @@ fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
     std::io::stdout().flush().context("flushing stdout")?;
 
     let cfg = transport::ConnectionConfig {
+        required_features: transport::Features::NONE,
         features: transport::Features::SUPPORTED,
         role: transport::Role::Server,
         local_static_priv: keypair.private,
@@ -916,7 +918,9 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     // startup session of its own to decide, and no tmux to drive -- it hands
     // out channels, and what to put in them (attaching to an existing tmux
     // session or something else entirely) is the client's decision now.
-    let mut backend = channel_backend::ChannelSessionBackend::new();
+    let mut backend = channel_backend::ChannelSessionBackend::new(Arc::new(
+        qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
+    ));
     if !start.binary_path.as_os_str().is_empty() {
         // `None`: the checksum is worked out on the first `About`, off the
         // start-up path. `personal` sweeps away staged files an update that
@@ -1784,9 +1788,11 @@ mod tests {
             Arc::new(socket),
             server.private,
             auth,
-            transport::BackendFactory(
-                Arc::new(qshd::channel_backend::ChannelSessionBackend::new()),
-            ),
+            transport::BackendFactory(Arc::new(qshd::channel_backend::ChannelSessionBackend::new(
+                Arc::new(qshd::screen_budget::ScreenBudget::new(
+                    qshd::screen_budget::BudgetLimits::default(),
+                )),
+            ))),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             transport::LoginEndedReports::none(),
         ));
@@ -1795,6 +1801,7 @@ mod tests {
         let connection = transport::driver_std::StdClient::connect(
             std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port),
             transport::ConnectionConfig {
+                required_features: transport::Features::NONE,
                 features: transport::Features::SUPPORTED,
                 role: transport::Role::Client,
                 local_static_priv: client.private,

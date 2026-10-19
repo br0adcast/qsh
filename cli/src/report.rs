@@ -53,17 +53,17 @@ fn hinted(reason: &::connect::Reason) -> bool {
 /// more than one cause, name the likely ones.
 fn no_answer_words(host: &str, port: u16, why: &NoAnswerWhy) -> String {
     match why {
+        NoAnswerWhy::UnsupportedProtocol { supported } => format!("incompatible authenticated handshake; this client requires QSH protocol {supported}"),
+        NoAnswerWhy::MissingRequiredFeatures { required, enabled } => format!("incompatible authenticated capabilities (required {required:#010x}, enabled {enabled:#010x})"),
+        NoAnswerWhy::InvalidProtocol => "invalid authenticated handshake".to_string(),
         NoAnswerWhy::PortRefused => format!("UDP port {port} refused the connection"),
         NoAnswerWhy::SendFailed { to, os_error, .. } => {
             format!("cannot send to {to}: {os_error}")
         }
         NoAnswerWhy::Silent { waited_secs } => format!(
-            "no answer over qsh in {waited_secs} s -- qshd is not running there, \
-             or a firewall drops UDP port {port}"
+            "No compatible response; this client requires QSH protocol 2 (waited {waited_secs} s)"
         ),
-        NoAnswerWhy::KeyedButSilent => "qshd answered the key request but not the login -- \
-             a different qsh version, or the daemon is overloaded; its log says more"
-            .to_string(),
+        NoAnswerWhy::KeyedButSilent => "No compatible response; this client requires QSH protocol 2".to_string(),
         NoAnswerWhy::NotQshd { reason } => format!(
             "something else answers on UDP port {port}: {}",
             printable(reason)
@@ -546,16 +546,29 @@ mod tests {
 
     /// Spec §4.1, row 3: the key request went unanswered.
     #[test]
+    fn stage6_boundary_silence_reports_a_requirement_not_a_peer_version() {
+        for why in [
+            NoAnswerWhy::Silent { waited_secs: 5 },
+            NoAnswerWhy::KeyedButSilent,
+        ] {
+            let text = no_answer("h", 60200, &why);
+            assert!(
+                text.contains("No compatible response; this client requires QSH protocol 2"),
+                "{text}"
+            );
+            assert!(!text.contains("v0.5"));
+        }
+    }
+
+    #[test]
     fn silence_says_how_long_and_what_it_may_be() {
         assert_eq!(
             no_answer("h", 60200, &NoAnswerWhy::Silent { waited_secs: 5 }),
-            "qsh: h:60200: no answer over qsh in 5 s -- qshd is not running there, \
-             or a firewall drops UDP port 60200"
+            "qsh: h:60200: No compatible response; this client requires QSH protocol 2 (waited 5 s)"
         );
         assert_eq!(
             no_answer("h", 60200, &NoAnswerWhy::Silent { waited_secs: 10 }),
-            "qsh: h:60200: no answer over qsh in 10 s -- qshd is not running there, \
-             or a firewall drops UDP port 60200"
+            "qsh: h:60200: No compatible response; this client requires QSH protocol 2 (waited 10 s)"
         );
     }
 
@@ -564,8 +577,7 @@ mod tests {
     fn a_key_without_a_login_says_the_daemon_answered() {
         assert_eq!(
             no_answer("h", 60200, &NoAnswerWhy::KeyedButSilent),
-            "qsh: h:60200: qshd answered the key request but not the login -- a different \
-             qsh version, or the daemon is overloaded; its log says more"
+            "qsh: h:60200: No compatible response; this client requires QSH protocol 2"
         );
     }
 
@@ -788,8 +800,7 @@ mod tests {
             all_failed(&addrs, &failures, &details, "alice"),
             vec![
                 "qsh: could not connect:".to_string(),
-                "qsh:   a:60022: no answer over qsh in 5 s -- qshd is not running there, or a \
-                 firewall drops UDP port 60022; ssh: qshd is not installed"
+                "qsh:   a:60022: No compatible response; this client requires QSH protocol 2 (waited 5 s); ssh: qshd is not installed"
                     .to_string(),
                 format!(
                     "qsh:   b:61000: no key was accepted over qsh for account alice \
@@ -913,9 +924,7 @@ mod tests {
         }];
         assert_eq!(
             all_failed(&addrs, &f, &[], "u")[1],
-            "qsh:   a:1: on the port qshd reported (60111): qshd answered the key request but \
-             not the login -- a different qsh version, or the daemon is overloaded; its log \
-             says more; the qshd started over ssh did not admit the key it was given (a \
+            "qsh:   a:1: on the port qshd reported (60111): No compatible response; this client requires QSH protocol 2; the qshd started over ssh did not admit the key it was given (a \
              session limit, or another account owns the session) -- qshd's log says which; \
              could not resolve a: no IPv4 or IPv6 address"
         );

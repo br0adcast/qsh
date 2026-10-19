@@ -43,12 +43,14 @@ that some streams carry.
 ```
    byte 0     byte 1
   +--------+--------+---------------------------------------------
-  | 0x01   | kind   | body, meaning depends on the kind
+  | 0x02   | kind   | body, meaning depends on the kind
   +--------+--------+---------------------------------------------
    VERSION
 ```
 
-`VERSION` is `0x01`, fixed for the whole project. `Kind` is one of:
+`VERSION` is `0x02`. Protocol 1 peers, including the published v0.5.0,
+are incompatible: there is no protocol-1 retry or QSH session fallback.
+Configured SSH recovery is separate (§2.6). `Kind` is one of:
 
 | Value | Kind | Body |
 |---|---|---|
@@ -66,7 +68,7 @@ fixed 18-byte header, then the AEAD ciphertext with its tag:
 ```
    0        1        2              10             18
   +--------+--------+--------------+--------------+------------------------+
-  | 0x01   | 0x02   | session_id   | counter      | ChaCha20-Poly1305      |
+  | 0x02   | 0x02   | session_id   | counter      | ChaCha20-Poly1305      |
   |        |        | u64, big-end | u64, big-end | ciphertext + 16B tag   |
   +--------+--------+--------------+--------------+------------------------+
   \_____ header: the associated data only with header-aad _____/
@@ -75,7 +77,7 @@ fixed 18-byte header, then the AEAD ciphertext with its tag:
 What the AEAD authenticates besides the ciphertext depends on the connection
 (§2.6). With `header-aad` negotiated the whole 18-byte header is the
 associated data, so neither the session id nor the counter can be altered
-without the tag failing. With a peer built before negotiation the associated
+without the tag failing. If `header-aad` is not negotiated, the associated
 data is empty: the counter is still protected, because it is the nonce, but
 the `session_id` is not authenticated; altering it only sends the datagram
 to another session, whose keys do not open it. The nonce is
@@ -98,9 +100,9 @@ unknown kind (`BadKind`), and a `Transport` datagram shorter than 18 bytes
 
 Noise IK needs the server's static public key before the client can send
 anything, so a client that has never met a server can ask for it.
-`encode_key_request` builds `0x01 | 0x03 | 0x01`, then zero-pads to
+`encode_key_request` builds `0x02 | 0x03 | 0x01`, then zero-pads to
 `KEY_REQUEST_MIN_LEN` = 64 bytes. The answer is
-`0x01 | 0x04 | 0x01 | server_pub[32]` — 35 bytes. The request is padded past
+`0x02 | 0x04 | 0x01 | server_pub[32]` — 35 bytes. The request is padded past
 the answer deliberately: the amplification factor stays at or below one, so the
 port cannot be used to bounce traffic at a spoofed victim. There is a test for
 exactly that (`a_discovery_request_is_padded_to_the_size_of_its_answer`).
@@ -218,15 +220,15 @@ own messages as records:
 the length is explicit, an unknown record type can be skipped without losing
 sync — which is what lets both peers ignore record kinds they do not know.
 
-Two record vocabularies use this envelope: the shell stream's (`REC_DATA` =
-0 for terminal output, `REC_ECHO_ACK` = 1 carrying a `u64` big-endian count
-of input bytes the server has consumed) and the session control stream's
-(§8). The authentication record has framing of its own (§3).
+Two record vocabularies use this envelope: the channel output stream's
+`DATA` (0), `ECHO_ACK` (1), `GEOMETRY` (2), and `OUTPUT_GAP` (3), and the
+session control stream's (§8). `ECHO_ACK` carries a `u64` big-endian count
+of input bytes the server has consumed. The authentication record has framing of its own (§3).
 
 A record's length is bounded by what its stream carries: 64 KiB on the
 session-control stream (`CONTROL_RECORD_MAX`; its longest record, a
-`CHANNELS` list of eight commands at their 4 096-byte limit, is about
-32 KiB), 64 MiB on any other (`RECORD_MAX`; the longest is a repaint). A
+`CHANNEL_SNAPSHOT` payload is at most 36,386 bytes, checked before
+allocation; see §8), 64 MiB on any other (`RECORD_MAX`; the longest is a repaint). A
 reader that meets a longer declared length stops reading that stream — the
 length that would find the next record cannot be trusted — and drops the
 rest; the daemon logs it once per connection, and the console client
@@ -277,7 +279,7 @@ Two messages, one round trip:
 `encode_msg1`, 23 bytes:
 
 ```
-  HS_VERSION(0x01) | start_kind(1) | token(16) | method(1)
+  HS_VERSION(0x02) | start_kind(1) | token(16) | method(1)
   | offered(u32, big-endian)
 ```
 
@@ -294,22 +296,19 @@ after msg1 decrypts. `session_manager.rs` builds the whole reattach decision
 inside the `accept` call for that reason: it is the only moment where the
 token is available and msg2 has not been written yet.
 
-`parse_msg1` accepts an 18-byte payload — one without the trailing method
-byte — and reads it as `Allowlist`. That is the shape a client built before
-the field existed would send. No shipped client sends it: msg1 is built by
-`Connection::start_session` (`conn.rs`), which `driver_std.rs` calls to
-start every session and which always writes the method byte, on every rung
-the console client takes — the fallback's one-time key included. The 18-byte
-case is a compatibility floor,
-not a description of the current console client. A payload shorter than 23 bytes —
-every client built before negotiation sends 19 — offers nothing.
+`parse_msg1` requires `HS_VERSION = 2`. Within that version, the generic
+codec accepts an 18-byte payload without the method and reads it as `Allowlist`;
+a payload shorter than 23 bytes offers no features. Current encoders always
+write both fields. These shortened forms do not provide protocol-1 compatibility
+and cannot establish an application channel session, which requires the
+`channel-geometry` feature (§2.6).
 
 ### 2.2 What msg2 carries
 
 `encode_msg2`, 30 bytes:
 
 ```
-  HS_VERSION(0x01) | session_id(8, big-endian) | resumed(1) | nonce(16)
+  HS_VERSION(0x02) | session_id(8, big-endian) | resumed(1) | nonce(16)
   | enabled(u32, big-endian)
 ```
 
@@ -324,19 +323,15 @@ client that goes on to send a version 2 AUTH record echoes it back under
 the signature (§3.2.1), so a proof made for one handshake cannot be
 presented for another. `enabled` is what this connection uses (§2.6).
 
-`parse_msg2` stays tolerant of shorter payloads, for a client talking to an
-older server. A 9-byte payload reads as `resumed: false`, which its doc
-argues is both what it meant and the safe way to be wrong: a client that
-believed it had resumed would sit waiting for a channel list that is never
-coming. A 10-byte payload — or one cut off partway through the nonce —
-reads as `nonce: None`, which is likewise the honest reading of a server
-too old to send one; the client then falls back to a version 1 AUTH record,
-because a version 2 one has nowhere to put the nonce it would need
-(`sshauth::v2_fields`, §3.2.1). A payload shorter than 30 bytes — every
-server built before negotiation sends 26 — enables nothing.
+`parse_msg2` also requires `HS_VERSION = 2`. Its generic codec accepts a
+9-byte payload as `resumed: false`; a payload shorter than 26 bytes has no
+nonce, and one shorter than 30 bytes enables no features. Application channel
+clients reject the missing mandatory feature before becoming Live or sending
+queued application output. These codec defaults are not a way to connect to a
+protocol-1 daemon. AUTH record versions in §3 are a separate format from the
+wire and handshake versions.
 
-That failure is reachable on the signature path, and worth knowing about.
-The flag is computed from the decision resolved *inside* `accept` — by the
+The `resumed` flag is provisional on the signature path. It is computed from the decision resolved *inside* `accept` — by the
 `resolve_for_msg2` closure `handle_datagram` passes it — because msg2 has to
 be written there. But the decision actually applied is resolved again after
 probation ends, in `on_probation_ended`, against the table as it stands
@@ -356,10 +351,11 @@ of any kind:
    downgraded into the other. A daemon may run both policies, and then
    `handle_datagram`'s `HandshakeInit` arm makes two `accept` calls, one per
    policy: the client's announced method is what decides which succeeds;
-6. ask the router whether this token resumes an existing session;
-7. decide the features (§2.6), mint the `session_id`, write msg2 with both,
-   take the transport keys in the agreed mode, record the source address,
-   go `Live`.
+6. negotiate features (§2.6) and reject if any configured required bit is
+   missing, before calling the session resolver;
+7. ask the router whether this token resumes an existing session;
+8. mint the `session_id`, write msg2 with the negotiated features, take the
+   transport keys in the agreed mode, record the source address, go `Live`.
 
 There is a *second* server-side entry point, `Connection::on_handshake_init`,
 reached through `on_datagram` rather than `accept`. It refuses
@@ -368,7 +364,8 @@ a proof that arrives afterwards, and `admits` passes for any key under that
 policy, so running it there would mean admitting everyone. The refusal is
 unreachable today; it is pinned so a future refactor cannot turn it into an
 authentication bypass with no symptom. That entry point decides the features
-by the same rule; a msg1 whose payload it cannot read offers nothing.
+by the same rule; a msg1 whose payload it cannot read offers nothing. It also
+rejects missing required features before creating a Live connection.
 
 ### 2.4 Retransmission
 
@@ -385,8 +382,8 @@ carries the cookie too; from then on the retransmits take turns — the plain
 msg1, then the msg1 behind the newest cookie it was handed, and so on
 (`Connection::retransmit_handshake`). The plain turns are there because a
 cookie need not come from the daemon: a party on the path that sees msg1 can
-answer it with one, and a daemon built before cookies drops every msg1 behind
-one (§2.7, "Old daemons"). Against a daemon under load a plain turn costs a
+answer it with one, and a compatible peer without cookie support would drop
+every msg1 behind one (§2.7, "Peers without cookies"). Against a daemon under load a plain turn costs a
 cookie reply and nothing else. A second cookie waits for its turn rather than
 going out at once, so a cookie that keeps failing (a NAT that changes the
 port on every packet) cannot turn into a ping-pong. The daemon takes the
@@ -417,7 +414,9 @@ connection will do (`enabled`, §2.2).
 | 0 (`0x0000_0001`) | `header-aad` | the 18-byte datagram header is the AEAD's associated data (§1.1) |
 | 1 (`0x0000_0002`) | `stream-credit` | `CREDIT` frames and per-stream limits (§7) |
 | 2 (`0x0000_0004`) | `offset-wrap` | stream offsets modulo 2³² (§7) |
-| 3–31 | — | reserved, sent as zero |
+| 3 (`0x0000_0008`) | `auth-accepted` | reserved; not advertised or enabled |
+| 4 (`0x0000_0010`) | `channel-geometry` | ordered geometry and atomic channel lifecycle discovery; required by application channel peers |
+| 5–31 | — | reserved, sent as zero |
 
 - A client offers what it implements (`Features::SUPPORTED`).
 - A server turns a bit on exactly when msg1 offered it, its configuration
@@ -427,25 +426,34 @@ connection will do (`enabled`, §2.2).
   they are offered; bytes after either field are ignored, for fields not
   invented yet.
 
-Why not a version number or a Noise prologue: either would make an old peer
-and a new one stop understanding each other outright — including the old
-personal daemon updated over qsh itself. Both fields travel
-inside the Noise messages, so a party on the path can neither alter nor
-strip them without the handshake failing (msg1's payload has no forward
-secrecy under IK, but what a client offers is no secret). The old mode stays
-supported indefinitely; making a feature mandatory would be a separate
-decision.
+Wire, handshake and channel protocol versions are all **2**. The feature
+fields are authenticated by Noise; negotiation remains the intersection of
+what the client offers, the server allows and this build implements. Application
+channel clients and daemons require `channel-geometry`: the server checks before
+session resolution/allocation or backend attachment, and the client before Live and
+queued application output. Missing geometry is a protocol failure, not a silent
+resize fallback. Bit 3 remains unadvertised: geometry or `ABOUT` is not an
+explicit post-proof authentication acceptance message. Generic transport-only
+profiles can explicitly require `Features::NONE`; this does not relax the
+application channel profile.
 
-This build implements all three. Between two ends of this version every
-connection runs with the header under the AEAD, with stream credits and with
-stream offsets that go on past 2³²; with a client or daemon built
-before negotiation it runs in the old mode.
+`Features::SUPPORTED` is `0x17`: header AAD, credits, offset wrapping and channel
+geometry. Protocol 1 datagrams are ignored at the outer parser; silence alone
+does not identify a peer's version. The CLI reports that protocol 2 is required
+when no compatible reply arrives. Configured SSH installation/recovery remains
+a separate path, not a protocol-1 QSH session.
 
 - A client that finds a bit in msg2 it did not offer treats msg2 as a
   protocol violation: `Event::UnofferedFeatureEnabled`, a line on stderr
   (`server enabled a transport feature it was not offered: 0x…`), and the
   connection closes — reading msg2 spent the Noise state, so there is nothing
   to wait for.
+- An authenticated msg2 with an invalid handshake version/shape reports
+  `Event::InvalidHandshakeResponse`; missing required bits report
+  `Event::MissingRequiredFeatures`. The standard driver exposes these as typed
+  protocol failures. The CLI ends that handshake attempt and key loop instead
+  of trying another key or rediscovering the key at that address; its ordinary
+  configured SSH/other-address recovery remains separate.
 - The decision is a function of msg1 and the configuration, so a
   retransmitted msg1, and its twin that went through probation on its own,
   get the same answer; the server's cached msg2 (`ResendMsg2`, §4) carries
@@ -457,10 +465,10 @@ before negotiation it runs in the old mode.
 
 What a connection agreed is visible: the daemon logs
 `session <id>: transport features <names>` for each connection a session
-binds (`none` with an old client); `qshd self-check` lists what the build
+binds; `qshd self-check` lists what the build
 implements (`transport_features`); `qsh --verbose` writes
 `transport features: …` to its log. Hosts can read the negotiated features
-through `StdClient::features` or `TmuxSession::transport_features`.
+through `Connection::features` or `StdClient::features`.
 
 ### 2.7 Proving the return address under load
 
@@ -486,7 +494,7 @@ log rather than two lines per flicker.
 
 **Under load** a `HandshakeInit` gets this answer and nothing else:
 
-    0x01 | 0x05 | 0x01 | echo(16) | cookie(16)          -- 35 bytes
+    0x02 | 0x05 | 0x01 | echo(16) | cookie(16)          -- 35 bytes
 
 `echo` is the first 16 bytes of the msg1's ephemeral key. `cookie` is keyed
 BLAKE2s-128 over `"qsh cookie v1" | source address (16 bytes, IPv4 mapped to
@@ -500,7 +508,7 @@ The client takes the reply only while its handshake is under way, only from
 the address its msg1 went to, and only if `echo` is its own; then it sends
 the same msg1 behind the cookie (`HandshakeInitCookie`):
 
-    0x01 | 0x06 | cookie(16) | Noise msg1
+    0x02 | 0x06 | cookie(16) | Noise msg1
 
 and its retransmits carry the cookie in turn with the plain msg1 (§2.4). A
 msg1 behind a cookie valid for its source and its ephemeral key is worked on,
@@ -535,20 +543,23 @@ to mint a cookie, up to two to check one against both secrets) and builds
 the answer — no Noise work, no nonce, no seat. An honest new client pays one
 round trip, and only while the load lasts.
 
-**Old clients.** A client built before this does not know kind `0x05`
-(`wire::parse` returns `BadKind`): it keeps sending plain msg1 every 500 ms
+**Peers without cookies.** The following describes the generic cookie mechanism,
+not interoperability with protocol-1 binaries. A compatible client without cookie
+support behaves like the pre-cookie implementation.
+
+**Client side.** Such a client drops kind `0x05` as unknown (`BadKind`): it keeps sending plain msg1 every 500 ms
 and is refused until the load is over — at least a second after a flood
 stops. That is the price of the defence, paid only under load — and load is
 cheap to cause: 65 forged msg1s a second, about 6.4 KB/s, keep it on for as
 long as they last.
 
-**Old daemons.** A daemon built before this never sends `0x05`, and drops
-`0x06` (`BadKind`). But a cookie reply need not come from the daemon: a
+**Server side.** A compatible daemon without cookie support never sends `0x05`
+and drops `0x06` (`BadKind`). But a cookie reply need not come from the daemon: a
 party on the path that sees msg1 — and so its echo — can answer it with a
 cookie in the daemon's name, and the client sends `0x06` to a daemon that
 drops it. Were every retransmit behind that cookie, a lost first exchange
 (msg1 or msg2) would keep the client out for good. The retransmits take
-turns with the plain msg1 instead (§2.4), so the old daemon sees msg1 again
+turns with the plain msg1 instead (§2.4), so that daemon sees msg1 again
 at the second retransmit after the cookie, a second or so later.
 
 **What it does not do.**
@@ -742,7 +753,7 @@ issued for *this* handshake and refuses the record — `AuthError::BadRecord`
 the verifier at all.
 
 **Which version a client sends** is decided by `sshauth::v2_fields`, from
-whether msg2 carried a nonce: no nonce (a server too old to send one) means
+whether msg2 carried a nonce: no nonce means
 a version 1 record, because there is nowhere in it to put a login. A nonce
 present means a version 2 record — and requires a login already configured
 on the signer (`with_login`, which the CLI calls for every candidate it
@@ -1323,7 +1334,7 @@ flap.
 
 **Moving by hand.** A client's owner can move the session onto one of its
 roads itself: `Connection::use_road(addr, now)`, reached through
-`StdClient::use_road` and `TmuxSession::use_road(label)`. It is refused unless this is a client with a session
+`StdClient::use_road`. It is refused unless this is a client with a session
 (`NoSession`), `addr` is one of the roads handed to `set_paths`
 (`UnknownRoad`), and the road is `Verified` (`NotAnswering`) -- by hand one
 cannot go anywhere automatic moving would not; the road already in use is
@@ -1395,8 +1406,7 @@ A flush (`Connection::flush_senders`) puts out, in this order:
 one `CREDIT` per stream, the newest limit — rides the next datagram this
 side sends anyway (`DATA`, `PING`, `PONG`, `Reset`, `Close`); what nothing
 carries goes alone `ACK_DELAY` = 20 ms after the first of it was owed. That
-is ten times less than the shortest retransmit timeout of an older peer
-(200 ms) and under a terminal's frame time. It goes at once after
+is below the 200 ms retransmit floor used before adaptive timeout tuning. It goes at once after
 `ACK_EVERY` = 4 `DATA` frames that extended an unbroken stream; for a `DATA`
 that did not — a repeat of what was delivered (the last `ACK` may be lost),
 one past a hole, one that fills a hole (fast retransmit and recovery count
@@ -1405,10 +1415,10 @@ that may be stopped at its limit. A `PONG` goes the moment its `PING` is
 read — it times a round trip — and takes what waits with it. The deadline
 is one `Connection::next_timeout` reports and `on_timeout` serves; a
 daemon's probation, which stops pumping its connection while a proof is
-verified, sends what it owes first (`Connection::answer_now`). An older
-peer acknowledges every `DATA` at once; this side counts an `ACK` for at
-most `ACK_EVERY` segments in the window's growth, which an older peer's
-single-segment `ACK`s never reach.
+verified, sends what it owes first (`Connection::answer_now`). A peer may
+acknowledge every `DATA` at once; this side counts an `ACK` for at most
+`ACK_EVERY` segments in the window's growth, so a single-segment `ACK`
+still counts only that segment.
 
 What it costs and saves. A round trip timed by an `ACK` includes up to
 20 ms of the receiver's wait: the safe side for a retransmit timer, and
@@ -1480,8 +1490,8 @@ drain. A move onto another road, a rebind and a wake from sleep start the
 window afresh -- the client's when it moves, rebinds or wakes, the server's
 when it follows its client to a new address or port -- and what was in
 flight then is resent under the fresh window rather than taken for a
-timeout. No frame changes: an older peer sees nothing but a sender that
-sends less at a time.
+timeout. This requires no extra frame: the peer sees a sender that sends
+less at a time.
 
 One more signal is not in NewReno: a round-trip sample (a `PONG`, or an `ACK`
 timed by Karn's rule) more than 500 ms (`QUEUE_DELAY_CAP`) above the road's
@@ -1770,7 +1780,8 @@ count. A field exactly 2³¹ away reads as behind, and one that would name an
 offset below zero is ignored. A stream simply goes on past 4 GiB, and a
 fast recovery's point is a full offset too.
 
-Without `offset-wrap` — a peer built before it — offsets do not wrap. A
+When a protocol-2 connection negotiates without `offset-wrap`, offsets do not
+wrap. A
 sender refuses to queue a byte past `OFFSET_LIMIT` = `u32::MAX` − 16 MiB:
 the write is refused, the connection reports `Event::OffsetSpaceExhausted`
 once for that stream, and its owner drops the connection without a `Close`
@@ -1787,7 +1798,7 @@ client it is:
   `qsh` reconnects warm at once.
 
 That is one such break per 4 GiB of one stream over one connection, and
-only while one end is older. A receiver in that mode drops a `DATA` frame
+only without `offset-wrap`. A receiver in that mode drops a `DATA` frame
 that ends past `u32::MAX` without delivering or acknowledging any of it.
 
 **Congestion control** is of the simplest kind: one window per
@@ -1840,10 +1851,14 @@ channel whose process ends while output it dropped is still unrepainted
 sends its repaint before the channel goes. A channel without a model
 (`tmux -C`: 512 KiB / 256 KiB) presses on its process instead: its reader
 waits for the gate before it reads, and the process blocks writing to its
-PTY, as behind a slow SSH. The control stream has no gate. While the client
-is gone the bridge opens every gate at the end of each turn (the output is
-thrown away and the return repaints anyway); bytes a backend hands over in
-between still count until the bridge takes them.
+PTY, as behind a slow SSH. The control stream has no gate. In the required
+channel-geometry profile, a parked bridge stops admitting output and retains
+pending DATA charges, metadata permits and the previous connection's frozen
+unacknowledged tail. It does not force gates open or discard NoScreen output.
+Backpressure therefore remains effective while the client is gone. Reattachment
+replaces the old connection tail while preserving pending ownership; ordered
+bootstrap and retained output drain under the new connection's admission limits
+as described below.
 
 **Consumption.** The bridge's connection counts every stream explicitly, the
 proof's excepted, and who says WHEN a stream's bytes count as taken is the
@@ -1928,7 +1943,7 @@ Records on `CONTROL_STREAM`, in the envelope of §1.5:
 | Kind | Direction | Meaning |
 |---|---|---|
 | `0x10` `OPEN` | client | open a channel — see the layout below |
-| `0x11` `RESIZE` | client | `stream(1) cols(2) rows(2)` |
+| `0x16` `RESIZE_REQUEST` | client | `stream(1) instance(u64) request_id(u64) cols(2) rows(2)` |
 | `0x12` `CLOSE` | client | `stream(1)` |
 | `0x13` `TERM` | client | the client emulator's terminal type, before the first `OPEN` |
 | `0x14` `ABOUT_REQUEST` | client | "who are you" — empty body |
@@ -1936,15 +1951,15 @@ Records on `CONTROL_STREAM`, in the envelope of §1.5:
 | `0x20` `OPENED` | server | `stream(1)` — it is running |
 | `0x21` `REFUSED` | server | `stream(1)` + a human-readable reason |
 | `0x22` `EXIT` | server | `stream(1) code(i32)` — the process ended |
-| `0x23` `CHANNELS` | server | what is already running, after a warm reattach |
+| `0x28` `PROTOCOL_ERROR` | server | `code(u16)` |
+| `0x29` `CHANNEL_SNAPSHOT` | server | one atomic active/draining lifecycle snapshot after warm attachment |
 | `0x24` `ABOUT` | server | `build(u64) checksum(32) arch_len(1) arch protocol(1) mode(1)` |
 | `0x25` `UPDATE_ANSWER` | server | a code; `Busy` adds `others(u32)` |
 | `0x26` `UPDATE_RESULT` | server | a code; `Rejected` adds `reason_code(1)` and a UTF-8 detail, `Busy` adds `others(u32)` |
 | `0x27` `RESTARTING` | server | the daemon is about to replace itself — empty body |
 
-An `OPEN` request has this layout, and so does every entry of `CHANNELS` —
-both go through one encode/decode pair, so the two record kinds cannot drift
-apart:
+An `OPEN` request has this layout. Active snapshot entries reuse this
+encoding after their nonzero `instance(u64)`:
 
 ```
   stream(1) | kind(1) | cols(2) | rows(2) | flags(1) | cmd_len(2) | command
@@ -1952,9 +1967,25 @@ apart:
               1=Command                     screen
 ```
 
-`CHANNELS` is a one-byte count followed by that many entries in exactly that
-layout. `REFUSED` is `stream(1)` followed by the reason as UTF-8 to the end
-of the payload; `EXIT` is `stream(1) | code(i32 big-endian)`.
+`CHANNEL_SNAPSHOT` contains `active_count(u8)`, the active entries,
+`draining_count(u8)`, then draining entries. Each draining entry is exactly
+15 bytes: `stream(1) instance(u64) kind(1) cols(2) rows(2) screen(1)`.
+It retains immutable OPEN classification after the process has ended; it is
+not a writable channel or an authoritative geometry update. Active entries
+carry the runner's current OPEN request, including its command. Commands are
+at most 4096 bytes; active count is at most 8 and active plus draining at most
+240, the stream IDs 16–255. A stream appears only once across both lists.
+
+`channel_snapshot.rs` preflights the entire payload without allocations,
+checking counts, uniqueness, instance IDs, classification, command lengths,
+geometry and exact exhaustion. Its maximum payload is
+`2 + 8*(8 + 9 + 4096) + 232*15 = 36,386` bytes (36,391 framed), below the
+64 KiB control-record cap. Retained arrays and commands are normalized to
+validated lengths. Eight live channels does not bound ended channels to eight.
+
+`REFUSED` is `stream(1)` followed by its UTF-8 reason; `EXIT` is
+`stream(1) | code(i32 big-endian)`. Retired kinds `0x11` and `0x23` are
+malformed known messages, not accepted legacy messages or skippable extensions.
 
 `cols` or `rows` of 0 means "no pseudo-terminal". `take_open` rejects a
 stream below `FIRST_CHANNEL_STREAM`, a `Shell` request with a non-empty
@@ -1979,7 +2010,8 @@ then an English detail meant for a log: `0 other`, `1 size mismatch`,
 (the control socket could not be held still in time, §8.1; nothing was
 replaced). An unknown code is kept as such
 (`Unknown`), not treated as malformed. `arch` is lower-case letters, digits
-and `_`, at most `MAX_ARCH_LEN` = 32 bytes. `PROTOCOL_VERSION` is `1`.
+and `_`, at most `MAX_ARCH_LEN` = 32 bytes. `PROTOCOL_VERSION` is `2`;
+`qshd self-check` advertises `protocols:[2]`.
 
 The `screen` flag is what the client *asks for*, not what it gets: the
 server declares a channel's recoverability from the spawned channel's own
@@ -1987,28 +2019,79 @@ answer (whether it has a screen model), both at open and again after a warm
 reattach. That declaration is what `set_stream_resyncable` carries into the
 transport (§5.2).
 
-`CHANNELS` is sent as the first record after a warm reattach **and only
-then**, so a returning client binds to what is running instead of opening a
-second copy of each. It is never sent on a cold start, where an empty list
-would be indistinguishable from a server that forgot to answer.
+`CHANNEL_SNAPSHOT` is the first control record on a warm attachment. The
+runner and bridge combine active and draining owners into one atomic snapshot
+and fence receive-side channel input until this exact attachment's snapshot is
+admitted. This allows a fresh client process to classify retained final output
+even after the runner has
+removed the ended process. Cold starts establish channels through OPEN/OPENED.
 
-A refusal is an answer, not a session failure: past the channel cap, on a
-reused stream number, or when the spawn itself fails, the client gets
-`REFUSED` and everything else keeps running. A channel ending is news, not a
-failure either: its exit code arrives as `EXIT`, once every byte of the
-channel's output — its last repaint included — has been acknowledged by
-the client. Streams are delivered independently, and a client drops a
-channel's data after its `EXIT`, so the daemon's backend asks its bridge to
-say when the channel's stream is delivered (`SessionIo::notify_delivered`)
-and sends `EXIT` then; a warm reattach answers at once, since the new
-connection holds none of the old data. Nothing on the wire changes. A
-`CLOSE` from the client meanwhile owes it no `EXIT`, and neither does a
-stream number it opens again.
+A refusal is an answer, not a session failure: failed OPEN receives `REFUSED`.
+The client needs both lifecycle metadata and an ordered `Established` geometry
+before Ready. Draining metadata never authorizes input. A new instance retires
+old parser/buffer/intent ownership atomically; the same ended instance cannot
+resurrect, lose its continuity state, or produce a second Exit.
 
-A channel's own data stream carries the §1.5 shell records — `REC_DATA` for
-output and `REC_ECHO_ACK` for input the server has consumed — interleaved on
-the same ordered stream. That is deliberate: an acknowledgement sent right
-after its output is applied by the client only after that output has already
+After EOF, final geometry/checkpoint output precedes an internal delivery marker.
+`EXIT` is held with its descriptor and budget permit until the output frontier
+has been transport-acknowledged and the control record reaches a real bounded
+handoff, or scoped teardown releases it. Warm attach carries pending ownership
+forward rather than declaring old output delivered. An ACK proves transport
+receipt, not application display. The client retains partial output framing when
+Exit arrives on the independent control stream and drains complete records
+before exposing Exit. A client CLOSE owes no Exit; reused instances cannot receive
+an old instance's completion.
+
+**Ordered geometry.** `GEOMETRY` has a 22-byte payload:
+`instance(u64) request_id(u64) outcome(1) reason(1) cols(2) rows(2)`.
+Outcome 0 is Established (request ID 0, reason 0), 1 Applied (nonzero ID,
+reason 0), and 2 Refused (nonzero ID, reason below). Instance IDs are nonzero.
+Refusal codes are 1 InvalidSize, 2 NoPty, 3 ResourceLimit, 4 PtyResizeFailed,
+5 ScreenPreparationFailed. A no-PTY OPEN retains its either-zero classification
+and cannot acquire a PTY by resizing. Other dimensions must satisfy the terminal
+resource policy. `PROTOCOL_ERROR` code 1 is ResizePipelineOverflow, an attempt
+failure distinct from OPEN refusal or process exit.
+
+Resize IDs are scoped to an attachment and channel instance. A client keeps
+requested dimensions separately from committed dimensions, allows one request
+in flight and coalesces later intent. The server reserves preparation/scratch
+before ioctl, commits the model/request only on success, then orders Geometry
+before output produced under the new size. A refusal reports the unchanged
+committed geometry. The same refused intent revision is not retried on ticks,
+repaint or warm reconnect; changing away and back is a new revision. Request-ID
+exhaustion fails explicitly. DATA before a boundary is rendered before geometry
+changes, even when both arrive in one callback batch.
+
+`OUTPUT_GAP` has a nine-byte payload `instance(u64) cause(1)`; cause 1 is
+PreviousConnectionOutputUnconfirmed. It marks an abandoned unacknowledged DATA
+frontier from the previous connection: those bytes may or may not have reached
+the application. Metadata-only replacement does not create a gap. An
+unacknowledged gap survives another attachment without intervening DATA. Screen
+snapshots can replace obsolete output; NoScreen records require
+complete-record credit admission and retain their bytes across attach. These
+bounds do not promise exactly-once replay.
+
+At cutover, bootstrap geometry precedes retained output. Old correlated outcomes
+become uncorrelated Established checkpoints; retained DATA keeps its geometry
+boundaries, followed by the current checkpoint and new output. A gap follows
+initial geometry and precedes the affected DATA. Only Screen DATA may drain in
+byte slices. A NoScreen DATA record is at most 8197 bytes (8192 payload plus
+framing); it needs room for the entire record under peer credit, offset headroom
+and the 512 KiB local unacknowledged-output cap. Geometry and gaps also require
+whole-record admission. Insufficient room retains ownership, and a credit or
+capacity notification resumes draining without needing another process write.
+
+The client validates declared record sizes before bulk deframing allocations.
+Before lifecycle/initial geometry, retention is at most 64 KiB of DATA payload
+and 256 events per channel. Unclassified channels additionally share an aggregate
+512 KiB declared-byte and 2048-event limit across at most 240 unknown IDs.
+Excess or contradictory known metadata fails explicitly. Portable same-instance
+intent preserves desired revision, refusal and debounce eligibility across
+reattachment; provisional early geometry cannot overwrite newer local intent.
+
+A channel's own data stream carries the §1.5 records — DATA, ECHO_ACK,
+GEOMETRY and OUTPUT_GAP — interleaved on the same ordered stream. An input
+acknowledgement sent right after its output is applied only after that output has
 reached the emulator, so local echo prediction has no "acknowledged before
 shown" race to handle.
 
@@ -2018,10 +2101,11 @@ shown" race to handle.
 `qshd/src/handover.rs`.
 
 A client that carries daemon images sends `ABOUT_REQUEST` right after the
-link is live and before it opens anything. A daemon that predates the
-record skips it and never answers; the client waits a bounded time and
-reads the silence as "cannot update itself". A daemon started by a service
-manager (`serve`, with or without `--system`) answers with mode `1` and
+link is live and before it opens anything. This requires a compatible QSH
+session; it cannot update a protocol-1 peer through a protocol-2 connection.
+If a compatible peer does not answer the request, the client waits a bounded
+time and treats the update facility as unavailable. A daemon started by a
+service manager (`serve`, with or without `--system`) answers with mode `1` and
 answers every offer `Managed`. The daemon works out its own checksum on the
 first `ABOUT_REQUEST` (off the session's loop), never at start-up.
 
@@ -2118,9 +2202,9 @@ promised more than the code delivers would be worse than no section.
 Everything after the two handshake messages is ChaCha20-Poly1305. Between
 two ends of this version the 18-byte header is its associated data
 (`header-aad`, §2.6): contents are confidential, contents and header are
-tamper-evident, and a modified `session_id` or `counter` fails the tag. With
-an end built before negotiation — an older `qsh`, an older
-personal or system daemon — the associated data is empty: the counter still
+tamper-evident, and a modified `session_id` or `counter` fails the tag. If a
+protocol-2 connection explicitly negotiates without `header-aad`, the associated
+data is empty: the counter still
 cannot be altered, because it is the nonce, but the `session_id` can; the
 datagram then goes to another session, whose keys do not open it, and is
 dropped. That leaves an attacker nothing a party on the path could not do by
@@ -2465,3 +2549,6 @@ same reason.
 - **Neither end is defended against its own host.** Someone who controls the
   server can read every session on it; someone who controls your machine can
   read your key, your tokens and your terminal. Nothing here changes that.
+
+Terminal geometry, admission refusals, payload caps and qualified storage bounds
+are documented in [Terminal resource policy](terminal-resources.md).
