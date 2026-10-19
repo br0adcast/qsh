@@ -1327,6 +1327,10 @@ fn channel_events(
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_channel_exit(ch, code, now_ms()));
             }
+            SessionEvent::ExitStatusUnavailable { ch } if *shell_channel == Some(ch) => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(sess.on_channel_exit_status_unavailable(ch));
+            }
             SessionEvent::Refused { ch, reason }
                 if shell_channel.is_none_or(|shell| shell == ch) =>
             {
@@ -1381,6 +1385,7 @@ fn channel_events(
             | SessionEvent::Data { .. }
             | SessionEvent::InputConsumed { .. }
             | SessionEvent::Exit { .. }
+            | SessionEvent::ExitStatusUnavailable { .. }
             | SessionEvent::Refused { .. }
             | SessionEvent::Vanished { .. } => {}
         }
@@ -1882,6 +1887,63 @@ mod tests {
         )));
         assert_eq!(sess.size(), before);
         assert_eq!(sess.desired_size(), before);
+    }
+
+    #[test]
+    fn unavailable_exit_reports_local_failure_after_final_output_for_tracked_shell_only() {
+        let mut sess = geometry_session();
+        sess.on_channel_ready(16, 0);
+        let mut pending = Vec::new();
+        let ignored = channel_events(
+            vec![SessionEvent::ExitStatusUnavailable { ch: 99 }],
+            &mut Some(16),
+            &mut sess,
+            &mut pending,
+            &|| 1,
+        );
+        assert!(ignored.is_empty());
+        let mut reference = geometry_session();
+        reference.on_channel_ready(16, 0);
+        let expected = reference.handle(
+            UiEvent::Stream0(encode_record(REC_DATA, b"final output")),
+            1,
+        );
+        let actions = channel_events(
+            vec![
+                SessionEvent::Data {
+                    ch: 16,
+                    bytes: b"final output".to_vec(),
+                },
+                SessionEvent::ExitStatusUnavailable { ch: 16 },
+            ],
+            &mut Some(16),
+            &mut sess,
+            &mut pending,
+            &|| 1,
+        );
+        assert!(pending.is_empty());
+        assert!(actions.starts_with(&expected));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::Exit(1)))
+                .count(),
+            1
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::Notice(text)
+            if text == "qsh: the remote process ended, but its exit status is unavailable")));
+        // Session owns renderer cleanup; the TTY guard owns alternate-screen
+        // restoration, which requires a separate actual PTY assertion.
+        assert!(matches!(actions.last(), Some(Action::Exit(1))));
+        assert!(actions
+            .iter()
+            .rev()
+            .find_map(|action| match action {
+                Action::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .unwrap()
+            .ends_with(b"\x1b[?25h\r\n"));
     }
 
     fn addr(literal: &str) -> SocketAddr {

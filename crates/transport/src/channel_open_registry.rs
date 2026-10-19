@@ -11,6 +11,7 @@ pub use executor::*;
 use crate::auth::Principal;
 use crate::channel::OpenRequest;
 use crate::channel_geometry::ChannelInstance;
+use crate::channel_server::reaping::Capsule as ReapCapsule;
 use crate::session_manager::LoginId;
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +81,12 @@ struct Registration {
     outcome: Mutex<Option<OpenOutcome>>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
+struct Retiring {
+    owner: Arc<ReapCapsule>,
+    uid: u32,
+}
 struct RegistryState {
+    retiring: HashMap<usize, Retiring>,
     jobs: HashMap<OpenJobId, Arc<Registration>>,
     uids: HashMap<u32, usize>,
     next_job: u64,
@@ -144,6 +150,7 @@ impl OpenJob {
         release_uid(&mut state, removed.request.owner.uid);
         let slot = InstalledSlot {
             session: removed.session.clone(),
+            uid: removed.request.owner.uid,
         };
         drop(state);
         drop(removed);
@@ -196,6 +203,7 @@ impl AdoptedOpen {
         let spawned = self.channel.adopt().ok()?;
         let slot = InstalledSlot {
             session: registered.session.clone(),
+            uid: registered.request.owner.uid,
         };
         let bridges = installation.commit(spawned, slot);
         let removed = state.jobs.remove(&self.job.id);
@@ -214,10 +222,20 @@ impl Drop for OpenJob {
 
 pub struct InstalledSlot {
     session: Arc<SessionOpenLedger>,
+    uid: u32,
+}
+impl InstalledSlot {
+    pub(crate) fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub(crate) fn belongs_to(&self, registry: &Arc<ChannelOpenRegistry>) -> bool {
+        Weak::ptr_eq(&self.session.registry, &Arc::downgrade(registry))
+    }
 }
 impl Drop for InstalledSlot {
     fn drop(&mut self) {
         self.session.occupied.fetch_sub(1, Ordering::SeqCst);
+        self.session.ready.notify_one();
     }
 }
 
@@ -235,6 +253,7 @@ impl ChannelOpenRegistry {
         Arc::new(Self {
             state: Mutex::new(RegistryState {
                 jobs: HashMap::new(),
+                retiring: HashMap::new(),
                 uids: HashMap::new(),
                 next_job: 1,
                 next_session: 1,
@@ -281,7 +300,7 @@ impl ChannelOpenRegistry {
             return Err(OpenRefusal::InvalidIdentity);
         }
         let uid = request.owner.uid;
-        if state.jobs.len() >= self.limits.global
+        if state.jobs.len() + state.retiring.len() >= self.limits.global
             || state.uids.get(&uid).copied().unwrap_or(0) >= self.limits.per_uid
             || session.occupied() >= crate::channel::MAX_CHANNELS
         {
@@ -311,11 +330,54 @@ impl ChannelOpenRegistry {
         })
     }
     pub fn outstanding(&self) -> usize {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.jobs.len() + state.retiring.len()
+    }
+    pub fn retiring_count(&self) -> usize {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .jobs
+            .retiring
             .len()
+    }
+    pub(crate) fn register_reap(&self, owner: Arc<ReapCapsule>, uid: u32) {
+        let stop = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let key = Arc::as_ptr(&owner) as usize;
+            assert!(state
+                .retiring
+                .insert(
+                    key,
+                    Retiring {
+                        owner: owner.clone(),
+                        uid
+                    }
+                )
+                .is_none());
+            // These children were already admitted. Retirement cannot fail when
+            // several healthy installed children exceed the pending-open cap;
+            // the charge prevents further unresolved-retirement churn.
+            *state.uids.entry(uid).or_default() += 1;
+            state.fence.is_some()
+        };
+        if stop {
+            owner.stop();
+        }
+    }
+    pub(crate) fn finish_reap(&self, owner: &Arc<ReapCapsule>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = Arc::as_ptr(owner) as usize;
+        let Some(entry) = state.retiring.get(&key) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.owner, owner) {
+            return;
+        }
+        let removed = state.retiring.remove(&key).expect("exact registered reap");
+        release_uid(&mut state, removed.uid);
+        self.changed.notify_all();
+        drop(state);
+        drop(removed);
     }
     pub fn cleanup(&self, id: OpenJobId) -> CleanupStatus {
         let registration = self
@@ -383,6 +445,15 @@ impl ChannelOpenRegistry {
         for registration in state.jobs.values() {
             registration.custody.cancel();
         }
+        let retiring: Vec<_> = state
+            .retiring
+            .values()
+            .map(|entry| entry.owner.clone())
+            .collect();
+        drop(state);
+        for owner in retiring {
+            owner.stop();
+        }
         Ok(RestartOpenFence {
             registry: self.clone(),
             id,
@@ -396,7 +467,7 @@ impl RestartOpenFence {
             if state.fence != Some(self.id) {
                 return None;
             }
-            if state.jobs.is_empty() {
+            if state.jobs.is_empty() && state.retiring.is_empty() {
                 return Some(OpenExecPermit { _fence: self });
             }
             let remaining = deadline.checked_duration_since(std::time::Instant::now())?;

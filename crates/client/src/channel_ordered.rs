@@ -41,6 +41,20 @@ pub enum ChannelProtocolError {
     RequestIdExhausted,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitOutcome {
+    Code(i32),
+    Unavailable,
+}
+impl ExitOutcome {
+    fn event(self, ch: ChannelId) -> SessionEvent {
+        match self {
+            Self::Code(code) => SessionEvent::Exit { ch, code },
+            Self::Unavailable => SessionEvent::ExitStatusUnavailable { ch },
+        }
+    }
+}
+
 pub(super) const EARLY_EVENTS: usize = 256;
 pub(super) const UNKNOWN_BYTES: usize = 512 * 1024;
 pub(super) const UNKNOWN_EVENTS: usize = 2048;
@@ -103,7 +117,7 @@ struct Entry {
     buffer: VecDeque<SubstrateEvent>,
     payload_bytes: usize,
     retained_bytes: usize,
-    exit: Option<i32>,
+    exit: Option<ExitOutcome>,
 }
 impl Default for Entry {
     fn default() -> Self {
@@ -164,6 +178,7 @@ impl Entry {
         self.buffer.len() + usize::from(self.exit.is_some())
     }
     fn all_retained_bytes(&self) -> usize {
+        // Reserve the larger numeric Exit size for either terminal status.
         self.retained_bytes + 10 * usize::from(self.exit.is_some())
     }
 }
@@ -785,6 +800,7 @@ impl OrderedSession {
                     | SubstrateEvent::ExtendedData { ch, .. }
                     | SubstrateEvent::InputConsumed { ch, .. }
                     | SubstrateEvent::Exit { ch, .. }
+                    | SubstrateEvent::ExitStatusUnavailable { ch }
                     | SubstrateEvent::Geometry { ch, .. }
                     | SubstrateEvent::OutputGap { ch, .. } => *ch,
                     _ => unreachable!(),
@@ -815,18 +831,20 @@ impl OrderedSession {
                         out.push(SessionEvent::Refused { ch, reason });
                         Ok(())
                     }
-                    SubstrateEvent::Exit { code, .. } => {
-                        if entry.exit.is_some_and(|old| old != code) {
+                    event @ (SubstrateEvent::Exit { .. }
+                    | SubstrateEvent::ExitStatusUnavailable { .. }) => {
+                        let outcome = match &event {
+                            SubstrateEvent::Exit { code, .. } => ExitOutcome::Code(*code),
+                            SubstrateEvent::ExitStatusUnavailable { .. } => {
+                                ExitOutcome::Unavailable
+                            }
+                            _ => unreachable!(),
+                        };
+                        if entry.exit.is_some_and(|old| old != outcome) {
                             Err(ChannelProtocolError::Metadata)
                         } else {
                             let admission = if entry.exit.is_none() {
-                                self.buffer(
-                                    substrate,
-                                    ch,
-                                    &mut entry,
-                                    SubstrateEvent::Exit { ch, code },
-                                )
-                                .map(|()| {
+                                self.buffer(substrate, ch, &mut entry, event).map(|()| {
                                     entry.buffer.pop_back();
                                     entry.retained_bytes -= 10;
                                 })
@@ -834,7 +852,7 @@ impl OrderedSession {
                                 Ok(())
                             };
                             admission.map(|()| {
-                                entry.exit = Some(code);
+                                entry.exit = Some(outcome);
                                 entry.draining = true;
                             })
                         }
@@ -868,7 +886,7 @@ impl OrderedSession {
                 if let Some(code) = entry.exit {
                     entry.retire();
                     substrate.retire_channel(ch);
-                    out.push(SessionEvent::Exit { ch, code });
+                    out.push(code.event(ch));
                 }
             }
         }

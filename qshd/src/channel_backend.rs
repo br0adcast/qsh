@@ -251,6 +251,16 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
 impl ChannelWait for ChildWait {
+    fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+        use transport::channel_server::ChildStatus;
+        match self.0.try_wait() {
+            Ok(Some(status)) => ChildStatus::Reaped {
+                code: Some(status.exit_code() as i32),
+            },
+            Ok(None) => ChildStatus::Running,
+            Err(error) => ChildStatus::Unknown(error.to_string()),
+        }
+    }
     fn cleanup_uninstalled(
         &mut self,
         authority: &transport::channel_open::CleanupAuthority<'_>,
@@ -385,6 +395,64 @@ mod tests {
     use crate::test_support::suppress_shell_history;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    #[test]
+    fn personal_child_poll_distinguishes_running_from_exact_reaped_status() {
+        use transport::channel_server::ChildStatus;
+        suppress_shell_history();
+        struct Cleanup(Option<SpawnedChannel>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(mut channel) = self.0.take() {
+                    channel.wait.kill();
+                    channel.wait.wait();
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Some(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(
+                        ChannelKind::Command,
+                        80,
+                        24,
+                        b"/bin/sh -c 'printf POLL_READY; read line; exit 7'",
+                    ),
+                    None,
+                )
+                .unwrap(),
+        ));
+        // Own cleanup before any fallible PTY read or assertion.
+        let output = read_until(cleanup.0.as_mut().unwrap(), "POLL_READY");
+        assert!(output.contains("POLL_READY"));
+        let channel = cleanup.0.as_mut().unwrap();
+        assert!(matches!(channel.wait.poll_exit(), ChildStatus::Running));
+        channel.writer.write_all(b"finish\n").unwrap();
+        channel.writer.flush().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match cleanup.0.as_mut().unwrap().wait.poll_exit() {
+                ChildStatus::Reaped { code } => {
+                    cleanup.0.take(); // Reaped: never signal this PID again, even on failure.
+                    assert_eq!(code, Some(7));
+                    break;
+                }
+                ChildStatus::Running => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned shell did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                ChildStatus::Unknown(error) => {
+                    cleanup.0.take(); // Lost identity is not permission for blind PID signaling.
+                    panic!("owned shell status became unknown: {error}");
+                }
+            }
+        }
+    }
 
     /// How long [`read_until`] waits before concluding the reading thread is
     /// stuck rather than merely slow.

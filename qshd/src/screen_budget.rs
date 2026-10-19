@@ -662,6 +662,9 @@ mod lifecycle_tests {
     }
     struct Wait(Feed);
     impl ChannelWait for Wait {
+        fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+            transport::channel_server::ChildStatus::Reaped { code: Some(0) }
+        }
         fn cleanup_uninstalled(
             &mut self,
             authority: &transport::channel_open::CleanupAuthority<'_>,

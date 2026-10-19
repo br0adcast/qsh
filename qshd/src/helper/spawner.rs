@@ -380,6 +380,7 @@ struct CleanupReceipt {
     kind: Option<CleanupKind>,
     cleanup_requested: bool,
     notify: transport::channel_open::CleanupNotifier,
+    reap_notify: Option<transport::channel_server::ReapNotifier>,
 }
 
 impl Pending {
@@ -702,13 +703,16 @@ fn read_loop(
                 let Some(pending) = map.get_mut(&id) else {
                     continue;
                 };
-                let notify = {
+                let (notify, reap_notify) = {
                     let mut receipt = pending.receipt.lock().unwrap_or_else(|e| e.into_inner());
                     if receipt.kind.is_some() {
                         continue;
                     }
                     receipt.kind = Some(kind);
-                    receipt.cleanup_requested.then(|| receipt.notify.clone())
+                    (
+                        receipt.cleanup_requested.then(|| receipt.notify.clone()),
+                        receipt.reap_notify.clone(),
+                    )
                 };
                 if pending.finished() {
                     map.remove(&id);
@@ -720,6 +724,9 @@ fn read_loop(
                 // recording that fact alone must never cancel its adoption.
                 if let Some(notify) = notify {
                     let _ = notify.retry_cleanup();
+                }
+                if let Some(notify) = reap_notify {
+                    notify.notify();
                 }
             }
             // `HelperChannelSpawner` never sends `Request::Nonce` or
@@ -925,6 +932,7 @@ impl HelperChannelSpawner {
             kind: None,
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
+            reap_notify: None,
         }));
         let construction = custody.protect(
             Box::new(HelperWait {
@@ -1026,6 +1034,34 @@ struct HelperWait {
 }
 
 impl ChannelWait for HelperWait {
+    fn set_reap_notifier(&mut self, notifier: transport::channel_server::ReapNotifier) {
+        let already_reaped = {
+            let mut receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+            receipt.reap_notify = Some(notifier.clone());
+            receipt.kind == Some(CleanupKind::Reaped)
+        };
+        // A receipt may precede retirement registration. Never notify while
+        // holding the helper receipt lock: the worker reads the same receipt.
+        if already_reaped {
+            notifier.notify();
+        }
+    }
+    fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+        use transport::channel_server::ChildStatus;
+        match self.exits.try_recv() {
+            Ok(code) => ChildStatus::Reaped { code: Some(code) },
+            Err(mpsc::TryRecvError::Empty) => ChildStatus::Running,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+                if receipt.kind == Some(CleanupKind::Reaped) {
+                    // Exact cleanup is known, but no exit status survived.
+                    ChildStatus::Reaped { code: None }
+                } else {
+                    ChildStatus::Unknown("helper exit receiver closed without cleanup proof".into())
+                }
+            }
+        }
+    }
     fn cleanup_uninstalled(
         &mut self,
         authority: &transport::channel_open::CleanupAuthority<'_>,
@@ -3922,6 +3958,7 @@ pub(crate) mod tests {
         helper
             .set_read_timeout(Some(TEST_RECV_TIMEOUT))
             .expect("set a receive timeout on the stub's socket");
+        let (report_exit, allow_exit) = std::sync::mpsc::sync_channel(1);
         let stub = std::thread::spawn(move || {
             let (bytes, _fd) = channel::recv(&helper).expect("recv").expect("open");
             let Request::Open { id, .. } = decode::<Request>(&bytes).expect("decode") else {
@@ -3930,21 +3967,40 @@ pub(crate) mod tests {
             let fake_master = tempfile::tempfile().expect("a fake master descriptor");
             let opened = encode(&Response::Opened { id }).expect("encode");
             channel::send(&helper, &opened, Some(fake_master.as_fd())).expect("reply");
+            allow_exit
+                .recv_timeout(TEST_RECV_TIMEOUT)
+                .expect("exit permission");
             let exited = encode(&Response::Exited { id, code: 7 }).expect("encode");
             channel::send(&helper, &exited, None).expect("report the exit");
             (helper, id)
         });
 
         let spawner = Arc::new(HelperChannelSpawner::new(worker).expect("spawner"));
-        let channel = bounded({
+        let mut channel = bounded({
             let spawner = Arc::clone(&spawner);
             move || spawner.spawn(&anyone(), any_login(), &shell_request(), None)
         })
         .expect("spawn");
+        use transport::channel_server::ChildStatus;
+        assert!(matches!(channel.wait.poll_exit(), ChildStatus::Running));
+        report_exit.send(()).unwrap();
+        let status = bounded(move || {
+            let deadline = std::time::Instant::now() + TEST_RECV_TIMEOUT;
+            loop {
+                match channel.wait.poll_exit() {
+                    ChildStatus::Reaped { code } => break code,
+                    ChildStatus::Running => {
+                        assert!(std::time::Instant::now() < deadline, "exit receipt missing");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    ChildStatus::Unknown(detail) => panic!("exact helper status lost: {detail}"),
+                }
+            }
+        });
         assert_eq!(
-            bounded(move || channel.wait.wait()),
-            7,
-            "the exit code the helper reported must reach the waiter"
+            status,
+            Some(7),
+            "poll retains the helper's actual exit status"
         );
 
         // Held open for the assertion below, for the reason the twin test

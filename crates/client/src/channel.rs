@@ -146,6 +146,10 @@ pub enum SubstrateEvent {
         ch: ChannelId,
         code: i32,
     },
+    /// The channel ended with confirmed cleanup but without a remote status.
+    ExitStatusUnavailable {
+        ch: ChannelId,
+    },
     Announced(Vec<OpenRequest>),
     /// A record in which the daemon talks about itself (`About`, an update's
     /// answer or result, `Restarting`). Not about any channel.
@@ -196,6 +200,10 @@ pub enum SessionEvent {
     Exit {
         ch: ChannelId,
         code: i32,
+    },
+    /// The channel ended with confirmed cleanup but without a remote status.
+    ExitStatusUnavailable {
+        ch: ChannelId,
     },
     /// A warm reattach listed the live channels and this one was not among
     /// them. Distinct from `Exit`, which carries a code because the server
@@ -701,6 +709,9 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
             }
             SubstrateEvent::Exit { ch, code } => {
                 self.terminate(ch, SessionEvent::Exit { ch, code })
+            }
+            SubstrateEvent::ExitStatusUnavailable { ch } => {
+                self.terminate(ch, SessionEvent::ExitStatusUnavailable { ch })
             }
             SubstrateEvent::Announced(list) => {
                 // Anything the client still thinks is running, but that

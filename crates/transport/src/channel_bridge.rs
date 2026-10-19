@@ -49,7 +49,11 @@ struct Queued {
 }
 enum Item {
     Record(ChannelOutput),
-    Exit(i32, crate::channel::OpenClassification, TimelinePermit),
+    Exit(
+        Option<i32>,
+        crate::channel::OpenClassification,
+        TimelinePermit,
+    ),
 }
 struct Stream {
     instance: ChannelInstance,
@@ -60,6 +64,9 @@ struct Stream {
     gap_charge: Option<OutputCharge>,
     bootstrap_charge: Option<OutputCharge>,
     fifo: VecDeque<Queued>,
+    // Original final marker ownership survives its delivery notification until
+    // Exit or scoped teardown. Attach reuses it for fresh delivery proof.
+    delivered_marker: Option<Queued>,
     frontier: Option<GeometryRecord>,
     data_end: u64,
     // The last admitted continuity warning remains owed until this frontier is ACKed.
@@ -120,6 +127,7 @@ impl ChannelBridge {
         for (&stream, state) in self.streams.iter_mut().filter(|(_, state)| state.ended) {
             if conn.retain_stream_output(stream) {
                 state.bootstrap = true;
+                Self::rearm_final_marker(state);
                 for queued in &mut state.fifo {
                     queued.bound = None;
                 }
@@ -147,6 +155,7 @@ impl ChannelBridge {
             state.hot_blocked = false;
             if state.ended {
                 state.bootstrap = true;
+                Self::rearm_final_marker(state);
                 for queued in &mut state.fifo {
                     queued.bound = None;
                 }
@@ -230,6 +239,7 @@ impl ChannelBridge {
                             gap_charge: None,
                             bootstrap_charge: None,
                             fifo: VecDeque::new(),
+                            delivered_marker: None,
                             frontier: None,
                             data_end: 0,
                             gap_end: 0,
@@ -331,6 +341,12 @@ impl ChannelBridge {
         }
         state.fifo.push_back(queued);
     }
+    fn rearm_final_marker(state: &mut Stream) {
+        if let Some(mut marker) = state.delivered_marker.take() {
+            marker.bound = None;
+            state.fifo.push_front(marker);
+        }
+    }
     pub(super) fn attach(&mut self, conn: &Connection, generation: u64) {
         self.pending_snapshot = None;
         self.snapshot_failed = false;
@@ -350,6 +366,7 @@ impl ChannelBridge {
             state.gap_end = 0;
             state.bootstrap = true;
             state.hot_blocked = false;
+            Self::rearm_final_marker(state);
             let old = std::mem::take(&mut state.fifo);
             for mut queued in old {
                 if matches!(queued.output, Item::Record(ChannelOutput::EchoAck(..))) {
@@ -696,7 +713,11 @@ impl ChannelBridge {
                 return Step::Blocked;
             }
             let token = marker.token;
-            state.fifo.pop_front();
+            debug_assert!(
+                state.delivered_marker.is_none(),
+                "one final marker per instance"
+            );
+            state.delivered_marker = state.fifo.pop_front();
             return Step::Delivered(token);
         }
         let target = if matches!(front.output, Item::Exit(..)) {
@@ -761,10 +782,14 @@ impl ChannelBridge {
                 if room < 10 || conn.stream_progress(stream).unacked != 0 {
                     return Step::Blocked;
                 }
-                crate::channel::encode_server(&crate::channel::ServerRecord::Exit {
-                    stream,
-                    code: *code,
-                })
+                let record = match code {
+                    Some(code) => crate::channel::ServerRecord::Exit {
+                        stream,
+                        code: *code,
+                    },
+                    None => crate::channel::ServerRecord::ExitStatusUnavailable { stream },
+                };
+                crate::channel::encode_server(&record)
             }
             Item::Record(ChannelOutput::DeliveryMarker(..)) => unreachable!(),
         };
@@ -1155,7 +1180,7 @@ mod tests {
                 );
                 assert!(matches!(
                     rig.bridge.streams[&STREAM].fifo.front().unwrap().output,
-                    Item::Exit(0, _, _)
+                    Item::Exit(Some(0), _, _)
                 ));
             }
             rig.attach();
@@ -1331,8 +1356,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn queued_exit_snapshot_survives_control_block_and_second_attach() {
+    fn queued_terminal_snapshot_survives_control_block_and_second_attach(code: Option<i32>) {
         let mut rig = Rig::new();
         rig.geometry(80, 0);
         rig.drain(false);
@@ -1347,7 +1371,7 @@ mod tests {
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
-            code: 42,
+            code,
             open,
             permit,
         });
@@ -1407,14 +1431,31 @@ mod tests {
             rig.control_records.first(),
             Some(crate::channel::ServerRecord::ChannelSnapshot(_))
         ));
-        assert!(rig.control_records.iter().any(|r| matches!(
-            r,
-            crate::channel::ServerRecord::Exit {
+        let expected = match code {
+            Some(code) => crate::channel::ServerRecord::Exit {
                 stream: STREAM,
-                code: 42
-            }
-        )));
+                code,
+            },
+            None => crate::channel::ServerRecord::ExitStatusUnavailable { stream: STREAM },
+        };
+        assert_eq!(
+            rig.control_records
+                .iter()
+                .filter(|r| **r == expected)
+                .count(),
+            1
+        );
         assert!(rig.bridge.streams.is_empty());
+    }
+
+    #[test]
+    fn queued_exit_snapshot_survives_control_block_and_second_attach() {
+        queued_terminal_snapshot_survives_control_block_and_second_attach(Some(42));
+    }
+
+    #[test]
+    fn unavailable_exit_snapshot_survives_control_block_and_second_attach() {
+        queued_terminal_snapshot_survives_control_block_and_second_attach(None);
     }
 
     #[test]
@@ -1546,7 +1587,7 @@ mod tests {
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
-            code: 0,
+            code: Some(0),
             open: crate::channel::OpenClassification {
                 kind: crate::channel::ChannelKind::Shell,
                 cols: 80,
@@ -1638,6 +1679,101 @@ mod tests {
             }
         )));
     }
+    #[test]
+    fn delivered_final_marker_survives_attach_until_the_child_exit_arrives() {
+        for consume_old_callback in [false, true] {
+            let mut rig = Rig::new();
+            rig.geometry(80, 0);
+            rig.data(b"last process output");
+            let marker = rig.budget.try_reserve(EntryClass::Lifecycle, 32).unwrap();
+            rig.emit(
+                ChannelOutput::DeliveryMarker(DeliveryMarker { token: 1 }, marker),
+                None,
+            );
+            let held = rig.budget.usage(EntryClass::Lifecycle);
+            rig.drain(false);
+            rig.drain(false);
+            if consume_old_callback {
+                assert!(rig.bridge.notifications().iter().any(|event| matches!(
+                    event,
+                    SessionInbound::Delivered {
+                        generation: 0,
+                        token: 1,
+                        ..
+                    }
+                )));
+            }
+            // No Exit yet: the actual child is still alive after output EOF.
+            // In either callback ordering, a new attachment owes fresh proof.
+            for generation in 1..=3 {
+                rig.attach();
+                rig.bridge.release_barrier(generation);
+                assert!(!rig
+                    .bridge
+                    .notifications()
+                    .iter()
+                    .any(|event| matches!(event, SessionInbound::Delivered { .. })));
+                let mut pending = Vec::new();
+                rig.bridge
+                    .drain(&mut rig.server, rig.now, false, &mut pending);
+                assert!(!pending.is_empty(), "fresh geometry bootstrap must be sent");
+                assert!(
+                    !rig.bridge
+                        .notifications()
+                        .iter()
+                        .any(|event| matches!(event, SessionInbound::Delivered { .. })),
+                    "fresh bootstrap must be acknowledged before delivery proof"
+                );
+                rig.pump(pending);
+                rig.drain(false);
+                assert!(rig.bridge.notifications().iter().any(|event| matches!(event,
+                SessionInbound::Delivered { generation: found, token: 1, .. } if *found == generation)),
+                "the original final marker must produce proof for the new attachment");
+                assert_eq!(
+                    rig.budget.usage(EntryClass::Lifecycle),
+                    held,
+                    "the original marker permit remains held while waiting for child reap"
+                );
+                assert!(!rig.drain(false), "delivered marker must not spin");
+                assert!(
+                    !rig.bridge
+                        .notifications()
+                        .iter()
+                        .any(|event| matches!(event, SessionInbound::Delivered { .. })),
+                    "one callback per attachment"
+                );
+            }
+            let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
+            rig.bridge.push(SessionOutbound::ChannelExit {
+                stream: STREAM,
+                instance: ChannelInstance::new(1).unwrap(),
+                origin: rig.origin(),
+                code: Some(7),
+                open: crate::channel::OpenClassification {
+                    kind: crate::channel::ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                },
+                permit,
+            });
+            rig.drain(false);
+            assert_eq!(
+                rig.control_records
+                    .iter()
+                    .filter(|record| **record
+                        == crate::channel::ServerRecord::Exit {
+                            stream: STREAM,
+                            code: 7
+                        })
+                    .count(),
+                1
+            );
+            assert!(rig.bridge.streams.is_empty());
+            assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (0, 0));
+        }
+    }
+
     #[test]
     fn live_screen_replaces_obsolete_snapshot() {
         let mut rig = Rig::new();
@@ -1731,6 +1867,10 @@ mod tests {
         );
         rig.drain(false);
         rig.drain(false); // old delivery is queued, not handed over
+        assert_eq!(
+            rig.budget.usage(EntryClass::Lifecycle),
+            (2, BRIDGE_LIFECYCLE_BYTES + 32)
+        );
         let newer = ChannelInstance::new(2).unwrap();
         let budget = TimelineBudget::new(newer, 0, |_| {});
         let gate = Arc::new(SendGate::new(crate::send_gate::GateKind::Pipe));
@@ -1752,6 +1892,11 @@ mod tests {
             budget.try_reserve(EntryClass::Lifecycle, BRIDGE_LIFECYCLE_BYTES),
         );
         rig.bridge.push(rig.outbound.try_recv().unwrap());
+        assert_eq!(
+            rig.budget.usage(EntryClass::Lifecycle),
+            (0, 0),
+            "new instance retires the old delivered marker exactly once"
+        );
         rig.bridge.push(SessionOutbound::ChannelClosed {
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
@@ -1783,7 +1928,7 @@ mod tests {
             stream: STREAM,
             instance: old_instance,
             origin: old_origin,
-            code: 42,
+            code: Some(42),
             open: OpenClassification {
                 kind: ChannelKind::Command,
                 cols: 0,
@@ -2298,7 +2443,7 @@ mod tests {
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
-            code: 42,
+            code: Some(42),
             open: crate::channel::OpenClassification {
                 kind: crate::channel::ChannelKind::Command,
                 cols: 0,
@@ -2314,7 +2459,7 @@ mod tests {
         assert!(matches!(
             rig.bridge.streams[&STREAM].fifo[0].output,
             Item::Exit(
-                42,
+                Some(42),
                 crate::channel::OpenClassification {
                     kind: crate::channel::ChannelKind::Command,
                     cols: 0,
@@ -2548,7 +2693,17 @@ mod tests {
             );
             assert_eq!(
                 rig.budget.usage(EntryClass::Lifecycle),
-                (1, BRIDGE_LIFECYCLE_BYTES)
+                (2, BRIDGE_LIFECYCLE_BYTES + 32)
+            );
+            rig.bridge.push(SessionOutbound::ChannelClosed {
+                stream: STREAM,
+                instance: ChannelInstance::new(1).unwrap(),
+                origin: rig.origin(),
+            });
+            assert_eq!(
+                rig.budget.usage(EntryClass::Lifecycle),
+                (0, 0),
+                "Close releases the retained final marker and bridge reserve"
             );
         }
     }
@@ -2762,7 +2917,7 @@ mod tests {
                 stream,
                 instance: ChannelInstance::new(u64::from(stream)).unwrap(),
                 origin: rig.origin(),
-                code: 0,
+                code: Some(0),
                 open: crate::channel::OpenClassification {
                     kind: crate::channel::ChannelKind::Shell,
                     cols: 80,
