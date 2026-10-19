@@ -4,7 +4,7 @@
 //! proof. Capabilities and notifications are not the last resource owner.
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use crate::channel_server::{ChannelWait, SpawnedChannel};
 use crate::shell_server::{ResizeHandle, SessionScreen};
@@ -12,6 +12,36 @@ use crate::shell_server::{ResizeHandle, SessionScreen};
 #[path = "channel_open_registry.rs"]
 mod registry;
 pub use registry::*;
+
+/// Holds the watch read guard across admission/final commit. The epoch alone
+/// is not authority: a registry fence must also agree at final adoption.
+pub struct IdleEpochGuard<'a> {
+    _signal: Option<tokio::sync::watch::Ref<'a, crate::channel_server::RestartSignal>>,
+    epoch: u64,
+}
+impl<'a> IdleEpochGuard<'a> {
+    pub(crate) fn from_signal(
+        signal: tokio::sync::watch::Ref<'a, crate::channel_server::RestartSignal>,
+    ) -> Result<Self, OpenRefusal> {
+        if signal.phase != crate::channel_server::RestartPhase::Idle {
+            return Err(OpenRefusal::Restarting);
+        }
+        let epoch = signal.invalidation_epoch;
+        Ok(Self {
+            _signal: Some(signal),
+            epoch,
+        })
+    }
+    pub(crate) fn initial() -> Self {
+        Self {
+            _signal: None,
+            epoch: 0,
+        }
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProofKind {
@@ -72,12 +102,15 @@ struct State {
     ready: bool,
     leased: bool,
     retry_requested: bool,
+    #[cfg(test)]
+    worker_waiting: bool,
     terminal: Option<ProofKind>,
     adopted: bool,
 }
 #[derive(Default)]
 struct Capsule {
     state: Mutex<State>,
+    resolved: Condvar,
     registration: OnceLock<(Weak<ChannelOpenRegistry>, OpenJobId)>,
 }
 impl std::fmt::Debug for Capsule {
@@ -136,6 +169,27 @@ impl OpenCustody {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cancelled = true;
+        self.inner.resolved.notify_all();
+    }
+
+    fn wait_for_resolution(&self) -> bool {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        while !state.cancelled && !state.adopted {
+            #[cfg(test)]
+            {
+                state.worker_waiting = true;
+            }
+            state = self
+                .inner
+                .resolved
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        #[cfg(test)]
+        {
+            state.worker_waiting = false;
+        }
+        state.adopted
     }
 
     /// The backend has established that no possibly creating operation ran.
@@ -196,6 +250,10 @@ impl OpenCustody {
 
     /// Called by the blocking resource owner, never by Drop or the async loop.
     pub fn cleanup(&self) -> CleanupStatus {
+        // Explicit cleanup also releases a worker parked on this capsule.
+        // Receipt tickets call this only once cleanup was requested, never merely
+        // because a healthy short-lived command supplied an early receipt.
+        self.cancel();
         loop {
             let resources = {
                 let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -353,12 +411,10 @@ impl UninstalledChannel {
     /// Ownership transfer only. The runner's final adoption critical section
     /// must validate its registry fence, identity and restart epoch around this.
     pub(crate) fn adopt(mut self) -> Result<SpawnedChannel, Self> {
-        let mut state = self
-            .custody
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let inner = self.custody.inner.clone();
+        let Ok(mut state) = inner.state.lock() else {
+            return Err(self);
+        };
         if state.cancelled || !state.ready || state.leased || state.adopted {
             drop(state);
             return Err(self);
@@ -375,6 +431,7 @@ impl UninstalledChannel {
         state.adopted = true;
         self.armed = false;
         drop(state);
+        self.custody.inner.resolved.notify_all();
         Ok(SpawnedChannel {
             reader: io.reader,
             writer: io.writer,

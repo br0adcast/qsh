@@ -2032,6 +2032,24 @@ admitted. This allows a fresh client process to classify retained final output
 even after the runner has
 removed the ended process. Cold starts establish channels through OPEN/OPENED.
 
+Channel creation runs outside the session loop after bounded admission (32
+outstanding jobs globally, 8 per authenticated numeric uid; a session counts
+installed plus unresolved opens against its eight-channel limit). Capacity
+exhaustion refuses without waiting for a constructor slot. A reset, CLOSE or
+restart cancels an uninstalled open; its late result cannot install into the
+replacement attachment or reused stream identity. Uninstalled jobs are absent
+from `CHANNEL_SNAPSHOT`. A process may already have executed side effects before
+cancellation, so missing acknowledgement is not proof it never ran. Clients do
+not automatically replay the OPEN or command after reset. Existing active
+channels and retained draining Exit owners still appear in the snapshot.
+
+Cancelled or failed construction retains its admission and resource ownership
+until exact no-child or reaped-child proof arrives. Unknown cleanup is not
+refunded on timeout or socket loss. The factory owner survives session runner
+replacement, and unresolved uninstalled cleanup blocks actual daemon exec. See
+[the resource policy](terminal-resources.md#outstanding-channel-creation) for the
+bounds and their limits.
+
 A refusal is an answer, not a session failure: failed OPEN receives `REFUSED`.
 The client needs both lifecycle metadata and an ordered `Established` geometry
 before Ready. Draining metadata never authorizes input. A new instance retires

@@ -431,3 +431,376 @@ fn open24_receipt_during_cleanup_is_retried_before_returning_unknown() {
     assert_eq!(registry.outstanding(), 0);
     assert_eq!(session.occupied(), 0);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_does_not_block_runtime_while_spawn_is_entered() {
+    use crate::channel_server::ChannelSpawner;
+    use std::sync::{mpsc, Condvar};
+    struct BlockingSpawn {
+        registry: Arc<ChannelOpenRegistry>,
+        entered: mpsc::Sender<()>,
+        entered_async: Arc<tokio::sync::Notify>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        observation: Arc<Observation>,
+    }
+    impl ChannelSpawner for BlockingSpawn {
+        fn open_registry(&self) -> Arc<ChannelOpenRegistry> {
+            self.registry.clone()
+        }
+        fn spawn(
+            &self,
+            _: &crate::auth::Principal,
+            _: crate::session_manager::LoginId,
+            _: &crate::channel::OpenRequest,
+            _: Option<&str>,
+            custody: &OpenCustody,
+        ) -> Result<UninstalledChannel, SpawnFailure> {
+            self.entered.send(()).unwrap();
+            self.entered_async.notify_one();
+            let (lock, wake) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            drop(released);
+            Ok(custody
+                .protect(
+                    Box::new(Wait(self.observation.clone())),
+                    Box::new(Screen(self.observation.clone())),
+                )
+                .finish(
+                    Box::new(std::io::empty()),
+                    Box::new(std::io::sink()),
+                    Box::new(Resize),
+                ))
+        }
+    }
+    let registry = ChannelOpenRegistry::new(OpenLimits {
+        global: 1,
+        per_uid: 1,
+    });
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 9, 1))
+        .unwrap();
+    let (entered, entered_rx) = mpsc::channel();
+    let entered_async = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let observation = Arc::new(Observation::default());
+    observation.confirmed.store(true, Ordering::SeqCst);
+    let executor = ChannelOpenExecutor::new(
+        Arc::new(BlockingSpawn {
+            registry: registry.clone(),
+            entered,
+            entered_async: entered_async.clone(),
+            release: release.clone(),
+            observation,
+        }),
+        registry.clone(),
+    );
+    let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
+    let heartbeat = tokio::spawn(async move {
+        entered_async.notified().await;
+        let _ = heartbeat_tx.send(());
+    });
+    let watchdog = std::thread::spawn(move || {
+        let entered = entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        let progressed = entered
+            && heartbeat_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+        let (lock, wake) = &*release;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        (entered, progressed)
+    });
+    executor.submit(&job).unwrap();
+    // Joining a std thread directly here would itself block this current-thread runtime.
+    let observed = tokio::task::spawn_blocking(move || watchdog.join().unwrap())
+        .await
+        .unwrap();
+    heartbeat.await.unwrap();
+    job.cancel();
+    if let Some(worker) = job.take_worker() {
+        worker.await.unwrap();
+    }
+    job.cleanup();
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(observed, (true, true));
+}
+
+struct ExecutorSpawn {
+    registry: Arc<ChannelOpenRegistry>,
+    observation: Arc<Observation>,
+    calls: Arc<AtomicUsize>,
+    panic_after_protect: bool,
+}
+impl crate::channel_server::ChannelSpawner for ExecutorSpawn {
+    fn open_registry(&self) -> Arc<ChannelOpenRegistry> {
+        self.registry.clone()
+    }
+    fn spawn(
+        &self,
+        _: &crate::auth::Principal,
+        _: crate::session_manager::LoginId,
+        _: &crate::channel::OpenRequest,
+        _: Option<&str>,
+        custody: &OpenCustody,
+    ) -> Result<UninstalledChannel, SpawnFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let guard = custody.protect(
+            Box::new(Wait(self.observation.clone())),
+            Box::new(Screen(self.observation.clone())),
+        );
+        assert!(
+            !self.panic_after_protect,
+            "injected constructor panic after custody"
+        );
+        Ok(guard.finish(
+            Box::new(std::io::empty()),
+            Box::new(std::io::sink()),
+            Box::new(Resize),
+        ))
+    }
+}
+fn executor_fixture(
+    panic_after_protect: bool,
+) -> (
+    Arc<ChannelOpenRegistry>,
+    ChannelOpenExecutor,
+    OpenJob,
+    Arc<Observation>,
+    Arc<AtomicUsize>,
+) {
+    let registry = ChannelOpenRegistry::new(OpenLimits {
+        global: 1,
+        per_uid: 1,
+    });
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 9, 1))
+        .unwrap();
+    let observation = Arc::new(Observation::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = ChannelOpenExecutor::new(
+        Arc::new(ExecutorSpawn {
+            registry: registry.clone(),
+            observation: observation.clone(),
+            calls: calls.clone(),
+            panic_after_protect,
+        }),
+        registry.clone(),
+    );
+    (registry, executor, job, observation, calls)
+}
+async fn worker_is_parked(job: &OpenJob) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            // Reading under the same mutex proves the worker released it in Condvar::wait.
+            if job.custody().inner.state.lock().unwrap().worker_waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker reached its adoption/cancellation wait");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_receipt_wakes_the_parked_resource_owner() {
+    let (registry, executor, job, observation, _) = executor_fixture(false);
+    executor.submit(&job).unwrap();
+    worker_is_parked(&job).await;
+    let mut worker = job.take_worker().unwrap();
+    observation.confirmed.store(true, Ordering::SeqCst);
+    let receipt = job.custody().cleanup_notifier();
+    assert!(matches!(
+        receipt.retry_cleanup(),
+        CleanupStatus::Confirmed(_)
+    ));
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker).await;
+    let finished_without_second_signal = completed.is_ok();
+    if let Ok(result) = completed {
+        result.unwrap();
+    } else {
+        job.cancel();
+        worker.await.unwrap();
+    }
+    assert_eq!(registry.outstanding(), 0);
+    assert!(
+        finished_without_second_signal,
+        "receipt freed accounting but stranded its blocking worker"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_constructor_panic_keeps_unknown_until_late_receipt() {
+    let (registry, executor, job, observation, calls) = executor_fixture(true);
+    let receipt = job.custody().cleanup_notifier();
+    executor.submit(&job).unwrap();
+    job.take_worker().unwrap().await.unwrap();
+    assert!(
+        matches!(job.take_outcome(), Some(OpenOutcome::Failed(reason)) if reason == "channel creation failed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.outstanding(), 1);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 0);
+    drop(job);
+    observation.confirmed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        receipt.retry_cleanup(),
+        CleanupStatus::Confirmed(_)
+    ));
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_ready_receiver_drop_reaps_without_orphaning_result() {
+    let (registry, executor, job, observation, _) = executor_fixture(false);
+    observation.confirmed.store(true, Ordering::SeqCst);
+    executor.submit(&job).unwrap();
+    worker_is_parked(&job).await;
+    let worker = job.take_worker().unwrap();
+    drop(job);
+    worker.await.unwrap();
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn open24_executor_queued_cancellation_never_calls_backend() {
+    use std::sync::mpsc;
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (registry, executor, job, _, calls) = executor_fixture(false);
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let release = Release(Some(release));
+        let occupant = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        executor.submit(&job).unwrap();
+        assert!(
+            executor.submit(&job).is_err(),
+            "one admitted job cannot schedule twice"
+        );
+        job.cancel();
+        assert_eq!(registry.outstanding(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(release);
+        occupant.await.unwrap();
+        job.take_worker().unwrap().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.outstanding(), 0);
+    });
+}
+
+#[test]
+fn open24_factory_fence_stops_admission_and_cancels_existing_jobs() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 1, 1))
+        .unwrap();
+    let fence = registry.begin_restart_fence().unwrap();
+    let cancelled = job.custody().is_cancelled();
+    let next = registry.try_reserve(&session, request(&session, 2, 2));
+    let refused = matches!(next, Err(OpenRefusal::Restarting));
+    if let Ok(next) = next {
+        next.custody()
+            .refuse_before_creation("fixture cleanup".into());
+        next.cleanup();
+    }
+    job.custody()
+        .refuse_before_creation("fixture cleanup".into());
+    job.cleanup();
+    fence.reopen();
+    assert!(refused, "factory accepted admission after its fence");
+    assert!(cancelled, "factory fence left a pending constructor live");
+}
+
+#[test]
+fn open24_factory_fence_refuses_exec_until_exact_receipt() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 1, 1))
+        .unwrap();
+    let observation = Arc::new(Observation::default());
+    drop(job.custody().protect(
+        Box::new(Wait(observation.clone())),
+        Box::new(Screen(observation.clone())),
+    ));
+    let id = job.id();
+    drop(job); // The runner/receiver is gone; the factory still owns cleanup.
+    let fence = registry.begin_restart_fence().unwrap();
+    assert!(matches!(registry.cleanup(id), CleanupStatus::Unknown));
+    let premature_permit = fence.wait_until(std::time::Instant::now()).is_some();
+    let still_charged = (registry.outstanding(), session.occupied());
+    observation.confirmed.store(true, Ordering::SeqCst);
+    registry.cleanup(id);
+    assert!(fence.wait_until(std::time::Instant::now()).is_some());
+    fence.reopen();
+    assert_eq!(still_charged, (1, 1));
+    assert!(!premature_permit, "unknown cleanup granted an exec permit");
+}
+
+#[test]
+fn open24_factory_fence_rejects_ready_adoption_before_watch_publication() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 1, 1))
+        .unwrap();
+    let id = job.id();
+    let observation = Arc::new(Observation::default());
+    let ready = job
+        .custody()
+        .protect(
+            Box::new(Wait(observation.clone())),
+            Box::new(Screen(observation.clone())),
+        )
+        .finish(
+            Box::new(std::io::empty()),
+            Box::new(std::io::sink()),
+            Box::new(Resize),
+        );
+    let fence = registry.begin_restart_fence().unwrap();
+    // No watch announcement exists. The factory fence must itself refuse this move.
+    let refused = match job.adopt(ready) {
+        Err(ready) => {
+            drop(ready);
+            true
+        }
+        Ok((channel, slot)) => {
+            drop((channel, slot));
+            false
+        }
+    };
+    observation.confirmed.store(true, Ordering::SeqCst);
+    registry.cleanup(id);
+    fence.reopen();
+    assert!(refused, "ready job adopted across the factory fence");
+}

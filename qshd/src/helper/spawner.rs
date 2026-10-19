@@ -6689,4 +6689,5 @@ pub(crate) mod tests {
         }
     }
     include!("spawner_open_tests.rs");
+    include!("executor_open_tests.rs");
 }

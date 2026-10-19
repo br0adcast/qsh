@@ -326,6 +326,11 @@ impl ChannelSessionBackend {
         }
     }
 
+    /// The factory owner survives every warm/cold session runner replacement.
+    pub fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+        self.spawner.open_registry()
+    }
+
     /// Every session this backend runs speaks for `daemon`.
     pub fn with_daemon(mut self, daemon: Arc<dyn DaemonUpdates>) -> ChannelSessionBackend {
         self.daemon = Some(daemon);
