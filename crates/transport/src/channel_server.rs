@@ -1084,6 +1084,18 @@ fn admit_terminal_reply(
     false
 }
 
+fn flush_due_terminal_output(io: &SessionIo, ch: &mut Channel, now: std::time::Instant) {
+    if ch.producer.reply_failed || ch.producer.eof {
+        return;
+    }
+    if ch.producer.reply_delivery.snapshot().failed {
+        fail_terminal_reply(io, ch);
+        return;
+    }
+    let replies = ch.screen.flush_due_output(now);
+    admit_terminal_reply(io, ch, replies);
+}
+
 fn emit_screen_repaint(io: &SessionIo, ch: &mut Channel) -> bool {
     if ch.producer.reply_failed {
         return false;
@@ -1803,9 +1815,13 @@ pub async fn run_channel_session_with(
                 // is still running.
             }
             Wakeup::AckTick => {
+                let now = std::time::Instant::now();
                 // Flush a pending echo_ack per channel: input advanced but no
                 // output happened (the program silently ate a keystroke).
                 for (stream, ch) in channels.iter_mut() {
+                    // Parser deadlines belong to models, independent of output
+                    // gates and prediction. Admission never waits for a writer.
+                    flush_due_terminal_output(&io, ch, now);
                     // Behind a closed gate, and until the repaint, the ack
                     // waits for the repaint (see repaint_stale).
                     if ch.stale || !ch.gate.is_open() {
@@ -2737,6 +2753,7 @@ pub(crate) mod tests {
     include!("channel_server_reap_tests.rs");
     include!("channel_server_reply_tests.rs");
     include!("channel_server_reply_delivery_tests.rs");
+    include!("channel_server_sync_deadline_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -3193,7 +3210,7 @@ pub(crate) mod tests {
                     sizes: self.sizes.clone(),
                 }),
                 screen: if req.screen && self.reply_queries.load(Ordering::SeqCst) {
-                    Box::new(terminal_replies::QueryScreen)
+                    Box::new(terminal_replies::QueryScreen::default())
                 } else if req.screen && !*self.force_no_screen.lock().unwrap() {
                     Box::new(FakeScreen {
                         stream: req.stream,

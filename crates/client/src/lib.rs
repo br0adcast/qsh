@@ -114,19 +114,7 @@ impl ShellState {
         for rec in records {
             match rec {
                 ShellRecord::Data(bytes) => {
-                    // Alacritty anchors nonzero offsets as output scrolls.
-                    // Borrow an offset while feeding at the live bottom so
-                    // explicit history mode anchors that position as well.
-                    let anchor = self.history_view
-                        && self.terminal.display_offset() == 0
-                        && self.terminal.history_size() > 0;
-                    if anchor {
-                        self.terminal.scroll(1);
-                    }
-                    self.terminal.feed(&bytes);
-                    if anchor {
-                        self.terminal.scroll(-1);
-                    }
+                    self.with_history_anchor(|terminal| terminal.feed(&bytes));
                 }
                 ShellRecord::EchoAck(k) => self.prediction.set_echo_ack(k as i64),
                 ShellRecord::Geometry(_) => {
@@ -151,6 +139,26 @@ impl ShellState {
         }
     }
 
+    // Alacritty anchors nonzero offsets as output scrolls. Borrow an offset
+    // when explicit history mode is at the live bottom, including when a
+    // synchronized batch executes later without another DATA record.
+    fn with_history_anchor<T>(
+        &mut self,
+        apply: impl FnOnce(&mut terminal::TerminalCore) -> T,
+    ) -> T {
+        let anchor = self.history_view
+            && self.terminal.display_offset() == 0
+            && self.terminal.history_size() > 0;
+        if anchor {
+            self.terminal.scroll(1);
+        }
+        let result = apply(&mut self.terminal);
+        if anchor {
+            self.terminal.scroll(-1);
+        }
+        result
+    }
+
     /// An ordered geometry boundary invalidates predictions even when the
     /// authoritative dimensions are unchanged or history is being displayed.
     pub fn geometry_frame(&mut self, cols: u16, rows: u16, now_ms: i64) -> terminal::Frame {
@@ -163,6 +171,7 @@ impl ShellState {
     /// Return the overlaid frame at the new size (raw, without overlay, while
     /// in history -- for the same reason as in `on_stream0`).
     pub fn resize_frame(&mut self, cols: u16, rows: u16, now_ms: i64) -> terminal::Frame {
+        self.with_history_anchor(terminal::TerminalCore::flush_pending_output);
         self.terminal
             .resize_to(terminal_size::TerminalSize::for_viewport(cols, rows));
         let auth = self.terminal.frame();
@@ -246,20 +255,32 @@ impl ShellState {
         self.terminal.frame()
     }
 
-    /// Timing-driven reveal without new input -- the 50ms tick. Returns an
-    /// overlaid frame ONLY while the prediction engine has something active;
-    /// `None` means the caller pushes no frame at all (that is exactly what
-    /// the old inline tick loops did with `continue`).
-    ///
-    /// History views suppress predictions, including the timing-driven reveal.
+    /// Apply due synchronized output and reveal active predictions without new
+    /// input. History views continue to suppress prediction overlays.
     pub fn tick(&mut self, now_ms: i64, rtt_ms: i64) -> Option<terminal::Frame> {
-        if self.history_view || self.terminal.display_offset() > 0 || !self.prediction.active() {
+        self.tick_at(std::time::Instant::now(), now_ms, rtt_ms)
+    }
+
+    fn tick_at(
+        &mut self,
+        now: std::time::Instant,
+        now_ms: i64,
+        rtt_ms: i64,
+    ) -> Option<terminal::Frame> {
+        let flushed = self.with_history_anchor(|terminal| terminal.flush_due_output(now));
+        let predict =
+            !self.history_view && self.terminal.display_offset() == 0 && self.prediction.active();
+        if !flushed && !predict {
             return None;
         }
-        self.prediction.set_send_interval(rtt_ms);
         let auth = self.terminal.frame();
-        self.prediction.cull(&auth, now_ms);
-        Some(self.prediction.apply(&auth))
+        if predict {
+            self.prediction.set_send_interval(rtt_ms);
+            self.prediction.cull(&auth, now_ms);
+            Some(self.prediction.apply(&auth))
+        } else {
+            Some(auth)
+        }
     }
 }
 
@@ -609,5 +630,75 @@ mod state_tests {
         // After the return: the first byte is acknowledged as byte 1.
         st.on_input(b"x", 1100, 100);
         assert_eq!(st.input_bytes_sent, 1);
+    }
+    #[test]
+    fn sync111_tick_reveals_quiet_output_with_prediction_disabled() {
+        let mut state = ShellState::new(80, 24, prediction::DisplayPreference::Never, false);
+        let data = encode_record(REC_DATA, b"\x1b[?2026hDEADLINE-TEXT");
+        let before = state.on_stream0(&data, 0, 0);
+        assert_eq!(before.cell(0, 0).ch, ' ');
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let frame = state
+            .tick(200, 0)
+            .expect("parser deadline must produce a frame without prediction or new input");
+        let text: String = frame.cells.iter().map(|cell| cell.ch).collect();
+        assert!(text.contains("DEADLINE-TEXT"));
+        assert!(
+            state.tick(201, 0).is_none(),
+            "one due update, not perpetual repaint"
+        );
+    }
+
+    #[test]
+    fn sync111_geometry_flushes_pending_bytes_under_the_old_size() {
+        let mut pending = ShellState::new(10, 3, prediction::DisplayPreference::Never, false);
+        let mut immediate = ShellState::new(10, 3, prediction::DisplayPreference::Never, false);
+        let bytes = b"\x1b[2;9HXYZ";
+        let mut deferred = b"\x1b[?2026h".to_vec();
+        deferred.extend_from_slice(bytes);
+        pending.on_stream0(&encode_record(REC_DATA, &deferred), 0, 0);
+        immediate.on_stream0(&encode_record(REC_DATA, bytes), 0, 0);
+        let expected = immediate.geometry_frame(5, 3, 0);
+        let actual = pending.geometry_frame(5, 3, 0);
+        assert_eq!(actual.cells, expected.cells);
+        assert_eq!(
+            (actual.cursor_row, actual.cursor_col),
+            (expected.cursor_row, expected.cursor_col)
+        );
+    }
+
+    #[test]
+    fn sync111_due_flush_matches_live_prediction_and_history_view_policy() {
+        for (history, offset) in [(false, 0), (true, 0), (true, 2)] {
+            let make = || ShellState::new(10, 3, prediction::DisplayPreference::Always, false);
+            let mut immediate = make();
+            let mut pending = make();
+            for state in [&mut immediate, &mut pending] {
+                state.on_stream0(
+                    &encode_record(REC_DATA, b"one\r\ntwo\r\nthree\r\nfour\r\nfive"),
+                    0,
+                    0,
+                );
+                state.on_input(b"x", 1, 10);
+                state.set_history_view(history);
+                state.scroll_frame(offset, 1, 10);
+            }
+            let bytes = b"\r\nsix\r\nseven";
+            immediate.on_stream0(&encode_record(REC_DATA, bytes), 2, 10);
+            let mut buffered = b"\x1b[?2026h".to_vec();
+            buffered.extend_from_slice(bytes);
+            pending.on_stream0(&encode_record(REC_DATA, &buffered), 2, 10);
+            let due = pending.terminal.sync_deadline().unwrap();
+            let actual = pending
+                .tick_at(due, 200, 10)
+                .expect("due model update must not be suppressed by history policy");
+            let expected = immediate.frame(200, 10);
+            assert_eq!(
+                actual.cells, expected.cells,
+                "history={history} offset={offset}"
+            );
+            assert_eq!(pending.display_offset(), immediate.display_offset());
+            assert_eq!(pending.history_size(), immediate.history_size());
+        }
     }
 }

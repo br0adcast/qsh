@@ -152,6 +152,21 @@ pub trait SessionScreen: Send {
     /// preparing a resize and admit these replies before changing the PTY/model.
     fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError>;
 
+    /// Existing parser deadline for buffered synchronized output. Raw channels
+    /// and models without synchronized buffering have no deadline.
+    fn sync_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    /// Execute due fresh output through the bounded authoritative reply path.
+    fn flush_due_output(&mut self, now: std::time::Instant) -> Result<Vec<u8>, ScreenReplyError> {
+        if self.sync_deadline().is_some_and(|deadline| now >= deadline) {
+            self.flush_pending_output()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// Reserve model storage before touching the PTY. Drop cancels; commit
     /// applies the model only after the PTY accepted the same geometry.
     fn prepare_resize(

@@ -921,3 +921,57 @@ fn sigtstp_leaves_the_alternate_screen_and_sigcont_comes_back_to_it() {
     drawn_on_the_alternate_screen(&screen);
     eprintln!("alt_screen_tstp: whole test {:?}", started.elapsed());
 }
+
+#[test]
+fn sync111_quiet_child_output_is_visible_without_esu_or_new_input() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client_with(&daemon, &key, config.path(), &["--predict", "never"]);
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    wait_for_the_line(&screen, &daemon);
+    // The marker is assembled only by the actual shell, never by command echo.
+    // read keeps the child alive and silent: no EOF/ESU/repaint rescues the batch.
+    client.type_line(
+        r"stty -echo; printf '\033[?2026hQUIET-%s' DEADLINE; read release; printf '\033[?2026l\n'",
+    );
+    assert!(
+        wait_for(Duration::from_secs(3), || screen
+            .rows()
+            .iter()
+            .any(|row| row.contains("QUIET-DEADLINE"))),
+        "the real qsh tick must reveal quiet synchronized output: {}",
+        screen.dump()
+    );
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "qsh remains connected while the child waits"
+    );
+    client.type_line("");
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn sync111_daemon_answers_a_due_query_once_without_more_output() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client_with(&daemon, &key, config.path(), &["--predict", "never"]);
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    wait_for_the_line(&screen, &daemon);
+    client.type_line(r#"stty -echo -icanon min 0 time 10; printf '\033[?2026h\033[5n'; got=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n'); printf '\033[?2026l'; extra=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'); stty sane -echo; if [ "$got" = '1b5b306e' ] && [ -z "$extra" ]; then printf '\nDUE-%s\n' PASS; else printf '\nDUE-%s\n' FAIL; fi"#);
+    assert!(
+        wait_for(Duration::from_secs(5), || screen.has_row("DUE-PASS")
+            || screen.has_row("DUE-FAIL")),
+        "child must finish query check: {}",
+        screen.dump()
+    );
+    assert!(
+        screen.has_row("DUE-PASS"),
+        "child must receive exactly one real DSR before ESU: {}",
+        screen.dump()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
