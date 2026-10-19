@@ -17258,4 +17258,5 @@ mod tests {
         assert_eq!(heard, 201 * 1024);
     }
     include!("session_manager_auth_tests.rs");
+    include!("session_manager_recovery_tests.rs");
 }

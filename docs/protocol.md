@@ -925,6 +925,35 @@ without automatically opening a shell. Resumed admission still requires usable
 channel evidence; it does not revive an ended channel. Ordered snapshots,
 geometry, buffered output and final Exit retain their existing meanings.
 
+### Shared recovery handshakes
+
+A recovery attempt uses one Noise initiator, client socket, session token and
+expected server key across its complete eligible physical endpoint catalog.
+Logical aliases share physical sends while retaining their completion
+obligations. A bounded round-robin scheduler sends at most eight handshake
+packets per 50 ms interval, including immediate cookie retries; retries repeat
+every 500 ms. N ready endpoints receive a turn within ceil(N/8) intervals,
+subject to socket scheduling. Check deadlines start with actual sends, not
+catalog insertion.
+
+Cookies remain local to their source endpoint. A response is eligible only
+after a successful send to that source. The first valid Noise response consumes
+the initiator and pins the selected source before any proof or queued output.
+Invalid unauthenticated responses leave the initiator usable; an authenticated
+malformed response retires it with a protocol failure. Late losing responses
+cannot create another transport or proof producer. Authentication acceptance
+stops the remaining handshake work.
+
+Aliases reaching the selected responder can carry the established session after
+normal authenticated path verification. Independent daemons sharing a server
+key have distinct transport keys: selecting another instance requires retiring
+the current attempt and starting a new one. Selected failures complete only
+the checked endpoint and credential, leaving other obligations eligible before
+the next credential. An authenticated protocol rejection excludes that endpoint
+across credentials for the current sweep. Cancellation, queued work and stale
+catalog revisions do not establish failure or permit SSH. Foreign identity
+results remain attempt-local; later sweeps may retry with the same expected key.
+
 ---
 
 ## 4. Sessions

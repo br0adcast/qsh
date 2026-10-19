@@ -225,6 +225,105 @@ fn shared_recovery_sends_to_returning_path_before_blackhole_deadline() {
 }
 
 #[test]
+fn returning_path_recovers_during_the_actual_maximum_ssh_backoff() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let network = RecoveryNetwork::new(daemon.port);
+    network.switch_mapping([Some(daemon.port), None]);
+    let mut session = Session::start(&network, &key);
+    network.grant(session.home.path());
+    network.switch_mapping([None, None]);
+    session.reconnect();
+    // Use the public manual retry action to skip earlier pauses. The final
+    // thirty-second backoff is the real worker state, with no virtual clock.
+    for seconds in [1, 2, 4, 8, 16] {
+        session.wait_log(&format!("next SSH round in {seconds} s; UDP keeps trying"));
+        session.reconnect();
+    }
+    session.wait_log("next SSH round in 30 s; UDP keeps trying");
+    let backoff_started = Instant::now();
+    let admissions = network.ssh_connections();
+    let commands = network.expected_exec();
+    assert!(admissions > 0, "the SSH worker must have actually run");
+    assert!(
+        wait_until(|| network
+            .handshakes()
+            .iter()
+            .all(|sends| sends.iter().any(|sent| *sent >= backoff_started))),
+        "both paths must receive real msg1 during the maximum SSH pause"
+    );
+    network.switch_mapping([None, Some(daemon.port)]);
+    session.wait_log("reconnected at address 1");
+    session.shell("MAXIMUM_BACKOFF");
+    assert!(
+        backoff_started.elapsed() < Duration::from_secs(30),
+        "UDP recovery must not wait for the SSH pause"
+    );
+    assert_eq!(
+        network.ssh_connections(),
+        admissions,
+        "successful QSH recovery cancels the pending SSH round"
+    );
+    assert_eq!(
+        network.expected_exec(),
+        commands,
+        "successful QSH recovery must cancel later SSH commands"
+    );
+    network.foreign_untouched();
+    session.exit();
+}
+
+#[test]
+fn selected_without_acceptance_gives_the_other_path_a_fresh_authentication_turn() {
+    let _serial = serialised();
+    let (daemon, key) = start_daemon();
+    let network = RecoveryNetwork::new(daemon.port);
+    network.switch_mapping([Some(daemon.port), None]);
+    let mut session = Session::start(&network, &key);
+    network.grant(session.home.path());
+    let pins = std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap();
+    network.handshake_only(0, true);
+    network.transport_after_next_initiator(1);
+    let before = network.transport_received(0);
+    session.reconnect();
+    assert!(
+        wait_until(|| network.transport_received(0) > before),
+        "selected A never sent its fresh transport proof: {}",
+        session.log()
+    );
+    // A real selected Noise transport cannot publish proof. B forwards its
+    // initial msg2 but withholds transport until a fresh initiator appears, so
+    // it cannot rescue A through authenticated alias movement instead.
+    let returned = Instant::now();
+    network.switch_mapping([Some(daemon.port), Some(daemon.port)]);
+    session.wait_log("reconnected at address 1");
+    assert!(
+        returned.elapsed() < Duration::from_secs(10),
+        "B must not wait behind another A authentication budget"
+    );
+    assert!(
+        network.handshakes()[1].iter().any(|sent| *sent >= returned),
+        "B must receive a fresh shared initiator after A's failed selection"
+    );
+    assert!(
+        network.saw_next_initiator(1),
+        "B must accept a fresh transcript, not A alias traffic"
+    );
+    session.shell("AFTER_SELECTED_FAILURE");
+    assert_eq!(
+        network.ssh_connections(),
+        0,
+        "unfinished B cannot grant an SSH round"
+    );
+    assert_eq!(
+        std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap(),
+        pins
+    );
+    network.untouched();
+    session.exit();
+}
+
+#[test]
 fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
     let _serial = serialised();
     let (daemon, key) = start_daemon();
@@ -294,19 +393,29 @@ fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
     // must still revisit A without resetting trust or starting another shell.
     let (foreign, _) = start_daemon();
     network.switch_mapping([Some(daemon.port), Some(foreign.port)]);
-    let returning = session.log().len();
+    let returning = Instant::now();
     let returning_probes = network.probes();
     session.reconnect();
     session.wait_log("reconnected at address 0");
-    let log = session.log();
-    let returning = &log[returning..];
-    // A foreign Noise peer can look silent before its diagnostic key offer
-    // completes. It must fail that path and continue to the expected server.
-    let first = returning.find("ladder: TryDirect { addr: 1 }").unwrap();
-    let second = returning.find("ladder: TryDirect { addr: 0 }").unwrap();
+    // Both paths must receive fresh msg1 promptly. Independent relay threads
+    // timestamp receives, so their order does not prove socket dispatch order.
+    // The foreign identity must not make returning A wait for a timeout.
+    let sends = network.handshakes();
+    let first_b = *sends[1]
+        .iter()
+        .find(|&&sent| sent >= returning)
+        .expect("preferred B received a fresh msg1");
+    let first_a = *sends[0]
+        .iter()
+        .find(|&&sent| sent >= returning)
+        .expect("returning A received a fresh msg1");
     assert!(
-        first < second,
-        "recovery must try B then returning A: {returning}"
+        first_b.duration_since(returning) < Duration::from_secs(3),
+        "foreign B must receive its fresh shared recovery check"
+    );
+    assert!(
+        first_a.duration_since(returning) < Duration::from_secs(3),
+        "returning A was starved behind B"
     );
     assert!(
         network

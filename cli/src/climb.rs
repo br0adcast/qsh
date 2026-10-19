@@ -30,6 +30,9 @@ use crate::session::UiEvent;
 use crate::ssh_step::{SshStep, SshStepError};
 use crate::{keys, log, report, status, trust};
 
+#[path = "climb_recovery.rs"]
+mod shared_recovery;
+
 /// Where the substrate sends its bytes: the connection's `send_bytes`.
 pub type Sink = Box<dyn FnMut(u8, Vec<u8>) + Send>;
 
@@ -530,7 +533,7 @@ impl<'a> Climb<'a> {
     pub fn run(&mut self) -> Climbed {
         let cancel = knock::Cancel::new();
         if let Some(recovery) = self.recovery {
-            return self.run_cancellable(&recovery.cancel);
+            return self.run_shared_recovery(&recovery.cancel);
         }
         if self.background() {
             return self.run_cancellable(&cancel);
@@ -1432,6 +1435,10 @@ impl<'a> Climb<'a> {
         } else {
             att.probe_port_refusal(sockaddr);
         }
+        self.trial_for_attempt(att)
+    }
+
+    fn trial_for_attempt(&self, att: attempt::Attempt) -> (Verdict, attempt::Attempt, Trial) {
         // The one substrate this run's session ever uses: `ChannelSession`
         // owns it for both directions from here on, so `interactive` needs
         // no second instance just to decode incoming bytes.

@@ -263,9 +263,15 @@ suppress ICMP still recover using the ordinary deadlines.
 
 When the live connection ends, qsh attempts a warm resume with the previous
 session token and expected QSH server key, starting at the last working address.
-Every allowed QSH address in the current network generation gets an attempt
-before the first SSH round is admitted. A failed or silent first address cannot
-exclude the remaining addresses. DNS and key discovery have bounded waits;
+Recovery sends one shared handshake to all eligible resolved endpoints, with
+at most eight handshake datagrams per 50 ms scheduling interval. Each endpoint
+gets its own send and failure evidence; aliases of one socket share that work.
+The first authenticated response selects one transport and one proof producer.
+If it cannot finish authentication, unfinished endpoints get another selection
+opportunity before the next credential is tried. Every applicable endpoint and
+credential check must finish before the first SSH round is admitted. A failed
+or silent first address cannot exclude the remaining addresses. DNS and key
+discovery have bounded waits;
 their answers are candidates and never replace the expected server key.
 
 | Recovery path | Behavior |
@@ -303,8 +309,8 @@ scrollback or hiding the normal status line. Its fixed text lists every configur
 hostname in command-line order, without ports, for example
 `reconnecting: host-a [QSH/SSH], host-b [QSH]`. Protocol labels
 are bright white while being tried and gray otherwise; hostnames remain gray.
-Warm probes can check several paths at once. New QSH handshakes currently try
-addresses in sequence. Gray labels indicate no current attempt; recovery can
+Warm probes and shared recovery handshakes can check several paths at once.
+A QSH label lights up after an actual send; queued work stays gray. Recovery can
 try eligible targets again. SSH can finish starting the daemon before QSH
 finishes checking whether the original session still exists.
 Monochrome terminals use

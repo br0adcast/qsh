@@ -634,7 +634,10 @@ fn a_changed_server_key_during_recovery_is_retryable_without_repinning() {
     client.master.write_all(b"\x1dr").unwrap();
     assert!(
         wait_for(Duration::from_secs(35), || verbose_log(config.path())
-            .contains("outcome Direct(KeyChanged)")),
+            .contains(&format!(
+                "the server key for 127.0.0.1:{} has changed!",
+                relay.port
+            ))),
         "the foreign key must be diagnosed: {}",
         verbose_log(config.path())
     );

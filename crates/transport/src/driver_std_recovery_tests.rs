@@ -245,3 +245,120 @@ fn shared_recovery_driver_signs_only_selected_transcript_and_stops_on_acceptance
     assert_eq!(signer.0.load(Ordering::SeqCst), 1);
     assert_eq!(client.0.active_path(), Some(b.local_addr().unwrap()));
 }
+
+#[test]
+fn shared_recovery_progress_reports_actual_checks_and_source_before_protocol_failure() {
+    #[derive(Debug)]
+    enum Trace {
+        Progress(RecoveryProgress),
+        Failure,
+        Closed,
+    }
+    struct Capture(Mutex<Sender<Trace>>);
+    impl ClientEvents for Capture {
+        fn on_bytes(&self, _: u8, _: Vec<u8>) {}
+        fn on_stats(&self, _: Stats) {}
+        fn on_reset(&self, _: u8) {}
+        fn on_state(&self, state: LinkState) {
+            if state == LinkState::Closed {
+                let _ = self.0.lock().unwrap().send(Trace::Closed);
+            }
+        }
+        fn on_protocol_failure(&self, _: crate::ProtocolFailure) {
+            let _ = self.0.lock().unwrap().send(Trace::Failure);
+        }
+        fn on_recovery_progress(&self, progress: RecoveryProgress) {
+            let _ = self.0.lock().unwrap().send(Trace::Progress(progress));
+        }
+    }
+    let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let server_key = crate::handshake::generate_keypair();
+    let client_key = crate::handshake::generate_keypair();
+    let (tx, traces) = mpsc::channel();
+    let started = Instant::now();
+    let client = Recovery16Client(StdClient::connect_recovery_with(
+        [&a, &b]
+            .into_iter()
+            .enumerate()
+            .map(|(address, socket)| RecoveryEndpoint {
+                address,
+                endpoint: socket.local_addr().unwrap(),
+            })
+            .collect(),
+        ConnectionConfig {
+            role: crate::Role::Client,
+            local_static_priv: client_key.private,
+            remote_static_pub: Some(server_key.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+            features: Features::SUPPORTED,
+            required_features: Features::AUTH_ACCEPTED,
+        },
+        [16; 16],
+        StartKind::Warm,
+        Arc::new(OkBinder),
+        Arc::new(Capture(Mutex::new(tx))),
+        None,
+        DriverSetup::default(),
+    ));
+    let mut buffer = [0; 2048];
+    let (len, from) = b.recv_from(&mut buffer).unwrap();
+    let crate::wire::Frame::Handshake { body, .. } = crate::wire::parse(&buffer[..len]).unwrap()
+    else {
+        panic!("msg1");
+    };
+    let mut responder = crate::handshake::Handshake::new_responder(&server_key.private);
+    responder.read_msg(body).unwrap();
+    b.send_to(
+        &crate::wire::encode_handshake(
+            crate::wire::Kind::HandshakeResp,
+            &responder.write_msg(b"invalid"),
+        ),
+        from,
+    )
+    .unwrap();
+    let mut history = Vec::new();
+    loop {
+        let trace = traces
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closed driver trace");
+        let closed = matches!(trace, Trace::Closed);
+        history.push(trace);
+        if closed {
+            break;
+        }
+    }
+    client.0.detach();
+    let a_addr = a.local_addr().unwrap();
+    let b_addr = b.local_addr().unwrap();
+    for endpoint in [a_addr, b_addr] {
+        assert!(
+            history.iter().any(|trace| matches!(trace,
+            Trace::Progress(RecoveryProgress::Sent { endpoint: sent, at, success: true })
+            if *sent == endpoint && *at >= started)),
+            "actual endpoint send is observable: {endpoint}"
+        );
+    }
+    let selected: Vec<_> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, trace)| match trace {
+            Trace::Progress(RecoveryProgress::Selected { endpoint, at }) => {
+                Some((index, *endpoint, *at))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].1, b_addr);
+    assert!(selected[0].2 >= started);
+    let failed = history
+        .iter()
+        .position(|trace| matches!(trace, Trace::Failure))
+        .unwrap();
+    assert!(
+        selected[0].0 < failed,
+        "failure must already have an exact consumed source"
+    );
+}

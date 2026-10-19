@@ -498,6 +498,9 @@ pub struct UdpRelay {
     upstream: UdpSocket,
     received: Arc<AtomicUsize>,
     handshakes: Arc<Mutex<std::collections::VecDeque<Instant>>>,
+    handshake_only: Arc<AtomicBool>,
+    transport_received: Arc<AtomicUsize>,
+    next_initiator: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -520,6 +523,9 @@ impl UdpRelay {
 
         let received = Arc::new(AtomicUsize::new(0));
         let handshakes = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let handshake_only = Arc::new(AtomicBool::new(false));
+        let transport_received = Arc::new(AtomicUsize::new(0));
+        let next_initiator = Arc::new(AtomicUsize::new(0));
         let upstream = back.try_clone().expect("clone upstream");
         let forward = {
             let front = front.try_clone().expect("clone front");
@@ -527,13 +533,42 @@ impl UdpRelay {
             let (cut, stop, client) = (cut.clone(), stop.clone(), client.clone());
             let received = received.clone();
             let handshakes = handshakes.clone();
+            let handshake_only = handshake_only.clone();
+            let transport_received = transport_received.clone();
+            let next_initiator = next_initiator.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
+                let mut handshake_source = None;
+                let mut first_initiator = None;
                 while !stop.load(Ordering::SeqCst) {
                     let Ok((n, from)) = front.recv_from(&mut buf) else {
                         continue;
                     };
                     received.fetch_add(1, Ordering::SeqCst);
+                    let msg1 = match transport::wire::parse(&buf[..n]) {
+                        Ok(transport::wire::Frame::Handshake {
+                            kind: transport::wire::Kind::HandshakeInit,
+                            body,
+                        }) => Some(body),
+                        Ok(transport::wire::Frame::Handshake {
+                            kind: transport::wire::Kind::HandshakeInitCookie,
+                            body,
+                        }) => transport::wire::split_cookie_init(body).map(|(_, body)| body),
+                        _ => None,
+                    };
+                    if let Some(body) = msg1 {
+                        match next_initiator.load(Ordering::SeqCst) {
+                            1 => {
+                                first_initiator = Some(body.to_vec());
+                                next_initiator.store(2, Ordering::SeqCst);
+                            }
+                            2 if first_initiator.as_deref() != Some(body) => {
+                                handshake_only.store(false, Ordering::SeqCst);
+                                next_initiator.store(3, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
                     if matches!(
                         transport::wire::parse(&buf[..n]),
                         Ok(transport::wire::Frame::Handshake {
@@ -542,14 +577,29 @@ impl UdpRelay {
                             ..
                         })
                     ) {
+                        if handshake_only.load(Ordering::SeqCst) {
+                            handshake_source = Some(from);
+                        }
                         let mut times = handshakes.lock().unwrap_or_else(|p| p.into_inner());
                         if times.len() == 64 {
                             times.pop_front();
                         }
                         times.push_back(Instant::now());
                     }
+                    let is_transport = matches!(
+                        transport::wire::parse(&buf[..n]),
+                        Ok(transport::wire::Frame::Transport { .. })
+                    );
+                    if is_transport
+                        && handshake_only.load(Ordering::SeqCst)
+                        && handshake_source == Some(from)
+                    {
+                        transport_received.fetch_add(1, Ordering::SeqCst);
+                    }
                     *client.lock().unwrap_or_else(|p| p.into_inner()) = Some(from);
-                    if !cut.load(Ordering::SeqCst) {
+                    if !cut.load(Ordering::SeqCst)
+                        && !(handshake_only.load(Ordering::SeqCst) && is_transport)
+                    {
                         let _ = back.send(&buf[..n]);
                     }
                 }
@@ -557,6 +607,7 @@ impl UdpRelay {
         };
         let backward = {
             let (cut, stop) = (cut.clone(), stop.clone());
+            let handshake_only = handshake_only.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 65536];
                 while !stop.load(Ordering::SeqCst) {
@@ -565,6 +616,13 @@ impl UdpRelay {
                     };
                     let to = *client.lock().unwrap_or_else(|p| p.into_inner());
                     if let (false, Some(to)) = (cut.load(Ordering::SeqCst), to) {
+                        let is_transport = matches!(
+                            transport::wire::parse(&buf[..n]),
+                            Ok(transport::wire::Frame::Transport { .. })
+                        );
+                        if handshake_only.load(Ordering::SeqCst) && is_transport {
+                            continue;
+                        }
                         let _ = front.send_to(&buf[..n], to);
                     }
                 }
@@ -577,6 +635,9 @@ impl UdpRelay {
             upstream,
             received,
             handshakes,
+            handshake_only,
+            transport_received,
+            next_initiator,
             stop,
             threads: vec![forward, backward],
         }
@@ -596,6 +657,29 @@ impl UdpRelay {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Keep real Noise replies but withhold transport proof/acceptance.
+    pub fn handshake_only(&self, enabled: bool) {
+        self.handshake_only.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Keep the first initiator silent at the transport layer, then permit
+    /// traffic only after a different actual Noise msg1 is observed. Retained
+    /// fixture state is one bounded msg1 body, never a packet history.
+    pub fn transport_after_next_initiator(&self) {
+        self.handshake_only.store(true, Ordering::SeqCst);
+        self.next_initiator.store(1, Ordering::SeqCst);
+    }
+
+    pub fn saw_next_initiator(&self) -> bool {
+        self.next_initiator.load(Ordering::SeqCst) == 3
+    }
+
+    /// Transport from a source that sent msg1 during handshake-only mode.
+    /// An old live connection closing cannot satisfy this recovery oracle.
+    pub fn transport_received(&self) -> usize {
+        self.transport_received.load(Ordering::SeqCst)
     }
 
     /// Move this test endpoint to another daemon without replacing the relay.

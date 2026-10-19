@@ -222,6 +222,20 @@ fn stats_are_due(cur: Stats, last: Stats, since_last_publish: Duration) -> bool 
     cur != last || since_last_publish >= STATS_HEARTBEAT
 }
 
+/// Incremental facts for the owner of one shared recovery attempt. No event
+/// itself authorizes SSH or proves committed authentication acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryProgress {
+    Sent {
+        endpoint: SocketAddr,
+        at: Instant,
+        success: bool,
+    },
+    /// The initiator was consumed by an authenticated Noise response, even if
+    /// payload validation subsequently rejects it. This is not AuthAccepted.
+    Selected { endpoint: SocketAddr, at: Instant },
+}
+
 /// External client callbacks implemented by the caller.
 pub trait ClientEvents: Send + Sync {
     /// Freshly delivered in-order bytes of stream `stream_id`.
@@ -240,6 +254,9 @@ pub trait ClientEvents: Send + Sync {
     fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
     /// Committed server admission for this exact active transport.
     fn on_auth_accepted(&self, _accepted: crate::AuthAcceptance) {}
+    /// Actual shared-handshake sends and consumed-source selection. The owner
+    /// stamps these with its immutable attempt identity; legacy connects emit none.
+    fn on_recovery_progress(&self, _progress: RecoveryProgress) {}
     /// The OS refused to send a datagram to `to`: its kind and its own
     /// words (e.g. `No route to host (os error 65)`). Called once per change
     /// of the error, not on every retransmit that fails the same way; the
@@ -938,7 +955,15 @@ fn send_recovery_aware(
                 ..
             })
         ) {
-            conn.recovery_handshake_sent(Instant::now(), dg.to, result.is_ok());
+            let at = Instant::now();
+            conn.recovery_handshake_sent(at, dg.to, result.is_ok());
+            if conn.recovery_handshake().is_some() {
+                record.events.on_recovery_progress(RecoveryProgress::Sent {
+                    endpoint: dg.to,
+                    at,
+                    success: result.is_ok(),
+                });
+            }
         }
         record.note(dg.to, result);
     }
@@ -1116,6 +1141,7 @@ fn run_driver(
     // generation this counter has since moved past is recognized as stale.
     let mut auth_generation: u64 = 0;
     let mut acceptance_parser = None;
+    let mut reported_selection = None;
 
     let mut state = LinkState::Connecting;
     events.on_state(state);
@@ -1388,6 +1414,20 @@ fn run_driver(
         // `active_path()` in response, the same reason `resumed_flag` is set
         // ahead of `dispatch_event` for `HandshakeDone` below.
         *active_path_flag.lock().expect("active path") = conn.active_path();
+
+        // Publish the consumed source before either protocol failure or a
+        // proof-producing HandshakeDone reaches the owner. The source may
+        // have supplied an authenticated but invalid payload, never Live.
+        let selected = conn
+            .recovery_handshake()
+            .and_then(|schedule| schedule.selected());
+        if let Some(endpoint) = selected.filter(|selected| Some(*selected) != reported_selection) {
+            reported_selection = Some(endpoint);
+            events.on_recovery_progress(RecoveryProgress::Selected {
+                endpoint,
+                at: Instant::now(),
+            });
+        }
 
         // 4. Forward core events and statistics.
         for ev in poll_events_abandoning_on_exhaustion(&mut conn) {
