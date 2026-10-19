@@ -896,9 +896,9 @@ mod tests {
         );
     }
     #[test]
-    fn stage6_activation_advertises_geometry_without_auth_acceptance() {
+    fn channel_profile_advertises_geometry_and_committed_authentication() {
         assert!(crate::Features::SUPPORTED.contains(crate::Features::CHANNEL_GEOMETRY));
-        assert!(!crate::Features::SUPPORTED.contains(crate::Features::AUTH_ACCEPTED));
+        assert!(crate::Features::SUPPORTED.contains(crate::Features::AUTH_ACCEPTED));
     }
     #[test]
     fn stage6_activation_retires_active_only_snapshot_and_uncorrelated_resize() {

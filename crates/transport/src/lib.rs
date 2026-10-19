@@ -1,6 +1,7 @@
 //! Transport protocol core (sans-IO). Public version-assembly entry point.
 
 pub mod auth;
+pub mod auth_acceptance;
 pub mod channel;
 pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]
@@ -50,6 +51,9 @@ pub mod udp_buffers;
 pub mod wire;
 
 pub use auth::*;
+pub use auth_acceptance::{
+    encode_auth_acceptance, AuthAcceptance, AuthAcceptanceError, SessionDisposition,
+};
 pub use conn::*;
 pub use handshake_payload::*;
 // The negotiable features (spec §5) are named by every layer that builds a

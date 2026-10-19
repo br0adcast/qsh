@@ -1,15 +1,11 @@
 //! Making the connection, and working out what happened when it does not
 //! work.
 //!
-//! The transport never says "your signature was refused": under the
-//! signature policy the server accepts any static key at the handshake and
-//! then simply closes the connection if the proof does not verify, so an
-//! attacker probing keys learns nothing from the failure mode. So a refusal
-//! has to be INFERRED from what can be observed --
-//! handshake completed, proof sent, no data, connection gone, and whether the
-//! link is live right now. That inference decides both the exit code the
-//! user sees and whether the next key is worth trying, so it is a pure
-//! function with its own tests.
+//! A validated server acknowledgement establishes admission for this exact
+//! transport. Refused proofs stay silent: a closed connection or the bounded
+//! acceptance timeout can decide failure, but neither Live, arbitrary DATA nor
+//! elapsed time establishes success. The pure verdict below also preserves
+//! authenticated protocol failures ahead of unauthenticated network errors.
 
 use crate::port_probe::{PortProbe, ProbeResult};
 use ::connect::recovery_gate::RecoveryEpoch;
@@ -25,11 +21,8 @@ use std::time::Duration;
 use transport::driver_std::{Binder, ClientEvents, DriverSetup, SendFailure, StdClient};
 use transport::{LinkState, Stats};
 
-/// How long to wait, once the handshake has completed, for either a byte of
-/// data or the link to fall away before treating silence itself as an
-/// answer: `transport::AUTH_SETTLED_AFTER`, the one definition every client
-/// shares (derived there from the server's own `AUTH_DEADLINE`).
-const AUTH_SETTLED_AFTER_MS: i64 = transport::AUTH_SETTLED_AFTER.as_millis() as i64;
+/// Failure budget for explicit server acceptance. Elapsed time never proves success.
+const AUTH_ACCEPTANCE_TIMEOUT_MS: i64 = transport::AUTH_ACCEPTANCE_TIMEOUT.as_millis() as i64;
 
 /// How long to wait for the handshake to complete AT ALL before giving up on
 /// this address: `transport::HANDSHAKE_GIVE_UP_AFTER`, shared with the app.
@@ -39,12 +32,12 @@ const UNREACHABLE_AFTER_MS: i64 = transport::HANDSHAKE_GIVE_UP_AFTER.as_millis()
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Verdict {
-    /// Data flowed: this key is the right one.
+    /// The server explicitly accepted this exact transport admission.
     Working,
     /// Authenticated protocol rejection; another key cannot repair it.
     ProtocolFailure(transport::ProtocolFailure),
-    /// The handshake succeeded and the session did not: the proof was not
-    /// accepted. Worth trying the next key.
+    /// No acceptance arrived after the handshake before closure or the failure
+    /// budget. Worth trying the next key; silence cannot prove why it failed.
     AuthRefused,
     /// Never got as far as a handshake. Another key will not help. Carries
     /// how the latest send failed, when it did: the one thing the client
@@ -54,44 +47,19 @@ pub enum Verdict {
     StillTrying,
 }
 
-/// What an attempt amounts to, from what can be observed.
-///
-/// There is no "proof accepted" signal on the wire either: acceptance is
-/// inferred, same as refusal, from what the link does. On refusal the
-/// server's probation task exits and the session manager drops the route
-/// (`crates/transport/src/probation.rs`), so it stops answering entirely and
-/// the client's link falls to `PathDown` within a few seconds. An accepted
-/// session keeps answering keepalives and stays `Live`. So past
-/// `AUTH_SETTLED_AFTER_MS`, `live_now` -- not `reached_live`, which only
-/// records that the link WAS live at some point -- is what tells the two
-/// apart.
-///
-/// Residual ambiguity, knowingly accepted rather than overlooked: a session
-/// that IS accepted, whose shell prints nothing at all, and whose shell then
-/// exits before the deadline -- closing the link -- still reads as
-/// `AuthRefused`. Nothing observable here distinguishes that from a genuine
-/// refusal; both end the same way, a dead link with no data ever delivered.
-///
-/// `send_error` is the transport's latest send failure, if any; it rides on
-/// an `Unreachable` verdict and changes no decision.
+/// Only a validated acceptance record establishes authentication. Link state and
+/// elapsed budgets distinguish refusal/unreachability, never infer success.
 pub fn attempt_verdict(
     reached_live: bool,
-    got_data: bool,
+    accepted: Option<transport::AuthAcceptance>,
     closed: bool,
-    live_now: bool,
     elapsed_ms: i64,
     send_error: Option<SendFailure>,
 ) -> Verdict {
-    if got_data {
+    if accepted.is_some() {
         return Verdict::Working;
     }
     if closed {
-        // Reaching Live proves nothing on the signature path -- the server
-        // admits any static key there. Being dropped right afterwards, with
-        // nothing delivered, is what a refused proof looks like. A close
-        // before the handshake ever finished is a different failure
-        // entirely: the daemon isn't there, or isn't reachable, and another
-        // key will not help.
         return if reached_live {
             Verdict::AuthRefused
         } else {
@@ -99,14 +67,11 @@ pub fn attempt_verdict(
         };
     }
     if reached_live {
-        if elapsed_ms >= AUTH_SETTLED_AFTER_MS {
-            return if live_now {
-                Verdict::Working
-            } else {
-                Verdict::AuthRefused
-            };
-        }
-        return Verdict::StillTrying;
+        return if elapsed_ms >= AUTH_ACCEPTANCE_TIMEOUT_MS {
+            Verdict::AuthRefused
+        } else {
+            Verdict::StillTrying
+        };
     }
     if elapsed_ms >= UNREACHABLE_AFTER_MS {
         return Verdict::Unreachable(send_error);
@@ -151,11 +116,10 @@ impl Binder for NoopBinder {
 pub struct Events {
     pub tx: Sender<crate::session::UiEvent>,
     pub reached_live: AtomicBool,
-    pub got_data: AtomicBool,
+    /// First completed handshake; later path recovery must not renew this budget.
+    first_live_at: std::sync::OnceLock<std::time::Instant>,
     pub closed: AtomicBool,
-    /// Whether the link is live RIGHT NOW, as opposed to `reached_live`,
-    /// which only ever records that it once was.
-    pub live_now: AtomicBool,
+    acceptance: Mutex<Option<transport::AuthAcceptance>>,
     /// Whether the connection runs with stream credits (spec §4.13).
     credits: AtomicBool,
     protocol_failure: Mutex<Option<transport::ProtocolFailure>>,
@@ -171,9 +135,9 @@ impl Events {
         Events {
             tx,
             reached_live: AtomicBool::new(false),
-            got_data: AtomicBool::new(false),
+            first_live_at: std::sync::OnceLock::new(),
             closed: AtomicBool::new(false),
-            live_now: AtomicBool::new(false),
+            acceptance: Mutex::new(None),
             credits: AtomicBool::new(false),
             protocol_failure: Mutex::new(None),
             queued: Mutex::new(0),
@@ -201,12 +165,6 @@ impl Events {
 
 impl ClientEvents for Events {
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
-        // Any byte at all proves the key was accepted, regardless of which
-        // stream it lands on: with channels, a cold session that opens no
-        // channel may see nothing at all before the trial's own deadline
-        // (see `attempt_verdict`'s "no data ever, link still live" branch
-        // for what settles the verdict then).
-        self.got_data.store(true, Ordering::SeqCst);
         {
             let mut queued = self.queued.lock().expect("queue count");
             while !self.credits.load(Ordering::SeqCst)
@@ -221,6 +179,15 @@ impl ClientEvents for Events {
             stream: stream_id,
             bytes: data,
         });
+    }
+
+    fn on_auth_accepted(&self, accepted: transport::AuthAcceptance) {
+        if !self.released.load(Ordering::SeqCst) {
+            self.acceptance
+                .lock()
+                .expect("authentication acceptance")
+                .get_or_insert(accepted);
+        }
     }
 
     fn on_protocol_failure(&self, failure: transport::ProtocolFailure) {
@@ -240,15 +207,12 @@ impl ClientEvents for Events {
     fn on_state(&self, state: LinkState) {
         match state {
             LinkState::Live => {
+                self.first_live_at.get_or_init(std::time::Instant::now);
                 self.reached_live.store(true, Ordering::SeqCst);
-                self.live_now.store(true, Ordering::SeqCst);
             }
-            LinkState::PathDown => {
-                self.live_now.store(false, Ordering::SeqCst);
-            }
+            LinkState::PathDown => {}
             LinkState::Closed => {
                 self.closed.store(true, Ordering::SeqCst);
-                self.live_now.store(false, Ordering::SeqCst);
             }
             LinkState::Connecting => {}
         }
@@ -366,7 +330,8 @@ impl Attempt {
         let client = Arc::new(StdClient::connect_with(
             addr,
             transport::ConnectionConfig {
-                required_features: transport::Features::CHANNEL_GEOMETRY,
+                required_features: transport::Features::CHANNEL_GEOMETRY
+                    | transport::Features::AUTH_ACCEPTED,
                 features: transport::Features::SUPPORTED,
                 role: transport::Role::Client,
                 local_static_priv: local_priv,
@@ -473,6 +438,15 @@ impl Attempt {
         self.client.detach();
     }
 
+    /// The committed admission outcome, distinct from msg2's tentative resume hint.
+    pub fn acceptance(&self) -> Option<transport::AuthAcceptance> {
+        *self
+            .events
+            .acceptance
+            .lock()
+            .expect("authentication acceptance")
+    }
+
     pub fn verdict(&self) -> Verdict {
         if let Some(failure) = *self
             .events
@@ -486,17 +460,28 @@ impl Attempt {
         let reached_live = self.events.reached_live.load(Ordering::SeqCst);
         // Authenticated progress takes precedence over an unauthenticated
         // network error, including a handshake racing with the probe.
-        if !reached_live && !self.events.got_data.load(Ordering::SeqCst) {
+        if !reached_live && self.acceptance().is_none() {
             if let Some(error) = refused {
                 return Verdict::Unreachable(Some(error));
             }
         }
+        // A late handshake has not yet had time to produce its proof or receive
+        // acceptance. Count that phase from its first Live, not from msg1; path
+        // recovery cannot extend it because first_live_at is written only once.
+        let phase_started = if reached_live {
+            self.events
+                .first_live_at
+                .get()
+                .copied()
+                .unwrap_or(self.started)
+        } else {
+            self.started
+        };
         attempt_verdict(
-            self.events.reached_live.load(Ordering::SeqCst),
-            self.events.got_data.load(Ordering::SeqCst),
+            reached_live,
+            self.acceptance(),
             self.events.closed.load(Ordering::SeqCst),
-            self.events.live_now.load(Ordering::SeqCst),
-            self.started.elapsed().as_millis() as i64,
+            phase_started.elapsed().as_millis() as i64,
             self.client.last_send_error(),
         )
     }
@@ -506,48 +491,26 @@ impl Attempt {
         self.settle_with(|| {})
     }
 
-    /// Like [`Self::settle`], but calls `on_live` once -- the moment the
-    /// link first comes alive, before the verdict is known at all -- rather
-    /// than only after the whole attempt is decided.
-    ///
-    /// Why this exists: under a protocol where the caller must ask for
-    /// something (open a channel) before the server ever answers with
-    /// anything, `verdict()`'s "data arrived" signal never fires on its own
-    /// -- a working key would otherwise sit out the FULL auth deadline in
-    /// silence every single time, because nothing ever prompts the server to
-    /// speak first. `on_live` is the caller's chance to send that first ask
-    /// (see `climb::settle_opening`) the instant it can possibly matter,
-    /// so a genuine answer -- and the `Verdict::Working` it produces via
-    /// `got_data` -- arrives as fast as the round trip allows instead of
-    /// waiting out a deadline that exists for the OPPOSITE case (a key that
-    /// is accepted but whose session simply has nothing to say yet).
-    ///
-    /// The refusal path is unaffected: `on_live` firing changes nothing
-    /// about `reached_live`/`closed`/`live_now`, which is everything
-    /// `attempt_verdict` looks at for `AuthRefused` -- a refused key never
-    /// gets a real answer to `on_live`'s ask, so `got_data` never flips
-    /// either way.
-    pub fn settle_with(&self, on_live: impl FnMut()) -> Verdict {
-        self.settle_until(on_live, || false)
+    /// Invoke application startup once explicit authentication acceptance arrives.
+    pub fn settle_with(&self, on_accepted: impl FnMut()) -> Verdict {
+        self.settle_until(on_accepted, || false)
     }
 
     /// Recovery can stop a stale attempt when SSH supplies a new port or
     /// authorization. The owner still detaches it before starting another.
     pub fn settle_until(
         &self,
-        mut on_live: impl FnMut(),
+        mut on_accepted: impl FnMut(),
         interrupted: impl Fn() -> bool,
     ) -> Verdict {
-        let mut fired = false;
         loop {
             if interrupted() {
                 return Verdict::Unreachable(None);
             }
-            if !fired && self.events.reached_live.load(Ordering::SeqCst) {
-                on_live();
-                fired = true;
-            }
             let v = self.verdict();
+            if v == Verdict::Working {
+                on_accepted();
+            }
             if v != Verdict::StillTrying {
                 return v;
             }
@@ -568,6 +531,13 @@ mod tests {
     ) {
         let (tx, rx) = channel();
         (Arc::new(Events::new(tx)), rx)
+    }
+
+    fn test_acceptance() -> transport::AuthAcceptance {
+        transport::AuthAcceptance {
+            session_id: 17,
+            disposition: transport::SessionDisposition::Fresh,
+        }
     }
 
     fn unstarted_attempt() -> Attempt {
@@ -641,7 +611,7 @@ mod tests {
         let attempt = unstarted_attempt();
         attempt.probe_port_refusal(addr);
         attempt.events.reached_live.store(true, Ordering::SeqCst);
-        attempt.events.got_data.store(true, Ordering::SeqCst);
+        attempt.events.on_auth_accepted(test_acceptance());
         assert_eq!(attempt.verdict(), Verdict::Working);
         assert!(attempt.refusal_probe.lock().unwrap().is_none());
     }
@@ -828,10 +798,10 @@ mod tests {
     #[test]
     fn the_settle_deadline_sits_past_the_servers_own() {
         assert_eq!(
-            AUTH_SETTLED_AFTER_MS,
-            (transport::AUTH_DEADLINE + transport::AUTH_SETTLE_MARGIN).as_millis() as i64
+            AUTH_ACCEPTANCE_TIMEOUT_MS,
+            (transport::AUTH_DEADLINE + transport::AUTH_DELIVERY_MARGIN).as_millis() as i64
         );
-        assert!(AUTH_SETTLED_AFTER_MS > transport::AUTH_DEADLINE.as_millis() as i64);
+        assert!(AUTH_ACCEPTANCE_TIMEOUT_MS > transport::AUTH_DEADLINE.as_millis() as i64);
     }
 
     /// Step 1 signs with an SSH key; step 3 is let in by the daemon's list
@@ -856,11 +826,11 @@ mod tests {
         assert!(signer.is_some());
     }
 
-    /// Data arrived: whatever else happened, this key worked.
+    /// A validated explicit acceptance establishes the result even without application data.
     #[test]
-    fn data_means_the_key_was_accepted() {
+    fn explicit_acceptance_means_the_key_was_accepted() {
         assert_eq!(
-            attempt_verdict(true, true, false, true, 100, None),
+            attempt_verdict(true, Some(test_acceptance()), false, 100, None),
             Verdict::Working
         );
     }
@@ -871,7 +841,7 @@ mod tests {
     #[test]
     fn a_close_after_the_handshake_with_no_data_is_a_refusal() {
         assert_eq!(
-            attempt_verdict(true, false, true, false, 200, None),
+            attempt_verdict(true, None, true, 200, None),
             Verdict::AuthRefused
         );
     }
@@ -882,19 +852,17 @@ mod tests {
     #[test]
     fn a_close_before_the_handshake_is_unreachable_not_refused() {
         assert_eq!(
-            attempt_verdict(false, false, true, false, 200, None),
+            attempt_verdict(false, None, true, 200, None),
             Verdict::Unreachable(None)
         );
     }
 
-    /// Past the deadline with nothing delivered but the link STILL live: the
-    /// server is still talking to us (keepalives), which is what an accepted
-    /// session with a quiet shell looks like -- not a refusal.
+    /// Transport keepalives cannot stand in for committed authentication.
     #[test]
-    fn a_live_link_past_the_deadline_with_no_data_is_accepted() {
+    fn a_live_link_past_the_deadline_without_acceptance_is_refused() {
         assert_eq!(
-            attempt_verdict(true, false, false, true, 6_000, None),
-            Verdict::Working
+            attempt_verdict(true, None, false, 6_000, None),
+            Verdict::AuthRefused
         );
     }
 
@@ -904,7 +872,7 @@ mod tests {
     #[test]
     fn silence_past_the_deadline_with_the_link_down_is_a_refusal() {
         assert_eq!(
-            attempt_verdict(true, false, false, false, 6_000, None),
+            attempt_verdict(true, None, false, 6_000, None),
             Verdict::AuthRefused
         );
     }
@@ -916,7 +884,7 @@ mod tests {
     #[test]
     fn silence_past_the_unreachable_deadline_with_no_handshake_is_unreachable() {
         assert_eq!(
-            attempt_verdict(false, false, false, false, 10_500, None),
+            attempt_verdict(false, None, false, 10_500, None),
             Verdict::Unreachable(None)
         );
     }
@@ -930,19 +898,19 @@ mod tests {
             "No route to host (os error 65)".to_string(),
         ));
         assert_eq!(
-            attempt_verdict(false, false, false, false, 10_500, refused.clone()),
+            attempt_verdict(false, None, false, 10_500, refused.clone()),
             Verdict::Unreachable(refused.clone())
         );
         assert_eq!(
-            attempt_verdict(false, false, true, false, 200, refused.clone()),
+            attempt_verdict(false, None, true, 200, refused.clone()),
             Verdict::Unreachable(refused.clone())
         );
         assert_eq!(
-            attempt_verdict(false, false, false, false, 1_000, refused.clone()),
+            attempt_verdict(false, None, false, 1_000, refused.clone()),
             Verdict::StillTrying
         );
         assert_eq!(
-            attempt_verdict(true, false, true, false, 200, refused),
+            attempt_verdict(true, None, true, 200, refused),
             Verdict::AuthRefused
         );
     }
@@ -963,12 +931,119 @@ mod tests {
     #[test]
     fn silence_inside_the_deadlines_concludes_nothing() {
         assert_eq!(
-            attempt_verdict(true, false, false, true, 1_000, None),
+            attempt_verdict(true, None, false, 1_000, None),
             Verdict::StillTrying
         );
         assert_eq!(
-            attempt_verdict(false, false, false, false, 1_000, None),
+            attempt_verdict(false, None, false, 1_000, None),
             Verdict::StillTrying
         );
+    }
+    #[test]
+    fn auth17_live_with_no_acceptance_never_becomes_working_after_old_settle_delay() {
+        let mut attempt = unstarted_attempt();
+        attempt.started = std::time::Instant::now() - StdDuration::from_secs(6);
+        attempt.events.on_state(LinkState::Live);
+        assert_ne!(attempt.verdict(), Verdict::Working);
+    }
+
+    #[test]
+    fn auth17_application_bytes_do_not_establish_authentication() {
+        let attempt = unstarted_attempt();
+        attempt.events.on_state(LinkState::Live);
+        attempt
+            .events
+            .on_bytes(0, b"channel metadata can arrive before acceptance".to_vec());
+        assert_eq!(attempt.verdict(), Verdict::StillTrying);
+    }
+
+    #[test]
+    fn auth17_live_without_acceptance_never_invokes_channel_open_callback() {
+        let mut attempt = unstarted_attempt();
+        attempt.started = std::time::Instant::now() - StdDuration::from_secs(6);
+        attempt.events.first_live_at.set(attempt.started).unwrap();
+        attempt.events.on_state(LinkState::Live);
+        let mut opened = 0;
+        let verdict = attempt.settle_until(|| opened += 1, || false);
+        assert_eq!(
+            opened, 0,
+            "transport Live is not permission to open a shell"
+        );
+        assert_ne!(verdict, Verdict::Working);
+    }
+    #[test]
+    fn auth17_explicit_acceptance_settles_immediately_and_calls_startup_once() {
+        for disposition in [
+            transport::SessionDisposition::Fresh,
+            transport::SessionDisposition::Resumed,
+        ] {
+            let attempt = unstarted_attempt();
+            attempt.events.on_state(LinkState::Live);
+            let accepted = transport::AuthAcceptance {
+                disposition,
+                ..test_acceptance()
+            };
+            attempt.events.on_auth_accepted(accepted);
+            let mut startup = 0;
+            assert_eq!(
+                attempt.settle_until(|| startup += 1, || false),
+                Verdict::Working
+            );
+            assert_eq!(startup, 1);
+            assert_eq!(attempt.acceptance(), Some(accepted));
+        }
+    }
+
+    #[test]
+    fn auth17_protocol_failure_and_cancellation_prevent_startup_after_acceptance() {
+        let attempt = unstarted_attempt();
+        attempt.events.on_auth_accepted(test_acceptance());
+        assert_eq!(
+            attempt.settle_until(|| panic!("cancelled startup"), || true),
+            Verdict::Unreachable(None)
+        );
+        let failure = transport::ProtocolFailure::InvalidAuthentication {
+            reason: transport::AuthAcceptanceError::Excess,
+        };
+        attempt.events.on_protocol_failure(failure);
+        assert_eq!(
+            attempt.settle_until(|| panic!("failed startup"), || false),
+            Verdict::ProtocolFailure(failure)
+        );
+        let stale = unstarted_attempt();
+        stale.events.release();
+        stale.events.on_auth_accepted(test_acceptance());
+        assert_eq!(stale.acceptance(), None);
+    }
+    #[test]
+    fn auth17_late_handshake_gets_its_own_acceptance_budget() {
+        let mut attempt = unstarted_attempt();
+        attempt.started = std::time::Instant::now() - StdDuration::from_secs(9);
+        assert_eq!(
+            attempt.verdict(),
+            Verdict::StillTrying,
+            "handshake still has its own ten-second budget"
+        );
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(
+            attempt.verdict(),
+            Verdict::StillTrying,
+            "time spent waiting for msg2 cannot spend the proof/acceptance budget"
+        );
+        attempt.events.on_auth_accepted(test_acceptance());
+        assert_eq!(attempt.verdict(), Verdict::Working);
+    }
+
+    #[test]
+    fn auth17_path_recovery_cannot_renew_the_acceptance_deadline() {
+        let attempt = unstarted_attempt();
+        let first_live = std::time::Instant::now() - StdDuration::from_secs(6);
+        attempt.events.first_live_at.set(first_live).unwrap();
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(attempt.verdict(), Verdict::AuthRefused);
+        attempt.events.on_state(LinkState::PathDown);
+        attempt.events.on_state(LinkState::Live);
+        assert_eq!(attempt.events.first_live_at.get(), Some(&first_live));
+        assert_eq!(attempt.verdict(), Verdict::AuthRefused);
     }
 }

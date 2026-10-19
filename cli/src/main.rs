@@ -1458,16 +1458,9 @@ fn interactive(
         chrome,
     );
     sess.set_history_limit(a.history);
-    // The climb's trial already opened the shell channel, the moment the link
-    // came alive, so its `Opened` confirmation could flip the verdict fast
-    // instead of the client waiting out the full auth deadline in silence
-    // -- see `climb::settle_opening`. `Session` must be told, or its own
-    // `on_link(Live)` -- replaying, from the queue, the very same `Live`
-    // transition the trial already acted on -- would open a SECOND
-    // channel. `shell_channel.is_some()` is the defensive case: `open_shell`
-    // returning `None` during the trial (unreachable for a fresh session's
-    // first channel, but not provably so) means nothing was actually
-    // requested, and `Session`'s own path should run normally instead.
+    // The climb's trial opens a fresh shell after explicit acceptance. Replaying
+    // the queued Live event must not request a second channel. If the trial
+    // could not request one, Session's existing startup path remains available.
     //
     // A login that resumed the session the token names -- the run before
     // this one left with `Ctrl-] .`, or was killed -- opened nothing on
@@ -1475,10 +1468,11 @@ fn interactive(
     // shell is bound from that list (`SessionEvent::Ready` after
     // `Announced`). `Session` must not open one on `Live` either, or the
     // server refuses it as a stream already open and the run ends.
-    let resumed = links
-        .live
-        .as_ref()
-        .is_some_and(|live| live.attempt.client.resumed());
+    let resumed = links.live.as_ref().is_some_and(|live| {
+        live.attempt
+            .acceptance()
+            .is_some_and(|accepted| accepted.disposition == transport::SessionDisposition::Resumed)
+    });
     if links.shell_channel.is_some() || resumed {
         sess.assume_channel_opening();
     }

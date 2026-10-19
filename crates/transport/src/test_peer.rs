@@ -83,7 +83,9 @@ where
     thread::spawn(move || {
         let conn = Connection::new(ConnectionConfig {
             required_features: crate::Features::NONE,
-            features: crate::Features::SUPPORTED,
+            features: crate::Features::from_bits(
+                crate::Features::SUPPORTED.bits() & !crate::Features::AUTH_ACCEPTED.bits(),
+            ),
             role: Role::Server,
             local_static_priv: server.private,
             remote_static_pub: None,

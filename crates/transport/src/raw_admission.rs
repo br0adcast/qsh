@@ -78,7 +78,14 @@ impl PendingAdmission {
                 if !matches!(cfg.auth, AuthPolicy::Allowlist(_)) {
                     return PacketResult::Handled;
                 }
-                let mut conn = Connection::new(cfg.clone());
+                // These raw diagnostic owners implement fresh-key proof, but
+                // no committed admission acknowledgement. Never advertise it
+                // just because the transport codec implements the bit.
+                let mut raw = cfg.clone();
+                raw.features = crate::Features::from_bits(
+                    raw.features.bits() & !crate::Features::AUTH_ACCEPTED.bits(),
+                );
+                let mut conn = Connection::new(raw);
                 let reply = conn.on_datagram(now, src, bytes);
                 if conn.state() == LinkState::Live {
                     conn.set_undelivered_cap(crate::probation::PROBATION_UNDELIVERED_MAX);
@@ -244,5 +251,17 @@ mod tests {
             PacketResult::Unrelated
         ));
         assert!(pending.candidate.is_none());
+    }
+    #[test]
+    fn auth17_raw_owner_explicitly_excludes_admission_acceptance() {
+        let (pending, _, client, _, _) = fixture();
+        assert!(!client.features().contains(crate::Features::AUTH_ACCEPTED));
+        assert!(!pending
+            .candidate
+            .as_ref()
+            .unwrap()
+            .conn
+            .features()
+            .contains(crate::Features::AUTH_ACCEPTED));
     }
 }

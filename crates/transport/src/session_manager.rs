@@ -93,9 +93,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::{AuthVerifier, Principal, AUTH_NONCE_LEN, AUTH_STREAM, NO_INCARNATION};
+use crate::auth_acceptance::{AuthAcceptance, SessionDisposition};
 use crate::conn::{
     AcceptOutcome, AuthPolicy, Connection, ConnectionConfig, Consumption, Datagram, Event,
     LinkState, Msg2Inputs, Role, StreamClass,
@@ -1160,6 +1161,29 @@ pub struct ServerAuth {
     pub logins: Arc<dyn LoginSink>,
 }
 
+/// Authority to publish the outcome of a completed manager admission.
+/// This value is private to the manager/bridge handoff.
+#[derive(Debug)]
+struct CommittedAdmission(AuthAcceptance);
+
+impl CommittedAdmission {
+    fn enqueue(self, conn: &mut Connection, now: Instant) -> Option<Vec<Datagram>> {
+        if self.0.session_id != conn.session_id() {
+            return None;
+        }
+        // This is the first server write to AUTH_STREAM on a fresh transport.
+        // Its implicit credit window cannot be reduced by the peer. A bounded
+        // enqueue succeeds even when congestion defers the actual datagram.
+        conn.try_send_bounded(
+            now,
+            AUTH_STREAM,
+            &crate::encode_auth_acceptance(self.0),
+            crate::auth_acceptance::AUTH_ACCEPTANCE_LEN,
+        )
+        .ok()
+    }
+}
+
 /// A control message from the manager to a backend's PERSISTENT bridge task.
 enum BridgeControl {
     /// A new client `Connection` has reattached (warm) to this backend: drive
@@ -1180,7 +1204,12 @@ enum BridgeControl {
     /// it reads its own route: sent into that route instead, `select!` could
     /// take one before the `Attach` and feed it to the connection being
     /// replaced.
-    Attach(Box<Connection>, Vec<StreamData>, Vec<(SocketAddr, Vec<u8>)>),
+    Attach(
+        Box<Connection>,
+        Vec<StreamData>,
+        Vec<(SocketAddr, Vec<u8>)>,
+        oneshot::Receiver<CommittedAdmission>,
+    ),
 }
 
 /// A registered backend for one token (= one device). One backend task + one
@@ -2718,7 +2747,13 @@ impl SessionManager {
                 // once the attach took (a raced-out bridge falls back to
                 // `cold_create`, which logs for itself).
                 let features = conn.features();
-                match control.send(BridgeControl::Attach(Box::new(conn), early, queued)) {
+                let (commit_tx, commit_rx) = oneshot::channel();
+                match control.send(BridgeControl::Attach(
+                    Box::new(conn),
+                    early,
+                    queued,
+                    commit_rx,
+                )) {
                     Ok(()) => {
                         // Bridge is alive. Repoint the datagram route to the
                         // new session_id: the STABLE dgram sender is taken
@@ -2747,10 +2782,37 @@ impl SessionManager {
                         // roam (beats DEATH_AFTER) ever sees the superseded
                         // key -- SessionEnded is never emitted for it.
                         scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                        // The bridge may already be runnable on another worker.
+                        // Release it only after route/revision/incarnation and key
+                        // ownership have all committed, before the first await.
+                        if commit_tx
+                            .send(CommittedAdmission(AuthAcceptance {
+                                session_id: new_id,
+                                disposition: SessionDisposition::Resumed,
+                            }))
+                            .is_err()
+                        {
+                            // The enqueued envelope owned the Connection, so a
+                            // dropped receiver cannot cold-fallback. Retire only
+                            // this committed route through normal lifecycle rules.
+                            if let Some(key) = on_session_ended_and_notify(
+                                router,
+                                ctx.auth,
+                                SessionEnded {
+                                    session_id: new_id,
+                                    token,
+                                    graceful: false,
+                                },
+                                tokio::time::Instant::now(),
+                            ) {
+                                remove_from_allowlist(&ctx.auth.allowlist, &key);
+                            }
+                            return;
+                        }
                         send_all(ctx.socket, &out).await;
                         log_session_features(new_id, features);
                     }
-                    Err(mpsc::error::SendError(BridgeControl::Attach(boxed, early, queued))) => {
+                    Err(mpsc::error::SendError(BridgeControl::Attach(boxed, early, queued, _))) => {
                         // The bridge already ended (its connection closed just
                         // as this reattach raced in), so its backend is gone
                         // too. Fall back to a clean cold-create -- recovering
@@ -2923,24 +2985,6 @@ impl SessionManager {
             None => dgram_queue(),
         };
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<BridgeControl>();
-        tokio::spawn(run_backend_bridge(BridgeSpawn {
-            socket: ctx.socket.clone(),
-            conn,
-            channels: BridgeChannels {
-                dgram_rx: dg_rx,
-                io_inbound_tx: in_tx,
-                backend_out_rx: out_rx,
-                control_rx: ctl_rx,
-                done_tx: ctx.done_tx.clone(),
-            },
-            token,
-            backend: ctx.factory.0.clone(),
-            io,
-            start,
-            active_count: ctx.active_count.clone(),
-            gates,
-        }));
-
         // Register BEFORE sending msg2, so a fast client reply is routable the
         // instant it arrives.
         router.sessions.insert(session_id, dg_tx);
@@ -2959,6 +3003,30 @@ impl SessionManager {
                 incarnation,
             },
         );
+        // No backend callback or bridge scheduling precedes the synchronous
+        // route, revision and backend registration above.
+        spawn_committed_bridge(BridgeSpawn {
+            socket: ctx.socket.clone(),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
+            conn,
+            channels: BridgeChannels {
+                dgram_rx: dg_rx,
+                io_inbound_tx: in_tx,
+                backend_out_rx: out_rx,
+                control_rx: ctl_rx,
+                done_tx: ctx.done_tx.clone(),
+            },
+            token,
+            backend: ctx.factory.0.clone(),
+            io,
+            start,
+            active_count: ctx.active_count.clone(),
+            gates,
+        });
+
         send_all(ctx.socket, &out).await;
         superseded.map(|e| e.client_key)
     }
@@ -3144,7 +3212,13 @@ fn adopt_connection(conn: &mut Connection, classes: &BTreeMap<u8, StreamClass>) 
 /// REVIVES a parked (retained) backend. The bridge's `drain_events` after the
 /// wake-up drains the new connection's queued events, and its gate refresh
 /// opens every gate (the new connection holds no tails).
-fn apply_control(
+enum AttachResult {
+    Applied,
+    Cancelled,
+    Rejected(u64),
+}
+
+async fn apply_control(
     conn: &mut Connection,
     parked: &mut bool,
     link: &mut BackendLink,
@@ -3152,8 +3226,22 @@ fn apply_control(
     classes: &BTreeMap<u8, StreamClass>,
     now: Instant,
     out: &mut Vec<Datagram>,
-) {
-    let BridgeControl::Attach(new_conn, early, queued) = control;
+) -> AttachResult {
+    let BridgeControl::Attach(mut new_conn, early, queued, commit) = control;
+    let Ok(committed) = commit.await else {
+        // The manager abandoned admission before committing it. Nothing in the
+        // existing attachment, its ledger or its backend has changed.
+        return AttachResult::Cancelled;
+    };
+    if committed.0.session_id != new_conn.session_id() {
+        return AttachResult::Cancelled;
+    }
+    if new_conn.features().contains(crate::Features::AUTH_ACCEPTED) {
+        let Some(datagrams) = committed.enqueue(&mut new_conn, Instant::now()) else {
+            return AttachResult::Rejected(new_conn.session_id());
+        };
+        out.extend(datagrams);
+    }
     // What this bridge handed its backend off the replaced connection and
     // the backend has not yet reported is owed to it (spec §4.10.3): its
     // late reports must not credit the new one. Not `conn`'s own
@@ -3184,6 +3272,7 @@ fn apply_control(
     for (src, bytes) in queued {
         out.extend(conn.on_datagram(now, src, &bytes));
     }
+    AttachResult::Applied
 }
 
 /// A backend's declaration of `stream_id`'s class: applied to `conn` now,
@@ -3222,7 +3311,7 @@ fn declare_class(
 /// A closed (parked) connection is deaf: `on_datagram` returns empty, so this
 /// is a harmless no-op until a revive.
 #[allow(clippy::too_many_arguments)]
-fn on_routed_datagram(
+async fn on_routed_datagram(
     conn: &mut Connection,
     parked: &mut bool,
     control_rx: &mut mpsc::UnboundedReceiver<BridgeControl>,
@@ -3232,11 +3321,16 @@ fn on_routed_datagram(
     src: SocketAddr,
     bytes: &[u8],
     out: &mut Vec<Datagram>,
-) {
+) -> AttachResult {
     while let Ok(control) = control_rx.try_recv() {
-        apply_control(conn, parked, link, control, classes, now, out);
+        if let rejected @ AttachResult::Rejected(_) =
+            apply_control(conn, parked, link, control, classes, now, out).await
+        {
+            return rejected;
+        }
     }
     out.extend(conn.on_datagram(now, src, bytes));
+    AttachResult::Applied
 }
 
 /// What woke the persistent bridge loop.
@@ -3277,6 +3371,7 @@ struct BridgeChannels {
 /// Everything a bridge task is started with.
 struct BridgeSpawn {
     socket: Arc<UdpSocket>,
+    committed: CommittedAdmission,
     /// The FIRST connection this bridge drives; swappable thereafter.
     conn: Connection,
     channels: BridgeChannels,
@@ -3294,6 +3389,24 @@ struct BridgeSpawn {
     gates: Arc<GateTable>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static POLL_COLD_BRIDGE_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spawn_committed_bridge(spawn: BridgeSpawn) {
+    #[cfg(test)]
+    if POLL_COLD_BRIDGE_INLINE.with(|flag| flag.get()) {
+        let mut future = Box::pin(run_backend_bridge(spawn));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        if future.as_mut().poll(&mut context).is_pending() {
+            tokio::spawn(future);
+        }
+        return;
+    }
+    tokio::spawn(run_backend_bridge(spawn));
+}
+
 /// The PERSISTENT per-backend bridge task: it owns ONE backend's io channels
 /// for the backend's whole life and drives a SWAPPABLE `Connection`. A cold
 /// create starts it with the first accepted connection; a warm reattach sends
@@ -3308,11 +3421,10 @@ struct BridgeSpawn {
 /// `conn.set_stream_resyncable`). Documenting this sequence prevents the
 /// question from arising for the next reader.
 ///
-/// Every connection a bridge ever sees is already authenticated: the allowlist
-/// checked its static key during the handshake, or its probation
-/// (`crate::probation`) verified its signature before the manager bound it. So
-/// the bridge has no authentication check of its own and nothing to withhold
-/// -- the session exists precisely because the peer is proven.
+/// Probation has already verified fresh possession and any required signature.
+/// The bridge must additionally wait for the manager's committed admission
+/// permission before adopting a warm connection. It queues explicit acceptance
+/// before handing Live, ResumeReset or early input to the backend.
 ///
 /// Send gates (spec §4.7.2). The bridge refreshes the session's send gates
 /// (`crate::send_gate`) at the end of every turn from its connection's
@@ -3358,6 +3470,7 @@ struct BridgeSpawn {
 async fn run_backend_bridge(spawn: BridgeSpawn) {
     let BridgeSpawn {
         socket,
+        committed,
         mut conn,
         channels,
         token,
@@ -3374,6 +3487,20 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         mut control_rx,
         done_tx,
     } = channels;
+
+    let now = Instant::now();
+    let mut out = Vec::new();
+    if conn.features().contains(crate::Features::AUTH_ACCEPTED) {
+        let Some(datagrams) = committed.enqueue(&mut conn, now) else {
+            let _ = done_tx.send(SessionEnded {
+                session_id: conn.session_id(),
+                token,
+                graceful: false,
+            });
+            return;
+        };
+        out.extend(datagrams);
+    }
 
     // Fixed before the backend runs (spec §4.10.3): who says when its
     // stream bytes are consumed.
@@ -3415,8 +3542,6 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // Replay what a probation stage consumed off this connection before the
     // bridge got it. ORDER: the backend hears its session started before any
     // byte of it, exactly as it would have from the drain below.
-    let now = Instant::now();
-    let mut out: Vec<Datagram> = Vec::new();
     if start.saw_live {
         first_live_sent = true;
         let context = AttachmentContext::for_connection(&conn, link.ledger.generation());
@@ -3493,7 +3618,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         match wakeup {
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
             Wakeup::Dgram(Some((src, bytes))) => {
-                on_routed_datagram(
+                if let AttachResult::Rejected(session_id) = on_routed_datagram(
                     &mut conn,
                     &mut parked,
                     &mut control_rx,
@@ -3503,7 +3628,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     src,
                     &bytes,
                     &mut out,
-                );
+                )
+                .await
+                {
+                    let _ = done_tx.send(SessionEnded {
+                        session_id,
+                        token,
+                        graceful: false,
+                    });
+                    break;
+                }
             }
             // The manager dropped the datagram channel -- shut the backend down.
             Wakeup::Dgram(None) => break,
@@ -3642,7 +3776,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             }
             // Warm reattach (see `apply_control`); also revives a parked bridge.
             Wakeup::Control(Some(control)) => {
-                apply_control(
+                if let AttachResult::Rejected(session_id) = apply_control(
                     &mut conn,
                     &mut parked,
                     &mut link,
@@ -3650,7 +3784,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     &classes,
                     now,
                     &mut out,
-                );
+                )
+                .await
+                {
+                    let _ = done_tx.send(SessionEnded {
+                        session_id,
+                        token,
+                        graceful: false,
+                    });
+                    break;
+                }
             }
             // What waited for the backend went to it: booked to the
             // connections that delivered it (see `ConsumptionLedger`).
@@ -7663,6 +7806,10 @@ mod tests {
         let active = Arc::new(AtomicUsize::new(0));
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -7949,7 +8096,7 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(
+            committed_attach(
                 Box::new(a_quiet_server_connection()),
                 Vec::new(),
                 Vec::new(),
@@ -7957,7 +8104,8 @@ mod tests {
             &classes,
             Instant::now(),
             &mut out,
-        );
+        )
+        .await;
         assert_eq!(conn.stream_class(14), StreamClass::Bulk);
     }
 
@@ -7977,7 +8125,7 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(
+            committed_attach(
                 Box::new(a_quiet_server_connection()),
                 Vec::new(),
                 Vec::new(),
@@ -7985,7 +8133,8 @@ mod tests {
             &classes,
             Instant::now(),
             &mut out,
-        );
+        )
+        .await;
         assert_eq!(conn.stream_class(14), StreamClass::Bulk, "the next one");
         assert_eq!(
             conn.stream_class(15),
@@ -8030,6 +8179,10 @@ mod tests {
         let backend_out = out_tx.clone();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -8116,6 +8269,10 @@ mod tests {
         let backend_out = out_tx.clone();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -8198,6 +8355,10 @@ mod tests {
         let backend_out = out_tx.clone();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -8238,11 +8399,7 @@ mod tests {
 
         let (_client2, conn2, _msg2) = accepted_connection(&server_kp, token, peer);
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(conn2),
-                Vec::new(),
-                Vec::new(),
-            ))
+            .send(committed_attach(Box::new(conn2), Vec::new(), Vec::new()))
             .map_err(|_| "the bridge is listening")
             .unwrap();
         gate_becomes(&pipe, true, "the attach opens the pipe gate").await;
@@ -8310,6 +8467,10 @@ mod tests {
         let backend_out = out_tx.clone();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -8377,11 +8538,7 @@ mod tests {
             let (_client, conn, _msg2) =
                 accepted_connection(&self.server_kp, self.token, self.peer);
             self.ctl_tx
-                .send(BridgeControl::Attach(
-                    Box::new(conn),
-                    Vec::new(),
-                    Vec::new(),
-                ))
+                .send(committed_attach(Box::new(conn), Vec::new(), Vec::new()))
                 .map_err(|_| "the bridge is listening")
                 .unwrap();
         }
@@ -8434,11 +8591,7 @@ mod tests {
                 accepted_connection(&self.server_kp, self.token, self.peer);
             let _ = client.on_datagram(Instant::now(), self.peer, &msg2[0].bytes);
             self.ctl_tx
-                .send(BridgeControl::Attach(
-                    Box::new(conn),
-                    Vec::new(),
-                    Vec::new(),
-                ))
+                .send(committed_attach(Box::new(conn), Vec::new(), Vec::new()))
                 .map_err(|_| "the bridge is listening")
                 .unwrap();
             self.client = client;
@@ -8515,7 +8668,7 @@ mod tests {
             assert_eq!(conn.state(), LinkState::Live);
             assert!(conn.features().contains(crate::Features::CHANNEL_GEOMETRY));
             rig.ctl_tx
-                .send(BridgeControl::Attach(Box::new(conn), vec![], vec![]))
+                .send(committed_attach(Box::new(conn), vec![], vec![]))
                 .unwrap();
             rig.client = client;
             rig.run(Duration::from_millis(100)).await;
@@ -8994,7 +9147,8 @@ mod tests {
                     peer,
                     &dg.bytes,
                     &mut out,
-                );
+                )
+                .await;
             }
             out.extend(conn.on_timeout_if_due(now));
             let closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
@@ -9066,8 +9220,8 @@ mod tests {
     /// for a PING at once -- the hand-over never waits, so nothing on the
     /// turn stands behind the backend -- while the delivered bytes wait in
     /// the bridge, uncounted.
-    #[test]
-    fn a_turn_answers_acks_and_pings_while_the_backend_is_full() {
+    #[tokio::test]
+    async fn a_turn_answers_acks_and_pings_while_the_backend_is_full() {
         let server_kp = generate_keypair();
         let peer: SocketAddr = "127.0.0.1:18".parse().unwrap();
         let now = Instant::now();
@@ -9106,7 +9260,8 @@ mod tests {
                 peer,
                 &dg.bytes,
                 &mut out,
-            );
+            )
+            .await;
         }
         out.extend(conn.on_timeout_if_due(later));
         let closed = drain_events(&mut conn, &mut link, &mut first_live_sent, later, &mut out);
@@ -9185,11 +9340,12 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(Box::new(conn_b), Vec::new(), Vec::new()),
+            committed_attach(Box::new(conn_b), Vec::new(), Vec::new()),
             &classes,
             now,
             &mut out,
-        );
+        )
+        .await;
         assert_eq!(
             deliver(&mut client_b, &mut conn, &mut now, peer, 20, 2000),
             2000
@@ -9273,11 +9429,12 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(Box::new(conn_b), Vec::new(), Vec::new()),
+            committed_attach(Box::new(conn_b), Vec::new(), Vec::new()),
             &classes,
             now,
             &mut out,
-        );
+        )
+        .await;
         assert_eq!(
             deliver(&mut client_b, &mut conn, &mut now, peer, 20, 2000),
             2000
@@ -10377,7 +10534,7 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(
+            committed_attach(
                 Box::new(a_quiet_server_connection()),
                 Vec::new(),
                 Vec::new(),
@@ -10385,7 +10542,8 @@ mod tests {
             &classes,
             Instant::now(),
             &mut out,
-        );
+        )
+        .await;
         assert_eq!(
             conn.stream_class(16),
             StreamClass::Interactive,
@@ -11478,6 +11636,10 @@ mod tests {
         let (done_tx, _done_rx) = mpsc::unbounded_channel::<SessionEnded>();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -14844,6 +15006,18 @@ mod tests {
         token: LoginId,
         start_kind: StartKind,
     ) -> (ProbationEnded, UdpSocket) {
+        let (ended, socket, _client) =
+            a_proof_with_client(wiring, router, verdicts, token, start_kind).await;
+        (ended, socket)
+    }
+
+    async fn a_proof_with_client(
+        wiring: &RouterWiring,
+        router: &mut Router,
+        verdicts: &mut mpsc::UnboundedReceiver<ProbationEnded>,
+        token: LoginId,
+        start_kind: StartKind,
+    ) -> (ProbationEnded, UdpSocket, Connection) {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_addr = sock.local_addr().unwrap();
         let server_addr = wiring.socket.local_addr().unwrap();
@@ -14901,7 +15075,7 @@ mod tests {
             .expect("the probation did not end")
             .expect("the probation channel is open");
         assert!(verdict.proven.is_some(), "setup: the proof verified");
-        (verdict, sock)
+        (verdict, sock, client)
     }
 
     #[tokio::test]
@@ -15683,7 +15857,7 @@ mod tests {
             // Keep control alive: cold fallback must not hide missing stable ownership.
             SessionManager::on_probation_ended(&wiring.ctx(), &mut router, verdict).await;
             assert!(
-                matches!(control.try_recv(), Ok(BridgeControl::Attach(conn, _, _)) if conn.session_id() == new_id)
+                matches!(control.try_recv(), Ok(BridgeControl::Attach(conn, _, _, _)) if conn.session_id() == new_id)
             );
             let entry = &router.backends[&token];
             assert_eq!(entry.session_id, new_id);
@@ -15818,6 +15992,10 @@ mod tests {
             let (out_tx, out_rx) = mpsc::unbounded_channel();
             let bridge = tokio::spawn(run_backend_bridge(BridgeSpawn {
                 socket: wiring.socket.clone(),
+                committed: CommittedAdmission(AuthAcceptance {
+                    session_id: conn.session_id(),
+                    disposition: SessionDisposition::Fresh,
+                }),
                 conn,
                 token,
                 channels: BridgeChannels {
@@ -16465,6 +16643,10 @@ mod tests {
             let (heard_tx, mut heard_rx) = mpsc::unbounded_channel::<Vec<u8>>();
             tokio::spawn(run_backend_bridge(BridgeSpawn {
                 socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+                committed: CommittedAdmission(AuthAcceptance {
+                    session_id: old_conn.session_id(),
+                    disposition: SessionDisposition::Fresh,
+                }),
                 conn: old_conn,
                 channels: BridgeChannels {
                     dgram_rx: dg_rx,
@@ -16494,11 +16676,7 @@ mod tests {
             // No await between the two: the bridge wakes with both ready,
             // in the order the manager produces them.
             ctl_tx
-                .send(BridgeControl::Attach(
-                    Box::new(new_conn),
-                    Vec::new(),
-                    Vec::new(),
-                ))
+                .send(committed_attach(Box::new(new_conn), Vec::new(), Vec::new()))
                 .map_err(|_| "the bridge is listening")
                 .unwrap();
             for dg in &typed {
@@ -16541,11 +16719,7 @@ mod tests {
         let (in_tx, mut in_rx) = mpsc::channel::<SessionInbound>(INBOUND_CAP);
         let mut link = BackendLink::new(in_tx, Consumption::OnDelivery);
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(new_conn),
-                Vec::new(),
-                Vec::new(),
-            ))
+            .send(committed_attach(Box::new(new_conn), Vec::new(), Vec::new()))
             .map_err(|_| "the receiver is here")
             .unwrap();
         let typed = new_client.send(Instant::now(), 0, b"typed");
@@ -16565,7 +16739,8 @@ mod tests {
             peer,
             &typed[0].bytes,
             &mut out,
-        );
+        )
+        .await;
 
         assert_eq!(conn.session_id(), new_id, "the Attach was applied");
         assert_eq!(
@@ -16644,19 +16819,11 @@ mod tests {
 
         let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<BridgeControl>();
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(conn_b),
-                Vec::new(),
-                b_queued,
-            ))
+            .send(committed_attach(Box::new(conn_b), Vec::new(), b_queued))
             .map_err(|_| "the receiver is here")
             .unwrap();
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(conn_c),
-                Vec::new(),
-                Vec::new(),
-            ))
+            .send(committed_attach(Box::new(conn_c), Vec::new(), Vec::new()))
             .map_err(|_| "the receiver is here")
             .unwrap();
 
@@ -16675,7 +16842,8 @@ mod tests {
             peer,
             &c_sent[0].bytes,
             &mut out,
-        );
+        )
+        .await;
         for dg in &c_sent[1..] {
             out.extend(conn.on_datagram(now, peer, &dg.bytes));
         }
@@ -16697,11 +16865,7 @@ mod tests {
         let _ = client_d.on_datagram(Instant::now(), peer, &msg2_d[0].bytes);
         let d_sent = client_d.send(Instant::now(), 20, &[3u8; 500]);
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(conn_d),
-                Vec::new(),
-                Vec::new(),
-            ))
+            .send(committed_attach(Box::new(conn_d), Vec::new(), Vec::new()))
             .map_err(|_| "the receiver is here")
             .unwrap();
         let now = Instant::now();
@@ -16715,7 +16879,8 @@ mod tests {
             peer,
             &d_sent[0].bytes,
             &mut out,
-        );
+        )
+        .await;
         let _ = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
         assert!(
             conn.unconsumed_streams().is_empty(),
@@ -16811,6 +16976,10 @@ mod tests {
         let backend_out = out_tx.clone();
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: old_conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn: old_conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -16863,11 +17032,7 @@ mod tests {
         let _ = new_client.on_datagram(Instant::now(), peer, &new_msg2[0].bytes);
         let _ = new_client.poll_events();
         ctl_tx
-            .send(BridgeControl::Attach(
-                Box::new(new_conn),
-                Vec::new(),
-                Vec::new(),
-            ))
+            .send(committed_attach(Box::new(new_conn), Vec::new(), Vec::new()))
             .map_err(|_| "the parked bridge is listening")
             .unwrap();
         loop {
@@ -16889,7 +17054,12 @@ mod tests {
             .map_err(|_| "the bridge is listening")
             .unwrap();
         let mut delivered = Vec::new();
-        while delivered.is_empty() {
+        let mut acceptance = None;
+        let mut auth = crate::auth_acceptance::AuthAcceptanceParser::new(
+            new_client.session_id(),
+            new_client.features(),
+        );
+        while delivered.is_empty() || acceptance.is_none() {
             let (len, src) = tokio::time::timeout(within, client_sock.recv_from(&mut buf))
                 .await
                 .expect("the new connection sends the stream")
@@ -16897,11 +17067,24 @@ mod tests {
             let _ = new_client.on_datagram(Instant::now(), src, &buf[..len]);
             for ev in new_client.poll_events() {
                 if let Event::StreamData { stream_id, data } = ev {
-                    assert_eq!(stream_id, STREAM);
-                    delivered.extend(data);
+                    if stream_id == AUTH_STREAM {
+                        if let Some(record) = auth.feed(&data).unwrap() {
+                            assert!(acceptance.replace(record).is_none());
+                        }
+                    } else {
+                        assert_eq!(stream_id, STREAM);
+                        delivered.extend(data);
+                    }
                 }
             }
         }
+        assert_eq!(
+            acceptance,
+            Some(AuthAcceptance {
+                session_id: new_client.session_id(),
+                disposition: SessionDisposition::Resumed
+            })
+        );
         assert_eq!(
             delivered, b"after",
             "a receiver starting at 0 delivered it: the offsets restarted"
@@ -16988,11 +17171,12 @@ mod tests {
             &mut conn,
             &mut parked,
             &mut link,
-            BridgeControl::Attach(Box::new(new_conn), Vec::new(), queued),
+            committed_attach(Box::new(new_conn), Vec::new(), queued),
             &BTreeMap::new(),
             Instant::now(),
             &mut out,
-        );
+        )
+        .await;
         assert!(conn.undelivered_cost_for_test() > crate::probation::PROBATION_UNDELIVERED_MAX);
     }
 
@@ -17019,6 +17203,10 @@ mod tests {
         let gates = Arc::new(GateTable::new());
         tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            committed: CommittedAdmission(AuthAcceptance {
+                session_id: conn.session_id(),
+                disposition: SessionDisposition::Fresh,
+            }),
             conn,
             channels: BridgeChannels {
                 dgram_rx: dg_rx,
@@ -17061,4 +17249,5 @@ mod tests {
         .unwrap_or_else(|_| panic!("every byte, those past 64 KiB included: {heard} heard"));
         assert_eq!(heard, 201 * 1024);
     }
+    include!("session_manager_auth_tests.rs");
 }
