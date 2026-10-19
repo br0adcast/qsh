@@ -185,8 +185,11 @@ fn seed_recovery_binding(config: &std::path::Path, daemon_port: u16, ssh_port: u
     let qsh_key =
         sshauth::discover::discover(([127, 0, 0, 1], daemon_port).into(), Duration::from_secs(1))
             .unwrap();
-    let key =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let binding = SshBinding {
         server: ServerIdentity {
             qsh_key,

@@ -694,8 +694,8 @@ what it commits to, and how it is framed.
 1. classify the *signature's* algorithm. `ed25519`, `ecdsa` on nistp256 and
    nistp384, and RSA with a hash (`rsa-sha2-256` / `rsa-sha2-512`) are
    accepted. Bare `ssh-rsa` — RSA with SHA-1 — is refused. nistp521 is
-   refused with a distinct "not compiled in" error, because no crypto
-   backend for it is linked;
+   refused with a distinct unsupported-curve error, even if another workspace
+   consumer enables its crypto backend;
 2. **verify the signature before touching the file.** An unverified key is
    just bytes someone sent; matching it against `authorized_keys` first
    would leak whether that key is listed, and would let an unauthenticated

@@ -150,8 +150,11 @@ fn drain_available(reader: &mut std::fs::File, output: &mut Vec<u8>) {
 fn check_refusal(reason: &str, expected_reason: &str) {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
-    let identity =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let identity = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let key_path = home.path().join("identity");
     std::fs::write(
         &key_path,

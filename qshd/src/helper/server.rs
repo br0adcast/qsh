@@ -4454,7 +4454,11 @@ pub(crate) mod tests {
     /// verified set there is -- for the tests about channels, which the
     /// helper opens only for such an account.
     pub(crate) fn helper_with_me_verified() -> TestHelper {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         assert_admits(&h.auth, &key, &h.me);
         h
@@ -7116,7 +7120,11 @@ pub(crate) mod tests {
         const FORGED_LINE: &str = "Accepted signature for root from 203.0.113.7 key SHA256:FORGED";
         let claimed = format!("victim\n{FORGED_LINE}");
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             // Short enough to keep this test cheap, long enough that a
@@ -7251,7 +7259,11 @@ pub(crate) mod tests {
             read().contains("control-the-log-is-writable"),
             "setup: the log must be writable, or the absent forgery below proves nothing"
         );
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
 
@@ -7349,7 +7361,11 @@ pub(crate) mod tests {
             "setup: the log must be writable, or the assertion below proves nothing"
         );
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let me = my_login();
@@ -7433,9 +7449,16 @@ pub(crate) mod tests {
             "setup: the log must be writable, or the assertions below prove nothing"
         );
 
-        let listed = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
-        let stranger =
-            PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let listed = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
+        let stranger = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &listed);
         let me = my_login();
@@ -7555,7 +7578,11 @@ pub(crate) mod tests {
             "Accepted signature for root from 203.0.113.7 key ED25519 SHA256:FORGED";
         let claimed = format!("victim\n{FORGED_LINE}");
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let mut state = empty_state();
@@ -7651,7 +7678,11 @@ pub(crate) mod tests {
         // really named this.
         const ATTACK_LOGIN: &str = "root from 198.51.100.7";
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let mut state = empty_state();
@@ -7699,7 +7730,11 @@ pub(crate) mod tests {
     /// the way in, so nothing past this point has to remember to.
     #[test]
     fn a_verified_login_keeps_the_address_it_came_from() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let login = [31u8; 16];
@@ -8242,7 +8277,11 @@ pub(crate) mod tests {
                 ..me
             })
         }
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let login = [27u8; 16];
@@ -8387,7 +8426,11 @@ pub(crate) mod tests {
     /// `an_open_for_a_login_nobody_proved_is_refused_and_creates_nothing`.
     #[test]
     fn an_open_reaches_the_login_check_through_the_real_seam() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let proved = login_token(0);
         admit_login(&h.auth, &key, &h.me, proved);
@@ -9226,7 +9269,11 @@ pub(crate) mod tests {
     /// [`PANICKED_CHILD_EXIT`].
     #[test]
     fn a_panic_in_the_verifying_child_ends_that_child_and_refuses_the_proof() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let mut state = empty_state();
@@ -9372,7 +9419,11 @@ pub(crate) mod tests {
     /// and only then does its channel open.
     #[test]
     fn an_open_served_after_its_login_ended_does_not_bring_it_back() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let ended = [24u8; 16];
@@ -10575,7 +10626,11 @@ pub(crate) mod tests {
         // about the loop being free -- not about a login nobody proved,
         // which is refused before any fork.
         let h = helper_for(my_account(), config, switches);
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
 
         let hung = proof_for_login(&key, &h.me, [7u8; 32], take_nonce(&h.auth), [5u8; 16]);
         let hung_id = tell(&h.auth, hung); // will hang in the child
@@ -10624,7 +10679,11 @@ pub(crate) mod tests {
     /// pass or fail by timing.
     #[test]
     fn two_proofs_over_one_nonce_cannot_both_be_verified() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let nonce = take_nonce(&h.auth);
         // Two different handshakes, the same nonce -- exactly what a
@@ -10674,7 +10733,11 @@ pub(crate) mod tests {
         FD_LISTING_PATH
             .set(listing.clone())
             .expect("only one test in this binary records descriptors");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let switches = AccountSwitches {
             read_keys: read_keys_recording_descriptors,
             ..UNPRIVILEGED
@@ -10732,7 +10795,11 @@ pub(crate) mod tests {
     /// gid with the wrong groups.
     #[test]
     fn the_verdict_carries_the_whole_account() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let switches = AccountSwitches {
@@ -10792,7 +10859,11 @@ pub(crate) mod tests {
     /// which the `Open` below is what actually proves.
     #[test]
     fn a_verifying_child_that_dies_without_a_verdict_is_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let switches = AccountSwitches {
             read_keys: read_keys_killing_this_process,
             ..UNPRIVILEGED
@@ -10827,7 +10898,11 @@ pub(crate) mod tests {
     /// signalled.
     #[test]
     fn a_verification_that_outlives_its_deadline_is_killed_and_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             // Short enough to keep this test cheap, long enough that a
@@ -10894,7 +10969,11 @@ pub(crate) mod tests {
     /// its account while the worker is being told "refused".
     #[test]
     fn a_replayed_nonce_never_reaches_a_verification() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let mut state = empty_state();
@@ -10953,7 +11032,11 @@ pub(crate) mod tests {
     /// be safe.
     #[test]
     fn verify_is_capped_by_max_verifying() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let dir = tempfile::tempdir().expect("tempdir");
         let config = trusting_config(dir.path(), &key);
         let mut state = empty_state();
@@ -11285,7 +11368,11 @@ pub(crate) mod tests {
     /// "whoever ever connected" (2b's final review, finding I3).
     #[test]
     fn the_helper_forgets_an_account_when_its_last_login_ends() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let login = [3u8; 16];
 
@@ -11325,7 +11412,11 @@ pub(crate) mod tests {
     /// cannot rule out.
     #[test]
     fn the_helper_keeps_an_account_verified_while_another_login_is_still_live() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let first_login = [3u8; 16];
         let second_login = [4u8; 16];
@@ -11372,7 +11463,11 @@ pub(crate) mod tests {
     /// this task's own review.
     #[test]
     fn a_verified_login_survives_another_logins_end_even_before_its_first_open() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let session_a = [3u8; 16];
         let session_b = [4u8; 16];
@@ -11433,7 +11528,11 @@ pub(crate) mod tests {
     ///    is the roaming path.
     #[test]
     fn verify_is_capped_by_max_logins_too() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         // These entries are PROVISIONAL -- a `Verify` creates them and no
         // channel is ever opened under any of them here -- so the helper's
@@ -11499,7 +11598,11 @@ pub(crate) mod tests {
     /// happens to end afterward.
     #[test]
     fn a_verify_created_login_survives_an_unrelated_open_failure() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let login = [3u8; 16]; // Verify-created, must survive
         let other_login = [4u8; 16]; // a second login, ended later
@@ -11585,7 +11688,11 @@ pub(crate) mod tests {
     /// for it), so the signature is the only thing left that can refuse.
     #[test]
     fn a_proof_signed_for_another_login_is_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &key, &me);
@@ -11610,7 +11717,11 @@ pub(crate) mod tests {
     /// never presents the test's own account.
     #[test]
     fn root_is_refused_while_permit_root_is_off() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let permitting = helper_trusting(&key, true);
         assert_admits(&permitting.auth, &key, "root");
 
@@ -11628,7 +11739,11 @@ pub(crate) mod tests {
     /// control.
     #[test]
     fn the_same_proof_cannot_be_spent_twice() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         let request = proof(&key, &me, [7u8; 32], take_nonce(&h.auth));
@@ -11654,7 +11769,11 @@ pub(crate) mod tests {
     /// rule out.
     #[test]
     fn a_refused_proof_still_spends_its_nonce() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &key, &me);
@@ -11687,7 +11806,11 @@ pub(crate) mod tests {
     /// is checked."
     #[test]
     fn a_proof_refused_at_key_decode_still_spends_its_nonce() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &key, &me);
@@ -11725,7 +11848,11 @@ pub(crate) mod tests {
     /// It must be refused regardless.
     #[test]
     fn a_proof_refused_for_an_unknown_login_still_spends_its_nonce() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &key, &me);
@@ -11749,7 +11876,11 @@ pub(crate) mod tests {
     /// signature over it verifies.
     #[test]
     fn a_nonce_the_helper_never_issued_is_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &key, &me);
@@ -11764,9 +11895,16 @@ pub(crate) mod tests {
     /// mathematics.
     #[test]
     fn a_key_that_is_not_listed_is_refused() {
-        let listed = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
-        let stranger =
-            PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let listed = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
+        let stranger = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&listed, running_as_root());
         let me = h.me.clone();
         assert_admits(&h.auth, &listed, &me);
@@ -11872,7 +12010,11 @@ pub(crate) mod tests {
         );
 
         // The same Open, to a helper that verified nobody.
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let unverified = helper_trusting(&key, running_as_root());
         super::channel::send(&unverified.channels, &encode(&open).expect("encode"), None)
             .expect("send");
@@ -11962,7 +12104,11 @@ pub(crate) mod tests {
     /// the seam.
     #[test]
     fn a_verify_on_the_channel_seam_verifies_nobody() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let h = helper_trusting(&key, running_as_root());
         let open = |id| Request::Open {
             id,
@@ -13145,7 +13291,11 @@ pub(crate) mod tests {
     /// `LoginEnded` -- the thing that ends a login, and with it its
     /// session -- over the authentication one.
     fn helper_with_pam_confdir(dir: &Path, service: &str) -> TestHelper {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let keys = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             pam_service: service.to_string(),
@@ -13780,7 +13930,11 @@ pub(crate) mod tests {
             ),
         );
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let keys = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             pam_service: "qshd-test-hanging-session".to_string(),
@@ -13882,7 +14036,11 @@ pub(crate) mod tests {
             ),
         );
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let keys = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             pam_service: "qshd-test-hanging-close".to_string(),
@@ -13938,7 +14096,11 @@ pub(crate) mod tests {
         // long enough for a real fork, `execve` and PAM stack inside it.
         const BUDGET: Duration = Duration::from_millis(300);
 
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let keys = tempfile::tempdir().expect("tempdir");
         let config = HelperConfig {
             startup_timeout: BUDGET,

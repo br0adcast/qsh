@@ -6,13 +6,12 @@ license.workspace = true
 
 [dependencies]
 transport = { path = "../transport" }
-# Pinned exactly: this is security-relevant parsing and verification, and the
-# feature set below is what enables ed25519/ecdsa/rsa verification. `encryption`
-# is unused by this task's verifier but is needed by the next task's
-# passphrase-protected FileSigner, which lives in this same crate -- leave it.
-ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "alloc", "ed25519", "p256", "p384", "rsa", "encryption"] }
-ssh-encoding = "=0.2.0"
-signature = "=2.2.0"
+# Pinned to the upstream RSA conversion already used by russh. This restores
+# file signing; it does not resolve the separate RSA timing advisory (#59).
+# Algorithm acceptance is explicit in verify.rs, independent of feature union.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "alloc", "ed25519", "p256", "p384", "rsa", "encryption"] }
+ssh-encoding = "=0.3.0"
+signature = "=3.0.0"
 # Used by known_hosts.rs for the file format and the server-key fingerprint.
 # Deliberately NOT pinned exactly like the three crates above: those parse
 # multiple untrusted key/signature formats, where a version bump could
@@ -28,7 +27,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-rand_core = { version = "0.6", features = ["getrandom"] }
-# Only for fabricating a genuine rsa-sha2-256 signature in a test: ssh-key's
-# own `Signer` impl for RSA keys always signs with SHA-512.
-rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+# Exercise the same SHA-1-capable decoder as the workspace's russh feature union.
+# QSH must reject legacy RSA signatures explicitly, independently of this backend.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "sha1", "p521"] }

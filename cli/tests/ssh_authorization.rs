@@ -230,8 +230,11 @@ fn cancelled_storage_write_waiting_for_lock_never_publishes_trust() {
         connection: 1,
         network: 1,
     });
-    let host =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let host = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let binding = SshBinding {
         server: ServerIdentity {
             qsh_key: [7; 32],
@@ -290,8 +293,11 @@ fn cancelling_initial_bootstrap_consent_writes_no_binding() {
 fn bootstrap(answer: &[u8], accept: bool) {
     let _serial = serialised();
     let home = tempfile::tempdir().unwrap();
-    let key =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let identity = home.path().join("identity");
     std::fs::write(
         &identity,

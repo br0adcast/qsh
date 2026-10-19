@@ -10,8 +10,11 @@ use support::{serialised, spawn_qsh, wait_for_exit};
 
 /// A fresh ed25519 key for `qsh -i`, in `dir`.
 fn client_key(dir: &Path) -> PathBuf {
-    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate");
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate");
     let path = dir.join("id_test");
     std::fs::write(
         &path,

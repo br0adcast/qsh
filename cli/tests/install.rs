@@ -34,8 +34,11 @@ impl Screen {
     }
 }
 fn key(home: &Path) -> (PathBuf, String) {
-    let key =
-        ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
     let path = home.join("identity");
     std::fs::write(
         &path,

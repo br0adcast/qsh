@@ -1456,9 +1456,11 @@ mod tests {
         async fn a_silent_helper_holds_up_neither_live_sessions_nor_refusals() {
             let dir = tempfile::tempdir().expect("tempdir");
             let key_path = dir.path().join("key");
-            let key =
-                ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-                    .expect("keygen");
+            let key = ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                ssh_key::Algorithm::Ed25519,
+            )
+            .expect("keygen");
             std::fs::write(
                 &key_path,
                 key.to_openssh(ssh_key::LineEnding::LF)
@@ -1839,9 +1841,11 @@ mod tests {
             async fn a_stuck_helper_with_a_full_seam_does_not_hold_up_the_router() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let key_path = dir.path().join("key");
-                let key =
-                    ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-                        .expect("keygen");
+                let key = ssh_key::PrivateKey::random(
+                    &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                    ssh_key::Algorithm::Ed25519,
+                )
+                .expect("keygen");
                 std::fs::write(
                     &key_path,
                     key.to_openssh(ssh_key::LineEnding::LF)

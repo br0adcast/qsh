@@ -121,7 +121,10 @@ fn main() -> ExitCode {
 /// length of one container's life and never leaves it; a passphrase would
 /// only give the acceptance script something to type.
 fn cmd_genkey(path: &Path) -> ExitCode {
-    let key = match PrivateKey::random(&mut OsRng, Algorithm::Ed25519) {
+    let key = match PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        Algorithm::Ed25519,
+    ) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("acceptance_client: generating a key: {e}");

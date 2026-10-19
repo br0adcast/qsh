@@ -995,7 +995,11 @@ impl TestAccount {
                  remove it by hand (userdel --remove {name})"
             );
         }
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
 
         let mut args = vec!["--create-home"];
         args.extend_from_slice(options);

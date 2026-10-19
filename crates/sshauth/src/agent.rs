@@ -250,20 +250,18 @@ impl AuthSigner for AgentSigner {
         // A malformed reply here is the local agent misbehaving, not a
         // remote peer's bad record -- AuthError::BadRecord's own doc ties
         // it to bytes that came off the network, which these never did.
-        // This is also where an agent that ignores the flags word (some
-        // third-party ones do) and answers ssh-rsa/SHA-1 instead of the
-        // requested rsa-sha2-256 gets caught: `Signature::decode` refuses
-        // to build an `Rsa { hash: None }`-labeled value at all (see
-        // `verify.rs`'s own note on the same quirk), so that reply fails
-        // to parse right here.
         let sig = decode_signature(&signature).map_err(|_| {
             AuthError::Backend("the ssh-agent returned a malformed signature".to_string())
         })?;
-        // Catch a signature that parses but does not actually verify --
-        // made by the wrong key, or (for algorithms `decode_signature`
-        // does accept in more than one hash variant) with a hash the
-        // server would refuse -- locally, rather than letting it surface
-        // only as the server's far-more-confusing `BadSignature`.
+        // Dependency feature union (notably with russh) can enable legacy
+        // algorithms in the decoder. Enforce QSH's policy explicitly before
+        // treating any locally valid signature as a usable proof.
+        if !crate::verify::signature_algorithm_allowed(&sig.algorithm()) {
+            return Err(AuthError::Backend(
+                "the ssh-agent returned a signature algorithm QSH does not accept".to_string(),
+            ));
+        }
+        // A valid encoding may still belong to another key or challenge.
         signature::Verifier::verify(&key, &challenge, &sig).map_err(|_| {
             AuthError::Backend(
                 "the ssh-agent returned a signature that does not verify against the requested key and challenge"
@@ -350,7 +348,11 @@ mod tests {
     fn the_agent_signs_the_challenge_and_the_verifier_accepts_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let agent = fake_agent(key.clone(), sock_path.clone());
 
         let signer = AgentSigner::connect_at(&sock_path).expect("connect");
@@ -401,7 +403,11 @@ mod tests {
     fn signing_without_with_key_uses_the_agents_only_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let agent = fake_agent(key.clone(), sock_path.clone());
 
         let signer = AgentSigner::connect_at(&sock_path).expect("connect");
@@ -424,7 +430,11 @@ mod tests {
     fn a_nonce_and_a_login_make_the_agent_sign_a_version_2_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let agent = fake_agent(key.clone(), sock_path.clone());
 
         let signer = AgentSigner::connect_at(&sock_path)
@@ -453,10 +463,13 @@ mod tests {
     fn an_agent_signer_refuses_a_nonce_without_a_login() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519)
-            .expect("keygen")
-            .public_key()
-            .clone();
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
+        .public_key()
+        .clone();
         // Bound but never accepted from: `connect_at` only needs the socket
         // to exist to succeed, and (with `with_key` naming an identity so
         // `sign` skips its own `identities()` round trip) this signer must
@@ -480,28 +493,19 @@ mod tests {
     /// here -- this is the one test that would notice.
     #[test]
     fn an_rsa_key_is_asked_for_a_sha2_256_signature() {
-        use rsa::pkcs1v15::SigningKey;
-        use rsa::RsaPrivateKey;
-        use sha2::Sha256;
+        use ssh_key::private::RsaKeypair;
         use ssh_key::public::KeyData;
         use ssh_key::HashAlg;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
 
-        // Built via the `rsa` crate directly for the same reason
-        // `verify.rs`'s RSA test is: `ssh_key::private::RsaKeypair::random`
-        // is unusable for signing in this pinned ssh-key version. Unlike
-        // the other RSA test in this file, this one signs for real (with a
-        // genuine rsa-sha2-256 PKCS#1v1.5 signature over the actual
-        // extracted challenge), so `sign`'s own local verification accepts
-        // it and the test can go through the real public API instead of
-        // reaching into private fields.
-        let rsa_private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
-        let ssh_public: ssh_key::public::RsaPublicKey = (&rsa_private.to_public_key())
-            .try_into()
-            .expect("public key conversion");
-        let rsa_key = PublicKey::new(KeyData::Rsa(ssh_public), "");
+        let pair = RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .expect("RSA fixture");
+        let rsa_key = PublicKey::new(KeyData::Rsa(pair.public().clone()), "");
 
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
@@ -516,16 +520,8 @@ mod tests {
                 u32::from_be_bytes(body[5 + key_len..5 + key_len + 4].try_into().unwrap()) as usize;
             let signed_data = &body[data_start..data_start + data_len];
 
-            let signing_key = SigningKey::<Sha256>::new(rsa_private);
-            let raw_sig: rsa::pkcs1v15::Signature =
-                signature::Signer::try_sign(&signing_key, signed_data).unwrap();
-            let sig = ssh_key::Signature::new(
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256),
-                },
-                signature::SignatureEncoding::to_vec(&raw_sig),
-            )
-            .expect("well-formed rsa-sha2-256 signature");
+            let sig = signature::Signer::try_sign(&(&pair, Some(HashAlg::Sha256)), signed_data)
+                .expect("SHA-256 RSA signature");
             let blob = crate::record::encode_signature(&sig).unwrap();
             let mut payload = vec![SSH_AGENT_SIGN_RESPONSE];
             payload.extend_from_slice(&(blob.len() as u32).to_be_bytes());
@@ -600,10 +596,13 @@ mod tests {
     fn an_agent_refusal_is_reported_as_a_backend_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let stray_key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519)
-            .expect("keygen")
-            .public_key()
-            .clone();
+        let stray_key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
+        .public_key()
+        .clone();
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
             let (mut sock, body) = accept_one_request(&listener);
@@ -697,7 +696,11 @@ mod tests {
     fn an_unparseable_identity_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let expected_key_data = key.public_key().key_data().clone();
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
@@ -736,7 +739,11 @@ mod tests {
     fn trailing_bytes_after_the_declared_identity_count_are_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
             let (mut sock, body) = accept_one_request(&listener);
@@ -787,12 +794,18 @@ mod tests {
     fn a_signature_that_does_not_verify_is_reported_locally() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let requested_key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519)
-            .expect("keygen")
-            .public_key()
-            .clone();
-        let wrong_key =
-            PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let requested_key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
+        .public_key()
+        .clone();
+        let wrong_key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
 
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
@@ -827,33 +840,41 @@ mod tests {
     /// wrong way) invisible.
     #[test]
     fn an_agent_answering_with_the_legacy_ssh_rsa_tag_is_reported_locally() {
-        use rsa::RsaPrivateKey;
+        use ssh_key::private::RsaKeypair;
         use ssh_key::public::KeyData;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
 
-        let rsa_private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
-        let ssh_public: ssh_key::public::RsaPublicKey = (&rsa_private.to_public_key())
-            .try_into()
-            .expect("public key conversion");
-        let rsa_key = PublicKey::new(KeyData::Rsa(ssh_public), "");
+        let pair = RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .expect("RSA fixture");
+        let rsa_key = PublicKey::new(KeyData::Rsa(pair.public().clone()), "");
 
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
             let (mut sock, body) = accept_one_request(&listener);
             assert_eq!(body[0], SSH_AGENTC_SIGN_REQUEST);
-            // A hand-built "ssh-rsa" (SHA-1) signature blob: string
-            // algorithm name, string signature bytes. The signature
-            // content does not matter -- this must fail before any crypto
-            // is even attempted.
-            let mut sig_bytes = Vec::new();
-            let name = b"ssh-rsa";
-            sig_bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
-            sig_bytes.extend_from_slice(name);
-            let junk = vec![0u8; 256];
-            sig_bytes.extend_from_slice(&(junk.len() as u32).to_be_bytes());
-            sig_bytes.extend_from_slice(&junk);
+            let mut request = &body[1..];
+            let _key = take_string(&mut request).unwrap();
+            let challenge = take_string(&mut request).unwrap();
+            let sig = signature::Signer::try_sign(&(&pair, None), &challenge)
+                .expect("valid SHA-1 signature");
+            let public = PublicKey::new(KeyData::Rsa(pair.public().clone()), "");
+            signature::Verifier::verify(&public, &challenge, &sig)
+                .expect("the rejected signature really verifies");
+            let sig_bytes = crate::record::encode_signature(&sig).unwrap();
+            let record = AuthRecord {
+                public_key: encode_public_key(&public).unwrap(),
+                signature: sig_bytes.clone(),
+                v2: None,
+            };
+            assert!(
+                crate::verify::verify_record_signature(&[9; 32], &record).is_err(),
+                "the server must also reject a valid SHA-1 proof"
+            );
 
             let mut payload = vec![SSH_AGENT_SIGN_RESPONSE];
             payload.extend_from_slice(&(sig_bytes.len() as u32).to_be_bytes());
@@ -880,10 +901,13 @@ mod tests {
     fn a_malformed_signature_from_the_agent_is_a_backend_error_not_a_bad_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("agent.sock");
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519)
-            .expect("keygen")
-            .public_key()
-            .clone();
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
+        .public_key()
+        .clone();
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let agent = thread::spawn(move || {
             let (mut sock, body) = accept_one_request(&listener);

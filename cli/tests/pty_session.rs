@@ -214,8 +214,11 @@ fn an_unauthorised_key_is_refused_with_code_twelve() {
     // nothing is pinned -- and is answered with `yes` below, exactly as the
     // happy path does; what is under test is what happens AFTER the server
     // has the signature.
-    let stranger = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate");
+    let stranger = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate");
     let stranger_path = config.path().join("stranger");
     std::fs::write(
         &stranger_path,
@@ -295,10 +298,16 @@ fn ctrl_c_at_a_passphrase_question_leaves_echo_on() {
     let _serial = serialised();
     let (daemon, _) = start_daemon();
     let config = tempfile::tempdir().expect("tempdir");
-    let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-        .expect("generate")
-        .encrypt(&mut rand_core::OsRng, "correct horse")
-        .expect("encrypt");
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .expect("generate")
+    .encrypt(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        "correct horse",
+    )
+    .expect("encrypt");
     let locked = config.path().join("locked");
     std::fs::write(
         &locked,

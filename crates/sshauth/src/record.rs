@@ -51,7 +51,11 @@ mod tests {
     use ssh_key::{Algorithm, PrivateKey};
 
     fn key() -> PrivateKey {
-        PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen")
+        PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen")
     }
 
     #[test]

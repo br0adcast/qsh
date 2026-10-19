@@ -90,6 +90,11 @@ impl AuthSigner for FileSigner {
         let signature =
             signature::Signer::try_sign(&self.key, &record_challenge(handshake_hash, &record))
                 .map_err(|e| AuthError::Backend(format!("signing: {e}")))?;
+        if !crate::verify::signature_algorithm_allowed(&signature.algorithm()) {
+            return Err(AuthError::Backend(
+                "the key produced a signature algorithm QSH does not accept".to_string(),
+            ));
+        }
         record.signature = encode_signature(&signature)?;
         Ok(record)
     }
@@ -104,11 +109,29 @@ mod tests {
 
     use crate::record::decode_signature;
 
+    #[test]
+    fn a_dependency_enabled_p521_key_remains_unsupported_by_qsh() {
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP521,
+            },
+        )
+        .expect("upstream supports P-521 in the workspace feature union");
+        assert!(matches!(
+            FileSigner::from_key(key).sign(&[3; 32], None),
+            Err(AuthError::Backend(_))
+        ));
+    }
+
     fn write_key(key: &PrivateKey, passphrase: Option<&str>) -> tempfile::NamedTempFile {
         let pem = match passphrase {
             None => key.to_openssh(LineEnding::LF).expect("encode"),
             Some(p) => key
-                .encrypt(&mut rand_core::OsRng, p)
+                .encrypt(
+                    &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                    p,
+                )
                 .expect("encrypt")
                 .to_openssh(LineEnding::LF)
                 .expect("encode"),
@@ -123,7 +146,11 @@ mod tests {
     /// the two halves are tested against each other, not against a fixture.
     #[test]
     fn a_file_signer_produces_a_record_the_verifier_accepts() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, None);
         let signer = FileSigner::load(key_file.path(), None).expect("load");
 
@@ -155,7 +182,11 @@ mod tests {
     /// signed the bare hash would make the first assertion below fail.
     #[test]
     fn the_record_signs_the_challenge_not_the_bare_hash() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, None);
         let signer = FileSigner::load(key_file.path(), None).expect("load");
 
@@ -179,7 +210,11 @@ mod tests {
     /// signature verifies over the version 2 challenge -- not the version 1 one.
     #[test]
     fn a_nonce_and_a_login_make_a_version_2_record() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let signer = FileSigner::from_key(key.clone()).with_login("alice".to_string());
         let hash = [21u8; 32];
         let nonce = [4u8; 16];
@@ -198,7 +233,11 @@ mod tests {
     /// record is the only thing it would accept.
     #[test]
     fn no_nonce_means_a_version_1_record() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let signer = FileSigner::from_key(key).with_login("alice".to_string());
         let record = signer.sign(&[21u8; 32], None).expect("sign");
         assert!(record.v2.is_none());
@@ -209,7 +248,11 @@ mod tests {
     /// hand a system-mode server a record it must refuse.
     #[test]
     fn a_nonce_without_a_login_is_an_error() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let signer = FileSigner::from_key(key);
         assert!(matches!(
             signer.sign(&[21u8; 32], Some(&[4u8; 16])),
@@ -219,7 +262,11 @@ mod tests {
 
     #[test]
     fn an_encrypted_key_without_a_passphrase_is_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, Some("hunter2"));
         assert!(
             matches!(
@@ -232,7 +279,11 @@ mod tests {
 
     #[test]
     fn an_encrypted_key_with_the_wrong_passphrase_is_refused() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, Some("hunter2"));
         assert!(
             matches!(
@@ -245,7 +296,11 @@ mod tests {
 
     #[test]
     fn an_encrypted_key_with_its_passphrase_loads() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, Some("hunter2"));
         FileSigner::load(key_file.path(), Some("hunter2")).expect("loads with the passphrase");
     }
@@ -256,7 +311,11 @@ mod tests {
     /// that as deliberate rather than accidental.
     #[test]
     fn a_passphrase_for_an_unencrypted_key_is_harmlessly_ignored() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let key_file = write_key(&key, None);
         FileSigner::load(key_file.path(), Some("unused"))
             .expect("an unneeded passphrase is not an error");
@@ -264,7 +323,11 @@ mod tests {
 
     #[test]
     fn a_public_key_file_is_not_a_private_key() {
-        let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("keygen");
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ed25519,
+        )
+        .expect("keygen");
         let mut f = tempfile::NamedTempFile::new().expect("temp file");
         f.write_all(key.public_key().to_openssh().unwrap().as_bytes())
             .expect("write");

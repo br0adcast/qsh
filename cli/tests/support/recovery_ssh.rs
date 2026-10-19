@@ -24,8 +24,11 @@ pub struct Server {
 }
 impl Server {
     pub fn start() -> Self {
-        let key = ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
-            .unwrap();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
         let key =
             russh::keys::decode_secret_key(&key.to_openssh(ssh_key::LineEnding::LF).unwrap(), None)
                 .unwrap();
