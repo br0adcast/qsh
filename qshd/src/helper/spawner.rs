@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use transport::auth::{AuthError, AuthRecord, AuthVerifier, Principal};
 use transport::channel::{ChannelKind, OpenRequest};
-use transport::channel_server::{ChannelSpawner, ChannelWait, SpawnedChannel};
+#[cfg(test)]
+use transport::channel_server::SpawnedChannel;
+use transport::channel_server::{ChannelSpawner, ChannelWait};
 use transport::probation::MAX_PROBATION;
 use transport::session_manager::{
     login_end_channel, LoginEndNotReported, LoginEndedReports, LoginId, LoginSink,
@@ -332,6 +334,7 @@ pub(super) fn worker_clients(
 /// Asks a privileged helper to open channels, over one `socketpair` shared
 /// with it.
 pub struct HelperChannelSpawner {
+    opens: Arc<transport::channel_open::ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
     /// The sending side. A mutex, not a channel: `spawn` is synchronous (the
     /// trait is), the message is tiny, and the helper answers in
@@ -502,6 +505,7 @@ impl HelperChannelSpawner {
                 )
             })?;
         Ok(HelperChannelSpawner {
+            opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
             budget,
             tx: Mutex::new(sock),
             next_id: AtomicU64::new(1),
@@ -701,6 +705,9 @@ impl HelperChannelSpawner {
 }
 
 impl ChannelSpawner for HelperChannelSpawner {
+    fn open_registry(&self) -> Arc<transport::channel_open::ChannelOpenRegistry> {
+        self.opens.clone()
+    }
     /// Asks for the channel on `owner`'s behalf: its uid goes into the
     /// request, and the helper opens the channel only if it verified that
     /// account itself -- through `HelperAuth`, when the session logged in.
@@ -713,14 +720,20 @@ impl ChannelSpawner for HelperChannelSpawner {
         login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
-    ) -> Result<SpawnedChannel, String> {
+        custody: &transport::channel_open::OpenCustody,
+    ) -> Result<transport::channel_open::UninstalledChannel, transport::channel_open::SpawnFailure>
+    {
         // The same refusal the personal mode's spawner gives, in the same
         // words: the two must not disagree about what a channel is.
         if req.cols == 0 || req.rows == 0 {
-            return Err("a channel without a terminal is not supported yet".to_string());
+            return Err(custody.refuse_before_creation(
+                "a channel without a terminal is not supported yet".to_string(),
+            ));
         }
-        terminal_size::TerminalSize::new(req.cols, req.rows).map_err(|e| e.to_string())?;
-        let screen = make_screen(req, owner, Arc::clone(&self.budget))?;
+        terminal_size::TerminalSize::new(req.cols, req.rows)
+            .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))
+            .map_err(|e| custody.refuse_before_creation(e))?;
         let (shell, command) = match req.kind {
             // The helper runs the account's login shell, from passwd as it
             // verified the account (`helper::server::login_shell`) -- never
@@ -740,8 +753,9 @@ impl ChannelSpawner for HelperChannelSpawner {
             // runs everything and there is no shell to confine anyone.
             ChannelKind::Command => (
                 false,
-                String::from_utf8(req.command.clone())
-                    .map_err(|e| format!("the command is not valid UTF-8: {e}"))?,
+                String::from_utf8(req.command.clone()).map_err(|e| {
+                    custody.refuse_before_creation(format!("the command is not valid UTF-8: {e}"))
+                })?,
             ),
         };
         // Echo ON for a shell (a full-screen program sets raw mode itself),
@@ -753,7 +767,12 @@ impl ChannelSpawner for HelperChannelSpawner {
         // already live, so every request on this connection needs an id
         // that has never been used before, for as long as the connection
         // lasts.
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| {
+                custody.refuse_before_creation("helper channel identity exhausted".into())
+            })?;
 
         let request = Request::Open {
             id,
@@ -778,10 +797,31 @@ impl ChannelSpawner for HelperChannelSpawner {
         // `waiting`, with both its senders, for the rest of the process's
         // life -- nobody left to remove it. Failing here, before either
         // sender exists, needs no such cleanup at all.
-        let bytes = encode(&request).map_err(|e| format!("could not ask for a channel: {e}"))?;
+        let bytes = encode(&request).map_err(|e| {
+            custody.refuse_before_creation(format!("could not ask for a channel: {e}"))
+        })?;
 
         let (opened_tx, opened_rx) = mpsc::channel::<Result<OwnedFd, String>>();
         let (exited_tx, exited_rx) = mpsc::channel::<i32>();
+        // Clone the close handle before sending any possibly creating request.
+        let wait_tx = self
+            .tx
+            .lock()
+            .expect("the helper socket is never poisoned")
+            .try_clone()
+            .map_err(|e| {
+                custody.refuse_before_creation(format!("closing the channel later: {e}"))
+            })?;
+        let construction = custody.protect(
+            Box::new(HelperWait {
+                id,
+                exits: exited_rx,
+                tx: wait_tx,
+                disconnected_locally: self.disconnected_locally.clone(),
+            }),
+            screen,
+        );
+
         self.waiting
             .lock()
             .expect("the waiting map is never poisoned")
@@ -796,7 +836,7 @@ impl ChannelSpawner for HelperChannelSpawner {
         {
             let tx = self.tx.lock().expect("the helper socket is never poisoned");
             if let Err(e) = channel::send(&tx, &bytes, None) {
-                // The request never reached the helper, so no response is
+                // A failed send is not proof that no child was created. No response is
                 // ever coming for this id -- remove it ourselves rather
                 // than leaving it in the map forever (the reader thread,
                 // if it is even still running, has no way to know about an
@@ -805,7 +845,7 @@ impl ChannelSpawner for HelperChannelSpawner {
                     .lock()
                     .expect("the waiting map is never poisoned")
                     .remove(&id);
-                return Err(format!("could not reach the helper: {e}"));
+                return Err(custody.failure(format!("could not reach the helper: {e}")));
             }
         }
 
@@ -818,13 +858,14 @@ impl ChannelSpawner for HelperChannelSpawner {
         // bound catches is a helper that stays connected but simply never
         // answers.
         let fd = match opened_rx.recv_timeout(self.open_timeout) {
-            Ok(result) => result?,
+            Ok(result) => result.map_err(|reason| custody.failure(reason))?,
             Err(_) => {
                 // A reply that was merely slow rather than lost would leave
                 // a channel running with nothing holding a `ChannelWait`
                 // able to close it -- see `abandon`.
                 self.abandon(id);
-                return Err("the helper did not answer an open request in time".to_string());
+                return Err(custody
+                    .failure("the helper did not answer an open request in time".to_string()));
             }
         };
 
@@ -838,37 +879,29 @@ impl ChannelSpawner for HelperChannelSpawner {
         let clone = |what: &str| {
             master.try_clone().map_err(|e| {
                 self.abandon(id);
-                format!("{what}: {e}")
+                custody.failure(format!("{what}: {e}"))
             })
         };
         let reader = Box::new(clone("reading the channel")?);
         let writer = Box::new(clone("writing the channel")?);
-        // The guard is taken and dropped inside this block on purpose:
-        // `abandon` takes the same lock, and taking it twice on one thread
-        // would deadlock.
-        let wait_tx = {
-            let tx = self.tx.lock().expect("the helper socket is never poisoned");
-            tx.try_clone()
-        };
-        let wait_tx = match wait_tx {
-            Ok(tx) => tx,
-            Err(e) => {
-                self.abandon(id);
-                return Err(format!("closing the channel later: {e}"));
-            }
-        };
-        Ok(SpawnedChannel {
+        Ok(construction.finish(
             reader,
             writer,
-            resize: Box::new(MasterResize(clone("resizing the channel")?)),
-            screen,
-            wait: Box::new(HelperWait {
-                id,
-                exits: exited_rx,
-                tx: wait_tx,
-                disconnected_locally: Arc::clone(&self.disconnected_locally),
-            }),
-        })
+            Box::new(MasterResize(clone("resizing the channel")?)),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl HelperChannelSpawner {
+    fn spawn(
+        &self,
+        owner: &Principal,
+        login: LoginId,
+        req: &OpenRequest,
+        term: Option<&str>,
+    ) -> Result<SpawnedChannel, String> {
+        crate::channel_backend::fixture_spawn(self, owner, login, req, term)
     }
 }
 
@@ -884,6 +917,15 @@ struct HelperWait {
 }
 
 impl ChannelWait for HelperWait {
+    fn cleanup_uninstalled(
+        &mut self,
+        _authority: &transport::channel_open::CleanupAuthority<'_>,
+    ) -> transport::channel_open::CleanupStatus {
+        // Exited and the legacy wait timeout do not establish cleanup custody.
+        // Tasks 3–4 add the helper's explicit receipt; retain all charges until then.
+        self.kill();
+        transport::channel_open::CleanupStatus::Unknown
+    }
     fn kill(&mut self) {
         match encode(&Request::Close { id: self.id }) {
             Ok(bytes) => {

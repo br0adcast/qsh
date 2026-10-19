@@ -160,6 +160,13 @@ pub trait ChannelWait: Send {
 
     /// Block until the process has exited and return its exit code.
     fn wait(self: Box<Self>) -> i32;
+
+    /// Cleanup of a never-installed result. A status code, timeout or kill
+    /// request is not proof; return Unknown unless the exact child was reaped.
+    fn cleanup_uninstalled(
+        &mut self,
+        authority: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus;
 }
 
 /// Everything one opened channel gives the runner. Assembled by the caller
@@ -179,6 +186,8 @@ pub struct SpawnedChannel {
 /// shown to the user, so it is written in the language the daemon's other
 /// messages use.
 pub trait ChannelSpawner: Send + Sync + 'static {
+    /// Factory-owned registry; every runner and replacement uses this same owner.
+    fn open_registry(&self) -> Arc<crate::channel_open::ChannelOpenRegistry>;
     /// `owner` is whose session asks for the channel -- the session's own
     /// [`SessionIo::principal`], exactly as authentication established it.
     /// A spawner that serves several accounts opens the channel for this
@@ -204,7 +213,8 @@ pub trait ChannelSpawner: Send + Sync + 'static {
         login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
-    ) -> Result<SpawnedChannel, String>;
+        custody: &crate::channel_open::OpenCustody,
+    ) -> Result<crate::channel_open::UninstalledChannel, crate::channel_open::SpawnFailure>;
 }
 
 /// How long an accepted transfer may go without a byte before it is given
@@ -775,6 +785,7 @@ impl Drop for PendingExit {
 
 /// One open channel, as the runner keeps track of it.
 struct Channel {
+    _open_slot: Option<crate::channel_open::InstalledSlot>,
     producer: ProducerState,
     /// Sends keystrokes to this channel's process. Unbounded: a synchronous
     /// send from the loop must never block it (see `shell_server`'s module
@@ -809,11 +820,29 @@ struct Channel {
     wait: Box<dyn ChannelWait>,
 }
 
-/// The runner's ordered attachment scope and one coalescing capacity signal.
+/// The runner's ordered attachment, admitted-open ledger and capacity signal.
 #[derive(Default)]
 struct ProducerContext {
     attachment: AttachmentContext,
     ready: Arc<tokio::sync::Notify>,
+    opens: OpenScope,
+}
+struct OpenScope {
+    registry: Arc<crate::channel_open::ChannelOpenRegistry>,
+    session: Arc<crate::channel_open::SessionOpenLedger>,
+}
+impl OpenScope {
+    fn new(registry: Arc<crate::channel_open::ChannelOpenRegistry>) -> Self {
+        let session = registry.session().expect("session open identity exhausted");
+        Self { registry, session }
+    }
+}
+impl Default for OpenScope {
+    fn default() -> Self {
+        Self::new(crate::channel_open::ChannelOpenRegistry::new(
+            Default::default(),
+        ))
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResizeIntent {
@@ -1238,7 +1267,10 @@ pub async fn run_channel_session_with(
     // Numbers every channel opened, so a delivery answer names the channel
     // it was asked for (see `PendingExit`).
     let mut next_instance: u64 = 1;
-    let mut producer = ProducerContext::default();
+    let mut producer = ProducerContext {
+        opens: OpenScope::new(spawner.open_registry()),
+        ..ProducerContext::default()
+    };
     let mut control_buf = RecordDeframer::for_control();
     let mut control_overflow_logged = false;
     // A protocol failure stops further application input for this attachment.
@@ -1858,10 +1890,56 @@ fn open_channel(
     // serving several accounts (the system mode's, which asks a privileged
     // helper) opens the channel for exactly this account, and its login is
     // the token a PAM session has to be keyed by (see `SessionIo::login`).
-    let spawned = match spawner.spawn(io.principal(), io.login(), &req, term) {
+    let request = crate::channel_open::OpenRequestSnapshot {
+        owner: io.principal().clone(),
+        login: io.login(),
+        request: req.clone(),
+        term: term.map(str::to_owned),
+        identity: crate::channel_open::OpenIdentity {
+            session: context.opens.session.id(),
+            instance: ChannelInstance::new(instance).expect("nonzero instance"),
+            stream,
+            generation: context.attachment.generation,
+            invalidation_epoch: 0,
+        },
+    };
+    let job = match context
+        .opens
+        .registry
+        .try_reserve(&context.opens.session, request)
+    {
+        Ok(job) => job,
+        Err(_) => {
+            refuse(
+                io,
+                stream,
+                "too many pending channels".into(),
+                context.attachment,
+            );
+            return;
+        }
+    };
+    let uninstalled = match spawner.spawn(io.principal(), io.login(), &req, term, job.custody()) {
         Ok(spawned) => spawned,
-        Err(reason) => {
-            refuse(io, stream, reason, context.attachment);
+        Err(failure) => {
+            // Synchronous prerequisite. Task 7 moves this work onto its admitted worker.
+            job.cleanup();
+            refuse(io, stream, failure.reason, context.attachment);
+            return;
+        }
+    };
+    let job_id = job.id();
+    let (spawned, open_slot) = match job.adopt(uninstalled) {
+        Ok(adopted) => adopted,
+        Err(result) => {
+            drop(result);
+            context.opens.registry.cleanup(job_id);
+            refuse(
+                io,
+                stream,
+                "channel ended before installation".into(),
+                context.attachment,
+            );
             return;
         }
     };
@@ -1914,6 +1992,7 @@ fn open_channel(
     channels.insert(
         stream,
         Channel {
+            _open_slot: Some(open_slot),
             producer: ProducerState::new(
                 ChannelInstance::new(instance).expect("nonzero channel instance"),
                 context,
@@ -2018,6 +2097,7 @@ fn channel_writer_loop(
 // `session_manager::tests::a_channel_reused_after_a_reattach_is_credited_only_its_own_report`.
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("channel_server_open_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2246,6 +2326,14 @@ pub(crate) mod tests {
     }
 
     impl ChannelWait for FakeWait {
+        fn cleanup_uninstalled(
+            &mut self,
+            authority: &crate::channel_open::CleanupAuthority<'_>,
+        ) -> crate::channel_open::CleanupStatus {
+            self.kill();
+            self.waited.lock().unwrap().push(self.stream);
+            authority.reaped()
+        }
         fn kill(&mut self) {
             self.killed.lock().unwrap().push(self.stream);
         }
@@ -2259,6 +2347,7 @@ pub(crate) mod tests {
     /// Everything the tests need to steer and observe the spawner.
     #[allow(clippy::type_complexity)]
     pub(crate) struct FakeSpawner {
+        opens: Arc<crate::channel_open::ChannelOpenRegistry>,
         /// When set, every `spawn` refuses with this reason.
         refuse: Mutex<Option<String>>,
         written: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
@@ -2299,6 +2388,7 @@ pub(crate) mod tests {
     impl FakeSpawner {
         pub(crate) fn new() -> Arc<FakeSpawner> {
             Arc::new(FakeSpawner {
+                opens: crate::channel_open::ChannelOpenRegistry::new(Default::default()),
                 refuse: Mutex::new(None),
                 written: Arc::new(Mutex::new(Vec::new())),
                 sizes: Arc::new(Mutex::new(Vec::new())),
@@ -2360,13 +2450,18 @@ pub(crate) mod tests {
     }
 
     impl ChannelSpawner for FakeSpawner {
+        fn open_registry(&self) -> Arc<crate::channel_open::ChannelOpenRegistry> {
+            self.opens.clone()
+        }
         fn spawn(
             &self,
             owner: &Principal,
             login: LoginId,
             req: &OpenRequest,
             term: Option<&str>,
-        ) -> Result<SpawnedChannel, String> {
+            custody: &crate::channel_open::OpenCustody,
+        ) -> Result<crate::channel_open::UninstalledChannel, crate::channel_open::SpawnFailure>
+        {
             self.owners
                 .lock()
                 .unwrap()
@@ -2377,11 +2472,11 @@ pub(crate) mod tests {
                 .unwrap()
                 .push((req.stream, term.map(str::to_string)));
             if let Some(reason) = self.refuse.lock().unwrap().clone() {
-                return Err(reason);
+                return Err(custody.refuse_before_creation(reason));
             }
             let (end_tx, end_rx) = std_mpsc::channel::<Vec<u8>>();
             self.enders.lock().unwrap().push((req.stream, end_tx));
-            Ok(SpawnedChannel {
+            let spawned = SpawnedChannel {
                 reader: Box::new(FakeProcess {
                     greeting: Some(b"hello from the shell".to_vec()),
                     feed: end_rx,
@@ -2411,7 +2506,12 @@ pub(crate) mod tests {
                     killed: self.killed.clone(),
                     waited: self.waited.clone(),
                 }),
-            })
+            };
+            Ok(custody.protect(spawned.wait, spawned.screen).finish(
+                spawned.reader,
+                spawned.writer,
+                spawned.resize,
+            ))
         }
     }
 
@@ -2591,6 +2691,7 @@ pub(crate) mod tests {
                 ..channel_producer()
             };
             let channel = Channel {
+                _open_slot: None,
                 input_tx,
                 resize: Box::new(TransactionPty {
                     fail: ioctl_fails,
