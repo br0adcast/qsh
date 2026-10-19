@@ -228,7 +228,9 @@ fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
 
     let cfg = transport::ConnectionConfig {
         required_features: transport::Features::NONE,
-        features: transport::Features::SUPPORTED,
+        features: transport::Features::from_bits(
+            transport::Features::SUPPORTED.bits() & !transport::Features::AUTH_ACCEPTED.bits(),
+        ),
         role: transport::Role::Server,
         local_static_priv: keypair.private,
         remote_static_pub: None,
@@ -343,7 +345,9 @@ fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
 
     let cfg = transport::ConnectionConfig {
         required_features: transport::Features::NONE,
-        features: transport::Features::SUPPORTED,
+        features: transport::Features::from_bits(
+            transport::Features::SUPPORTED.bits() & !transport::Features::AUTH_ACCEPTED.bits(),
+        ),
         role: transport::Role::Server,
         local_static_priv: keypair.private,
         remote_static_pub: None,

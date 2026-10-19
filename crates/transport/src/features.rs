@@ -30,7 +30,7 @@ impl Features {
     /// Bit 2: stream offsets modulo 2^32 (spec §4.14): a stream goes on past
     /// 4 GiB.
     pub const OFFSET_WRAP: Features = Features(1 << 2);
-    /// Reserved for explicit post-proof authentication acceptance; not enabled yet.
+    /// Bit 3: explicit committed authentication acceptance on the server auth stream.
     pub const AUTH_ACCEPTED: Features = Features(1 << 3);
     /// Bit 4: ordered authoritative channel geometry and atomic lifecycle metadata.
     pub const CHANNEL_GEOMETRY: Features = Features(1 << 4);
@@ -40,6 +40,7 @@ impl Features {
         Features::HEADER_AAD.0
             | Features::STREAM_CREDIT.0
             | Features::OFFSET_WRAP.0
+            | Features::AUTH_ACCEPTED.0
             | Features::CHANNEL_GEOMETRY.0,
     );
 
@@ -174,6 +175,7 @@ mod tests {
             Features::HEADER_AAD
                 | Features::STREAM_CREDIT
                 | Features::OFFSET_WRAP
+                | Features::AUTH_ACCEPTED
                 | Features::CHANNEL_GEOMETRY
         );
     }
@@ -199,15 +201,28 @@ mod geometry_feature_tests {
         assert_eq!(Features::CHANNEL_GEOMETRY.bits(), 16);
         assert!(!Features::CHANNEL_GEOMETRY.contains(Features::AUTH_ACCEPTED));
         let reserved = Features::AUTH_ACCEPTED | Features::CHANNEL_GEOMETRY;
-        assert_eq!(
-            Features::negotiate(reserved, reserved),
-            Features::CHANNEL_GEOMETRY
-        );
+        assert_eq!(Features::negotiate(reserved, reserved), reserved);
         assert_eq!(
             Features::negotiate(Features::from_bits(u32::MAX), Features::from_bits(u32::MAX)),
             Features::SUPPORTED
         );
-        assert_eq!(Features::SUPPORTED & reserved, Features::CHANNEL_GEOMETRY);
+        assert_eq!(Features::SUPPORTED & reserved, reserved);
         assert_eq!(reserved.names(), vec!["auth-accepted", "channel-geometry"]);
+    }
+    #[test]
+    fn auth17_acceptance_is_supported_but_never_enabled_without_both_peers() {
+        assert!(Features::SUPPORTED.contains(Features::AUTH_ACCEPTED));
+        assert_eq!(
+            Features::negotiate(Features::AUTH_ACCEPTED, Features::AUTH_ACCEPTED),
+            Features::AUTH_ACCEPTED
+        );
+        assert_eq!(
+            Features::negotiate(Features::NONE, Features::AUTH_ACCEPTED),
+            Features::NONE
+        );
+        assert_eq!(
+            Features::negotiate(Features::AUTH_ACCEPTED, Features::NONE),
+            Features::NONE
+        );
     }
 }

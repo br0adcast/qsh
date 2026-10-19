@@ -1236,7 +1236,9 @@ impl<'a> Climb<'a> {
         }
         let outcome = landed(
             self.background() && !self.fresh_session,
-            att.client.resumed(),
+            att.acceptance().is_some_and(|accepted| {
+                accepted.disposition == transport::SessionDisposition::Resumed
+            }),
         );
         if outcome == DirectOutcome::Connected {
             let mut slot = self
@@ -1392,7 +1394,13 @@ impl<'a> Climb<'a> {
     /// unreachable, and a `Close` would then tear down the very session a
     /// return is for (or, at login, the one a warm return found).
     fn forget(&self, att: &attempt::Attempt) {
-        match let_go(att.client.resumed()) {
+        // Before acceptance the tentative hint remains a conservative teardown
+        // safeguard; it never establishes authentication or recovery success.
+        let resumed = att.acceptance().map_or_else(
+            || att.client.resumed(),
+            |accepted| accepted.disposition == transport::SessionDisposition::Resumed,
+        );
+        match let_go(resumed) {
             LetGo::Detach => att.detach(),
             LetGo::Close => att.close(),
         }
@@ -1488,7 +1496,8 @@ fn protocol_why(failure: transport::ProtocolFailure) -> NoAnswerWhy {
                 enabled: enabled.bits(),
             }
         }
-        transport::ProtocolFailure::InvalidHandshake { .. }
+        transport::ProtocolFailure::InvalidAuthentication { .. }
+        | transport::ProtocolFailure::InvalidHandshake { .. }
         | transport::ProtocolFailure::UnofferedFeatures { .. } => NoAnswerWhy::InvalidProtocol,
     }
 }
@@ -1655,18 +1664,9 @@ fn let_go(resumed: bool) -> LetGo {
     }
 }
 
-/// Like [`attempt::Attempt::settle_with`], but the thing done on `Live` is
-/// to open the shell channel at `cols`x`rows` when a fresh shell is allowed,
-/// and remember what came back. Sending this the moment the link comes alive,
-/// rather than only once the whole attempt is judged `Working`, is what
-/// makes a working key's verdict fast: under the channel protocol a cold
-/// server answers nothing at all until asked for a channel, so without
-/// this every accepted key sat out the full auth deadline in silence (the
-/// coordinator's finding -- the old, single-stream protocol's shell used
-/// to print its prompt unprompted, which is what made the verdict instant
-/// before). A refused key gets no `Opened` in reply, `got_data` never
-/// flips, and `settle_with` resolves the verdict exactly as it did before
-/// this existed.
+/// Open a fresh shell only after explicit acceptance and existing consent.
+/// A resumed transport keeps its authoritative channel metadata; recovery probes
+/// that discover a fresh session open nothing before the owner agrees.
 fn settle_opening(
     att: &attempt::Attempt,
     channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
@@ -1678,14 +1678,11 @@ fn settle_opening(
     let mut opened_ch = None;
     let verdict = att.settle_until(
         || {
-            // A resumed session already has its channels; the server announces
-            // them unprompted, and opening one here would ask for a stream it
-            // still holds. Nothing is lost for the verdict either: that
-            // announcement is itself the traffic this open exists to provoke.
-            // Recovery probes must not create a replacement shell before
-            // the owner asks. With no channel, authentication settles from
-            // the live link at the existing signature deadline instead.
-            if open_fresh && !att.client.resumed() {
+            if open_fresh
+                && att.acceptance().is_some_and(|accepted| {
+                    accepted.disposition == transport::SessionDisposition::Fresh
+                })
+            {
                 opened_ch = channel_session.open_shell(cols, rows);
             }
         },

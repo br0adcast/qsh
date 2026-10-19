@@ -340,7 +340,7 @@ impl ChannelSessionBackend {
 
 impl SessionBackend for ChannelSessionBackend {
     fn required_features(&self) -> transport::Features {
-        transport::Features::CHANNEL_GEOMETRY
+        transport::Features::CHANNEL_GEOMETRY | transport::Features::AUTH_ACCEPTED
     }
 
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {

@@ -587,7 +587,7 @@ fn this_qsh_follows_a_flood_as_screen_repaints_with_the_header_under_aead() {
     follow_8_mb_of_output_as_repaints_and_interrupt(&mut client, &seen, &daemon);
     let log = std::fs::read_to_string(config.path().join("qsh").join("log")).unwrap_or_default();
     assert!(
-        log.contains("transport features: header-aad stream-credit offset-wrap channel-geometry"),
+        log.contains("transport features: header-aad stream-credit offset-wrap auth-accepted channel-geometry"),
         "all three, credits among them: {log}"
     );
     leave(client);

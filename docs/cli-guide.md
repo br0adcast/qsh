@@ -345,6 +345,14 @@ starts with a fresh local record and cannot automatically resume a detached
 session through its old record. This transition does not terminate the old
 server session.
 
+Current application peers require explicit authentication acceptance as well as
+ordered channel geometry. A completed transport handshake or successful SSH
+bootstrap alone does not start application work: qsh waits for the server's
+committed admission record. Missing capabilities are an incompatibility; elapsed
+time and unrelated output never substitute for acceptance. A resumed record
+still needs usable channel evidence, while a fresh record during recovery does
+not open a shell before the existing consent question.
+
 A key conflict during foreground login exits with code 11. During recovery, a
 foreign server is retried as a failed path while the expected key remains unchanged. When the expected server authenticates but
 confirms that the old session no longer exists, for example after a daemon

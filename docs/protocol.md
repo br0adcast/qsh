@@ -414,7 +414,7 @@ connection will do (`enabled`, §2.2).
 | 0 (`0x0000_0001`) | `header-aad` | the 18-byte datagram header is the AEAD's associated data (§1.1) |
 | 1 (`0x0000_0002`) | `stream-credit` | `CREDIT` frames and per-stream limits (§7) |
 | 2 (`0x0000_0004`) | `offset-wrap` | stream offsets modulo 2³² (§7) |
-| 3 (`0x0000_0008`) | `auth-accepted` | reserved; not advertised or enabled |
+| 3 (`0x0000_0008`) | `auth-accepted` | explicit committed session admission on server-direction stream 15 (§3.4); required by application channel peers |
 | 4 (`0x0000_0010`) | `channel-geometry` | ordered geometry and atomic channel lifecycle discovery; required by application channel peers |
 | 5–31 | — | reserved, sent as zero |
 
@@ -429,16 +429,16 @@ connection will do (`enabled`, §2.2).
 Wire, handshake and channel protocol versions are all **2**. The feature
 fields are authenticated by Noise; negotiation remains the intersection of
 what the client offers, the server allows and this build implements. Application
-channel clients and daemons require `channel-geometry`: the server checks before
+channel clients and daemons require `channel-geometry` and `auth-accepted`: the server checks before
 session resolution/allocation or backend attachment, and the client before Live and
-queued application output. Missing geometry is a protocol failure, not a silent
-resize fallback. Bit 3 remains unadvertised: geometry or `ABOUT` is not an
-explicit post-proof authentication acceptance message. Generic transport-only
-profiles can explicitly require `Features::NONE`; this does not relax the
-application channel profile.
+queued application output. Missing either capability is a protocol failure.
+Geometry, `ABOUT`, and arbitrary application bytes do not establish admission.
+Generic transport-only profiles can explicitly require `Features::NONE`; this
+does not relax the application channel profile. Raw echo/shell diagnostic owners
+exclude `auth-accepted` because they do not implement the session acknowledgement.
 
-`Features::SUPPORTED` is `0x17`: header AAD, credits, offset wrapping and channel
-geometry. Protocol 1 datagrams are ignored at the outer parser; silence alone
+`Features::SUPPORTED` is `0x1f`: header AAD, credits, offset wrapping, explicit
+authentication acceptance and channel geometry. Protocol 1 datagrams are ignored at the outer parser; silence alone
 does not identify a peer's version. The CLI reports that protocol 2 is required
 when no compatible reply arrives. Configured SSH installation/recovery remains
 a separate path, not a protocol-1 QSH session.
@@ -881,21 +881,47 @@ admissions rather than wrapping. Completion effects require the original
 registered probation seat, preventing duplicate or already retired completions
 from changing a binding or releasing a nonce twice.
 
-### 3.4 There is no "accepted" or "refused" on the wire
+### 3.4 Explicit committed admission
 
-A refused proof is not answered with an error. The probation task exits, the
-manager drops the route, and the server simply stops answering. An attacker
-probing keys therefore learns nothing from the failure mode.
-`cli/src/connect.rs` infers the outcome instead — from whether the handshake
-completed, whether any data arrived, whether the link is live now, and how
-long it has been — and documents the one residual ambiguity it accepts (an
-accepted session whose shell prints nothing and then exits reads as a
-refusal).
+After proof and committed session admission, the server sends exactly one
+`AuthAccepted` record on the server-to-client direction of stream 15:
 
-One answer does precede every check: under load (§2.7) a msg1 is answered
-with a cookie before anything is read from it. It says the daemon is busy,
-nothing about whether a key would be accepted; and a proven msg1 past its
-source's rate is dropped in silence, like any refusal.
+`version(u8)=1 | kind(u8)=1 | disposition(u8) | reserved(u8)=0 | session_id(u64 BE)`
+
+The record is exactly twelve bytes. Disposition 0 means a fresh backend;
+disposition 1 means an existing backend was reattached. The session ID must
+match the active transport, and `auth-accepted` must have been negotiated.
+This framing is separate from the client-to-server signature record on the
+same stream. A successful SSH command or tentative msg2 `resumed` flag is not
+an admission acknowledgement. If warm attachment fails before the bridge
+receives it and admission instead creates a backend, the record says fresh.
+
+The manager commits cold routing before scheduling the backend bridge. A warm
+Attach carries private commit permission: the bridge waits for the manager's
+revision, route, incarnation and key changes before replacing its connection.
+It queues acceptance through the ordinary reliable stream before backend Live,
+ResumeReset or early application input can produce output. This is sender
+ordering; independent streams may arrive in a different order. Acceptance does
+not require a channel OPEN, shell creation, or application output.
+
+The client driver buffers at most twelve bytes and validates the fixed fields,
+active session ID and negotiated capability before emitting its typed
+`AuthAcceptance` callback. Reserved bytes never reach generic application DATA
+callbacks. The driver consumes this stream even when application streams use
+explicit consumption. Excess bytes in the completing chunk invalidate the
+whole record; a later nonempty chunk is a protocol failure without a second
+callback. A callback already emitted cannot be retracted.
+
+The CLI starts consented application work only after this explicit acceptance.
+Neither Live, unrelated DATA nor an elapsed timeout establishes success. The
+5.5-second acceptance timeout bounds failure only. Refused proofs remain silent:
+the manager removes their provisional routes without an acceptance or a
+key-specific refusal record. Load cookies (§2.7) also prove no admission.
+
+During recovery, fresh admission leads to the existing missing-session question
+without automatically opening a shell. Resumed admission still requires usable
+channel evidence; it does not revive an ended channel. Ordered snapshots,
+geometry, buffered output and final Exit retain their existing meanings.
 
 ---
 

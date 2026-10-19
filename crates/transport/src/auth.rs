@@ -22,22 +22,14 @@ use std::time::Duration;
 /// `tokio-driver` feature that gates `crate::probation`.
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The margin a CLIENT adds to [`AUTH_DEADLINE`] before it reads silence as
-/// an answer: long enough that a close already on the wire arrives first,
-/// short enough that the person is not left watching nothing happen.
-pub const AUTH_SETTLE_MARGIN: Duration = Duration::from_millis(500);
+/// Allow a response already on the wire to arrive after the proof deadline.
+pub const AUTH_DELIVERY_MARGIN: Duration = Duration::from_millis(500);
 
-/// How long a client waits, once the handshake has completed, for a byte of
-/// data or for the link to fall away before treating silence itself as the
-/// answer to a signature login. Derived from [`AUTH_DEADLINE`] -- past it the
-/// question of whether the key was accepted is settled one way or the other
-/// -- and shared by clients so their deadlines cannot drift.
-///
-/// A refusal is visible within this window only because the link falls to
-/// `PathDown` before it ends: see the check next to `PATH_DOWN_AFTER` in
-/// `conn.rs`.
-pub const AUTH_SETTLED_AFTER: Duration =
-    Duration::from_millis(AUTH_DEADLINE.as_millis() as u64 + AUTH_SETTLE_MARGIN.as_millis() as u64);
+/// Client failure budget for explicit admission acceptance. Neither elapsed
+/// time, transport keepalives nor application bytes establish authentication.
+pub const AUTH_ACCEPTANCE_TIMEOUT: Duration = Duration::from_millis(
+    AUTH_DEADLINE.as_millis() as u64 + AUTH_DELIVERY_MARGIN.as_millis() as u64,
+);
 
 /// How long a client waits for the handshake of a signature login to
 /// complete AT ALL before giving up on the address. Nothing listening on the

@@ -50,25 +50,6 @@ const PING_INTERVAL_DOWN: Duration = Duration::from_secs(15);
 /// shows up faster.
 pub const PATH_DOWN_AFTER: Duration = Duration::from_secs(3);
 
-/// How much earlier than [`crate::auth::AUTH_SETTLED_AFTER`] the link must
-/// be able to reach `PathDown`: the tick that notices the silence, and the
-/// handshake round trip a client may count its settle window from.
-const REFUSAL_DETECTION_MARGIN: Duration = Duration::from_secs(1);
-
-// Load-bearing, and written down nowhere else: a daemon that refuses a
-// signature does not say so, it drops the route and stops answering. A
-// client learns of the refusal only because the link falls to `PathDown`
-// INSIDE its settle window -- a link still `Live` when the window ends is
-// read as a key that was accepted. `PATH_DOWN_AFTER` was 6 s before it was
-// lowered to 3 s, and at 6 s every silent refusal read as success, in the
-// console client and the app alike. Whoever moves either value meets this
-// first, at compile time.
-const _: () = assert!(
-    PATH_DOWN_AFTER.as_millis() + REFUSAL_DETECTION_MARGIN.as_millis()
-        < crate::auth::AUTH_SETTLED_AFTER.as_millis(),
-    "PATH_DOWN_AFTER must fall well inside AUTH_SETTLED_AFTER, or a refused signature reads as accepted"
-);
-
 /// Client link-death: how long an ACTIVE client tolerates silence before
 /// declaring the link dead (`Closed`) and triggering a reconnect. Kept short so
 /// a genuinely-dead server is detected quickly. A Doze/freeze must NOT count
@@ -296,6 +277,9 @@ pub struct ConnectionConfig {
 /// An authenticated handshake cannot satisfy this application profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolFailure {
+    InvalidAuthentication {
+        reason: crate::AuthAcceptanceError,
+    },
     UnsupportedProtocol {
         supported: u8,
     },
@@ -4503,7 +4487,7 @@ pub(crate) mod tests {
     #[test]
     fn a_msg2_enabling_what_was_not_offered_closes_the_connection() {
         for (offer, enabled) in [
-            (Features::SUPPORTED, Features::from_bits(1 << 3)),
+            (Features::SUPPORTED, Features::from_bits(1 << 5)),
             (Features::NONE, Features::HEADER_AAD),
             (Features::SUPPORTED, Features::from_bits(1 << 30)),
         ] {
@@ -4643,12 +4627,13 @@ pub(crate) mod tests {
     fn a_hand_built_msg1_offers_only_what_this_build_implements() {
         let unknown = Features::from_bits(1 << 30);
         let offered = Features::from_bits(
-            Features::SUPPORTED.bits() | Features::from_bits(1 << 3).bits() | unknown.bits(),
+            Features::SUPPORTED.bits() | Features::from_bits(1 << 5).bits() | unknown.bits(),
         );
         for (enabled, live) in [
-            (Features::from_bits(1 << 3), false),
+            (Features::from_bits(1 << 5), false),
             (unknown, false),
             (Features::HEADER_AAD, true),
+            (Features::AUTH_ACCEPTED, true),
         ] {
             let server_kp = generate_keypair();
             let client_kp = generate_keypair();

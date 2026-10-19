@@ -227,6 +227,8 @@ pub trait ClientEvents: Send + Sync {
     fn on_features(&self, _features: Features) {}
     /// A bounded authenticated protocol failure, delivered before Closed.
     fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
+    /// Committed server admission for this exact active transport.
+    fn on_auth_accepted(&self, _accepted: crate::AuthAcceptance) {}
     /// The OS refused to send a datagram to `to`: its kind and its own
     /// words (e.g. `No route to host (os error 65)`). Called once per change
     /// of the error, not on every retransmit that fails the same way; the
@@ -283,6 +285,8 @@ pub enum SendBlocked {
 
 /// A command to the driver thread.
 enum Command {
+    #[cfg(test)]
+    UnconsumedForTest(Sender<Vec<(u8, u64)>>),
     Send {
         stream_id: u8,
         data: Vec<u8>,
@@ -355,7 +359,7 @@ struct AuthResult {
 pub struct DriverSetup {
     /// How the streams nobody declared count their consumption (spec
     /// §4.10.1): `OnDelivery` for the app, `Explicit` for the console
-    /// client (spec §4.13).
+    /// client (spec §4.13). AUTH_STREAM is always consumed by the driver.
     pub default_consumption: Consumption,
     /// Per-stream declarations, applied after the default.
     pub stream_consumption: Vec<(u8, Consumption)>,
@@ -586,10 +590,10 @@ impl StdClient {
         self.roads.lock().expect("roads mutex").probes.clone()
     }
 
-    /// Whether the server said this connection landed on the session named
-    /// by its token, rather than a fresh one. False until the handshake
-    /// completes, and false forever against a server that predates the
-    /// answer.
+    /// Tentative msg2 resume hint. It may differ from the later committed
+    /// AuthAcceptance (for example, a raced-out warm bridge cold-falls back).
+    /// Use on_auth_accepted for authentication/recovery decisions; this hint
+    /// remains useful for conservative teardown before acceptance arrives.
     pub fn resumed(&self) -> bool {
         self.resumed.load(Ordering::SeqCst)
     }
@@ -994,6 +998,10 @@ fn run_driver(
     for (stream_id, consumption) in setup.stream_consumption {
         conn.set_stream_consumption(stream_id, consumption);
     }
+    // The reserved server-direction record is consumed by this driver, never
+    // by the application. Override even an explicit per-stream setup once;
+    // on-delivery accounting owns its credit, with no duplicate report.
+    conn.set_stream_consumption(AUTH_STREAM, Consumption::OnDelivery);
     let start = Instant::now();
     // The first msg1; the connection keeps it and hands it back for every
     // retransmit, byte for byte -- behind the daemon's cookie once one
@@ -1014,6 +1022,7 @@ fn run_driver(
     // captures the value at the time it was started, so an `AuthDone` for a
     // generation this counter has since moved past is recognized as stale.
     let mut auth_generation: u64 = 0;
+    let mut acceptance_parser = None;
 
     let mut state = LinkState::Connecting;
     events.on_state(state);
@@ -1100,6 +1109,10 @@ fn run_driver(
                     send_all(&socket, &out, &mut sends);
                     let tail = conn.stream_progress(stream_id).unacked;
                     let _ = gates.gate(stream_id, GateKind::Pipe).transfer(n, tail);
+                }
+                #[cfg(test)]
+                Ok(Command::UnconsumedForTest(reply)) => {
+                    let _ = reply.send(conn.unconsumed_streams());
                 }
                 Ok(Command::Consumed { stream_id, n }) => {
                     let now = Instant::now();
@@ -1297,6 +1310,10 @@ fn run_driver(
                 resumed_flag.store(conn.resumed(), Ordering::SeqCst);
                 *features_flag.lock().expect("features mutex") = Some(conn.features());
                 events.on_features(conn.features());
+                acceptance_parser = Some(crate::auth_acceptance::AuthAcceptanceParser::new(
+                    conn.session_id(),
+                    conn.features(),
+                ));
                 if let Some(signer) = signer.as_ref() {
                     auth_generation += 1;
                     spawn_auth_signing(
@@ -1311,7 +1328,26 @@ fn run_driver(
             if matches!(ev, Event::StateChanged(LinkState::Closed)) {
                 closed_gracefully_flag.store(conn.closed_gracefully(), Ordering::SeqCst);
             }
-            dispatch_event(ev, events.as_ref(), &mut state, &mut handshake_pending);
+            if let Err(reason) = dispatch_authenticated_event(
+                ev,
+                events.as_ref(),
+                &mut state,
+                &mut handshake_pending,
+                &mut acceptance_parser,
+            ) {
+                events
+                    .on_protocol_failure(crate::ProtocolFailure::InvalidAuthentication { reason });
+                // Do not send Close: a malformed admission response must not
+                // accidentally destroy a session the tentative msg2 resumed.
+                conn.abandon();
+                dispatch_event(
+                    Event::StateChanged(LinkState::Closed),
+                    events.as_ref(),
+                    &mut state,
+                    &mut handshake_pending,
+                );
+                break;
+            }
         }
         let cur = conn.stats(now);
         if stats_are_due(
@@ -1405,6 +1441,35 @@ thread_local! {
 /// local `state`/`handshake_pending` bookkeeping along the way. Pulled out of
 /// the driver loop as its own function so the routing itself (which event
 /// reaches which callback) is unit-testable without spinning up sockets.
+fn dispatch_authenticated_event(
+    ev: Event,
+    events: &dyn ClientEvents,
+    state: &mut LinkState,
+    handshake_pending: &mut bool,
+    parser: &mut Option<crate::auth_acceptance::AuthAcceptanceParser>,
+) -> Result<(), crate::AuthAcceptanceError> {
+    match ev {
+        Event::StreamData {
+            stream_id: AUTH_STREAM,
+            data,
+        } => {
+            let parser = parser
+                .as_mut()
+                .ok_or(crate::AuthAcceptanceError::Unnegotiated)?;
+            if let Some(accepted) = parser.feed(&data)? {
+                events.on_auth_accepted(accepted);
+            }
+        }
+        Event::StreamReset {
+            stream_id: AUTH_STREAM,
+        } => {
+            return Err(crate::AuthAcceptanceError::Malformed);
+        }
+        other => dispatch_event(other, events, state, handshake_pending),
+    }
+    Ok(())
+}
+
 fn dispatch_event(
     ev: Event,
     events: &dyn ClientEvents,
@@ -1498,7 +1563,12 @@ mod tests {
     #[test]
     fn a_client_says_what_its_handshake_agreed() {
         let (client, _arrivals) = crate::test_peer::client_whose_server_stops_acknowledging();
-        assert_eq!(client.features(), Some(crate::Features::SUPPORTED));
+        assert_eq!(
+            client.features(),
+            Some(crate::Features::from_bits(
+                crate::Features::SUPPORTED.bits() & !crate::Features::AUTH_ACCEPTED.bits(),
+            ))
+        );
         client.detach();
         assert_eq!(StdClient::dead().features(), None);
     }
@@ -4206,7 +4276,12 @@ mod tests {
         let heard: Vec<Heard> = log_rx.try_iter().collect();
         assert_eq!(
             heard,
-            vec![Heard::Features(Features::SUPPORTED), Heard::Live],
+            vec![
+                Heard::Features(Features::from_bits(
+                    Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits()
+                )),
+                Heard::Live
+            ],
             "the agreed features, once, then Live"
         );
         client.detach();
@@ -4274,4 +4349,109 @@ mod tests {
         assert_eq!(got, data.len());
         client.detach();
     }
+    #[derive(Default)]
+    struct Auth17Events {
+        accepted: Mutex<Vec<crate::AuthAcceptance>>,
+        bytes: Mutex<Vec<(u8, Vec<u8>)>>,
+    }
+    impl ClientEvents for Auth17Events {
+        fn on_bytes(&self, stream: u8, bytes: Vec<u8>) {
+            self.bytes.lock().unwrap().push((stream, bytes));
+        }
+        fn on_state(&self, _: LinkState) {}
+        fn on_stats(&self, _: Stats) {}
+        fn on_reset(&self, _: u8) {}
+        fn on_auth_accepted(&self, record: crate::AuthAcceptance) {
+            self.accepted.lock().unwrap().push(record);
+        }
+    }
+
+    #[test]
+    fn auth17_driver_routes_only_complete_valid_record_to_typed_callback() {
+        let accepted = crate::AuthAcceptance {
+            session_id: 17,
+            disposition: crate::SessionDisposition::Fresh,
+        };
+        let wire = crate::encode_auth_acceptance(accepted);
+        for split in 0..=wire.len() {
+            let events = Auth17Events::default();
+            let mut parser = Some(crate::auth_acceptance::AuthAcceptanceParser::new(
+                17,
+                crate::Features::AUTH_ACCEPTED,
+            ));
+            let mut state = LinkState::Live;
+            let mut pending = false;
+            for chunk in [&wire[..split], &wire[split..]] {
+                dispatch_authenticated_event(
+                    Event::StreamData {
+                        stream_id: AUTH_STREAM,
+                        data: chunk.to_vec(),
+                    },
+                    &events,
+                    &mut state,
+                    &mut pending,
+                    &mut parser,
+                )
+                .unwrap();
+            }
+            assert_eq!(*events.accepted.lock().unwrap(), vec![accepted]);
+            assert!(
+                events.bytes.lock().unwrap().is_empty(),
+                "reserved bytes never become generic application data"
+            );
+        }
+    }
+
+    #[test]
+    fn auth17_driver_rejects_auth_bytes_without_active_parser_and_malformed_records() {
+        for active in [false, true] {
+            let events = Auth17Events::default();
+            let mut parser = active.then(|| {
+                crate::auth_acceptance::AuthAcceptanceParser::new(
+                    17,
+                    crate::Features::AUTH_ACCEPTED,
+                )
+            });
+            let mut state = LinkState::Live;
+            let mut pending = false;
+            assert!(dispatch_authenticated_event(
+                Event::StreamData {
+                    stream_id: AUTH_STREAM,
+                    data: vec![0; 12]
+                },
+                &events,
+                &mut state,
+                &mut pending,
+                &mut parser
+            )
+            .is_err());
+            assert!(events.accepted.lock().unwrap().is_empty());
+            assert!(events.bytes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn auth17_driver_preserves_other_stream_delivery_without_inventing_acceptance() {
+        let events = Auth17Events::default();
+        let mut parser = None;
+        let mut state = LinkState::Live;
+        let mut pending = false;
+        dispatch_authenticated_event(
+            Event::StreamData {
+                stream_id: 0,
+                data: b"ordered metadata".to_vec(),
+            },
+            &events,
+            &mut state,
+            &mut pending,
+            &mut parser,
+        )
+        .unwrap();
+        assert!(events.accepted.lock().unwrap().is_empty());
+        assert_eq!(
+            *events.bytes.lock().unwrap(),
+            vec![(0, b"ordered metadata".to_vec())]
+        );
+    }
+    include!("driver_std_auth_tests.rs");
 }
