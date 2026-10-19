@@ -41,15 +41,29 @@ fn fetch(
             .build()
             .map_err(|error| rejected(clean(&error.to_string())))?,
     ));
-    runtime.0.as_ref().expect("runtime is alive").block_on(async {
-        // One deadline surrounds DNS, connect, redirects, headers and body.
-        tokio::select! {
-            biased;
-            _ = cancelled(cancel) => Err(FetchError::Rejected(ImageError::Cancelled)),
-            _ = tokio::time::sleep(limits.total) => Err(FetchError::TemporarilyUnavailable("release download deadline exceeded".into())),
-            result = download(builder, url, limits, observer) => result,
-        }
-    })
+    runtime
+        .0
+        .as_ref()
+        .expect("runtime is alive")
+        .block_on(with_deadline(
+            limits,
+            cancel,
+            download(builder, url, limits, observer),
+        ))
+}
+
+async fn with_deadline<T>(
+    limits: FetchLimits,
+    cancel: &Cancel,
+    download: impl std::future::Future<Output = Result<T, FetchError>>,
+) -> Result<T, FetchError> {
+    // One deadline surrounds DNS, connect, redirects, headers and body.
+    tokio::select! {
+        biased;
+        _ = cancelled(cancel) => Err(FetchError::Rejected(ImageError::Cancelled)),
+        _ = tokio::time::sleep(limits.total) => Err(FetchError::TemporarilyUnavailable("release download deadline exceeded".into())),
+        result = download => result,
+    }
 }
 
 async fn download(
@@ -70,36 +84,9 @@ async fn download(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(download_error)?;
-    let mut url = reqwest::Url::parse(url).map_err(|error| rejected(clean(&error.to_string())))?;
-    let mut redirects = 0;
-    let mut response = loop {
-        if url.scheme() != "https" {
-            return Err(rejected("release URLs must use HTTPS".into()));
-        }
-        let response = tokio::time::timeout(limits.idle, client.get(url.clone()).send())
-            .await
-            .map_err(|_| {
-                FetchError::TemporarilyUnavailable("release download idle timeout".into())
-            })?
-            .map_err(download_error)?;
-        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-            if redirects == 5 {
-                return Err(rejected("release has more than five redirects".into()));
-            }
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| rejected("invalid release redirect location".into()))?;
-            url = response
-                .url()
-                .join(location)
-                .map_err(|error| rejected(clean(&error.to_string())))?;
-            redirects += 1;
-        } else {
-            break response;
-        }
-    };
+    let url = reqwest::Url::parse(url).map_err(|error| rejected(clean(&error.to_string())))?;
+    let mut response =
+        request_following_redirects(url, limits.idle, |url| client.get(url).send()).await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(missing("release asset not found (HTTP 404)".into()));
     }
@@ -150,6 +137,46 @@ async fn download(
         finished: true,
     });
     Ok(bytes)
+}
+
+async fn request_following_redirects<F, Fut>(
+    mut url: reqwest::Url,
+    idle: std::time::Duration,
+    mut send: F,
+) -> Result<reqwest::Response, FetchError>
+where
+    F: FnMut(reqwest::Url) -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let mut redirects = 0;
+    loop {
+        if url.scheme() != "https" {
+            return Err(rejected("release URLs must use HTTPS".into()));
+        }
+        let response = tokio::time::timeout(idle, send(url.clone()))
+            .await
+            .map_err(|_| {
+                FetchError::TemporarilyUnavailable("release download idle timeout".into())
+            })?
+            .map_err(download_error)?;
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            if redirects == 5 {
+                return Err(rejected("release has more than five redirects".into()));
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| rejected("invalid release redirect location".into()))?;
+            url = response
+                .url()
+                .join(location)
+                .map_err(|error| rejected(clean(&error.to_string())))?;
+            redirects += 1;
+        } else {
+            return Ok(response);
+        }
+    }
 }
 
 async fn cancelled(cancel: &Cancel) {
@@ -271,6 +298,7 @@ def serve(raw):
     # This handler closes the socket after each response.
     s.sendall(('HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: https://localhost:%d%s\r\nContent-Length: 0\r\n\r\n' % (listener.getsockname()[1], target)).encode()); return
    if path == '/downgrade': s.sendall(b'HTTP/1.1 302 Found\r\nLocation: http://localhost:1/no\r\nContent-Length: 0\r\n\r\n'); return
+   if path == '/relative/start': s.sendall(b'HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: ../ok\r\nContent-Length: 0\r\n\r\n'); return
    if path == '/encoded':
     body = gzip.compress(b'abcd'); s.sendall(('HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n' % len(body)).encode() + body); return
    if path.startswith('/status/'):
@@ -341,10 +369,6 @@ while True:
         let server = Server::start();
         let cancel = Cancel::new();
         assert_eq!(server.get("/ok", limits(), &cancel).unwrap(), b"abcd");
-        assert_eq!(
-            server.get("/redirect/4", limits(), &cancel).unwrap(),
-            b"abcd"
-        );
         for path in ["/redirect/5", "/downgrade", "/cut", "/huge", "/chunked"] {
             assert!(
                 matches!(
@@ -444,19 +468,137 @@ while True:
         }
     }
     #[test]
-    fn each_redirect_response_resets_idle_but_not_the_total_deadline() {
+    fn https_redirect_chains_and_relative_locations_reach_the_body() {
         let server = Server::start();
-        let bytes = server
-            .get(
-                "/slowredirect/4",
-                FetchLimits {
-                    idle: Duration::from_millis(100),
-                    ..limits()
+        for path in ["/redirect/4", "/relative/start"] {
+            assert_eq!(server.get(path, limits(), &Cancel::new()).unwrap(), b"abcd");
+        }
+    }
+
+    fn scripted_redirect(url: reqwest::Url) -> reqwest::Response {
+        use reqwest::ResponseBuilderExt;
+        let response = http::Response::builder().url(url.clone());
+        if url.path() == "/ok" {
+            response.body("abcd").unwrap().into()
+        } else {
+            let n: u8 = url.path().rsplit('/').next().unwrap().parse().unwrap();
+            let target = if n == 0 {
+                "/ok".to_owned()
+            } else {
+                format!("/redirect/{}", n - 1)
+            };
+            response
+                .status(302)
+                .header(reqwest::header::LOCATION, target)
+                .body("")
+                .unwrap()
+                .into()
+        }
+    }
+
+    async fn timed_redirect_chain(limits: FetchLimits) -> Result<reqwest::Response, FetchError> {
+        let cancel = Cancel::new();
+        with_deadline(
+            limits,
+            &cancel,
+            request_following_redirects(
+                reqwest::Url::parse("https://releases.invalid/redirect/4").unwrap(),
+                limits.idle,
+                |url| async move {
+                    if url.path() != "/ok" {
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                    }
+                    Ok(scripted_redirect(url))
                 },
-                &Cancel::new(),
-            )
-            .unwrap();
-        assert_eq!(bytes, b"abcd");
+            ),
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redirect_headers_reset_idle_for_each_request() {
+        let started = tokio::time::Instant::now();
+        let response = timed_redirect_chain(FetchLimits {
+            idle: Duration::from_millis(100),
+            ..limits()
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.url().as_str(), "https://releases.invalid/ok");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"abcd");
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redirect_headers_do_not_reset_the_total_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = timed_redirect_chain(FetchLimits {
+            total: Duration::from_millis(130),
+            idle: Duration::from_millis(100),
+            ..limits()
+        })
+        .await;
+        assert!(
+            matches!(result, Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("deadline"))
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(130));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_without_headers_exhausts_its_own_idle_budget() {
+        let started = tokio::time::Instant::now();
+        let result = request_following_redirects(
+            reqwest::Url::parse("https://releases.invalid/redirect/4").unwrap(),
+            Duration::from_millis(100),
+            |url| async move {
+                tokio::time::sleep(Duration::from_millis(101)).await;
+                Ok(scripted_redirect(url))
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("idle"))
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_precedes_ready_deadline_and_download() {
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let result = with_deadline(
+            FetchLimits {
+                total: Duration::ZERO,
+                ..limits()
+            },
+            &cancel,
+            std::future::ready(Ok(b"abcd")),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FetchError::Rejected(ImageError::Cancelled))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_deadline_precedes_a_download_ready_at_the_same_time() {
+        let cancel = Cancel::new();
+        let result = with_deadline(
+            FetchLimits {
+                total: Duration::from_millis(130),
+                ..limits()
+            },
+            &cancel,
+            async {
+                tokio::time::sleep(Duration::from_millis(130)).await;
+                Ok(b"abcd")
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("deadline"))
+        );
     }
 
     #[test]
