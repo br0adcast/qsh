@@ -80,7 +80,7 @@ jobs:
           ln -s /usr/include/linux "$uapi/linux"
           ln -s /usr/include/asm-generic "$uapi/asm-generic"
           ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
-          native_prefix=$(scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+          native_prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" --cflag=-idirafter --cflag="$uapi" --jobs 2)
           export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
           export CC=musl-gcc
@@ -153,7 +153,7 @@ jobs:
         run: |
           brew install gnupg
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
-            prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+            prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
             scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
             echo "${scoped}_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
             echo "${scoped}_OPENSSL_STATIC=1" >> "$GITHUB_ENV"

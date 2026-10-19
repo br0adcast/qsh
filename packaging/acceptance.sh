@@ -306,7 +306,7 @@ native_uapi=$(mktemp -d)
 ln -s /usr/include/linux "$native_uapi/linux"
 ln -s /usr/include/asm-generic "$native_uapi/asm-generic"
 ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$native_uapi/asm"
-native_prefix=$("$root/scripts/build-openssl.sh" --target "$client_target" \
+native_prefix=$(bash "$root/scripts/build-openssl.sh" --target "$client_target" \
   --cache "${CARGO_TARGET_DIR:-$root/target}/native-crypto" \
   --cflag=-idirafter --cflag="$native_uapi" --jobs 2)
 export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1

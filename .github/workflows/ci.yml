@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Discovery tests
@@ -114,7 +114,7 @@ jobs:
         shell: bash
         run: |
           target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Formatting
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Allocation bounds on the package compiler

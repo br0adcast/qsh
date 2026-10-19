@@ -90,7 +90,7 @@ jobs:
           bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" \
             --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}"
-          prefix=$(scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" \
             --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}")
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"

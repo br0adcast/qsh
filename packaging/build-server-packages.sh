@@ -250,7 +250,7 @@ for row in "${targets[@]}"; do
   if [[ $triple == aarch64-unknown-linux-gnu ]]; then
     native_args+=(--cc aarch64-linux-gnu-gcc --ar aarch64-linux-gnu-ar --ranlib aarch64-linux-gnu-ranlib)
   fi
-  native_prefix=$("$root/scripts/build-openssl.sh" --target "$triple" \
+  native_prefix=$(bash "$root/scripts/build-openssl.sh" --target "$triple" \
     --cache "$target_dir/native-crypto" --toolchain-id "package-floor-$fmt" \
     --jobs 2 "${native_args[@]}")
   export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
