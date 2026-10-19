@@ -2,6 +2,14 @@
 
 File bugs and suggestions under Issues; send changes as a pull request.
 
+## Native crypto prerequisite
+
+Before the Cargo commands below, build the pinned native RSA backend and export
+its prefix as described in [native crypto](docs/native-crypto.md). Use
+`OPENSSL_DIR` and `OPENSSL_STATIC=1` (or their target-prefixed forms for cross
+builds). A system OpenSSL installation is not a substitute for the qualified
+source/version/target manifest. CI and package builds use the same helper.
+
 ## Contribution licensing terms
 
 qsh is dual-licensed: AGPLv3 for everyone, plus a commercial license from

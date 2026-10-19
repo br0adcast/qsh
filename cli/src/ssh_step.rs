@@ -204,6 +204,11 @@ fn ssh_failure(e: &ssh::SshError, on_macos: bool) -> ::connect::SshFailure {
     ::connect::SshFailure {
         why: e.to_string(),
         local_network_hint,
+        cause: if matches!(e, ssh::SshError::CryptoBusy) {
+            ::connect::SshFailureCause::CryptoBusy
+        } else {
+            ::connect::SshFailureCause::Other
+        },
     }
 }
 
@@ -833,6 +838,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn native_crypto_busy_retains_its_retry_classification() {
+        let failure = ssh_failure(&ssh::SshError::CryptoBusy, false);
+        assert_eq!(failure.cause, ::connect::SshFailureCause::CryptoBusy);
+        assert!(!failure.local_network_hint);
+        assert!(failure.why.contains("private-key workers are busy"));
+    }
+
     fn unreachable(target: &str, kind: std::io::ErrorKind) -> ssh::SshError {
         ssh::SshError::Unreachable {
             target: target.parse().expect("addr"),
@@ -852,6 +865,7 @@ mod tests {
             ::connect::SshFailure {
                 why: "192.168.0.200:22: No route to host (os error 65)".into(),
                 local_network_hint: true,
+                cause: ::connect::SshFailureCause::Other,
             }
         );
     }

@@ -22,6 +22,8 @@ use russh::{Channel, MethodKind, MethodSet};
 pub struct FakeAuth {
     /// Accept every user public key, for host-verification boundary tests.
     pub accept_any_key: bool,
+    /// Restrict advertised RSA hashes; Some(None) advertises legacy ssh-rsa.
+    pub rsa_hash: Option<Option<russh::keys::HashAlg>>,
     pub activity: Arc<ServerActivity>,
     /// Successive exec outputs, without running a shell or touching user state.
     pub exec_outputs: Vec<Vec<u8>>,
@@ -109,6 +111,16 @@ impl FakeServer {
             auth_rejection_time: Duration::ZERO,
             auth_rejection_time_initial: Some(Duration::ZERO),
             keys: vec![key],
+            preferred: match auth.rsa_hash {
+                Some(hash) => russh::Preferred {
+                    key: Cow::Owned(vec![
+                        russh::keys::Algorithm::Ed25519,
+                        russh::keys::Algorithm::Rsa { hash },
+                    ]),
+                    ..Default::default()
+                },
+                None => Default::default(),
+            },
             // A zero receive window stalls even the INIT write, so the tests
             // verify shutdown of a blocked SFTP writer as well as its reader.
             window_size: match auth.sftp {

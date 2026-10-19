@@ -87,6 +87,7 @@ assets = [
     ["target/release/qsh", "usr/bin/", "755"],
     ["../README.md", "usr/share/doc/qsh/README.md", "644"],
     ["../CHANGELOG.md", "usr/share/doc/qsh/CHANGELOG.md", "644"],
+    ["../docs/licenses/openssl.txt", "usr/share/doc/qsh/LICENSE-OPENSSL.txt", "644"],
 ]
 
 # The server package. `cargo deb -p qsh --variant qshd --no-build` builds it;
@@ -112,6 +113,7 @@ assets = [
     ["../packaging/pam.d/qshd.debian", "etc/pam.d/qshd", "644"],
     ["../README.md", "usr/share/doc/qshd/README.md", "644"],
     ["../CHANGELOG.md", "usr/share/doc/qshd/CHANGELOG.md", "644"],
+    ["../docs/licenses/openssl.txt", "usr/share/doc/qshd/LICENSE-OPENSSL.txt", "644"],
 ]
 # An administrator's edits to the PAM stack must survive an upgrade.
 conf-files = ["/etc/pam.d/qshd"]
@@ -133,6 +135,7 @@ assets = [
     { source = "../README.md", dest = "/usr/share/doc/qsh/README.md", mode = "644", doc = true },
     { source = "../CHANGELOG.md", dest = "/usr/share/doc/qsh/CHANGELOG.md", mode = "644", doc = true },
     { source = "../LICENSE", dest = "/usr/share/doc/qsh/LICENSE", mode = "644", doc = true },
+    { source = "../docs/licenses/openssl.txt", dest = "/usr/share/doc/qsh/LICENSE-OPENSSL.txt", mode = "644", doc = true },
 ]
 
 # The server package: `cargo generate-rpm -p cli --variant qshd`. The flag is
@@ -161,6 +164,7 @@ assets = [
     { source = "../README.md", dest = "/usr/share/doc/qshd/README.md", mode = "644", doc = true },
     { source = "../CHANGELOG.md", dest = "/usr/share/doc/qshd/CHANGELOG.md", mode = "644", doc = true },
     { source = "../LICENSE", dest = "/usr/share/doc/qshd/LICENSE", mode = "644", doc = true },
+    { source = "../docs/licenses/openssl.txt", dest = "/usr/share/doc/qshd/LICENSE-OPENSSL.txt", mode = "644", doc = true },
 ]
 # The same file dpkg runs as the postinst; it takes no arguments on purpose.
 post_install_script = "../packaging/maintainer/postinst"

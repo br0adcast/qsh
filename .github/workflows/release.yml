@@ -25,13 +25,23 @@ permissions:
 
 jobs:
   # The same path-filtered CI qualification is mandatory for a release build.
-  # This prerequisite adds no native dependency to the current Rust products.
+  # Product builds below link this same verified native source statically.
   native-crypto:
     uses: ./.github/workflows/native-crypto.yml
 
   linux:
-    runs-on: ubuntu-latest
-    # Cross-compiling two targets and building two package formats; a hang
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+    # Building this native target and two package formats; a hang
     # here would otherwise burn the default 360 minutes before GitHub kills
     # the job.
     timeout-minutes: 45
@@ -41,18 +51,18 @@ jobs:
       - name: Install the toolchain and targets
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustup target add "$NATIVE_TARGET"
           scripts/check-qualified-rust.sh
 
       # v2.9.2, pinned by commit so a mutable tag can't change what a
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      # Cross-compile aarch64 with the GNU cross toolchain.
-      - name: Install the cross toolchain and packaging tools
+      # Build each musl target with its native musl compiler and kernel UAPI.
+      - name: Install native musl and packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
           # Exact patch pins, not `cargo-deb@3.8`: current cargo parses that
           # as a truncated SemVer and refuses it outright ("unexpected end of
           # input while parsing minor version number"), which failed this
@@ -63,21 +73,24 @@ jobs:
           # ("3.8", "0.21") did not.
           cargo install 'cargo-deb@=3.8.0' 'cargo-generate-rpm@=0.21.0' --locked
 
-      - name: Build x86_64
-        run: cargo build --release --locked -p qsh -p qshd --target x86_64-unknown-linux-musl
-
-      - name: Build aarch64
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked -p qsh -p qshd --target aarch64-unknown-linux-musl
-
-      - name: Strip
+      - name: Build the pinned native backend and products
         run: |
-          strip target/x86_64-unknown-linux-musl/release/qsh
-          strip target/x86_64-unknown-linux-musl/release/qshd
-          aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/qsh
-          aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/qshd
+          uapi="$RUNNER_TEMP/kernel-uapi"
+          mkdir -p "$uapi"
+          ln -s /usr/include/linux "$uapi/linux"
+          ln -s /usr/include/asm-generic "$uapi/asm-generic"
+          ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
+          native_prefix=$(scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" --cflag=-idirafter --cflag="$uapi" --jobs 2)
+          export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
+          export CC=musl-gcc
+          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
+          dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
+          if grep -q NEEDED <<< "$dynamic"; then
+            echo 'musl products unexpectedly import dynamic libraries' >&2
+            exit 1
+          fi
+          strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
 
       - name: Package
         run: |
@@ -100,11 +113,12 @@ jobs:
             VERSION="$CARGO_VERSION"
           fi
           mkdir -p dist
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in "$NATIVE_TARGET"; do
             stage="qsh-$VERSION-$target"
             mkdir -p "$stage"
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
+            cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
             cargo deb -p qsh --target "$target" --no-build
             cargo generate-rpm -p cli --target "$target"
@@ -114,7 +128,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: linux-${{ matrix.target }}
           path: dist/
 
   macos:
@@ -134,6 +148,16 @@ jobs:
       # v2.9.2, pinned by commit so a mutable tag can't change what a
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+
+      - name: Prepare both pinned native architectures
+        run: |
+          brew install gnupg
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+            scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+            echo "${scoped}_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+            echo "${scoped}_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          done
 
       - name: Test daemon handover on macOS
         run: |
@@ -182,6 +206,7 @@ jobs:
             mkdir -p "$stage"
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
+            cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
           done
 
@@ -271,6 +296,9 @@ jobs:
         with:
           name: server-packages
           path: dist
+
+      - name: Install native acceptance-client prerequisites
+        run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
 
       - name: Run the acceptance tier
         run: |

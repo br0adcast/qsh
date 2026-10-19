@@ -10,8 +10,10 @@ use crate::record::{encode_public_key, encode_signature};
 
 /// Signs with one private key held in memory.
 pub struct FileSigner {
-    key: PrivateKey,
+    key: crate::prepared_key::PreparedKey,
     login: Option<String>,
+    #[cfg(test)]
+    native_probe: Option<std::sync::Arc<NativeProbe>>,
 }
 
 impl FileSigner {
@@ -29,23 +31,26 @@ impl FileSigner {
         path: &Path,
         passphrase: Option<&str>,
     ) -> Result<FileSigner, crate::keyfile::KeyFileError> {
-        use crate::keyfile::KeyFileError;
-        let key = crate::keyfile::read(path)?;
-        let key = if key.is_encrypted() {
-            let phrase = passphrase.ok_or(KeyFileError::PassphraseRequired)?;
-            key.decrypt(phrase)
-                .map_err(|_| KeyFileError::DecryptionFailed)?
-        } else {
-            key
-        };
-        Ok(FileSigner { key, login: None })
+        let key = crate::keyfile::read(path)?.into_prepared(passphrase)?;
+        Ok(FileSigner {
+            key,
+            login: None,
+            #[cfg(test)]
+            native_probe: None,
+        })
     }
 
     /// Build a signer around a key already in hand. The loader above is the
     /// usual way in; this one exists for callers that decrypted the key
     /// themselves, and for tests.
-    pub fn from_key(key: PrivateKey) -> FileSigner {
-        FileSigner { key, login: None }
+    pub fn from_key(key: PrivateKey) -> Result<FileSigner, crate::keyfile::KeyFileError> {
+        let key = crate::prepared_key::PreparedKey::from_key(key)?;
+        Ok(FileSigner {
+            key,
+            login: None,
+            #[cfg(test)]
+            native_probe: None,
+        })
     }
 
     /// The login name this signer claims. Required before a version 2
@@ -91,9 +96,15 @@ impl AuthSigner for FileSigner {
             signature: Vec::new(),
             v2,
         };
-        let signature =
-            signature::Signer::try_sign(&self.key, &record_challenge(handshake_hash, &record))
-                .map_err(|e| AuthError::Backend(format!("signing: {e}")))?;
+        let signature = self
+            .key
+            .sign_inner(
+                &record_challenge(handshake_hash, &record),
+                crate::prepared_key::RsaDigest::Sha512,
+                #[cfg(test)]
+                self.native_probe.as_deref(),
+            )
+            .map_err(|e| AuthError::Backend(format!("signing: {e}")))?;
         if !crate::verify::signature_algorithm_allowed(&signature.algorithm()) {
             return Err(AuthError::Backend(
                 "the key produced a signature algorithm QSH does not accept".to_string(),
@@ -105,6 +116,14 @@ impl AuthSigner for FileSigner {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+pub(crate) struct NativeProbe {
+    pub(crate) calls: std::sync::atomic::AtomicUsize,
+    pub(crate) checks: std::sync::atomic::AtomicUsize,
+    pub(crate) fail: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ssh_key::{Algorithm, LineEnding, PrivateKey};
@@ -112,6 +131,88 @@ mod tests {
     use transport::auth::{auth_challenge, auth_challenge_v2, AuthSigner, AuthVerifier};
 
     use crate::record::decode_signature;
+
+    fn rsa_native_fixture() -> FileSigner {
+        let pair = ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .expect("generated RSA fixture");
+        FileSigner::from_key(
+            PrivateKey::new(ssh_key::private::KeypairData::Rsa(pair), "generated").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn native_rsa_prepares_once_per_owner_and_supports_concurrent_proofs() {
+        use std::sync::{atomic::Ordering, Arc};
+        let signer = Arc::new(rsa_native_fixture().with_login("generated".into()));
+        let probe = signer.key.native_probe().unwrap().clone();
+        assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
+        let workers: Vec<_> = (0..4)
+            .map(|id| {
+                let signer = signer.clone();
+                std::thread::spawn(move || {
+                    let hash = [id; 32];
+                    let record = signer.sign(&hash, Some(&[3; 16])).unwrap();
+                    let signature = decode_signature(&record.signature).unwrap();
+                    signature::Verifier::verify(
+                        signer.public_key(),
+                        &record_challenge(&hash, &record),
+                        &signature,
+                    )
+                    .unwrap();
+                    assert!(signature::Verifier::verify(
+                        signer.public_key(),
+                        b"changed",
+                        &signature
+                    )
+                    .is_err());
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            probe.checks.load(Ordering::SeqCst),
+            1,
+            "proofs do not revalidate private factors"
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn native_rsa_route_is_observed_on_the_real_file_signer() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut signer = rsa_native_fixture();
+        let probe = Arc::new(NativeProbe::default());
+        signer.native_probe = Some(probe.clone());
+        let record = signer.sign(&[17; 32], None).expect("sign generated RSA");
+        let signature = decode_signature(&record.signature).unwrap();
+        signature::Verifier::verify(signer.public_key(), &auth_challenge(&[17; 32]), &signature)
+            .unwrap();
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            1,
+            "native private signing must run"
+        );
+    }
+
+    #[test]
+    fn native_rsa_failure_cannot_fall_back_to_a_successful_file_proof() {
+        use std::sync::{atomic::Ordering, Arc};
+        let mut signer = rsa_native_fixture();
+        let probe = Arc::new(NativeProbe::default());
+        probe.fail.store(true, Ordering::SeqCst);
+        signer.native_probe = Some(probe.clone());
+        assert!(
+            signer.sign(&[19; 32], None).is_err(),
+            "a native failure must prevent any proof"
+        );
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn a_dependency_enabled_p521_key_remains_unsupported_by_qsh() {
@@ -123,7 +224,7 @@ mod tests {
         )
         .expect("upstream supports P-521 in the workspace feature union");
         assert!(matches!(
-            FileSigner::from_key(key).sign(&[3; 32], None),
+            FileSigner::from_key(key).unwrap().sign(&[3; 32], None),
             Err(AuthError::Backend(_))
         ));
     }
@@ -219,7 +320,9 @@ mod tests {
             Algorithm::Ed25519,
         )
         .expect("keygen");
-        let signer = FileSigner::from_key(key.clone()).with_login("alice".to_string());
+        let signer = FileSigner::from_key(key.clone())
+            .unwrap()
+            .with_login("alice".to_string());
         let hash = [21u8; 32];
         let nonce = [4u8; 16];
 
@@ -242,7 +345,9 @@ mod tests {
             Algorithm::Ed25519,
         )
         .expect("keygen");
-        let signer = FileSigner::from_key(key).with_login("alice".to_string());
+        let signer = FileSigner::from_key(key)
+            .unwrap()
+            .with_login("alice".to_string());
         let record = signer.sign(&[21u8; 32], None).expect("sign");
         assert!(record.v2.is_none());
     }
@@ -257,7 +362,7 @@ mod tests {
             Algorithm::Ed25519,
         )
         .expect("keygen");
-        let signer = FileSigner::from_key(key);
+        let signer = FileSigner::from_key(key).unwrap();
         assert!(matches!(
             signer.sign(&[21u8; 32], Some(&[4u8; 16])),
             Err(AuthError::Backend(_))

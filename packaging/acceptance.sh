@@ -162,7 +162,9 @@ floor_image() {
 image=$(floor_image "$fmt")
 
 container="qshd-acceptance-$fmt-$arch-$$"
+native_uapi=
 cleanup() {
+  [[ -z $native_uapi ]] || rm -rf "$native_uapi"
   "$docker" rm -f "$container" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -300,6 +302,14 @@ fi
 # The full tier, x86_64 only: real logins over the real wire protocol.
 # ---------------------------------------------------------------------------
 client_target=x86_64-unknown-linux-musl
+native_uapi=$(mktemp -d)
+ln -s /usr/include/linux "$native_uapi/linux"
+ln -s /usr/include/asm-generic "$native_uapi/asm-generic"
+ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$native_uapi/asm"
+native_prefix=$("$root/scripts/build-openssl.sh" --target "$client_target" \
+  --cache "${CARGO_TARGET_DIR:-$root/target}/native-crypto" \
+  --cflag=-idirafter --cflag="$native_uapi" --jobs 2)
+export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
 say "building acceptance_client for $client_target (host cargo, never shipped)"
 ( cd "$root" && cargo build -p qshd --example acceptance_client --locked --release --target "$client_target" ) ||
   die "acceptance_client did not build -- needs a Rust toolchain with the $client_target target on this machine"

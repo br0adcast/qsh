@@ -4,9 +4,8 @@
 use std::{fmt, io, path::Path};
 
 use pkcs8::{AssociatedOid, DecodePrivateKey, SecretDocument};
-use rsa::pkcs1::DecodeRsaPrivateKey;
 use ssh_key::{
-    private::{EcdsaKeypair, Ed25519Keypair, KeypairData, RsaKeypair},
+    private::{EcdsaKeypair, Ed25519Keypair, KeypairData},
     PrivateKey,
 };
 use zeroize::Zeroizing;
@@ -25,6 +24,7 @@ pub enum KeyFileError {
     UnsupportedEncryptedPpk,
     PassphraseRequired,
     DecryptionFailed,
+    NativeOperation,
 }
 
 impl fmt::Display for KeyFileError {
@@ -43,6 +43,7 @@ impl fmt::Display for KeyFileError {
                 f.write_str("encrypted PPK files are not supported; convert to OpenSSH format")
             }
             Self::PassphraseRequired => f.write_str("key is encrypted and needs a passphrase"),
+            Self::NativeOperation => f.write_str("native private-key operation failed"),
             Self::DecryptionFailed => {
                 f.write_str("could not decrypt private key with this passphrase")
             }
@@ -52,14 +53,52 @@ impl fmt::Display for KeyFileError {
 
 impl std::error::Error for KeyFileError {}
 
+/// A file retains either its locked OpenSSH representation or its prepared
+/// signing owner. Native RSA is never projected back into secret SSH components.
+#[derive(Debug)]
+pub enum DecodedKey {
+    Locked(Box<PrivateKey>),
+    Prepared(crate::prepared_key::PreparedKey),
+}
+impl DecodedKey {
+    pub fn from_key(key: PrivateKey) -> Result<Self, KeyFileError> {
+        if key.is_encrypted() {
+            Ok(Self::Locked(Box::new(key)))
+        } else {
+            crate::prepared_key::PreparedKey::from_key(key).map(Self::Prepared)
+        }
+    }
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, Self::Locked(_))
+    }
+    pub fn public_key(&self) -> &ssh_key::PublicKey {
+        match self {
+            Self::Locked(key) => key.public_key(),
+            Self::Prepared(key) => key.public_key(),
+        }
+    }
+    pub fn into_prepared(
+        self,
+        phrase: Option<&str>,
+    ) -> Result<crate::prepared_key::PreparedKey, KeyFileError> {
+        match self {
+            Self::Prepared(key) => Ok(key),
+            Self::Locked(key) => crate::prepared_key::PreparedKey::from_key(
+                key.decrypt(phrase.ok_or(KeyFileError::PassphraseRequired)?)
+                    .map_err(|_| KeyFileError::DecryptionFailed)?,
+            ),
+        }
+    }
+}
+
 /// Read once into storage that is cleared when parsing finishes.
-pub fn read(path: &Path) -> Result<PrivateKey, KeyFileError> {
+pub fn read(path: &Path) -> Result<DecodedKey, KeyFileError> {
     let text = Zeroizing::new(std::fs::read_to_string(path).map_err(KeyFileError::Io)?);
     decode(&text)
 }
 
 /// Decode a supported container, retaining an OpenSSH key's encryption state.
-pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
+pub fn decode(text: &str) -> Result<DecodedKey, KeyFileError> {
     let text = text.trim();
     let first = text.lines().next().ok_or(KeyFileError::InvalidFormat)?;
     if first.starts_with("PuTTY-User-Key-File-") {
@@ -73,7 +112,9 @@ pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
         {
             return Err(KeyFileError::UnsupportedEncryptedPpk);
         }
-        return PrivateKey::from_ppk(text, None).map_err(|_| KeyFileError::InvalidFormat);
+        return DecodedKey::from_key(
+            PrivateKey::from_ppk(text, None).map_err(|_| KeyFileError::InvalidFormat)?,
+        );
     }
     // OpenSSL exports can carry Bag Attributes before the PEM boundary. Let
     // the upstream grammar locate that boundary, while retaining exactly one
@@ -116,7 +157,9 @@ pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
         }
     }
     if label == "OPENSSH PRIVATE KEY" {
-        return PrivateKey::from_openssh(text).map_err(|_| KeyFileError::InvalidFormat);
+        return DecodedKey::from_key(
+            PrivateKey::from_openssh(text).map_err(|_| KeyFileError::InvalidFormat)?,
+        );
     }
     if !matches!(label, "RSA PRIVATE KEY" | "EC PRIVATE KEY" | "PRIVATE KEY") {
         return Err(KeyFileError::UnsupportedFormat);
@@ -130,13 +173,29 @@ pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
     decoder
         .decode_to_end(&mut bytes)
         .map_err(|_| KeyFileError::InvalidFormat)?;
+    if label == "RSA PRIVATE KEY" {
+        return crate::prepared_key::PreparedKey::from_pkcs1(&bytes).map(DecodedKey::Prepared);
+    }
+    if label == "PRIVATE KEY" {
+        use pkcs8::der::Decode;
+        let info =
+            pkcs8::PrivateKeyInfoRef::from_der(&bytes).map_err(|_| KeyFileError::InvalidFormat)?;
+        if info.algorithm.oid == pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1") {
+            // Preserve the previous rsaEncryption AlgorithmIdentifier policy:
+            // explicit NULL is required, even if the native decoder is lenient.
+            if info.algorithm.parameters != Some(pkcs8::der::asn1::AnyRef::NULL) {
+                return Err(KeyFileError::InvalidFormat);
+            }
+            return crate::prepared_key::PreparedKey::from_pkcs8(
+                &bytes,
+                info.private_key.as_bytes(),
+            )
+            .map(DecodedKey::Prepared);
+        }
+    }
     let doc =
         SecretDocument::try_from(bytes.as_slice()).map_err(|_| KeyFileError::InvalidFormat)?;
     let data = match label {
-        "RSA PRIVATE KEY" => rsa_data(
-            rsa::RsaPrivateKey::from_pkcs1_der(doc.as_bytes())
-                .map_err(|_| KeyFileError::InvalidFormat)?,
-        )?,
         "EC PRIVATE KEY" => {
             if explicit_ec_parameters(doc.as_bytes()).map_err(|_| KeyFileError::InvalidFormat)? {
                 return Err(KeyFileError::ExplicitEcParameters);
@@ -164,12 +223,7 @@ pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
             let info = doc
                 .decode_msg::<pkcs8::PrivateKeyInfoRef<'_>>()
                 .map_err(|_| KeyFileError::InvalidFormat)?;
-            if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID {
-                rsa_data(
-                    rsa::RsaPrivateKey::from_pkcs8_der(doc.as_bytes())
-                        .map_err(|_| KeyFileError::InvalidFormat)?,
-                )?
-            } else if info.algorithm.oid == ed25519_dalek::pkcs8::ALGORITHM_OID {
+            if info.algorithm.oid == ed25519_dalek::pkcs8::ALGORITHM_OID {
                 let key = ed25519_dalek::SigningKey::from_pkcs8_der(doc.as_bytes())
                     .map_err(|_| KeyFileError::InvalidFormat)?;
                 KeypairData::Ed25519(Ed25519Keypair::from(key))
@@ -199,13 +253,7 @@ pub fn decode(text: &str) -> Result<PrivateKey, KeyFileError> {
         }
         _ => unreachable!("container labels were checked before decoding"),
     };
-    PrivateKey::new(data, "").map_err(|_| KeyFileError::InvalidFormat)
-}
-
-fn rsa_data(key: rsa::RsaPrivateKey) -> Result<KeypairData, KeyFileError> {
-    RsaKeypair::try_from(key)
-        .map(KeypairData::Rsa)
-        .map_err(|_| KeyFileError::InvalidFormat)
+    DecodedKey::from_key(PrivateKey::new(data, "").map_err(|_| KeyFileError::InvalidFormat)?)
 }
 
 fn p256_data(key: p256::SecretKey) -> KeypairData {

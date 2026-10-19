@@ -41,6 +41,19 @@ jobs:
       - name: Verify qualified compiler
         run: scripts/check-qualified-rust.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Install native build prerequisites
+        run: brew install gnupg
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/native-crypto
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
+      - name: Prepare the pinned native backend
+        shell: bash
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Portable CLI tests
@@ -91,6 +104,19 @@ jobs:
       - name: Native build script controls
         run: python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
 
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/native-crypto
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
+      - name: Prepare the pinned native backend
+        shell: bash
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Formatting
         run: cargo fmt --all --check
 
@@ -160,6 +186,19 @@ jobs:
       - name: Install libpam
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev jq
 
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/native-crypto
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
+      - name: Prepare the pinned native backend
+        shell: bash
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          prefix=$(scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Allocation bounds on the package compiler
         run: cargo test -p qshd --lib --locked screen_budget::allocation_bounds -- --nocapture
 
