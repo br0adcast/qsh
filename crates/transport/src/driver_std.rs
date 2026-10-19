@@ -987,6 +987,7 @@ fn run_driver(
     };
 
     let mut sends = SendRecord::new(last_send_error, Arc::clone(&events));
+    let allowlist_proof = matches!(cfg.auth, crate::conn::AuthPolicy::Allowlist(_));
     let mut conn = Connection::new(cfg);
     // Before msg1: no byte can arrive before these are in force.
     conn.set_default_consumption(setup.default_consumption);
@@ -1286,6 +1287,13 @@ fn run_driver(
             // are read here, on the driver thread, but `AuthSigner::sign`
             // never is.
             if matches!(ev, Event::HandshakeDone) {
+                if allowlist_proof {
+                    // Prove possession of the fresh responder keys immediately,
+                    // without opening an application channel. A lost PING is
+                    // retried by the existing keepalive schedule.
+                    conn.request_ping(now);
+                    send_all(&socket, &conn.on_timeout(now), &mut sends);
+                }
                 resumed_flag.store(conn.resumed(), Ordering::SeqCst);
                 *features_flag.lock().expect("features mutex") = Some(conn.features());
                 events.on_features(conn.features());
@@ -1451,6 +1459,7 @@ fn dispatch_event(
         // callback of their own. `OffsetSpaceExhausted` was acted on before
         // dispatch (see `poll_events_abandoning_on_exhaustion`).
         Event::HandshakeDone
+        | Event::PeerKeyConfirmed { .. }
         | Event::Rehomed { .. }
         | Event::OutputResync
         | Event::OffsetSpaceExhausted { .. } => {}
@@ -3278,6 +3287,86 @@ mod tests {
             remote_static_pub: Some(server_pub),
             auth: AuthPolicy::Allowlist(Vec::new()),
         }
+    }
+
+    #[test]
+    fn allowlist_driver_sends_immediate_proof_and_retries_a_lost_ping() {
+        let server_key = crate::handshake::generate_keypair();
+        let client_key = crate::handshake::generate_keypair();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+        let (result_tx, result_rx) = mpsc::channel();
+        let _server = StoppedOnDrop::spawn(move |stop| {
+            let mut connection = server_conn(server_key.private, client_key.public);
+            let mut buf = [0; 65536];
+            let mut response_at = None;
+            let mut first_delay = None;
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                    continue;
+                };
+                let now = Instant::now();
+                if let Some(frames) = connection.peek_frames(&buf[..n]) {
+                    assert!(
+                        frames
+                            .iter()
+                            .all(|frame| !matches!(frame, StreamFrame::Data { .. })),
+                        "fresh proof must not open an application channel"
+                    );
+                    if frames
+                        .iter()
+                        .any(|frame| matches!(frame, StreamFrame::Ping { .. }))
+                    {
+                        if first_delay.is_none() {
+                            first_delay =
+                                Some(now.duration_since(response_at.expect("msg2 was sent")));
+                            // Drop the initial proof before decryption; a later normal
+                            // keepalive must establish fresh possession by itself.
+                            continue;
+                        }
+                        connection.on_datagram(now, from, &buf[..n]);
+                        let confirmed = connection
+                            .poll_events()
+                            .iter()
+                            .any(|event| matches!(event, Event::PeerKeyConfirmed { .. }));
+                        let _ = result_tx.send((first_delay.unwrap(), confirmed));
+                        return;
+                    }
+                }
+                let reply = connection.on_datagram(now, from, &buf[..n]);
+                if response_at.is_none() && connection.state() == LinkState::Live {
+                    response_at = Some(now);
+                }
+                for dg in reply {
+                    socket.send_to(&dg.bytes, dg.to).unwrap();
+                }
+                let _ = connection.poll_events();
+            }
+        });
+        let client = StdClient::connect(
+            address,
+            client_cfg(client_key.private, server_key.public),
+            [0xBC; 16],
+            StartKind::Cold,
+            Arc::new(OkBinder),
+            Arc::new(NullEvents),
+            None,
+        );
+        let (first_delay, confirmed) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the driver must retry its lost proof without application traffic");
+        client.close();
+        assert!(
+            first_delay < Duration::from_millis(750),
+            "proof waited for the periodic timer: {first_delay:?}"
+        );
+        assert!(
+            confirmed,
+            "the retry must authenticate fresh transport keys"
+        );
     }
 
     /// A helper thread of a flood test that stops when the test ends --

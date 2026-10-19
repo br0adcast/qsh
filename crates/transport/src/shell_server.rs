@@ -47,7 +47,7 @@
 //! a new handshake -- the core migrates to the new source on its own within
 //! the same `Connection`, and the shell keeps running. A new `HandshakeInit`
 //! from a different or restarted client replaces the `Connection` only after
-//! the existing Noise and allowlist checks admit it. A rejected or incomplete
+//! the Noise and allowlist checks and fresh transport proof admit it. A rejected or incomplete
 //! candidate leaves the active connection and its control/echo state intact.
 //! An admitted replacement does not touch the shell or PTY: it reconnects to
 //! the same live shell, with fresh control and echo accounting.
@@ -61,8 +61,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::conn::{Connection, ConnectionConfig, Datagram, Event, LinkState};
+use crate::raw_admission::{PacketResult, PendingAdmission};
 use crate::shell_frame::{encode_record, REC_DATA, REC_ECHO_ACK};
-use crate::wire::{parse, Frame, Kind};
 
 /// Receive buffer size for a single UDP datagram.
 const RECV_BUF_LEN: usize = 64 * 1024;
@@ -257,6 +257,7 @@ pub async fn serve_shell(
     // A single connection. `None` until the first admitted handshake and
     // after the session closes (ready for a new client).
     let mut conn: Option<Connection> = None;
+    let mut pending = PendingAdmission::default();
     // Buffer for unfinished control records on stream 1 (a reliable stream
     // can deliver a 5-byte record split across fragments or merged).
     let mut control_buf: Vec<u8> = Vec::new();
@@ -273,7 +274,12 @@ pub async fn serve_shell(
 
     loop {
         // The nearest timer of the current connection (if any).
-        let next = conn.as_ref().and_then(Connection::next_timeout);
+        let next = conn
+            .as_ref()
+            .and_then(Connection::next_timeout)
+            .into_iter()
+            .chain(pending.next_timeout())
+            .min();
 
         let wakeup = match next {
             Some(deadline) => {
@@ -298,35 +304,27 @@ pub async fn serve_shell(
 
         let now = Instant::now();
         let mut out: Vec<Datagram> = Vec::new();
+        let mut admitted_events = Vec::new();
 
         match wakeup {
-            Wakeup::Packet(Ok((len, src))) => match parse(&buf[..len]) {
-                Ok(Frame::Handshake {
-                    kind: Kind::HandshakeInit,
-                    ..
-                }) => {
-                    // Validate a candidate without disturbing the active
-                    // connection. Incomplete Noise remains Connecting;
-                    // rejected keys/features become Closed. Only Live passed
-                    // this entry point's existing Noise/allowlist admission.
-                    let mut fresh = Connection::new(cfg.clone());
-                    let reply = fresh.on_datagram(now, src, &buf[..len]);
-                    if fresh.state() == LinkState::Live {
-                        out.extend(reply);
-                        conn = Some(fresh);
+            Wakeup::Packet(Ok((len, src))) => {
+                match pending.on_packet(&cfg, now, src, &buf[..len], &mut out) {
+                    PacketResult::Admitted(admitted) => {
+                        let admitted = *admitted;
+                        conn = Some(admitted.conn);
+                        admitted_events = admitted.events;
                         control_buf.clear();
                         input_consumed = 0;
                         last_acked = 0;
                     }
-                }
-                Ok(_) => {
-                    if let Some(c) = conn.as_mut() {
-                        out.extend(c.on_datagram(now, src, &buf[..len]));
+                    PacketResult::Handled => {}
+                    PacketResult::Unrelated => {
+                        if let Some(c) = conn.as_mut() {
+                            out.extend(c.on_datagram(now, src, &buf[..len]));
+                        }
                     }
                 }
-                // Malformed input from the network is silently ignored.
-                Err(_) => {}
-            },
+            }
             // Receive error -- nothing to process, the socket is still alive.
             // No `continue`: the timers below run after this wake-up too.
             Wakeup::Packet(Err(_)) => {}
@@ -376,6 +374,7 @@ pub async fn serve_shell(
             }
         }
 
+        pending.on_timeout(now, &mut out);
         // Timers after every wake-up (spec §4.1).
         if let Some(c) = conn.as_mut() {
             out.extend(c.on_timeout_if_due(now));
@@ -386,8 +385,9 @@ pub async fn serve_shell(
         // records on stream 1 are applied as resize, session close resets
         // conn.
         let reset = match conn.as_mut() {
-            Some(c) => apply_events(
+            Some(c) => apply_event_batch(
                 c,
+                admitted_events,
                 &mut input_consumed,
                 &pty_in_tx,
                 &mut control_buf,
@@ -420,6 +420,7 @@ pub async fn serve_shell(
 /// connection is abandoned without a `Close`, as the daemon's bridge does,
 /// instead of staying `Live` with an output stream that refuses every write.
 /// The client's next connection starts its streams at 0.
+#[cfg(test)]
 fn apply_events(
     c: &mut Connection,
     input_consumed: &mut u64,
@@ -427,8 +428,27 @@ fn apply_events(
     control_buf: &mut Vec<u8>,
     resize: &dyn ResizeHandle,
 ) -> bool {
+    apply_event_batch(
+        c,
+        Vec::new(),
+        input_consumed,
+        pty_in_tx,
+        control_buf,
+        resize,
+    )
+}
+
+fn apply_event_batch(
+    c: &mut Connection,
+    mut events: Vec<Event>,
+    input_consumed: &mut u64,
+    pty_in_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    control_buf: &mut Vec<u8>,
+    resize: &dyn ResizeHandle,
+) -> bool {
+    events.extend(c.poll_events());
     let mut ended = false;
-    for ev in c.poll_events() {
+    for ev in events {
         match ev {
             Event::StreamData { stream_id, data } => match stream_id {
                 STREAM_IO => {
@@ -593,6 +613,7 @@ mod tests {
         parser: crate::shell_frame::ShellDeframer,
         output: Vec<u8>,
         ack: u64,
+        confirmed: bool,
         resize: std::sync::Arc<RecordingResize>,
     }
 
@@ -646,6 +667,7 @@ mod tests {
                 parser: crate::shell_frame::ShellDeframer::new(),
                 output: Vec::new(),
                 ack: 0,
+                confirmed: false,
                 resize,
             }
         }
@@ -666,6 +688,9 @@ mod tests {
                     let out = tokio::select! {
                         received = self.socket.recv_from(&mut buf) => {
                             let (n, from) = received.unwrap();
+                            if self.conn.peek_frames(&buf[..n]).is_some_and(|frames| frames.iter().any(|frame| matches!(frame, crate::reliability::StreamFrame::Pong { .. }))) {
+                                self.confirmed = true;
+                            }
                             self.conn.on_datagram(std::time::Instant::now(), from, &buf[..n])
                         }
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
@@ -698,6 +723,11 @@ mod tests {
             let out = self.conn.start(std::time::Instant::now(), self.addr);
             self.transmit(out).await;
             self.until(|rig| rig.conn.state() == LinkState::Live).await;
+            self.confirmed = false;
+            self.conn.request_ping(std::time::Instant::now());
+            let proof = self.conn.on_timeout(std::time::Instant::now());
+            self.transmit(proof).await;
+            self.until(|rig| rig.confirmed).await;
         }
 
         async fn send(&mut self, stream: u8, data: &[u8]) {
@@ -757,6 +787,37 @@ mod tests {
     #[tokio::test]
     async fn shell_replacement_unlisted_key_preserves_active_state() {
         rejected_replacement_case(2).await;
+    }
+
+    #[tokio::test]
+    async fn shell_replayed_allowlist_handshake_preserves_active_state() {
+        let key = crate::handshake::generate_keypair();
+        let mut rig = ReplacementRig::new(&[key]).await;
+        let initial = rig.conn.start(std::time::Instant::now(), rig.addr);
+        let captured = initial[0].bytes.clone();
+        rig.transmit(initial).await;
+        rig.until(|r| r.conn.state() == LinkState::Live).await;
+        let resize = record(123, 45);
+        rig.send(1, &resize[..2]).await;
+        rig.send(0, b"before").await;
+        rig.until(|r| r.output == b"before" && r.ack == 6).await;
+        let replay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        replay.send_to(&captured, rig.addr).await.unwrap();
+        let mut response = [0; 256];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            replay.recv(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // A valid captured msg1 has obtained new msg2, but no peer has proved
+        // possession of those fresh keys. The original shell still owns state.
+        rig.send(1, &resize[2..]).await;
+        rig.send(0, b"after").await;
+        rig.until(|r| r.output == b"beforeafter" && r.ack == 11)
+            .await;
+        assert_eq!(rig.resize.taken(), vec![(123, 45)]);
     }
 
     #[tokio::test]

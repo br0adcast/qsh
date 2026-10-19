@@ -1,28 +1,18 @@
 //! The probation stage: what a connection may do before its peer has proved
 //! who it is.
 //!
-//! On the ALLOWLIST path a handshake IS a proof -- `Connection::accept`
-//! checked the client's static key against the allowlist -- so the manager
-//! binds the connection to a backend the moment it is accepted. On the
-//! SIGNATURE path it is not: `AuthPolicy::SshSignature` admits ANY static
-//! key, and the real proof (an SSH signature over this handshake's hash)
-//! arrives afterwards, on [`AUTH_STREAM`].
+//! Both authentication policies enter probation after the Noise handshake.
+//! Allowlist membership authorizes a static key, but a captured msg1 cannot
+//! prove fresh possession of the responder's keys. That policy waits for
+//! `PeerKeyConfirmed`; the signature policy also requires an SSH proof on
+//! [`AUTH_STREAM`]. Only the datagram route exists while the proof is pending.
 //!
-//! So a signature handshake does not become a session; it becomes a
-//! PROBATION. A task owns the accepted `Connection`, answers its transport
-//! chatter and waits for the record. The manager registers only the datagram
-//! route (so the record can reach the task) and touches NOTHING in its
-//! backend table -- no reattach, no replace, no eviction. An unproven peer
-//! therefore cannot repoint another device's route, overwrite its client key,
-//! scrub that key off the shared allowlist, or evict a retained backend,
-//! because it never reaches the code that does any of those things.
-//!
-//! When the record verifies, the task hands the manager the proven connection
-//! plus everything the binding decision needs, and the manager runs its
-//! ordinary decision arms THEN -- the logic does not move, it only runs later.
-//! When it does not verify -- a malformed or refused record, a closed
-//! connection, or [`AUTH_DEADLINE`] -- the task exits and the manager drops
-//! the route.
+//! A successful proof hands the connection and bounded early data to the
+//! manager. The manager checks the captured binding revision and resolves the
+//! current session decision before any create, attach, replacement or eviction.
+//! A failed/expired/closed candidate drops its route without adopting a backend.
+//! The complete event batch is examined: Close or excess early-data cost wins
+//! even when the same packet established fresh possession.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -38,6 +28,7 @@ use crate::auth::{
 use crate::conn::{Connection, Consumption, Datagram, Event, LinkState};
 use crate::dgram_queue::DgramRx;
 use crate::handshake_payload::Msg1Payload;
+use crate::session_manager::binding_revision::BindingRevision;
 use crate::session_manager::{send_all, StreamData};
 
 /// How many connections may sit in probation at once, across every source.
@@ -207,15 +198,15 @@ pub(crate) fn hold_for_probation(conn: &mut Connection) {
     conn.set_stream_consumption(AUTH_STREAM, Consumption::OnDelivery);
 }
 
-/// The per-connection authentication gate. It stays shut until the client's
-/// record on [`AUTH_STREAM`] verifies against THIS connection's handshake
-/// hash, so a warm reattach -- which brings a new handshake, hence a new
-/// challenge -- must prove itself again before it inherits anything.
-///
-/// There is no "no verifier" case: the allowlist path builds no gate at all,
-/// because it runs no probation stage.
+/// The proof required before this connection may bind a backend. Allowlist
+/// membership was checked at msg1; fresh possession is still required.
+pub(crate) enum ProofPolicy {
+    Allowlisted { principal: Principal },
+    SshSignature { verifier: Arc<dyn AuthVerifier> },
+}
+
 struct AuthGate {
-    verifier: Arc<dyn AuthVerifier>,
+    policy: ProofPolicy,
     hash: [u8; 32],
     /// The nonce THIS handshake's msg2 delivered to the client. A version 2
     /// record must echo it back under its signature, so a proof made for a
@@ -241,21 +232,42 @@ struct AuthGate {
 }
 
 impl AuthGate {
+    #[cfg(test)]
     fn new(
         verifier: Arc<dyn AuthVerifier>,
         hash: [u8; 32],
         nonce: [u8; AUTH_NONCE_LEN],
         now: Instant,
     ) -> Self {
+        Self::from_policy(ProofPolicy::SshSignature { verifier }, hash, nonce, now)
+    }
+
+    fn from_policy(
+        policy: ProofPolicy,
+        hash: [u8; 32],
+        nonce: [u8; AUTH_NONCE_LEN],
+        now: Instant,
+    ) -> Self {
+        let principal = match &policy {
+            ProofPolicy::Allowlisted { principal } => Some(principal.clone()),
+            ProofPolicy::SshSignature { .. } => None,
+        };
         AuthGate {
-            verifier,
+            policy,
             hash,
             nonce,
             open: false,
             verifying: false,
             deadline: now + AUTH_DEADLINE,
             pending: Vec::new(),
-            principal: None,
+            principal,
+        }
+    }
+
+    fn signature_verifier(&self) -> Option<&Arc<dyn AuthVerifier>> {
+        match &self.policy {
+            ProofPolicy::SshSignature { verifier } => Some(verifier),
+            ProofPolicy::Allowlisted { .. } => None,
         }
     }
 
@@ -282,7 +294,7 @@ impl AuthGate {
         // not be able to shut a connection that is already proved. A gate
         // whose record is out with the verifier is the same case, one step
         // earlier.
-        if self.open || self.verifying {
+        if self.open || self.verifying || matches!(self.policy, ProofPolicy::Allowlisted { .. }) {
             return Ok(Fed::Waiting);
         }
         if self.pending.len() + bytes.len() > AUTH_RECORD_MAX {
@@ -341,9 +353,8 @@ enum Fed {
 /// replays them. ORDER IS PART OF THE CONTRACT: the backend hears about its
 /// session starting (`Live`/`ResumeReset`) before any of these bytes.
 ///
-/// `Default` is the ALLOWLIST path: nothing was consumed, so there is nothing
-/// to replay and the bridge behaves exactly as it did before probation
-/// existed.
+/// `Default` is an empty handoff. Both authentication policies collect the
+/// initial Live transition and any early stream data before admission.
 #[derive(Default)]
 pub(crate) struct BridgeStart {
     /// The connection reached `Live` while in probation (always true in
@@ -358,6 +369,7 @@ pub(crate) struct BridgeStart {
 /// binding decision needs. Boxed by the channel: it is large and rare next to
 /// the per-datagram traffic the same loop carries.
 pub(crate) struct ProvenSession {
+    pub revision: BindingRevision,
     pub conn: Connection,
     pub client_key: [u8; 32],
     pub msg1: Msg1Payload,
@@ -389,6 +401,7 @@ pub(crate) struct ProvenSession {
 /// can either bind it or drop its route. Mirrors `SessionEnded`: one
 /// unbounded channel, drained in the same `select!` as the socket.
 pub(crate) struct ProbationEnded {
+    pub revision: BindingRevision,
     /// The provisional `session_id` the datagram route was registered under.
     pub session_id: u64,
     /// The nonce this handshake's msg2 carried. Duplicated here (rather than
@@ -404,9 +417,10 @@ pub(crate) struct ProbationEnded {
 
 /// Everything a probation task is started with.
 pub(crate) struct Probation {
+    pub revision: BindingRevision,
     pub socket: Arc<UdpSocket>,
     pub conn: Connection,
-    pub verifier: Arc<dyn AuthVerifier>,
+    pub policy: ProofPolicy,
     pub dgram_rx: DgramRx,
     pub client_key: [u8; 32],
     pub msg1: Msg1Payload,
@@ -450,7 +464,8 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
     let Probation {
         socket,
         mut conn,
-        verifier,
+        policy,
+        revision,
         mut dgram_rx,
         client_key,
         msg1,
@@ -463,7 +478,7 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
     } = p;
     hold_for_probation(&mut conn);
     let session_id = conn.session_id();
-    let mut gate = AuthGate::new(verifier, conn.handshake_hash(), nonce, auth_now());
+    let mut gate = AuthGate::from_policy(policy, conn.handshake_hash(), nonce, auth_now());
     let mut start = BridgeStart::default();
     let mut early_cost = 0usize;
 
@@ -518,7 +533,7 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
         // together, and the datagram arm may win after the absolute deadline.
         if gate.expired(auth_now()) {
             log::warn!("session refused: authentication deadline expired");
-            return end(&ended_tx, session_id, nonce, None);
+            return end(&ended_tx, session_id, nonce, revision, None);
         }
         let mut reply: Vec<Datagram> = Vec::new();
         match incoming {
@@ -526,7 +541,7 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
                 reply.extend(conn.on_datagram(Instant::now(), from, &bytes));
             }
             // The manager dropped the route (shutdown, or supersession).
-            Some(None) => return end(&ended_tx, session_id, nonce, None),
+            Some(None) => return end(&ended_tx, session_id, nonce, revision, None),
             None => {}
         }
         // Timers after every wake-up (spec §4.1), the datagram arm included.
@@ -549,6 +564,7 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
 
     let proven = match step {
         Step::Proved => Some(Box::new(ProvenSession {
+            revision: revision.clone(),
             conn,
             client_key,
             msg1,
@@ -567,7 +583,7 @@ async fn run_probation_with_clock(p: Probation, auth_now: impl Fn() -> Instant) 
         // on neither); `Refused` hands nothing over.
         _ => None,
     };
-    end(&ended_tx, session_id, nonce, proven);
+    end(&ended_tx, session_id, nonce, revision, proven);
 }
 
 /// Verify one record away from the probation's own task, and say what
@@ -626,7 +642,9 @@ async fn verify_off_task(
         log::warn!("session refused: authentication deadline expired");
         return Step::Refused;
     }
-    let verifier = Arc::clone(&gate.verifier);
+    let Some(verifier) = gate.signature_verifier().cloned() else {
+        return Step::Refused;
+    };
     let hash = gate.hash;
     // Where this handshake came from, for a verifier that records it (the
     // system mode's keeps it for `PAM_RHOST` and for the log). Rendered
@@ -667,11 +685,13 @@ fn end(
     ended_tx: &mpsc::UnboundedSender<ProbationEnded>,
     session_id: u64,
     nonce: [u8; AUTH_NONCE_LEN],
+    revision: BindingRevision,
     proven: Option<Box<ProvenSession>>,
 ) {
     // A send error means the manager is already gone; there is nothing left to
     // reclaim.
     let _ = ended_tx.send(ProbationEnded {
+        revision,
         session_id,
         nonce,
         proven,
@@ -703,6 +723,11 @@ fn drain(
     let mut to_verify = None;
     for ev in conn.poll_events() {
         match ev {
+            Event::PeerKeyConfirmed { .. } => {
+                if matches!(gate.policy, ProofPolicy::Allowlisted { .. }) {
+                    gate.open = true;
+                }
+            }
             Event::StreamData { stream_id, data } if stream_id == AUTH_STREAM => {
                 // The proof never reaches a backend -- this stream belongs to
                 // the session layer.
@@ -730,7 +755,9 @@ fn drain(
                 start.early.push(StreamData { stream_id, data });
             }
             Event::StateChanged(LinkState::Live) => start.saw_live = true,
-            Event::StateChanged(LinkState::Closed) => closed = true,
+            Event::StateChanged(LinkState::Closed)
+            | Event::SendBufferOverCap { .. }
+            | Event::OffsetSpaceExhausted { .. } => closed = true,
             // `OutputResync` asks a backend to repaint. There is no backend
             // yet, and the bridge opens with `Live`/`ResumeReset` -- on which
             // a backend re-renders anyway -- so it is subsumed, not lost.
@@ -769,6 +796,12 @@ mod tests {
     /// never the process-wide one, so nothing another test in this binary
     /// happens to be doing can take a permit this test is counting on, or
     /// be refused because this test is holding them all.
+    fn test_revision() -> BindingRevision {
+        crate::session_manager::binding_revision::BindingRevisions::new(1)
+            .capture([9; 16])
+            .unwrap()
+    }
+
     fn test_permits() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFIES))
     }
@@ -818,7 +851,10 @@ mod tests {
         match gate.feed(bytes)? {
             Fed::Waiting => Ok(()),
             Fed::Verify(record) => {
-                let verifier = Arc::clone(&gate.verifier);
+                let verifier = Arc::clone(
+                    gate.signature_verifier()
+                        .expect("signature verification policy"),
+                );
                 let hash = gate.hash;
                 // These tests are about the gate, not about which device
                 // this is -- a fixed placeholder is enough.
@@ -840,7 +876,10 @@ mod tests {
     ) -> Step {
         match drain(conn, gate, start, early_cost, Instant::now()) {
             Step::Verify(record) => {
-                let verifier = Arc::clone(&gate.verifier);
+                let verifier = Arc::clone(
+                    gate.signature_verifier()
+                        .expect("signature verification policy"),
+                );
                 let hash = gate.hash;
                 // As in `feed_and_verify`: not about which device this is.
                 match verifier.verify(&hash, &record, [0u8; 16], "") {
@@ -1337,6 +1376,10 @@ mod tests {
     /// A [`Fixture`] whose msg2 carries exactly `nonce`, and the client it
     /// accepted -- which has read msg2 and can talk to it.
     fn accepted_signature_pair(nonce: [u8; AUTH_NONCE_LEN]) -> (Connection, Fixture) {
+        accepted_pair(nonce, AuthMethod::SshSignature)
+    }
+
+    fn accepted_pair(nonce: [u8; AUTH_NONCE_LEN], method: AuthMethod) -> (Connection, Fixture) {
         let server_kp = generate_keypair();
         let client_kp = generate_keypair();
         let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -1346,13 +1389,16 @@ mod tests {
             role: Role::Client,
             local_static_priv: client_kp.private,
             remote_static_pub: Some(server_kp.public),
-            auth: AuthPolicy::SshSignature,
+            auth: match method {
+                AuthMethod::Allowlist => AuthPolicy::Allowlist(vec![client_kp.public]),
+                AuthMethod::SshSignature => AuthPolicy::SshSignature,
+            },
         });
         let payload = encode_msg1(&Msg1Payload {
             offered: crate::Features::SUPPORTED,
             start_kind: StartKind::Cold,
             token: [9u8; 16],
-            method: AuthMethod::SshSignature,
+            method,
         });
         let out = client.start_with_payload(Instant::now(), src, &payload);
         let msg1_body = match parse_wire_frame(&out[0].bytes).expect("valid frame") {
@@ -1365,7 +1411,10 @@ mod tests {
             role: Role::Server,
             local_static_priv: server_kp.private,
             remote_static_pub: None,
-            auth: AuthPolicy::SshSignature,
+            auth: match method {
+                AuthMethod::Allowlist => AuthPolicy::Allowlist(vec![client_kp.public]),
+                AuthMethod::SshSignature => AuthPolicy::SshSignature,
+            },
         };
         match Connection::accept(cfg, Instant::now(), src, &msg1_body, &mut |_| {
             Some(Msg2Inputs {
@@ -1395,6 +1444,119 @@ mod tests {
             }
             AcceptOutcome::Rejected => panic!("accept must succeed for this test fixture"),
         }
+    }
+
+    fn allowlisted_gate(now: Instant) -> AuthGate {
+        AuthGate::from_policy(
+            ProofPolicy::Allowlisted {
+                principal: Principal {
+                    uid: 1000,
+                    name: "test".into(),
+                    identity: "allowlisted test key".into(),
+                    incarnation: 0,
+                },
+            },
+            [0; 32],
+            [0; AUTH_NONCE_LEN],
+            now,
+        )
+    }
+
+    #[test]
+    fn allowlist_probation_requires_real_packet_and_preserves_early_data() {
+        let (mut client, mut fixture) = accepted_pair([0; AUTH_NONCE_LEN], AuthMethod::Allowlist);
+        hold_for_probation(&mut fixture.conn);
+        let now = Instant::now();
+        let mut gate = allowlisted_gate(now);
+        let mut start = BridgeStart::default();
+        let mut cost = 0;
+        assert!(matches!(
+            drain(&mut fixture.conn, &mut gate, &mut start, &mut cost, now),
+            Step::Waiting
+        ));
+        assert!(start.saw_live);
+        for packet in client.frames_for_test(vec![
+            StreamFrame::Data {
+                stream_id: 16,
+                offset: 0,
+                data: b"early".to_vec(),
+            },
+            StreamFrame::Data {
+                stream_id: AUTH_STREAM,
+                offset: 0,
+                data: b"not a signature".to_vec(),
+            },
+        ]) {
+            fixture.conn.on_datagram(now, fixture.src, &packet.bytes);
+        }
+        assert!(matches!(
+            drain(&mut fixture.conn, &mut gate, &mut start, &mut cost, now),
+            Step::Proved
+        ));
+        assert_eq!(start.early.len(), 1);
+        assert_eq!(start.early[0].stream_id, 16);
+        assert_eq!(start.early[0].data, b"early");
+        assert_eq!(fixture.conn.unconsumed_streams(), vec![(16, 5)]);
+    }
+
+    #[test]
+    fn allowlist_probation_real_ping_is_proof_without_application_data() {
+        let (mut client, mut fixture) = accepted_pair([0; AUTH_NONCE_LEN], AuthMethod::Allowlist);
+        let now = Instant::now();
+        let mut gate = allowlisted_gate(now);
+        for packet in client.frames_for_test(vec![StreamFrame::Ping { token: 1 }]) {
+            fixture.conn.on_datagram(now, fixture.src, &packet.bytes);
+        }
+        let mut start = BridgeStart::default();
+        assert!(matches!(
+            drain(&mut fixture.conn, &mut gate, &mut start, &mut 0, now),
+            Step::Proved
+        ));
+        assert!(start.saw_live);
+        assert!(start.early.is_empty());
+    }
+
+    #[test]
+    fn allowlist_probation_close_and_overflow_override_same_batch_proof() {
+        let now = Instant::now();
+        let peer = "127.0.0.1:1".parse().unwrap();
+        for terminal_event in [
+            Event::StateChanged(LinkState::Closed),
+            data(16, &vec![0; EARLY_DATA_MAX]),
+            Event::SendBufferOverCap { stream_id: 16 },
+        ] {
+            let mut conn = seeded(vec![Event::PeerKeyConfirmed { peer }, terminal_event]);
+            let mut gate = allowlisted_gate(now);
+            assert!(matches!(
+                drain(
+                    &mut conn,
+                    &mut gate,
+                    &mut BridgeStart::default(),
+                    &mut 0,
+                    now
+                ),
+                Step::Refused
+            ));
+        }
+    }
+
+    #[test]
+    fn allowlist_probation_expiry_wins_over_ready_proof() {
+        let now = Instant::now();
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let mut conn = seeded(vec![Event::PeerKeyConfirmed { peer }]);
+        let mut gate = allowlisted_gate(now);
+        assert!(matches!(
+            drain(
+                &mut conn,
+                &mut gate,
+                &mut BridgeStart::default(),
+                &mut 0,
+                now + AUTH_DEADLINE
+            ),
+            Step::Refused
+        ));
+        assert!(!gate.is_open());
     }
 
     /// Build a [`Fixture`] whose msg2 carries exactly `nonce` -- the same
@@ -1471,9 +1633,12 @@ mod tests {
         let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<ProbationEnded>();
         let (_route, dgram_rx) = dgram_queue();
         tokio::spawn(run_probation(Probation {
+            revision: test_revision(),
             socket,
             conn,
-            verifier: accepting_good(),
+            policy: ProofPolicy::SshSignature {
+                verifier: accepting_good(),
+            },
             dgram_rx,
             client_key,
             msg1,
@@ -1526,12 +1691,15 @@ mod tests {
         let clock = std::sync::Mutex::new(Instant::now());
         let now = || *clock.lock().unwrap();
         let p = Probation {
+            revision: test_revision(),
             socket,
             conn,
-            verifier: Arc::new(FakeVerifier {
-                expected: b"good".to_vec(),
-                attempts: Arc::clone(&attempts),
-            }),
+            policy: ProofPolicy::SshSignature {
+                verifier: Arc::new(FakeVerifier {
+                    expected: b"good".to_vec(),
+                    attempts: Arc::clone(&attempts),
+                }),
+            },
             dgram_rx,
             client_key,
             msg1,
@@ -1846,9 +2014,10 @@ mod tests {
         });
         let (dg_tx, dg_rx) = dgram_queue();
         tokio::spawn(run_probation(Probation {
+            revision: test_revision(),
             socket,
             conn,
-            verifier,
+            policy: ProofPolicy::SshSignature { verifier },
             dgram_rx: dg_rx,
             client_key,
             msg1,
@@ -2164,9 +2333,12 @@ mod tests {
         drop(dg_tx);
 
         tokio::spawn(run_probation(Probation {
+            revision: test_revision(),
             socket,
             conn,
-            verifier: accepting_good(),
+            policy: ProofPolicy::SshSignature {
+                verifier: accepting_good(),
+            },
             dgram_rx: dg_rx,
             client_key,
             msg1,
@@ -2220,9 +2392,12 @@ mod tests {
         let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<ProbationEnded>();
 
         tokio::spawn(run_probation(Probation {
+            revision: test_revision(),
             socket,
             conn,
-            verifier: accepting_good(),
+            policy: ProofPolicy::SshSignature {
+                verifier: accepting_good(),
+            },
             dgram_rx: dg_rx,
             client_key,
             msg1,
