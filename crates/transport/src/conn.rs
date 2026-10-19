@@ -2086,13 +2086,17 @@ impl Connection {
         }
     }
 
-    /// How long that dwell lasts: twice the retransmit timeout, which is
-    /// comfortably longer than the round trip that traffic on the new road
-    /// needs to come back and clear `PathDown`, with [`PROBE_URGENT`] as the
-    /// floor -- nothing new can be learned about any road faster than the
-    /// schedule that checks them.
+    /// Twice the destination's round-trip allowance, using its probe EWMA
+    /// rather than a PONG from the road just left. Keep the existing liveness
+    /// bounds and urgent-probe floor. Moves require a verified destination,
+    /// so it normally has a measurement; if its path metadata was removed,
+    /// give it the full unmeasured liveness allowance, not the old road's RTT.
     fn move_dwell(&self) -> Duration {
-        (self.liveness_rto() * 2).max(PROBE_URGENT)
+        let allowance = self
+            .peer
+            .and_then(|addr| self.paths.rtt(addr))
+            .map_or(RTO_CEILING, |rtt| (rtt * 2).clamp(RTO_FLOOR, RTO_CEILING));
+        (allowance * 2).max(PROBE_URGENT)
     }
 
     /// When the next scheduled PING is due. The one definition both
@@ -3468,8 +3472,8 @@ impl Connection {
         self.cookie
     }
 
-    /// The round-trip allowance of road liveness -- the unanswered-PING rule
-    /// and the move dwell: `2 * rtt` of the latest PONG (or the handshake's
+    /// The round-trip allowance for the unanswered-PING rule: `2 * rtt` of
+    /// the latest PONG (or the handshake's
     /// seed, floored at `DEFAULT_RTO` as above) within `[RTO_FLOOR,
     /// RTO_CEILING]`, `DEFAULT_RTO` with nothing measured. Not the
     /// retransmit timeout: that one may grow past `RTO_CEILING` under a
@@ -3493,8 +3497,8 @@ impl Connection {
     /// retransmit timeout, which a bulk write's queue may stretch to 15 s.
     /// Nothing measured yet: past both the
     /// interval and the 3 s ceiling -- `DEFAULT_RTO` (500 ms) is kept for
-    /// retransmits and the move dwell, but a road slower than the PING
-    /// interval would have its first PING called unanswered with it.
+    /// retransmits, but a road slower than the PING interval would have its
+    /// first PING called unanswered with it.
     fn unanswered_after(&self, now: Instant) -> Duration {
         match self.rtt {
             Some(_) => self.ping_interval(now).max(self.liveness_rto()),
@@ -6690,6 +6694,145 @@ pub(crate) mod tests {
             Some(backup),
             "a client must stay on the road it just moved to long enough to hear from it"
         );
+    }
+
+    /// Drive actual encrypted PING/PONG and path probes with a controlled
+    /// delivery clock. The destination takes two seconds, the old path 10 ms.
+    fn destination_dwell_trial(manual: bool, lose_first_ping: bool) {
+        let (mut client, mut server, caddr, fast) = established_pair();
+        let slow = addr("203.0.113.9:60000");
+        let slow_rtt = Duration::from_secs(2);
+        client.set_paths(vec![fast, slow]);
+        let start = Instant::now();
+        client.request_ping(start);
+        let mut arriving = Vec::new();
+        for dg in client.on_timeout(start) {
+            let rtt = if dg.to == fast { NEAR } else { slow_rtt };
+            for answer in server.on_datagram(start, caddr, &dg.bytes) {
+                arriving.push((start + rtt, dg.to, answer.bytes));
+            }
+        }
+        arriving.sort_by_key(|(at, _, _)| *at);
+        for (at, road, bytes) in arriving.drain(..) {
+            let _ = client.on_datagram(at, road, &bytes);
+        }
+        assert!(client.paths.is_verified(fast));
+        assert!(client.paths.is_verified(slow));
+        assert_eq!(
+            client.rtt.unwrap().value,
+            NEAR,
+            "latest PONG is from the old path"
+        );
+
+        let moved = start + Duration::from_secs(4);
+        if manual {
+            client.use_road(slow, moved).unwrap();
+        }
+        let lost_at = moved + Duration::from_secs(12);
+        let end = lost_at + Duration::from_secs(12);
+        let mut now = moved;
+        let mut dropped = false;
+        let mut proved_slow = false;
+        let mut returned = false;
+        while now <= end {
+            arriving.sort_by_key(|(at, _, _)| *at);
+            let ready = arriving.partition_point(|(at, _, _)| *at <= now);
+            let mut outgoing = Vec::new();
+            for (at, road, bytes) in arriving.drain(..ready) {
+                outgoing.extend(client.on_datagram(at, road, &bytes));
+            }
+            outgoing.extend(client.on_timeout(now));
+            if now < lost_at {
+                assert_eq!(client.active_path(), Some(slow),
+                    "destination abandoned before its first PONG/recovery at {:?}; manual={manual}, lost={lose_first_ping}", now - moved);
+                if client.rtt.unwrap().value == slow_rtt {
+                    proved_slow = true;
+                    assert!(matches!(client.state, LinkState::Live));
+                }
+            } else if client.active_path() == Some(fast) {
+                returned = true;
+            }
+            if returned {
+                assert_eq!(
+                    client.active_path(),
+                    Some(fast),
+                    "must settle on the working original path"
+                );
+            }
+            for dg in outgoing {
+                if dg.to == fast && now < moved + Duration::from_secs(7) {
+                    continue; // The original path is initially unavailable.
+                }
+                if dg.to == slow && now >= lost_at {
+                    continue; // The destination really dies after proving itself.
+                }
+                if lose_first_ping
+                    && !dropped
+                    && dg.to == slow
+                    && server.peek_frames(&dg.bytes).is_some_and(|frames| {
+                        frames
+                            .iter()
+                            .any(|frame| matches!(frame, StreamFrame::Ping { .. }))
+                    })
+                {
+                    dropped = true;
+                    continue;
+                }
+                let rtt = if dg.to == fast { NEAR } else { slow_rtt };
+                for answer in server.on_datagram(now, caddr, &dg.bytes) {
+                    arriving.push((now + rtt, dg.to, answer.bytes));
+                }
+            }
+            now += TICK;
+        }
+        assert_eq!(dropped, lose_first_ping);
+        assert!(proved_slow, "must observe an actual destination PONG");
+        assert!(returned, "a dead destination must not pin the connection");
+        assert_eq!(client.rtt.unwrap().value, NEAR);
+        assert!(matches!(client.state, LinkState::Live));
+    }
+
+    #[test]
+    fn destination_dwell_waits_for_the_slow_first_pong() {
+        destination_dwell_trial(false, false);
+    }
+
+    #[test]
+    fn destination_dwell_waits_after_a_manual_move() {
+        destination_dwell_trial(true, false);
+    }
+
+    #[test]
+    fn destination_dwell_tolerates_a_lost_first_ping_and_returns_after_failure() {
+        destination_dwell_trial(false, true);
+    }
+
+    #[test]
+    fn destination_dwell_without_a_measurement_uses_the_conservative_allowance() {
+        let (mut client, _server, _caddr, fast) = established_pair();
+        let slow = addr("203.0.113.9:60000");
+        client.set_paths(vec![fast, slow]);
+        let start = Instant::now();
+        let checks = client.paths.due(start, false);
+        for (road, token) in checks {
+            let rtt = if road == fast {
+                NEAR
+            } else {
+                Duration::from_secs(2)
+            };
+            client.on_path_probe_ack(token, start + rtt);
+        }
+        let moved = start + Duration::from_secs(3);
+        client.use_road(slow, moved).unwrap();
+        // An empty list explicitly disables checking, clearing even the
+        // active path's metadata. A nonempty list pins that path instead.
+        client.set_paths(Vec::new());
+        assert!(
+            client.paths.rtt(slow).is_none(),
+            "destination metadata must actually be absent"
+        );
+        assert!(!client.may_move(moved + RTO_CEILING));
+        assert!(client.may_move(moved + RTO_CEILING * 2));
     }
 
     /// With nothing verified to move to, the connection stays where it is --

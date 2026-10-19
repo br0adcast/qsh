@@ -1192,8 +1192,9 @@ path-sized window (slice 2 of the transport-defects work).
 
 Road liveness does not read that estimate. Its allowance is `2 * rtt` of
 the round trip above, clamped to [200 ms, 3000 ms] (to [500 ms, 3000 ms] for
-the seed), `DEFAULT_RTO` with nothing measured; it sets the move dwell and
-the unanswered-PING rule. A PING counts as unanswered once an older
+the seed), `DEFAULT_RTO` with nothing measured; it sets the
+unanswered-PING rule. The move dwell uses the destination probe estimate below.
+A PING counts as unanswered once an older
 outstanding one is past both the PING interval and that allowance -- or,
 while nothing is measured, past both
 the interval and the 3 s ceiling, so the first PINGs on a road slower than
@@ -1325,8 +1326,13 @@ says nothing about the new one -- and forces a PING down the new road on the
 same tick, as a move by hand does: an ordinary packet down it clears
 `PathDown` after one round trip and makes the server follow, where waiting
 for the scheduled PING would outlast the dwell and bounce the client back
-onto the road it just left. The dwell is
-`max(2 * rto, PROBE_URGENT)` — `PathDown` clears only when an ordinary frame
+onto the road it just left. The dwell uses the destination path's smoothed
+RTT from authenticated probe answers, not the previous path's latest PONG:
+`max(2 * clamp(2 * destination_rtt, 200 ms, 3 s), PROBE_URGENT)`, hence
+between 1 and 6 seconds. A missing destination measurement uses the 3-second
+allowance, giving a 6-second dwell. Normal moves require a verified path and
+therefore have a measurement; explicitly disabling path checking with an empty
+list clears that metadata, without falling back to the old path's RTT. `PathDown` clears only when an ordinary frame
 arrives, and none can arrive before a round trip on the road just moved to,
 so without it the next tick would be handed back the road just left, still
 `Verified` because its own probe has not timed out yet, and the client would

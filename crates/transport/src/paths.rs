@@ -331,6 +331,16 @@ impl PathTable {
             .unwrap_or(false)
     }
 
+    /// Smoothed RTT from authenticated answers to this destination's checks.
+    /// Retained across a failed check; absent for an unknown or unmeasured road.
+    pub(crate) fn rtt(&self, addr: SocketAddr) -> Option<Duration> {
+        self.paths
+            .iter()
+            .find(|path| path.addr == addr)
+            .and_then(|path| path.ewma_ms)
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+    }
+
     /// Whether this road failed its last check (did not answer within
     /// [`PROBE_TIMEOUT`]). A road the table does not know is not dead: there is
     /// nothing to say about it.
