@@ -12,11 +12,12 @@
 //! slot 1, and so on, each with its own token. A run takes the lowest slot no
 //! live process is holding.
 //!
-//! "Holding" is an exclusive `flock` on the slot's file, which the kernel
-//! releases when the process dies however it dies -- there is no stale lock
-//! to clean up, and no pid file to go wrong. A slot whose lock is free but
-//! whose token file exists is exactly the case this module exists for: the
-//! session someone left behind, waiting to be returned to.
+//! "Holding" is an exclusive `flock` on the slot's file. The acquiring
+//! process explicitly unlocks it when its claim is dropped; a forked copy
+//! only closes its descriptor. The kernel also releases the lock when the
+//! last copy of its descriptor closes. There is no persistent pid file or
+//! stale lock to clean up. A free slot with an existing token is the session
+//! someone left behind, waiting to be returned to.
 
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -33,17 +34,50 @@ const MAX_SLOTS: usize = 16;
 /// The session token this run should use, and the lock that says it is ours.
 pub struct Claim {
     pub token: [u8; 16],
-    /// Dropped when the run ends (or the process dies), which releases the
-    /// lock and leaves the slot free for the next run to return to. `None`
-    /// when every slot was taken and this run got a throwaway token.
-    _lock: Option<File>,
+    /// Owning-process drop releases the slot even while a concurrent child
+    /// retains an inherited descriptor before exec. None for a throwaway token.
+    _lock: Option<SlotLock>,
+}
+
+struct SlotLock {
+    file: File,
+    owner_pid: libc::pid_t,
+}
+
+impl SlotLock {
+    // Construct immediately after successful flock, before fallible token I/O.
+    fn new(file: File) -> Self {
+        // SAFETY: getpid has no preconditions and is async-signal-safe.
+        let owner_pid = unsafe { libc::getpid() };
+        Self { file, owner_pid }
+    }
+}
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        // SAFETY: getpid has no preconditions, including in a forked child.
+        if unsafe { libc::getpid() } != self.owner_pid {
+            return; // Field destruction closes only this copy's descriptor.
+        }
+        loop {
+            // SAFETY: our File still owns the valid descriptor until this
+            // destructor returns. Unlock the shared open-file description now.
+            let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            if result == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break; // Other errors retain the existing best-effort close.
+            }
+        }
+    }
 }
 
 impl Claim {
     /// Replace only this run's token, retaining its exclusive slot lock.
     pub fn replace_token(&mut self) -> std::io::Result<[u8; 16]> {
         let token = fresh_token();
-        if let Some(file) = &mut self._lock {
+        if let Some(slot) = &mut self._lock {
+            let file = &mut slot.file;
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(format!("{}\n", hex(&token)).as_bytes())?;
@@ -74,7 +108,7 @@ pub fn claim(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
 
     for slot in 0..MAX_SLOTS {
         let path = dir.join(slot_name(login, host, port, slot));
-        let Ok(mut file) = OpenOptions::new()
+        let Ok(file) = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -89,12 +123,14 @@ pub fn claim(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
             // take.
             continue;
         }
+        let mut slot = SlotLock::new(file);
+        let file = &mut slot.file;
         let mut text = String::new();
         if file.read_to_string(&mut text).is_ok() {
             if let Some(token) = parse_token(text.trim()) {
                 return Claim {
                     token,
-                    _lock: Some(file),
+                    _lock: Some(slot),
                 };
             }
         }
@@ -112,7 +148,7 @@ pub fn claim(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
         let _ = file.flush();
         return Claim {
             token,
-            _lock: Some(file),
+            _lock: Some(slot),
         };
     }
 
@@ -173,6 +209,7 @@ fn lock_exclusive(file: &File) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("sessions_inheritance_tests.rs");
 
     #[test]
     fn each_login_resumes_its_own_token_on_the_same_endpoint() {
