@@ -420,7 +420,8 @@ fn shared_recovery_driver_rejects_no_acceptance_peer_before_signing_or_data() {
     ));
     client
         .0
-        .send_bytes(16, b"must not leave before admission".to_vec());
+        .send_bytes(16, b"must not leave before admission".to_vec())
+        .expect("fixture application input admitted locally before peer response");
     let mut buffer = [0; 65536];
     let (len, from) = socket.recv_from(&mut buffer).unwrap();
     let response = server.on_datagram(Instant::now(), from, &buffer[..len]);

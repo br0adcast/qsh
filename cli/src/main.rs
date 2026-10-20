@@ -776,11 +776,16 @@ impl Links {
                 // `Session` puts the terminal back the way any exit of its
                 // own does (`Terminate` is the one way to ask it to); only
                 // the code is this order's, not its 0.
-                let mut actions: Vec<Action> = sess
-                    .handle(UiEvent::Terminate, now_ms)
-                    .into_iter()
-                    .filter(|a| !matches!(a, Action::Exit(_)))
-                    .collect();
+                let mut actions = if matches!(stop, Stop::SessionGone { .. }) {
+                    sess.discard_pending_input()
+                } else {
+                    Vec::new()
+                };
+                actions.extend(
+                    sess.handle(UiEvent::Terminate, now_ms)
+                        .into_iter()
+                        .filter(|a| !matches!(a, Action::Exit(_))),
+                );
                 actions.push(Action::Exit(code));
                 actions
             }
@@ -1303,6 +1308,7 @@ fn channel_events(
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 *shell_channel = Some(ch);
                 actions.extend(sess.on_channel_ready(ch, now_ms()));
+                log::log(&format!("shell channel {ch} ready"));
             }
             SessionEvent::Announced { active, draining } => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
@@ -1768,7 +1774,7 @@ impl InputReader {
         let stopped = cancel.clone();
         let thread = std::thread::spawn(move || {
             let mut buf = [0u8; qsh::input_ingress::READ_BYTES];
-            while !stopped.is_cancelled() {
+            'reading: while !stopped.is_cancelled() {
                 let mut fd = libc::pollfd {
                     fd: stdin_fd,
                     events: libc::POLLIN,
@@ -1794,15 +1800,31 @@ impl InputReader {
                     }
                     break;
                 }
-                let input = match budget.admit_slice(&buf[..n as usize]) {
-                    Ok(input) => input,
-                    Err(_) => {
-                        // One terminal outcome, then stop reading. Repeated
-                        // overflow cannot create another event/side queue.
-                        let _ = tx.send(UiEvent::InputFailure(
-                            session::LocalInputFailure::IngressFull,
-                        ));
-                        break;
+                let input = loop {
+                    if stopped.is_cancelled() {
+                        break 'reading;
+                    }
+                    if let Ok(input) = budget.admit_slice(&buf[..n as usize]) {
+                        break input;
+                    }
+                    // Published after the complete preceding input prefix. No
+                    // read-ahead or newer Stdin publication can pass this fence.
+                    let (blocked, reply) =
+                        qsh::input_ingress::IngressBlocked::channel(budget.clone(), n as usize);
+                    if tx.send(UiEvent::IngressBlocked(blocked)).is_err() {
+                        break 'reading;
+                    }
+                    loop {
+                        if stopped.is_cancelled() {
+                            break 'reading;
+                        }
+                        // Keep the existing cancellation polling bound even
+                        // when the UI/Session still owns every ingress guard.
+                        match reply.recv_timeout(Duration::from_millis(20)) {
+                            Ok(true) => break,
+                            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'reading,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
                     }
                 };
                 if tx.send(UiEvent::Stdin(input)).is_err() {

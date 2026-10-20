@@ -327,3 +327,61 @@ fn client179_prediction_waits_for_actual_admission() {
         "no speculative paint before admission"
     );
 }
+
+#[test]
+fn client179_reconnect_keeps_only_unaccepted_suffix_through_repeated_attach() {
+    let budget = crate::input_ingress::IngressBudget::default();
+    let mut session = ready_session();
+    let accepted = session.handle(UiEvent::Stdin(budget.admit_slice(b"old").unwrap()), 0);
+    assert_eq!(sent(&accepted), b"old");
+    drop(accepted); // canonical admission is the executor's separate boundary
+    session.on_link_gone(1);
+    let pending = session.handle(UiEvent::Stdin(budget.admit_slice(b"pending").unwrap()), 2);
+    assert!(
+        pending.is_empty(),
+        "recoverable input is retained, not fatal"
+    );
+    assert_eq!(budget.usage(), (7, 1, 7));
+    assert!(!session.shell.prediction_active());
+    assert!(
+        session.on_channel_ready(99, 3).is_empty(),
+        "stale Ready cannot attach"
+    );
+    session.on_reattached(4);
+    session.on_link_gone(5); // a failed replacement cannot drop the pending suffix
+    session.on_reattached(6);
+    assert!(session.on_announced(&[16], 7).is_empty());
+    let ready = session.on_channel_ready(16, 8);
+    assert_eq!(sent(&ready), b"pending");
+    assert!(sent(&session.on_channel_ready(16, 9)).is_empty());
+    drop(ready);
+    assert_eq!(budget.usage(), (0, 0, 0));
+}
+
+#[test]
+fn client179_confirmed_shell_loss_discards_pending_once_without_new_shell_replay() {
+    let budget = crate::input_ingress::IngressBudget::default();
+    let mut session = ready_session();
+    session.on_link_gone(1);
+    assert!(session
+        .handle(
+            UiEvent::Stdin(budget.admit_slice(b"old command").unwrap()),
+            2
+        )
+        .is_empty());
+    session.on_reattached(3);
+    let lost = session.on_announced(&[], 4);
+    assert!(lost.contains(&Action::ShellUnavailable));
+    assert_eq!(budget.usage(), (0, 0, 0));
+    assert_eq!(
+        lost.iter()
+            .filter(|a| matches!(a, Action::Notice(s) if s.contains("pending input")))
+            .count(),
+        1
+    );
+    let again = session.on_announced(&[], 5);
+    assert!(!again
+        .iter()
+        .any(|a| matches!(a, Action::Notice(s) if s.contains("pending input"))));
+    assert!(sent(&session.on_channel_ready(16, 6)).is_empty());
+}

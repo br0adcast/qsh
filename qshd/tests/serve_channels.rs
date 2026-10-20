@@ -586,17 +586,15 @@ fn serve_sends_a_command_channel_in_full_with_the_header_under_aead() {
 }
 
 /// Spec §4.10.6 and §11.3 (6), end to end on a real daemon: a channel
-/// whose process never reads its input (its terminal raw, the process
-/// asleep) gets a 1 MiB paste. The daemon takes at most a window of it --
-/// the client's sender keeps the rest -- and a second channel's shell
-/// answers meanwhile; closing the stuck channel leaves the session working.
+/// whose process never reads its raw terminal gets a 1 MiB paste. Its
+/// credit-blocked suffix stays in canonical source custody before entering
+/// the reliable sender; the full record's logical budget remains charged.
+/// A second channel must answer both before and after closing the stuck one.
 ///
-/// Measured on the review's machine, three runs: `held` comes out at
-/// exactly `PASTE - STREAM_WINDOW` (524288 of 1048576) every time -- the
-/// kernel holds every byte behind the raw terminal rather than discarding
-/// any of it, and the daemon's own take of the stuck stream is 0 (the first
-/// `write_all` never returns). The bound below keeps a 256 KiB margin past
-/// that measured value for a kernel that buffers differently.
+/// The high-mark probe observes pressure; the global-budget probe independently
+/// detects missing whole-record charge after other streams are acknowledged.
+/// These assertions measure logical custody, not physical retained bytes/RSS.
+/// Exact bytes after credit release are covered by actual transport controls.
 #[test]
 fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
     const PASTE: usize = 1 << 20;
@@ -703,24 +701,51 @@ fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
         "the other channel answers while the paste is held: {}",
         output(true)
     );
-    let held = client.stream_progress(stuck).expect("written to").unacked;
-    assert!(
-        held >= PASTE as u64 - transport::reliability::STREAM_WINDOW - 256 * 1024,
-        "the daemon took at most a window and what the terminal buffers; the client still has {held} of {PASTE}"
+    // The canonical source now holds credit-blocked suffixes before they
+    // enter Connection's reliable sender. Observe both its pressure and the
+    // complete record's retained logical budget, rather than sender-only debt.
+    let other_acknowledged = wait_until(|| {
+        [CONTROL_STREAM, shell].into_iter().all(|stream| {
+            client
+                .stream_progress(stream)
+                .is_some_and(|progress| progress.unacked == 0)
+        })
+    });
+    let bounded_candidate = vec![b'?'; 32];
+    let bounded_pointer = bounded_candidate.as_ptr();
+    let bounded_capacity = bounded_candidate.capacity();
+    let bounded_probe = client.send_bytes_bounded(stuck, bounded_candidate, Duration::ZERO);
+    let debt_candidate = vec![b'?'; transport::client_input_budget::INPUT_BYTES - PASTE + 1];
+    let debt_pointer = debt_candidate.as_ptr();
+    let debt_capacity = debt_candidate.capacity();
+    let debt_probe = client.send_bytes(stuck, debt_candidate);
+    // A failed probe may itself have admitted a large record. Preserve its
+    // outcome and always join the driver before asserting any later operation.
+    let close_channel = client.send_bytes(
+        CONTROL_STREAM,
+        encode_client(&ClientRecord::Close { stream: stuck }),
     );
-    client
-        .send_bytes(
-            CONTROL_STREAM,
-            encode_client(&ClientRecord::Close { stream: stuck }),
-        )
-        .expect("fixture input admitted");
-    client
-        .send_bytes(shell, b"echo still-$((5*5))\n".to_vec())
-        .expect("fixture input admitted");
-    assert!(
-        wait_until(|| output(true).contains("still-25")),
-        "{}",
-        output(true)
-    );
+    let next_command = client.send_bytes(shell, b"echo still-$((5*5))\n".to_vec());
+    let still_alive = wait_until(|| output(true).contains("still-25"));
     client.close();
+    assert!(
+        other_acknowledged,
+        "other stream records must be ACKed before interpreting budget pressure"
+    );
+    let debt = debt_probe.expect_err("complete paste debt must remain charged");
+    assert_eq!(debt.reason, transport::driver_std::SendBlocked::Full);
+    assert_eq!(debt.data.as_ptr(), debt_pointer);
+    assert_eq!(debt.data.capacity(), debt_capacity);
+    assert_eq!(
+        debt.data,
+        vec![b'?'; transport::client_input_budget::INPUT_BYTES - PASTE + 1]
+    );
+    let bounded = bounded_probe.expect_err("stuck stream must retain high-mark pressure");
+    assert_eq!(bounded.reason, transport::driver_std::SendBlocked::Full);
+    assert_eq!(bounded.data.as_ptr(), bounded_pointer);
+    assert_eq!(bounded.data.capacity(), bounded_capacity);
+    assert_eq!(bounded.data, vec![b'?'; 32]);
+    close_channel.expect("channel Close admitted independently of held paste");
+    next_command.expect("other channel command admitted");
+    assert!(still_alive, "{}", output(true));
 }

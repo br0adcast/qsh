@@ -403,3 +403,59 @@ fn client179_deferred_resize_failure_flushes_prior_output_then_exits_locally() {
         .handle(UiEvent::Link(LinkState::Closed), 2)
         .contains(&Action::Exit(1)));
 }
+
+#[test]
+fn client179_actual_session_gone_stop_discards_pending_before_exit() {
+    let (_home, mut links) = input_executor_links();
+    let mut session = geometry_session();
+    session.on_channel_ready(16, 0);
+    session.on_link_gone(1);
+    let budget = qsh::input_ingress::IngressBudget::default();
+    assert!(session
+        .handle(
+            UiEvent::Stdin(budget.admit_slice(b"never cold replay").unwrap()),
+            2
+        )
+        .is_empty());
+    let actions = links.obey(Order::Stop(Stop::SessionGone { addr: 0 }), &mut session, 3);
+    let mut notices = Vec::new();
+    let exit = apply_actions(
+        actions,
+        &mut Vec::new(),
+        &mut links,
+        &mut session,
+        &mut notices,
+        3,
+    );
+    assert_eq!(exit, Some(13));
+    assert_eq!(links.replacement_at, Some(0));
+    assert_eq!(
+        budget.usage(),
+        (0, 0, 0),
+        "confirmed loss refunds while Session is still alive"
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("pending input"))
+            .count(),
+        1
+    );
+    let again = links.obey(Order::Stop(Stop::SessionGone { addr: 0 }), &mut session, 4);
+    apply_actions(
+        again,
+        &mut Vec::new(),
+        &mut links,
+        &mut session,
+        &mut notices,
+        4,
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("pending input"))
+            .count(),
+        1
+    );
+    assert!(session.on_channel_ready(16, 5).is_empty());
+}

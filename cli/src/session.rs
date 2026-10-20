@@ -60,7 +60,7 @@ pub enum LocalInputFailure {
     Rejected(transport::driver_std::SendBlocked),
     Accepted(transport::driver_std::InputFailure),
     IngressFull,
-    OpeningFull,
+    PendingFull,
     NotReady,
 }
 
@@ -73,6 +73,8 @@ pub enum UiEvent {
     InputFailure(LocalInputFailure),
     /// Raw bytes read from the local keyboard.
     Stdin(InputBytes),
+    /// FIFO fence for one reader-held scratch read; not additional input.
+    IngressBlocked(crate::input_ingress::IngressBlocked),
     /// Framed shell-output records for the shell channel, decoded from
     /// whichever wire stream `main` has bound it to.
     Stream0(Vec<u8>),
@@ -211,11 +213,18 @@ enum ShellChannel {
     /// Final output is readable, but input and resize are closed.
     Draining(ChannelId),
     /// The link is gone: `ch` is the channel the shell had (when it was
-    /// confirmed), for the reconnect to find again. Remote input fails locally.
-    Detached { ch: Option<ChannelId> },
+    /// confirmed), for the reconnect to find again. Only unaccepted input
+    /// moves with this same bounded queue until the retained shell is Ready.
+    Detached {
+        ch: Option<ChannelId>,
+        queued: VecDeque<InputBytes>,
+    },
     /// A new connection reached the session; waiting for the server's list
-    /// of what it still runs (`on_announced`). Remote input fails locally.
-    Reattaching { ch: Option<ChannelId> },
+    /// of what it still runs (`on_announced`). Pending input keeps its guards.
+    Reattaching {
+        ch: Option<ChannelId>,
+        queued: VecDeque<InputBytes>,
+    },
 }
 
 pub struct Session {
@@ -399,6 +408,16 @@ impl Session {
                 );
                 actions
             }
+            UiEvent::IngressBlocked(blocked) => {
+                if blocked.resolve() {
+                    Vec::new()
+                } else {
+                    self.handle(
+                        UiEvent::InputFailure(LocalInputFailure::IngressFull),
+                        now_ms,
+                    )
+                }
+            }
             UiEvent::InputFailure(failure) => {
                 if self.input_failed {
                     return Vec::new();
@@ -412,7 +431,7 @@ impl Session {
                     ),
                     LocalInputFailure::Rejected(reason) => format!("qsh: local input was not accepted ({reason:?})"),
                     LocalInputFailure::IngressFull => "qsh: keyboard input buffer limit reached".into(),
-                    LocalInputFailure::OpeningFull => "qsh: input buffer limit reached while opening the shell".into(),
+                    LocalInputFailure::PendingFull => "qsh: pending shell input buffer limit reached".into(),
                     LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
                 };
                 actions.insert(actions.len() - 1, Action::Notice(message));
@@ -580,16 +599,16 @@ impl Session {
         self.paint_at(&frame, now_ms)
     }
 
-    /// The link is gone; a reconnect is under way. Input goes nowhere until
-    /// `on_reattached`.
+    /// The link is gone; retain only input not yet admitted to the driver.
     pub fn on_link_gone(&mut self, now_ms: i64) -> Vec<Action> {
         self.lost_since_ms.get_or_insert(now_ms);
         let ch = match &self.shell_channel {
             ShellChannel::Ready(ch) | ShellChannel::Draining(ch) => Some(*ch),
-            ShellChannel::Detached { ch } | ShellChannel::Reattaching { ch } => *ch,
+            ShellChannel::Detached { ch, .. } | ShellChannel::Reattaching { ch, .. } => *ch,
             _ => None,
         };
-        self.shell_channel = ShellChannel::Detached { ch };
+        let queued = self.take_pending_input();
+        self.shell_channel = ShellChannel::Detached { ch, queued };
         self.plate = Some(Plate::Reconnecting { to: None });
         self.refresh_line(now_ms);
         self.repaint(now_ms)
@@ -610,23 +629,23 @@ impl Session {
         self.rtt_ms = 0;
         self.refresh_line(now_ms);
         let ch = match &self.shell_channel {
-            ShellChannel::Detached { ch } | ShellChannel::Reattaching { ch } => *ch,
+            ShellChannel::Detached { ch, .. } | ShellChannel::Reattaching { ch, .. } => *ch,
             ShellChannel::Ready(ch) | ShellChannel::Draining(ch) => Some(*ch),
             _ => None,
         };
-        self.shell_channel = ShellChannel::Reattaching { ch };
+        let queued = self.take_pending_input();
+        self.shell_channel = ShellChannel::Reattaching { ch, queued };
         self.paint_at(&frame, now_ms)
     }
 
     /// The server listed what it is running (a warm reattach).
     pub fn on_announced(&mut self, live: &[ChannelId], _now_ms: i64) -> Vec<Action> {
         let (cols, rows) = self.desired_size();
-        if let ShellChannel::Reattaching { ch } = self.shell_channel {
+        if let ShellChannel::Reattaching { ch, .. } = self.shell_channel {
             return match ch {
                 Some(ch) if live.contains(&ch) => {
-                    self.shell_channel = ShellChannel::Opening {
-                        queued: VecDeque::new(),
-                    };
+                    let queued = self.take_pending_input();
+                    self.shell_channel = ShellChannel::Opening { queued };
                     Vec::new()
                 }
                 _ => {
@@ -634,6 +653,7 @@ impl Session {
                         Action::Notice(status::shell_ended_text()),
                         Action::ShellUnavailable,
                     ];
+                    actions.splice(0..0, self.discard_pending_input());
                     actions.extend(self.leave(13));
                     actions
                 }
@@ -783,6 +803,17 @@ impl Session {
     /// through the exact same path an immediate keystroke takes -- so a
     /// queued keystroke's echo is predicted only after its eventual admission.
     pub fn on_channel_ready(&mut self, ch: ChannelId, now_ms: i64) -> Vec<Action> {
+        // Detached and still-unannounced replacements cannot consume pending
+        // commands. Main also filters Ready by the exact current link/channel.
+        if matches!(
+            self.shell_channel,
+            ShellChannel::Detached { .. }
+                | ShellChannel::Reattaching { .. }
+                | ShellChannel::Draining(_)
+        ) || matches!(self.shell_channel, ShellChannel::Ready(known) if known != ch)
+        {
+            return Vec::new();
+        }
         let queued = match std::mem::replace(&mut self.shell_channel, ShellChannel::Ready(ch)) {
             ShellChannel::Opening { queued } => queued,
             _ => VecDeque::new(),
@@ -1135,10 +1166,35 @@ impl Session {
         self.apply_shell_size(now_ms)
     }
 
+    /// Confirmed shell/session loss never carries unaccepted commands to a
+    /// consented replacement shell. Both authenticated loss paths share this
+    /// idempotent release; its notice is displayed before replacement consent.
+    pub fn discard_pending_input(&mut self) -> Vec<Action> {
+        let queued = self.take_pending_input();
+        if queued.is_empty() {
+            return Vec::new();
+        }
+        drop(queued);
+        vec![Action::Notice(
+            "qsh: discarded pending input because the previous shell ended".into(),
+        )]
+    }
+
+    /// Move the single pre-admission queue through reconnect transitions.
+    /// Accepted old-driver records never enter this queue and are not replayed.
+    fn take_pending_input(&mut self) -> VecDeque<InputBytes> {
+        match &mut self.shell_channel {
+            ShellChannel::Opening { queued }
+            | ShellChannel::Detached { queued, .. }
+            | ShellChannel::Reattaching { queued, .. } => std::mem::take(queued),
+            _ => VecDeque::new(),
+        }
+    }
+
     /// Sends keyboard bytes to the shell channel once it is confirmed, or
     /// queues them if it is not there yet -- see `ShellChannel::Opening`'s
-    /// own doc for its whole-record limits. Input without a usable or Opening
-    /// channel fails explicitly. Confirmed Draining input is handled as
+    /// own doc for its whole-record limits. That single queue also spans
+    /// Detached/Reattaching until the retained shell is Ready. Draining is
     /// read-only before this method, preserving the remote exit status.
     fn queue_or_send(&mut self, bytes: InputBytes, now_ms: i64) -> Vec<Action> {
         let ready = match &self.shell_channel {
@@ -1148,13 +1204,16 @@ impl Session {
         if let Some(ch) = ready {
             return self.send_now(ch, bytes, now_ms);
         }
-        if let ShellChannel::Opening { queued } = &mut self.shell_channel {
+        if let ShellChannel::Opening { queued }
+        | ShellChannel::Detached { queued, .. }
+        | ShellChannel::Reattaching { queued, .. } = &mut self.shell_channel
+        {
             let held: usize = queued.iter().map(InputBytes::len).sum();
             if bytes.len() > MAX_QUEUED_INPUT_BYTES.saturating_sub(held)
                 || queued.len() == INGRESS_READS
             {
                 return self.handle(
-                    UiEvent::InputFailure(LocalInputFailure::OpeningFull),
+                    UiEvent::InputFailure(LocalInputFailure::PendingFull),
                     now_ms,
                 );
             }

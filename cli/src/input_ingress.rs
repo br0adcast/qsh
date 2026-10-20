@@ -35,6 +35,46 @@ pub struct IngressFull {
     pub bytes: Vec<u8>,
 }
 
+/// One FIFO pressure fence. The reader holds one fixed scratch read and waits
+/// for this acknowledgement before publishing any newer keyboard event.
+#[derive(Debug)]
+pub struct IngressBlocked(Arc<BlockedRead>);
+#[derive(Debug)]
+struct BlockedRead {
+    budget: IngressBudget,
+    bytes: usize,
+    reply: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
+}
+impl PartialEq for IngressBlocked {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for IngressBlocked {}
+impl IngressBlocked {
+    pub fn channel(budget: IngressBudget, bytes: usize) -> (Self, std::sync::mpsc::Receiver<bool>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        (
+            Self(Arc::new(BlockedRead {
+                budget,
+                bytes,
+                reply: Mutex::new(Some(tx)),
+            })),
+            rx,
+        )
+    }
+
+    /// Called only after the UI has processed this marker's published prefix.
+    /// No budget mutex is held while acknowledging or waiting for the reader.
+    pub fn resolve(&self) -> bool {
+        let available = self.0.budget.can_admit(self.0.bytes);
+        if let Some(reply) = self.0.reply.lock().expect("ingress acknowledgement").take() {
+            let _ = reply.send(available);
+        }
+        available
+    }
+}
+
 impl IngressBudget {
     fn with_limits(byte_limit: usize, read_limit: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
@@ -44,6 +84,13 @@ impl IngressBudget {
             byte_limit,
             read_limit,
         })))
+    }
+
+    fn can_admit(&self, bytes: usize) -> bool {
+        let state = self.0.lock().expect("keyboard ingress budget");
+        bytes <= state.byte_limit.saturating_sub(state.bytes)
+            && bytes <= state.byte_limit.saturating_sub(state.capacity)
+            && state.reads < state.read_limit
     }
 
     fn reserve(&self, bytes: usize, capacity: usize) -> Option<Arc<ReadPermit>> {
