@@ -1174,6 +1174,7 @@ fn serve_channel_seam(
         Ok(Request::Open {
             id,
             uid,
+            name,
             login,
             cols,
             rows,
@@ -1233,15 +1234,18 @@ fn serve_channel_seam(
             //
             // A login also belongs to exactly one account for its whole life
             // -- the account the proof that created it verified -- so an
-            // `Open` naming another uid under it is refused too. This is
-            // also where the next task's PAM session gets its key: it
-            // belongs to the login, and this is what makes "this login" a
-            // well-defined, single-owner thing to open one for.
+            // `Open` naming another uid or canonical name under it is refused
+            // too. The login is the single-account key for its PAM session,
+            // independent of any channel or connection's lifetime.
             //
             // Both refusals carry the `REFUSED_REASON` every refusal of this
             // kind does; the real one goes to the helper's own log only.
             let bound_account = match state.logins.get(&login) {
-                Some(entry) if entry.account.uid == Uid::from_raw(uid) => Ok(entry.account.clone()),
+                Some(entry)
+                    if entry.account.uid == Uid::from_raw(uid) && entry.account.name == name =>
+                {
+                    Ok(entry.account.clone())
+                }
                 Some(_) => Err("its login is already bound to a different account"),
                 None => Err("its login is not on file -- it has ended, or nothing proved it"),
             };
@@ -1728,11 +1732,12 @@ fn request_kind(request: &Request) -> &'static str {
 /// capped by [`MAX_LOGINS`] the way a nonce is capped by
 /// `MAX_OUTSTANDING_NONCES` (a login's token is chosen by the device
 /// presenting its proof, so a fresh one must cost nothing to refuse); and
-/// bound to exactly one account for its whole life (the FIRST account a
-/// proof verified for a login wins -- a later proof for the same token
-/// naming another account is refused, and `Request::Open` refuses an `Open`
-/// naming another uid under it). Both refusals share `REFUSED_REASON` on the
-/// wire (the error string returned here is for the caller's OWN log line
+/// bound to exactly one account for its whole life, identified by UID and
+/// canonical NSS name (the FIRST account a proof verified for a login wins --
+/// a later proof for the same token naming another account is refused, and
+/// `Request::Open` refuses another uid or canonical name under it). Both
+/// refusals share `REFUSED_REASON` on the wire (the error string returned here
+/// is for the caller's OWN log line
 /// only, never sent to the worker), so neither leaks which one fired.
 ///
 /// A new entry starts PROVISIONAL ([`LoginState::provisional`]): the helper
@@ -1749,7 +1754,7 @@ fn ensure_login(
     rhost: String,
 ) -> Result<u64, &'static str> {
     if let Some(entry) = state.logins.get(&login) {
-        return if entry.account.uid == account.uid {
+        return if entry.account.uid == account.uid && entry.account.name == account.name {
             Ok(entry.incarnation)
         } else {
             Err("its login is already bound to a different account")
@@ -4487,6 +4492,7 @@ pub(crate) mod tests {
         Request::Open {
             id,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -4599,6 +4605,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 1,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -4759,6 +4766,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 1,
             uid: account.uid.as_raw(),
+            name: account.name.clone(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -4916,6 +4924,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 5,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -4960,6 +4969,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 6,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -5026,6 +5036,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 8,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -5095,6 +5106,7 @@ pub(crate) mod tests {
         let first = Request::Open {
             id: 7,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -5115,6 +5127,7 @@ pub(crate) mod tests {
         let second = Request::Open {
             id: 7,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -5741,6 +5754,7 @@ pub(crate) mod tests {
         let request = Request::Open {
             id,
             uid: uid.as_raw(),
+            name: my_login(),
             login,
             cols: 80,
             rows: 24,
@@ -5945,6 +5959,7 @@ pub(crate) mod tests {
         Request::Open {
             id,
             uid,
+            name: my_login(),
             login,
             cols: 80,
             rows: 24,
@@ -6214,6 +6229,7 @@ pub(crate) mod tests {
             let req = Request::Open {
                 id: 1,
                 uid: me_uid(),
+                name: my_login(),
                 login: PROOF_LOGIN,
                 cols,
                 rows,
@@ -6560,7 +6576,8 @@ pub(crate) mod tests {
                 let mut observations = Vec::new();
                 let mut observe = |state: &mut LoopState, id, login| {
                     let mut request = open_request(id, first.uid.as_raw(), login);
-                    if let Request::Open { command, .. } = &mut request {
+                    if let Request::Open { command, name, .. } = &mut request {
+                        *name = state.logins[&login].account.name.clone();
                         *command = "printf '%s|%s|%s|%s|%s|DONE\\n' \"$USER\" \"$LOGNAME\" \"$HOME\" \"$SHELL\" \"$ALIAS_SHELL\"".into();
                     }
                     seam.serve(state, &request, &config, UNPRIVILEGED.become_account);
@@ -9140,6 +9157,7 @@ pub(crate) mod tests {
             &Request::Open {
                 id: 1,
                 uid: account.uid.as_raw(),
+                name: account.name.clone(),
                 login,
                 cols: 80,
                 rows: 24,
@@ -12088,6 +12106,7 @@ pub(crate) mod tests {
             let barrier = Request::Open {
                 id: 1,
                 uid: me_uid(),
+                name: my_login(),
                 login: [0u8; 16],
                 cols: 80,
                 rows: 24,
@@ -12140,6 +12159,7 @@ pub(crate) mod tests {
         let open = |id| Request::Open {
             id,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -12311,6 +12331,7 @@ pub(crate) mod tests {
         let blocked = Request::Open {
             id: 1,
             uid: me_uid(),
+            name: my_login(),
             login: [0u8; 16],
             cols: 80,
             rows: 24,
@@ -12359,6 +12380,7 @@ pub(crate) mod tests {
         let sleeper = Request::Open {
             id: 1,
             uid: me_uid(),
+            name: my_login(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -12459,6 +12481,7 @@ pub(crate) mod tests {
         Request::Open {
             id,
             uid: account.uid.as_raw(),
+            name: account.name.clone(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -12474,6 +12497,7 @@ pub(crate) mod tests {
         Request::Open {
             id,
             uid: account.uid.as_raw(),
+            name: account.name.clone(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -13010,6 +13034,7 @@ pub(crate) mod tests {
         let req = Request::Open {
             id: 2,
             uid: nobody.uid.as_raw(),
+            name: nobody.name.clone(),
             login: PROOF_LOGIN,
             cols: 80,
             rows: 24,
@@ -15102,4 +15127,5 @@ pub(crate) mod tests {
         );
     }
     include!("server_open_tests.rs");
+    include!("server_account_binding_tests.rs");
 }
