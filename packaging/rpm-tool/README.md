@@ -62,3 +62,31 @@ Source references: [pinned rpm-rs builder](https://github.com/rpm-rs/rpm/blob/v0
 [pinned signature builder](https://github.com/rpm-rs/rpm/blob/v0.23.2/src/rpm/headers/signatures.rs),
 and [RPM 4.18.2 decoder](https://github.com/rpm-software-management/rpm/blob/rpm-4.18.2-release/rpm2cpio.c).
 The checked-in patches retain the downloaded crates' license and provenance files.
+
+## Post-install command dependencies
+
+The same pinned tool has a small metadata extension for the daemon variant:
+
+```toml
+requires-post = { "/usr/bin/getent" = "*", "/usr/sbin/useradd" = "*" }
+```
+
+The table maps unversioned package or file capabilities to genuine RPM
+`SCRIPT_POST` dependencies using `rpm::Dependency::script_post`. Empty and
+`"*"` values are supported; version expressions and non-string values fail.
+This is separate from ordinary `requires` and automatic ELF requirements,
+which stay enabled for the daemon. A capability named `shadow-utils(post)`
+would not express a script-phase dependency and is not used.
+
+Debian's server variant keeps automatic library dependencies and adds an
+ordinary `Depends: passwd` for `postinst configure`. Essential tools need no
+new explicit dependency. `systemctl` remains optional; account attributes,
+upgrade behavior and service activation policy do not change.
+
+Installed-package acceptance queries actual Debian Depends or numeric RPM
+flags before installation, using `check-maintainer-dependencies.sh`. The
+required RPM command-file entries must carry bit 1024 (`SCRIPT_POST`), not
+merely look like a post-script dependency in a manifest. Controlled minimal
+installation additionally proves package-manager resolution with the
+user-management provider initially absent; stock-image tool presence alone
+cannot establish that property.
