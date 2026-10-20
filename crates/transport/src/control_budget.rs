@@ -1,6 +1,6 @@
 //! Reservation ownership for control replies and daemon callback work.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::channel::{CHANNEL_SNAPSHOT_MAX, MAX_CHANNELS};
@@ -168,6 +168,88 @@ struct ResponsePermit {
     class: usize,
     bytes: usize,
 }
+/// One future obligation plus a fixed number of wire records share an envelope.
+/// Neither owner nor record handles can be cloned by callers.
+#[must_use = "retain the owner until no future outcome can be produced"]
+struct ResponseOwner {
+    permit: Arc<ResponsePermit>,
+    records_left: usize,
+}
+#[must_use = "move the record lease through queued bytes to cumulative ACK"]
+struct ResponsePart(Arc<ResponsePermit>);
+
+impl ResponsePermit {
+    fn into_owner(self) -> ResponseOwner {
+        let records_left = match self.class {
+            1 => 2, // Opened followed by a terminal outcome, or one refusal.
+            2 => 3, // Accept, Restarting, and a final failure.
+            _ => 1,
+        };
+        ResponseOwner {
+            permit: Arc::new(self),
+            records_left,
+        }
+    }
+}
+impl ResponseOwner {
+    fn take_record(&mut self) -> Option<ResponsePart> {
+        if self.records_left == 0 {
+            return None;
+        }
+        self.records_left -= 1;
+        Some(ResponsePart(Arc::clone(&self.permit)))
+    }
+}
+impl ResponsePart {
+    fn envelope_bytes(&self) -> usize {
+        self.0.bytes
+    }
+}
+
+/// Delivery custody for one exact connection generation. Entries are bounded
+/// by the finite record leases issued from the shared response-entry ceiling.
+struct ControlLedger {
+    generation: u64,
+    last_end: u64,
+    pending: VecDeque<(u64, ResponsePart)>,
+}
+impl ControlLedger {
+    fn new(generation: u64, queued: u64) -> Self {
+        Self {
+            generation,
+            last_end: queued,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Register only after the whole record has entered this connection.
+    /// Failure returns custody to the caller rather than discarding an outcome.
+    fn register(
+        &mut self,
+        generation: u64,
+        end: u64,
+        part: ResponsePart,
+    ) -> Result<(), ResponsePart> {
+        if generation != self.generation || end <= self.last_end {
+            return Err(part);
+        }
+        self.last_end = end;
+        self.pending.push_back((end, part));
+        Ok(())
+    }
+
+    /// `offset` must come from the connection's validated cumulative ACK base,
+    /// never from queued/sent byte counts or an unvalidated peer frame.
+    fn acknowledge(&mut self, generation: u64, offset: u64) {
+        if generation != self.generation {
+            return;
+        }
+        while self.pending.front().is_some_and(|(end, _)| *end <= offset) {
+            self.pending.pop_front();
+        }
+    }
+}
+
 impl Drop for ResponsePermit {
     fn drop(&mut self) {
         let mut global = self.session.global.0.lock().unwrap();
@@ -204,6 +286,123 @@ impl Drop for JobPermit {
 mod tests {
     use super::*;
     include!("control_budget_wire_tests.rs");
+
+    #[test]
+    fn mandatory_envelopes_have_finite_nonclone_record_leases() {
+        let global = GlobalBudget::default();
+        let session = global.session(1);
+        for (response, records) in [
+            (Response::Ordinary(6), 1),
+            (Response::Open, 2),
+            (Response::Update, 3),
+            (Response::Snapshot, 1),
+            (Response::Restart, 1),
+        ] {
+            let mut owner = session.reserve(response).unwrap().into_owner();
+            let parts: Vec<_> = (0..records).map(|_| owner.take_record().unwrap()).collect();
+            assert!(
+                owner.take_record().is_none(),
+                "an envelope cannot mint extra record handles"
+            );
+            drop((owner, parts));
+        }
+        assert_eq!(global.0.lock().unwrap().response_entries, 0);
+    }
+
+    #[test]
+    fn mandatory_envelope_waits_for_future_obligation_and_last_retired_record() {
+        let global = GlobalBudget::default();
+        let session = global.session(1);
+        let mut owner = session.reserve(Response::Open).unwrap().into_owner();
+        let opened = owner.take_record().unwrap();
+        assert_eq!(opened.envelope_bytes(), MAX_RECORD);
+        drop(opened); // Opened ACK does not refund a future terminal outcome.
+        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        let terminal = owner.take_record().unwrap();
+        session.retire();
+        drop(owner); // The producer ended, but terminal bytes still await ACK.
+        drop(session);
+        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        assert_eq!(global.0.lock().unwrap().response_entries, 1);
+        drop(terminal);
+        assert_eq!(global.0.lock().unwrap().bytes, 0);
+        assert_eq!(global.0.lock().unwrap().response_entries, 0);
+    }
+
+    #[test]
+    fn control_ledger_releases_only_whole_records_at_the_exact_cumulative_ack() {
+        let global = GlobalBudget::default();
+        let session = global.session(1);
+        let mut ledger = ControlLedger::new(7, 0);
+        for (bytes, end) in [(6, 6), (10, 16)] {
+            let mut owner = session
+                .reserve(Response::Ordinary(bytes))
+                .unwrap()
+                .into_owner();
+            assert!(ledger
+                .register(7, end, owner.take_record().unwrap())
+                .is_ok());
+        }
+        session.retire();
+        drop(session);
+        ledger.acknowledge(6, 16);
+        assert_eq!(global.0.lock().unwrap().bytes, 16, "stale generation ACK");
+        ledger.acknowledge(7, 5);
+        assert_eq!(global.0.lock().unwrap().bytes, 16, "partial record ACK");
+        ledger.acknowledge(7, 6);
+        assert_eq!(global.0.lock().unwrap().bytes, 10);
+        assert_eq!(global.0.lock().unwrap().response_entries, 1);
+        ledger.acknowledge(7, 6);
+        ledger.acknowledge(7, 5);
+        ledger.acknowledge(7, 15);
+        assert_eq!(
+            global.0.lock().unwrap().bytes,
+            10,
+            "duplicate/stale/partial ACK"
+        );
+        ledger.acknowledge(7, 16);
+        assert_eq!(global.0.lock().unwrap().bytes, 0);
+        assert_eq!(global.0.lock().unwrap().response_entries, 0);
+    }
+
+    #[test]
+    fn control_ledger_rejects_foreign_or_reordered_registration_without_losing_custody() {
+        let global = GlobalBudget::default();
+        let session = global.session(1);
+        let mut owner = session.reserve(Response::Ordinary(6)).unwrap().into_owner();
+        let part = owner.take_record().unwrap();
+        drop(owner);
+        let mut ledger = ControlLedger::new(8, 10);
+        let part = match ledger.register(7, 16, part) {
+            Err(part) => part,
+            Ok(()) => panic!("foreign generation"),
+        };
+        let part = match ledger.register(8, 10, part) {
+            Err(part) => part,
+            Ok(()) => panic!("nonadvancing end"),
+        };
+        assert_eq!(global.0.lock().unwrap().bytes, 6);
+        assert!(ledger.register(8, 16, part).is_ok());
+        drop(ledger); // Exact connection teardown destroys its delivery representation.
+        assert_eq!(global.0.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn control_ledger_ack_or_teardown_cannot_refund_a_future_terminal_obligation() {
+        let global = GlobalBudget::default();
+        let session = global.session(1);
+        let mut owner = session.reserve(Response::Open).unwrap().into_owner();
+        let mut ledger = ControlLedger::new(9, 0);
+        assert!(ledger.register(9, 6, owner.take_record().unwrap()).is_ok());
+        ledger.acknowledge(9, 6);
+        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        assert!(ledger.register(9, 16, owner.take_record().unwrap()).is_ok());
+        session.retire();
+        drop(ledger);
+        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        drop(owner);
+        assert_eq!(global.0.lock().unwrap().bytes, 0);
+    }
 
     fn full_session(session: &SessionBudget) -> Vec<ResponsePermit> {
         let mut permits = vec![session.reserve(Response::Ordinary(MAX_RECORD)).unwrap()];

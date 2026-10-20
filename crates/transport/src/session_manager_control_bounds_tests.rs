@@ -13,17 +13,20 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
     });
     assert_eq!(encoded.len(), CONTROL_RECORD_MAX);
     let records = SEND_HARD_CAP / encoded.len() + 2;
-    let generated = (records * encoded.len()) as u64;
+    const FENCE: u64 = 0x26;
+    let attempted = Arc::new(AtomicUsize::new(0));
 
     struct Refusals {
         reason: String,
         records: usize,
+        attempted: Arc<AtomicUsize>,
         ended: mpsc::Sender<()>,
     }
     impl SessionBackend for Refusals {
         fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let reason = self.reason.clone();
             let records = self.records;
+            let attempted = self.attempted.clone();
             let ended = self.ended.clone();
             Box::pin(async move {
                 let mut sent = false;
@@ -33,7 +36,9 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
                             sent = true;
                             for _ in 0..records {
                                 io.channel_refused(origin, 16, reason.clone());
+                                attempted.fetch_add(1, Ordering::SeqCst);
                             }
+                            io.notify_delivered(CONTROL_STREAM, FENCE);
                         }
                     }
                 }
@@ -43,25 +48,39 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
     }
 
     CONTROL_RELIABLE_PEAK.with(|peak| peak.set(0));
+    CONTROL_PRODUCER_FENCE.with(|fence| fence.set(None));
     let (ended, mut end_rx) = mpsc::channel(1);
-    let rig = delivery_rig(
+    let mut rig = delivery_rig(
         Arc::new(Refusals {
             reason,
             records,
+            attempted: attempted.clone(),
             ended,
         }),
         |_| {},
     )
     .await;
-    // Deliberately never poll the client socket: neither delivery ACKs nor
-    // credit can return. The hook counts actual retained Connection debt.
+    // Observe real packets while discarding every generated ACK/CREDIT. The
+    // bridge fence proves old source processed the burst; bounded source may
+    // instead terminate explicitly before taking the final marker.
     let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut packet = vec![0u8; 65536];
         loop {
-            let peak = CONTROL_RELIABLE_PEAK.with(|peak| peak.get());
-            if peak >= generated {
-                return peak;
+            if CONTROL_PRODUCER_FENCE.with(|fence| fence.get()) == Some(FENCE) {
+                return None;
             }
-            tokio::task::yield_now().await;
+            tokio::select! {
+                received = rig.client_sock.recv_from(&mut packet) => {
+                    let (len, source) = received.unwrap();
+                    let _withheld = rig.client.on_datagram(Instant::now(), source, &packet[..len]);
+                    for event in rig.client.poll_events() {
+                        if let Event::SessionAborted(reason) = event {
+                            return Some(reason);
+                        }
+                    }
+                }
+                _ = tokio::task::yield_now() => {}
+            }
         }
     })
     .await;
@@ -77,9 +96,19 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
         reached.is_ok(),
         "the bridge must actually retain the fixture replies"
     );
+    assert_eq!(attempted.load(Ordering::SeqCst), records);
+    assert!(
+        peak > 0,
+        "real reliable bytes must have reached the connection"
+    );
     assert!(
         peak <= SEND_HARD_CAP as u64,
         "reliable control debt retained {peak} bytes beyond existing cap {SEND_HARD_CAP}"
+    );
+    assert_eq!(
+        reached.unwrap(),
+        Some(crate::SessionAbortReason::ResourceExhausted),
+        "raw producer overload has an explicit authenticated bounded outcome"
     );
 }
 
