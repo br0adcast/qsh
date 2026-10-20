@@ -132,10 +132,15 @@ impl KnownHosts {
     }
 
     pub fn add(&self, host: &str, port: u16, key_type: &str, wire: &[u8]) -> std::io::Result<()> {
-        if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == ',' || c == '#') {
+        if host.is_empty()
+            || host.starts_with(['!', '@', '|'])
+            || host.contains(|c: char| {
+                c.is_whitespace() || matches!(c, ',' | '#' | '*' | '?' | '[' | ']')
+            })
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "host must not be empty or contain whitespace, comma, or hash",
+                "host must be nonempty and literal: no whitespace, comma, hash, wildcard, brackets, or leading !, @, or |",
             ));
         }
         if key_type.is_empty()
@@ -635,5 +640,139 @@ mod tests {
         assert!(err_comma.is_err());
         let err_hash = kh.add("host", 22, "ssh#ed25519", K1);
         assert!(err_hash.is_err());
+    }
+
+    #[test]
+    fn single_host_approval_cannot_become_a_wildcard_for_other_names() {
+        for (host, other) in [
+            ("*.example", "other.example"),
+            ("h?st.example", "host.example"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let kh = KnownHosts::new(dir.path().join("known_hosts"), None);
+            let result = kh.add(host, 22, "ssh-ed25519", K1);
+            assert!(
+                kh.lookup(other, 22).unwrap().known.is_empty(),
+                "single-host approval for {host:?} must not authorize {other:?}"
+            );
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn single_host_approval_cannot_become_another_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = KnownHosts::new(dir.path().join("known_hosts"), None);
+        let result = kh.add("[other.example]:2222", 22, "ssh-ed25519", K1);
+        assert!(
+            kh.lookup("other.example", 2222).unwrap().known.is_empty(),
+            "raw host input must not be interpreted as another host/port pair"
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn single_host_approval_rejects_syntax_before_any_store_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for host in [
+            "",
+            "host name",
+            "host\tname",
+            "host,name",
+            "host#name",
+            "*.example",
+            "h?st.example",
+            "[host]",
+            "[2001:db8::1]:2222",
+            "host]",
+            "host[",
+            "!host.example",
+            "@revoked",
+            "@host.example",
+            "|1|salt|hash",
+        ] {
+            for port in [22, 2222] {
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().join("missing").join(".ssh");
+                let kh = KnownHosts::new(parent.join("known_hosts"), None);
+                let error = kh.add(host, port, "ssh-ed25519", K1).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host:?}:{port}");
+                assert!(
+                    std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+                    "rejected {host:?}:{port} must not create a parent or file"
+                );
+
+                let path = dir.path().join("known_hosts");
+                let sentinel = line("existing.example", K2);
+                std::fs::write(&path, sentinel.as_bytes()).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+                let before = std::fs::metadata(&path).unwrap();
+                let kh = KnownHosts::new(path.clone(), None);
+                let error = kh.add(host, port, "ssh-ed25519", K1).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{host:?}:{port}");
+                let after = std::fs::metadata(&path).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), sentinel.as_bytes());
+                assert_eq!(
+                    (after.dev(), after.ino(), after.mode()),
+                    (before.dev(), before.ino(), before.mode())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_host_approval_round_trips_literal_dns_ip_and_ports_with_exact_keys() {
+        for host in [
+            "host.example",
+            "Host.Example",
+            "192.0.2.8",
+            "2001:db8::8",
+            "::1",
+        ] {
+            for port in [22, 2222] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("known_hosts");
+                let kh = KnownHosts::new(path.clone(), None);
+                kh.add(host, port, "ssh-ed25519", K1).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    line(&entry_name(host, port), K1)
+                );
+                let keys = kh.lookup(&host.to_ascii_lowercase(), port).unwrap();
+                assert_eq!(keys.known, vec![K1.to_vec()]);
+                assert!(!keys.known.contains(&K2.to_vec()));
+                assert!(keys.revoked.is_empty());
+                assert!(kh
+                    .lookup("unrelated.example", port)
+                    .unwrap()
+                    .known
+                    .is_empty());
+                assert!(kh
+                    .lookup(host, if port == 22 { 2222 } else { 22 })
+                    .unwrap()
+                    .known
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn configured_patterns_and_revocation_still_require_the_recorded_key() {
+        for pattern in [
+            "*.example,!excluded.example".to_string(),
+            hashed("host.example", b"0123456789abcdefghij"),
+        ] {
+            let (_dir, kh) = store(&line(&pattern, K1));
+            let keys = kh.lookup("host.example", 22).unwrap();
+            assert_eq!(keys.known, vec![K1.to_vec()]);
+            assert!(!keys.known.contains(&K2.to_vec()));
+            assert!(kh.lookup("excluded.example", 22).unwrap().known.is_empty());
+            let text = line(&pattern, K1) + &format!("@revoked {}", line(&pattern, K1));
+            let (_dir, kh) = store(&text);
+            let keys = kh.lookup("host.example", 22).unwrap();
+            assert!(keys.known.is_empty());
+            assert_eq!(keys.revoked, vec![K1.to_vec()]);
+            assert!(!keys.revoked.contains(&K2.to_vec()));
+        }
     }
 }
