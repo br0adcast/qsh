@@ -997,6 +997,15 @@ msg2, with the original `session_id`, and touches nothing else. Minting a
 new `session_id` there would repoint the route while the client — already
 live on the first msg2 — stayed on the old one, wedging it.
 
+An early cache hit still passes the cookie gate, Noise decryption, static-key
+policy, msg1 parsing, announced-method and required-feature checks. It then
+returns the cached reply without requesting a fresh auth nonce, generating a
+new session ID or splitting a new transport connection. Nonce-source failure
+therefore cannot block an otherwise valid cached reply. A fresh handshake
+still requires its own nonce. A handshake already in probation may later prove
+to be a twin of a competing admission; that separate completion path retains
+its normal proof/nonce accounting and login-incarnation reconciliation.
+
 `WarmReattach` swaps the new `Connection` into the still-running bridge:
 the backend is not respawned, `ResumeReset` goes to it, the route is
 repointed to the new `session_id`, and msg2 says `resumed: true`. Each

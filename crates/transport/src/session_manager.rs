@@ -102,8 +102,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::auth::{AuthVerifier, Principal, AUTH_NONCE_LEN, AUTH_STREAM, NO_INCARNATION};
 use crate::auth_acceptance::{AuthAcceptance, SessionDisposition};
 use crate::conn::{
-    AcceptOutcome, AuthPolicy, Connection, ConnectionConfig, Consumption, Datagram, Event,
-    LinkState, Msg2Inputs, Role, StreamClass,
+    AcceptedHandshake, AuthPolicy, Connection, ConnectionConfig, Consumption, Datagram, Event,
+    LinkState, Msg2Inputs, Msg2Resolution, ResolvedAccept, Role, StreamClass,
 };
 use crate::cookie::{source_group_key, CookieCheck, Verdict};
 use crate::dgram_queue::{dgram_queue, probation_dgram_queue, DgramRx, DgramTx, DGRAM_QUEUE_BYTES};
@@ -981,9 +981,9 @@ pub trait NonceSource: Send + Sync + 'static {
     fn issue(&self) -> Result<[u8; AUTH_NONCE_LEN], String>;
 
     /// Give up a nonce that was issued but will never be spent: the
-    /// handshake it belonged to was refused, discarded as a `ResendMsg2`
-    /// retransmit, authenticated by allowlist (so no proof will ever echo
-    /// it back), or its probation ended without one arriving. A tell, not
+    /// handshake it belonged to was refused, authenticated by allowlist (so
+    /// no proof will ever echo it back), or its probation ended without one
+    /// arriving. Cached msg2 replay issues no nonce. A tell, not
     /// an ask -- no result, and the caller never waits for it: like
     /// [`NonceSource::issue`], this runs on the router's own task, and must
     /// never wait on anything outside this process -- a source whose table
@@ -1300,8 +1300,8 @@ enum AcceptDecision {
     /// stored first msg1 datagram verbatim (see `driver_std`), so a lost msg2
     /// lands here, NOT on `WarmReattach`/`ColdReplace`. Idempotent: re-send the
     /// ORIGINAL msg2 (same `session_id`) and touch NOTHING else -- no new
-    /// session, no route repoint, no respawn. The freshly accepted connection
-    /// from this call is discarded.
+    /// session, no route repoint, no respawn. An early cache hit needs no
+    /// fresh connection; an already-proven in-flight twin is discarded.
     ResendMsg2,
     /// An entry exists and this is a genuine warm reconnect (a NEW ephemeral key,
     /// same token): reattach the NEW connection to the still-running backend,
@@ -2307,8 +2307,11 @@ impl SessionManager {
                 // other rejection reason (bad Noise, wrong method, unknown
                 // key), which must stay silent as they always have.
                 let mut nonce_failure: Option<String> = None;
-                let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Inputs> {
+                let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Resolution> {
                     let d = router.resolve(&msg1.token, body, msg1.start_kind);
+                    if matches!(d, AcceptDecision::ResendMsg2) {
+                        return Some(Msg2Resolution::Cached);
+                    }
                     let resumed = matches!(d, AcceptDecision::WarmReattach);
                     decision = Some(d);
                     let nonce = match issued_nonce {
@@ -2324,7 +2327,7 @@ impl SessionManager {
                             }
                         },
                     };
-                    Some(Msg2Inputs { resumed, nonce })
+                    Some(Msg2Resolution::Fresh(Msg2Inputs { resumed, nonce }))
                 };
                 // An empty allowlist admits nobody, so that `accept` could
                 // only ever reject -- and under `serve` the allowlist is
@@ -2332,11 +2335,11 @@ impl SessionManager {
                 // there. Skipping it costs nothing and saves a full Noise
                 // `accept` on every handshake, junk datagram included.
                 let mut outcome = if allowlist.is_empty() {
-                    AcceptOutcome::Rejected
+                    ResolvedAccept::Rejected
                 } else {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    Connection::accept(
+                    Connection::accept_resolved(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -2351,10 +2354,10 @@ impl SessionManager {
                         &mut resolve_for_msg2,
                     )
                 };
-                if matches!(outcome, AcceptOutcome::Rejected) && ctx.auth.verifier.is_some() {
+                if matches!(outcome, ResolvedAccept::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    outcome = Connection::accept(
+                    outcome = Connection::accept_resolved(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -2370,13 +2373,19 @@ impl SessionManager {
                     );
                 }
                 match outcome {
-                    AcceptOutcome::Accepted {
+                    ResolvedAccept::Cached {
+                        client_key: _client_key,
+                        msg1,
+                    } => {
+                        Self::resend_original_msg2(ctx, router, &msg1.token, src).await;
+                    }
+                    ResolvedAccept::Fresh(AcceptedHandshake {
                         conn,
                         client_key,
                         msg1,
                         out,
                         nonce,
-                    } => {
+                    }) => {
                         // Taken inside `accept`, above: the same decision the
                         // client was told about in msg2.
                         let decision = decision
@@ -2413,7 +2422,7 @@ impl SessionManager {
                     // the auth gate: a non-allowlisted key (or bad Noise) never
                     // reaches the reattach/replace decision, so it cannot hijack
                     // an existing token's backend.
-                    AcceptOutcome::Rejected => {
+                    ResolvedAccept::Rejected => {
                         // Self-healing guard, not a live path today:
                         // `resolve` is the LAST check inside `accept` (see
                         // that function's docs), so nothing after a
@@ -2491,16 +2500,10 @@ impl SessionManager {
             principal,
             route: _,
         } = admission;
-        // A retransmit adopts nothing on either path, and must not create a
-        // probation entry either: the client is already Live on the original
-        // session, so re-sending the ORIGINAL msg2 is the whole answer. The
-        // nonce issued for the discarded new connection will never be
-        // spent -- release it.
-        if matches!(decision, AcceptDecision::ResendMsg2) {
-            ctx.auth.nonces.release(nonce);
-            Self::resend_original_msg2(ctx, router, &msg1.token, src).await;
-            return;
-        }
+        // Early cached responses never construct an Admission. A fresh
+        // probation may still become a proven twin before it completes;
+        // on_probation_ended re-resolves that distinct race after proof.
+        debug_assert!(!matches!(decision, AcceptDecision::ResendMsg2));
         let session_id = conn.session_id();
         // Over the probation cap: drop in silence. Nothing is evicted, because
         // nothing here belongs to anyone yet, and nothing real is reachable
@@ -2748,7 +2751,7 @@ impl SessionManager {
                 // discarded connection's nonce could look unspent from this
                 // arm alone: this same arm is reached from TWO callers with
                 // different answers to "will this nonce be spent". The
-                // allowlist completion already released its own nonce, unconditionally, before ever
+                // allowlist completion already released its own nonce before
                 // reaching here. The signature path
                 // (`on_probation_ended`'s re-resolution, the "fourth
                 // outcome" of a proven twin) hands in a PROVEN connection
@@ -4843,6 +4846,7 @@ mod tests {
     use crate::auth::{encode_auth_record, AuthError, AuthRecord, Principal};
     use crate::channel::{encode_client, ChannelKind, ClientRecord, OpenRequest, CONTROL_STREAM};
     use crate::channel_server::run_channel_session;
+    use crate::conn::AcceptOutcome;
     use crate::conn::{AuthPolicy, Connection, ConnectionConfig, Consumption, Event, Role};
     use crate::cookie::{CookieCheck, LoadLimits, PROVEN_BURST, PROVEN_PER_SECOND};
     use crate::handshake::{generate_keypair, Handshake};
@@ -13823,10 +13827,8 @@ mod tests {
         );
     }
 
-    /// A `ResendMsg2` retransmit on the SIGNATURE path is caught inside
-    /// `begin_probation`, BEFORE probation is ever entered: the fresh
-    /// connection (and its freshly issued nonce) is discarded in favor of
-    /// resending the entry's cached msg2.
+    /// An early signature retransmit uses the cached response without issuing
+    /// or releasing a nonce, independently of outstanding-set cleanup.
     #[tokio::test]
     async fn outstanding_nonces_after_a_signature_resend_msg2_is_zero() {
         let token = [77u8; 16];
@@ -13876,8 +13878,12 @@ mod tests {
         .await;
 
         assert!(
+            tracking.issued_order.lock().unwrap().is_empty(),
+            "cached replay must issue no nonce"
+        );
+        assert!(
             tracking.outstanding_snapshot().is_empty(),
-            "a ResendMsg2 retransmit must release the nonce issued for the discarded connection"
+            "cached replay must leave no new nonce obligation"
         );
         assert_eq!(
             tracking.bad_releases(),
@@ -13886,14 +13892,7 @@ mod tests {
         );
     }
 
-    /// The same retransmit, on the ALLOWLIST path: caught inside
-    /// `apply_decision` (reached directly, not via `begin_probation`).
-    /// `apply_decision` itself releases nothing (see its `ResendMsg2` arm's
-    /// own comment) -- the allowlist accept's nonce is released
-    /// unconditionally in `handle_datagram`, before `apply_decision` is
-    /// even called, so this proves that single release is enough on its
-    /// own: outstanding lands at exactly empty with no second release
-    /// anywhere on this path.
+    /// The same no-new-nonce cache path under the allowlist policy.
     #[tokio::test]
     async fn outstanding_nonces_after_an_allowlist_resend_msg2_is_zero() {
         let token = [88u8; 16];
@@ -13945,8 +13944,12 @@ mod tests {
         .await;
 
         assert!(
+            tracking.issued_order.lock().unwrap().is_empty(),
+            "cached replay must issue no nonce"
+        );
+        assert!(
             tracking.outstanding_snapshot().is_empty(),
-            "an allowlist ResendMsg2 retransmit must release exactly once, not zero and not twice"
+            "allowlist cached replay must leave no new nonce obligation"
         );
         assert_eq!(
             tracking.bad_releases(),
@@ -13955,15 +13958,10 @@ mod tests {
         );
     }
 
-    /// Discrimination, not just counting: a live probation's OWN nonce
-    /// must stay outstanding while an UNRELATED, discarded handshake's
-    /// nonce is released -- so a bug that released the WRONG nonce (or
-    /// cleared the table indiscriminately) would be caught here even
-    /// though every `outstanding_nonces_after_*` test above, each landing
-    /// on empty, cannot on its own tell "released the right one" apart
-    /// from "released everything".
+    /// A cached response for token B must preserve the nonce held by token
+    /// A's still-running probation; final-empty checks alone cannot prove this.
     #[tokio::test]
-    async fn a_live_probations_nonce_survives_while_an_unrelated_discarded_ones_is_released() {
+    async fn a_live_probations_nonce_survives_an_unrelated_cached_replay() {
         let server_kp = generate_keypair();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let tracking = Arc::new(TrackingNonces::default());
@@ -14005,8 +14003,8 @@ mod tests {
         );
         let nonce_a = tracking.nth_issued(0);
 
-        // Token B: a discarded ResendMsg2 retransmit against an unrelated,
-        // already-bound entry -- its freshly issued nonce must be released.
+        // Token B: a cached retransmit against an unrelated bound entry.
+        // It must not issue or release any nonce.
         let token_b = [0xBBu8; 16];
         let (_ctl_rx, _dg_rx) = synthetic_live_entry(&mut router, token_b, 777);
         let msg1_b = signature_msg1(&server_kp.public, token_b, StartKind::Cold);
@@ -14017,17 +14015,18 @@ mod tests {
         }
         let src_b: SocketAddr = "127.0.0.1:9989".parse().unwrap();
         SessionManager::handle_datagram(&ctx, &mut router, msg1_b.len(), src_b, &msg1_b).await;
-        let nonce_b = tracking.nth_issued(1);
+        assert_eq!(
+            tracking.issued_order.lock().unwrap().len(),
+            1,
+            "cached replay must not issue another nonce"
+        );
 
         let outstanding = tracking.outstanding_snapshot();
         assert!(
             outstanding.contains(&nonce_a),
             "the live probation's own nonce must still be outstanding"
         );
-        assert!(
-            !outstanding.contains(&nonce_b),
-            "the discarded retransmit's nonce must have been released"
-        );
+        assert_eq!(outstanding, [nonce_a].into_iter().collect());
         assert_eq!(
             tracking.bad_releases(),
             0,
@@ -17400,6 +17399,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("every byte, those past 64 KiB included: {heard} heard"));
         assert_eq!(heard, 201 * 1024);
     }
+    include!("session_manager_cached_replay_tests.rs");
     include!("session_manager_auth_tests.rs");
     include!("session_manager_recovery_tests.rs");
 }
