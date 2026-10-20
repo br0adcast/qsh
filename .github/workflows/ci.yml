@@ -101,8 +101,11 @@ jobs:
       - name: Install integration test dependencies
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils
 
-      - name: Native build script controls
-        run: python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
+      - name: Build and release script controls
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_release_output.py'
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg

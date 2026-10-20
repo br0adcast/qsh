@@ -54,6 +54,14 @@ jobs:
           rustup target add "$NATIVE_TARGET"
           scripts/check-qualified-rust.sh
 
+      - name: Validate the shipped pair version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 scripts/check-release-version.py \
+                --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME")
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
       # v2.9.2, pinned by commit so a mutable tag can't change what a
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
@@ -62,7 +70,7 @@ jobs:
       - name: Install native musl and packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
+          sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg rpm rpm2cpio cpio
           # Exact patch pins, not `cargo-deb@3.8`: current cargo parses that
           # as a truncated SemVer and refuses it outright ("unexpected end of
           # input while parsing minor version number"), which failed this
@@ -94,24 +102,7 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --format-version 1 --no-deps \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"] == "qsh"))')
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            # The .tar.gz names below are built from the tag; the .deb/.rpm
-            # names (and the `--version` a user runs) come from
-            # `[workspace.package] version` in Cargo.toml instead. A tag
-            # pushed without bumping that version would ship a release
-            # where those two disagree.
-            if [ "$VERSION" != "$CARGO_VERSION" ]; then
-              echo "::error::tag $GITHUB_REF_NAME implies version $VERSION, but the workspace" \
-                   "version in Cargo.toml is $CARGO_VERSION -- bump [workspace.package] version" \
-                   "to match the tag before releasing" >&2
-              exit 1
-            fi
-          else
-            VERSION="$CARGO_VERSION"
-          fi
+          VERSION="$RELEASE_VERSION"
           mkdir -p dist
           for target in "$NATIVE_TARGET"; do
             stage="qsh-$VERSION-$target"
@@ -120,11 +111,27 @@ jobs:
             cp README.md LICENSE CHANGELOG.md "$stage/"
             cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
+            # Probes both actual stripped inputs, then checks archived bytes.
+            python3 scripts/check-release-output.py archive --version "$VERSION" \
+              --target "$target" --inputs "$stage" "dist/$stage.tar.gz"
             cargo deb -p qsh --target "$target" --no-build
             cargo generate-rpm -p cli --target "$target"
           done
           cp target/*/debian/*.deb dist/
           cp target/*/generate-rpm/*.rpm dist/
+          case "$NATIVE_TARGET" in
+            x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
+            aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
+            *) echo 'unsupported package architecture' >&2; exit 1 ;;
+          esac
+          for package in dist/*.deb; do
+            python3 scripts/check-release-output.py package --format deb --program qsh \
+              --version "$VERSION" --arch "$deb_arch" --probe "$package"
+          done
+          for package in dist/*.rpm; do
+            python3 scripts/check-release-output.py package --format rpm --program qsh \
+              --version "$VERSION" --arch "$rpm_arch" --probe "$package"
+          done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -133,7 +140,7 @@ jobs:
 
   macos:
     runs-on: macos-14
-    # Two architectures built natively-per-arch on the same runner; see the
+    # Both architectures build on one runner and must execute there; see the
     # `linux` job's timeout for why this is bounded at all.
     timeout-minutes: 45
     steps:
@@ -144,6 +151,14 @@ jobs:
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           scripts/check-qualified-rust.sh
+
+      - name: Validate the shipped pair version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 scripts/check-release-version.py \
+                --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME")
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
 
       # v2.9.2, pinned by commit so a mutable tag can't change what a
       # release run does.
@@ -184,22 +199,7 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --format-version 1 --no-deps \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"] == "qsh"))')
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            # Same check as the `linux` job: the .tar.gz name below is
-            # built from the tag, `--version` from Cargo.toml -- catch the
-            # two disagreeing before they ship.
-            if [ "$VERSION" != "$CARGO_VERSION" ]; then
-              echo "::error::tag $GITHUB_REF_NAME implies version $VERSION, but the workspace" \
-                   "version in Cargo.toml is $CARGO_VERSION -- bump [workspace.package] version" \
-                   "to match the tag before releasing" >&2
-              exit 1
-            fi
-          else
-            VERSION="$CARGO_VERSION"
-          fi
+          VERSION="$RELEASE_VERSION"
           mkdir -p dist
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             stage="qsh-$VERSION-$target"
@@ -208,6 +208,9 @@ jobs:
             cp README.md LICENSE CHANGELOG.md "$stage/"
             cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
+            # Probes both actual stripped inputs, then checks archived bytes.
+            python3 scripts/check-release-output.py archive --version "$VERSION" \
+              --target "$target" --inputs "$stage" "dist/$stage.tar.gz"
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -227,6 +230,8 @@ jobs:
   # sees it. Nothing here re-implements or second-guesses that check.
   server-packages:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     # Two containers, four packages, each rebuilding qshd with --features
     # system inside its container: under six minutes end to end on a warm
     # Docker cache (measured locally). A GitHub runner starts with no cache
@@ -238,6 +243,21 @@ jobs:
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the metadata toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          scripts/check-qualified-rust.sh
+
+      - name: Validate the shipped pair version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 scripts/check-release-version.py \
+                --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME")
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Docker ships on GitHub's ubuntu-latest runners already; the script
       # drives it directly (build the image, then run itself inside it).
@@ -301,9 +321,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
 
       - name: Run the acceptance tier
+        env:
+          EXPECTED_VERSION: ${{ needs.server-packages.outputs.version }}
         run: |
+          test -n "$EXPECTED_VERSION"
           pkg=$(ls dist/${{ matrix.glob }})
-          packaging/acceptance.sh "$pkg"
+          packaging/acceptance.sh "$pkg" "$EXPECTED_VERSION"
 
   # The cheap aarch64 tier design §11 asks for (its own words: "two
   # properties, both cheap"): the package installs under emulation, and the
@@ -349,9 +372,12 @@ jobs:
       # acceptance_client, only `docker`/`dpkg`/`dnf`, which the runner
       # already has.
       - name: Run the acceptance tier
+        env:
+          EXPECTED_VERSION: ${{ needs.server-packages.outputs.version }}
         run: |
+          test -n "$EXPECTED_VERSION"
           pkg=$(ls dist/${{ matrix.glob }})
-          packaging/acceptance.sh "$pkg"
+          packaging/acceptance.sh "$pkg" "$EXPECTED_VERSION"
 
   release:
     needs:
