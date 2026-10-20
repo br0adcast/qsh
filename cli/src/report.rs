@@ -229,13 +229,20 @@ pub fn not_the_same_server(
 /// Text from the other side, made safe for a terminal: a server must not be
 /// able to move the cursor, retitle the window or clear the screen from a
 /// line of ours. Line breaks and tabs become spaces (one line stays one
-/// line); every other control character -- C0 with ESC, DEL, C1 -- becomes
-/// `?`.
+/// line), including Unicode line/paragraph separators; every other control
+/// character -- C0 with ESC, DEL, C1 -- and Unicode Bidi_Control becomes `?`.
+/// Ordinary multilingual text and joiners remain intact. Each input scalar
+/// produces one scalar, without increasing UTF-8 length. Caller output limits
+/// still apply; this does not impose a total prompt-size or memory bound.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| match c {
-            '\n' | '\r' | '\t' => ' ',
-            c if c.is_control() => '?',
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => ' ',
+            c if c.is_control()
+                || matches!(
+                    c,
+                    '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                ) => '?',
             c => c,
         })
         .collect()
@@ -385,6 +392,67 @@ mod tests {
         );
         assert_eq!(printable("one\ntwo\r\tthree"), "one two  three");
         assert_eq!(printable("plain, ünïcode — ok"), "plain, ünïcode — ok");
+    }
+
+    #[test]
+    fn unicode_direction_and_line_controls_cannot_format_remote_text() {
+        // Unicode Bidi_Control, listed independently of the implementation.
+        for control in [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert_eq!(printable(&format!("left{control}right")), "left?right");
+        }
+        for separator in ['\u{2028}', '\u{2029}'] {
+            assert_eq!(printable(&format!("left{separator}right")), "left right");
+        }
+    }
+
+    #[test]
+    fn unicode_control_policy_reaches_warnings_and_authorization_fields() {
+        let server = connect::server_identity::ServerIdentity {
+            qsh_key: [0; 32], // Public fingerprint fixture, not a private key.
+            username: "ali\u{202e}ce\u{2029}account".into(),
+        };
+        let endpoint = connect::server_identity::SshEndpoint {
+            host: "host\u{2066}.example\u{2028}name".into(),
+            port: 22,
+        };
+        let info = ssh::HostKeyInfo {
+            key_type: "ssh-ed25519".into(),
+            key: vec![],
+            fingerprint: "SHA256:fixture\u{200f}".into(),
+        };
+        let question = ssh_authorization(&server, &endpoint, &info);
+        assert!(question.contains("(account ali?ce account)\nSSH host host?.example name:22 (SHA256:fixture?)\nAuthorize SSH recovery"));
+        assert_eq!(question.matches('\n').count(), 2);
+        assert_eq!(
+            qshd_warning("h", "care\u{061c}ful\u{2028}now"),
+            "qsh: h: qshd: care?ful now"
+        );
+        assert_eq!(
+            ssh_failed("h", &SshFailure::plain("denied\u{2069}\u{2029}again")),
+            "qsh: h: ssh: denied? again"
+        );
+        assert_eq!(
+            channel_refused("no\u{202b}\u{202c}\u{200e}shell"),
+            "qsh: server refused the shell channel: no???shell"
+        );
+    }
+
+    #[test]
+    fn unicode_scripts_and_joiners_survive_without_output_expansion() {
+        // ZWNJ, ZWJ, combining accents and variation selectors are intentional.
+        let text = "العربية עברית Кириллица 中文 e\u{301} می\u{200c}روم क्\u{200d}ष 👩\u{200d}💻 ❤️";
+        assert_eq!(printable(text), text);
+        let hostile = format!("{text}\u{202e}\u{2028}\0\n").repeat(1000);
+        let rendered = printable(&hostile);
+        assert!(rendered.len() <= hostile.len());
+        assert_eq!(rendered.chars().count(), hostile.chars().count());
+        assert!(
+            rendered == format!("{text}? ? ").repeat(1000),
+            "mixed multilingual text must keep its scalars and neutralize only controls"
+        );
     }
 
     #[test]
