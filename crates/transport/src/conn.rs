@@ -428,6 +428,34 @@ pub enum AcceptOutcome {
     },
 }
 
+/// Internal router choice after all msg1 validation, before fresh msg2 work.
+pub(crate) enum Msg2Resolution {
+    Fresh(Msg2Inputs),
+    // Only the optional async manager requests cached replies.
+    #[cfg(any(feature = "tokio-driver", test))]
+    Cached,
+}
+
+pub(crate) struct AcceptedHandshake {
+    pub(crate) conn: Connection,
+    pub(crate) client_key: [u8; 32],
+    pub(crate) msg1: Msg1Payload,
+    pub(crate) out: Vec<Datagram>,
+    pub(crate) nonce: [u8; AUTH_NONCE_LEN],
+}
+
+// Like AcceptOutcome, this is immediately destructured rather than stored.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ResolvedAccept {
+    Rejected,
+    Fresh(AcceptedHandshake),
+    #[cfg(any(feature = "tokio-driver", test))]
+    Cached {
+        client_key: [u8; 32],
+        msg1: Msg1Payload,
+    },
+}
+
 /// Summary connection statistics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
@@ -974,40 +1002,76 @@ impl Connection {
         msg1_bytes: &[u8],
         resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Inputs>,
     ) -> AcceptOutcome {
+        match Self::accept_resolved(cfg, now, src, msg1_bytes, &mut |msg1| {
+            resolve(msg1).map(Msg2Resolution::Fresh)
+        }) {
+            ResolvedAccept::Rejected => AcceptOutcome::Rejected,
+            ResolvedAccept::Fresh(AcceptedHandshake {
+                conn,
+                client_key,
+                msg1,
+                out,
+                nonce,
+            }) => AcceptOutcome::Accepted {
+                conn,
+                client_key,
+                msg1,
+                out,
+                nonce,
+            },
+            #[cfg(any(feature = "tokio-driver", test))]
+            ResolvedAccept::Cached { .. } => {
+                unreachable!("fresh-only adapter requested cached msg2")
+            }
+        }
+    }
+
+    /// Validate msg1 once for either a fresh accept or a cached response.
+    /// Cached returns before session-id generation, msg2 writing and key split;
+    /// it does not bypass any cookie gate owned by the caller or checks here.
+    pub(crate) fn accept_resolved(
+        cfg: ConnectionConfig,
+        now: Instant,
+        src: SocketAddr,
+        msg1_bytes: &[u8],
+        resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
+    ) -> ResolvedAccept {
         let mut conn = Connection::new(cfg);
         let payload_bytes = {
             let hs = match conn.handshake.as_mut() {
                 Some(h) => h,
-                None => return AcceptOutcome::Rejected,
+                None => return ResolvedAccept::Rejected,
             };
             match hs.read_msg(msg1_bytes) {
                 Ok(p) => p,
-                Err(_) => return AcceptOutcome::Rejected,
+                Err(_) => return ResolvedAccept::Rejected,
             }
         };
         let client_key = match conn.handshake.as_ref().and_then(Handshake::remote_static) {
             Some(k) if conn.auth.admits(&k) => k,
-            _ => return AcceptOutcome::Rejected,
+            _ => return ResolvedAccept::Rejected,
         };
         let msg1 = match parse_msg1(&payload_bytes) {
             Ok(m) => m,
-            Err(_) => return AcceptOutcome::Rejected,
+            Err(_) => return ResolvedAccept::Rejected,
         };
         // The client must announce the method this server actually runs:
         // silently downgrading a signature client to the allowlist path (or
         // the other way round) would leave one side thinking it authenticated.
         if msg1.method != conn.auth.method() {
-            return AcceptOutcome::Rejected;
+            return ResolvedAccept::Rejected;
         }
         let features = Features::negotiate(msg1.offered, conn.allowed_features);
         if !features.contains(conn.required_features) {
-            return AcceptOutcome::Rejected;
+            return ResolvedAccept::Rejected;
         }
         // The only call to `resolve`, and the last point at which this
         // handshake can still be refused -- see this function's docs.
         let Msg2Inputs { resumed, nonce } = match resolve(&msg1) {
-            Some(inputs) => inputs,
-            None => return AcceptOutcome::Rejected,
+            Some(Msg2Resolution::Fresh(inputs)) => inputs,
+            #[cfg(any(feature = "tokio-driver", test))]
+            Some(Msg2Resolution::Cached) => return ResolvedAccept::Cached { client_key, msg1 },
+            None => return ResolvedAccept::Rejected,
         };
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
@@ -1038,13 +1102,13 @@ impl Connection {
             bytes: encode_handshake(Kind::HandshakeResp, &msg2),
         }];
         conn.set_state(LinkState::Live);
-        AcceptOutcome::Accepted {
+        ResolvedAccept::Fresh(AcceptedHandshake {
             conn,
             client_key,
             msg1,
             out,
             nonce,
-        }
+        })
     }
 
     /// Start the connection. The client builds the IK initiator, remembers the
@@ -5584,6 +5648,75 @@ pub(crate) mod tests {
                 panic!("the handshake must be accepted");
             };
             assert_eq!(got, nonce, "accept must not alter the nonce it was given");
+        }
+    }
+
+    #[test]
+    fn cached_resolution_follows_every_msg1_validation_gate() {
+        for failure in ["none", "noise", "key", "payload", "method", "features"] {
+            let server = generate_keypair();
+            let client = generate_keypair();
+            let mut initiator = Handshake::new_initiator(&client.private, &server.public);
+            let payload = crate::handshake_payload::encode_msg1(&Msg1Payload {
+                offered: if failure == "features" {
+                    Features::NONE
+                } else {
+                    Features::SUPPORTED
+                },
+                start_kind: StartKind::Warm,
+                token: [17; 16],
+                method: if failure == "method" {
+                    AuthMethod::SshSignature
+                } else {
+                    AuthMethod::Allowlist
+                },
+            });
+            let mut body = initiator.write_msg(if failure == "payload" {
+                &[0xff]
+            } else {
+                &payload
+            });
+            if failure == "noise" {
+                body[0] ^= 1;
+            }
+            let cfg = ConnectionConfig {
+                required_features: if failure == "features" {
+                    Features::CHANNEL_GEOMETRY
+                } else {
+                    Features::NONE
+                },
+                features: Features::SUPPORTED,
+                role: Role::Server,
+                local_static_priv: server.private,
+                remote_static_pub: None,
+                auth: AuthPolicy::Allowlist(if failure == "key" {
+                    Vec::new()
+                } else {
+                    vec![client.public]
+                }),
+            };
+            let mut calls = 0;
+            let result = Connection::accept_resolved(
+                cfg,
+                Instant::now(),
+                addr("198.51.100.7:40000"),
+                &body,
+                &mut |_| {
+                    calls += 1;
+                    Some(Msg2Resolution::Cached)
+                },
+            );
+            if failure == "none" {
+                let ResolvedAccept::Cached { client_key, msg1 } = result else {
+                    panic!("validated cached outcome");
+                };
+                assert_eq!(client_key, client.public);
+                assert_eq!(msg1.token, [17; 16]);
+                assert_eq!(calls, 1);
+            } else {
+                assert!(matches!(result, ResolvedAccept::Rejected), "gate {failure}");
+                assert_eq!(calls, 0, "gate {failure} must precede cache resolution");
+            }
         }
     }
 
