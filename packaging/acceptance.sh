@@ -63,7 +63,11 @@
 # amendment says to leave it.
 #
 # Usage:
-#   packaging/acceptance.sh <path-to-qshd-package.deb-or-.rpm>
+#   packaging/acceptance.sh <path-to-qshd-package.deb-or-.rpm> [expected-version]
+#
+# Release CI supplies the producer's checked expected-version. Standalone
+# invocations without it compare the installed binary with its package version
+# and filename, without claiming a source/tag match. Host Python3 is required.
 #
 # The package's own file name decides everything else: its extension picks
 # the family (dpkg/apt for `.deb`, dnf for `.rpm`), and its architecture
@@ -124,8 +128,14 @@ ok() {
   echo "ok    $*"
 }
 
-[[ $# -eq 1 ]] || usage
+[[ $# -eq 1 || $# -eq 2 ]] || usage
 pkg=$1
+expected_args=()
+if [[ $# -eq 2 ]]; then
+  [[ -n $2 ]] || die "expected-version must not be empty"
+  expected_args=(--version "$2")
+fi
+command -v python3 >/dev/null || die "'python3' is required on the host for version validation"
 [[ -f $pkg ]] || die "no such package: $pkg"
 docker=${DOCKER:-docker}
 command -v "$docker" >/dev/null || die "'$docker' was not found; set DOCKER= to the container tool to use"
@@ -271,6 +281,27 @@ case $fmt in
 esac
 ok "$base installed"
 
+# Both tiers execute the installed daemon, before the cheap tier can return.
+# Only a bounded version line crosses back to the host; --version starts no
+# login/session. Failure still owns this fixture's container through EXIT.
+installed_version=$(dexec timeout --kill-after=1 10 /usr/bin/qshd --version \
+  | python3 "$root/scripts/check-release-output.py" text --program qshd "${expected_args[@]}") ||
+  die "installed daemon version does not match the selected release version"
+if [[ $fmt == deb ]]; then
+  package_arch=amd64
+  if [[ $arch == aarch64 ]]; then package_arch=arm64; fi
+  dexec dpkg-query -W -f '${Package}\n${Version}\n${Architecture}\n' qshd \
+    | python3 "$root/scripts/check-release-output.py" fields --format deb --program qshd \
+        --version "$installed_version" --arch "$package_arch" "$base" ||
+    die "installed Debian metadata/filename differs from the daemon version"
+else
+  dexec rpm -q --qf '%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n' qshd \
+    | python3 "$root/scripts/check-release-output.py" fields --format rpm --program qshd \
+        --version "$installed_version" --arch "$arch" "$base" ||
+    die "installed RPM metadata/filename differs from the daemon version"
+fi
+ok "installed daemon, package metadata and filename versions agree"
+
 dexec sh -c 'getent passwd qshd >/dev/null' ||
   die "the qshd system account was not created by the postinst"
 ok "account qshd exists"
@@ -325,7 +356,7 @@ if [[ $arch == aarch64 ]]; then
     *) die "the refusal must name the missing file /etc/pam.d/qshd; got: $refusal" ;;
   esac
   ok "the daemon refuses to start without its PAM service file (exit $status), under $arch emulation"
-  say "$fmt/$arch: cheap tier complete -- install and the PAM-less refusal, nothing else"
+  say "$fmt/$arch: cheap tier complete -- install, version agreement and PAM-less refusal"
   exit 0
 fi
 
