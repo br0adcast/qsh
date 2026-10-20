@@ -505,6 +505,8 @@ struct SessionUpdate {
     /// the next attempt's `Announced` without the `Idle` between them; the
     /// number is what lets it say it exactly once per attempt.
     announced: Option<u64>,
+    /// Uncommitted attempt retried only on watch or processed attachment changes.
+    pending_announcement: Option<u64>,
     /// The restart this session last joined -- the only one it may confirm.
     joined: Option<u64>,
     /// The restart this session last ended its channels for.
@@ -538,6 +540,7 @@ impl SessionUpdate {
             slot: UpdateSlot::Idle,
             task: None,
             announced: None,
+            pending_announcement: None,
             joined: None,
             reaped: None,
             released: None,
@@ -804,11 +807,49 @@ impl SessionUpdate {
         self.current_signal().phase != RestartPhase::Idle
     }
 
-    /// Tell this session's client `Restarting`, once per restart.
+    /// Admit the complete mandatory announcement before committing its state.
+    /// The watch guard establishes the source commit point; publication and
+    /// permit destruction happen outside it, since receiver wakes may publish.
     fn announce(&mut self, io: &SessionIo, restart: u64) {
-        if self.announced != Some(restart) {
-            self.announced = Some(restart);
-            io.send(CONTROL_STREAM, encode_server(&ServerRecord::Restarting));
+        let origin = io.processed_attachment();
+        let Some(rx) = &self.restart_rx else { return };
+        let signal = rx.borrow();
+        if signal.restart != restart || signal.phase == RestartPhase::Idle {
+            self.pending_announcement = None;
+            return;
+        }
+        if self.announced == Some(restart) {
+            self.pending_announcement = None;
+            return;
+        }
+        self.pending_announcement = Some(restart);
+        let reserved = io
+            .control_budget()
+            .reserve(crate::control_budget::Response::Restart);
+        match reserved {
+            Ok(response) => {
+                self.announced = Some(restart);
+                self.pending_announcement = None;
+                drop(signal);
+                let mut owner = response.into_owner();
+                let bytes = encode_server(&ServerRecord::Restarting);
+                let part = owner
+                    .take_record(bytes.len())
+                    .expect("fixed Restarting envelope");
+                io.send_session_control(bytes, part);
+            }
+            Err(_) => {
+                drop(signal);
+                // This is independent of joining the daemon's cleanup count.
+                // A captured old origin can never terminate its replacement.
+                io.resource_exhausted(origin);
+            }
+        }
+    }
+
+    fn retry_announcement(&mut self, io: &SessionIo) {
+        if let Some(restart) = self.pending_announcement {
+            self.announce(io, restart);
         }
     }
 
@@ -2036,6 +2077,7 @@ pub async fn run_channel_session_with(
                 }
                 producer.attachment = context;
                 // A cold attachment has no retained lifecycle inventory.
+                update.retry_announcement(&io);
             }
             Wakeup::Inbound(Some(SessionInbound::ResumeReset(context))) => {
                 if !context.has_geometry() {
@@ -2066,6 +2108,7 @@ pub async fn run_channel_session_with(
                 // treatment after this reattach, and the next long absence
                 // would replay its full backlog instead of a single repaint.
                 reset_attachment_outputs(&io, &mut channels, &mut exits, context);
+                update.retry_announcement(&io);
             }
             Wakeup::Inbound(Some(SessionInbound::RepaintCutover {
                 generation,
@@ -2224,7 +2267,11 @@ pub async fn run_channel_session_with(
                     send_echo_ack_if_moved(&io, *stream, ch);
                 }
             }
-            Wakeup::Restart(signal) => {
+            Wakeup::Restart(_observed) => {
+                let signal = update.current_signal();
+                if signal.phase == RestartPhase::Idle {
+                    update.pending_announcement = None;
+                }
                 opening.retain(|_, job| {
                     signal.phase == RestartPhase::Idle
                         && job.request().identity.invalidation_epoch == signal.invalidation_epoch
@@ -3181,6 +3228,7 @@ fn install_open(
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
 /// [`CONTROL_STREAM`].
+#[cfg(test)]
 fn refuse(io: &SessionIo, stream: u8, reason: String, origin: AttachmentContext) {
     io.channel_refused(origin, stream, reason);
 }
@@ -3276,6 +3324,7 @@ pub(crate) mod tests {
     include!("channel_server_update_bounds_tests.rs");
     include!("channel_server_open_bounds_tests.rs");
     include!("channel_server_snapshot_bounds_tests.rs");
+    include!("channel_server_restart_bounds_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -3654,6 +3703,10 @@ pub(crate) mod tests {
                 wait_hold: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                 broken: Arc::new(AtomicBool::new(false)),
             })
+        }
+
+        pub(crate) fn repaint_count(&self) -> usize {
+            self.repaints.lock().unwrap().len()
         }
 
         /// Every channel's process stops reading its input (`true`) or
@@ -4634,22 +4687,42 @@ pub(crate) mod tests {
         let mut owned = Vec::new();
         let mut failures = 0;
         let mut outcomes = 0;
-        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        let mut consumed = 0;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let message=outbound.recv().await.unwrap();
-                let finished=matches!(&message,SessionOutbound::Consumed{stream_id:CONTROL_STREAM,n:bytes} if *bytes==n);
+                let message = outbound.recv().await.unwrap();
+                if let SessionOutbound::Consumed {
+                    stream_id: CONTROL_STREAM,
+                    n: bytes,
+                } = &message
+                {
+                    consumed += bytes;
+                    assert!(consumed <= n, "each input byte is consumed once");
+                }
+                let finished = consumed == n;
                 match &message {
-                    SessionOutbound::ProtocolFailure{code:Some(ProtocolErrorCode::ResizePipelineOverflow),..}=>failures+=1,
-                    SessionOutbound::ChannelOutput{output:ChannelOutput::Geometry(g,_),..} if g.request_id>0=>outcomes+=1,
-                    _=>{}
+                    SessionOutbound::ProtocolFailure {
+                        code: Some(ProtocolErrorCode::ResizePipelineOverflow),
+                        ..
+                    } => failures += 1,
+                    SessionOutbound::ChannelOutput {
+                        output: ChannelOutput::Geometry(g, _),
+                        ..
+                    } if g.request_id > 0 => outcomes += 1,
+                    _ => {}
                 }
                 owned.push(message); // keep permits while the entire batch runs
-                if finished {break;}
+                if finished {
+                    break;
+                }
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         drop(inbound);
         spawner.end_channel(16);
         runner.await.unwrap();
+        assert_eq!(consumed, n);
         assert_eq!(outcomes, 128);
         assert_eq!(failures, 1);
         assert_eq!(spawner.sizes.lock().unwrap().len(), 128);

@@ -2359,9 +2359,19 @@ they were. Nothing has been announced at that point: a `Busy` never follows
 a `Restarting`, and no session is cut for an update that does not happen.
 
 Otherwise the decision is made. The daemon answers `UPDATE_RESULT
-Restarting`, sends `RESTARTING` to every session (the offering one
-included), and waits `RESTART_GRACE` (500 ms) — only for the record to reach
-the clients; admission stays closed. Then, in order:
+Restarting`, requests `RESTARTING` for every session (the offering one
+included), and waits `RESTART_GRACE` (500 ms); admission stays closed.
+Each session reserves its complete announcement before committing the source
+state. If an earlier announcement still occupies that finite envelope, the
+current authenticated attachment gets `SESSION_ABORT ResourceExhausted`, or
+ordinary `CLOSE` without negotiated `resource-limits`. Joining the daemon's
+cleanup count is independent of announcement admission; only actual channel
+and pending-open cleanup permits a counted session to confirm release.
+
+The grace period is best effort: source admission precedes bridge enqueue and
+peer ACK, and an admitted record may arrive after the restart watch advances.
+Already queued records on a replaced transport are not relabelled or replayed.
+Then, in order:
 
 1. Every session — a parked one included — is counted into the drain
    (within 1 s) and then ends and reaps its channels (within 3 s). A channel

@@ -21,7 +21,7 @@ fn capacity_callback_completed_unreaped_result_and_panic_retain_job_capacity() {
         let lifecycle = Arc::new(Lifecycle::default());
         let global = lifecycle.control_budget.clone();
         let runtime = callback_runtime();
-        let mut result = runtime.block_on(async {
+        let (mut result,) = runtime.block_on(async {
             let (entered, entry) = oneshot::channel();
             let result = lifecycle.spawn_callback(callback_lease(&lifecycle, 1), move || {
                 let _ = entered.send(());
@@ -32,7 +32,7 @@ fn capacity_callback_completed_unreaped_result_and_panic_retain_job_capacity() {
                 .await
                 .expect("actual callback entered")
                 .unwrap();
-            result
+            (result,)
         });
         // Owned runtime shutdown joins the actual worker before inspecting an
         // unreaped task. No guessed sleep establishes callback completion.
@@ -67,7 +67,6 @@ fn capacity_callback_completed_unreaped_result_and_panic_retain_job_capacity() {
 fn capacity_callback_receiver_loss_and_cancelled_drain_keep_actual_worker_owned() {
     let runtime = callback_runtime();
     let completed = Arc::new(AtomicBool::new(false));
-    let global: GlobalBudget;
     let (pending, charged, joined_before_receipt) = runtime.block_on(async {
         let lifecycle = Arc::new(Lifecycle::default());
         let global = lifecycle.control_budget.clone();
@@ -98,7 +97,7 @@ fn capacity_callback_receiver_loss_and_cancelled_drain_keep_actual_worker_owned(
         (pending, charged, (joined_before_receipt, global))
     });
     let (joined_before_receipt, owned_global) = joined_before_receipt;
-    global = owned_global;
+    let global: GlobalBudget = owned_global;
     drop(runtime);
     assert!(
         pending,

@@ -611,7 +611,7 @@ impl Links {
     fn current(&self, ev: UiEvent) -> Option<UiEvent> {
         match ev {
             UiEvent::FromLink { link, event } => {
-                current_link_event(self.live.as_ref().map(|live| live.link), link, event)
+                current_link_event(self.live.as_ref().map(|live| live.link), link, *event)
             }
             // Progress travels apart from the round's answer, so it can
             // arrive late: after the round ended, and a `Waiting` plate went
@@ -1153,8 +1153,8 @@ impl Links {
 
 /// All connection events, including terminal aborts, use the same exact link
 /// fence. Old callbacks cannot close or report a failure for a replacement.
-fn current_link_event(current: Option<u64>, link: u64, event: Box<UiEvent>) -> Option<UiEvent> {
-    (current == Some(link)).then_some(*event)
+fn current_link_event(current: Option<u64>, link: u64, event: UiEvent) -> Option<UiEvent> {
+    (current == Some(link)).then_some(event)
 }
 
 /// Whether progress stamped `round` is shown: only while it is the `current`
@@ -2251,11 +2251,7 @@ mod tests {
 
     #[test]
     fn capacity_cli_stale_abort_cannot_terminate_a_replacement_link() {
-        let abort = || {
-            Box::new(UiEvent::SessionAborted(
-                transport::SessionAbortReason::ResourceExhausted,
-            ))
-        };
+        let abort = || UiEvent::SessionAborted(transport::SessionAbortReason::ResourceExhausted);
         assert!(current_link_event(Some(8), 7, abort()).is_none());
         assert!(current_link_event(None, 7, abort()).is_none());
         assert!(matches!(

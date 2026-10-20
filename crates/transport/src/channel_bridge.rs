@@ -822,8 +822,7 @@ impl ChannelBridge {
                     now,
                     TURN_BYTES - bytes,
                     out,
-                    self.generation,
-                    control_delivery,
+                    (self.generation, &mut *control_delivery),
                 ) {
                     Step::Blocked => {}
                     Step::Sent(n) => {
@@ -878,9 +877,9 @@ impl ChannelBridge {
         now: Instant,
         remaining: usize,
         out: &mut Vec<Datagram>,
-        generation: u64,
-        control_delivery: &mut crate::control_budget::ControlLedger,
+        delivery: (u64, &mut crate::control_budget::ControlLedger),
     ) -> Step {
+        let (generation, control_delivery) = delivery;
         conn.declare_channel_output(stream, state.instance);
         if state.bootstrap {
             if matches!(
@@ -1186,8 +1185,10 @@ mod tests {
             let (client, server) = Self::pair(peer);
             let (io, _, outbound) = SessionIo::test_pair();
             let gate = io.send_gate(STREAM, crate::send_gate::GateKind::Pipe);
-            let mut bridge = ChannelBridge::default();
-            bridge.snapshots = io.resume_snapshots.clone();
+            let bridge = ChannelBridge {
+                snapshots: io.resume_snapshots.clone(),
+                ..ChannelBridge::default()
+            };
             Self {
                 bridge,
                 server,

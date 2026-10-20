@@ -21,6 +21,7 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
         records: usize,
         attempted: Arc<AtomicUsize>,
         ended: mpsc::Sender<()>,
+        first_observed: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
     impl SessionBackend for Refusals {
         fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -28,7 +29,9 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
             let records = self.records;
             let attempted = self.attempted.clone();
             let ended = self.ended.clone();
+            let first_observed = self.first_observed.lock().unwrap().take().unwrap();
             Box::pin(async move {
+                let mut first_observed = Some(first_observed);
                 let mut sent = false;
                 while let Some(event) = io.recv().await {
                     if let SessionInbound::Live(origin) = event {
@@ -37,6 +40,11 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
                             for _ in 0..records {
                                 io.channel_refused(origin, 16, reason.clone());
                                 attempted.fetch_add(1, Ordering::SeqCst);
+                                if let Some(observed) = first_observed.take() {
+                                    // Retain real first-record debt before the
+                                    // remaining burst may trigger priority abort.
+                                    let _ = observed.await;
+                                }
                             }
                             io.notify_delivered(CONTROL_STREAM, FENCE);
                         }
@@ -50,12 +58,15 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
     CONTROL_RELIABLE_PEAK.with(|peak| peak.set(0));
     CONTROL_PRODUCER_FENCE.with(|fence| fence.set(None));
     let (ended, mut end_rx) = mpsc::channel(1);
+    let (first_observed, first_receipt) = tokio::sync::oneshot::channel();
+    let mut first_observed = Some(first_observed);
     let mut rig = delivery_rig(
         Arc::new(Refusals {
             reason,
             records,
             attempted: attempted.clone(),
             ended,
+            first_observed: Mutex::new(Some(first_receipt)),
         }),
         |_| {},
     )
@@ -74,6 +85,9 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
                     let (len, source) = received.unwrap();
                     let _withheld = rig.client.on_datagram(Instant::now(), source, &packet[..len]);
                     for event in rig.client.poll_events() {
+                        if matches!(&event, Event::StreamData { stream_id: CONTROL_STREAM, data } if !data.is_empty()) {
+                            if let Some(observed) = first_observed.take() { let _ = observed.send(()); }
+                        }
                         if let Event::SessionAborted(reason) = event {
                             return Some(reason);
                         }
@@ -87,6 +101,7 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
     let peak = CONTROL_RELIABLE_PEAK.with(|peak| peak.get());
     // Drop all fixture routes/control/output senders, then await backend exit.
     // No OS children or blocking workers are launched by this backend.
+    drop(first_observed.take()); // Release the producer on every fixture result.
     drop(rig);
     tokio::time::timeout(Duration::from_secs(5), end_rx.recv())
         .await
@@ -98,8 +113,8 @@ async fn withheld_control_acks_cannot_retain_more_than_the_existing_hard_cap() {
     );
     assert_eq!(attempted.load(Ordering::SeqCst), records);
     assert!(
-        peak > 0,
-        "real reliable bytes must have reached the connection"
+        peak >= encoded.len() as u64,
+        "one complete valid record must be retained by real reliable output"
     );
     assert!(
         peak <= SEND_HARD_CAP as u64,

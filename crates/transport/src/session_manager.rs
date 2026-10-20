@@ -647,10 +647,18 @@ struct ControlOrigin {
     abort_notification_queued: bool,
 }
 struct SessionControl {
+    terminal_ready: tokio::sync::Notify,
     budget: crate::control_budget::SessionBudget,
     origin: Mutex<ControlOrigin>,
 }
 impl SessionControl {
+    fn take_priority_abort(&self) -> Option<TerminalRequest> {
+        // The ordinary queued alias may remain behind a snapshot fence.
+        // Keep its latch until that alias is actually consumed: generation
+        // churn must not enqueue another alias after this priority read.
+        self.origin.lock().unwrap().requested_abort.take()
+    }
+
     fn take_abort(&self, fallback: TerminalRequest) -> TerminalRequest {
         let mut state = self.origin.lock().unwrap();
         state.abort_notification_queued = false;
@@ -685,6 +693,7 @@ impl SessionIo {
     fn control(&self) -> &Arc<SessionControl> {
         self.control.get_or_init(|| {
             Arc::new(SessionControl {
+                terminal_ready: tokio::sync::Notify::new(),
                 budget: self.lifecycle.control_budget.session(self.principal.uid),
                 origin: Mutex::new(ControlOrigin::default()),
             })
@@ -741,11 +750,15 @@ impl SessionIo {
             origin,
             disposition,
         });
-        if state.abort_notification_queued {
-            return;
-        }
+        let enqueue_alias = !state.abort_notification_queued;
         state.abort_notification_queued = true;
         drop(state);
+        // One stored Notify permit wakes the existing fixed mailbox even
+        // when snapshot backpressure fences ordinary backend reception.
+        self.control().terminal_ready.notify_one();
+        if !enqueue_alias {
+            return;
+        }
         let notification = match disposition {
             TerminalDisposition::Close => SessionOutbound::CloseSession { origin },
             TerminalDisposition::ResourceExhausted => SessionOutbound::ResourceExhausted { origin },
@@ -871,6 +884,7 @@ impl SessionIo {
     /// so drain cannot observe an empty owner between admission and publication.
     /// Already admitted work remains owned even after a shutdown request; the
     /// supervisor must await its actual worker, regardless of stale receivers.
+    #[cfg(test)]
     pub(crate) fn spawn_owned(&self, future: impl Future<Output = ()> + Send + 'static) {
         self.lifecycle.spawn(future);
     }
@@ -904,12 +918,14 @@ impl SessionIo {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
         self.send_control(
             origin,
             crate::channel::encode_server(&crate::channel::ServerRecord::Opened { stream }),
         );
     }
+    #[cfg(test)]
     pub(crate) fn channel_refused(&self, origin: AttachmentContext, stream: u8, reason: String) {
         // Normalize before encoder allocation; the maximum is derived from
         // the actual one-byte stream prefix, not an arbitrary diagnostic cap.
@@ -3882,6 +3898,27 @@ fn drain_reserved_control(
     }
 }
 
+/// Both mailbox wake paths validate the actual target before retiring debt.
+fn apply_terminal_request(
+    conn: &mut Connection,
+    generation: u64,
+    budget: &crate::control_budget::SessionBudget,
+    request: TerminalRequest,
+    now: Instant,
+    out: &mut Vec<Datagram>,
+) {
+    if request.origin.session_id != conn.session_id() || request.origin.generation != generation {
+        return;
+    }
+    budget.retire();
+    out.extend(match request.disposition {
+        TerminalDisposition::Close => conn.close(now),
+        TerminalDisposition::ResourceExhausted => {
+            conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted)
+        }
+    });
+}
+
 /// What woke the persistent bridge loop.
 enum Wakeup {
     /// An incoming datagram routed from the manager (`None` = router gone).
@@ -3890,6 +3927,8 @@ enum Wakeup {
     Timeout,
     /// One coalesced continuation after a finite channel-output drain turn.
     Drain,
+    /// The fixed terminal mailbox became ready, independent of stream room.
+    Terminal,
     /// The backend produced an outbound message -- data or a declaration
     /// (`None` = backend finished).
     Backend(Option<SessionOutbound>),
@@ -4156,6 +4195,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             biased;
             _ = lifecycle.shutdown.requested() => break,
             c = control_rx.recv(), if control_open => Wakeup::Control(c),
+            _ = control.terminal_ready.notified() => Wakeup::Terminal,
             w = async {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
@@ -4177,6 +4217,18 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         let mut writable: Vec<u8> = Vec::new();
 
         match wakeup {
+            Wakeup::Terminal => {
+                if let Some(request) = control.take_priority_abort() {
+                    apply_terminal_request(
+                        &mut conn,
+                        link.ledger.generation(),
+                        &control_budget,
+                        request,
+                        now,
+                        &mut out,
+                    );
+                }
+            }
             Wakeup::Backend(Some(SessionOutbound::ReservedControl {
                 origin,
                 bytes,
@@ -4229,18 +4281,14 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 // Validate before retirement: stale signals cannot poison the
                 // replacement's budget or change its terminal classification.
                 let request = control.take_abort(fallback);
-                let origin = request.origin;
-                if origin.session_id == conn.session_id()
-                    && origin.generation == link.ledger.generation()
-                {
-                    control_budget.retire();
-                    out.extend(match request.disposition {
-                        TerminalDisposition::Close => conn.close(now),
-                        TerminalDisposition::ResourceExhausted => {
-                            conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted)
-                        }
-                    });
-                }
+                apply_terminal_request(
+                    &mut conn,
+                    link.ledger.generation(),
+                    &control_budget,
+                    request,
+                    now,
+                    &mut out,
+                );
             }
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
             Wakeup::Dgram(Some((src, bytes))) => {
@@ -17979,4 +18027,6 @@ mod tests {
     include!("session_manager_control_bounds_tests.rs");
     include!("session_manager_update_bounds_tests.rs");
     include!("session_manager_snapshot_bounds_tests.rs");
+    include!("session_manager_restart_bounds_tests.rs");
+    include!("session_manager_repaint_bounds_tests.rs");
 }
