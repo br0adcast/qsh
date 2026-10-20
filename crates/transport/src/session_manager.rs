@@ -85,7 +85,11 @@ mod channel_bridge;
 #[path = "session_lifecycle.rs"]
 mod lifecycle;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
+pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
+#[cfg(test)]
+#[path = "session_manager_fixture.rs"]
+pub(crate) mod fixture;
 pub use lifecycle::{Shutdown, ShutdownError};
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -651,6 +655,20 @@ impl SessionIo {
         &self.control().budget
     }
 
+    pub(crate) fn global_control_budget(&self) -> crate::control_budget::GlobalBudget {
+        self.lifecycle.control_budget.clone()
+    }
+
+    pub(crate) fn spawn_callback<T: Send + 'static>(
+        &self,
+        lease: crate::control_job::JobLease,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, CallbackFailure>> {
+        // This backend's registered parent retains custody until synchronous
+        // callback registration, even when STOP raced its earlier admission.
+        self.lifecycle.spawn_callback(lease, work)
+    }
+
     fn set_control_origin(&self, attachment: AttachmentContext) {
         let mut state = self.control().origin.lock().unwrap();
         if state.attachment != attachment {
@@ -844,7 +862,8 @@ impl SessionIo {
     /// Queue outbound bytes for `stream_id`. Non-blocking; a send after the
     /// session task has ended is silently dropped. A stream with a send gate
     /// counts the bytes on it from here until the bridge takes them (spec
-    /// §4.7.2): the queue to the bridge has no bound of its own, and a gate
+    /// §4.7.2). Control records additionally require shared response custody;
+    /// raw control overload requests an explicit scoped abort. A gate
     /// that saw only the connection's tail would let a producer faster than
     /// the bridge fill it past the gate's marks.
     pub fn send(&self, stream_id: u8, data: Vec<u8>) {

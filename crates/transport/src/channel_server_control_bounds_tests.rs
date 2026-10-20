@@ -137,3 +137,76 @@ fn about_burst_shares_one_held_provider_call() {
         "one session should share its held About computation"
     );
 }
+
+struct ResetAdmissionHooks;
+impl Drop for ResetAdmissionHooks {
+    fn drop(&mut self) {
+        CONTROL_REFUND_BEFORE_SELECT.with(|hook| drop(hook.borrow_mut().take()));
+        CONTROL_FIRST_ACK_TICK.with(|slot| drop(slot.borrow_mut().take()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_about_refund_between_admission_check_and_select_remains_ready() {
+    let _reset = ResetAdmissionHooks;
+    CONTROL_CAPACITY_WAKES.with(|count| count.set(0));
+    let (io, inbound, mut outbound) = channel_pair();
+    let held = io
+        .control_budget()
+        .reserve(crate::control_budget::Response::Ordinary(
+            crate::control_budget::MAX_RECORD,
+        ))
+        .unwrap();
+    let refunded = Arc::new(AtomicBool::new(false));
+    let observed = refunded.clone();
+    CONTROL_REFUND_BEFORE_SELECT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Release real pre-existing response custody in the precise race
+            // window. The hook changes no production admission decision.
+            drop(held);
+            observed.store(true, Ordering::SeqCst);
+        }));
+    });
+    let first_tick = Arc::new(tokio::sync::Notify::new());
+    CONTROL_FIRST_ACK_TICK.with(|slot| *slot.borrow_mut() = Some(first_tick.clone()));
+    let runner = tokio::spawn(run_channel_session_with(
+        io,
+        FakeSpawner::new(),
+        with_daemon(&FakeDaemon::new()),
+    ));
+    // Positively observe the real initial tick before submitting the request.
+    // The paused clock then has no unrelated ready timer in the race window.
+    tokio::time::timeout(std::time::Duration::from_secs(5), first_tick.notified())
+        .await
+        .unwrap();
+    let request = encode_client(&ClientRecord::AboutRequest);
+    let bytes = request.len();
+    inbound
+        .send(SessionInbound::Data(StreamData {
+            stream_id: CONTROL_STREAM,
+            data: request,
+        }))
+        .await
+        .unwrap();
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(outbound.recv().await.expect("runner alive until admission"), SessionOutbound::Consumed { stream_id: CONTROL_STREAM, n } if n == bytes) {
+                break;
+            }
+        }
+    }).await;
+    let capacity_wakes = CONTROL_CAPACITY_WAKES.with(|count| count.get());
+    drop(inbound);
+    // No callback is held; the fixture driver joins its real worker before
+    // returning. Assert only after that cleanup, including the RED outcome.
+    runner.await.unwrap();
+    assert!(admitted.is_ok(), "real pending record eventually admits");
+    assert!(
+        refunded.load(Ordering::SeqCst),
+        "failed admission reached the refund fence"
+    );
+    assert_eq!(
+        capacity_wakes, 1,
+        "refund must wake select before the next actual ACK tick rescues progress"
+    );
+}

@@ -262,7 +262,7 @@ pub enum UpdateResult {
 /// Whether `name` is an architecture name this protocol carries: lower-case
 /// letters, digits and `_`, at most [`MAX_ARCH_LEN`] bytes. Empty is allowed
 /// and means "not said" (a short [`About`]).
-fn is_arch_name(name: &str) -> bool {
+pub(crate) fn is_arch_name(name: &str) -> bool {
     name.len() <= MAX_ARCH_LEN
         && name
             .bytes()

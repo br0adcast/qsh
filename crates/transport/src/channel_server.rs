@@ -127,12 +127,11 @@ use crate::channel_timeline::{
 use crate::conn::StreamClass;
 use crate::send_gate::{GateKind, SendGate};
 use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
-#[cfg(test)]
 #[path = "control_input.rs"]
 mod control_input;
 
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
-use crate::shell_frame::{RawRecord, RecordDeframer};
+use crate::shell_frame::RawRecord;
 use crate::shell_server::{ResizeHandle, SessionScreen};
 
 /// Buffer size for a single channel read. Matches `shell_server::CHUNK_SIZE`.
@@ -396,7 +395,6 @@ enum UpdateSlot {
 
 /// What a blocking call into the daemon came back with.
 enum DaemonReply {
-    About(Option<About>),
     Offer {
         size: u64,
         decision: Result<Box<dyn UpdateTransfer>, UpdateAnswer>,
@@ -409,8 +407,64 @@ enum UpdateTaskEnd {
     Failed(UpdateResult),
 }
 
+type AboutResult = Result<Option<About>, crate::channel::AboutUnavailable>;
+const ABOUT_RECORD_MAX: usize = 5 + 8 + 32 + 1 + crate::channel::MAX_ARCH_LEN + 2;
+
+struct AboutWaiter {
+    origin: AttachmentContext,
+    response: crate::control_budget::ResponsePermit,
+}
+struct AboutFlight {
+    _job: crate::control_job::JobOwner,
+    waiters: Vec<AboutWaiter>,
+    result: tokio::sync::oneshot::Receiver<
+        Result<AboutResult, crate::session_manager::CallbackFailure>,
+    >,
+}
+
+async fn next_about(flight: &mut Option<AboutFlight>) -> AboutResult {
+    match flight.as_mut() {
+        Some(flight) => match (&mut flight.result).await {
+            Ok(Ok(result)) => result,
+            _ => Err(crate::channel::AboutUnavailable::ProviderFailed),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn send_about_result(io: &SessionIo, waiter: AboutWaiter, result: &AboutResult) {
+    let record = match result {
+        Ok(Some(about)) => ServerRecord::About(about.clone()),
+        Ok(None) => return,
+        Err(reason) => {
+            if !waiter
+                .origin
+                .features
+                .contains(crate::Features::RESOURCE_LIMITS)
+            {
+                io.close_session(waiter.origin);
+                return;
+            }
+            ServerRecord::AboutUnavailable(*reason)
+        }
+    };
+    // The provider metadata was validated on its bounded callback before this
+    // encoding. Each waiter owns its own complete byte allocation and entry.
+    let bytes = encode_server(&record);
+    let mut response = waiter.response;
+    response
+        .shrink_ordinary(bytes.len())
+        .expect("About preflight covers encoding");
+    let mut owner = response.into_owner();
+    let part = owner
+        .take_record(bytes.len())
+        .expect("one reserved About response");
+    io.send_reserved_control(waiter.origin, bytes, part);
+}
+
 /// Everything one session keeps about updating the daemon.
 struct SessionUpdate {
+    about: Option<AboutFlight>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     restart_rx: Option<watch::Receiver<RestartSignal>>,
     replies_tx: mpsc::UnboundedSender<DaemonReply>,
@@ -449,6 +503,7 @@ impl SessionUpdate {
         }
         let (replies_tx, replies_rx) = mpsc::unbounded_channel();
         SessionUpdate {
+            about: None,
             daemon,
             restart_rx,
             replies_tx,
@@ -464,16 +519,63 @@ impl SessionUpdate {
         }
     }
 
-    /// Ask the daemon about itself off the loop; the answer comes back as a
-    /// [`DaemonReply`]. Nobody behind this session: stay silent.
-    fn about(&self) {
+    /// Waiters share one actual provider call; every accepted request owns a
+    /// separate response reservation. Missing optional service stays silent.
+    fn about(
+        &mut self,
+        io: &SessionIo,
+        origin: AttachmentContext,
+        response: Option<crate::control_budget::ResponsePermit>,
+    ) {
         let Some(daemon) = self.daemon.clone() else {
             return;
         };
-        let replies = self.replies_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = replies.send(DaemonReply::About(daemon.about()));
+        let waiter = AboutWaiter {
+            origin,
+            response: response.expect("About effect requires response preflight"),
+        };
+        if let Some(flight) = self.about.as_mut() {
+            flight.waiters.push(waiter);
+            return;
+        }
+        let mut job = match crate::control_job::JobOwner::reserve(
+            io.control_budget(),
+            crate::control_budget::Job::About,
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                send_about_result(
+                    io,
+                    waiter,
+                    &Err(crate::channel::AboutUnavailable::ResourceExhausted),
+                );
+                return;
+            }
+        };
+        let lease = job.take_worker().expect("one About provider phase");
+        let result = io.spawn_callback(lease, move || {
+            let about = daemon.about();
+            if about
+                .as_ref()
+                .is_some_and(|about| !crate::channel::is_arch_name(&about.arch))
+            {
+                Err(crate::channel::AboutUnavailable::ProviderFailed)
+            } else {
+                Ok(about)
+            }
         });
+        self.about = Some(AboutFlight {
+            _job: job,
+            waiters: vec![waiter],
+            result,
+        });
+    }
+
+    fn on_about(&mut self, io: &SessionIo, result: AboutResult) {
+        let flight = self.about.take().expect("one joined provider result");
+        for waiter in flight.waiters {
+            send_about_result(io, waiter, &result);
+        }
     }
 
     fn offer(&mut self, io: &SessionIo, offer: UpdateOffer) {
@@ -498,10 +600,6 @@ impl SessionUpdate {
 
     fn on_reply(&mut self, io: &SessionIo, reply: DaemonReply) {
         match reply {
-            DaemonReply::About(Some(about)) => {
-                io.send(CONTROL_STREAM, encode_server(&ServerRecord::About(about)));
-            }
-            DaemonReply::About(None) => {}
             DaemonReply::Offer {
                 decision: Err(refusal),
                 ..
@@ -1353,6 +1451,13 @@ fn resume_producer(io: &SessionIo, ch: &mut Channel) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CONTROL_REFUND_BEFORE_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CONTROL_CAPACITY_WAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONTROL_FIRST_ACK_TICK: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What woke the runner loop.
 enum Wakeup {
     /// An inbound session event (`None` = the manager dropped the io,
@@ -1363,6 +1468,9 @@ enum Wakeup {
     ChannelOut(Option<(u8, u64, Option<Vec<u8>>)>),
     /// The short echo_ack flush timer, as in `serve_shell`.
     AckTick,
+    ControlReady,
+    CapacityReady,
+    About(AboutResult),
     OutputReady,
     OpenReady,
     Reaped(reaping::Completion),
@@ -1544,7 +1652,8 @@ pub async fn run_channel_session_with(
         attachment: AttachmentContext::default(),
         ready: Arc::new(tokio::sync::Notify::new()),
     };
-    let mut control_buf = RecordDeframer::for_control();
+    let mut control_buf = control_input::ControlInput::default();
+    let global_budget = io.global_control_budget();
     let mut control_overflow_logged = false;
     // A protocol failure stops further application input for this attachment.
     let mut unsupported_control = false;
@@ -1565,7 +1674,88 @@ pub async fn run_channel_session_with(
     ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        // Register before admission checks, including the refund/select race.
+        let capacity_changed = global_budget.changed();
+        tokio::pin!(capacity_changed);
+        capacity_changed.as_mut().enable();
+        let mut control_blocked = false;
+        let mut applied = 0;
+        let mut consumed = 0;
+        if !unsupported_control {
+            for _ in 0..crate::channel_timeline::ORDINARY_ENTRIES {
+                let raw = match control_buf.peek() {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) => break,
+                    Err(overflow) => {
+                        consumed += overflow.dropped;
+                        if !control_overflow_logged {
+                            control_overflow_logged = true;
+                            log::warn!("session control stream: a record declared a length past CONTROL_RECORD_MAX; nothing more on it is read (spec §4.16)");
+                        }
+                        break;
+                    }
+                };
+                let about_response = if update.daemon.is_some()
+                    && matches!(decode_client(raw), Ok(ClientRecord::AboutRequest))
+                {
+                    match io
+                        .control_budget()
+                        .reserve(crate::control_budget::Response::Ordinary(ABOUT_RECORD_MAX))
+                    {
+                        Ok(response) => Some(response),
+                        Err(_) => {
+                            control_blocked = true;
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (raw, n) = control_buf
+                    .complete()
+                    .expect("peek materialized one record");
+                consumed += n;
+                applied += 1;
+                if !apply_control_record(
+                    &io,
+                    &mut channels,
+                    &mut exits,
+                    &mut next_instance,
+                    &executor,
+                    &mut opening,
+                    raw,
+                    about_response,
+                    &mut term,
+                    &mut update,
+                    &producer,
+                    &mut reaps,
+                ) {
+                    unsupported_control = true;
+                    consumed += control_buf.reset();
+                    for ch in channels.values_mut() {
+                        ch.producer.failed = true;
+                        ch.producer.deferred = None;
+                    }
+                    break;
+                }
+            }
+        }
+        if consumed != 0 {
+            io.consumed(CONTROL_STREAM, consumed);
+        }
+        let more_control =
+            applied == crate::channel_timeline::ORDINARY_ENTRIES && control_buf.held() != 0;
+        #[cfg(test)]
+        if control_blocked {
+            let refund = CONTROL_REFUND_BEFORE_SELECT.with(|hook| hook.borrow_mut().take());
+            if let Some(refund) = refund {
+                refund();
+            }
+        }
         let wakeup = tokio::select! {
+            _ = std::future::ready(()), if more_control => Wakeup::ControlReady,
+            _ = &mut capacity_changed, if control_blocked => Wakeup::CapacityReady,
+            about = next_about(&mut update.about) => Wakeup::About(about),
             ev = io.recv() => Wakeup::Inbound(ev),
             c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
             _ = ack_tick.tick() => Wakeup::AckTick,
@@ -1590,39 +1780,19 @@ pub async fn run_channel_session_with(
                     continue;
                 }
                 if stream_id == CONTROL_STREAM {
-                    let records = control_buf.push(&data);
-                    if control_buf.overflowed() && !control_overflow_logged {
-                        control_overflow_logged = true;
-                        log::warn!(
-                            "session control stream: a record declared a length past \
-                             CONTROL_RECORD_MAX; nothing more on it is read (spec §4.16)"
-                        );
-                    }
-                    for raw in records {
-                        if !apply_control_record(
-                            &io,
-                            &mut channels,
-                            &mut exits,
-                            &mut next_instance,
-                            &executor,
-                            &mut opening,
-                            raw,
-                            &mut term,
-                            &mut update,
-                            &producer,
-                            &mut reaps,
-                        ) {
-                            unsupported_control = true;
-                            for ch in channels.values_mut() {
-                                ch.producer.failed = true;
-                                ch.producer.deferred = None;
+                    match control_buf.push(data) {
+                        Ok(dropped) => {
+                            if dropped != 0 {
+                                io.consumed(CONTROL_STREAM, dropped);
                             }
-                            break;
+                        }
+                        Err(data) => {
+                            let dropped = data.len() + control_buf.reset();
+                            io.consumed(CONTROL_STREAM, dropped);
+                            unsupported_control = true;
+                            io.resource_exhausted(producer.attachment);
                         }
                     }
-                    // Applied, held as an unfinished record, or dropped:
-                    // taken (spec §4.10.3).
-                    io.consumed(CONTROL_STREAM, n);
                 } else if stream_id == UPDATE_STREAM {
                     update.receive(&io, data);
                 } else if let Some(ch) = channels.get_mut(&stream_id) {
@@ -1672,7 +1842,10 @@ pub async fn run_channel_session_with(
                 producer.attachment = context;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
-                control_buf = RecordDeframer::for_control();
+                let old_input = control_buf.reset();
+                if old_input != 0 {
+                    io.consumed(CONTROL_STREAM, old_input);
+                }
                 control_overflow_logged = false;
                 unsupported_control = false;
                 // A warm reattach is a new client connection: its echo_ack
@@ -1749,6 +1922,12 @@ pub async fn run_channel_session_with(
                     }
                 }
             }
+            Wakeup::ControlReady => {}
+            Wakeup::CapacityReady => {
+                #[cfg(test)]
+                CONTROL_CAPACITY_WAKES.with(|count| count.set(count.get() + 1));
+            }
+            Wakeup::About(result) => update.on_about(&io, result),
             Wakeup::OpenReady => {}
             Wakeup::Reaped(done) => {
                 if done.code.is_none() {
@@ -1819,6 +1998,13 @@ pub async fn run_channel_session_with(
                 // is still running.
             }
             Wakeup::AckTick => {
+                #[cfg(test)]
+                {
+                    let fence = CONTROL_FIRST_ACK_TICK.with(|slot| slot.borrow_mut().take());
+                    if let Some(fence) = fence {
+                        fence.notify_one();
+                    }
+                }
                 let now = std::time::Instant::now();
                 // Flush a pending echo_ack per channel: input advanced but no
                 // output happened (the program silently ate a keystroke).
@@ -2035,7 +2221,7 @@ fn repaint_stale(io: &SessionIo, _stream: u8, ch: &mut Channel) {
 /// channel -- closing one also reaps its process (see the module docs). An
 /// `UnknownKind` record (a newer client's own evolution) is ignored in
 /// silence -- the envelope already kept the stream in sync (see
-/// [`RecordDeframer`]), so there is nothing left to resynchronise. A
+/// [`crate::shell_frame::RecordDeframer`]), so there is nothing left to resynchronise. A
 /// `Malformed` one is different: it is a broken promise from a peer that
 /// claims to speak this exact protocol, and every record on this stream is
 /// one-shot, so losing it silently would leave whatever channel it named
@@ -2049,6 +2235,7 @@ fn apply_control_record(
     executor: &crate::channel_open::ChannelOpenExecutor,
     opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
     raw: RawRecord,
+    about_response: Option<crate::control_budget::ResponsePermit>,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
     context: &ProducerContext,
@@ -2182,7 +2369,7 @@ fn apply_control_record(
                 }
             }
         }
-        Ok(ClientRecord::AboutRequest) => update.about(),
+        Ok(ClientRecord::AboutRequest) => update.about(io, context.attachment, about_response),
         Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
         Err(ChannelCodecError::UnknownKind(_)) => {}
         Err(ChannelCodecError::Malformed)
@@ -2759,6 +2946,7 @@ pub(crate) mod tests {
     include!("channel_server_reply_delivery_tests.rs");
     include!("channel_server_sync_deadline_tests.rs");
     include!("channel_server_control_bounds_tests.rs");
+    include!("channel_server_about_bounds_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -2776,6 +2964,20 @@ pub(crate) mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::sync::{Arc, Mutex};
     use tokio::sync::watch;
+
+    async fn run_channel_session_with(
+        io: SessionIo,
+        spawner: Arc<dyn ChannelSpawner>,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) {
+        crate::session_manager::fixture::drive_backend(io, move |io| {
+            super::run_channel_session_with(io, spawner, daemon)
+        })
+        .await;
+    }
+    async fn run_channel_session(io: SessionIo, spawner: Arc<dyn ChannelSpawner>) {
+        run_channel_session_with(io, spawner, None).await;
+    }
 
     fn channel_context() -> AttachmentContext {
         AttachmentContext {
@@ -3275,6 +3477,17 @@ pub(crate) mod tests {
                 .expect("the runner must answer within five seconds")
                 .expect("the runner must not drop its outbound channel");
             let msg = match msg {
+                // This standalone fixture consumes its owned record. Dropping
+                // that guard is not evidence of a real transport ACK.
+                SessionOutbound::ReservedControl {
+                    bytes, delivery, ..
+                } => {
+                    drop(delivery);
+                    SessionOutbound::Data(StreamData {
+                        stream_id: CONTROL_STREAM,
+                        data: bytes,
+                    })
+                }
                 SessionOutbound::ChannelExit { stream, code, .. } => {
                     return match code {
                         Some(code) => ServerRecord::Exit { stream, code },
@@ -4554,6 +4767,7 @@ pub(crate) mod tests {
                     ),
                     &mut HashMap::new(),
                     record,
+                    None,
                     &mut None,
                     &mut SessionUpdate::new(None),
                     &channel_producer(),
@@ -4623,6 +4837,7 @@ pub(crate) mod tests {
                     ),
                     &mut HashMap::new(),
                     record,
+                    None,
                     &mut None,
                     &mut SessionUpdate::new(None),
                     &channel_producer(),
