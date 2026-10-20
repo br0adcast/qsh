@@ -4234,6 +4234,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         }
 
         if backend_finished && pending_control.is_empty() && control_delivery.is_empty() {
+            // EOF becomes graceful only after admitted control delivery settles.
+            // A parked connection is already Closed, so close remains a no-op.
+            out.extend(conn.close(now));
+            send_all(&socket, &out).await;
             deactivate(&mut was_active, &active_count);
             let _ = done_tx.send(SessionEnded {
                 session_id: conn.session_id(),

@@ -372,3 +372,122 @@ fn capacity_boundary_repeated_attachments_keep_one_pending_overload_notification
         "generation churn must not mint exempt terminal queue entries"
     );
 }
+
+struct EofControlBackend(bool);
+impl SessionBackend for EofControlBackend {
+    fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        if self.0 {
+            io.send(
+                CONTROL_STREAM,
+                crate::channel::encode_server(&crate::channel::ServerRecord::Restarting),
+            );
+        }
+        Box::pin(async {})
+    }
+}
+
+async fn authenticated_peer_observes_backend_eof(with_control: bool) {
+    CONTROL_BACKEND_EOF.with(|count| count.set(0));
+    let mut rig = delivery_rig(Arc::new(EofControlBackend(with_control)), |_| {}).await;
+    let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
+    drop(closed_receiver);
+    drop(std::mem::replace(&mut rig.backend_out, closed_sender));
+    let mut delivered = Vec::new();
+    let mut packet = vec![0; 65536];
+    let eof = tokio::time::timeout(Duration::from_secs(5), async {
+        while CONTROL_BACKEND_EOF.with(|count| count.get()) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let retained_before_ack = rig.lifecycle.control_budget.retained_for_test();
+    // Service the real peer's ACK deadlines, without a fixed waiting window.
+    // After the bridge joins, every final send has completed and its queued
+    // packets can be drained without a negative timeout for missing Close.
+    let joined = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let deadline = rig.client.next_timeout();
+            let mut replies = tokio::select! {
+                received = rig.client_sock.recv_from(&mut packet) => {
+                    let (len, source) = received.unwrap();
+                    rig.client.on_datagram(Instant::now(), source, &packet[..len])
+                }
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => rig.client.on_timeout_if_due(Instant::now()),
+                result = &mut rig.bridge => {
+                    result.unwrap();
+                    break;
+                }
+            };
+            for event in rig.client.poll_events() {
+                if let Event::StreamData {
+                    stream_id: CONTROL_STREAM,
+                    data,
+                } = event
+                {
+                    delivered.extend(data);
+                }
+            }
+            for reply in replies.drain(..) {
+                let _ = rig.dg_tx.send(rig.peer, reply.bytes);
+            }
+        }
+    })
+    .await;
+    // Always finish fixture custody before outcome assertions, including when
+    // EOF or ACK progress failed. This backend launches no blocking workers.
+    rig.lifecycle.shutdown.request();
+    if joined.is_err() {
+        tokio::time::timeout(Duration::from_secs(5), &mut rig.bridge)
+            .await
+            .expect("fixture STOP joins bridge")
+            .unwrap();
+    }
+    rig.lifecycle.drain().await.unwrap();
+    while let Ok((len, source)) = rig.client_sock.try_recv_from(&mut packet) {
+        let _ = rig
+            .client
+            .on_datagram(Instant::now(), source, &packet[..len]);
+        for event in rig.client.poll_events() {
+            if let Event::StreamData {
+                stream_id: CONTROL_STREAM,
+                data,
+            } = event
+            {
+                delivered.extend(data);
+            }
+        }
+    }
+    assert!(eof.is_ok(), "actual backend EOF reached the bridge");
+    assert!(joined.is_ok(), "settled delivery permits graceful EOF");
+    assert_eq!(
+        retained_before_ack,
+        if with_control { (5, 1, 0) } else { (0, 0, 0) }
+    );
+    let expected = if with_control {
+        crate::channel::encode_server(&crate::channel::ServerRecord::Restarting)
+    } else {
+        Vec::new()
+    };
+    assert_eq!(delivered, expected, "admitted control precedes EOF");
+    assert!(
+        rig.client.closed_gracefully(),
+        "authenticated peer must receive Close before backend EOF teardown"
+    );
+    assert!(rig.done_rx.try_recv().unwrap().graceful);
+    assert_eq!(rig.lifecycle.control_budget.retained_for_test(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn capacity_boundary_empty_backend_eof_sends_authenticated_close() {
+    authenticated_peer_observes_backend_eof(false).await;
+}
+
+#[tokio::test]
+async fn capacity_boundary_drained_control_backend_eof_sends_authenticated_close() {
+    authenticated_peer_observes_backend_eof(true).await;
+}
