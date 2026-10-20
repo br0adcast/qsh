@@ -102,6 +102,7 @@ impl Tty {
         let mut answer = Vec::new();
         for attempt in 0..=CONFIRM_RETRIES {
             answer.clear();
+            let mut overflow = false;
             loop {
                 if cancel.is_cancelled() || crate::signals::termination_requested() {
                     return Err(ssh::SshError::Cancelled);
@@ -127,10 +128,19 @@ impl Tty {
                     Ok(0) => return Ok(false),
                     Ok(_) if byte[0] == b'\n' => break,
                     Ok(_) if answer.len() < 128 => answer.push(byte[0]),
-                    Ok(_) => return Ok(false),
+                    // Keep the rest of this rejected line away from later
+                    // questions, while retaining the same cancellation checks.
+                    Ok(_) => {
+                        overflow = true;
+                        #[cfg(test)]
+                        tests::DISCARD_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return Ok(false),
                 }
+            }
+            if overflow {
+                return Ok(false);
             }
             match String::from_utf8_lossy(&answer)
                 .trim()
@@ -278,6 +288,7 @@ impl ssh::AuthPrompter for SshPrompter {
 
 #[cfg(test)]
 mod tests {
+    include!("prompt_overflow_tests.rs");
     use super::*;
     use std::io::Read;
 
