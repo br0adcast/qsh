@@ -1452,7 +1452,6 @@ fn interactive(
             ),
             colour: caps.color != ColorDepth::Mono,
         },
-        several: a.addresses.len() > 1,
     };
     let mut sess = Session::new_with_logical_size(
         display.physical,
@@ -1810,7 +1809,6 @@ mod tests {
                     utf8: true,
                     colour: true,
                 },
-                several: false,
             },
         )
     }

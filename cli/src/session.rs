@@ -147,8 +147,6 @@ pub struct Chrome {
     /// The status line at the start (`--status`); `Ctrl-] h` toggles it.
     pub line: bool,
     pub glyphs: window::Glyphs,
-    /// More than one address: the line names the road in use.
-    pub several: bool,
 }
 
 /// The shell's size in a terminal of `cols` x `rows`: one row fewer when the
@@ -274,7 +272,7 @@ pub struct Session {
     recovery_view: Option<crate::recovery_status::View>,
     /// Seconds of silence on the road in use, from the last `Stats`.
     silent_secs: u64,
-    /// What the status line says: the road in use (when there are several)
+    /// What the status line says: the road in use
     /// and the link. Recomputed at most once a second (`LINE_REFRESH_MS`),
     /// and at once when the link, the plate or the line changes.
     line_view: (Option<String>, Link),
@@ -499,14 +497,11 @@ impl Session {
     /// Recomputes what the status line says; whether it changed.
     fn refresh_line(&mut self, now_ms: i64) -> bool {
         self.line_refreshed_ms = now_ms;
-        let road = if self.chrome.several {
-            self.roads
-                .iter()
-                .find(|r| r.in_use)
-                .map(|r| r.label.clone())
-        } else {
-            None
-        };
+        let road = self
+            .roads
+            .iter()
+            .find(|r| r.in_use)
+            .map(|r| r.label.clone());
         let view = (road, self.link_now(now_ms));
         let changed = view != self.line_view;
         self.line_view = view;
@@ -1317,7 +1312,20 @@ impl Session {
         } else {
             statusline::right_part(road.as_deref(), link)
         };
-        statusline::line(self.cols, &left, &right, alarm, self.chrome.glyphs.colour)
+        if matches!(link, Link::Latency { .. } | Link::Silent { .. })
+            && self.history_frame.is_none()
+        {
+            statusline::connected_line(
+                self.cols,
+                &left,
+                &right,
+                alarm,
+                self.chrome.glyphs.colour,
+                self.chrome.glyphs.utf8,
+            )
+        } else {
+            statusline::line(self.cols, &left, &right, alarm, self.chrome.glyphs.colour)
+        }
     }
 
     /// Paints `frame` with the client's chrome: the status line above it
@@ -1868,7 +1876,6 @@ mod tests {
                 utf8: true,
                 colour: true,
             },
-            several: false,
         }
     }
 
@@ -2937,7 +2944,6 @@ mod tests {
                 utf8: true,
                 colour: true,
             },
-            several: true,
         };
         let mut s = Session::new(
             cols,
@@ -3099,25 +3105,246 @@ mod tests {
     }
 
     #[test]
-    fn one_address_puts_no_road_on_the_line() {
-        let chrome = Chrome {
-            line: true,
-            ..plain()
-        };
-        let mut s = Session::new(40, 5, TermCaps::truecolor(), PredictMode::Never, chrome);
-        let _ = s.handle(roads_event(), 0);
-        let stats = transport::Stats {
-            rtt_ms: 42,
-            ..Default::default()
-        };
-        let _ = s.handle(UiEvent::Stats(stats), 0);
-        let _ = s.handle(UiEvent::Tick, 1_000);
-        let a = s.handle(UiEvent::Resumed, 1_001);
-        let top = row0(&a, 40, 5);
-        assert!(
-            top.trim_end().ends_with("42 ms") && !top.contains("a:1"),
-            "{top}"
+    fn a_single_destination_is_rendered_with_latency() {
+        for label in [
+            "host.example:60000",
+            "192.0.2.8:60000",
+            "[2001:db8::8]:60000",
+        ] {
+            let chrome = Chrome {
+                line: true,
+                ..plain()
+            };
+            let mut s = Session::new(60, 5, TermCaps::truecolor(), PredictMode::Never, chrome);
+            s.handle(
+                UiEvent::Roads {
+                    roads: vec![road(
+                        label,
+                        1,
+                        true,
+                        transport::paths::PathState::Verified,
+                        Some(42),
+                    )],
+                },
+                0,
+            );
+            s.handle(
+                UiEvent::Stats(transport::Stats {
+                    rtt_ms: 42,
+                    ..Default::default()
+                }),
+                0,
+            );
+            s.handle(UiEvent::Tick, 1_000);
+            let actions = s.handle(UiEvent::Resumed, 1_001);
+            let top = row0(&actions, 60, 5);
+            assert!(top.starts_with(" Ctrl-] ?"), "{top}");
+            assert!(top.ends_with(&format!("{label}  42 ms ")), "{top}");
+        }
+    }
+
+    #[test]
+    fn connected_destination_overflow_has_an_ellipsis_without_wrapping() {
+        let mut s = lined(20, 5);
+        s.handle(
+            UiEvent::Roads {
+                roads: vec![road(
+                    "very-long-host.example:60000",
+                    1,
+                    true,
+                    transport::paths::PathState::Verified,
+                    Some(42),
+                )],
+            },
+            0,
         );
+        s.handle(
+            UiEvent::Stats(transport::Stats {
+                rtt_ms: 42,
+                ..Default::default()
+            }),
+            0,
+        );
+        s.handle(UiEvent::Tick, 1_000);
+        let actions = s.handle(UiEvent::Resumed, 1_001);
+        let top = row0(&actions, 20, 5);
+        assert_eq!(top, "very-long-host.exa… ");
+        let mut terminal = terminal::TerminalCore::new(20, 5);
+        terminal.feed(&written(&actions));
+        assert!((0..20).all(|c| terminal.frame().cell(1, c).ch == ' '));
+    }
+
+    #[test]
+    fn connected_destination_resize_preserves_complete_cells_and_shell_rows() {
+        for utf8 in [true, false] {
+            let mut s = lined(60, 5);
+            s.chrome.glyphs.utf8 = utf8;
+            s.handle(UiEvent::Stream0(record(b"SHELL")), 0);
+            s.handle(
+                UiEvent::Roads {
+                    roads: vec![road(
+                        "e\u{301}界界-long.example:60000",
+                        1,
+                        true,
+                        transport::paths::PathState::Verified,
+                        Some(42),
+                    )],
+                },
+                0,
+            );
+            s.handle(
+                UiEvent::Stats(transport::Stats {
+                    rtt_ms: 42,
+                    ..Default::default()
+                }),
+                0,
+            );
+            s.handle(UiEvent::Tick, 1_000);
+            for cols in [60, 20, 6, 5, 4, 2, 1, 60] {
+                s.handle(UiEvent::Resized { cols, rows: 5 }, 1_001);
+                let actions = s.handle(UiEvent::Resumed, 1_002);
+                let mut terminal = terminal::TerminalCore::new(cols, 5);
+                terminal.feed(&written(&actions));
+                let frame = terminal.frame();
+                let top: String = (0..cols).map(|c| frame.cell(0, c).ch).collect();
+                assert_eq!(frame.cell(0, cols - 1).ch, ' ', "margin {cols}: {top}");
+                if cols == 60 {
+                    assert!(top.starts_with(" Ctrl-] ?"), "{top}");
+                    assert!(top.ends_with("42 ms "), "{top}");
+                    if utf8 {
+                        let owner = (0..cols).find(|&c| frame.cell(0, c).ch == 'e').unwrap();
+                        assert_eq!(frame.cell(0, owner).combining.as_slice(), &['\u{301}']);
+                    } else {
+                        assert!(!top.contains('界'), "{top}");
+                    }
+                } else if cols > 1 {
+                    assert!(
+                        top.ends_with(if utf8 {
+                            "… "
+                        } else if cols >= 4 {
+                            "... "
+                        } else {
+                            ". "
+                        }),
+                        "{cols}: {top}"
+                    );
+                }
+                for c in 0..cols {
+                    let flags = frame.cell(0, c).flags;
+                    if flags & terminal::FLAG_WIDE != 0 {
+                        assert!(c + 1 < cols);
+                        assert_ne!(frame.cell(0, c + 1).flags & terminal::FLAG_WIDE_SPACER, 0);
+                    }
+                    if flags & terminal::FLAG_WIDE_SPACER != 0 {
+                        assert!(c > 0);
+                        assert_ne!(frame.cell(0, c - 1).flags & terminal::FLAG_WIDE, 0);
+                    }
+                }
+                let shell: String = (0..cols).map(|c| frame.cell(1, c).ch).collect();
+                assert!(
+                    shell.starts_with(&"SHELL"[..usize::from(cols).min(5)]),
+                    "{cols}: {shell}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initially_hidden_status_does_not_cover_the_shell_with_a_destination() {
+        let mut s = Session::new(60, 5, TermCaps::truecolor(), PredictMode::Never, plain());
+        s.on_link(LinkState::Live, 0);
+        s.on_channel_ready(16, 0);
+        s.handle(UiEvent::Stream0(record(b"SHELL")), 0);
+        s.handle(
+            UiEvent::Roads {
+                roads: vec![road(
+                    "host.example:60000",
+                    1,
+                    true,
+                    transport::paths::PathState::Verified,
+                    Some(42),
+                )],
+            },
+            0,
+        );
+        s.handle(
+            UiEvent::Stats(transport::Stats {
+                rtt_ms: 42,
+                ..Default::default()
+            }),
+            0,
+        );
+        s.handle(UiEvent::Tick, 1_000);
+        let actions = s.handle(UiEvent::Resumed, 1_001);
+        assert!(row0(&actions, 60, 5).starts_with("SHELL"));
+        assert!(!screen_text(&actions, 60, 5).contains("host.example"));
+        assert_eq!(s.desired_size(), (60, 5));
+    }
+
+    #[test]
+    fn connected_destination_follows_the_active_path_and_status_visibility() {
+        let mut s = lined(60, 5);
+        s.handle(roads_event(), 0);
+        s.handle(
+            UiEvent::Stats(transport::Stats {
+                rtt_ms: 42,
+                ..Default::default()
+            }),
+            0,
+        );
+        s.handle(UiEvent::Tick, 1_000);
+        s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 1_001);
+        let hidden = s.handle(UiEvent::Resumed, 1_002);
+        assert!(!screen_text(&hidden, 60, 5).contains("a:1"));
+        assert_eq!(s.desired_size(), (60, 5));
+        s.handle(
+            UiEvent::Roads {
+                roads: vec![
+                    road(
+                        "a:1",
+                        1,
+                        false,
+                        transport::paths::PathState::Verified,
+                        Some(40),
+                    ),
+                    road(
+                        "b:2",
+                        2,
+                        true,
+                        transport::paths::PathState::Verified,
+                        Some(42),
+                    ),
+                ],
+            },
+            1_003,
+        );
+        s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 1_004);
+        let shown = s.handle(UiEvent::Resumed, 1_005);
+        assert!(row0(&shown, 60, 5).ends_with("b:2  42 ms "));
+        assert_eq!(s.desired_size(), (60, 4));
+        s.on_link_gone(1_006);
+        s.handle(
+            UiEvent::Reconnecting {
+                round: 1,
+                to: "host.example".into(),
+            },
+            1_007,
+        );
+        let reconnecting = s.handle(UiEvent::Resumed, 1_008);
+        assert!(row0(&reconnecting, 60, 5).contains("reconnecting to host.example"));
+        s.on_reattached(1_009);
+        let returned = s.handle(UiEvent::Resumed, 1_010);
+        assert!(!row0(&returned, 60, 5).contains("42 ms"));
+        s.handle(
+            UiEvent::Stats(transport::Stats {
+                rtt_ms: 38,
+                ..Default::default()
+            }),
+            1_011,
+        );
+        s.handle(UiEvent::Tick, 2_010);
+        let live = s.handle(UiEvent::Resumed, 2_011);
+        assert!(row0(&live, 60, 5).ends_with("b:2  38 ms "));
     }
 
     #[test]

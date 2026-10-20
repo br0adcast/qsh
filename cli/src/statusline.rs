@@ -89,6 +89,44 @@ pub fn scroll_part(offset: usize, total: usize) -> String {
 /// Exactly `cols` cells, all reversed. The right part ends one column before
 /// the edge; the left part is dropped when it does not fit beside it.
 pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Vec<Cell> {
+    line_with_right(cols, left, text_cells(right, true), alarm, colour)
+}
+
+/// Connected destinations use the same ellipsis glyph policy as recovery,
+/// retaining the usual one-cell right margin and dropping a hint that cannot fit.
+/// Recovery and scrollback keep their own presentation rules.
+pub(crate) fn connected_line(
+    cols: u16,
+    left: &str,
+    right: &str,
+    alarm: bool,
+    colour: bool,
+    utf8: bool,
+) -> Vec<Cell> {
+    let mut right = text_cells(right, utf8);
+    let available = usize::from(terminal_size::ViewportSize::new(cols, 0).cols()).saturating_sub(1);
+    if right.len() > available {
+        let suffix = text_cells(if utf8 { "…" } else { "..." }, utf8);
+        let suffix: Vec<_> = suffix.into_iter().take(available).collect();
+        right.truncate(available - suffix.len());
+        if right
+            .last()
+            .is_some_and(|c| c.flags & terminal::FLAG_WIDE != 0)
+        {
+            *right.last_mut().unwrap() = Cell::blank();
+        }
+        right.extend(suffix);
+    }
+    line_with_right(cols, left, right, alarm, colour)
+}
+
+fn line_with_right(
+    cols: u16,
+    left: &str,
+    right: Vec<Cell>,
+    alarm: bool,
+    colour: bool,
+) -> Vec<Cell> {
     let cols = usize::from(terminal_size::ViewportSize::new(cols, 0).cols());
     let plain = Cell {
         ch: ' ',
@@ -101,7 +139,6 @@ pub fn line(cols: u16, left: &str, right: &str, alarm: bool, colour: bool) -> Ve
     if cols == 0 {
         return cells;
     }
-    let right = text_cells(right, true);
     // The right part ends one column before the edge when it fits with that
     // margin; otherwise it starts at column 0 and is cut at the edge.
     let (start, shown) = if right.len() < cols {
