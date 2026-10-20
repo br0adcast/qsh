@@ -174,11 +174,12 @@ suspension restore the previous screen; resuming repaints the session. The top
 row normally shows qsh status, so the remote shell gets one fewer row. Mouse
 coordinates are adjusted accordingly.
 
-The status line shows the active address when there are several, latency, and
-silence duration or the recovery stage. `--status off` hides it initially; a
-temporary status display still appears during connection loss, recovery, or
-history browsing. A resize refusal also stays visible while the connection is
-live, even with status hidden. The notice does not take another remote row.
+The status line shows the active address, including for a single-server command,
+latency, and silence duration or the recovery stage. `--status off` hides it
+initially; a temporary status display still appears during connection loss,
+recovery, or history browsing. A resize refusal also stays visible while the
+connection is live, even with status hidden. The notice does not take another
+remote row.
 
 Window changes request a new remote size. Until the server confirms it, qsh
 keeps parsing output at the last committed dimensions and crops or pads that
