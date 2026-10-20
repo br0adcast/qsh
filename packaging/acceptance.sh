@@ -129,6 +129,7 @@ pkg=$1
 [[ -f $pkg ]] || die "no such package: $pkg"
 docker=${DOCKER:-docker}
 command -v "$docker" >/dev/null || die "'$docker' was not found; set DOCKER= to the container tool to use"
+command -v cmp >/dev/null || die "'cmp' (diffutils) is required on the host for byte-exact profile checks"
 
 base=$(basename -- "$pkg")
 case $base in
@@ -163,7 +164,9 @@ image=$(floor_image "$fmt")
 
 container="qshd-acceptance-$fmt-$arch-$$"
 native_uapi=
+pam_snapshot=
 cleanup() {
+  [[ -z $pam_snapshot ]] || rm -f "$pam_snapshot"
   [[ -z $native_uapi ]] || rm -rf "$native_uapi"
   "$docker" rm -f "$container" >/dev/null 2>&1 || true
 }
@@ -261,12 +264,17 @@ dexec sh -c '[ -f /etc/pam.d/qshd ]' ||
   die "/etc/pam.d/qshd is missing after install -- the package's own PAM service file"
 ok "/etc/pam.d/qshd is present"
 
-# Test the configuration that ships, not a hand-written equivalent.
+# Test the configuration that ships, not a hand-written equivalent. Compare
+# on the host: minimal package-floor images need not contain diffutils.
 profile=debian
 if [[ $fmt == rpm ]]; then profile=fedora; fi
-"$docker" cp "$root/packaging/pam.d/qshd.$profile" "$container:/tmp/expected-qshd-pam"
-dexec cmp -s /etc/pam.d/qshd /tmp/expected-qshd-pam ||
+pam_snapshot=$(mktemp)
+"$docker" cp "$container:/etc/pam.d/qshd" "$pam_snapshot" ||
+  die "could not copy the installed PAM service for byte comparison"
+cmp -s "$root/packaging/pam.d/qshd.$profile" "$pam_snapshot" ||
   die "installed PAM service differs from this checkout's package profile"
+rm -f "$pam_snapshot"
+pam_snapshot=
 ok "installed PAM profile matches the source bytes"
 
 dexec sh -c '[ -f /usr/lib/systemd/system/qshd.service ]' ||
