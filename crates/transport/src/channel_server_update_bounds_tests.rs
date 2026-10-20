@@ -542,3 +542,217 @@ async fn capacity_update_legacy_offer_panic_requests_explicit_close() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(global.retained_for_test(), (0, 0, 0));
 }
+
+#[derive(Clone, Copy, Debug)]
+enum AcceptedBoundary {
+    VerifyPanic,
+    RestartPanic,
+    Diagnostic(usize),
+}
+struct AcceptedBoundaryDaemon {
+    inner: Arc<FakeDaemon>,
+    behavior: AcceptedBoundary,
+    phases: Arc<[AtomicUsize; 3]>,
+}
+struct AcceptedBoundaryTransfer {
+    _inner: Box<dyn UpdateTransfer>,
+    behavior: AcceptedBoundary,
+    phases: Arc<[AtomicUsize; 3]>,
+}
+impl UpdateTransfer for AcceptedBoundaryTransfer {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self._inner.write(bytes)
+    }
+    fn verify(&mut self) -> Result<(), UpdateResult> {
+        self.phases[1].fetch_add(1, Ordering::SeqCst);
+        if matches!(self.behavior, AcceptedBoundary::VerifyPanic) {
+            panic!("controlled accepted verification panic");
+        }
+        Ok(())
+    }
+    fn restart(self: Box<Self>) -> UpdateResult {
+        self.phases[2].fetch_add(1, Ordering::SeqCst);
+        match self.behavior {
+            AcceptedBoundary::RestartPanic => panic!("controlled accepted restart panic"),
+            AcceptedBoundary::Diagnostic(len) => UpdateResult::Rejected {
+                code: RejectCode::ExecFailed,
+                detail: "d".repeat(len),
+            },
+            AcceptedBoundary::VerifyPanic => unreachable!("verification did not succeed"),
+        }
+    }
+}
+impl DaemonUpdates for AcceptedBoundaryDaemon {
+    fn about(&self) -> Option<About> {
+        Some(fake_about())
+    }
+    fn offer(
+        &self,
+        from: &Principal,
+        offer: &UpdateOffer,
+    ) -> Result<Box<dyn UpdateTransfer>, UpdateAnswer> {
+        self.phases[0].fetch_add(1, Ordering::SeqCst);
+        self.inner.offer(from, offer).map(|inner| {
+            Box::new(AcceptedBoundaryTransfer {
+                _inner: inner,
+                behavior: self.behavior,
+                phases: self.phases.clone(),
+            }) as Box<dyn UpdateTransfer>
+        })
+    }
+    fn restart_signal(&self) -> watch::Receiver<RestartSignal> {
+        self.inner.restart_signal()
+    }
+    fn restart_joined(&self, restart: u64) -> bool {
+        self.inner.restart_joined(restart)
+    }
+    fn channels_released(&self, restart: u64) {
+        self.inner.channels_released(restart);
+    }
+}
+
+async fn accepted_boundary_record(
+    outbound: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+) -> (ServerRecord, usize, crate::session_manager::ControlDelivery) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let (bytes, delivery) = match outbound.recv().await.unwrap() {
+                SessionOutbound::UpdateAccept {
+                    bytes,
+                    delivery,
+                    committed,
+                    ..
+                } => {
+                    // Standalone bridge commitment; retained guard is not a
+                    // transport ACK and stays held through all later phases.
+                    let _ = committed.send(());
+                    (bytes, delivery)
+                }
+                SessionOutbound::ReservedSessionControl { bytes, delivery } => (bytes, delivery),
+                _ => continue,
+            };
+            let raw = RecordDeframer::for_control().push(&bytes).remove(0);
+            return (decode_server(&raw).unwrap(), bytes.len(), delivery);
+        }
+    })
+    .await
+    .expect("accepted update produces its bounded mandatory outcome")
+}
+
+async fn accepted_boundary_case(behavior: AcceptedBoundary) {
+    let phases = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+    let inner = FakeDaemon::new();
+    let provider = Arc::new(AcceptedBoundaryDaemon {
+        inner: inner.clone(),
+        behavior,
+        phases: phases.clone(),
+    });
+    let (io, inbound, mut outbound) = about_pair();
+    let global = io.global_control_budget();
+    let ordinary = io
+        .control_budget()
+        .reserve(crate::control_budget::Response::Ordinary(
+            crate::control_budget::MAX_RECORD,
+        ))
+        .unwrap();
+    let runner = tokio::spawn(run_channel_session_with(
+        io,
+        FakeSpawner::new(),
+        Some(provider),
+    ));
+    inbound.send(control(offer_of(0))).await.unwrap();
+    let mut results = vec![accepted_boundary_record(&mut outbound).await];
+    results.push(accepted_boundary_record(&mut outbound).await);
+    if !matches!(behavior, AcceptedBoundary::VerifyPanic) {
+        results.push(accepted_boundary_record(&mut outbound).await);
+    }
+    let retained_before_guard_drop = global.retained_for_test();
+    drop(inbound);
+    runner.await.unwrap();
+    drop(outbound);
+    let actual_phases = std::array::from_fn::<_, 3, _>(|i| phases[i].load(Ordering::SeqCst));
+    let result_bytes: usize = results.iter().map(|(_, len, _)| len).sum();
+    let records: Vec<_> = results
+        .iter()
+        .map(|(record, _, _)| record.clone())
+        .collect();
+    let encoded_lengths: Vec<_> = results.iter().map(|(_, len, _)| *len).collect();
+    drop(results);
+    let retained_after_guard_drop = global.retained_for_test();
+    drop(ordinary);
+
+    assert_eq!(records[0], ServerRecord::UpdateAnswer(UpdateAnswer::Accept));
+    assert_eq!(
+        actual_phases,
+        [
+            1,
+            1,
+            usize::from(!matches!(behavior, AcceptedBoundary::VerifyPanic))
+        ]
+    );
+    assert!(
+        !inner.busy.load(Ordering::SeqCst),
+        "transfer cleanup completed"
+    );
+    assert_eq!(
+        retained_before_guard_drop,
+        (2 * crate::control_budget::MAX_RECORD + 12, 2, 0),
+        "actual joined job refunded while independent record guards retain envelope"
+    );
+    assert_eq!(
+        retained_after_guard_drop,
+        (crate::control_budget::MAX_RECORD, 1, 0)
+    );
+    assert_eq!(global.retained_for_test(), (0, 0, 0));
+    assert!(result_bytes <= crate::control_budget::MAX_RECORD + 12);
+    if !matches!(behavior, AcceptedBoundary::VerifyPanic) {
+        assert_eq!(
+            records[1],
+            ServerRecord::UpdateResult(UpdateResult::Restarting)
+        );
+    }
+    let expected = match behavior {
+        AcceptedBoundary::VerifyPanic | AcceptedBoundary::RestartPanic => UpdateResult::Rejected {
+            code: RejectCode::Other,
+            detail: "the update provider failed".into(),
+        },
+        AcceptedBoundary::Diagnostic(len) => UpdateResult::Rejected {
+            code: RejectCode::ExecFailed,
+            detail: if len > crate::shell_frame::CONTROL_RECORD_MAX - 2 {
+                crate::channel::OVERSIZED_CONTROL_DIAGNOSTIC.into()
+            } else {
+                "d".repeat(len)
+            },
+        },
+    };
+    assert_eq!(records.last(), Some(&ServerRecord::UpdateResult(expected)));
+    if matches!(behavior, AcceptedBoundary::Diagnostic(len) if len == crate::shell_frame::CONTROL_RECORD_MAX - 2)
+    {
+        assert_eq!(
+            encoded_lengths,
+            vec![6, 6, crate::control_budget::MAX_RECORD]
+        );
+        assert_eq!(result_bytes, crate::control_budget::MAX_RECORD + 12);
+    }
+}
+
+#[tokio::test]
+async fn capacity_update_accepted_phase_panics_refund_actual_jobs_under_ordinary_saturation() {
+    for behavior in [
+        AcceptedBoundary::VerifyPanic,
+        AcceptedBoundary::RestartPanic,
+    ] {
+        accepted_boundary_case(behavior).await;
+    }
+}
+
+#[tokio::test]
+async fn capacity_update_maximum_and_oversize_final_diagnostic_fit_three_record_chain() {
+    for len in [
+        17,
+        crate::shell_frame::CONTROL_RECORD_MAX - 2,
+        crate::shell_frame::CONTROL_RECORD_MAX - 1,
+    ] {
+        accepted_boundary_case(AcceptedBoundary::Diagnostic(len)).await;
+    }
+}
