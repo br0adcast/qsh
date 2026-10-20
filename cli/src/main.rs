@@ -610,10 +610,9 @@ impl Links {
     /// for a round's progress once that round is not the one under way.
     fn current(&self, ev: UiEvent) -> Option<UiEvent> {
         match ev {
-            UiEvent::FromLink { link, event } => match &self.live {
-                Some(live) if live.link == link => Some(*event),
-                _ => None,
-            },
+            UiEvent::FromLink { link, event } => {
+                current_link_event(self.live.as_ref().map(|live| live.link), link, *event)
+            }
             // Progress travels apart from the round's answer, so it can
             // arrive late: after the round ended, and a `Waiting` plate went
             // up that it must not replace.
@@ -759,6 +758,9 @@ impl Links {
                     self.replacement_at = Some(addr);
                 }
                 let (code, line) = match stop {
+                    Stop::SessionAborted { reason, .. } => {
+                        (1, Some(crate::connect::abort_line_code(reason)))
+                    }
                     Stop::KeyChanged { .. } => (11, self.round_line.take()),
                     Stop::SessionGone { addr } => (
                         13,
@@ -1147,6 +1149,12 @@ impl Links {
         }
         self.resolver
     }
+}
+
+/// All connection events, including terminal aborts, use the same exact link
+/// fence. Old callbacks cannot close or report a failure for a replacement.
+fn current_link_event(current: Option<u64>, link: u64, event: UiEvent) -> Option<UiEvent> {
+    (current == Some(link)).then_some(event)
 }
 
 /// Whether progress stamped `round` is shown: only while it is the `current`
@@ -2140,5 +2148,117 @@ mod tests {
             vec![0, 2],
             "the window keeps the command line's numbering"
         );
+    }
+    #[test]
+    fn capacity_cli_action_executor_retains_abort_notice_before_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let args = args::parse_args(&["fixture@127.0.0.1:60022".into()]).unwrap();
+        let addresses = args.addresses.clone();
+        let setup = Arc::new(Setup::new(
+            args,
+            transport::generate_keypair(),
+            sshauth::known_hosts::KnownHosts::open(home.path().join("known_hosts")),
+            Box::new(trust::UdpDiscovery),
+            prompt::Tty::at(home.path().join("no-tty")),
+            known_hosts::KnownHosts::new(home.path().join("ssh_known_hosts"), None),
+            None,
+            None,
+            [1; 16],
+        ));
+        let epoch = RecoveryEpoch {
+            connection: 1,
+            network: 1,
+        };
+        let (tx, _rx) = mpsc::channel();
+        // No live link, recovery round, DNS request or terminal reader is started.
+        let mut links = Links {
+            setup,
+            live: None,
+            shell_channel: None,
+            attachment_intent: None,
+            next_link: 1,
+            reconnect: Reconnect::new(0),
+            catalog: RoadCatalog::new(addresses.clone(), epoch),
+            addresses,
+            at: 0,
+            labels: Vec::new(),
+            roads_at: None,
+            resolver: BoundedResolver::new(),
+            road_epoch: epoch,
+            road_origin: Instant::now(),
+            road_active: "127.0.0.1:60022".parse().unwrap(),
+            refusal: None,
+            probe_attempt: 0,
+            keep: false,
+            round: None,
+            rounds: 0,
+            round_line: None,
+            farewell: None,
+            stopped: false,
+            replacement_at: None,
+            tx,
+        };
+        for reason in [
+            transport::SessionAbortReason::ResourceExhausted,
+            transport::SessionAbortReason::Unknown(200),
+        ] {
+            let mut sess = geometry_session();
+            let mut actions = sess.handle(UiEvent::SessionAborted(reason), 0);
+            let exit_is_last = matches!(actions.last(), Some(Action::Exit(1)));
+            let writes: Vec<u8> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Write(bytes) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .flatten()
+                .copied()
+                .collect();
+            // Transport delivers the terminal reason and Closed in the same batch.
+            actions.extend(sess.handle(UiEvent::Link(LinkState::Closed), 0));
+            let mut stdout = Vec::new();
+            let mut notices = Vec::new();
+            assert_eq!(
+                apply_actions(actions, &mut stdout, &mut links, &mut sess, &mut notices, 0),
+                Some(1)
+            );
+            assert_eq!(
+                notices,
+                vec![connect::abort_line_code(match reason {
+                    transport::SessionAbortReason::ResourceExhausted => 1,
+                    transport::SessionAbortReason::Unknown(code) => code,
+                })],
+                "the real executor must capture the reason before its first Exit"
+            );
+            assert!(exit_is_last);
+            assert_eq!(
+                stdout, writes,
+                "terminal restoration writes precede the exit"
+            );
+            assert!(sess.handle(UiEvent::SessionAborted(reason), 1).is_empty());
+            let closed = sess.handle(UiEvent::Link(LinkState::Closed), 1);
+            assert_eq!(
+                apply_actions(closed, &mut stdout, &mut links, &mut sess, &mut notices, 1),
+                Some(1)
+            );
+            assert_eq!(
+                notices.len(),
+                1,
+                "duplicate Closed preserves the failure and notice"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_cli_stale_abort_cannot_terminate_a_replacement_link() {
+        let abort = || UiEvent::SessionAborted(transport::SessionAbortReason::ResourceExhausted);
+        assert!(current_link_event(Some(8), 7, abort()).is_none());
+        assert!(current_link_event(None, 7, abort()).is_none());
+        assert!(matches!(
+            current_link_event(Some(8), 8, abort()),
+            Some(UiEvent::SessionAborted(
+                transport::SessionAbortReason::ResourceExhausted
+            ))
+        ));
     }
 }

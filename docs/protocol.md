@@ -182,11 +182,26 @@ is a type byte followed by big-endian fields:
   0x07 PATH_PROBE      token(u32)
   0x08 PATH_PROBE_ACK  token(u32)
   0x09 CREDIT          stream_id(1)  limit(u32)
+  0x0a SESSION_ABORT   reason(1)
 ```
 
 `CREDIT` goes only to a peer that agreed `stream-credit` (§2.6, §7): a parser
 from before it would stop at the unknown type and drop the rest of the
 datagram.
+
+`SESSION_ABORT` is sent only with negotiated `resource-limits` (§2.6).
+Reason `1` is ResourceExhausted; unknown reasons remain terminal with a generic
+abort description. It is a fixed authenticated service frame, independent of
+reliable control-stream credit. Its receiver records the reason before `Closed`
+and tears down the exact session rather than retaining it for warm resume.
+Unnegotiated aborts have no terminal authority; unauthenticated, replayed, or
+other-session packets follow the ordinary transport rejection rules.
+
+Emission is best effort, like `CLOSE`: it does not prove peer delivery or resource
+cleanup. A peer without `resource-limits` receives ordinary `CLOSE` without an
+invented specific reason. The CLI exits with failure for an authenticated abort
+and does not try another key, address, SSH fallback, or reconnect round. Its
+existing generic-close behavior remains the legacy fallback.
 
 `decode_all` parses frames back to back and is written against untrusted
 input: a truncated frame or an unknown type stops the parse and returns
@@ -416,7 +431,8 @@ connection will do (`enabled`, §2.2).
 | 2 (`0x0000_0004`) | `offset-wrap` | stream offsets modulo 2³² (§7) |
 | 3 (`0x0000_0008`) | `auth-accepted` | explicit committed session admission on server-direction stream 15 (§3.4); required by application channel peers |
 | 4 (`0x0000_0010`) | `channel-geometry` | ordered geometry and atomic channel lifecycle discovery; required by application channel peers |
-| 5–31 | — | reserved, sent as zero |
+| 5 (`0x0000_0020`) | `resource-limits` | authenticated terminal session abort and explicit daemon capacity/provider failures |
+| 6–31 | — | reserved, sent as zero |
 
 - A client offers what it implements (`Features::SUPPORTED`).
 - A server turns a bit on exactly when msg1 offered it, its configuration
@@ -437,8 +453,8 @@ Generic transport-only profiles can explicitly require `Features::NONE`; this
 does not relax the application channel profile. Raw echo/shell diagnostic owners
 exclude `auth-accepted` because they do not implement the session acknowledgement.
 
-`Features::SUPPORTED` is `0x1f`: header AAD, credits, offset wrapping, explicit
-authentication acceptance and channel geometry. Protocol 1 datagrams are ignored at the outer parser; silence alone
+`Features::SUPPORTED` is `0x3f`: header AAD, credits, offset wrapping, explicit
+authentication acceptance, channel geometry and resource-limit failures. Protocol 1 datagrams are ignored at the outer parser; silence alone
 does not identify a peer's version. The CLI reports that protocol 2 is required
 when no compatible reply arrives. Configured SSH installation/recovery remains
 a separate path, not a protocol-1 QSH session.
@@ -2063,6 +2079,7 @@ Records on `CONTROL_STREAM`, in the envelope of §1.5:
 | `0x28` `PROTOCOL_ERROR` | server | `code(u16)` |
 | `0x29` `CHANNEL_SNAPSHOT` | server | one atomic active/draining lifecycle snapshot after warm attachment |
 | `0x24` `ABOUT` | server | `build(u64) checksum(32) arch_len(1) arch protocol(1) mode(1)` |
+| `0x2b` `ABOUT_UNAVAILABLE` | server | `reason(1)`: ResourceExhausted (`1`) or ProviderFailed (`2`); only with `resource-limits` |
 | `0x25` `UPDATE_ANSWER` | server | a code; `Busy` adds `others(u32)` |
 | `0x26` `UPDATE_RESULT` | server | a code; `Rejected` adds `reason_code(1)` and a UTF-8 detail, `Busy` adds `others(u32)` |
 | `0x27` `RESTARTING` | server | the daemon is about to replace itself — empty body |
@@ -2117,7 +2134,13 @@ an empty architecture, protocol `0`, mode `0`). A field cut off half-way is
 skipped. `mode` is `0` for a daemon a client installed and keeps up to date,
 anything else for one a service manager or a package owns. Answer codes:
 `0 Accept`, `1 UpToDate`, `2 DaemonNewer`, `3 Busy`, `4 Managed`,
-`5 ArchMismatch`, `6 TooLarge`, `7 NotAllowed`, `8 InProgress`. Result codes:
+`5 ArchMismatch`, `6 TooLarge`, `7 NotAllowed`, `8 InProgress`,
+`9 ResourceExhausted`, `10 ProviderFailed`. Codes 9 and 10 are sent only with
+`resource-limits`, have exactly one payload byte, and mean no update was
+accepted. `ABOUT_UNAVAILABLE` also has exactly one payload byte; unknown reason
+values are retained explicitly. Open admission uses the existing typed
+`REFUSED` for the requested stream. These failures do not use `PROTOCOL_ERROR`.
+Result codes:
 `0 Restarting`, `1 Rejected`, `2 Busy`. `Rejected` carries a reason code,
 then an English detail meant for a log: `0 other`, `1 size mismatch`,
 `2 checksum mismatch`, `3 self-check failed`, `4 version not accepted`,
@@ -2127,6 +2150,14 @@ replaced). An unknown code is kept as such
 (`Unknown`), not treated as malformed. `arch` is lower-case letters, digits
 and `_`, at most `MAX_ARCH_LEN` = 32 bytes. `PROTOCOL_VERSION` is `2`;
 `qshd self-check` advertises `protocols:[2]`.
+
+An update is accepted only after its reserved `Accept` record is committed to
+its original authenticated transport. Before that commitment, a replaced
+attachment's offer decision is discarded and receiving does not start. After
+acceptance the operation survives a warm attachment replacement; newly produced
+results target the currently authenticated attachment. Records already queued
+on a replaced transport are not relabelled or replayed. As with other transport
+teardown, replacement does not guarantee receipt of an unacknowledged old record.
 
 The `screen` flag is what the client *asks for*, not what it gets: the
 server declares a channel's recoverability from the spawned channel's own
@@ -2328,9 +2359,19 @@ they were. Nothing has been announced at that point: a `Busy` never follows
 a `Restarting`, and no session is cut for an update that does not happen.
 
 Otherwise the decision is made. The daemon answers `UPDATE_RESULT
-Restarting`, sends `RESTARTING` to every session (the offering one
-included), and waits `RESTART_GRACE` (500 ms) — only for the record to reach
-the clients; admission stays closed. Then, in order:
+Restarting`, requests `RESTARTING` for every session (the offering one
+included), and waits `RESTART_GRACE` (500 ms); admission stays closed.
+Each session reserves its complete announcement before committing the source
+state. If an earlier announcement still occupies that finite envelope, the
+current authenticated attachment gets `SESSION_ABORT ResourceExhausted`, or
+ordinary `CLOSE` without negotiated `resource-limits`. Joining the daemon's
+cleanup count is independent of announcement admission; only actual channel
+and pending-open cleanup permits a counted session to confirm release.
+
+The grace period is best effort: source admission precedes bridge enqueue and
+peer ACK, and an admitted record may arrive after the restart watch advances.
+Already queued records on a replaced transport are not relabelled or replayed.
+Then, in order:
 
 1. Every session — a parked one included — is counted into the drain
    (within 1 s) and then ends and reaps its channels (within 3 s). A channel

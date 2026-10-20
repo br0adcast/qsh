@@ -115,17 +115,32 @@ mod async_open_tests {
             ),
             SessionOutbound::ChannelExit { stream, code, .. } => (
                 CONTROL_STREAM,
-                encode_server(&match code { Some(code) => ServerRecord::Exit { stream, code }, None => ServerRecord::ExitStatusUnavailable { stream } }),
+                encode_server(&match code {
+                    Some(code) => ServerRecord::Exit { stream, code },
+                    None => ServerRecord::ExitStatusUnavailable { stream },
+                }),
             ),
-            SessionOutbound::ChannelOutput { stream, instance, output, .. } => {
+            SessionOutbound::ChannelOutput {
+                stream,
+                instance,
+                output,
+                ..
+            } => {
                 let record = match output {
                     ChannelOutput::Geometry(record, _) => ShellRecord::Geometry(record),
                     ChannelOutput::Data(bytes) => ShellRecord::Data(bytes),
                     ChannelOutput::EchoAck(offset, _) => ShellRecord::EchoAck(offset),
-                    ChannelOutput::OutputGap(cause, _) => ShellRecord::OutputGap { instance, cause },
+                    ChannelOutput::OutputGap(cause, _) => {
+                        ShellRecord::OutputGap { instance, cause }
+                    }
                     ChannelOutput::DeliveryMarker(..) => return Vec::new(),
                 };
                 (stream, encode_shell(&record).unwrap())
+            }
+            SessionOutbound::ReservedControl { bytes, .. }
+            | SessionOutbound::ReservedSessionControl { bytes, .. } => {
+                // Standalone model delivery consumes guards, not a peer ACK.
+                (CONTROL_STREAM, bytes)
             }
             SessionOutbound::Data(data) => (data.stream_id, data.data),
             SessionOutbound::ProtocolFailure { .. } => panic!("fixture server protocol failure"),
@@ -244,8 +259,11 @@ mod async_open_tests {
             .unwrap();
         let snapshot = loop {
             let message = next(&mut output, "resume snapshot").await;
-            if let SessionOutbound::ResumeBarrier { generation } = message {
-                break snapshots(generation).expect("actual runner snapshot");
+            if let SessionOutbound::ResumeSnapshotReady = message {
+                // Standalone mailbox inspection consumes guards, not peer ACK.
+                let (generation, snapshot) = snapshots().expect("actual runner snapshot");
+                assert_eq!(generation, resumed.generation);
+                break snapshot;
             }
         };
         assert_eq!(

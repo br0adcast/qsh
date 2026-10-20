@@ -756,6 +756,14 @@ mod lifecycle_tests {
                     SessionOutbound::ChannelRefused { stream, reason, .. } => {
                         return ServerRecord::Refused { stream, reason }
                     }
+                    SessionOutbound::ReservedControl { bytes, .. }
+                    | SessionOutbound::ReservedSessionControl { bytes, .. } => {
+                        // Standalone fixture consumption drops delivery custody;
+                        // it is not a peer ACK or reliable delivery assertion.
+                        if let Some(raw) = records.push(&bytes).first() {
+                            return decode_server(raw).unwrap();
+                        }
+                    }
                     SessionOutbound::Data(data) if data.stream_id == CONTROL_STREAM => {
                         if let Some(raw) = records.push(&data.data).first() {
                             return decode_server(raw).unwrap();
@@ -826,10 +834,8 @@ mod lifecycle_tests {
             .unwrap();
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let Some(SessionOutbound::ResumeBarrier { generation }) =
-                    sessions[0].1.recv().await
-                {
-                    break sessions[0].4(generation).expect("the actual resume snapshot");
+                if let Some(SessionOutbound::ResumeSnapshotReady) = sessions[0].1.recv().await {
+                    break sessions[0].4().expect("the actual resume snapshot").1;
                 }
             }
         })

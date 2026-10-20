@@ -754,6 +754,12 @@ impl<'a> Climb<'a> {
         use ::connect::reconnect::RoundEnd;
         if !self.background() {
             return match give_up {
+                GiveUp::SessionAborted { reason, .. } => {
+                    let line = attempt::abort_line_code(reason);
+                    eprintln!("{line}");
+                    log::shown(&line);
+                    Climbed::Exit(1)
+                }
                 GiveUp::KeyChanged { .. } => Climbed::Exit(11),
                 GiveUp::Declined { .. } => Climbed::Exit(1),
                 GiveUp::SessionGone { .. } => {
@@ -775,6 +781,10 @@ impl<'a> Climb<'a> {
             };
         }
         match give_up {
+            GiveUp::SessionAborted { addr, reason } => Climbed::Failed {
+                end: RoundEnd::SessionAborted { addr, reason },
+                line: Some(attempt::abort_line_code(reason)),
+            },
             GiveUp::KeyChanged { addr } => Climbed::Failed {
                 end: RoundEnd::KeyChanged { addr },
                 line: self.loud.take(),
@@ -1139,6 +1149,15 @@ impl<'a> Climb<'a> {
                 self.proved(host, port, &server);
             }
             match verdict {
+                Verdict::SessionAborted(reason) => {
+                    self.forget(&att);
+                    return Ok((
+                        DirectOutcome::SessionAborted {
+                            reason: attempt::abort_code(reason),
+                        },
+                        None,
+                    ));
+                }
                 Verdict::ProtocolFailure(failure) => {
                     self.forget(&att);
                     let why = protocol_why(failure);
@@ -1196,6 +1215,15 @@ impl<'a> Climb<'a> {
             self.proved(host, port, &server);
         }
         match verdict {
+            Verdict::SessionAborted(reason) => {
+                self.forget(&att);
+                (
+                    DirectOutcome::SessionAborted {
+                        reason: attempt::abort_code(reason),
+                    },
+                    None,
+                )
+            }
             Verdict::ProtocolFailure(failure) => {
                 self.forget(&att);
                 let why = protocol_why(failure);
