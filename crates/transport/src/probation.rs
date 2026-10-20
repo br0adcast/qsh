@@ -190,6 +190,7 @@ pub(crate) const PROBATION_UNDELIVERED_MAX: usize = 64 * 1024;
 /// The bridge that binds a proven connection lets it go
 /// (`session_manager::adopt_connection`).
 pub(crate) fn hold_for_probation(conn: &mut Connection) {
+    conn.restrict_to_handshake_source();
     conn.set_undelivered_cap(PROBATION_UNDELIVERED_MAX);
     // What arrives before the proof is taken only when a backend takes it
     // (spec §4.10.3): counted explicitly, like every connection a bridge
@@ -781,6 +782,7 @@ fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("probation_source_tests.rs");
     use crate::auth::{encode_auth_record, AuthRecord, AuthV2, AUTH_RECORD_VERSION};
     use crate::conn::{AcceptOutcome, AuthPolicy, ConnectionConfig, Msg2Inputs, Role};
     use crate::dgram_queue::{dgram_queue, DgramTx};
@@ -1380,9 +1382,16 @@ mod tests {
     }
 
     fn accepted_pair(nonce: [u8; AUTH_NONCE_LEN], method: AuthMethod) -> (Connection, Fixture) {
+        accepted_pair_at(nonce, method, "127.0.0.1:1".parse().unwrap())
+    }
+
+    fn accepted_pair_at(
+        nonce: [u8; AUTH_NONCE_LEN],
+        method: AuthMethod,
+        src: SocketAddr,
+    ) -> (Connection, Fixture) {
         let server_kp = generate_keypair();
         let client_kp = generate_keypair();
-        let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let mut client = Connection::new(ConnectionConfig {
             required_features: crate::Features::NONE,
             features: crate::Features::SUPPORTED,
@@ -2478,8 +2487,8 @@ mod tests {
 
     /// Final review C1, ruling R15, in the shape of the review's probe: an
     /// unproven peer with credits negotiated sends a `Reset` on every
-    /// stream number, lets the timers run, then PINGs -- from its own
-    /// address and from a spoofed one the connection follows. Before the
+    /// stream number, lets the timers run, then PINGs from its handshake
+    /// source. Other-source rejection is covered separately. Before the
     /// fix the Resets drew 512 datagrams at once and 774 repeats over
     /// 10 s, and each 39-byte PING drew 257 datagrams (10 279 bytes), all
     /// of them to the spoofed address when it was the source. Now the
@@ -2515,11 +2524,9 @@ mod tests {
                 .count();
         }
         assert_eq!(credits, 0, "no CREDIT repeats over 10 s");
-        let victim: SocketAddr = "192.0.2.7:9".parse().unwrap();
         for round in 0..3u32 {
             let ping = client.frames_for_test(vec![StreamFrame::Ping { token: 77 + round }]);
-            let from = if round == 0 { fixture.src } else { victim };
-            let answers = conn.on_datagram(now, from, &ping[0].bytes);
+            let answers = conn.on_datagram(now, fixture.src, &ping[0].bytes);
             let frames: Vec<StreamFrame> = answers
                 .iter()
                 .filter_map(|d| client.peek_frames(&d.bytes))
@@ -2537,7 +2544,7 @@ mod tests {
     /// Ruling R16 (spec §4.11): a datagram is answered once, whatever it
     /// packs. Answers used to be built frame by frame: one 1 384-byte
     /// datagram of 270 PINGs from a peer in probation drew 270 PONG
-    /// datagrams to the forged source it moved the session to, 270
+    /// datagrams, 270
     /// PathProbes as many PathProbeAcks, 160 empty DATA frames 160 ACKs
     /// (final re-review of slice 4, N1).
     #[test]
@@ -2546,23 +2553,23 @@ mod tests {
         let mut conn = fixture.conn;
         hold_for_probation(&mut conn);
         let now = Instant::now();
-        let victim: SocketAddr = "192.0.2.7:9".parse().unwrap();
-        let prober: SocketAddr = "192.0.2.8:9".parse().unwrap();
+        let peer = fixture.src;
+        let prober = fixture.src;
         let read = |client: &Connection, out: &[Datagram]| -> Vec<StreamFrame> {
             out.iter()
                 .filter_map(|d| client.peek_frames(&d.bytes))
                 .flatten()
                 .collect()
         };
-        // 270 PINGs from a forged source: one PONG, for the last, to it.
+        // 270 PINGs from the handshake source: one PONG, for the last, to it.
         let dg = client.packed_for_test(
             (0..270u32)
                 .map(|token| StreamFrame::Ping { token })
                 .collect(),
         );
-        let out = conn.on_datagram(now, victim, &dg.bytes);
+        let out = conn.on_datagram(now, peer, &dg.bytes);
         assert_eq!(out.len(), 1, "one datagram");
-        assert_eq!(out[0].to, victim);
+        assert_eq!(out[0].to, peer);
         assert_eq!(read(&client, &out), vec![StreamFrame::Pong { token: 269 }]);
         // 270 PathProbes: one answer, alone, to the datagram's own source.
         let dg = client.packed_for_test(
@@ -2587,7 +2594,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let out = conn.on_datagram(now, victim, &dg.bytes);
+        let out = conn.on_datagram(now, peer, &dg.bytes);
         assert_eq!(out.len(), 1);
         assert_eq!(
             read(&client, &out),
@@ -2607,7 +2614,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let out = conn.on_datagram(now, victim, &dg.bytes);
+        let out = conn.on_datagram(now, peer, &dg.bytes);
         assert_eq!(out.len(), 1, "160 six-byte ACKs fit one datagram");
         let frames = read(&client, &out);
         assert_eq!(frames.len(), 160);
@@ -2625,7 +2632,7 @@ mod tests {
             data: Vec::new(),
         }));
         let dg = client.packed_for_test(mixed);
-        let out = conn.on_datagram(now, victim, &dg.bytes);
+        let out = conn.on_datagram(now, peer, &dg.bytes);
         assert_eq!(
             out.len(),
             2,
