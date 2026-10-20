@@ -17,6 +17,8 @@ mod congestion;
 pub mod conn;
 #[cfg(feature = "tokio-driver")]
 mod control_budget;
+#[cfg(feature = "tokio-driver")]
+mod control_job;
 pub mod cookie;
 #[cfg(feature = "tokio-driver")]
 mod dgram_queue;

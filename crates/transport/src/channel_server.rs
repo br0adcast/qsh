@@ -131,10 +131,6 @@ use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
 #[path = "control_input.rs"]
 mod control_input;
 
-#[cfg(test)]
-#[path = "control_job.rs"]
-mod control_job;
-
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
 use crate::shell_frame::{RawRecord, RecordDeframer};
 use crate::shell_server::{ResizeHandle, SessionScreen};
