@@ -20,6 +20,7 @@
 //!   subsequent `expire` on the common paths anyway). This is the only
 //!   arithmetic deviation.
 
+use crate::budget::{self, Budget, Exhausted};
 use crate::keystroke::{KeyAction, KeystrokeParser};
 use crate::overlay::{
     ConditionalCursorMove, ConditionalOverlayCell, ConditionalOverlayRow, Validity,
@@ -55,9 +56,23 @@ pub enum DisplayPreference {
     Adaptive,
 }
 
-/// Input prediction engine. Holds overlays (`overlays`) and cursor predictions
-/// (`cursors`), the sent/acked frame numbers, epochs, and triggers.
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct ObservedWork {
+    culls: u64,
+    cells: u64,
+    cursors: u64,
+}
+
+/// Input prediction engine with bounded speculative backing and work.
+/// Input parsing and authoritative frame cloning remain independent of speculation.
 pub struct PredictionEngine {
+    budget: Budget,
+    suppressed_until: Option<i64>,
+    active_cells: usize,
+    overlay_cells: usize,
+    #[cfg(test)]
+    observed_work: ObservedWork,
     last_byte: u8,
     parser: KeystrokeParser,
 
@@ -90,6 +105,12 @@ impl PredictionEngine {
     /// mosh (`prediction_epoch = 1`, `confirmed_epoch = 0`, `send_interval = 250`).
     pub fn new(pref: DisplayPreference) -> Self {
         PredictionEngine {
+            budget: Budget::default(),
+            suppressed_until: None,
+            active_cells: 0,
+            overlay_cells: 0,
+            #[cfg(test)]
+            observed_work: ObservedWork::default(),
             last_byte: 0,
             parser: KeystrokeParser::new(),
             overlays: Vec::new(),
@@ -113,6 +134,13 @@ impl PredictionEngine {
 
     /// Change the display mode.
     pub fn set_display_preference(&mut self, pref: DisplayPreference) {
+        if pref == DisplayPreference::Never {
+            if self.local_frame_sent > self.local_frame_late_acked {
+                self.suppress();
+            } else {
+                self.release();
+            }
+        }
         self.display_preference = pref;
     }
 
@@ -128,6 +156,9 @@ impl PredictionEngine {
     /// synchronously sending a keystroke).
     pub fn set_local_frame_sent(&mut self, x: i64) {
         self.local_frame_sent = x;
+        if let Some(until) = &mut self.suppressed_until {
+            *until = (*until).max(x);
+        }
     }
 
     /// Set the echo-ack watermark: moves BOTH `local_frame_acked` AND
@@ -156,17 +187,7 @@ impl PredictionEngine {
     // Whether there are any active predictions at all (a port of mosh's raw
     // `PredictionEngine::active`). Used inside `cull` for the srtt hysteresis.
     fn has_active_overlays(&self) -> bool {
-        if !self.cursors.is_empty() {
-            return true;
-        }
-        for row in &self.overlays {
-            for cell in &row.overlay_cells {
-                if cell.base.active {
-                    return true;
-                }
-            }
-        }
-        false
+        !self.cursors.is_empty() || self.active_cells != 0
     }
 
     // Condition for showing predictions (a port of the gate in mosh's `apply`):
@@ -183,16 +204,24 @@ impl PredictionEngine {
     /// AND a display trigger has fired (a port of `active()` as interpreted by
     /// the display -- the display gate plus the presence of active predictions).
     pub fn active(&self) -> bool {
-        self.showing() && self.has_active_overlays()
+        self.suppressed_until.is_none() && self.showing() && self.has_active_overlays()
     }
 
     /// Overlay the active predictions onto a COPY of frame `fb` and return it.
     /// If there is nothing to show (`!active()`), return an unmodified copy
     /// (a port of mosh's display condition: `apply` is a no-op when prediction
     /// is inactive).
-    pub fn apply(&self, fb: &Frame) -> Frame {
+    pub fn apply(&mut self, fb: &Frame) -> Frame {
         let mut clone = fb.clone();
         if !self.active() {
+            return clone;
+        }
+        if self
+            .budget
+            .work(self.cursors.len() + self.overlays.len() + self.overlay_cells)
+            .is_err()
+        {
+            self.suppress();
             return clone;
         }
         for c in &self.cursors {
@@ -207,8 +236,38 @@ impl PredictionEngine {
     /// Reset all predictions (a port of `reset`): clear overlays/cursors and
     /// move to a new epoch.
     pub fn reset(&mut self) {
-        self.cursors.clear();
-        self.overlays.clear();
+        self.release();
+        self.become_tentative();
+    }
+
+    /// Start a new authenticated connection's input-offset scope. Visual resets,
+    /// resizes and display preferences must keep using `reset` instead.
+    /// The keystroke parser continues across the reconnect, as before.
+    pub fn reset_connection(&mut self) {
+        self.reset();
+        self.suppressed_until = None;
+        self.local_frame_sent = 0;
+        self.local_frame_acked = 0;
+        self.local_frame_late_acked = 0;
+        self.budget.acknowledged();
+    }
+
+    fn release(&mut self) {
+        // Cell is Copy; destroying a row visits only its bounded nested vectors.
+        // Their cleanup was reserved when the row was created.
+        self.overlays = Vec::new();
+        self.cursors = Vec::new();
+        self.active_cells = 0;
+        self.overlay_cells = 0;
+        self.budget.release_all();
+    }
+
+    fn suppress(&mut self) {
+        self.suppressed_until = Some(
+            self.local_frame_sent
+                .max(self.suppressed_until.unwrap_or(0)),
+        );
+        self.release();
         self.become_tentative();
     }
 
@@ -219,75 +278,131 @@ impl PredictionEngine {
     // Kill an ambiguous epoch: drop that epoch's predictions, recreate the
     // cursor from the actual position, and move to a new epoch (a port of
     // `kill_epoch`).
-    fn kill_epoch(&mut self, epoch: i64, fb: &Frame) {
+    fn kill_epoch(&mut self, epoch: i64, fb: &Frame) -> budget::Result {
+        self.budget.work(self.cursors.len())?;
         self.cursors.retain(|c| !c.base.tentative(epoch - 1));
         // The constructor keeps the `+ 1` as in mosh (see the module doc comment).
         let exp = self.local_frame_sent + 1;
         let pe = self.prediction_epoch;
-        self.cursors.push(ConditionalCursorMove::new(
-            exp,
-            fb.cursor_row as i32,
-            fb.cursor_col as i32,
-            pe,
-        ));
+        if self.cursors.len() == self.budget.max_cursors() {
+            return Err(Exhausted);
+        }
+        budget::push(
+            &mut self.cursors,
+            ConditionalCursorMove::new(exp, fb.cursor_row as i32, fb.cursor_col as i32, pe),
+            &mut self.budget,
+        )?;
         self.cursor_mut().base.active = true;
         for row in &mut self.overlays {
+            self.budget.work(1)?;
             for cell in &mut row.overlay_cells {
+                self.budget.work(1)?;
                 if cell.base.tentative(epoch - 1) {
+                    self.active_cells -= usize::from(cell.base.active);
                     cell.reset();
                 }
             }
         }
         self.become_tentative();
+        Ok(())
     }
 
     // Ensure a current-epoch cursor prediction exists (a port of `init_cursor`).
     // The constructors keep the `+ 1` as in mosh.
-    fn init_cursor(&mut self, fb: &Frame) {
+    fn init_cursor(&mut self, fb: &Frame) -> budget::Result {
         let exp = self.local_frame_sent + 1;
         let pe = self.prediction_epoch;
         if self.cursors.is_empty() {
-            self.cursors.push(ConditionalCursorMove::new(
-                exp,
-                fb.cursor_row as i32,
-                fb.cursor_col as i32,
-                pe,
-            ));
+            if self.cursors.len() == self.budget.max_cursors() {
+                return Err(Exhausted);
+            }
+            budget::push(
+                &mut self.cursors,
+                ConditionalCursorMove::new(exp, fb.cursor_row as i32, fb.cursor_col as i32, pe),
+                &mut self.budget,
+            )?;
             self.cursor_mut().base.active = true;
         } else if self.cursor().base.tentative_until_epoch != pe {
             let (r, c) = {
                 let cu = self.cursor();
                 (cu.row, cu.base.col)
             };
-            self.cursors.push(ConditionalCursorMove::new(exp, r, c, pe));
+            if self.cursors.len() == self.budget.max_cursors() {
+                return Err(Exhausted);
+            }
+            budget::push(
+                &mut self.cursors,
+                ConditionalCursorMove::new(exp, r, c, pe),
+                &mut self.budget,
+            )?;
             self.cursor_mut().base.active = true;
         }
+        Ok(())
     }
 
     // Find or create an overlay row for the given row number; return its index
     // in `overlays` (a port of `get_or_make_row`, but returning an index --
     // Rust's borrow checker).
-    fn get_or_make_row(&mut self, row_num: i32, num_cols: i32) -> usize {
-        if let Some(idx) = self.overlays.iter().position(|r| r.row_num == row_num) {
-            return idx;
+    fn get_or_make_row(&mut self, row_num: i32, num_cols: i32) -> budget::Result<usize> {
+        for (idx, row) in self.overlays.iter().enumerate() {
+            self.budget.work(1)?;
+            if row.row_num == row_num {
+                return Ok(idx);
+            }
         }
-        let mut r = ConditionalOverlayRow {
-            row_num,
-            overlay_cells: Vec::with_capacity(num_cols.max(0) as usize),
-        };
-        for i in 0..num_cols {
-            r.overlay_cells
-                .push(ConditionalOverlayCell::new(0, i, self.prediction_epoch));
+        let width = num_cols.max(0) as usize;
+        self.budget.reserve_cleanup(2 * width + 1)?;
+        let mut cells = Vec::new();
+        budget::reserve(&mut cells, width, &mut self.budget)?;
+        for i in 0..width {
+            self.budget.work(1)?;
+            cells.push(ConditionalOverlayCell::new(
+                0,
+                i as i32,
+                self.prediction_epoch,
+            ));
         }
-        self.overlays.push(r);
-        self.overlays.len() - 1
+        budget::push(
+            &mut self.overlays,
+            ConditionalOverlayRow {
+                row_num,
+                overlay_cells: cells,
+            },
+            &mut self.budget,
+        )?;
+        self.overlay_cells += width;
+        Ok(self.overlays.len() - 1)
     }
 
     /// Retire/confirm predictions against the authoritative frame `fb` (a port
     /// of `cull`). `now_ms` is the current time (ms) for glitch timing.
     pub fn cull(&mut self, fb: &Frame, now_ms: i64) {
+        // Only an ACK consumed together with an authoritative frame can open a
+        // new episode. A setter, resize, mode switch or partial ACK cannot.
+        if let Some(until) = self.suppressed_until {
+            if self.local_frame_late_acked < until {
+                return;
+            }
+            self.suppressed_until = None;
+            self.budget.acknowledged();
+        } else if self.local_frame_late_acked >= self.local_frame_sent {
+            self.budget.acknowledged();
+        }
+        if self.cull_inner(fb, now_ms).is_err() {
+            self.suppress();
+            // This frame already consumed the complete ACK. Abandoning costly
+            // validation must not leave an already-satisfied fence for the next
+            // input setter to extend before another frame arrives.
+            if self.local_frame_late_acked >= self.local_frame_sent {
+                self.suppressed_until = None;
+                self.budget.acknowledged();
+            }
+        }
+    }
+
+    fn cull_inner(&mut self, fb: &Frame, now_ms: i64) -> budget::Result {
         if self.display_preference == DisplayPreference::Never {
-            return;
+            return Ok(());
         }
 
         if self.last_height != fb.height() || self.last_width != fb.width() {
@@ -296,6 +411,11 @@ impl PredictionEngine {
             self.reset();
         }
 
+        #[cfg(test)]
+        {
+            self.observed_work.culls += 1;
+        }
+        self.budget.work(1)?;
         let now = now_ms;
 
         // srtt_trigger with hysteresis.
@@ -325,16 +445,36 @@ impl PredictionEngine {
 
         let mut row_i = 0;
         while row_i < self.overlays.len() {
+            self.budget.work(1)?;
             let row_num = self.overlays[row_i].row_num;
             if row_num < 0 || row_num >= fb.height() as i32 {
-                self.overlays.remove(row_i);
+                self.budget.work(self.overlays.len() - row_i)?;
+                let row = self.overlays.remove(row_i);
+                let mut bytes =
+                    row.overlay_cells.capacity() * std::mem::size_of::<ConditionalOverlayCell>();
+                for cell in &row.overlay_cells {
+                    bytes += cell.original_contents.capacity() * std::mem::size_of::<Cell>();
+                    self.active_cells -= usize::from(cell.base.active);
+                }
+                self.overlay_cells -= row.overlay_cells.len();
+                self.budget.release_row(bytes, row.overlay_cells.len());
                 continue;
             }
             let ncells = self.overlays[row_i].overlay_cells.len();
             let mut j = 0;
             while j < ncells {
-                let validity =
-                    self.overlays[row_i].overlay_cells[j].get_validity(fb, row_num, early, late);
+                #[cfg(test)]
+                {
+                    self.observed_work.cells += 1;
+                }
+                self.budget.work(1)?;
+                let validity = self.overlays[row_i].overlay_cells[j].validity_budgeted(
+                    fb,
+                    row_num,
+                    early,
+                    late,
+                    &mut self.budget,
+                )?;
                 match validity {
                     Validity::IncorrectOrExpired => {
                         if self.overlays[row_i].overlay_cells[j]
@@ -344,10 +484,10 @@ impl PredictionEngine {
                             let tue = self.overlays[row_i].overlay_cells[j]
                                 .base
                                 .tentative_until_epoch;
-                            self.kill_epoch(tue, fb);
+                            self.kill_epoch(tue, fb)?;
                         } else {
                             self.reset();
-                            return;
+                            return Ok(());
                         }
                     }
                     Validity::Correct => {
@@ -370,14 +510,19 @@ impl PredictionEngine {
                         let col_j = self.overlays[row_i].overlay_cells[j].base.col;
                         let actual = *fb.cell(row_num as u16, col_j as u16);
                         for k in j..ncells {
+                            self.budget.work(1)?;
                             let repl = &mut self.overlays[row_i].overlay_cells[k].replacement;
                             repl.fg = actual.fg;
                             repl.bg = actual.bg;
                             repl.flags = actual.flags;
                         }
+                        self.active_cells -=
+                            usize::from(self.overlays[row_i].overlay_cells[j].base.active);
                         self.overlays[row_i].overlay_cells[j].reset();
                     }
                     Validity::CorrectNoCredit => {
+                        self.active_cells -=
+                            usize::from(self.overlays[row_i].overlay_cells[j].base.active);
                         self.overlays[row_i].overlay_cells[j].reset();
                     }
                     Validity::Pending => {
@@ -400,27 +545,38 @@ impl PredictionEngine {
         }
 
         // Cursor predictions.
+        #[cfg(test)]
+        if !self.cursors.is_empty() {
+            self.observed_work.cursors += 1;
+        }
+        self.budget.work(usize::from(!self.cursors.is_empty()))?;
         if !self.cursors.is_empty()
             && self.cursor().get_validity(fb, early, late) == Validity::IncorrectOrExpired
         {
             self.reset();
-            return;
+            return Ok(());
         }
-        self.cursors
-            .retain(|c| c.get_validity(fb, early, late) == Validity::Pending);
+        self.budget.work(self.cursors.len())?;
+        #[cfg(test)]
+        let observed_work = &mut self.observed_work;
+        self.cursors.retain(|c| {
+            #[cfg(test)]
+            {
+                observed_work.cursors += 1;
+            }
+            c.get_validity(fb, early, late) == Validity::Pending
+        });
+        Ok(())
     }
 
     /// Spawn a prediction from a single input byte (a port of `new_user_byte`).
     /// `now_ms` is the current time (ms).
     pub fn new_user_byte(&mut self, byte: u8, fb: &Frame, now_ms: i64) {
-        if self.display_preference == DisplayPreference::Never {
-            return;
-        }
-
         self.cull(fb, now_ms);
+        self.parse_byte(byte, fb, now_ms);
+    }
 
-        let now = now_ms;
-
+    fn parse_byte(&mut self, byte: u8, fb: &Frame, now: i64) {
         let mut the_byte = byte;
         // Application-mode cursor function (ESC O ...) -> ANSI (ESC [ ...).
         if self.last_byte == 0x1b && the_byte == b'O' {
@@ -428,201 +584,236 @@ impl PredictionEngine {
         }
         self.last_byte = the_byte;
 
-        let width = fb.width() as i32;
-
         for act in self.parser.input(the_byte) {
-            match act {
-                KeyAction::Print(ch) => {
-                    self.init_cursor(fb);
-                    if ch == '\u{7f}' {
-                        // Backspace.
-                        let cur_row = self.cursor().row;
-                        let row_idx = self.get_or_make_row(cur_row, width);
-                        if self.cursor().base.col > 0 {
-                            self.cursor_mut().base.col -= 1;
-                            let lfs = self.local_frame_sent;
-                            self.cursor_mut().base.expire(lfs, now);
-                            let col = self.cursor().base.col;
-                            let epoch = self.prediction_epoch;
-                            if self.predict_overwrite {
-                                let orig = *fb.cell(fb.cursor_row, fb.cursor_col);
-                                let cell = &mut self.overlays[row_idx].overlay_cells[col as usize];
-                                cell.reset_with_orig();
-                                cell.base.active = true;
-                                cell.base.tentative_until_epoch = epoch;
-                                cell.base.expire(lfs, now);
-                                cell.original_contents.push(orig);
-                                // replacement = orig, then clear()+append(' ').
-                                cell.replacement = orig;
-                                cell.replacement.set_char(' ');
-                            } else {
-                                for i in col..width {
-                                    let orig = *fb.cell(cur_row as u16, i as u16);
-                                    let (next_active, next_unknown, next_repl, next_actual) =
-                                        if i + 2 < width {
-                                            let nc = &self.overlays[row_idx].overlay_cells
-                                                [(i + 1) as usize];
-                                            (
-                                                nc.base.active,
-                                                nc.unknown,
-                                                nc.replacement,
-                                                *fb.cell(cur_row as u16, (i + 1) as u16),
-                                            )
-                                        } else {
-                                            (false, false, Cell::blank(), Cell::blank())
-                                        };
-                                    let cell =
-                                        &mut self.overlays[row_idx].overlay_cells[i as usize];
-                                    cell.reset_with_orig();
-                                    cell.base.active = true;
-                                    cell.base.tentative_until_epoch = epoch;
-                                    cell.base.expire(lfs, now);
-                                    cell.original_contents.push(orig);
-                                    if i + 2 < width {
-                                        if next_active {
-                                            if next_unknown {
-                                                cell.unknown = true;
-                                            } else {
-                                                cell.unknown = false;
-                                                cell.replacement = next_repl;
-                                            }
-                                        } else {
-                                            cell.unknown = false;
-                                            cell.replacement = next_actual;
-                                        }
-                                    } else {
-                                        cell.unknown = true;
-                                    }
-                                }
-                            }
-                        }
-                    } else if (ch as u32) < 0x20 || ch.width() != Some(1) {
-                        // Control/wide/zero-width character -- unreliable to
-                        // predict.
-                        self.become_tentative();
-                    } else {
-                        let cur_row = self.cursor().row;
-                        let cur_col = self.cursor().base.col;
-                        let row_idx = self.get_or_make_row(cur_row, width);
-                        if cur_col + 1 >= width {
-                            // Prediction in the last column is unreliable.
-                            self.become_tentative();
-                        }
-                        let epoch = self.prediction_epoch;
-                        let lfs = self.local_frame_sent;
-
-                        let rightmost = if self.predict_overwrite {
-                            cur_col
-                        } else {
-                            width - 1
-                        };
-                        for i in (cur_col + 1..=rightmost).rev() {
-                            let orig = *fb.cell(cur_row as u16, i as u16);
-                            let (prev_active, prev_unknown, prev_repl) = {
-                                let pc = &self.overlays[row_idx].overlay_cells[(i - 1) as usize];
-                                (pc.base.active, pc.unknown, pc.replacement)
-                            };
-                            let prev_actual = *fb.cell(cur_row as u16, (i - 1) as u16);
-                            let cell = &mut self.overlays[row_idx].overlay_cells[i as usize];
-                            cell.reset_with_orig();
-                            cell.base.active = true;
-                            cell.base.tentative_until_epoch = epoch;
-                            cell.base.expire(lfs, now);
-                            cell.original_contents.push(orig);
-                            if i == width - 1 {
-                                cell.unknown = true;
-                            } else if prev_active {
-                                if prev_unknown {
-                                    cell.unknown = true;
-                                } else {
-                                    cell.unknown = false;
-                                    cell.replacement = prev_repl;
-                                }
-                            } else {
-                                cell.unknown = false;
-                                cell.replacement = prev_actual;
-                            }
-                        }
-
-                        // The cell under the cursor -- the typed character itself.
-                        let orig = *fb.cell(cur_row as u16, cur_col as u16);
-                        // Default renditions (analogous to `fb.ds.renditions`),
-                        // then a heuristic: take the styling from the character
-                        // to the left.
-                        let (mut rf, mut rb, mut rfl) =
-                            (terminal::Color::Default, terminal::Color::Default, 0u16);
-                        if cur_col > 0 {
-                            let (pa, pu, prepl) = {
-                                let pc =
-                                    &self.overlays[row_idx].overlay_cells[(cur_col - 1) as usize];
-                                (pc.base.active, pc.unknown, pc.replacement)
-                            };
-                            let pactual = *fb.cell(cur_row as u16, (cur_col - 1) as u16);
-                            let src = if pa && !pu { prepl } else { pactual };
-                            rf = src.fg;
-                            rb = src.bg;
-                            rfl = src.flags;
-                        }
-                        {
-                            let cell = &mut self.overlays[row_idx].overlay_cells[cur_col as usize];
-                            cell.reset_with_orig();
-                            cell.base.active = true;
-                            cell.base.tentative_until_epoch = epoch;
-                            cell.base.expire(lfs, now);
-                            cell.replacement = Cell {
-                                ch,
-                                fg: rf,
-                                bg: rb,
-                                combining: Default::default(),
-                                flags: rfl,
-                            };
-                            cell.original_contents.push(orig);
-                        }
-                        self.cursor_mut().base.expire(lfs, now);
-                        if self.cursor().base.col < width - 1 {
-                            self.cursor_mut().base.col += 1;
-                        } else {
-                            self.become_tentative();
-                            self.newline_carriage_return(fb, now);
-                        }
-                    }
+            if self.suppressed_until.is_some()
+                || self.display_preference == DisplayPreference::Never
+            {
+                if self.display_preference == DisplayPreference::Never
+                    && self.local_frame_sent > self.local_frame_late_acked
+                {
+                    self.suppressed_until = Some(self.local_frame_sent);
                 }
-                KeyAction::Execute(ch) => {
-                    if ch == '\r' {
-                        self.become_tentative();
-                        self.newline_carriage_return(fb, now);
-                    } else {
-                        self.become_tentative();
-                    }
-                }
-                KeyAction::Esc => self.become_tentative(),
-                KeyAction::Csi(ch) => {
-                    if ch == 'C' {
-                        // Right arrow.
-                        self.init_cursor(fb);
-                        if self.cursor().base.col < width - 1 {
-                            self.cursor_mut().base.col += 1;
-                            let lfs = self.local_frame_sent;
-                            self.cursor_mut().base.expire(lfs, now);
-                        }
-                    } else if ch == 'D' {
-                        // Left arrow.
-                        self.init_cursor(fb);
-                        if self.cursor().base.col > 0 {
-                            self.cursor_mut().base.col -= 1;
-                            let lfs = self.local_frame_sent;
-                            self.cursor_mut().base.expire(lfs, now);
-                        }
-                    } else {
-                        self.become_tentative();
-                    }
-                }
+                continue;
+            }
+            if self.predict_action(act, fb, now).is_err() {
+                self.suppress();
             }
         }
     }
 
-    fn newline_carriage_return(&mut self, fb: &Frame, now: i64) {
-        self.init_cursor(fb);
+    fn predict_action(&mut self, act: KeyAction, fb: &Frame, now: i64) -> budget::Result {
+        self.budget.work(1)?;
+        let width = fb.width() as i32;
+        match act {
+            KeyAction::Print(ch) => {
+                self.init_cursor(fb)?;
+                if ch == '\u{7f}' {
+                    // Backspace.
+                    let cur_row = self.cursor().row;
+                    let row_idx = self.get_or_make_row(cur_row, width)?;
+                    if self.cursor().base.col > 0 {
+                        self.cursor_mut().base.col -= 1;
+                        let lfs = self.local_frame_sent;
+                        self.cursor_mut().base.expire(lfs, now);
+                        let col = self.cursor().base.col;
+                        let epoch = self.prediction_epoch;
+                        if self.predict_overwrite {
+                            let orig = *fb.cell(fb.cursor_row, fb.cursor_col);
+                            self.budget.work(1)?;
+                            self.active_cells += usize::from(
+                                !self.overlays[row_idx].overlay_cells[col as usize]
+                                    .base
+                                    .active,
+                            );
+                            let cell = &mut self.overlays[row_idx].overlay_cells[col as usize];
+                            reset_cell_with_orig(cell, &mut self.budget)?;
+                            cell.base.active = true;
+                            cell.base.tentative_until_epoch = epoch;
+                            cell.base.expire(lfs, now);
+                            budget::push(&mut cell.original_contents, orig, &mut self.budget)?;
+                            // replacement = orig, then clear()+append(' ').
+                            cell.replacement = orig;
+                            cell.replacement.set_char(' ');
+                        } else {
+                            for i in col..width {
+                                self.budget.work(1)?;
+                                self.active_cells += usize::from(
+                                    !self.overlays[row_idx].overlay_cells[i as usize].base.active,
+                                );
+                                let orig = *fb.cell(cur_row as u16, i as u16);
+                                let (next_active, next_unknown, next_repl, next_actual) =
+                                    if i + 2 < width {
+                                        let nc =
+                                            &self.overlays[row_idx].overlay_cells[(i + 1) as usize];
+                                        (
+                                            nc.base.active,
+                                            nc.unknown,
+                                            nc.replacement,
+                                            *fb.cell(cur_row as u16, (i + 1) as u16),
+                                        )
+                                    } else {
+                                        (false, false, Cell::blank(), Cell::blank())
+                                    };
+                                let cell = &mut self.overlays[row_idx].overlay_cells[i as usize];
+                                reset_cell_with_orig(cell, &mut self.budget)?;
+                                cell.base.active = true;
+                                cell.base.tentative_until_epoch = epoch;
+                                cell.base.expire(lfs, now);
+                                budget::push(&mut cell.original_contents, orig, &mut self.budget)?;
+                                if i + 2 < width {
+                                    if next_active {
+                                        if next_unknown {
+                                            cell.unknown = true;
+                                        } else {
+                                            cell.unknown = false;
+                                            cell.replacement = next_repl;
+                                        }
+                                    } else {
+                                        cell.unknown = false;
+                                        cell.replacement = next_actual;
+                                    }
+                                } else {
+                                    cell.unknown = true;
+                                }
+                            }
+                        }
+                    }
+                } else if (ch as u32) < 0x20 || ch.width() != Some(1) {
+                    // Control/wide/zero-width character -- unreliable to
+                    // predict.
+                    self.become_tentative();
+                } else {
+                    let cur_row = self.cursor().row;
+                    let cur_col = self.cursor().base.col;
+                    let row_idx = self.get_or_make_row(cur_row, width)?;
+                    if cur_col + 1 >= width {
+                        // Prediction in the last column is unreliable.
+                        self.become_tentative();
+                    }
+                    let epoch = self.prediction_epoch;
+                    let lfs = self.local_frame_sent;
+
+                    let rightmost = if self.predict_overwrite {
+                        cur_col
+                    } else {
+                        width - 1
+                    };
+                    for i in (cur_col + 1..=rightmost).rev() {
+                        self.budget.work(1)?;
+                        self.active_cells += usize::from(
+                            !self.overlays[row_idx].overlay_cells[i as usize].base.active,
+                        );
+                        let orig = *fb.cell(cur_row as u16, i as u16);
+                        let (prev_active, prev_unknown, prev_repl) = {
+                            let pc = &self.overlays[row_idx].overlay_cells[(i - 1) as usize];
+                            (pc.base.active, pc.unknown, pc.replacement)
+                        };
+                        let prev_actual = *fb.cell(cur_row as u16, (i - 1) as u16);
+                        let cell = &mut self.overlays[row_idx].overlay_cells[i as usize];
+                        reset_cell_with_orig(cell, &mut self.budget)?;
+                        cell.base.active = true;
+                        cell.base.tentative_until_epoch = epoch;
+                        cell.base.expire(lfs, now);
+                        budget::push(&mut cell.original_contents, orig, &mut self.budget)?;
+                        if i == width - 1 {
+                            cell.unknown = true;
+                        } else if prev_active {
+                            if prev_unknown {
+                                cell.unknown = true;
+                            } else {
+                                cell.unknown = false;
+                                cell.replacement = prev_repl;
+                            }
+                        } else {
+                            cell.unknown = false;
+                            cell.replacement = prev_actual;
+                        }
+                    }
+
+                    // The cell under the cursor -- the typed character itself.
+                    let orig = *fb.cell(cur_row as u16, cur_col as u16);
+                    // Default renditions (analogous to `fb.ds.renditions`),
+                    // then a heuristic: take the styling from the character
+                    // to the left.
+                    let (mut rf, mut rb, mut rfl) =
+                        (terminal::Color::Default, terminal::Color::Default, 0u16);
+                    if cur_col > 0 {
+                        let (pa, pu, prepl) = {
+                            let pc = &self.overlays[row_idx].overlay_cells[(cur_col - 1) as usize];
+                            (pc.base.active, pc.unknown, pc.replacement)
+                        };
+                        let pactual = *fb.cell(cur_row as u16, (cur_col - 1) as u16);
+                        let src = if pa && !pu { prepl } else { pactual };
+                        rf = src.fg;
+                        rb = src.bg;
+                        rfl = src.flags;
+                    }
+                    {
+                        self.budget.work(1)?;
+                        self.active_cells += usize::from(
+                            !self.overlays[row_idx].overlay_cells[cur_col as usize]
+                                .base
+                                .active,
+                        );
+                        let cell = &mut self.overlays[row_idx].overlay_cells[cur_col as usize];
+                        reset_cell_with_orig(cell, &mut self.budget)?;
+                        cell.base.active = true;
+                        cell.base.tentative_until_epoch = epoch;
+                        cell.base.expire(lfs, now);
+                        cell.replacement = Cell {
+                            ch,
+                            fg: rf,
+                            bg: rb,
+                            combining: Default::default(),
+                            flags: rfl,
+                        };
+                        budget::push(&mut cell.original_contents, orig, &mut self.budget)?;
+                    }
+                    self.cursor_mut().base.expire(lfs, now);
+                    if self.cursor().base.col < width - 1 {
+                        self.cursor_mut().base.col += 1;
+                    } else {
+                        self.become_tentative();
+                        self.newline_carriage_return(fb, now)?;
+                    }
+                }
+            }
+            KeyAction::Execute(ch) => {
+                if ch == '\r' {
+                    self.become_tentative();
+                    self.newline_carriage_return(fb, now)?;
+                } else {
+                    self.become_tentative();
+                }
+            }
+            KeyAction::Esc => self.become_tentative(),
+            KeyAction::Csi(ch) => {
+                if ch == 'C' {
+                    // Right arrow.
+                    self.init_cursor(fb)?;
+                    if self.cursor().base.col < width - 1 {
+                        self.cursor_mut().base.col += 1;
+                        let lfs = self.local_frame_sent;
+                        self.cursor_mut().base.expire(lfs, now);
+                    }
+                } else if ch == 'D' {
+                    // Left arrow.
+                    self.init_cursor(fb)?;
+                    if self.cursor().base.col > 0 {
+                        self.cursor_mut().base.col -= 1;
+                        let lfs = self.local_frame_sent;
+                        self.cursor_mut().base.expire(lfs, now);
+                    }
+                } else {
+                    self.become_tentative();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn newline_carriage_return(&mut self, fb: &Frame, now: i64) -> budget::Result {
+        self.init_cursor(fb)?;
         self.cursor_mut().base.col = 0;
         if self.cursor().row == fb.height() as i32 - 1 {
             // We don't predict scrolling; use an empty prediction for the last
@@ -631,8 +822,10 @@ impl PredictionEngine {
             let width = fb.width() as i32;
             let epoch = self.prediction_epoch;
             let lfs = self.local_frame_sent;
-            let row_idx = self.get_or_make_row(cur_row, width);
+            let row_idx = self.get_or_make_row(cur_row, width)?;
             for cell in &mut self.overlays[row_idx].overlay_cells {
+                self.budget.work(1)?;
+                self.active_cells += usize::from(!cell.base.active);
                 cell.base.active = true;
                 cell.base.tentative_until_epoch = epoch;
                 cell.base.expire(lfs, now);
@@ -641,7 +834,18 @@ impl PredictionEngine {
         } else {
             self.cursor_mut().row += 1;
         }
+        Ok(())
     }
+}
+
+fn reset_cell_with_orig(cell: &mut ConditionalOverlayCell, budget: &mut Budget) -> budget::Result {
+    if cell.base.active && !cell.unknown {
+        budget.work(1)?;
+        budget::reserve(&mut cell.original_contents, 1, budget)?;
+    }
+    // The existing operation cannot grow: its possible push was reserved above.
+    cell.reset_with_orig();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -661,7 +865,7 @@ mod tests {
     // syncing `confirmed_epoch == prediction_epoch`; after that, subsequent
     // predictions are visible right away. A port of the technique from the
     // earlier validated Kotlin port (`PredictionEngineTest.warmUp`).
-    fn warm_up(e: &mut PredictionEngine) {
+    pub(super) fn warm_up(e: &mut PredictionEngine) {
         let blank = frame(20, 1);
         e.set_local_frame_sent(0); // 'a' -> expiration_frame = 0 (offset without +1)
         e.new_user_byte(b'a', &blank, 0);
@@ -836,3 +1040,7 @@ mod tests {
         assert!(!e.predict_overwrite);
     }
 }
+
+#[cfg(test)]
+#[path = "engine_budget_tests.rs"]
+mod budget_tests;

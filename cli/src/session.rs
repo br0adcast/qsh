@@ -2465,6 +2465,34 @@ mod tests {
     }
 
     #[test]
+    fn prediction_budget_fallback_preserves_every_raw_and_bracketed_input_byte() {
+        for mode in [PredictMode::Adaptive, PredictMode::Never] {
+            for bracketed in [false, true] {
+                let mut s = Session::new(80, 24, TermCaps::truecolor(), mode, plain());
+                s.on_link(LinkState::Live, 0);
+                s.on_channel_ready(16, 0);
+                let mut payload = Vec::new();
+                if bracketed {
+                    payload.extend_from_slice(b"\x1b[200~");
+                }
+                for _ in 0..4096 {
+                    payload.extend_from_slice("p界e\u{301}".as_bytes());
+                }
+                if bracketed {
+                    payload.extend_from_slice(b"\x1b[201~");
+                }
+                let mut delivered = Vec::new();
+                for chunk in payload.chunks(997) {
+                    delivered.extend(sent(&s.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                }
+                assert_eq!(delivered, payload, "prediction must never truncate input");
+                assert!(!s.shell.prediction_active());
+                assert!(!s.window_open());
+            }
+        }
+    }
+
+    #[test]
     fn bracketed_paste_sends_prefix_commands_to_the_shell_without_local_actions() {
         for key in [0x1d, 0x02, 0x1b] {
             let mut bytes = b"\x1b[200~".to_vec();
