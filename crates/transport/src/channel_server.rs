@@ -127,6 +127,14 @@ use crate::channel_timeline::{
 use crate::conn::StreamClass;
 use crate::send_gate::{GateKind, SendGate};
 use crate::session_manager::{AttachmentContext, ChannelOutput, DeliveryMarker};
+#[cfg(test)]
+#[path = "control_input.rs"]
+mod control_input;
+
+#[cfg(test)]
+#[path = "control_job.rs"]
+mod control_job;
+
 use crate::session_manager::{ConsumptionReporter, LoginId, SessionInbound, SessionIo, StreamData};
 use crate::shell_frame::{RawRecord, RecordDeframer};
 use crate::shell_server::{ResizeHandle, SessionScreen};
