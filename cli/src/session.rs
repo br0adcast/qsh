@@ -2494,6 +2494,31 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_csi_prediction_preserves_original_channel_bytes() {
+        for bytes in [
+            &b"\x1b[1;\x1b[Ctext"[..],
+            &b"\x1b[\x1b\x1b[Dtext"[..],
+            &b"\x1b[1;\x1bOCtext"[..],
+            &b"\x1b[htext"[..],
+        ] {
+            for split in 0..=bytes.len() {
+                let mut session = ready_session();
+                let mut delivered = Vec::new();
+                for chunk in [&bytes[..split], &bytes[split..]] {
+                    delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                }
+                assert_eq!(delivered, bytes, "split {split}");
+            }
+            let mut session = ready_session();
+            let mut delivered = Vec::new();
+            for chunk in bytes.chunks(1) {
+                delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+            }
+            assert_eq!(delivered, bytes);
+        }
+    }
+
+    #[test]
     fn prediction_budget_fallback_preserves_every_raw_and_bracketed_input_byte() {
         for mode in [PredictMode::Adaptive, PredictMode::Never] {
             for bracketed in [false, true] {
