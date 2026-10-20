@@ -96,9 +96,14 @@ use super::channel;
 use super::pam::{Cred, Pam, PamError};
 use super::protocol::{decode, encode, ChannelId, MonitorEvent, MonitorRequest};
 use super::server::{
-    become_account_checks, child_env, close_other_descriptors, login_shell, read_startup_report,
-    shell_basename, StartupReport, CLOSE_GRACE_PERIOD, REAP_INTERVAL, STARTUP_REPORT_TIMEOUT,
+    become_account_checks, child_env, close_other_descriptors, login_shell, shell_basename,
+    REAP_INTERVAL, STARTUP_REPORT_TIMEOUT,
 };
+
+#[cfg(not(target_os = "linux"))]
+use super::server::CLOSE_GRACE_PERIOD;
+#[cfg(any(test, not(target_os = "linux")))]
+use super::server::{read_startup_report, StartupReport};
 
 /// Supplementary-group operations confined to each login's monitor.
 /// Production always uses REAL; function pointers let tests exercise syscall failures.
@@ -265,11 +270,15 @@ struct Shell {
     /// The channel id the helper knows this shell by. The helper refuses a
     /// repeated id, so no two live shells of one monitor share one.
     id: ChannelId,
+    #[cfg(any(test, not(target_os = "linux")))]
     pid: Pid,
+    #[cfg(target_os = "linux")]
+    native: Option<native::NativeShell>,
     /// The read end of this shell's startup-report pipe, while it is still
     /// starting: end-of-file with nothing in it means the `execve` took,
     /// four bytes mean it did not (`server::read_startup_report`). `None`
     /// once the report has been read.
+    #[cfg(any(test, not(target_os = "linux")))]
     report: Option<OwnedFd>,
     /// Whether the helper has been told this shell STARTED.
     ///
@@ -277,6 +286,7 @@ struct Shell {
     /// shell whose start failed was already answered with
     /// [`MonitorEvent::Failed`], and an `Exited` for the same channel id
     /// afterwards would be a second answer to one request.
+    #[cfg(any(test, not(target_os = "linux")))]
     started: bool,
 }
 
@@ -1027,7 +1037,7 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     // shell would be closed while the thing it was opened for is still
     // running, and the modules that count logins (`pam_systemd`,
     // `pam_limits`) would tear down what that shell is still using.
-    end_the_shells(&mut shells);
+    end_the_shells(&seam, &mut shells);
     if let Some(session) = session {
         // The closing half gets a deadline too, and the asymmetry it
         // corrects was an accident rather than a decision: the guard had
@@ -1064,7 +1074,19 @@ fn serve(
     loop {
         let report_fds: Vec<RawFd> = shells
             .iter()
-            .filter_map(|shell| shell.report.as_ref().map(AsRawFd::as_raw_fd))
+            .filter_map(|shell| {
+                #[cfg(target_os = "linux")]
+                {
+                    shell
+                        .native
+                        .as_ref()
+                        .and_then(native::NativeShell::report_fd)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    shell.report.as_ref().map(AsRawFd::as_raw_fd)
+                }
+            })
             .collect();
         let mut fds: Vec<PollFd> = Vec::with_capacity(1 + report_fds.len());
         fds.push(PollFd::new(seam.as_fd(), PollFlags::POLLIN));
@@ -1099,12 +1121,21 @@ fn serve(
             .map(|(fd, _)| *fd)
             .collect();
 
+        #[cfg(target_os = "linux")]
+        {
+            let _ = ready;
+            report_owned_shells(seam, shells);
+        }
+        #[cfg(not(target_os = "linux"))]
         report_startups(seam, shells, &ready);
         if seam_ready && !serve_request(plan, seam, shells, session, &mut closing) {
             return;
         }
-        reap_shells(seam, shells, &mut closing);
-        escalate(seam, shells, &mut closing);
+        #[cfg(not(target_os = "linux"))]
+        {
+            reap_shells(seam, shells, &mut closing);
+            escalate(seam, shells, &mut closing);
+        }
     }
 }
 
@@ -1202,10 +1233,15 @@ fn serve_request(
                 shell,
                 &command,
             ) {
-                Ok((pid, report)) => shells.push(Shell {
+                Ok(forked) => shells.push(Shell {
                     id,
-                    pid,
-                    report: Some(report),
+                    #[cfg(any(test, not(target_os = "linux")))]
+                    pid: forked.pid,
+                    #[cfg(target_os = "linux")]
+                    native: Some(forked.native),
+                    #[cfg(any(test, not(target_os = "linux")))]
+                    report: forked.report,
+                    #[cfg(any(test, not(target_os = "linux")))]
                     started: false,
                 }),
                 Err(errno) => {
@@ -1228,11 +1264,19 @@ fn serve_request(
             }
         }
         MonitorRequest::Close { id } => {
+            #[cfg(target_os = "linux")]
+            {
+                let _ = closing;
+                if let Some(native) = shells
+                    .iter_mut()
+                    .find(|shell| shell.id == id)
+                    .and_then(|shell| shell.native.as_mut())
+                {
+                    native.request_stop(Instant::now());
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
             if let Some(shell) = shells.iter().find(|shell| shell.id == id) {
-                // SIGHUP first: a shell that wants to save its history gets
-                // the chance. Not every process takes it -- one that traps
-                // or ignores SIGHUP would otherwise never die -- so
-                // `escalate` sends SIGKILL once the grace has passed.
                 signal_shell(seam, shell, Signal::SIGHUP);
                 closing.insert(id, Instant::now() + CLOSE_GRACE_PERIOD);
             }
@@ -1247,6 +1291,7 @@ fn serve_request(
 
 /// Tell the helper what became of every shell whose report pipe has just
 /// spoken.
+#[cfg(any(test, not(target_os = "linux")))]
 fn report_startups(seam: &UnixStream, shells: &mut [Shell], ready: &[RawFd]) {
     for shell in shells.iter_mut() {
         let Some(report) = shell.report.as_ref() else {
@@ -1295,6 +1340,7 @@ fn report_startups(seam: &UnixStream, shells: &mut [Shell], ready: &[RawFd]) {
 /// `waitpid(None, ...)`, which would reap whatever else happened to be a
 /// child of this process (the tests run a helper on a thread of a process
 /// with children of its own).
+#[cfg(any(test, not(target_os = "linux")))]
 fn reap_shells(
     seam: &UnixStream,
     shells: &mut Vec<Shell>,
@@ -1361,6 +1407,7 @@ fn reap_shells(
 /// own escalation, moved here with the fork. Without it a shell that traps
 /// the hang-up away (`trap "" HUP`) would never exit, never be reported,
 /// and pin whatever is waiting for that channel to end.
+#[cfg(not(target_os = "linux"))]
 fn escalate(seam: &UnixStream, shells: &[Shell], closing: &mut HashMap<ChannelId, Instant>) {
     let now = Instant::now();
     let mut overdue: Vec<ChannelId> = Vec::new();
@@ -1394,6 +1441,7 @@ fn escalate(seam: &UnixStream, shells: &[Shell], closing: &mut HashMap<ChannelId
 /// docs for why it may not write to the file itself). `ESRCH` -- the shell
 /// exited between the lookup and the signal -- is ordinary and says
 /// nothing.
+#[cfg(any(test, not(target_os = "linux")))]
 fn signal_shell(seam: &UnixStream, shell: &Shell, signal: Signal) {
     match nix::sys::signal::kill(shell.pid, signal) {
         Ok(()) | Err(nix::Error::ESRCH) => {}
@@ -1417,7 +1465,8 @@ fn signal_shell(seam: &UnixStream, shell: &Shell, signal: Signal) {
 /// parent-death signal every shell arms before its `execve` is the second
 /// half of the same promise, for the case where this process is killed
 /// outright and never reaches here.
-fn end_the_shells(shells: &mut Vec<Shell>) {
+#[cfg(not(target_os = "linux"))]
+fn end_the_shells(_seam: &UnixStream, shells: &mut Vec<Shell>) {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
     // Nothing is reported from here: the seam is what this function runs
@@ -1442,6 +1491,93 @@ fn end_the_shells(shells: &mut Vec<Shell>) {
     }
     for shell in shells.iter() {
         let _ = nix::sys::signal::kill(shell.pid, Signal::SIGKILL);
+    }
+}
+
+/// Advance Linux startup, leader status and complete cleanup in that order.
+#[cfg(target_os = "linux")]
+fn report_owned_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
+    use super::startup::{Failure, Outcome};
+    use crate::process_scope::scope::Progress;
+    let mut index = 0;
+    while index < shells.len() {
+        let shell = &mut shells[index];
+        let Some(native) = shell.native.as_mut() else {
+            // Only legacy unit fixtures omit the native owner. Missing custody
+            // can never authorize numeric signalling or a cleanup receipt.
+            index += 1;
+            continue;
+        };
+        let update = native.advance(Instant::now());
+        match update.startup {
+            Some(Outcome::Started) => {
+                #[cfg(test)]
+                {
+                    shell.started = true;
+                }
+                tell(seam, &MonitorEvent::Started { id: shell.id });
+            }
+            Some(Outcome::Failed(failure)) => {
+                let errno = match failure {
+                    Failure::Os(errno) => errno,
+                    Failure::Protocol => nix::libc::EPROTO,
+                    Failure::TimedOut => nix::libc::ETIMEDOUT,
+                    Failure::Cancelled => nix::libc::ECANCELED,
+                    Failure::Read => nix::libc::EIO,
+                };
+                tell(
+                    seam,
+                    &MonitorEvent::Failed {
+                        id: shell.id,
+                        errno,
+                    },
+                );
+            }
+            None => {}
+        }
+        if let Some(code) = update.leader {
+            tell(seam, &MonitorEvent::Exited { id: shell.id, code });
+        }
+        if let Some((signal, errno)) = update.signal_failure {
+            tell(
+                seam,
+                &MonitorEvent::SignalFailed {
+                    id: shell.id,
+                    signal,
+                    errno,
+                },
+            );
+        }
+        if matches!(update.progress, Progress::Complete(_)) {
+            let shell = shells.remove(index);
+            tell(
+                seam,
+                &MonitorEvent::CleanupComplete {
+                    id: shell.id,
+                    kind: super::protocol::CleanupKind::Reaped,
+                },
+            );
+        } else {
+            index += 1;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn end_the_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
+    let now = Instant::now();
+    for shell in shells.iter_mut() {
+        if let Some(native) = shell.native.as_mut() {
+            native.request_stop(now);
+        }
+    }
+    // Grace controls escalation only. Unknown remains owned; PAM close must
+    // never run while a shell scope or its private startup stream is retained.
+    while !shells.is_empty() {
+        report_owned_shells(seam, shells);
+        if !shells.is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -1471,6 +1607,15 @@ fn tell(seam: &UnixStream, event: &MonitorEvent) {
 /// (`Session::env`, read by `pam_getenvlist` when the session opened and
 /// not once per channel): it is merged into the environment built from
 /// passwd, here, before the fork, for exactly the reason above.
+struct ForkedShell {
+    #[cfg(any(test, not(target_os = "linux")))]
+    pid: Pid,
+    #[cfg(any(test, not(target_os = "linux")))]
+    report: Option<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    native: native::NativeShell,
+}
+
 fn fork_shell(
     plan: &MonitorPlan,
     session_env: &[CString],
@@ -1479,7 +1624,7 @@ fn fork_shell(
     term: Option<&str>,
     login: bool,
     command: &str,
-) -> Result<(Pid, OwnedFd), nix::Error> {
+) -> Result<ForkedShell, nix::Error> {
     use nix::fcntl::OFlag;
     use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow};
     use nix::unistd::{close, dup2, fork, pipe2, setsid, ForkResult};
@@ -1521,7 +1666,16 @@ fn fork_shell(
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    #[cfg(target_os = "linux")]
+    let view = crate::process_scope::prepare().map_err(|_| nix::Error::EOPNOTSUPP)?;
     let (report_read, report_write) = pipe2(OFlag::O_CLOEXEC)?;
+    #[cfg(target_os = "linux")]
+    nix::fcntl::fcntl(
+        report_read.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
+    )?;
+    #[cfg(target_os = "linux")]
+    let startup_deadline = Instant::now() + STARTUP_REPORT_TIMEOUT;
     // Taken BEFORE the fork, so the child can tell a monitor that died in
     // the window between the fork and its own `PR_SET_PDEATHSIG` apart from
     // one still alive -- exactly as `helper::split_and_run` takes the
@@ -1542,15 +1696,50 @@ fn fork_shell(
     // `server`'s module docs make for the code this is.
     match unsafe { fork() }? {
         ForkResult::Parent { child } => {
+            #[cfg(target_os = "linux")]
+            let native = native::NativeShell::new(
+                std::num::NonZeroU32::new(child.as_raw() as u32)
+                    .expect("fork returns a positive child PID"),
+                view,
+                report_read,
+                startup_deadline,
+            );
             drop(slave);
             // Our own copy of the write end has to close BEFORE anything
             // reads the pipe, or it never reaches end-of-file even once the
             // child's copy is gone.
             drop(report_write);
-            Ok((child, report_read))
+            Ok(ForkedShell {
+                #[cfg(any(test, not(target_os = "linux")))]
+                pid: child,
+                #[cfg(not(target_os = "linux"))]
+                report: Some(report_read),
+                #[cfg(all(test, target_os = "linux"))]
+                report: None,
+                #[cfg(target_os = "linux")]
+                native,
+            })
         }
         ForkResult::Child => {
+            #[cfg(target_os = "linux")]
+            fn record(report: BorrowedFd<'_>, tag: u8, payload: i32) {
+                let mut frame = [0u8; 5];
+                frame[0] = tag;
+                frame[1..].copy_from_slice(&payload.to_ne_bytes());
+                loop {
+                    match nix::unistd::write(report, &frame) {
+                        Ok(5) => return,
+                        Err(nix::Error::EINTR) => continue,
+                        // A partial/failed stage never proceeds to exec or any
+                        // descendant-producing code. No allocation after fork.
+                        _ => unsafe { nix::libc::_exit(127) },
+                    }
+                }
+            }
             fn fail<T>(report_write: BorrowedFd<'_>, e: nix::Error) -> T {
+                #[cfg(target_os = "linux")]
+                record(report_write, 2, e as i32);
+                #[cfg(not(target_os = "linux"))]
                 let _ = nix::unistd::write(report_write, &(e as i32).to_ne_bytes());
                 // SAFETY: `_exit` ends the process immediately, running no
                 // atexit handlers and no Rust `Drop` impls -- sound to call
@@ -1561,7 +1750,11 @@ fn fork_shell(
 
             let report_write = report_write.as_fd();
             let slave = slave.as_raw_fd();
-            setsid().unwrap_or_else(|e| fail(report_write, e));
+            let sid = setsid().unwrap_or_else(|e| fail(report_write, e));
+            #[cfg(target_os = "linux")]
+            record(report_write, 1, sid.as_raw());
+            #[cfg(not(target_os = "linux"))]
+            let _ = sid;
             // Without this every program started here would inherit the
             // ignored `SIGPIPE` Rust's runtime sets, and whatever mask the
             // helper happened to have -- see `server::open_channel`'s docs.
@@ -2126,6 +2319,8 @@ mod tests {
             .set_read_timeout(Some(SEAM_READ_TIMEOUT))
             .expect("bounded read");
         let init = Shell {
+            #[cfg(target_os = "linux")]
+            native: None,
             id: 4,
             pid: Pid::from_raw(1),
             report: None,
@@ -2174,6 +2369,8 @@ mod tests {
         // would make this test signal a stranger.
         let gone = Pid::from_raw(i32::MAX);
         let shell = Shell {
+            #[cfg(target_os = "linux")]
+            native: None,
             id: 5,
             pid: gone,
             report: None,
@@ -2371,6 +2568,8 @@ mod tests {
         nix::unistd::write(&report_write, &(nix::Error::EACCES as i32).to_ne_bytes()).unwrap();
         drop(report_write);
         let mut shells = vec![Shell {
+            #[cfg(target_os = "linux")]
+            native: None,
             id: 101,
             pid,
             report: Some(report_read),
@@ -2430,6 +2629,8 @@ mod tests {
         let pid = Pid::from_raw(child.id() as i32);
         child.wait().unwrap(); // the monitor did not reap this child
         let mut shells = vec![Shell {
+            #[cfg(target_os = "linux")]
+            native: None,
             id: 102,
             pid,
             report: None,
@@ -2441,4 +2642,75 @@ mod tests {
             matches!(channel::recv(&helper), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
+
+    #[test]
+    fn helper39_empty_pre_session_report_never_publishes_started() {
+        use std::io::Read;
+        let view = crate::process_scope::prepare().unwrap();
+        let (helper, monitor) = channel::pair().unwrap();
+        helper.set_nonblocking(true).unwrap();
+        // This exact owned child has not called setsid: EOF cannot grant
+        // authority over the parent's session or claim exec success.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; read release"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32);
+        let owned = Open24OwnedChild(pid);
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        assert_eq!(unsafe { nix::libc::getsid(pid.as_raw()) }, unsafe {
+            nix::libc::getsid(0)
+        });
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let raw = read.as_raw_fd();
+        drop(write);
+        let mut shells = vec![Shell {
+            #[cfg(target_os = "linux")]
+            native: Some(native::NativeShell::new(
+                std::num::NonZeroU32::new(pid.as_raw() as u32).unwrap(),
+                view,
+                read,
+                Instant::now() + STARTUP_REPORT_TIMEOUT,
+            )),
+            id: 3901,
+            pid,
+            report: None,
+            started: false,
+        }];
+        let _ = raw;
+        report_owned_shells(&monitor, &mut shells);
+        let event = channel::recv(&helper).unwrap().unwrap();
+        assert!(event.1.is_none());
+        let event: MonitorEvent = decode(&event.0).unwrap();
+        let started = shells[0].started;
+        // Fixture cleanup is exact direct-child kill + actual wait, before
+        // the RED assertion. No session/group signalling occurs here.
+        drop(owned);
+        assert_eq!(
+            child.wait().unwrap_err().raw_os_error(),
+            Some(nix::libc::ECHILD)
+        );
+        assert!(
+            !started,
+            "missing setsid acknowledgement must not establish a session"
+        );
+        assert!(
+            matches!(event, MonitorEvent::Failed { id: 3901, .. }),
+            "empty pre-session EOF must fail startup, got {event:?}"
+        );
+    }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "monitor_native.rs"]
+mod native;

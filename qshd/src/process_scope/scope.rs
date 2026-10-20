@@ -70,6 +70,29 @@ impl<C: ChildCustody> Scope<C> {
             custody_lost: false,
         }
     }
+    /// Transfer the same reserved child and retained exact handles after its
+    /// private startup pipe has authenticated successful setsid.
+    pub(super) fn from_reserved(
+        child: C,
+        view: QualifiedProc,
+        process: Option<RetainedProcess>,
+        unproved: Option<std::os::fd::OwnedFd>,
+    ) -> Self {
+        let pid = child.leader_id().get();
+        let mut scope = Self::new(child, view);
+        if let Some(process) = process {
+            scope.members.push(Member {
+                pid,
+                process,
+                hup: false,
+                killed: false,
+            });
+        }
+        if let Some(fd) = unproved {
+            scope.unproved.push((pid, fd));
+        }
+        scope
+    }
     pub fn poll_leader(&mut self) -> LeaderStatus {
         if let Some(code) = self.completed {
             return LeaderStatus::Exited(code);

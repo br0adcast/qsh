@@ -3251,6 +3251,7 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
 ///
 /// Anything short of a complete 4-byte report (or a clean end-of-file with
 /// none at all) is treated as a timeout rather than guessed at.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(super) fn read_startup_report(report_read: &OwnedFd, deadline: Instant) -> StartupReport {
     let mut buf = [0u8; 4];
     let mut filled = 0usize;
@@ -3609,9 +3610,10 @@ fn apply_channel_verdict(
     }
     let cancelled = cancelled || state.retired.contains(&owner);
     match report {
-        StartupReport::Started if cancelled => {
+        StartupReport::Started | StartupReport::Failed(nix::Error::ECANCELED) if cancelled => {
             // `Request::Close` reached this channel while it was still
-            // starting. Its shell is already dead of that `SIGHUP`, and a
+            // starting. Native monitors report ECANCELED explicitly; legacy
+            // monitors may report clean EOF as Started. Its shell is already dead of that `SIGHUP`, and a
             // report pipe at end-of-file says only "the descriptor closed"
             // -- never "the exec took". Answering `Opened` here would hand
             // the worker a terminal whose process is a corpse; the
@@ -4183,6 +4185,7 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     include!("log_tests.rs");
+    include!("monitor_scope_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};

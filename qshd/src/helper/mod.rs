@@ -38,8 +38,14 @@ mod pam;
 /// Private to `helper` -- nothing outside it has any business holding one.
 mod pending;
 pub mod protocol;
+#[cfg(target_os = "linux")]
+mod scope_ops;
 pub mod server;
+#[cfg(target_os = "linux")]
+mod shell_owner;
 pub mod spawner;
+#[cfg(target_os = "linux")]
+mod startup;
 
 use anyhow::Context;
 

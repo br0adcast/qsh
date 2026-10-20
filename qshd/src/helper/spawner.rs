@@ -938,6 +938,8 @@ impl HelperChannelSpawner {
             Box::new(HelperWait {
                 id,
                 exits: exited_rx,
+                leader_code: None,
+                exits_closed: false,
                 receipt: receipt.clone(),
                 tx: wait_tx,
                 disconnected_locally: self.disconnected_locally.clone(),
@@ -1025,6 +1027,8 @@ impl HelperChannelSpawner {
 struct HelperWait {
     id: ChannelId,
     exits: Receiver<i32>,
+    leader_code: Option<i32>,
+    exits_closed: bool,
     receipt: Arc<Mutex<CleanupReceipt>>,
     tx: UnixStream,
     /// Shared with the [`HelperChannelSpawner`] this channel came from --
@@ -1046,20 +1050,40 @@ impl ChannelWait for HelperWait {
             notifier.notify();
         }
     }
+    fn poll_leader_status(&mut self) -> Option<transport::channel_server::LeaderStatus> {
+        use transport::channel_server::LeaderStatus;
+        if self.leader_code.is_none() && !self.exits_closed {
+            match self.exits.try_recv() {
+                Ok(code) => self.leader_code = Some(code),
+                Err(mpsc::TryRecvError::Disconnected) => self.exits_closed = true,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(code) = self.leader_code {
+            return Some(LeaderStatus::Exited { code: Some(code) });
+        }
+        let reaped = self.receipt.lock().unwrap_or_else(|e| e.into_inner()).kind
+            == Some(CleanupKind::Reaped);
+        Some(if reaped {
+            LeaderStatus::Exited { code: None }
+        } else if self.exits_closed {
+            LeaderStatus::Unknown("helper exit receiver closed without cleanup proof".into())
+        } else {
+            LeaderStatus::Running
+        })
+    }
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
         use transport::channel_server::ChildStatus;
-        match self.exits.try_recv() {
-            Ok(code) => ChildStatus::Reaped { code: Some(code) },
-            Err(mpsc::TryRecvError::Empty) => ChildStatus::Running,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
-                if receipt.kind == Some(CleanupKind::Reaped) {
-                    // Exact cleanup is known, but no exit status survived.
-                    ChildStatus::Reaped { code: None }
-                } else {
-                    ChildStatus::Unknown("helper exit receiver closed without cleanup proof".into())
-                }
+        let _ = self.poll_leader_status();
+        let receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+        if receipt.kind == Some(CleanupKind::Reaped) {
+            ChildStatus::Reaped {
+                code: self.leader_code,
             }
+        } else if self.exits_closed {
+            ChildStatus::Unknown("helper exit receiver closed without cleanup proof".into())
+        } else {
+            ChildStatus::Running
         }
     }
     fn cleanup_uninstalled(
@@ -1094,6 +1118,9 @@ impl ChannelWait for HelperWait {
     }
 
     fn wait(self: Box<Self>) -> i32 {
+        if let Some(code) = self.leader_code {
+            return code;
+        }
         match self.exits.recv_timeout(HELPER_EXIT_TIMEOUT) {
             Ok(code) => code,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -3984,16 +4011,23 @@ pub(crate) mod tests {
         use transport::channel_server::ChildStatus;
         assert!(matches!(channel.wait.poll_exit(), ChildStatus::Running));
         report_exit.send(()).unwrap();
-        let status = bounded(move || {
+        let (status, mut channel) = bounded(move || {
             let deadline = std::time::Instant::now() + TEST_RECV_TIMEOUT;
             loop {
-                match channel.wait.poll_exit() {
-                    ChildStatus::Reaped { code } => break code,
-                    ChildStatus::Running | ChildStatus::WaitingForWorkers => {
-                        assert!(std::time::Instant::now() < deadline, "exit receipt missing");
+                match channel.wait.poll_leader_status() {
+                    Some(transport::channel_server::LeaderStatus::Exited { code }) => {
+                        break (code, channel)
+                    }
+                    Some(transport::channel_server::LeaderStatus::Unknown(detail)) => {
+                        panic!("exact helper status lost: {detail}")
+                    }
+                    _ => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "leader status missing"
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    ChildStatus::Unknown(detail) => panic!("exact helper status lost: {detail}"),
                 }
             }
         });
@@ -4003,6 +4037,10 @@ pub(crate) mod tests {
             "poll retains the helper's actual exit status"
         );
 
+        assert!(
+            matches!(channel.wait.poll_exit(), ChildStatus::Running),
+            "leader status alone must not release custody"
+        );
         // Held open for the assertion below, for the reason the twin test
         // above spells out.
         let (helper, id) = stub.join().expect("join");
@@ -4024,6 +4062,13 @@ pub(crate) mod tests {
         wait_for("receipt retires bookkeeping", &|| {
             spawner.waiting.lock().unwrap().is_empty()
         });
+        assert!(
+            matches!(
+                channel.wait.poll_exit(),
+                ChildStatus::Reaped { code: Some(7) }
+            ),
+            "the explicit final receipt preserves the cached code"
+        );
         assert!(
             spawner.waiting.lock().expect("not poisoned").is_empty(),
             "a channel that has reported its exit must leave no entry behind"
@@ -6753,4 +6798,47 @@ pub(crate) mod tests {
     }
     include!("spawner_open_tests.rs");
     include!("executor_open_tests.rs");
+
+    #[test]
+    fn helper39_leader_exited_without_scope_receipt_remains_owned() {
+        use transport::channel_server::ChildStatus;
+        let (tx, peer) = channel::pair().unwrap();
+        let (send, exits) = mpsc::channel();
+        let custody = transport::channel_open::OpenCustody::new();
+        let receipt = Arc::new(Mutex::new(CleanupReceipt {
+            kind: None,
+            cleanup_requested: false,
+            notify: custody.cleanup_notifier(),
+            reap_notify: None,
+        }));
+        let mut wait = HelperWait {
+            id: 3902,
+            exits,
+            leader_code: None,
+            exits_closed: false,
+            receipt: receipt.clone(),
+            tx,
+            disconnected_locally: Arc::new(AtomicBool::new(false)),
+        };
+        send.send(7).unwrap();
+        let before_scope = wait.poll_exit();
+        let leader = wait.poll_leader_status();
+        let still_owned = wait.poll_exit();
+        // This controlled receipt is distinct from the preceding leader event.
+        receipt.lock().unwrap().kind = Some(CleanupKind::Reaped);
+        drop(send);
+        let after_scope = wait.poll_exit();
+        drop(wait);
+        drop(peer);
+        assert!(
+            !matches!(before_scope, ChildStatus::Reaped { .. }),
+            "leader Exited is not a final scope receipt"
+        );
+        assert!(matches!(
+            leader,
+            Some(transport::channel_server::LeaderStatus::Exited { code: Some(7) })
+        ));
+        assert!(!matches!(still_owned, ChildStatus::Reaped { .. }));
+        assert!(matches!(after_scope, ChildStatus::Reaped { code: Some(7) }));
+    }
 }

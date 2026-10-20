@@ -40,7 +40,8 @@ impl RetainedProcess {
         self.exited = result == Evidence::Exited;
         result
     }
-    // Call only after exact-fd membership was established by acquire_member.
+    // Call only after exact-fd membership or exclusive reserved-child identity
+    // was established. Neither path grants authority over numeric PID reuse.
     pub fn stop(&mut self, ops: &mut impl Operations, signal: i32) -> Evidence {
         if self.exited {
             return Evidence::Exited;
@@ -52,6 +53,21 @@ impl RetainedProcess {
                 Evidence::Exited => Evidence::Exited,
                 _ => Evidence::Unknown,
             },
+        }
+    }
+    fn acquire_reserved_child(
+        fd: OwnedFd,
+        expected_pid: u32,
+        ops: &mut impl Operations,
+    ) -> Result<Self, Acquisition> {
+        if ops
+            .status(&fd)
+            .and_then(|bytes| validate_tgid(&bytes, expected_pid))
+            .unwrap_or(false)
+        {
+            Ok(Self { fd, exited: false })
+        } else {
+            Err(Acquisition::Unknown(fd))
         }
     }
     pub fn acquire_member(
@@ -283,6 +299,18 @@ pub enum CaptureFailure {
     Unproved(Acquisition),
 }
 impl QualifiedProc {
+    /// Caller exclusively owns this exact unreaped direct child. This proves
+    /// its identity, never membership in a session or authority over siblings.
+    fn capture_reserved_child(
+        &self,
+        pid: u32,
+        ops: &mut impl ProcOperations,
+    ) -> Result<RetainedProcess, CaptureFailure> {
+        let fd = ops
+            .open_numeric(&self.root, pid)
+            .map_err(CaptureFailure::Open)?;
+        RetainedProcess::acquire_reserved_child(fd, pid, ops).map_err(CaptureFailure::Unproved)
+    }
     pub fn capture(
         &self,
         pid: u32,
@@ -754,3 +782,7 @@ pub mod scope;
 
 mod pty;
 pub(crate) use pty::{own_child, prepare};
+
+pub(crate) mod fork;
+
+pub(crate) mod fork_child;

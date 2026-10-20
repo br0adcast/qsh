@@ -352,14 +352,16 @@ pub enum CleanupKind {
 /// for another's. Exactly one of `Started`/`Failed` is sent per `Open`, and
 /// an `Exited` only ever follows a `Started`: a channel whose start failed
 /// has already been answered. CleanupComplete is a separate terminal fact:
-/// only successful exact-child waitpid proves Reaped; audited pre-fork
-/// failures prove NoChild. Neither an outcome nor disconnection proves either.
+/// Linux monitors prove Reaped only after native session-scope cleanup, startup
+/// pipe retirement, and the reserved child's actual final wait. Legacy monitors
+/// retain their direct-child meaning. Audited pre-fork failures prove NoChild;
+/// neither an exit status nor disconnection proves either cleanup fact.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MonitorEvent {
-    /// No shell was created, or this monitor reaped its exact shell PID.
+    /// No shell was created, or the monitor completed its owned cleanup scope.
     CleanupComplete { id: ChannelId, kind: CleanupKind },
     /// The shell exec'd -- the same moment, and the same evidence (the
-    /// startup-report pipe at end-of-file), that [`Response::Opened`]
+    /// startup-report pipe at end-of-file after a valid native session stage), that [`Response::Opened`]
     /// stands for.
     Started { id: ChannelId },
     /// The shell could not be started, and this is the `errno` that says
