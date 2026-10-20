@@ -303,6 +303,7 @@ async fn capacity_boundary_stale_overload_cannot_retire_a_replacement_attachment
     // Attach has priority over queued backend items in the actual bridge.
     rig.attach_a_new_connection();
     rig.backend_sends(SessionOutbound::ResourceExhausted { origin: old });
+    rig.backend_sends(SessionOutbound::CloseSession { origin: old });
     rig.backend_sends(SessionOutbound::NotifyDelivered {
         stream_id: CONTROL_STREAM,
         token: 0x2601,
@@ -365,7 +366,10 @@ fn capacity_boundary_repeated_attachments_keep_one_pending_overload_notification
         .count();
     drop(items);
     assert_eq!(lifecycle.control_budget.retained_for_test(), (0, 0, 0));
-    assert_eq!(latest_abort.unwrap().generation, MAX_SESSIONS_TOTAL as u64);
+    assert_eq!(
+        latest_abort.unwrap().origin.generation,
+        MAX_SESSIONS_TOTAL as u64
+    );
     assert_eq!(replies, 1);
     assert_eq!(
         overloads, 1,
@@ -490,4 +494,108 @@ async fn capacity_boundary_empty_backend_eof_sends_authenticated_close() {
 #[tokio::test]
 async fn capacity_boundary_drained_control_backend_eof_sends_authenticated_close() {
     authenticated_peer_observes_backend_eof(true).await;
+}
+
+struct ExplicitTerminalBackend {
+    close_first: bool,
+}
+impl SessionBackend for ExplicitTerminalBackend {
+    fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let close_first = self.close_first;
+        Box::pin(async move {
+            while let Some(event) = io.recv().await {
+                if let SessionInbound::Live(origin) = event {
+                    if close_first {
+                        io.close_session(origin);
+                        io.resource_exhausted(origin);
+                    } else {
+                        io.resource_exhausted(origin);
+                        io.close_session(origin);
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn capacity_terminal_first_request_preserves_explicit_close_or_resource_reason() {
+    for close_first in [true, false] {
+        let mut rig = delivery_rig(Arc::new(ExplicitTerminalBackend { close_first }), |_| {}).await;
+        let mut reason = None;
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut packet = vec![0; 65536];
+            while rig.client.state() != LinkState::Closed {
+                let (len, source) = rig.client_sock.recv_from(&mut packet).await.unwrap();
+                let _ = rig
+                    .client
+                    .on_datagram(Instant::now(), source, &packet[..len]);
+                for event in rig.client.poll_events() {
+                    if let Event::SessionAborted(value) = event {
+                        reason = Some(value);
+                    }
+                }
+            }
+        })
+        .await;
+        rig.lifecycle.shutdown.request();
+        tokio::time::timeout(Duration::from_secs(5), &mut rig.bridge)
+            .await
+            .expect("terminal fixture bridge joins")
+            .unwrap();
+        rig.lifecycle.drain().await.unwrap();
+        assert!(
+            reached.is_ok(),
+            "real authenticated terminal packet reaches peer"
+        );
+        assert!(rig.client.closed_gracefully());
+        assert_eq!(
+            reason,
+            if close_first {
+                None
+            } else {
+                Some(crate::SessionAbortReason::ResourceExhausted)
+            },
+            "first terminal request wins within one attachment"
+        );
+    }
+}
+
+#[test]
+fn capacity_terminal_close_and_resource_share_one_notification_across_generations() {
+    let (io, _input, mut output) = SessionIo::test_pair();
+    for generation in 0..MAX_SESSIONS_TOTAL as u64 {
+        let origin = AttachmentContext {
+            generation,
+            session_id: generation + 1,
+            features: crate::Features::SUPPORTED,
+        };
+        io.set_control_origin(origin);
+        if generation % 2 == 0 {
+            io.close_session(origin);
+            io.resource_exhausted(origin);
+        } else {
+            io.resource_exhausted(origin);
+            io.close_session(origin);
+        }
+    }
+    let latest = io.control().take_abort(TerminalRequest {
+        origin: AttachmentContext::default(),
+        disposition: TerminalDisposition::Close,
+    });
+    assert_eq!(latest.origin.generation, MAX_SESSIONS_TOTAL as u64 - 1);
+    assert_eq!(latest.disposition, TerminalDisposition::ResourceExhausted);
+    let mut notifications = 0;
+    while let Ok(event) = output.try_recv() {
+        assert!(matches!(
+            event,
+            SessionOutbound::CloseSession { .. } | SessionOutbound::ResourceExhausted { .. }
+        ));
+        notifications += 1;
+    }
+    drop(io);
+    assert_eq!(
+        notifications, 1,
+        "generation churn cannot create a second terminal queue"
+    );
 }

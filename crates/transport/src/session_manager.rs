@@ -481,6 +481,10 @@ pub enum SessionOutbound {
     ResourceExhausted {
         origin: AttachmentContext,
     },
+    /// Explicit compatibility teardown without a protocol-error classification.
+    CloseSession {
+        origin: AttachmentContext,
+    },
     ChannelOpened {
         stream: u8,
         origin: AttachmentContext,
@@ -580,11 +584,22 @@ pub struct ControlDelivery {
     charge: Option<OutputCharge>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalDisposition {
+    Close,
+    ResourceExhausted,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalRequest {
+    origin: AttachmentContext,
+    disposition: TerminalDisposition,
+}
+
 #[derive(Default)]
 struct ControlOrigin {
     attachment: AttachmentContext,
     aborting: bool,
-    requested_abort: Option<AttachmentContext>,
+    requested_abort: Option<TerminalRequest>,
     abort_notification_queued: bool,
 }
 struct SessionControl {
@@ -592,7 +607,7 @@ struct SessionControl {
     origin: Mutex<ControlOrigin>,
 }
 impl SessionControl {
-    fn take_abort(&self, fallback: AttachmentContext) -> AttachmentContext {
+    fn take_abort(&self, fallback: TerminalRequest) -> TerminalRequest {
         let mut state = self.origin.lock().unwrap();
         state.abort_notification_queued = false;
         state.requested_abort.take().unwrap_or(fallback)
@@ -644,21 +659,36 @@ impl SessionIo {
         }
     }
 
+    pub(crate) fn close_session(&self, origin: AttachmentContext) {
+        self.request_terminal(origin, TerminalDisposition::Close);
+    }
+
     pub(crate) fn resource_exhausted(&self, origin: AttachmentContext) {
+        self.request_terminal(origin, TerminalDisposition::ResourceExhausted);
+    }
+
+    fn request_terminal(&self, origin: AttachmentContext, disposition: TerminalDisposition) {
         let mut state = self.control().origin.lock().unwrap();
         if state.attachment != origin || state.aborting {
             return;
         }
+        // First terminal cause wins within one attachment. A newly processed
+        // attachment may replace the fixed mailbox, never add another signal.
         state.aborting = true;
-        state.requested_abort = Some(origin);
+        state.requested_abort = Some(TerminalRequest {
+            origin,
+            disposition,
+        });
         if state.abort_notification_queued {
             return;
         }
         state.abort_notification_queued = true;
         drop(state);
-        let _ = self
-            .outbound
-            .send(SessionOutbound::ResourceExhausted { origin });
+        let notification = match disposition {
+            TerminalDisposition::Close => SessionOutbound::CloseSession { origin },
+            TerminalDisposition::ResourceExhausted => SessionOutbound::ResourceExhausted { origin },
+        };
+        let _ = self.outbound.send(notification);
     }
 
     /// The caller reserved the complete encoding before accepting its effect.
@@ -3982,17 +4012,36 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     delivery,
                 });
             }
-            Wakeup::Backend(Some(SessionOutbound::ResourceExhausted { origin })) => {
-                // One fixed mailbox replaces repeated generation notifications;
-                // validate its latest request only after the signal is consumed.
-                let origin = control.take_abort(origin);
+            Wakeup::Backend(Some(
+                message @ (SessionOutbound::ResourceExhausted { .. }
+                | SessionOutbound::CloseSession { .. }),
+            )) => {
+                let fallback = match message {
+                    SessionOutbound::ResourceExhausted { origin } => TerminalRequest {
+                        origin,
+                        disposition: TerminalDisposition::ResourceExhausted,
+                    },
+                    SessionOutbound::CloseSession { origin } => TerminalRequest {
+                        origin,
+                        disposition: TerminalDisposition::Close,
+                    },
+                    _ => unreachable!(),
+                };
+                // One signal consumes the latest origin/disposition together.
+                // Validate before retirement: stale signals cannot poison the
+                // replacement's budget or change its terminal classification.
+                let request = control.take_abort(fallback);
+                let origin = request.origin;
                 if origin.session_id == conn.session_id()
                     && origin.generation == link.ledger.generation()
                 {
                     control_budget.retire();
-                    out.extend(
-                        conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted),
-                    );
+                    out.extend(match request.disposition {
+                        TerminalDisposition::Close => conn.close(now),
+                        TerminalDisposition::ResourceExhausted => {
+                            conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted)
+                        }
+                    });
                 }
             }
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
