@@ -158,7 +158,7 @@ floor=${QSHD_GLIBC_FLOOR:-}
 # step, minutes into a build, as a shell error about a word rather than as
 # "the image is missing cpio" -- and the format-specific half is exactly
 # where an image and this script drift apart.
-tools=(cargo readelf nm file find sort "$root/scripts/check-pam-linkage.sh")
+tools=(cargo python3 readelf nm file find sort "$root/scripts/check-pam-linkage.sh")
 case $fmt in
   deb) tools+=(cargo-deb dpkg-deb dpkg-shlibdeps) ;;
   rpm) tools+=(cargo-generate-rpm rpm rpm2cpio cpio) ;;
@@ -167,6 +167,12 @@ for tool in "${tools[@]}"; do
   command -v "$tool" >/dev/null ||
     die "'$tool' is needed inside the $fmt container and was not found -- packaging/Dockerfile.build-$fmt should install it"
 done
+
+# Local invocations also require one consistent shipped pair. CI checks the
+# tag before launching these containers; here the same checkout supplies the
+# selected version, independent of a developer's branch name.
+version=$(cargo metadata --locked --format-version 1 --no-deps \
+  | python3 "$root/scripts/check-release-version.py" --ref-type branch --ref-name local)
 
 # What a shipped system-mode binary must be, wherever it came from. Every
 # one of these has a way of being quietly false: `--features system`
@@ -296,6 +302,8 @@ for row in "${targets[@]}"; do
       [[ -f $pkg ]] || pkg=$(find "$dist" -maxdepth 1 -name "qshd_*_$deb_arch.deb" | head -n 1)
       [[ -n $pkg && -f $pkg ]] || die "cargo deb produced no package for $triple: $out"
 
+      python3 "$root/scripts/check-release-output.py" package --format deb --program qshd \
+        --version "$version" --arch "$deb_arch" "$pkg"
       declared=$(dpkg-deb -f "$pkg" Architecture)
       [[ $declared == "$deb_arch" ]] || die "$pkg says Architecture: $declared, expected $deb_arch"
       ok "$(basename "$pkg"): Architecture: $declared"
@@ -351,6 +359,8 @@ for row in "${targets[@]}"; do
       [[ -f $pkg ]] || pkg=$(find "$dist" -maxdepth 1 -name "qshd-*.$rpm_arch.rpm" | head -n 1)
       [[ -n $pkg && -f $pkg ]] || die "cargo generate-rpm produced no package for $triple: $out"
 
+      python3 "$root/scripts/check-release-output.py" package --format rpm --program qshd \
+        --version "$version" --arch "$rpm_arch" "$pkg"
       declared=$(rpm -qp --qf '%{ARCH}' "$pkg" 2>/dev/null)
       [[ $declared == "$rpm_arch" ]] || die "$pkg says arch $declared, expected $rpm_arch"
       ok "$(basename "$pkg"): arch $declared"

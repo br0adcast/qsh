@@ -10,7 +10,11 @@ SOURCES = (
     ("cargo-generate-rpm-0.21.0", "3187e19f0e00274b3b24f017559038722388889bd1a2ecd2281cd748e7d52ec6"),
     ("rpm-0.23.2", "cf5c92939a06adb261d757e43f49bcdb121d62c6fe8e859b1006ce37f81e6d7f"),
 )
-PATCHES = ("rpm-0.23.2-archive-size.patch", "cargo-generate-rpm-0.21.0-local-rpm.patch")
+PATCHES = (
+    "rpm-0.23.2-archive-size.patch",
+    "cargo-generate-rpm-0.21.0-local-rpm.patch",
+    "cargo-generate-rpm-0.21.0-requires-post.patch",
+)
 
 
 def extract_source(archive, checksum, name, destination):
