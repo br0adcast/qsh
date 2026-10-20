@@ -350,6 +350,11 @@ make_account() {
 make_account alice
 make_account bob
 
+# These fresh containers never run systemd-user-sessions to remove the
+# image's boot marker. Complete fixture boot before the normal login controls;
+# the explicit nologin checks below still install and test both policy markers.
+dexec rm -f /run/nologin
+
 say "starting the installed /usr/bin/qshd serve --system directly, as root"
 port=$((20000 + (RANDOM % 20000)))
 dexec sh -c "nohup /usr/bin/qshd serve --system --port $port >/tmp/daemon.out 2>/tmp/daemon.err </dev/null &"
