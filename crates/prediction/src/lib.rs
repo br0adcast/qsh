@@ -3,6 +3,8 @@
 //! no terminal implementation or foreign-language bindings. `PredictionEngine` is the public surface
 //! (see `engine`).
 
+mod budget;
+
 pub mod engine;
 pub mod keystroke;
 pub mod overlay;

@@ -186,41 +186,68 @@ impl ConditionalOverlayCell {
         }
     }
 
-    pub fn get_validity(&self, fb: &Frame, row: i32, _early_ack: i64, late_ack: i64) -> Validity {
+    pub fn get_validity(&self, fb: &Frame, row: i32, early_ack: i64, late_ack: i64) -> Validity {
+        self.validity(fb, row, early_ack, late_ack, || Ok(()))
+            .expect("unlimited standalone validity")
+    }
+
+    pub(crate) fn validity_budgeted(
+        &self,
+        fb: &Frame,
+        row: i32,
+        early_ack: i64,
+        late_ack: i64,
+        budget: &mut crate::budget::Budget,
+    ) -> crate::budget::Result<Validity> {
+        self.validity(fb, row, early_ack, late_ack, || budget.work(1))
+    }
+
+    fn validity(
+        &self,
+        fb: &Frame,
+        row: i32,
+        _early_ack: i64,
+        late_ack: i64,
+        mut charge: impl FnMut() -> crate::budget::Result,
+    ) -> crate::budget::Result<Validity> {
         if !self.base.active {
-            return Validity::Inactive;
+            return Ok(Validity::Inactive);
         }
         if row >= fb.height() as i32 || self.base.col >= fb.width() as i32 {
-            return Validity::IncorrectOrExpired;
+            return Ok(Validity::IncorrectOrExpired);
         }
         let current = fb.cell(row as u16, self.base.col as u16);
 
         // The authoritative frame confirming or refuting the prediction hasn't
         // arrived yet -- too early to judge.
         if late_ack < self.base.expiration_frame {
-            return Validity::Pending;
+            return Ok(Validity::Pending);
         }
 
         if self.unknown {
-            return Validity::CorrectNoCredit;
+            return Ok(Validity::CorrectNoCredit);
         }
         // Too easy to false-positive on a blank cell -- no credit given.
         if self.replacement.is_blank() {
-            return Validity::CorrectNoCredit;
+            return Ok(Validity::CorrectNoCredit);
         }
 
         if current.contents_match(&self.replacement) {
-            let matches_original = self
-                .original_contents
-                .iter()
-                .any(|cell| cell.contents_match(&self.replacement));
+            let mut matches_original = false;
+            for cell in &self.original_contents {
+                charge()?;
+                if cell.contents_match(&self.replacement) {
+                    matches_original = true;
+                    break;
+                }
+            }
             if matches_original {
-                Validity::CorrectNoCredit
+                Ok(Validity::CorrectNoCredit)
             } else {
-                Validity::Correct
+                Ok(Validity::Correct)
             }
         } else {
-            Validity::IncorrectOrExpired
+            Ok(Validity::IncorrectOrExpired)
         }
     }
 
@@ -360,5 +387,25 @@ mod complete_cell_tests {
         assert_eq!(frame.cells[0], prediction.replacement);
         assert_ne!(frame.cells[0].flags & terminal::FLAG_HIDDEN, 0);
         assert_eq!(prediction.get_validity(&frame, 0, 0, 1), Validity::Correct);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn history_comparison_is_part_of_the_work_allowance() {
+        let mut cell = ConditionalOverlayCell::new(1, 0, 0);
+        cell.base.active = true;
+        cell.replacement.set_char('x');
+        cell.original_contents = vec![Cell::blank(); 100];
+        let mut frame = Frame::blank(2, 1);
+        frame.cell_mut(0, 0).set_char('x');
+        let mut budget = crate::budget::Budget::default();
+        budget.limits.work = 8;
+        assert!(cell
+            .validity_budgeted(&frame, 0, 1, 1, &mut budget)
+            .is_err());
+        assert_eq!(budget.used, 8);
     }
 }

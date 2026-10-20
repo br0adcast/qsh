@@ -248,10 +248,8 @@ impl ShellState {
     /// The grid stays: the server repaints it.
     pub fn on_reattach(&mut self) -> terminal::Frame {
         self.deframer = ShellDeframer::new();
-        self.prediction.reset();
+        self.prediction.reset_connection();
         self.input_bytes_sent = 0;
-        self.prediction.set_local_frame_sent(0);
-        self.prediction.set_echo_ack(0);
         self.terminal.frame()
     }
 
@@ -322,6 +320,24 @@ mod state_tests {
         assert_eq!(
             state.on_stream0(&encode_record(REC_DATA, b"d"), 3, 0),
             expected.on_stream0(&encode_record(REC_DATA, b"d"), 3, 0)
+        );
+    }
+
+    #[test]
+    fn reattach_restarts_prediction_ack_scope_after_budget_fallback() {
+        let mut st = ShellState::new(80, 24, prediction::DisplayPreference::Always, false);
+        st.on_input(&vec![b'p'; 4096], 1000, 100);
+        assert!(!st.prediction_active());
+        st.on_reattach();
+        st.on_input(b"h", 1100, 100);
+        let mut ack = encode_record(REC_DATA, b"h");
+        ack.extend(encode_record(REC_ECHO_ACK, &1u64.to_be_bytes()));
+        st.on_stream0(&ack, 1150, 100);
+        let frame = st.on_input(b"i", 1200, 100);
+        assert_eq!(
+            frame.cell(0, 1).ch,
+            'i',
+            "new connection's ACK1 must retire its own input, not wait for the old watermark"
         );
     }
 

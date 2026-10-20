@@ -408,7 +408,16 @@ exit is returned as its own exit code. Client-generated failures use:
 ### Prediction
 
 `adaptive` enables local input prediction when latency warrants it and disables
-it on fast links. `always` predicts unconditionally; `never` disables prediction.
+it on fast links. `always` shows available predictions regardless of latency;
+`never` disables prediction.
+
+Prediction has per-episode limits on speculative memory, pending cursors and
+work. A large paste or delayed echo can reach a limit; the client then displays
+authoritative output until echo acknowledgement catches up. Every input byte
+still goes to the remote application. Prediction can resume after that
+acknowledgement. Resizing or changing the prediction display mode does not
+bypass this wait.
+
 The client reconciles the predicted display with the authoritative server frame.
 On applications with unusual redraw behavior, disabling prediction may avoid
 visible corrections.
