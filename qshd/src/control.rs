@@ -368,7 +368,10 @@ pub struct EnsureLock {
 }
 
 impl EnsureLock {
-    pub fn acquire(socket: &Path) -> std::io::Result<Self> {
+    /// Attempt immediately, even for a zero budget, then bound contention by
+    /// `patience`. This does not bound filesystem operations or the transaction
+    /// performed after acquisition. A timeout never removes or unlocks the file.
+    pub fn acquire(socket: &Path, patience: Duration) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
         let parent = socket
@@ -400,14 +403,40 @@ impl EnsureLock {
                 "the ensure lock must be a private, singly linked regular file owned by this user",
             ));
         }
+        let deadline = std::time::Instant::now()
+            .checked_add(patience)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ensure lock wait budget is too large",
+                )
+            })?;
+        let mut attempted = false;
         loop {
+            // There is one immediate attempt, including with zero patience.
+            // Neither contention nor EINTR grants another attempt after expiry.
+            if attempted && std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("timed out after {patience:?} waiting for another transport ensure transaction"),
+                ));
+            }
+            attempted = true;
             // SAFETY: the descriptor remains owned by file throughout the call.
-            if unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX) } == 0 {
+            if unsafe {
+                nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB)
+            } == 0
+            {
                 break;
             }
             let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                ),
+                _ => return Err(error),
             }
         }
         let current = std::fs::symlink_metadata(&path)?;
@@ -732,24 +761,24 @@ mod tests {
         let target = dir.path().join("untouched");
         std::fs::write(&target, b"fixture sentinel").unwrap();
         symlink(&target, &lock).unwrap();
-        assert!(EnsureLock::acquire(&socket).is_err());
+        assert!(EnsureLock::acquire(&socket, Duration::from_secs(1)).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"fixture sentinel");
         std::fs::remove_file(&lock).unwrap();
         std::fs::hard_link(&target, &lock).unwrap();
-        assert!(EnsureLock::acquire(&socket).is_err());
+        assert!(EnsureLock::acquire(&socket, Duration::from_secs(1)).is_err());
         std::fs::remove_file(&lock).unwrap();
         nix::unistd::mkfifo(
             &lock,
             nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
         )
         .unwrap();
-        assert!(EnsureLock::acquire(&socket).is_err());
+        assert!(EnsureLock::acquire(&socket, Duration::from_secs(1)).is_err());
         std::fs::remove_file(&lock).unwrap();
         std::fs::write(&lock, b"retained lock contents").unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(EnsureLock::acquire(&socket).is_err());
+        assert!(EnsureLock::acquire(&socket, Duration::from_secs(1)).is_err());
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
-        drop(EnsureLock::acquire(&socket).unwrap());
+        drop(EnsureLock::acquire(&socket, Duration::from_secs(1)).unwrap());
         assert_eq!(std::fs::read(&lock).unwrap(), b"retained lock contents");
     }
 
@@ -758,7 +787,7 @@ mod tests {
         use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
-        let held = EnsureLock::acquire(&socket).unwrap();
+        let held = EnsureLock::acquire(&socket, Duration::from_secs(1)).unwrap();
         let inherited = held._file.try_clone().unwrap();
         let contender = std::fs::OpenOptions::new()
             .write(true)
