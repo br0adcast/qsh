@@ -1584,9 +1584,10 @@ impl Connection {
         Ok(out)
     }
 
-    /// Whole-record admission transfers the source allocation to this call;
-    /// a blocked record is returned unchanged with its caller's custody intact.
-    pub(crate) fn try_send_owned_bounded(
+    /// Consume a whole source Vec after copying into the reliable sender. A
+    /// blocked record is returned unchanged. Callers account source scratch and
+    /// reliable bytes independently while both exist; this is not zero-copy.
+    pub(crate) fn try_send_consuming_bounded(
         &mut self,
         now: Instant,
         stream: u8,

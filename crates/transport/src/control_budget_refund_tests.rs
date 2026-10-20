@@ -111,18 +111,18 @@ fn capacity_refund_preflight_shrink_reuses_bytes_without_refunding_entry() {
     retry.as_mut().enable();
     assert_eq!(retry.as_mut().poll(&mut context), Poll::Pending);
     response.shrink_ordinary(5).unwrap();
-    assert_eq!(global.retained_for_test(), (5, 1, 0));
+    assert_eq!(global.retained_for_test(), (2 * 5, 1, 0));
     assert_eq!(retry.as_mut().poll(&mut context), Poll::Ready(()));
     assert!(wake.locks_released.load(Ordering::SeqCst));
     let rest = session.reserve(Response::Ordinary(MAX_RECORD - 5)).unwrap();
-    assert_eq!(global.retained_for_test(), (MAX_RECORD, 2, 0));
+    assert_eq!(global.retained_for_test(), (2 * MAX_RECORD, 2, 0));
     let mut owner = response.into_owner();
     let record = owner.take_record(5).unwrap();
     drop(owner);
     drop(rest);
     assert_eq!(
         global.retained_for_test(),
-        (5, 1, 0),
+        (2 * 5, 1, 0),
         "record still owns the shrunken entry"
     );
     drop(record);
@@ -139,7 +139,7 @@ fn capacity_refund_shrink_rejects_growth_empty_and_mandatory_future_allowance() 
             ordinary.shrink_ordinary(invalid),
             Err(CapacityError::InvalidSize)
         );
-        assert_eq!(global.retained_for_test(), (10, 1, 0));
+        assert_eq!(global.retained_for_test(), (2 * 10, 1, 0));
     }
     ordinary.shrink_ordinary(10).unwrap();
     for class in [
@@ -160,7 +160,7 @@ fn capacity_refund_shrink_rejects_growth_empty_and_mandatory_future_allowance() 
     ordinary.shrink_ordinary(5).unwrap();
     assert_eq!(
         global.retained_for_test(),
-        (5, 1, 0),
+        (2 * 5, 1, 0),
         "retired retained obligation may settle its excess reservation"
     );
     drop(ordinary);

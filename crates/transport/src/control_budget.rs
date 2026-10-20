@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{futures::Notified, Notify};
 
-use crate::channel::{CHANNEL_SNAPSHOT_MAX, MAX_CHANNELS};
+use crate::channel::{CHANNEL_IDENTITIES, CHANNEL_SNAPSHOT_MAX, MAX_CHANNELS};
 use crate::channel_timeline::ORDINARY_ENTRIES;
 use crate::session_manager::{MAX_SESSIONS_PER_OWNER, MAX_SESSIONS_TOTAL};
 use crate::shell_frame::CONTROL_RECORD_MAX;
@@ -12,13 +12,27 @@ use crate::shell_frame::CONTROL_RECORD_MAX;
 pub(crate) const MAX_RECORD: usize = CONTROL_RECORD_MAX + 5;
 const MAX_SNAPSHOT: usize = CHANNEL_SNAPSHOT_MAX + 5;
 const UPDATE_ENVELOPE: usize = 6 + 6 + MAX_RECORD;
-pub(crate) const SESSION_BYTES: usize =
-    MAX_RECORD + MAX_CHANNELS * MAX_RECORD + UPDATE_ENVELOPE + 3 * MAX_SNAPSHOT + 5;
+// Derived maxima: 1,422,427 charged bytes/session, 182,070,656 globally,
+// and 48,768 response entries. These logical/copy bounds are not RSS bounds.
+// Generic response envelopes conservatively retain both queued source and
+// simultaneous reliable copy allowance through ACK. Snapshot has three
+// independent DTO/scratch/wire leases; terminal scratch has its timeline lease.
+const COPY_WEIGHT: [usize; 6] = [2, 2, 2, 1, 2, 1];
+pub(crate) const SESSION_BYTES: usize = 2
+    * (MAX_RECORD + MAX_CHANNELS * MAX_RECORD + UPDATE_ENVELOPE + 5)
+    + 3 * MAX_SNAPSHOT
+    + CHANNEL_IDENTITIES * 10;
 const GLOBAL_BYTES: usize = MAX_SESSIONS_TOTAL * SESSION_BYTES;
 // Entry accounting also bounds tiny reply permits across retired owners;
 // the byte envelope alone cannot bound their object/Arc/container overhead.
 pub(crate) const GLOBAL_RESPONSE_ENTRIES: usize =
-    MAX_SESSIONS_TOTAL * (ORDINARY_ENTRIES + MAX_CHANNELS + 1 + 3 + 1);
+    MAX_SESSIONS_TOTAL * (ORDINARY_ENTRIES + MAX_CHANNELS + 1 + 3 + 1 + CHANNEL_IDENTITIES);
+// Each About job additionally owns <=160 logical bytes of validated retained
+// metadata + per-waiter clone (not arbitrary allocations inside the provider).
+// This job cap includes retired sessions and remains held through result drop:
+// <=40,960 additional bytes globally, or <=160 for one current session.
+// Combined response/copy + About metadata: 182,111,616 globally, 1,422,587 for
+// one current session. Struct/container and allocator overhead remain separate.
 const GLOBAL_JOBS: usize = 2 * MAX_SESSIONS_TOTAL;
 const PRINCIPAL_JOBS: usize = 2 * MAX_SESSIONS_PER_OWNER;
 
@@ -38,6 +52,7 @@ pub(crate) enum Response {
     Update,
     Snapshot,
     Restart,
+    Terminal,
 }
 impl Response {
     fn charge(self) -> (usize, usize) {
@@ -47,6 +62,7 @@ impl Response {
             Self::Update => (2, UPDATE_ENVELOPE),
             Self::Snapshot => (3, MAX_SNAPSHOT),
             Self::Restart => (4, 5),
+            Self::Terminal => (5, 10),
         }
     }
 }
@@ -76,8 +92,8 @@ pub(crate) struct GlobalBudget(Arc<Mutex<GlobalState>>, Arc<Notify>);
 #[derive(Default)]
 struct SessionState {
     retired: bool,
-    entries: [usize; 5],
-    bytes: [usize; 5],
+    entries: [usize; 6],
+    bytes: [usize; 6],
     jobs: [bool; 2],
 }
 #[derive(Clone)]
@@ -111,44 +127,82 @@ impl SessionBudget {
         self.state.lock().unwrap().retired = true;
     }
     pub(crate) fn reserve(&self, response: Response) -> Result<ResponsePermit, CapacityError> {
-        let (class, bytes) = response.charge();
+        self.reserve_batch([response]).map(|[permit]| permit)
+    }
+
+    /// Both future obligations exist before any factory effects. Rejection
+    /// changes no counters and emits no provisional-refund wake.
+    pub(crate) fn reserve_open(&self) -> Result<[ResponsePermit; 2], CapacityError> {
+        self.reserve_batch([Response::Open, Response::Terminal])
+    }
+
+    /// Independent custody for source DTO, merged DTO, and owned wire bytes.
+    pub(crate) fn reserve_snapshot(&self) -> Result<[ResponsePermit; 3], CapacityError> {
+        self.reserve_batch([Response::Snapshot; 3])
+    }
+
+    fn reserve_batch<const N: usize>(
+        &self,
+        responses: [Response; N],
+    ) -> Result<[ResponsePermit; N], CapacityError> {
+        let charges = responses.map(Response::charge);
+        let mut entries = [0usize; 6];
+        let mut bytes = [0usize; 6];
+        let mut total = 0usize;
+        for &(class, amount) in &charges {
+            if class == 0 && (amount == 0 || amount > MAX_RECORD) {
+                return Err(CapacityError::InvalidSize);
+            }
+            let charged = amount
+                .checked_mul(COPY_WEIGHT[class])
+                .ok_or(CapacityError::InvalidSize)?;
+            entries[class] += 1;
+            bytes[class] = bytes[class]
+                .checked_add(charged)
+                .ok_or(CapacityError::InvalidSize)?;
+            total = total
+                .checked_add(charged)
+                .ok_or(CapacityError::InvalidSize)?;
+        }
         let mut global = self.global.0.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        // Fixed envelopes may exceed one record; only ordinary bytes are
-        // supplied by a caller and need record-size validation here.
-        if class == 0 && (bytes == 0 || bytes > MAX_RECORD) {
-            return Err(CapacityError::InvalidSize);
-        }
         if state.retired {
             return Err(CapacityError::Retired);
         }
-        let entry_limits = [ORDINARY_ENTRIES, MAX_CHANNELS, 1, 3, 1];
+        let entry_limits = [ORDINARY_ENTRIES, MAX_CHANNELS, 1, 3, 1, CHANNEL_IDENTITIES];
         let byte_limits = [
-            MAX_RECORD,
-            MAX_CHANNELS * MAX_RECORD,
-            UPDATE_ENVELOPE,
+            2 * MAX_RECORD,
+            2 * MAX_CHANNELS * MAX_RECORD,
+            2 * UPDATE_ENVELOPE,
             3 * MAX_SNAPSHOT,
-            5,
+            2 * 5,
+            CHANNEL_IDENTITIES * 10,
         ];
-        if state.entries[class] >= entry_limits[class]
-            || bytes > byte_limits[class].saturating_sub(state.bytes[class])
-        {
-            return Err(CapacityError::Session);
+        for class in 0..entries.len() {
+            if entries[class] > entry_limits[class].saturating_sub(state.entries[class])
+                || bytes[class] > byte_limits[class].saturating_sub(state.bytes[class])
+            {
+                return Err(CapacityError::Session);
+            }
         }
-        if global.response_entries >= GLOBAL_RESPONSE_ENTRIES
-            || bytes > GLOBAL_BYTES.saturating_sub(global.bytes)
+        if N > GLOBAL_RESPONSE_ENTRIES.saturating_sub(global.response_entries)
+            || total > GLOBAL_BYTES.saturating_sub(global.bytes)
         {
             return Err(CapacityError::Global);
         }
-        global.bytes += bytes;
-        global.response_entries += 1;
-        state.entries[class] += 1;
-        state.bytes[class] += bytes;
-        Ok(ResponsePermit {
+        global.bytes += total;
+        global.response_entries += N;
+        for class in 0..entries.len() {
+            state.entries[class] += entries[class];
+            state.bytes[class] += bytes[class];
+        }
+        drop(state);
+        drop(global);
+        Ok(charges.map(|(class, bytes)| ResponsePermit {
             session: self.clone(),
             class,
             bytes,
-        })
+        }))
     }
     pub(crate) fn job(&self, job: Job) -> Result<JobPermit, CapacityError> {
         let mut global = self.global.0.lock().unwrap();
@@ -189,7 +243,11 @@ pub(crate) struct ResponseOwner {
     issued_bytes: usize,
 }
 #[must_use = "move the record lease through queued bytes to cumulative ACK"]
-pub(crate) struct ResponsePart(Arc<ResponsePermit>, usize);
+pub(crate) struct ResponsePart {
+    // Linear custody keeps the reservation alive; callers never clone it.
+    _permit: Arc<ResponsePermit>,
+    bytes: usize,
+}
 
 impl ResponsePermit {
     /// Before issuing any record lease, refund conservative ordinary preflight
@@ -198,7 +256,7 @@ impl ResponsePermit {
         if self.class != 0 || bytes == 0 || bytes > self.bytes {
             return Err(CapacityError::InvalidSize);
         }
-        let refund = self.bytes - bytes;
+        let refund = (self.bytes - bytes) * COPY_WEIGHT[self.class];
         if refund == 0 {
             return Ok(());
         }
@@ -214,7 +272,6 @@ impl ResponsePermit {
     }
     pub(crate) fn into_owner(self) -> ResponseOwner {
         let records_left = match self.class {
-            1 => 2, // Opened followed by a terminal outcome, or one refusal.
             2 => 3, // Accept, Restarting, and a final failure.
             _ => 1,
         };
@@ -233,15 +290,15 @@ impl ResponseOwner {
         }
         self.records_left -= 1;
         self.issued_bytes = total;
-        Some(ResponsePart(Arc::clone(&self.permit), bytes))
+        Some(ResponsePart {
+            _permit: Arc::clone(&self.permit),
+            bytes,
+        })
     }
 }
 impl ResponsePart {
     pub(crate) fn encoded_bytes(&self) -> usize {
-        self.1
-    }
-    pub(crate) fn envelope_bytes(&self) -> usize {
-        self.0.bytes
+        self.bytes
     }
 }
 
@@ -279,7 +336,7 @@ impl ControlLedger {
     ) -> Result<(), ResponsePart> {
         if generation != self.generation
             || start < self.last_end
-            || end.checked_sub(start) != Some(part.1 as u64)
+            || end.checked_sub(start) != Some(part.bytes as u64)
         {
             return Err(part);
         }
@@ -304,10 +361,10 @@ impl Drop for ResponsePermit {
     fn drop(&mut self) {
         let mut global = self.session.global.0.lock().unwrap();
         let mut state = self.session.state.lock().unwrap();
-        global.bytes -= self.bytes;
+        global.bytes -= self.bytes * COPY_WEIGHT[self.class];
         global.response_entries -= 1;
         state.entries[self.class] -= 1;
-        state.bytes[self.class] -= self.bytes;
+        state.bytes[self.class] -= self.bytes * COPY_WEIGHT[self.class];
         drop(state);
         drop(global);
         self.session.global.1.notify_waiters();
@@ -344,6 +401,8 @@ mod tests {
     use super::*;
     include!("control_budget_wire_tests.rs");
     include!("control_budget_refund_tests.rs");
+    include!("control_budget_open_tests.rs");
+    include!("control_budget_copy_tests.rs");
 
     #[test]
     fn mandatory_envelopes_have_finite_nonclone_record_leases() {
@@ -351,7 +410,8 @@ mod tests {
         let session = global.session(1);
         for (response, records) in [
             (Response::Ordinary(6), vec![6]),
-            (Response::Open, vec![6, 10]),
+            (Response::Open, vec![6]),
+            (Response::Terminal, vec![10]),
             (Response::Update, vec![6, 6, MAX_RECORD]),
             (Response::Snapshot, vec![MAX_SNAPSHOT]),
             (Response::Restart, vec![5]),
@@ -374,28 +434,27 @@ mod tests {
     fn mandatory_envelope_waits_for_future_obligation_and_last_retired_record() {
         let global = GlobalBudget::default();
         let session = global.session(1);
-        let mut owner = session.reserve(Response::Open).unwrap().into_owner();
-        let opened = owner.take_record(6).unwrap();
-        assert_eq!(opened.envelope_bytes(), MAX_RECORD);
-        drop(opened); // Opened ACK does not refund a future terminal outcome.
-        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
-        let terminal = owner.take_record(10).unwrap();
+        let [decision, terminal] = session.reserve_open().unwrap();
+        let mut decision = decision.into_owner();
+        let mut terminal = terminal.into_owner();
+        let opened = decision.take_record(6).unwrap();
+        drop(decision);
+        drop(opened);
+        assert_eq!(global.retained_for_test(), (10, 1, 0));
+        let terminal_record = terminal.take_record(10).unwrap();
         session.retire();
-        drop(owner); // The producer ended, but terminal bytes still await ACK.
-        drop(session);
-        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
-        assert_eq!(global.0.lock().unwrap().response_entries, 1);
-        drop(terminal);
-        assert_eq!(global.0.lock().unwrap().bytes, 0);
-        assert_eq!(global.0.lock().unwrap().response_entries, 0);
+        drop((terminal, session));
+        assert_eq!(global.retained_for_test(), (10, 1, 0));
+        drop(terminal_record);
+        assert_eq!(global.retained_for_test(), (0, 0, 0));
     }
 
     #[test]
     fn capacity_accounting_envelope_checks_total_encoded_bytes_before_issuing_record_custody() {
         let global = GlobalBudget::default();
         let session = global.session(1);
-        let mut owner = session.reserve(Response::Open).unwrap().into_owner();
-        let first = owner.take_record(MAX_RECORD - 1).unwrap();
+        let mut owner = session.reserve(Response::Update).unwrap().into_owner();
+        let first = owner.take_record(UPDATE_ENVELOPE - 1).unwrap();
         assert!(
             owner.take_record(2).is_none(),
             "simultaneously retained records exceed envelope"
@@ -440,18 +499,18 @@ mod tests {
         session.retire();
         drop(session);
         ledger.acknowledge(6, 16);
-        assert_eq!(global.0.lock().unwrap().bytes, 16, "stale generation ACK");
+        assert_eq!(global.0.lock().unwrap().bytes, 32, "stale generation ACK");
         ledger.acknowledge(7, 5);
-        assert_eq!(global.0.lock().unwrap().bytes, 16, "partial record ACK");
+        assert_eq!(global.0.lock().unwrap().bytes, 32, "partial record ACK");
         ledger.acknowledge(7, 6);
-        assert_eq!(global.0.lock().unwrap().bytes, 10);
+        assert_eq!(global.0.lock().unwrap().bytes, 20);
         assert_eq!(global.0.lock().unwrap().response_entries, 1);
         ledger.acknowledge(7, 6);
         ledger.acknowledge(7, 5);
         ledger.acknowledge(7, 15);
         assert_eq!(
             global.0.lock().unwrap().bytes,
-            10,
+            20,
             "duplicate/stale/partial ACK"
         );
         ledger.acknowledge(7, 16);
@@ -475,7 +534,7 @@ mod tests {
             Err(part) => part,
             Ok(()) => panic!("nonadvancing end"),
         };
-        assert_eq!(global.0.lock().unwrap().bytes, 6);
+        assert_eq!(global.0.lock().unwrap().bytes, 12);
         assert!(ledger.register(8, 10, 16, part).is_ok());
         drop(ledger); // Exact connection teardown destroys its delivery representation.
         assert_eq!(global.0.lock().unwrap().bytes, 0);
@@ -485,19 +544,19 @@ mod tests {
     fn control_ledger_ack_or_teardown_cannot_refund_a_future_terminal_obligation() {
         let global = GlobalBudget::default();
         let session = global.session(1);
-        let mut owner = session.reserve(Response::Open).unwrap().into_owner();
+        let mut owner = session.reserve(Response::Update).unwrap().into_owner();
         let mut ledger = ControlLedger::new(9, 0);
         assert!(ledger
             .register(9, 0, 6, owner.take_record(6).unwrap())
             .is_ok());
         ledger.acknowledge(9, 6);
-        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        assert_eq!(global.0.lock().unwrap().bytes, 2 * UPDATE_ENVELOPE);
         assert!(ledger
             .register(9, 6, 16, owner.take_record(10).unwrap())
             .is_ok());
         session.retire();
         drop(ledger);
-        assert_eq!(global.0.lock().unwrap().bytes, MAX_RECORD);
+        assert_eq!(global.0.lock().unwrap().bytes, 2 * UPDATE_ENVELOPE);
         drop(owner);
         assert_eq!(global.0.lock().unwrap().bytes, 0);
     }
@@ -512,6 +571,9 @@ mod tests {
             permits.push(session.reserve(Response::Snapshot).unwrap());
         }
         permits.push(session.reserve(Response::Restart).unwrap());
+        for _ in 0..CHANNEL_IDENTITIES {
+            permits.push(session.reserve(Response::Terminal).unwrap());
+        }
         permits
     }
 
@@ -565,7 +627,7 @@ mod tests {
         drop(last);
         let moved = replacement.reserve(Response::Ordinary(5)).unwrap();
         drop(held);
-        assert_eq!(global.0.lock().unwrap().bytes, 5);
+        assert_eq!(global.0.lock().unwrap().bytes, 10);
         drop(moved);
         assert_eq!(global.0.lock().unwrap().bytes, 0);
     }
@@ -580,6 +642,7 @@ mod tests {
             Response::Update,
             Response::Snapshot,
             Response::Restart,
+            Response::Terminal,
         ] {
             assert!(matches!(
                 session.reserve(response),
@@ -700,7 +763,7 @@ mod tests {
     #[test]
     fn retired_tiny_replies_cannot_exceed_the_global_entry_ceiling() {
         const EXPECTED_LIMIT: usize =
-            MAX_SESSIONS_TOTAL * (ORDINARY_ENTRIES + MAX_CHANNELS + 1 + 3 + 1);
+            MAX_SESSIONS_TOTAL * (ORDINARY_ENTRIES + MAX_CHANNELS + 1 + 3 + 1 + CHANNEL_IDENTITIES);
         let global = GlobalBudget::default();
         let mut held = Vec::new();
         for _ in 0..EXPECTED_LIMIT / ORDINARY_ENTRIES {
@@ -712,7 +775,7 @@ mod tests {
             }
             session.retire();
         }
-        assert_eq!(EXPECTED_LIMIT, 18_048);
+        assert_eq!(EXPECTED_LIMIT, 48_768);
         assert_eq!(GLOBAL_RESPONSE_ENTRIES, EXPECTED_LIMIT);
         assert_eq!(held.len(), EXPECTED_LIMIT);
         assert_eq!(global.0.lock().unwrap().response_entries, EXPECTED_LIMIT);
@@ -731,7 +794,7 @@ mod tests {
             Err(CapacityError::Global)
         );
         drop(held);
-        assert_eq!(global.0.lock().unwrap().bytes, 6);
+        assert_eq!(global.0.lock().unwrap().bytes, 12);
         assert_eq!(global.0.lock().unwrap().response_entries, 1);
         drop(moved);
         assert_eq!(global.0.lock().unwrap().bytes, 0);

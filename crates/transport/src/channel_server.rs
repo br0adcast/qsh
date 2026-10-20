@@ -421,6 +421,9 @@ struct AboutWaiter {
     origin: AttachmentContext,
     response: crate::control_budget::ResponsePermit,
 }
+// Separate from response leases: at most two bounded logical metadata DTOs
+// (provider result + one per-waiter clone) coexist under this job owner. The
+// unshrunk response reservation covers encoder payload/record overlap.
 struct AboutFlight {
     _job: crate::control_job::JobOwner,
     waiters: Vec<AboutWaiter>,
@@ -458,6 +461,10 @@ fn send_about_result(io: &SessionIo, waiter: AboutWaiter, result: &AboutResult) 
     // The provider metadata was validated on its bounded callback before this
     // encoding. Each waiter owns its own complete byte allocation and entry.
     let bytes = encode_server(&record);
+    // The unshrunk response preflight covers payload/encoded overlap. The
+    // separate About-job allowance covers provider DTO + this one clone.
+    // Destroy the clone before narrowing to source/reliable-copy bytes.
+    drop(record);
     let mut response = waiter.response;
     response
         .shrink_ordinary(bytes.len())
@@ -574,13 +581,20 @@ impl SessionUpdate {
         };
         let lease = job.take_worker().expect("one About provider phase");
         let result = io.spawn_callback(lease, move || {
-            let about = daemon.about();
+            let mut about = daemon.about();
             if about
                 .as_ref()
                 .is_some_and(|about| !crate::channel::is_arch_name(&about.arch))
             {
                 Err(crate::channel::AboutUnavailable::ProviderFailed)
             } else {
+                if let Some(about) = about.as_mut() {
+                    // Valid length alone does not bound retained provider
+                    // capacity. Discard excess storage before publication.
+                    about.arch = std::mem::take(&mut about.arch)
+                        .into_boxed_str()
+                        .into_string();
+                }
                 Ok(about)
             }
         });
@@ -596,6 +610,9 @@ impl SessionUpdate {
         for waiter in flight.waiters {
             send_about_result(io, waiter, &result);
         }
+        // Metadata custody ends before the final About job owner is refunded.
+        // Function parameters would otherwise outlive the local flight owner.
+        drop(result);
     }
 
     fn offer(
@@ -722,7 +739,7 @@ impl SessionUpdate {
             },
             result => result,
         };
-        let bytes = encode_server(&ServerRecord::UpdateResult(result));
+        let bytes = crate::channel::encode_server_owned(ServerRecord::UpdateResult(result));
         let part = self
             .chain
             .as_mut()
@@ -1192,6 +1209,7 @@ struct ResizeIntent {
     origin: AttachmentContext,
 }
 struct ProducerState {
+    terminal_response: Option<crate::control_budget::ResponseOwner>,
     reply_delivery: crate::channel_reply_delivery::ReplyDelivery,
     origin: AttachmentContext,
     timeline: TimelineBudget,
@@ -1229,6 +1247,7 @@ impl ProducerState {
             .try_reserve(EntryClass::Lifecycle, 14)
             .expect("fixed terminal failure reserve");
         Self {
+            terminal_response: None,
             reply_delivery: crate::channel_reply_delivery::ReplyDelivery::new(
                 context.ready.clone(),
             ),
@@ -1620,30 +1639,30 @@ fn reset_attachment_outputs(
     exits: &mut HashMap<u8, PendingExit>,
     context: AttachmentContext,
 ) {
-    for ch in channels.values_mut() {
-        // These bounded reader chunks use geometry already established in the
-        // old timeline. A capacity-blocked repaint checkpoint did not resize
-        // that model. Transfer the bytes under their old origin before closing
-        // that producer scope; Stage 4 supplies the new attachment bootstrap.
-        while let Some(bytes) = ch.producer.queued_data.pop_front() {
-            emit_data(io, ch, &bytes);
+    // Reserve all three independent snapshot representations before resetting
+    // producer/model state. Rejection leaves the old view untouched.
+    let published = io.publish_resume_snapshot(context, || {
+        for ch in channels.values_mut() {
+            // These bounded reader chunks use geometry already established in the
+            // old timeline. A capacity-blocked repaint checkpoint did not resize
+            // that model. Transfer the bytes under their old origin before closing
+            // that producer scope; Stage 4 supplies the new attachment bootstrap.
+            while let Some(bytes) = ch.producer.queued_data.pop_front() {
+                emit_data(io, ch, &bytes);
+            }
+            reset_producer(ch, context);
+            ch.input_consumed = 0;
+            ch.last_acked = 0;
+            // The same rule `open_channel` uses: ask the channel's
+            // OWN screen model, not `ch.request.screen` (what the
+            // client originally asked for) -- see
+            // `SessionScreen::has_screen`'s own doc for why the two
+            // can disagree.
+            io.set_stream_resyncable(ch.request.stream, ch.screened && !ch.producer.reply_failed);
         }
-        reset_producer(ch, context);
-        ch.input_consumed = 0;
-        ch.last_acked = 0;
-        // The same rule `open_channel` uses: ask the channel's
-        // OWN screen model, not `ch.request.screen` (what the
-        // client originally asked for) -- see
-        // `SessionScreen::has_screen`'s own doc for why the two
-        // can disagree.
-        io.set_stream_resyncable(ch.request.stream, ch.screened && !ch.producer.reply_failed);
-    }
-    for pending in exits.values_mut() {
-        pending.reset(context);
-    }
-    // The barrier cannot wait for producer/metadata gates. Its snapshot is
-    // published in one replaceable mailbox, never copied into the output FIFO.
-    io.publish_resume_snapshot(context, || {
+        for pending in exits.values_mut() {
+            pending.reset(context);
+        }
         use crate::channel::{ActiveChannel, ChannelSnapshot, DrainingChannel, OpenClassification};
         let mut active = Vec::with_capacity(channels.len());
         let mut draining = Vec::with_capacity(exits.len() + channels.len());
@@ -1669,10 +1688,10 @@ fn reset_attachment_outputs(
         }));
         ChannelSnapshot::new(active, draining)
     });
-    // The new client's screens are empty until this repaints
-    // them -- see this module's own docs above ("Repaint and the
-    // live-channel list") for the fuller rationale.
-    repaint_all(io, channels);
+    // Publication emits the snapshot wake before new-generation repaint output.
+    if published {
+        repaint_all(io, channels);
+    }
 }
 
 fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
@@ -1681,6 +1700,14 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
         .expect("child termination confirmed before Exit");
     forget_channel_stream(io, stream);
     let permit = pending.producer.exit_permit.take().expect("one final Exit");
+    let bytes = if code.is_some() { 10 } else { 6 };
+    let response = pending
+        .producer
+        .terminal_response
+        .as_mut()
+        .expect("terminal outcome retains admitted open envelope")
+        .take_record(bytes)
+        .expect("one reserved terminal outcome");
     io.send_channel_exit(
         crate::channel::DrainingChannel {
             stream,
@@ -1690,6 +1717,7 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
         pending.producer.origin,
         code,
         permit,
+        response,
     );
 }
 
@@ -1827,7 +1855,18 @@ pub async fn run_channel_session_with(
                         break;
                     }
                 };
-                let response_class = if update.daemon.is_some() {
+                let open_refusal = match decode_client(raw) {
+                    Ok(ClientRecord::Open(req)) => {
+                        known_open_refusal(&channels, &opening, &req, &update, &producer)
+                    }
+                    _ => None,
+                };
+                let response_class = if matches!(decode_client(raw), Ok(ClientRecord::Open(_))) {
+                    Some(match &open_refusal {
+                        Some(reason) => crate::control_budget::Response::Ordinary(reason.len() + 6),
+                        None => crate::control_budget::Response::Open,
+                    })
+                } else if update.daemon.is_some() {
                     match decode_client(raw) {
                         Ok(ClientRecord::AboutRequest) => {
                             Some(crate::control_budget::Response::Ordinary(ABOUT_RECORD_MAX))
@@ -1845,16 +1884,25 @@ pub async fn run_channel_session_with(
                 } else {
                     None
                 };
-                let response = if let Some(class) = response_class {
-                    match io.control_budget().reserve(class) {
-                        Ok(response) => Some(response),
+                let (response, terminal) = if let Some(class) = response_class {
+                    let reserved = if matches!(class, crate::control_budget::Response::Open) {
+                        io.control_budget()
+                            .reserve_open()
+                            .map(|[decision, terminal]| (decision, Some(terminal)))
+                    } else {
+                        io.control_budget()
+                            .reserve(class)
+                            .map(|decision| (decision, None))
+                    };
+                    match reserved {
+                        Ok((response, terminal)) => (Some(response), terminal),
                         Err(_) => {
                             control_blocked = true;
                             break;
                         }
                     }
                 } else {
-                    None
+                    (None, None)
                 };
                 let (raw, n) = control_buf
                     .complete()
@@ -1870,6 +1918,8 @@ pub async fn run_channel_session_with(
                     &mut opening,
                     raw,
                     response,
+                    terminal,
+                    open_refusal,
                     &mut term,
                     &mut update,
                     &producer,
@@ -2405,9 +2455,11 @@ fn apply_control_record(
     exits: &mut HashMap<u8, PendingExit>,
     next_instance: &mut u64,
     executor: &crate::channel_open::ChannelOpenExecutor,
-    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
+    opening: &mut HashMap<u8, PendingOpen>,
     raw: RawRecord,
     response: Option<crate::control_budget::ResponsePermit>,
+    terminal: Option<crate::control_budget::ResponsePermit>,
+    open_refusal: Option<String>,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
     context: &ProducerContext,
@@ -2442,6 +2494,10 @@ fn apply_control_record(
             );
         }
         Ok(ClientRecord::Open(req)) => {
+            let terminal = terminal.map(crate::control_budget::ResponsePermit::into_owner);
+            let response = response
+                .expect("open effect requires response preflight")
+                .into_owner();
             // A client opens a number it considers free: whatever ended on
             // it before, it is not waiting for that `Exit` any more, and it
             // must not end the new channel.
@@ -2454,15 +2510,8 @@ fn apply_control_record(
                 );
                 forget_channel_stream(io, req.stream);
             }
-            if update.restarting() {
-                // Its process would outlive the drain and become a child of
-                // the new binary, which never waits for it.
-                refuse(
-                    io,
-                    req.stream,
-                    "the daemon is restarting".to_string(),
-                    context.attachment,
-                );
+            if let Some(reason) = open_refusal {
+                reserved_refusal(io, req.stream, reason, context.attachment, response);
             } else {
                 // Numbered whether or not it opens: only uniqueness matters.
                 let instance = *next_instance;
@@ -2481,6 +2530,8 @@ fn apply_control_record(
                     instance,
                     update,
                     context,
+                    response,
+                    terminal.expect("admitted open reserves future terminal"),
                 )
             }
         }
@@ -2595,27 +2646,30 @@ fn open_channel_async(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
     executor: &crate::channel_open::ChannelOpenExecutor,
-    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
+    opening: &mut HashMap<u8, PendingOpen>,
     req: OpenRequest,
     term: Option<&str>,
     instance: u64,
     update: &SessionUpdate,
     context: &ProducerContext,
+    response: crate::control_budget::ResponseOwner,
+    terminal: crate::control_budget::ResponseOwner,
 ) {
     let stream = req.stream;
     if opening.contains_key(&stream) {
-        refuse(
+        reserved_refusal(
             io,
             stream,
             "channel already opening".into(),
             context.attachment,
+            response,
         );
         return;
     }
     let prepared = match prepare_open(io, channels, req, term, instance, context) {
         Ok(prepared) => prepared,
         Err(reason) => {
-            refuse(io, stream, reason, context.attachment);
+            reserved_refusal(io, stream, reason, context.attachment, response);
             return;
         }
     };
@@ -2627,7 +2681,7 @@ fn open_channel_async(
             } else {
                 "too many pending channels"
             };
-            refuse(io, stream, reason.into(), context.attachment);
+            reserved_refusal(io, stream, reason.into(), context.attachment, response);
             return;
         }
     };
@@ -2636,21 +2690,29 @@ fn open_channel_async(
         job.custody()
             .refuse_before_creation("channel opening unavailable".into());
         job.cleanup(); // No backend was scheduled; this is a proved no-child transition.
-        refuse(
+        reserved_refusal(
             io,
             stream,
             "channel opening unavailable".into(),
             context.attachment,
+            response,
         );
         return;
     }
-    opening.insert(stream, job);
+    opening.insert(
+        stream,
+        PendingOpen {
+            job,
+            response,
+            terminal,
+        },
+    );
 }
 
 fn complete_opens(
     io: &SessionIo,
     channels: &mut HashMap<u8, Channel>,
-    opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
+    opening: &mut HashMap<u8, PendingOpen>,
     chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     update: &SessionUpdate,
     context: &ProducerContext,
@@ -2661,7 +2723,12 @@ fn complete_opens(
         .filter_map(|(&stream, job)| job.take_outcome().map(|outcome| (stream, outcome)))
         .collect();
     for (stream, outcome) in completed {
-        let Some(job) = opening.remove(&stream) else {
+        let Some(PendingOpen {
+            job,
+            response,
+            terminal,
+        }) = opening.remove(&stream)
+        else {
             continue;
         };
         let request = job.request();
@@ -2678,7 +2745,7 @@ fn complete_opens(
                 // The exact attachment/request was checked above. Publication
                 // follows this epoch check without awaiting another loop turn.
                 if current {
-                    refuse(io, stream, reason, context.attachment);
+                    reserved_refusal(io, stream, reason, context.attachment, response);
                 }
             }
             crate::channel_open::OpenOutcome::Ready(channel) => {
@@ -2692,11 +2759,12 @@ fn complete_opens(
                         .idle_epoch_guard()
                         .is_ok_and(|epoch| identity.invalidation_epoch == epoch.epoch());
                     if current {
-                        refuse(
+                        reserved_refusal(
                             io,
                             stream,
                             "channel preparation unavailable".into(),
                             context.attachment,
+                            response,
                         );
                     }
                     continue;
@@ -2709,11 +2777,78 @@ fn complete_opens(
                 // bridge scheduling must not hold up restart publication.
                 drop(epoch);
                 if let Some(bridges) = committed {
-                    start_installed(io, channels, chan_out_tx, bridges, context);
+                    // The response owner remains outside guarded commit so a
+                    // failed installation cannot wake budget waiters under the
+                    // restart watch guard. No callback runs before this move.
+                    channels
+                        .get_mut(&stream)
+                        .expect("committed installation")
+                        .producer
+                        .terminal_response = Some(terminal);
+                    start_installed(io, channels, chan_out_tx, bridges, context, response);
                 }
             }
         }
     }
+}
+
+struct PendingOpen {
+    job: crate::channel_open::OpenJob,
+    response: crate::control_budget::ResponseOwner,
+    terminal: crate::control_budget::ResponseOwner,
+}
+impl std::ops::Deref for PendingOpen {
+    type Target = crate::channel_open::OpenJob;
+    fn deref(&self) -> &Self::Target {
+        &self.job
+    }
+}
+
+/// Classification reads runner-owned state only and launches no factory work.
+fn known_open_refusal(
+    channels: &HashMap<u8, Channel>,
+    opening: &HashMap<u8, PendingOpen>,
+    req: &OpenRequest,
+    update: &SessionUpdate,
+    context: &ProducerContext,
+) -> Option<String> {
+    let reason = if update.restarting() {
+        Some("the daemon is restarting")
+    } else if opening.contains_key(&req.stream) {
+        Some("channel already opening")
+    } else if channels.contains_key(&req.stream) {
+        Some("channel already open")
+    } else if channels.len() >= MAX_CHANNELS {
+        Some("too many channels")
+    } else if context.opens.session.is_none() {
+        Some("channel opening identity exhausted")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Some(reason.into());
+    }
+    if req.cols != 0 && req.rows != 0 {
+        if let Err(reason) = TerminalSize::new(req.cols, req.rows) {
+            return Some(reason.to_string());
+        }
+    }
+    None
+}
+
+fn reserved_refusal(
+    io: &SessionIo,
+    stream: u8,
+    reason: String,
+    origin: AttachmentContext,
+    mut response: crate::control_budget::ResponseOwner,
+) {
+    let reason = crate::channel::bounded_control_diagnostic(reason, 1);
+    let bytes = crate::channel::encode_server_owned(ServerRecord::Refused { stream, reason });
+    let part = response
+        .take_record(bytes.len())
+        .expect("reserved open refusal");
+    io.send_reserved_control(origin, bytes, part);
 }
 
 /// Validation and owned request data are prepared before watching restart state.
@@ -2971,6 +3106,7 @@ fn start_installed(
     chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     bridges: InstalledBridges,
     context: &ProducerContext,
+    mut response: crate::control_budget::ResponseOwner,
 ) {
     let InstalledBridges {
         stream,
@@ -2999,7 +3135,11 @@ fn start_installed(
     let reporter = io.consumption_reporter();
     tokio::task::spawn_blocking(move || channel_writer_loop(stream, input_rx, writer, reporter));
     io.set_stream_resyncable(stream, recoverable);
-    io.channel_opened(context.attachment, stream);
+    let bytes = encode_server(&ServerRecord::Opened { stream });
+    let part = response
+        .take_record(bytes.len())
+        .expect("one reserved Opened");
+    io.send_reserved_control(context.attachment, bytes, part);
     checkpoint(io, ch);
 }
 
@@ -3015,7 +3155,7 @@ fn install_open(
     spawned: SpawnedChannel,
     open_slot: crate::channel_open::InstalledSlot,
 ) {
-    let Some(prepared) = PreparedInstallation::new(
+    let Some(mut prepared) = PreparedInstallation::new(
         channels,
         req,
         ChannelInstance::new(instance).expect("nonzero instance"),
@@ -3023,8 +3163,20 @@ fn install_open(
     ) else {
         return;
     };
+    let [response, terminal] = io
+        .control_budget()
+        .reserve_open()
+        .expect("fixture open pair");
+    prepared.producer.terminal_response = Some(terminal.into_owner());
     let bridges = prepared.commit(spawned, open_slot);
-    start_installed(io, channels, chan_out_tx, bridges, context);
+    start_installed(
+        io,
+        channels,
+        chan_out_tx,
+        bridges,
+        context,
+        response.into_owner(),
+    );
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
@@ -3122,6 +3274,8 @@ pub(crate) mod tests {
     include!("channel_server_control_bounds_tests.rs");
     include!("channel_server_about_bounds_tests.rs");
     include!("channel_server_update_bounds_tests.rs");
+    include!("channel_server_open_bounds_tests.rs");
+    include!("channel_server_snapshot_bounds_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -3234,15 +3388,14 @@ pub(crate) mod tests {
     }
     async fn next_snapshot(
         rx: &mut mpsc::UnboundedReceiver<SessionOutbound>,
-        read: &impl Fn(u64) -> Option<crate::channel::ChannelSnapshot>,
+        read: &impl Fn() -> Option<(u64, crate::channel::ChannelSnapshot)>,
     ) -> ServerRecord {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let SessionOutbound::ResumeBarrier { generation } =
-                    rx.recv().await.expect("runner alive")
+                if let SessionOutbound::ResumeSnapshotReady = rx.recv().await.expect("runner alive")
                 {
                     return ServerRecord::ChannelSnapshot(
-                        read(generation).expect("matching snapshot mailbox"),
+                        read().expect("actual snapshot mailbox").1,
                     );
                 }
             }
@@ -3860,7 +4013,16 @@ pub(crate) mod tests {
                     observed: false,
                 })),
                 terminal_code: None,
-                producer: ProducerState::new(ChannelInstance::new(1).unwrap(), &producer),
+                producer: {
+                    let mut state = ProducerState::new(ChannelInstance::new(1).unwrap(), &producer);
+                    state.terminal_response = Some(
+                        io.control_budget()
+                            .reserve(crate::control_budget::Response::Terminal)
+                            .unwrap()
+                            .into_owner(),
+                    );
+                    state
+                },
             };
             Self {
                 io,
@@ -4563,6 +4725,7 @@ pub(crate) mod tests {
     async fn assert_correlated_resize_reset_order(partial: bool) {
         let spawner = FakeSpawner::new();
         let (io, inbound, mut outbound) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
         let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
         let old = AttachmentContext {
             generation: 1,
@@ -4610,7 +4773,9 @@ pub(crate) mod tests {
             let mut seen = Vec::new();
             loop {
                 match outbound.recv().await.unwrap() {
-                    SessionOutbound::ResumeBarrier { generation } => seen.push((generation, 0, 0)),
+                    SessionOutbound::ResumeSnapshotReady => {
+                        seen.push((snapshots().expect("actual snapshot generation").0, 0, 0))
+                    }
                     SessionOutbound::ChannelOutput {
                         origin,
                         output: ChannelOutput::Geometry(g, _),
@@ -4674,6 +4839,7 @@ pub(crate) mod tests {
             session_id: 12,
             ..rig.channel.producer.origin
         };
+        let snapshots = rig.io.snapshot_reader_for_test();
         let mut channels = HashMap::from([(16, rig.channel)]);
         reset_attachment_outputs(&rig.io, &mut channels, &mut HashMap::new(), origin);
         let gate = channels[&16].gate.clone();
@@ -4686,9 +4852,10 @@ pub(crate) mod tests {
                     output: ChannelOutput::Data(bytes),
                     ..
                 } => visible.push((origin.generation, bytes.clone())),
-                SessionOutbound::ResumeBarrier { generation } => {
-                    visible.push((*generation, b"barrier".to_vec()))
-                }
+                SessionOutbound::ResumeSnapshotReady => visible.push((
+                    snapshots().expect("actual snapshot generation").0,
+                    b"barrier".to_vec(),
+                )),
                 SessionOutbound::ChannelOutput {
                     output: ChannelOutput::Geometry(..),
                     ..
@@ -4957,6 +5124,8 @@ pub(crate) mod tests {
                     &mut HashMap::new(),
                     record,
                     None,
+                    None,
+                    None,
                     &mut None,
                     &mut SessionUpdate::new(None),
                     &channel_producer(),
@@ -5026,6 +5195,8 @@ pub(crate) mod tests {
                     ),
                     &mut HashMap::new(),
                     record,
+                    None,
+                    None,
                     None,
                     &mut None,
                     &mut SessionUpdate::new(None),

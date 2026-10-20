@@ -149,7 +149,7 @@ fn capacity_accounting_owned_control_admission_returns_blocked_allocation_unchan
     let now = conn.handshake_at;
     let bytes = vec![b'x'; 80];
     let allocation = bytes.as_ptr();
-    let result = conn.try_send_owned_bounded(now, crate::channel::CONTROL_STREAM, bytes, 79);
+    let result = conn.try_send_consuming_bounded(now, crate::channel::CONTROL_STREAM, bytes, 79);
     let (reason, returned) = match result {
         Err(blocked) => blocked,
         Ok(_) => panic!("over-limit record was admitted"),
@@ -170,12 +170,12 @@ fn capacity_accounting_owned_control_admission_obeys_existing_reliable_debt() {
     let stream = crate::channel::CONTROL_STREAM;
     let _ = conn.send(now, stream, b"opened");
     assert!(conn
-        .try_send_owned_bounded(now, stream, vec![1; 10], 16)
+        .try_send_consuming_bounded(now, stream, vec![1; 10], 16)
         .is_ok());
     let before = conn.stream_progress(stream);
     assert_eq!(before.queued, 16);
     assert_eq!(before.unacked, 16);
-    let blocked = conn.try_send_owned_bounded(now, stream, vec![2], 16);
+    let blocked = conn.try_send_consuming_bounded(now, stream, vec![2], 16);
     assert!(matches!(blocked, Err((SendBlocked::WouldBlock, bytes)) if bytes == vec![2]));
     assert_eq!(conn.stream_progress(stream), before);
 }

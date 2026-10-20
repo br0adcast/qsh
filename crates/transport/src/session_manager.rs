@@ -517,11 +517,15 @@ pub enum SessionOutbound {
         sequence: u64,
     },
     ChannelClosed {
+        /// Successful typed-output queue position; zero only in direct fixtures.
+        position: u64,
         stream: u8,
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
     },
     ChannelOutput {
+        /// Successful typed-output queue position; zero only in direct fixtures.
+        position: u64,
         stream: u8,
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
@@ -537,16 +541,19 @@ pub enum SessionOutbound {
     /// None means confirmed child cleanup with a lost exit status; it never
     /// means that cleanup is still unknown or in progress.
     ChannelExit {
+        /// Successful typed-output queue position; zero only in direct fixtures.
+        position: u64,
         stream: u8,
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
         code: Option<i32>,
         open: crate::channel::OpenClassification,
         permit: crate::channel_timeline::TimelinePermit,
+        control: ControlDelivery,
     },
-    ResumeBarrier {
-        generation: u64,
-    },
+    /// One coalesced mailbox wake, not an attachment-scoped control record.
+    /// The consumer takes only payload matching its actual bridge target.
+    ResumeSnapshotReady,
     /// End only the originating attempt; a late old-generation failure cannot
     /// close a replacement connection. At most one diagnostic per attempt.
     ProtocolFailure {
@@ -583,6 +590,25 @@ pub enum SessionOutbound {
         stream_id: u8,
         n: usize,
     },
+}
+
+impl SessionOutbound {
+    fn channel_position(&self) -> Option<u64> {
+        match self {
+            Self::ChannelOutput { position, .. }
+            | Self::ChannelExit { position, .. }
+            | Self::ChannelClosed { position, .. } => Some(*position),
+            _ => None,
+        }
+    }
+    fn assign_channel_position(&mut self, next: u64) {
+        match self {
+            Self::ChannelOutput { position, .. }
+            | Self::ChannelExit { position, .. }
+            | Self::ChannelClosed { position, .. } => *position = next,
+            _ => unreachable!("only typed channel output has prefix custody"),
+        }
+    }
 }
 
 /// The router's own token for one device (see [`Router`]'s `backends` map):
@@ -854,11 +880,28 @@ impl SessionIo {
         origin: AttachmentContext,
         build: impl FnOnce()
             -> Result<crate::channel::ChannelSnapshot, crate::channel::ChannelCodecError>,
-    ) {
-        match self.resume_snapshots.publish(origin.generation, build) {
-            Ok(true) => self.resume_barrier(origin.generation),
-            Ok(false) => {}
-            Err(_) => self.protocol_failure(origin, None),
+    ) -> bool {
+        match self
+            .resume_snapshots
+            .publish(origin.generation, self.control_budget(), build)
+        {
+            Ok(publication) => {
+                if publication.notify {
+                    self.resume_snapshot_ready();
+                }
+                publication.published
+            }
+            Err(channel_bridge::SnapshotError::Capacity(
+                crate::control_budget::CapacityError::Retired,
+            )) => false,
+            Err(channel_bridge::SnapshotError::Capacity(_)) => {
+                self.resource_exhausted(origin);
+                false
+            }
+            Err(channel_bridge::SnapshotError::Codec) => {
+                self.protocol_failure(origin, None);
+                false
+            }
         }
     }
     pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
@@ -956,6 +999,12 @@ impl SessionIo {
         }
     }
 
+    fn send_ordered_channel(&self, origin: AttachmentContext, message: SessionOutbound) {
+        if !self.resume_snapshots.send_ordered(&self.outbound, message) {
+            self.resource_exhausted(origin);
+        }
+    }
+
     pub(crate) fn send_channel_output(
         &self,
         stream: u8,
@@ -967,14 +1016,18 @@ impl SessionIo {
     ) {
         let bytes = output.framed_len() as u64;
         gate.admit(bytes);
-        let _ = self.outbound.send(SessionOutbound::ChannelOutput {
-            stream,
-            instance,
+        self.send_ordered_channel(
             origin,
-            output,
-            charge: OutputCharge { gate, bytes },
-            gap_reserve,
-        });
+            SessionOutbound::ChannelOutput {
+                position: 0,
+                stream,
+                instance,
+                origin,
+                output,
+                charge: OutputCharge { gate, bytes },
+                gap_reserve,
+            },
+        );
     }
     pub(crate) fn channel_closed(
         &self,
@@ -982,11 +1035,15 @@ impl SessionIo {
         instance: crate::channel_geometry::ChannelInstance,
         origin: AttachmentContext,
     ) {
-        let _ = self.outbound.send(SessionOutbound::ChannelClosed {
-            stream,
-            instance,
+        self.send_ordered_channel(
             origin,
-        });
+            SessionOutbound::ChannelClosed {
+                position: 0,
+                stream,
+                instance,
+                origin,
+            },
+        );
     }
     pub(crate) fn send_channel_exit(
         &self,
@@ -994,15 +1051,22 @@ impl SessionIo {
         origin: AttachmentContext,
         code: Option<i32>,
         permit: crate::channel_timeline::TimelinePermit,
+        response: crate::control_budget::ResponsePart,
     ) {
-        let _ = self.outbound.send(SessionOutbound::ChannelExit {
-            stream: descriptor.stream,
-            instance: descriptor.instance,
+        let control = self.operation_delivery(response.encoded_bytes(), response);
+        self.send_ordered_channel(
             origin,
-            code,
-            open: descriptor.open,
-            permit,
-        });
+            SessionOutbound::ChannelExit {
+                position: 0,
+                stream: descriptor.stream,
+                instance: descriptor.instance,
+                origin,
+                code,
+                open: descriptor.open,
+                permit,
+                control,
+            },
+        );
     }
     pub(crate) fn repaint_barrier(&self, generation: u64, sequence: u64) {
         let _ = self.outbound.send(SessionOutbound::RepaintBarrier {
@@ -1010,10 +1074,8 @@ impl SessionIo {
             sequence,
         });
     }
-    pub(crate) fn resume_barrier(&self, generation: u64) {
-        let _ = self
-            .outbound
-            .send(SessionOutbound::ResumeBarrier { generation });
+    fn resume_snapshot_ready(&self) {
+        let _ = self.outbound.send(SessionOutbound::ResumeSnapshotReady);
     }
     pub(crate) fn protocol_failure(
         &self,
@@ -1132,9 +1194,9 @@ impl SessionIo {
     #[cfg(any(test, feature = "testnet"))]
     pub fn snapshot_reader_for_test(
         &self,
-    ) -> impl Fn(u64) -> Option<crate::channel::ChannelSnapshot> + Send + 'static {
+    ) -> impl Fn() -> Option<(u64, crate::channel::ChannelSnapshot)> + Send + 'static {
         let snapshots = self.resume_snapshots.clone();
-        move |generation| snapshots.take(generation)
+        move || snapshots.take_fixture()
     }
 
     /// Build an in-process session fixture owned by `principal` and `login`.
@@ -3645,6 +3707,10 @@ async fn apply_control(
     link.ledger.carry();
     link.channel_output.attach(conn, link.ledger.generation());
     *conn = *new_conn;
+    // Destruction of the old Connection is the exact wire-custody boundary.
+    // Release its ledger before ResumeReset can wake the backend to reserve
+    // the new snapshot. Future effect/FIFO owners remain independently held.
+    synchronize_control_delivery(conn, link.ledger.generation(), &mut link.control_delivery);
     // The new connection has heard none of this session's declarations of
     // class; recoverability the backend declares again on `ResumeReset`.
     // Before the queued datagrams below: an ACK among them may already let
@@ -3733,14 +3799,10 @@ struct PendingControl {
     committed: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
-fn drain_reserved_control(
-    conn: &mut Connection,
+fn synchronize_control_delivery(
+    conn: &Connection,
     generation: u64,
-    pending: &mut VecDeque<PendingControl>,
     ledger: &mut crate::control_budget::ControlLedger,
-    parked: bool,
-    now: Instant,
-    out: &mut Vec<Datagram>,
 ) {
     let stream = crate::channel::CONTROL_STREAM;
     if ledger.generation() != generation {
@@ -3753,6 +3815,19 @@ fn drain_reserved_control(
     }
     let progress = conn.stream_progress(stream);
     ledger.acknowledge(generation, progress.queued.saturating_sub(progress.unacked));
+}
+
+fn drain_reserved_control(
+    conn: &mut Connection,
+    generation: u64,
+    pending: &mut VecDeque<PendingControl>,
+    ledger: &mut crate::control_budget::ControlLedger,
+    parked: bool,
+    now: Instant,
+    out: &mut Vec<Datagram>,
+) {
+    synchronize_control_delivery(conn, generation, ledger);
+    let stream = crate::channel::CONTROL_STREAM;
     while let Some(item) = pending.pop_front() {
         if item.origin.is_some_and(|origin| {
             origin.generation != generation || origin.session_id != conn.session_id()
@@ -3767,7 +3842,7 @@ fn drain_reserved_control(
             continue;
         }
         let start = conn.stream_progress(stream).queued;
-        match conn.try_send_owned_bounded(
+        match conn.try_send_consuming_bounded(
             now,
             stream,
             item.bytes,
@@ -3991,7 +4066,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let mut link = BackendLink::new(io_inbound_tx, consumption);
     link.channel_output.snapshots = resume_snapshots;
     let mut pending_control = VecDeque::new();
-    let mut control_delivery = crate::control_budget::ControlLedger::new(
+    link.control_delivery = crate::control_budget::ControlLedger::new(
         0,
         conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
     );
@@ -4198,7 +4273,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 message @ (SessionOutbound::ChannelOutput { .. }
                 | SessionOutbound::ChannelExit { .. }
                 | SessionOutbound::ChannelClosed { .. }
-                | SessionOutbound::ResumeBarrier { .. }
+                | SessionOutbound::ResumeSnapshotReady
                 | SessionOutbound::RepaintBarrier { .. }),
             )) => {
                 if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
@@ -4353,7 +4428,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             &mut conn,
             link.ledger.generation(),
             &mut pending_control,
-            &mut control_delivery,
+            &mut link.control_delivery,
             parked,
             now,
             &mut out,
@@ -4369,7 +4444,9 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         let mut closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
         // A hot Reset changes framing before any queued channel bytes may be
         // admitted. Its event must reach the typed owner before this drain.
-        drain_pending = link.channel_output.drain(&mut conn, now, parked, &mut out);
+        drain_pending =
+            link.channel_output
+                .drain(&mut conn, now, parked, &mut out, &mut link.control_delivery);
         // Typed admission can discover permanent offset exhaustion. Observe its
         // abandonment in this turn so parking never waits for another event.
         if matches!(closed, CloseKind::None) && conn.state() == LinkState::Closed {
@@ -4405,7 +4482,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             was_active = now_active;
         }
 
-        if backend_finished && pending_control.is_empty() && control_delivery.is_empty() {
+        if backend_finished && pending_control.is_empty() && link.control_delivery.is_empty() {
             // EOF becomes graceful only after admitted control delivery settles.
             // A parked connection is already Closed, so close remains a no-op.
             out.extend(conn.close(now));
@@ -5219,6 +5296,7 @@ struct BackendLink {
     inbound: Inbound,
     ledger: ConsumptionLedger,
     channel_output: channel_bridge::ChannelBridge,
+    control_delivery: crate::control_budget::ControlLedger,
 }
 
 impl BackendLink {
@@ -5227,6 +5305,7 @@ impl BackendLink {
             inbound: Inbound::new(tx),
             ledger: ConsumptionLedger::new(consumption),
             channel_output: channel_bridge::ChannelBridge::default(),
+            control_delivery: crate::control_budget::ControlLedger::new(0, 0),
         }
     }
 
@@ -10902,7 +10981,7 @@ mod tests {
             |_| {},
         )
         .await;
-        rig.backend_sends(SessionOutbound::ResumeBarrier { generation: 0 });
+        rig.backend_sends(SessionOutbound::ResumeSnapshotReady);
         rig.run(Duration::from_millis(100)).await;
         let ended = tokio::time::timeout(Duration::from_secs(2), rig.done_rx.recv())
             .await
@@ -17899,4 +17978,5 @@ mod tests {
     include!("session_manager_recovery_tests.rs");
     include!("session_manager_control_bounds_tests.rs");
     include!("session_manager_update_bounds_tests.rs");
+    include!("session_manager_snapshot_bounds_tests.rs");
 }

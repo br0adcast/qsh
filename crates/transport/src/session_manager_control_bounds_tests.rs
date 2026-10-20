@@ -208,7 +208,7 @@ fn capacity_boundary_retired_tiny_replies_keep_the_global_entry_ceiling() {
     }
     assert_eq!(
         lifecycle.control_budget.retained_for_test(),
-        (GLOBAL_RESPONSE_ENTRIES * 6, GLOBAL_RESPONSE_ENTRIES, 0)
+        (2 * GLOBAL_RESPONSE_ENTRIES * 6, GLOBAL_RESPONSE_ENTRIES, 0)
     );
     let (mut io, _input, mut output) = SessionIo::test_pair();
     io.lifecycle = lifecycle.clone();
@@ -289,7 +289,7 @@ async fn capacity_boundary_backend_eof_retains_ack_debt_and_stop_joins_without_p
     assert_eq!(eof_count, 1, "the closed backend receiver must be masked");
     assert_eq!(
         before_stop,
-        (5, 1, 0),
+        (10, 1, 0),
         "retired backend still owns real unacknowledged bytes"
     );
     assert_eq!(rig.lifecycle.control_budget.retained_for_test(), (0, 0, 0));
@@ -470,7 +470,7 @@ async fn authenticated_peer_observes_backend_eof(with_control: bool) {
     assert!(joined.is_ok(), "settled delivery permits graceful EOF");
     assert_eq!(
         retained_before_ack,
-        if with_control { (5, 1, 0) } else { (0, 0, 0) }
+        if with_control { (10, 1, 0) } else { (0, 0, 0) }
     );
     let expected = if with_control {
         crate::channel::encode_server(&crate::channel::ServerRecord::Restarting)

@@ -8,10 +8,58 @@ use crate::shell_frame::{encode_shell, ShellRecord};
 const TURN_RECORDS: usize = 32;
 const TURN_BYTES: usize = 64 * 1024;
 
+pub(super) struct ReservedSnapshot {
+    snapshot: ChannelSnapshot,
+    prefix: u64,
+    source: crate::control_budget::ResponsePermit,
+    merged: crate::control_budget::ResponsePermit,
+    wire: crate::control_budget::ResponsePermit,
+}
+impl ReservedSnapshot {
+    // Standalone runner fixtures consume custody to inspect the DTO. This is
+    // deliberately not a peer ACK or production delivery path.
+    #[cfg(any(test, feature = "testnet"))]
+    pub(super) fn into_fixture_snapshot(self) -> ChannelSnapshot {
+        self.snapshot
+    }
+}
+struct PendingSnapshot {
+    snapshot: ChannelSnapshot,
+    _merged: crate::control_budget::ResponsePermit,
+    // Once source DTO storage is gone, its independent allowance covers the
+    // encoded scratch Vec until the consuming sender call destroys that Vec.
+    _scratch: crate::control_budget::ResponsePermit,
+    wire: crate::control_budget::ResponseOwner,
+}
+impl std::ops::Deref for PendingSnapshot {
+    type Target = ChannelSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+#[derive(Debug)]
+pub(super) enum SnapshotError {
+    Capacity(crate::control_budget::CapacityError),
+    Codec,
+}
 #[derive(Default)]
 struct SnapshotSlot {
     generation: Option<u64>,
-    value: Option<ChannelSnapshot>,
+    minimum_generation: u64,
+    notification_pending: bool,
+    produced: u64,
+    observed: u64,
+    value: Option<ReservedSnapshot>,
+}
+pub(super) struct SnapshotPublication {
+    pub published: bool,
+    pub notify: bool,
+}
+impl SnapshotPublication {
+    const STALE: Self = Self {
+        published: false,
+        notify: false,
+    };
 }
 #[derive(Clone, Default)]
 pub(super) struct SnapshotMailbox(Arc<Mutex<SnapshotSlot>>);
@@ -19,24 +67,130 @@ impl SnapshotMailbox {
     pub(super) fn publish(
         &self,
         generation: u64,
+        budget: &crate::control_budget::SessionBudget,
         build: impl FnOnce() -> Result<ChannelSnapshot, ChannelCodecError>,
-    ) -> Result<bool, ChannelCodecError> {
-        let mut slot = self.0.lock().expect("resume snapshot");
-        if slot.generation.is_some_and(|old| old >= generation) {
-            return Ok(false);
-        }
-        // Release the old command storage before constructing a replacement.
-        // Together with the bridge admission slot, at most two snapshots live.
-        slot.value = None;
-        slot.generation = Some(generation);
-        slot.value = Some(build()?);
-        Ok(true)
+    ) -> Result<SnapshotPublication, SnapshotError> {
+        let old = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            if generation < slot.minimum_generation
+                || slot.generation.is_some_and(|old| old >= generation)
+            {
+                return Ok(SnapshotPublication::STALE);
+            }
+            slot.generation = Some(generation);
+            slot.value.take()
+        };
+        // Destroy obsolete storage and refund outside the mailbox lock before
+        // admitting the next independent source/merge/wire representations.
+        drop(old);
+        let [source, merged, wire] = budget.reserve_snapshot().map_err(SnapshotError::Capacity)?;
+        let snapshot = build().map_err(|_| SnapshotError::Codec)?;
+        let mut replacement = Some(ReservedSnapshot {
+            snapshot,
+            prefix: 0,
+            source,
+            merged,
+            wire,
+        });
+        let published = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            if generation >= slot.minimum_generation && slot.generation == Some(generation) {
+                debug_assert!(slot.value.is_none());
+                replacement.as_mut().expect("one source snapshot").prefix = slot.produced;
+                slot.value = replacement.take();
+                let notify = !slot.notification_pending;
+                slot.notification_pending = true;
+                SnapshotPublication {
+                    published: true,
+                    notify,
+                }
+            } else {
+                SnapshotPublication::STALE
+            }
+        };
+        // A newer publication may have superseded a synchronous builder on a
+        // different thread. Its older custody is never dropped under the lock.
+        drop(replacement);
+        Ok(published)
     }
-    pub(super) fn take(&self, generation: u64) -> Option<ChannelSnapshot> {
+    // Position assignment and successful queue publication commit under one
+    // short lock, so concurrent producers cannot invert a snapshot prefix.
+    // Failed messages (and their permits) are destroyed after releasing it.
+    pub(super) fn send_ordered(
+        &self,
+        sender: &mpsc::UnboundedSender<SessionOutbound>,
+        mut message: SessionOutbound,
+    ) -> bool {
+        let (overflow, rejected) = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            match slot.produced.checked_add(1) {
+                Some(next) => {
+                    message.assign_channel_position(next);
+                    match sender.send(message) {
+                        Ok(()) => {
+                            slot.produced = next;
+                            (false, None)
+                        }
+                        Err(error) => (false, Some(error.0)),
+                    }
+                }
+                None => (true, Some(message)),
+            }
+        };
+        drop(rejected);
+        !overflow
+    }
+    fn observed(&self, position: u64) {
+        if position == 0 {
+            return;
+        } // Direct fixture, not a queued publication.
         let mut slot = self.0.lock().expect("resume snapshot");
-        (slot.generation == Some(generation))
-            .then(|| slot.value.take())
-            .flatten()
+        assert_eq!(
+            slot.observed.checked_add(1),
+            Some(position),
+            "typed output processed in source queue order"
+        );
+        slot.observed = position;
+    }
+    pub(super) fn discard_before(&self, generation: u64) {
+        let old = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            slot.minimum_generation = slot.minimum_generation.max(generation);
+            if slot.generation.is_some_and(|old| old < generation) {
+                slot.value.take()
+            } else {
+                None
+            }
+        };
+        drop(old);
+    }
+    // A wake carries no generation. Consume its latch and take payload only
+    // for the exact bridge target. A future payload stays parked until attach;
+    // attach may take it without consuming a still-queued wake's latch.
+    fn take(&self, generation: Option<u64>, consume_wake: bool) -> Option<ReservedSnapshot> {
+        let mut slot = self.0.lock().expect("resume snapshot");
+        if consume_wake {
+            slot.notification_pending = false;
+        }
+        (slot.generation == generation
+            && generation.is_some()
+            && slot
+                .value
+                .as_ref()
+                .is_some_and(|value| value.prefix <= slot.observed))
+        .then(|| slot.value.take())
+        .flatten()
+    }
+    #[cfg(any(test, feature = "testnet"))]
+    pub(super) fn take_fixture(&self) -> Option<(u64, ChannelSnapshot)> {
+        let (generation, value) = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            slot.notification_pending = false;
+            (slot.generation, slot.value.take())
+        };
+        generation
+            .zip(value)
+            .map(|(generation, value)| (generation, value.into_fixture_snapshot()))
     }
 }
 
@@ -53,6 +207,7 @@ enum Item {
         Option<i32>,
         crate::channel::OpenClassification,
         TimelinePermit,
+        Option<ControlDelivery>,
     ),
 }
 struct Stream {
@@ -85,7 +240,7 @@ struct Stream {
 #[derive(Default)]
 pub(super) struct ChannelBridge {
     pub(super) snapshots: SnapshotMailbox,
-    pending_snapshot: Option<ChannelSnapshot>,
+    pending_snapshot: Option<PendingSnapshot>,
     snapshot_failed: bool,
     streams: BTreeMap<u8, Stream>,
     declarations: BTreeMap<u8, bool>,
@@ -205,8 +360,19 @@ impl ChannelBridge {
         }
     }
     pub(super) fn push(&mut self, message: SessionOutbound) {
+        let position = message.channel_position();
+        self.push_inner(message);
+        if let Some(position) = position {
+            // Even discarded old attachment/instance output satisfied its
+            // queue prefix. Never wait while blocking this same input queue.
+            self.snapshots.observed(position);
+            self.prepare_snapshot(false);
+        }
+    }
+    fn push_inner(&mut self, message: SessionOutbound) {
         match message {
             SessionOutbound::ChannelOutput {
+                position: _,
                 stream,
                 instance,
                 origin,
@@ -310,12 +476,14 @@ impl ChannelBridge {
                 Self::append(state, queued);
             }
             SessionOutbound::ChannelExit {
+                position: _,
                 stream,
                 instance,
                 origin,
                 code,
                 open,
                 permit,
+                control,
             } => {
                 if let Some(state) = self
                     .streams
@@ -325,7 +493,7 @@ impl ChannelBridge {
                     state.ended = true;
                     state.fifo.push_back(Queued {
                         origin,
-                        output: Item::Exit(code, open, permit),
+                        output: Item::Exit(code, open, permit, Some(control)),
                         charge: None,
                         offset: 0,
                         bound: None,
@@ -349,7 +517,7 @@ impl ChannelBridge {
                     self.delivered.remove(&stream);
                 }
             }
-            SessionOutbound::ResumeBarrier { generation } => self.prepare_snapshot(generation),
+            SessionOutbound::ResumeSnapshotReady => self.prepare_snapshot(true),
             SessionOutbound::RepaintBarrier {
                 generation,
                 sequence,
@@ -389,6 +557,7 @@ impl ChannelBridge {
     }
     pub(super) fn attach(&mut self, conn: &Connection, generation: u64) {
         self.pending_snapshot = None;
+        self.snapshots.discard_before(generation);
         self.snapshot_failed = false;
         self.generation = generation;
         self.target = Some(generation);
@@ -420,15 +589,19 @@ impl ChannelBridge {
             // Old sender ownership is abandoned, while pending FIFO charges stay.
             state.gate.update(0);
         }
+        self.prepare_snapshot(false);
     }
-    fn prepare_snapshot(&mut self, generation: u64) {
-        if self.target != Some(generation) {
-            return;
-        }
-        let Some(snapshot) = self.snapshots.take(generation) else {
-            self.snapshot_failed = true;
+    fn prepare_snapshot(&mut self, consume_wake: bool) {
+        let Some(snapshot) = self.snapshots.take(self.target, consume_wake) else {
             return;
         };
+        let ReservedSnapshot {
+            snapshot,
+            prefix: _,
+            source,
+            merged,
+            wire,
+        } = snapshot;
         let (active, old_draining) = snapshot.into_parts();
         for (stream, instance, ended) in active
             .iter()
@@ -455,7 +628,7 @@ impl ChannelBridge {
         draining.extend(old_draining);
         for (&stream, state) in &self.streams {
             for queued in &state.fifo {
-                let Item::Exit(_, open, _) = queued.output else {
+                let Item::Exit(_, open, _, _) = queued.output else {
                     continue;
                 };
                 let entry = DrainingChannel {
@@ -481,7 +654,14 @@ impl ChannelBridge {
             }
         }
         match ChannelSnapshot::new(active, draining) {
-            Ok(snapshot) => self.pending_snapshot = Some(snapshot),
+            Ok(snapshot) => {
+                self.pending_snapshot = Some(PendingSnapshot {
+                    snapshot,
+                    _merged: merged,
+                    _scratch: source,
+                    wire: wire.into_owner(),
+                })
+            }
             Err(_) => self.snapshot_failed = true,
         }
     }
@@ -557,7 +737,9 @@ impl ChannelBridge {
         now: Instant,
         parked: bool,
         out: &mut Vec<Datagram>,
+        control_delivery: &mut crate::control_budget::ControlLedger,
     ) -> bool {
+        synchronize_control_delivery(conn, self.generation, control_delivery);
         self.seal_ended(conn);
         if self.snapshot_failed {
             out.extend(conn.close(now));
@@ -568,7 +750,7 @@ impl ChannelBridge {
         }
         let mut records = 0;
         let mut bytes = 0;
-        if let Some(snapshot) = &self.pending_snapshot {
+        if let Some(snapshot) = &mut self.pending_snapshot {
             let n = snapshot.payload_len() + 5;
             if !Self::offset_fits(conn, crate::channel::CONTROL_STREAM, n)
                 || conn.stream_write_room(
@@ -578,15 +760,35 @@ impl ChannelBridge {
             {
                 return false;
             }
+            // The former source DTO lease now covers encoded scratch, while
+            // merged DTO and reliable copy have separate leases. The helper
+            // destroys scratch before returning success; a blocked returned
+            // Vec is destroyed before this PendingSnapshot can refund it.
             let encoded = snapshot.encode_record();
-            let Ok(datagrams) = conn.try_send_bounded(
+            let start = conn.stream_progress(crate::channel::CONTROL_STREAM).queued;
+            let Ok(datagrams) = conn.try_send_consuming_bounded(
                 now,
                 crate::channel::CONTROL_STREAM,
-                &encoded,
+                encoded,
                 crate::send_gate::PIPE_HIGH as usize,
             ) else {
                 return false;
             };
+            let part = snapshot
+                .wire
+                .take_record(n)
+                .expect("one bounded snapshot wire record");
+            assert!(
+                control_delivery
+                    .register(
+                        self.generation,
+                        start,
+                        conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
+                        part
+                    )
+                    .is_ok(),
+                "whole snapshot enqueue and reservation length diverged"
+            );
             out.extend(datagrams);
             self.pending_snapshot = None;
             self.release_barrier(self.generation);
@@ -613,7 +815,16 @@ impl ChannelBridge {
                 if state.hot_blocked {
                     continue;
                 }
-                match Self::step(state, stream, conn, now, TURN_BYTES - bytes, out) {
+                match Self::step(
+                    state,
+                    stream,
+                    conn,
+                    now,
+                    TURN_BYTES - bytes,
+                    out,
+                    self.generation,
+                    control_delivery,
+                ) {
                     Step::Blocked => {}
                     Step::Sent(n) => {
                         bytes += n;
@@ -667,6 +878,8 @@ impl ChannelBridge {
         now: Instant,
         remaining: usize,
         out: &mut Vec<Datagram>,
+        generation: u64,
+        control_delivery: &mut crate::control_budget::ControlLedger,
     ) -> Step {
         conn.declare_channel_output(stream, state.instance);
         if state.bootstrap {
@@ -830,7 +1043,7 @@ impl ChannelBridge {
                 })
                 .unwrap()
             }
-            Item::Exit(code, _, _) => {
+            Item::Exit(code, _, _, _) => {
                 if room < 10 || conn.stream_progress(stream).unacked != 0 {
                     return Step::Blocked;
                 }
@@ -845,13 +1058,38 @@ impl ChannelBridge {
             }
             Item::Record(ChannelOutput::DeliveryMarker(..)) => unreachable!(),
         };
-        let Ok(datagrams) =
+        let n = encoded.len();
+        let start = conn.stream_progress(target).queued;
+        let sent = if matches!(front.output, Item::Exit(..)) {
+            // Independent timeline custody covers the encoded terminal scratch;
+            // its control delivery lease covers the simultaneous reliable copy.
+            conn.try_send_consuming_bounded(
+                now,
+                target,
+                encoded,
+                crate::send_gate::PIPE_HIGH as usize,
+            )
+            .map_err(|(reason, _)| reason)
+        } else {
             conn.try_send_bounded(now, target, &encoded, crate::send_gate::PIPE_HIGH as usize)
-        else {
+        };
+        let Ok(datagrams) = sent else {
             return Step::Blocked;
         };
+        if let Item::Exit(_, _, _, control) = &mut front.output {
+            let delivery = control.take().expect("one terminal control delivery");
+            let end = conn.stream_progress(target).queued;
+            if let Some(charge) = delivery.charge {
+                charge.transfer(conn.stream_progress(target).unacked);
+            }
+            assert!(
+                control_delivery
+                    .register(generation, start, end, delivery.part)
+                    .is_ok(),
+                "whole terminal control enqueue and reserved length diverged"
+            );
+        }
         out.extend(datagrams);
-        let n = encoded.len();
         let tail = conn.stream_progress(stream).unacked;
         match &front.output {
             Item::Record(ChannelOutput::Geometry(g, _)) => state.frontier = Some(*g),
@@ -876,7 +1114,7 @@ impl ChannelBridge {
                     conn.stream_progress(stream).queued,
                 );
             }
-            Item::Exit(_, _, permit) => {
+            Item::Exit(_, _, permit, _) => {
                 let _ = permit;
             }
             _ => {}
@@ -910,6 +1148,18 @@ mod tests {
     use super::*;
     use crate::channel_timeline::{EntryClass, BRIDGE_LIFECYCLE_BYTES};
     use crate::shell_frame::ShellDeframer;
+    fn fixture_exit_control(io: &SessionIo, code: Option<i32>) -> ControlDelivery {
+        let bytes = if code.is_some() { 10 } else { 6 };
+        let mut owner = io
+            .control_budget()
+            .reserve(crate::control_budget::Response::Ordinary(bytes))
+            .unwrap()
+            .into_owner();
+        ControlDelivery {
+            part: owner.take_record(bytes).unwrap(),
+            charge: None,
+        }
+    }
     const STREAM: u8 = 16;
     struct Rig {
         bridge: ChannelBridge,
@@ -926,6 +1176,7 @@ mod tests {
         records: Vec<ShellRecord>,
         control_frames: crate::shell_frame::RecordDeframer,
         control_records: Vec<crate::channel::ServerRecord>,
+        control_delivery: crate::control_budget::ControlLedger,
         other_frames: BTreeMap<u8, ShellDeframer>,
         other_records: BTreeMap<u8, Vec<ShellRecord>>,
     }
@@ -935,8 +1186,10 @@ mod tests {
             let (client, server) = Self::pair(peer);
             let (io, _, outbound) = SessionIo::test_pair();
             let gate = io.send_gate(STREAM, crate::send_gate::GateKind::Pipe);
+            let mut bridge = ChannelBridge::default();
+            bridge.snapshots = io.resume_snapshots.clone();
             Self {
-                bridge: ChannelBridge::default(),
+                bridge,
                 server,
                 client,
                 now: Instant::now(),
@@ -950,6 +1203,7 @@ mod tests {
                 records: Vec::new(),
                 control_frames: crate::shell_frame::RecordDeframer::for_control(),
                 control_records: Vec::new(),
+                control_delivery: crate::control_budget::ControlLedger::new(0, 0),
                 other_frames: BTreeMap::new(),
                 other_records: BTreeMap::new(),
             }
@@ -1020,6 +1274,9 @@ mod tests {
             self.generation += 1;
             self.bridge.attach(&self.server, self.generation);
             (self.client, self.server) = Self::pair(self.peer);
+            // Match production apply_control: actual old wire destruction must
+            // refund its ledger before a new snapshot is admitted.
+            synchronize_control_delivery(&self.server, self.generation, &mut self.control_delivery);
             self.frames = ShellDeframer::new();
             self.records.clear();
             self.control_frames = crate::shell_frame::RecordDeframer::for_control();
@@ -1031,9 +1288,13 @@ mod tests {
         }
         fn drain(&mut self, parked: bool) -> bool {
             let mut out = Vec::new();
-            let again = self
-                .bridge
-                .drain(&mut self.server, self.now, parked, &mut out);
+            let again = self.bridge.drain(
+                &mut self.server,
+                self.now,
+                parked,
+                &mut out,
+                &mut self.control_delivery,
+            );
             self.pump(out);
             again
         }
@@ -1244,7 +1505,7 @@ mod tests {
                 );
                 assert!(matches!(
                     rig.bridge.streams[&STREAM].fifo.front().unwrap().output,
-                    Item::Exit(Some(0), _, _)
+                    Item::Exit(Some(0), _, _, _)
                 ));
             }
             rig.attach();
@@ -1255,7 +1516,7 @@ mod tests {
             loop {
                 match outbound.recv().await.unwrap() {
                     message @ (SessionOutbound::ChannelOutput { .. }
-                    | SessionOutbound::ResumeBarrier { .. }) => rig.bridge.push(message),
+                    | SessionOutbound::ResumeSnapshotReady) => rig.bridge.push(message),
                     SessionOutbound::Data(data) if data.stream_id == CONTROL_STREAM => {
                         let datagrams = rig.server.send(rig.now, CONTROL_STREAM, &data.data);
                         rig.pump(datagrams);
@@ -1355,22 +1616,38 @@ mod tests {
 
     #[test]
     fn resume_snapshot_mailbox_has_one_latest_exact_generation() {
+        let global = crate::control_budget::GlobalBudget::default();
+        let budget = global.session(1);
         let mailbox = SnapshotMailbox::default();
         for generation in 1..=300 {
-            assert!(mailbox
-                .publish(generation, || ChannelSnapshot::new(Vec::new(), Vec::new()))
-                .unwrap());
-            assert!(mailbox.take(generation - 1).is_none());
+            assert!(
+                mailbox
+                    .publish(generation, &budget, || ChannelSnapshot::new(
+                        Vec::new(),
+                        Vec::new()
+                    ))
+                    .unwrap()
+                    .published
+            );
+            assert!(mailbox.take(Some(generation - 1), false).is_none());
             assert!(mailbox.0.lock().unwrap().value.is_some());
         }
-        assert!(!mailbox
-            .publish(299, || panic!("obsolete builder must not allocate"))
-            .unwrap());
-        assert!(mailbox.take(300).is_some());
-        assert!(mailbox.take(300).is_none());
-        assert!(!mailbox
-            .publish(300, || panic!("same generation is consumed once"))
-            .unwrap());
+        assert!(
+            !mailbox
+                .publish(299, &budget, || panic!(
+                    "obsolete builder must not allocate"
+                ))
+                .unwrap()
+                .published
+        );
+        assert!(mailbox.take(Some(300), true).is_some());
+        assert!(mailbox.take(Some(300), true).is_none());
+        assert!(
+            !mailbox
+                .publish(300, &budget, || panic!("same generation is consumed once"))
+                .unwrap()
+                .published
+        );
     }
 
     #[tokio::test]
@@ -1432,6 +1709,8 @@ mod tests {
         };
         let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
         rig.bridge.push(SessionOutbound::ChannelExit {
+            position: 0,
+            control: fixture_exit_control(&rig.io, code),
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -1460,10 +1739,11 @@ mod tests {
             rig.control_records.clear();
             rig.bridge
                 .snapshots
-                .publish(generation, || ChannelSnapshot::new(Vec::new(), Vec::new()))
+                .publish(generation, rig.io.control_budget(), || {
+                    ChannelSnapshot::new(Vec::new(), Vec::new())
+                })
                 .unwrap();
-            rig.bridge
-                .push(SessionOutbound::ResumeBarrier { generation });
+            rig.bridge.push(SessionOutbound::ResumeSnapshotReady);
             assert!(rig.bridge.receive_fenced());
             let held = rig.budget.usage(EntryClass::Lifecycle);
             assert!(!rig.drain(false));
@@ -1621,7 +1901,13 @@ mod tests {
         let mut rig = Rig::new();
         rig.geometry(80, 0);
         let mut out = Vec::new();
-        rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         assert_eq!(rig.server.stream_progress(STREAM).queued, 27);
         rig.attach();
         rig.bridge.release_barrier(1);
@@ -1639,7 +1925,13 @@ mod tests {
         rig.geometry(80, 0);
         rig.data(b"abandoned");
         let mut out = Vec::new();
-        rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         rig.data(b"prefix");
         let marker = rig.budget.try_reserve(EntryClass::Lifecycle, 32).unwrap();
         rig.emit(
@@ -1648,6 +1940,8 @@ mod tests {
         );
         let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
         rig.bridge.push(SessionOutbound::ChannelExit {
+            position: 0,
+            control: fixture_exit_control(&rig.io, Some(0)),
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -1778,8 +2072,13 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, SessionInbound::Delivered { .. })));
                 let mut pending = Vec::new();
-                rig.bridge
-                    .drain(&mut rig.server, rig.now, false, &mut pending);
+                rig.bridge.drain(
+                    &mut rig.server,
+                    rig.now,
+                    false,
+                    &mut pending,
+                    &mut rig.control_delivery,
+                );
                 assert!(!pending.is_empty(), "fresh geometry bootstrap must be sent");
                 assert!(
                     !rig.bridge
@@ -1809,6 +2108,8 @@ mod tests {
             }
             let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
             rig.bridge.push(SessionOutbound::ChannelExit {
+                position: 0,
+                control: fixture_exit_control(&rig.io, Some(7)),
                 stream: STREAM,
                 instance: ChannelInstance::new(1).unwrap(),
                 origin: rig.origin(),
@@ -1860,6 +2161,7 @@ mod tests {
         rig.data(b"closed");
         rig.attach();
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin,
@@ -1879,7 +2181,13 @@ mod tests {
         rig.geometry(100, 1);
         let mut out = Vec::new();
         assert!(
-            rig.bridge.drain(&mut rig.server, rig.now, false, &mut out),
+            rig.bridge.drain(
+                &mut rig.server,
+                rig.now,
+                false,
+                &mut out,
+                &mut rig.control_delivery
+            ),
             "remaining record needs an internal continuation, not a network event"
         );
         assert_eq!(
@@ -1962,6 +2270,7 @@ mod tests {
             "new instance retires the old delivered marker exactly once"
         );
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -1989,6 +2298,8 @@ mod tests {
         let old_origin = rig.origin();
         let old_instance = ChannelInstance::new(1).unwrap();
         rig.bridge.push(SessionOutbound::ChannelExit {
+            position: 0,
+            control: fixture_exit_control(&rig.io, Some(42)),
             stream: STREAM,
             instance: old_instance,
             origin: old_origin,
@@ -2005,6 +2316,7 @@ mod tests {
         // Close belongs to its channel instance even though its attachment was
         // replaced. It must release the old Exit descriptor and permit.
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: old_instance,
             origin: old_origin,
@@ -2037,7 +2349,7 @@ mod tests {
         for _ in 0..2 {
             rig.bridge
                 .snapshots
-                .publish(rig.generation, || {
+                .publish(rig.generation, rig.io.control_budget(), || {
                     ChannelSnapshot::new(
                         vec![ActiveChannel {
                             instance,
@@ -2054,11 +2366,10 @@ mod tests {
                     )
                 })
                 .unwrap();
-            rig.bridge.push(SessionOutbound::ResumeBarrier {
-                generation: rig.generation,
-            });
+            rig.bridge.push(SessionOutbound::ResumeSnapshotReady);
             let before = budget.usage(EntryClass::Lifecycle);
             rig.bridge.push(SessionOutbound::ChannelClosed {
+                position: 0,
                 stream: STREAM,
                 instance: old_instance,
                 origin: old_origin,
@@ -2078,6 +2389,7 @@ mod tests {
         assert_eq!(rig.bridge.streams.len(), 1);
         assert_eq!(rig.bridge.retired.len(), 1);
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance,
             origin: rig.origin(),
@@ -2123,6 +2435,7 @@ mod tests {
             rig.bridge.push(rig.outbound.try_recv().unwrap());
             assert!(!gate.is_open());
             rig.bridge.push(SessionOutbound::ChannelClosed {
+                position: 0,
                 stream: STREAM,
                 instance,
                 origin: rig.origin(),
@@ -2166,7 +2479,13 @@ mod tests {
         );
         rig.bridge.push(rig.outbound.try_recv().unwrap());
         let mut out = Vec::new();
-        assert!(rig.bridge.drain(&mut rig.server, rig.now, false, &mut out));
+        assert!(rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery
+        ));
         assert_eq!(rig.server.stream_progress(17).queued, 27);
         assert_eq!(
             rig.budget.usage(EntryClass::Ordinary).0,
@@ -2252,6 +2571,7 @@ mod tests {
             .unwrap();
         let failures = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut failures = 0;
+            let mut consumed = 0;
             loop {
                 match outbound.recv().await.unwrap() {
                     message @ SessionOutbound::ChannelOutput { .. } => {
@@ -2262,7 +2582,16 @@ mod tests {
                     SessionOutbound::Consumed {
                         stream_id: CONTROL_STREAM,
                         n,
-                    } if n == len => break failures,
+                    } => {
+                        consumed += n;
+                        assert!(
+                            consumed <= len,
+                            "control input credit exceeded admitted batch"
+                        );
+                        if consumed == len {
+                            break failures;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2428,8 +2757,13 @@ mod tests {
                 rig.data(b"lost final DATA");
             }
             let mut abandoned = Vec::new();
-            rig.bridge
-                .drain(&mut rig.server, rig.now, false, &mut abandoned);
+            rig.bridge.drain(
+                &mut rig.server,
+                rig.now,
+                false,
+                &mut abandoned,
+                &mut rig.control_delivery,
+            );
             rig.now += std::time::Duration::from_secs(11);
             rig.server.on_timeout(rig.now);
             assert_eq!(rig.server.state(), crate::LinkState::PathDown);
@@ -2504,6 +2838,8 @@ mod tests {
         rig.drain(false);
         let permit = rig.budget.try_reserve(EntryClass::Lifecycle, 10).unwrap();
         rig.bridge.push(SessionOutbound::ChannelExit {
+            position: 0,
+            control: fixture_exit_control(&rig.io, Some(42)),
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -2530,6 +2866,7 @@ mod tests {
                     rows: 24,
                     screen: false,
                 },
+                _,
                 _
             )
         ));
@@ -2556,7 +2893,13 @@ mod tests {
         rig.geometry(80, 0);
         rig.data(b"lost DATA");
         let mut out = Vec::new();
-        rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         rig.now += std::time::Duration::from_secs(11);
         rig.server.on_timeout(rig.now);
         for dg in rig.client.send(rig.now, 0, b"return") {
@@ -2698,13 +3041,23 @@ mod tests {
             rig.geometry(80, 0);
             rig.data(b"lost before first Attach");
             let mut abandoned = Vec::new();
-            rig.bridge
-                .drain(&mut rig.server, rig.now, false, &mut abandoned);
+            rig.bridge.drain(
+                &mut rig.server,
+                rig.now,
+                false,
+                &mut abandoned,
+                &mut rig.control_delivery,
+            );
             rig.attach();
             rig.bridge.release_barrier(1);
             let mut gap_datagrams = Vec::new();
-            rig.bridge
-                .drain(&mut rig.server, rig.now, false, &mut gap_datagrams);
+            rig.bridge.drain(
+                &mut rig.server,
+                rig.now,
+                false,
+                &mut gap_datagrams,
+                &mut rig.control_delivery,
+            );
             assert_eq!(rig.server.stream_progress(STREAM).queued, 41);
             assert_eq!(
                 rig.bridge.streams[&STREAM].data_end, 0,
@@ -2760,6 +3113,7 @@ mod tests {
                 (2, BRIDGE_LIFECYCLE_BYTES + 32)
             );
             rig.bridge.push(SessionOutbound::ChannelClosed {
+                position: 0,
                 stream: STREAM,
                 instance: ChannelInstance::new(1).unwrap(),
                 origin: rig.origin(),
@@ -2778,12 +3132,22 @@ mod tests {
         rig.geometry(80, 0);
         rig.data(b"old instance lost DATA");
         let mut abandoned = Vec::new();
-        rig.bridge
-            .drain(&mut rig.server, rig.now, false, &mut abandoned);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut abandoned,
+            &mut rig.control_delivery,
+        );
         rig.attach();
         rig.bridge.release_barrier(1);
-        rig.bridge
-            .drain(&mut rig.server, rig.now, false, &mut abandoned);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut abandoned,
+            &mut rig.control_delivery,
+        );
         assert_eq!(rig.server.stream_progress(STREAM).queued, 41);
         let newer = ChannelInstance::new(2).unwrap();
         let budget = TimelineBudget::new(newer, 1, |_| {});
@@ -2909,9 +3273,13 @@ mod tests {
         }
         let before = rig.server.stream_progress(STREAM).queued;
         let mut abandoned = Vec::new();
-        assert!(rig
-            .bridge
-            .drain(&mut rig.server, rig.now, false, &mut abandoned));
+        assert!(rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut abandoned,
+            &mut rig.control_delivery
+        ));
         assert_eq!(rig.server.stream_progress(STREAM).queued - before, 7 * 8197);
         let retained = rig.bridge.streams[&STREAM].fifo.front().unwrap();
         assert_eq!(retained.offset, 0);
@@ -2934,7 +3302,13 @@ mod tests {
         rig.server.limit_channel_offset_for_test(STREAM, 8196);
         let before = rig.server.stream_progress(STREAM);
         let mut out = Vec::new();
-        rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         assert_eq!(rig.server.state(), crate::LinkState::Closed);
         assert_eq!(rig.server.stream_progress(STREAM), before);
         let retained = rig.bridge.streams[&STREAM].fifo.front().unwrap();
@@ -2978,6 +3352,8 @@ mod tests {
         for (stream, budget) in [17, 18].into_iter().zip(&budgets) {
             assert_eq!(rig.server.stream_progress(stream).unacked, 0);
             rig.bridge.push(SessionOutbound::ChannelExit {
+                position: 0,
+                control: fixture_exit_control(&rig.io, Some(0)),
                 stream,
                 instance: ChannelInstance::new(u64::from(stream)).unwrap(),
                 origin: rig.origin(),
@@ -2995,7 +3371,13 @@ mod tests {
         rig.bridge.cursor = 15;
         let before = rig.server.stream_progress(STREAM).queued;
         let mut out = Vec::new();
-        let again = rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        let again = rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         let data_bytes = rig.server.stream_progress(STREAM).queued - before;
         let exit_bytes = rig
             .server
@@ -3010,7 +3392,13 @@ mod tests {
             budgets[1].usage(EntryClass::Lifecycle),
             (2, BRIDGE_LIFECYCLE_BYTES + 10)
         );
-        rig.bridge.drain(&mut rig.server, rig.now, false, &mut out);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
         assert_eq!(
             rig.server
                 .stream_progress(crate::channel::CONTROL_STREAM)
@@ -3026,14 +3414,24 @@ mod tests {
         rig.geometry(80, 0);
         rig.data(b"initial lost DATA");
         let mut abandoned = Vec::new();
-        rig.bridge
-            .drain(&mut rig.server, rig.now, false, &mut abandoned);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut abandoned,
+            &mut rig.control_delivery,
+        );
         for _ in 0..32 {
             rig.attach();
             rig.bridge.release_barrier(rig.generation);
             abandoned.clear();
-            rig.bridge
-                .drain(&mut rig.server, rig.now, false, &mut abandoned);
+            rig.bridge.drain(
+                &mut rig.server,
+                rig.now,
+                false,
+                &mut abandoned,
+                &mut rig.control_delivery,
+            );
             assert_eq!(rig.server.stream_progress(STREAM).queued, 41);
             let state = &rig.bridge.streams[&STREAM];
             assert_eq!(state.gap_end, 41);
@@ -3051,6 +3449,7 @@ mod tests {
             );
         }
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -3119,8 +3518,13 @@ mod tests {
             rig.server.on_datagram(rig.now, rig.peer, &dg.bytes);
         }
         let mut pending = Vec::new();
-        rig.bridge
-            .drain(&mut rig.server, rig.now, false, &mut pending);
+        rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut pending,
+            &mut rig.control_delivery,
+        );
         assert!(!rig
             .bridge
             .notifications()
@@ -3142,6 +3546,7 @@ mod tests {
             .any(|e| matches!(e, SessionInbound::Delivered { token: 1, .. })));
         assert_eq!(rig.budget.usage(EntryClass::Lifecycle), held);
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: ChannelInstance::new(1).unwrap(),
             origin: rig.origin(),
@@ -3174,8 +3579,13 @@ mod tests {
                 rig.attach();
                 rig.bridge.release_barrier(generation);
                 let mut pending = Vec::new();
-                rig.bridge
-                    .drain(&mut rig.server, rig.now, false, &mut pending);
+                rig.bridge.drain(
+                    &mut rig.server,
+                    rig.now,
+                    false,
+                    &mut pending,
+                    &mut rig.control_delivery,
+                );
                 assert!(!rig
                     .bridge
                     .notifications()
@@ -3202,6 +3612,8 @@ mod tests {
                 );
             }
             rig.bridge.push(SessionOutbound::ChannelExit {
+                position: 0,
+                control: fixture_exit_control(&rig.io, Some(7)),
                 stream: STREAM,
                 instance: ChannelInstance::new(1).unwrap(),
                 origin: rig.origin(),
@@ -3305,6 +3717,7 @@ mod tests {
         assert_eq!(rig.bridge.streams[&STREAM].instance, newer);
         assert!(!rig.bridge.streams[&STREAM].ended);
         rig.bridge.push(SessionOutbound::ChannelClosed {
+            position: 0,
             stream: STREAM,
             instance: newer,
             origin: rig.origin(),
@@ -3365,4 +3778,6 @@ mod tests {
         assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
         assert_eq!(rig.budget.usage(EntryClass::Lifecycle), (2, 55));
     }
+    include!("channel_bridge_control_bounds_tests.rs");
+    include!("channel_bridge_snapshot_bounds_tests.rs");
 }

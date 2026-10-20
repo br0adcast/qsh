@@ -106,7 +106,7 @@ fn capacity_update_reserves_mandatory_outcome_and_job_before_held_offer() {
     assert_eq!(provider.completed.load(Ordering::SeqCst), 1);
     assert_eq!(
         retained.0,
-        (2 * crate::control_budget::MAX_RECORD + 12, 2, 1),
+        (2 * (2 * crate::control_budget::MAX_RECORD + 12), 2, 1),
         "the whole mandatory chain and actual-joined job precede provider effects"
     );
     assert_eq!(retained.1, (0, 0, 0));
@@ -366,7 +366,7 @@ fn capacity_update_accepted_verify_survives_warm_and_ordinary_saturation() {
     assert_eq!(state.completed.load(Ordering::SeqCst), 1);
     assert_eq!(
         observed.0,
-        (2 * crate::control_budget::MAX_RECORD + 12, 2, 1)
+        (2 * (2 * crate::control_budget::MAX_RECORD + 12), 2, 1)
     );
     assert_eq!(
         observed.1.unwrap(),
@@ -696,12 +696,12 @@ async fn accepted_boundary_case(behavior: AcceptedBoundary) {
     );
     assert_eq!(
         retained_before_guard_drop,
-        (2 * crate::control_budget::MAX_RECORD + 12, 2, 0),
+        (2 * (2 * crate::control_budget::MAX_RECORD + 12), 2, 0),
         "actual joined job refunded while independent record guards retain envelope"
     );
     assert_eq!(
         retained_after_guard_drop,
-        (crate::control_budget::MAX_RECORD, 1, 0)
+        (2 * crate::control_budget::MAX_RECORD, 1, 0)
     );
     assert_eq!(global.retained_for_test(), (0, 0, 0));
     assert!(result_bytes <= crate::control_budget::MAX_RECORD + 12);

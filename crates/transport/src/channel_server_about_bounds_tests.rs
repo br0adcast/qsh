@@ -5,6 +5,7 @@ enum AboutBehavior {
     Panic,
     LongArchitecture,
     InvalidArchitecture,
+    ExcessArchitectureCapacity,
 }
 struct AboutProvider {
     inner: Arc<FakeDaemon>,
@@ -37,6 +38,10 @@ impl DaemonUpdates for AboutProvider {
                 about.arch = "a".repeat(crate::channel::MAX_ARCH_LEN + 1)
             }
             AboutBehavior::InvalidArchitecture => about.arch = "invalid/architecture".into(),
+            AboutBehavior::ExcessArchitectureCapacity => {
+                about.arch = String::with_capacity(128 * 1024);
+                about.arch.push_str("fixture");
+            }
         }
         Some(about)
     }
@@ -618,7 +623,7 @@ async fn capacity_about_waiter_limit_pauses_input_and_keeps_runner_responsive() 
     drop(inbound);
     runner.await.unwrap();
     drop(outbound);
-    assert_eq!(retained, (entries * ABOUT_RECORD_MAX, entries, 1));
+    assert_eq!(retained, (2 * entries * ABOUT_RECORD_MAX, entries, 1));
     assert_eq!(entered_while_held, 1);
     assert!(responsive.is_ok());
     assert_eq!(
@@ -635,5 +640,34 @@ async fn capacity_about_waiter_limit_pauses_input_and_keeps_runner_responsive() 
         "the next flight starts only after the first actual join and entry refund"
     );
     assert_eq!(provider.completed.load(Ordering::SeqCst), 2);
+    assert_eq!(global.retained_for_test(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn capacity_about_validated_result_discards_excess_provider_storage_before_publication() {
+    let provider = AboutProvider::new(AboutBehavior::ExcessArchitectureCapacity);
+    let (io, _inbound, _outbound) = about_pair();
+    let global = io.global_control_budget();
+    let observed = Arc::new(Mutex::new(None));
+    let actual = observed.clone();
+    let backend_provider = provider.clone();
+    crate::session_manager::fixture::drive_backend(io, move |io| async move {
+        let mut update = SessionUpdate::new(Some(backend_provider));
+        let response = io
+            .control_budget()
+            .reserve(crate::control_budget::Response::Ordinary(ABOUT_RECORD_MAX))
+            .unwrap();
+        update.about(&io, resource_context(), Some(response));
+        let result = next_about(&mut update.about).await;
+        *actual.lock().unwrap() = Some(result.as_ref().unwrap().as_ref().unwrap().arch.capacity());
+        drop(result);
+        drop(update);
+    })
+    .await;
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        observed.lock().unwrap().unwrap() <= crate::channel::MAX_ARCH_LEN,
+        "validated callback publication cannot retain arbitrary provider capacity"
+    );
     assert_eq!(global.retained_for_test(), (0, 0, 0));
 }

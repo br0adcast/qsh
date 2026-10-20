@@ -7,8 +7,18 @@ use crate::channel_geometry::ChannelInstance;
 
 #[test]
 fn envelope_wire_maxima_cover_complete_records_and_mandatory_update_sequence() {
-    assert_eq!(SESSION_BYTES, 764_600);
-    assert_eq!(GLOBAL_BYTES, 97_868_800);
+    assert_eq!(SESSION_BYTES, 1_422_427);
+    assert_eq!(GLOBAL_BYTES, 182_070_656);
+    assert_eq!(GLOBAL_RESPONSE_ENTRIES, 48_768);
+    let about_record_max = 5 + 8 + 32 + 1 + MAX_ARCH_LEN + 2;
+    let about_metadata_per_job = 2 * about_record_max;
+    assert_eq!(about_metadata_per_job, 160);
+    assert_eq!(GLOBAL_JOBS * about_metadata_per_job, 40_960);
+    assert_eq!(SESSION_BYTES + about_metadata_per_job, 1_422_587);
+    assert_eq!(
+        GLOBAL_BYTES + GLOBAL_JOBS * about_metadata_per_job,
+        182_111_616
+    );
     let about = encode_server(&ServerRecord::About(About {
         build: u64::MAX,
         checksum: [0; 32],
