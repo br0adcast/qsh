@@ -99,13 +99,14 @@ jobs:
       # `binutils` is for `strip`: qshd/tests/transport_ensure_update.rs
       # strips its copy of the debug qshd below MAX_UPDATE_SIZE.
       - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils patch
 
       - name: Build and release script controls
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_output.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg

@@ -1,0 +1,20 @@
+--- a/cargo-generate-rpm-0.21.0/Cargo.toml
++++ b/cargo-generate-rpm-0.21.0/Cargo.toml
+@@ -94,3 +94,6 @@
+ 
+ [dev-dependencies.tempfile]
+ version = "3"
++
++[patch.crates-io]
++rpm = { path = "../rpm-0.23.2" }
+--- a/cargo-generate-rpm-0.21.0/Cargo.lock
++++ b/cargo-generate-rpm-0.21.0/Cargo.lock
+@@ -1828,8 +1828,6 @@
+ [[package]]
+ name = "rpm"
+ version = "0.23.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cf5c92939a06adb261d757e43f49bcdb121d62c6fe8e859b1006ce37f81e6d7f"
+ dependencies = [
+  "base64",
+  "bitflags",
