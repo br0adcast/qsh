@@ -64,6 +64,8 @@ this section.**
 - `cargo fmt` and `cargo clippy` are clean on the files you changed.
 - Changes to the native crypto build prerequisite follow
   [its source verification and qualification procedure](docs/native-crypto.md).
+- Changes to GitHub Actions follow
+  [the revision review and validation procedure](docs/actions-maintenance.md).
 - A change to how `qshd` uses Linux-PAM (`qshd/src/helper/pam.rs`, the
   `system` feature) keeps `scripts/check-pam-linkage.sh` passing; its header
   says what it checks, and when only `--featureless-only` applies.
