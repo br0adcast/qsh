@@ -261,6 +261,14 @@ dexec sh -c '[ -f /etc/pam.d/qshd ]' ||
   die "/etc/pam.d/qshd is missing after install -- the package's own PAM service file"
 ok "/etc/pam.d/qshd is present"
 
+# Test the configuration that ships, not a hand-written equivalent.
+profile=debian
+if [[ $fmt == rpm ]]; then profile=fedora; fi
+"$docker" cp "$root/packaging/pam.d/qshd.$profile" "$container:/tmp/expected-qshd-pam"
+dexec cmp -s /etc/pam.d/qshd /tmp/expected-qshd-pam ||
+  die "installed PAM service differs from this checkout's package profile"
+ok "installed PAM profile matches the source bytes"
+
 dexec sh -c '[ -f /usr/lib/systemd/system/qshd.service ]' ||
   die "/usr/lib/systemd/system/qshd.service is missing after install"
 ok "the system unit file is present"
@@ -385,6 +393,59 @@ for name in alice bob; do
     *) die "$name's \`id -un\` must print $name and exit 0; got: $out" ;;
   esac
   ok "$name: $out"
+done
+
+# --- package PAM policy on executed commands ---------------------------
+say "new logins receive audit identity and per-account limits"
+policy_report='printf "policy_uid=%s audit=%s soft=%s hard=%s\n" "$(id -u)" "$(cat /proc/self/loginuid)" "$(ulimit -Sn)" "$(ulimit -Hn)"'
+bob_before=$(probe --key "$(key_of bob)" --login bob --command "$policy_report" --timeout-secs 10) ||
+  die "unaffected account baseline failed: $bob_before"
+dexec sh -c 'test ! -e /etc/security/limits.d/99-qshd-policy-acceptance.conf' ||
+  die "limits fixture collision"
+printf 'alice soft nofile 73\nalice hard nofile 73\n' |
+  dexec_i sh -c 'mkdir -p /etc/security/limits.d; cat > /etc/security/limits.d/99-qshd-policy-acceptance.conf'
+alice_uid=$(dexec id -u alice)
+policy_out=$(probe --key "$(key_of alice)" --login alice --command "$policy_report" --timeout-secs 10) ||
+  die "policy login failed: $policy_out"
+[[ $policy_out == RESULT=opened\ exit=0\ output=*"policy_uid=$alice_uid audit=$alice_uid soft=73 hard=73"* ]] ||
+  die "executed audit identity/limits are wrong: $policy_out"
+bob_after=$(probe --key "$(key_of bob)" --login bob --command "$policy_report" --timeout-secs 10) ||
+  die "unaffected account control failed: $bob_after"
+[[ $bob_after == "$bob_before" ]] || die "alice's policy changed bob's context: $bob_before -> $bob_after"
+ok "account audit UID and limits reach exec without changing the other account"
+dexec rm /etc/security/limits.d/99-qshd-policy-acceptance.conf
+
+say "both nologin markers refuse a new PAM session"
+dexec sh -c 'test ! -e /etc/nologin && test ! -e /run/nologin' ||
+  die "nologin fixture collision"
+ordinal=0
+for marker in /etc/nologin /run/nologin; do
+  ordinal=$((ordinal + 1))
+  # Unique known token abbreviations correlate the helper verdict to this
+  # Open; route retirement can race delivery of the wire Refused record.
+  prefix=$(printf '%04x' "$((0x5700 + ordinal))")
+  policy_token=$(printf '%s%028x' "$prefix" "$ordinal")
+  pattern="login session setup failed $prefix\\.\\. at channel [0-9]+: pam_acct_mgmt:"
+  [[ $(log_count "$pattern") == 0 ]] || die "policy token abbreviation collision"
+  printf 'Disposable package acceptance\n' | dexec_i sh -c 'cat > "$1"' _ "$marker"
+  if refused_out=$(probe --key "$(key_of alice)" --login alice --token "$policy_token" \
+      --command "printf 'policy-forbidden-%s' execution" --timeout-secs 6); then
+    die "$marker must refuse a new login: $refused_out"
+  else
+    probe_code=$?
+  fi
+  [[ $probe_code == 2 || $probe_code == 3 ]] || die "probe failed unexpectedly ($probe_code): $refused_out"
+  [[ $refused_out != *RESULT=opened* && $refused_out != *policy-forbidden-execution* ]] ||
+    die "$marker allowed command execution: $refused_out"
+  [[ $(log_count "$pattern") == 1 ]] ||
+    die "$marker produced no exact-session PAM account refusal (a timeout alone is not evidence)"
+  dexec rm "$marker"
+  restored=$(probe --key "$(key_of alice)" --login alice \
+    --command "printf 'policy-restored-%s' execution" --timeout-secs 10) ||
+    die "login did not recover after removing $marker: $restored"
+  [[ $restored == RESULT=opened\ exit=0\ output=*policy-restored-execution* ]] ||
+    die "missing executed positive control after $marker: $restored"
+  ok "$marker: exact-session PAM refusal and restored admission (client-visible delivery is outside this check)"
 done
 
 # --- §10: the accept line, whole shape, for each account -----------------

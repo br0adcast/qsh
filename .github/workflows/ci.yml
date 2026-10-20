@@ -319,6 +319,9 @@ jobs:
             if [ "$kind" = lib ] || [ "$name" = system_mode_pam ]; then
               fixture_env=(-e "QSHD_TEST_PAM_GROUP_MODULE=$GITHUB_WORKSPACE/target/test-fixtures/pam/session_groups.so")
             fi
+            if [ "$name" = system_mode_policies ]; then
+              fixture_env+=(-e QSHD_TEST_PAM_FAMILY=debian)
+            fi
             network_caps=()
             if [ "$kind" = lib ]; then network_caps=(--cap-add=NET_ADMIN); fi
             echo "::group::$name"
@@ -342,7 +345,7 @@ jobs:
             echo "::endgroup::"
           }
 
-          # The five suites that are `#[cfg(feature = "system")]` at file
+          # The six suites that are `#[cfg(feature = "system")]` at file
           # scope. NOTHING in them may skip: they are the reason this job
           # exists.
           #
@@ -372,6 +375,13 @@ jobs:
             --require pam_can_remove_all_supplementary_groups \
             --require pam_groups_are_isolated_between_logins \
             --require pam_group_teardown_uses_the_opening_monitor
+          run_suite test system_mode_policies \
+            --require new_pam_sessions_obey_both_nologin_markers \
+            --require executed_children_receive_account_audit_identity \
+            --require executed_children_receive_per_account_limits \
+            --require retained_login_keeps_policy_until_a_new_incarnation \
+            --require required_audit_failure_refuses_before_exec \
+            --require required_limits_failure_refuses_before_exec
           run_suite test system_mode_shell \
             --require the_system_mode_serves_a_shell_over_the_seam
           run_suite test authorized_keys_privilege \

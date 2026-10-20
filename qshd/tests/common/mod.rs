@@ -504,6 +504,7 @@ fn octal_escape(s: &str) -> String {
 /// completes the handshake, and simply never gets an answer to anything it
 /// asks for afterwards -- see [`Session::saw_opened`].
 pub(crate) struct Session {
+    token: [u8; 16],
     client: StdClient,
     events: Arc<ShellRunEvents>,
 }
@@ -525,6 +526,18 @@ impl Session {
     ) -> Session {
         let mut token = [0u8; 16];
         OsRng.fill_bytes(&mut token);
+        Self::connect_with_token(port, server_pub, key, login, token, StartKind::Cold)
+    }
+
+    /// Reconnect tests must distinguish transport replacement from login incarnation.
+    pub(crate) fn connect_with_token(
+        port: u16,
+        server_pub: [u8; 32],
+        key: &PrivateKey,
+        login: &str,
+        token: [u8; 16],
+        start: StartKind,
+    ) -> Session {
         let events = Arc::new(ShellRunEvents::default());
         let client = StdClient::connect(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
@@ -537,7 +550,7 @@ impl Session {
                 auth: AuthPolicy::SshSignature,
             },
             token,
-            StartKind::Cold,
+            start,
             Arc::new(NoopBinder),
             events.clone(),
             Some(Arc::new(
@@ -546,12 +559,21 @@ impl Session {
                     .with_login(login.to_string()),
             )),
         );
-        let session = Session { client, events };
+        let session = Session {
+            token,
+            client,
+            events,
+        };
         assert!(
             wait_until(|| session.events.collected.lock().expect("collected").live),
             "the handshake with the daemon must complete"
         );
         session
+    }
+
+    /// Helper diagnostics identify this login by the first two token bytes.
+    pub(crate) fn login_log_prefix(&self) -> String {
+        format!("{:02x}{:02x}", self.token[0], self.token[1])
     }
 
     /// Asks for a channel on [`FIRST_CHANNEL_STREAM`]: the account's login
@@ -579,7 +601,11 @@ impl Session {
 
     /// A second command channel in the same login. Its output can be a fixture file.
     pub(crate) fn run_another_command(&self, command: &str) {
-        let stream = FIRST_CHANNEL_STREAM + 1;
+        self.run_command_on_stream(FIRST_CHANNEL_STREAM + 1, command);
+    }
+
+    /// Unique streams let a test observe successive channels without stale Exit records.
+    pub(crate) fn run_command_on_stream(&self, stream: u8, command: &str) {
         self.client.send_bytes(
             CONTROL_STREAM,
             encode_client(&ClientRecord::Open(OpenRequest {
@@ -695,18 +721,19 @@ impl Session {
     /// channel ends (the kernel's hang-up, when a test kills the daemon, is
     /// enough for bash). Unset, the history goes nowhere.
     pub(crate) fn run_in_shell(&self, command: &str) -> String {
-        let marker = "QSHD_SYSTEM_MODE_SHELL_DONE";
-        let seen_before = self.output().matches(marker).count();
+        // A resumed channel can replay earlier output; only this command's marker counts.
+        let marker = format!("QSHD_SYSTEM_MODE_SHELL_DONE_{:016x}", OsRng.next_u64());
+        let seen_before = self.output().matches(&marker).count();
         self.client.send_bytes(
             FIRST_CHANNEL_STREAM,
             format!(
                 "unset HISTFILE; {command}; printf '{}'\n",
-                octal_escape(marker)
+                octal_escape(&marker)
             )
             .into_bytes(),
         );
         assert!(
-            wait_until(|| self.output().matches(marker).count() > seen_before),
+            wait_until(|| self.output().matches(&marker).count() > seen_before),
             "the shell must run the command and print the marker that follows it; got: {:?}",
             self.output()
         );
@@ -746,6 +773,16 @@ impl Session {
     /// `false` if it never did.
     pub(crate) fn wait_for_output(&self, mut probe: impl FnMut(&str) -> bool) -> bool {
         wait_until(|| probe(&self.output()))
+    }
+
+    /// Stop this client locally while retaining the server-side logical login.
+    pub(crate) fn detach(&self) {
+        self.client.detach();
+    }
+
+    pub(crate) fn exit_shell(&self) {
+        self.client
+            .send_bytes(FIRST_CHANNEL_STREAM, b"exit\n".to_vec());
     }
 
     /// Ends the session the way a client that means to leave does: a `Close`
