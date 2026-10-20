@@ -598,6 +598,9 @@ pub struct Connection {
     /// `Live`.
     server_nonce: Option<[u8; AUTH_NONCE_LEN]>,
     peer: Option<SocketAddr>,
+    /// Daemon probation accepts transport only from its handshake's source.
+    /// Noise possession alone must not redirect replies before admission.
+    probation_source: Option<SocketAddr>,
     /// The authenticated remote static key, recorded once the handshake
     /// completes (server: the client's key from msg1; unset on the client
     /// path today).
@@ -925,6 +928,7 @@ impl Connection {
             resumed: false,
             server_nonce: None,
             peer: None,
+            probation_source: None,
             peer_static: None,
             paths: PathTable::new(),
             handshake_hash: [0u8; 32],
@@ -1888,6 +1892,20 @@ impl Connection {
         self.peer
     }
 
+    /// Called only after the daemon accepted a server handshake. Repeated
+    /// probation setup preserves the original source; it never retargets it.
+    #[cfg(feature = "tokio-driver")]
+    pub(crate) fn restrict_to_handshake_source(&mut self) {
+        self.probation_source
+            .get_or_insert(self.peer.expect("probation follows an accepted handshake"));
+    }
+
+    /// Only committed bridge adoption restores ordinary server roaming.
+    #[cfg(feature = "tokio-driver")]
+    pub(crate) fn admit_source_migration(&mut self) {
+        self.probation_source = None;
+    }
+
     /// Tell the connection which roads lead to the same peer. Only a client
     /// has these: a server does not know what other addresses reach it.
     ///
@@ -2715,6 +2733,12 @@ impl Connection {
         aead: &[u8],
     ) -> Vec<Datagram> {
         let mut out = Vec::new();
+        // Reject the whole other-source packet before AEAD, replay/liveness,
+        // key confirmation or frame routing (including direct probe answers).
+        // A source change before admission requires a fresh handshake there.
+        if self.probation_source.is_some_and(|source| source != src) {
+            return out;
+        }
         if self.keys.is_none() || session_id != self.session_id {
             return out;
         }

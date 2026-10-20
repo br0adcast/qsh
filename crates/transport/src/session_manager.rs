@@ -3663,6 +3663,9 @@ fn scrub_superseded_key(
 /// §4.8). Called for the connection a bridge starts with and for every one
 /// an `Attach` brings.
 fn adopt_connection(conn: &mut Connection, classes: &BTreeMap<u8, StreamClass>) {
+    // Binding/revision checks committed this admission. Restore roaming before
+    // processing traffic queued while the actual proof was being verified.
+    conn.admit_source_migration();
     // Every stream is counted when the bridge says its backend took the
     // bytes (spec §4.10.3) -- but the proof's: it never reaches a backend,
     // and is taken as it is read.
@@ -5446,6 +5449,7 @@ pub(crate) async fn send_all(socket: &UdpSocket, dgrams: &[Datagram]) {
 
 #[cfg(test)]
 mod tests {
+    include!("session_manager_source_tests.rs");
     mod shutdown_tests {
         include!("session_shutdown_tests.rs");
     }
