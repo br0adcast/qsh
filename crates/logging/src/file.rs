@@ -1,11 +1,16 @@
 //! A rotating append-only file sink that stays whole-line safe when several
 //! processes (or sinks) share one path.
 //!
-//! Every line is one `write_all` on an `O_APPEND` descriptor, so concurrent
-//! writers interleave by line. Before each write the sink checks whether
-//! someone else rotated the file (the path now names a different inode, or
-//! none) and, if so, reopens the path instead of writing into the rotated
-//! file. Only the writer that still owns the path's inode renames it.
+//! Each complete record is appended with `write_all` on an `O_APPEND`
+//! descriptor. Failed preparation drops the record instead of extending an old
+//! inode indefinitely; later records retry. Oversized records are dropped whole.
+//!
+//! The mutex bounds a single sink's appends by its configured threshold.
+//! Independent sinks can race preflight and append: for N cooperating writers
+//! with threshold B and maximum encoded record L <= B, the conservative inode
+//! bound is max(initial size, B + (N - 1) * L), at worst max(initial size, N * B).
+//! This assumes regular-file metadata/append semantics and no outside writes;
+//! it is not a writer-count-independent cap or transactional I/O guarantee.
 //! Errors are swallowed: a log must never fail its caller.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
@@ -23,6 +28,9 @@ struct Inner {
     rotated: PathBuf,
     max_bytes: u64,
     file: File,
+    // One-shot owned phase gate for the actual concurrent preflight test.
+    #[cfg(test)]
+    before_append: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 fn open_append(path: &Path) -> std::io::Result<File> {
@@ -65,11 +73,16 @@ impl FileSink {
                 rotated: PathBuf::from(rotated),
                 max_bytes,
                 file,
+                #[cfg(test)]
+                before_append: None,
             }),
         })
     }
 
-    /// Writes the lines, one write_all each; rotates to "<path>.1" past max_bytes.
+    /// Appends whole records, rotating to "<path>.1" before exceeding the threshold.
+    /// Records larger than the threshold (including newline), or whose target
+    /// cannot be prepared, are dropped. A later record retries preparation.
+    /// Zero disables appends. Independent writers have the bound described above.
     pub fn write_lines(&self, lines: &[String]) {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
@@ -88,30 +101,57 @@ impl FileSink {
 
 impl Inner {
     fn write_line(&mut self, line: &str) {
-        self.prepare();
-        let mut buf = Vec::with_capacity(line.len() + 1);
+        let Some(size) = line.len().checked_add(1) else {
+            return;
+        };
+        let Ok(bytes) = u64::try_from(size) else {
+            return;
+        };
+        if bytes > self.max_bytes || !self.prepare(bytes) {
+            return;
+        }
+        #[cfg(test)]
+        if let Some((entered, released)) = self.before_append.take() {
+            let _ = entered.send(());
+            let _ = released.recv();
+        }
+        let mut buf = Vec::with_capacity(size);
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
         let _ = self.file.write_all(&buf);
     }
 
-    /// Follows a rotation done by someone else, and rotates when full.
-    fn prepare(&mut self) {
-        if !self.owns_path() {
-            self.reopen();
+    /// Follows other rotations, then admits only a complete fitting record.
+    fn prepare(&mut self, bytes: u64) -> bool {
+        if !self.owns_path() && !self.reopen() {
+            return false;
         }
-        let full = self
-            .file
+        let Ok(metadata) = self.file.metadata() else {
+            return false;
+        };
+        if self.fits(metadata.len(), bytes) {
+            return true;
+        }
+        if self.owns_path() && fs::rename(&self.path, &self.rotated).is_err() {
+            return false;
+        }
+        // A raced rotation may already have installed another file. Reopen
+        // either way; never fall back to the descriptor that did not fit.
+        if !self.reopen() {
+            return false;
+        }
+        // Another writer may have filled the reopened file. Drop this record
+        // rather than loop, truncate, or append past the observed threshold.
+        self.file
             .metadata()
-            .map(|m| m.len() >= self.max_bytes)
-            .unwrap_or(false);
-        if full && self.owns_path() {
-            let _ = fs::rename(&self.path, &self.rotated);
-            self.reopen();
-        } else if full {
-            // Raced with another rotation: the path already holds a fresh file.
-            self.reopen();
-        }
+            .map(|m| self.fits(m.len(), bytes))
+            .unwrap_or(false)
+    }
+
+    fn fits(&self, current: u64, bytes: u64) -> bool {
+        current
+            .checked_add(bytes)
+            .is_some_and(|next| next <= self.max_bytes)
     }
 
     /// Whether the path still names the file we hold open.
@@ -122,9 +162,17 @@ impl Inner {
         }
     }
 
-    fn reopen(&mut self) {
-        if let Ok(f) = open_append(&self.path) {
-            self.file = f;
+    fn reopen(&mut self) -> bool {
+        match open_append(&self.path) {
+            Ok(file) => {
+                self.file = file;
+                true
+            }
+            Err(_) => false,
         }
     }
 }
+
+#[cfg(test)]
+#[path = "file_tests.rs"]
+mod tests;

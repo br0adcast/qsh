@@ -455,9 +455,16 @@ New logs use the XDG cache directory. Previous macOS logs under
 `~/Library/Caches/qsh` are left in place; they are not copied or removed.
 Downloaded release archives already use the XDG cache directory.
 
-After exceeding 1 MiB, `log` becomes `log.1` and a new log starts; one prior file
-is retained. Directories use mode 0700 and files 0600. Logging failures do not
-end the session or overwrite its screen.
+Before the next complete record would exceed 1 MiB, `log` becomes `log.1`
+and a new log starts; one prior file is retained. A record larger than 1 MiB
+including its newline is dropped whole. If rotation or reopening fails, that
+record is dropped and later records retry, instead of growing an old file.
+Existing oversized files are not silently truncated. Independent clients can
+race their size checks: with N cooperating writers and maximum record size L,
+the conservative per-inode bound is the larger of its initial size and
+1 MiB + (N - 1) × L, at worst the larger of its initial size and N MiB; this
+excludes outside writes. Directories use mode 0700 and files 0600. Logging
+failures do not end the session or overwrite its screen.
 
 Records contain a UTC timestamp with milliseconds, PID, level, and component:
 
