@@ -67,6 +67,8 @@ mod open24_tests {
         let mut req = request(ChannelKind::Command, 80, 24, b"/bin/sleep 60");
         req.screen = true;
         let screen = make_screen(&req, &owner(), budget.clone()).unwrap();
+        #[cfg(target_os = "linux")]
+        let process_view = crate::process_scope::prepare().unwrap();
         let (master, child) = pty::spawn_command_no_echo(
             PtySize {
                 rows: 24,
@@ -80,13 +82,17 @@ mod open24_tests {
         .unwrap();
         let pid = Pid::from_raw(child.process_id().unwrap() as i32);
         let fixture = ReapFixture(pid);
+        #[cfg(target_os = "linux")]
+        let wait = crate::process_scope::own_child(child, process_view);
+        #[cfg(not(target_os = "linux"))]
+        let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
         let custody = OpenCustody::new();
         let outcome = finish_personal_spawn(
             Box::new(FailingMaster {
                 inner: master,
                 reader,
             }),
-            child,
+            wait,
             screen,
             &custody,
         );

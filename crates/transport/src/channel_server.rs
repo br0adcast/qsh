@@ -145,7 +145,12 @@ const CHANNEL_CAPACITY: usize = 16;
 /// unavailable even when an exact backend receipt proves the child is gone.
 pub enum ChildStatus {
     Running,
-    Reaped { code: Option<i32> },
+    /// Process cleanup is proved; actual owned I/O worker joins are pending.
+    /// Retain custody and retry from the worker notifier without parking a thread.
+    WaitingForWorkers,
+    Reaped {
+        code: Option<i32>,
+    },
     Unknown(String),
 }
 
@@ -154,12 +159,25 @@ pub(crate) mod reaping;
 pub use reaping::ReapNotifier;
 use reaping::ReapSet;
 
+/// Non-reaping leader status, independent of process-scope and I/O cleanup.
+pub enum LeaderStatus {
+    Running,
+    Exited { code: Option<i32> },
+    Unknown(String),
+}
+
 /// Exclusive child lifecycle operations. The runner calls observation/stop on
 /// blocking workers; a pending or failed observation never releases custody.
 pub trait ChannelWait: Send {
     /// Nonblocking observation by the exclusive wait owner. After Unknown the
     /// owner must retain custody and must not signal a possibly reused PID.
     fn poll_exit(&mut self) -> ChildStatus;
+
+    /// Observed by the same exclusive blocking owner as cleanup. Legacy backends
+    /// may omit this signal; it never implies a full cleanup receipt.
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        None
+    }
 
     /// Wake a parked retirement owner after an exact backend receipt arrives.
     fn set_reap_notifier(&mut self, _notifier: ReapNotifier) {}
@@ -872,7 +890,7 @@ struct Channel {
     producer: ProducerState,
     /// Every queued or writer-held chunk owns channel and session quota.
     /// Admission bounds this nonblocking FIFO independently of transport credit.
-    input_tx: mpsc::UnboundedSender<WriterInput>,
+    input_tx: Option<mpsc::UnboundedSender<WriterInput>>,
     input_budget: crate::channel_input::ChannelInputBudget,
     resize: Box<dyn ResizeHandle>,
     screen: Box<dyn SessionScreen>,
@@ -902,6 +920,8 @@ struct Channel {
     wait: Option<Box<dyn ChannelWait>>,
     /// Confirmed process termination, including an unavailable exit status.
     terminal_code: Option<Option<i32>>,
+    /// Leader exit rejects client input while real EOF may still flush replies.
+    ending: bool,
 }
 
 /// The runner's ordered attachment, admitted-open ledger and capacity signal.
@@ -1068,11 +1088,9 @@ fn admit_terminal_reply(
             Ok(None) => return true,
             Ok(Some(chunk)) => {
                 if let Some(receipt) = ch.producer.reply_delivery.try_reserve() {
-                    if ch
-                        .input_tx
-                        .send(WriterInput::LocalReply { receipt, chunk })
-                        .is_ok()
-                    {
+                    if ch.input_tx.as_ref().is_some_and(|tx| {
+                        tx.send(WriterInput::LocalReply { receipt, chunk }).is_ok()
+                    }) {
                         return true;
                     }
                 }
@@ -1361,7 +1379,7 @@ enum Wakeup {
     AckTick,
     OutputReady,
     OpenReady,
-    Reaped(reaping::Completion),
+    Reaped(reaping::ReapEvent),
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
@@ -1405,7 +1423,7 @@ fn reset_attachment_outputs(
         let mut draining = Vec::with_capacity(exits.len() + channels.len());
         for (&stream, ch) in channels.iter() {
             let instance = ChannelInstance::new(ch.instance).expect("channel instance");
-            if ch.wait.is_none() {
+            if ch.ending {
                 draining.push(DrainingChannel {
                     stream,
                     instance,
@@ -1453,7 +1471,9 @@ fn send_pending_exit(io: &SessionIo, stream: u8, pending: &mut PendingExit) {
 /// Natural EOF observes without signalling; an explicit stop also reaches a
 /// process already being observed by the registered reaper.
 fn begin_channel_ending(ch: &mut Channel, reaps: &mut ReapSet, stop: bool) {
+    ch.ending = true;
     ch.input_budget.close();
+    drop(ch.input_tx.take());
     ch.producer.deferred = None;
     if let Some(wait) = ch.wait.take() {
         reaps.start(
@@ -1465,6 +1485,8 @@ fn begin_channel_ending(ch: &mut Channel, reaps: &mut ReapSet, stop: bool) {
         );
     } else if stop {
         reaps.stop(ch.instance);
+    } else {
+        reaps.retire(ch.instance);
     }
 }
 
@@ -1567,7 +1589,7 @@ pub async fn run_channel_session_with(
             _ = ack_tick.tick() => Wakeup::AckTick,
             _ = producer.ready.notified() => Wakeup::OutputReady,
             _ = producer.opens.notified() => Wakeup::OpenReady,
-            done = reaps.next(), if !reaps.is_empty() => Wakeup::Reaped(done),
+            done = reaps.next_event(), if !reaps.is_empty() => Wakeup::Reaped(done),
             signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
             reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
             end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
@@ -1622,7 +1644,7 @@ pub async fn run_channel_session_with(
                 } else if stream_id == UPDATE_STREAM {
                     update.receive(&io, data);
                 } else if let Some(ch) = channels.get_mut(&stream_id) {
-                    if ch.wait.is_none() {
+                    if ch.ending {
                         // Ending channels retain output, but accept no new input.
                         io.consumed(stream_id, n);
                         continue;
@@ -1631,7 +1653,11 @@ pub async fn run_channel_session_with(
                         Ok(Some(chunk)) => {
                             // Echo offsets cover admitted network input only.
                             ch.input_consumed += n as u64;
-                            if ch.input_tx.send(WriterInput::Network(chunk)).is_err() {
+                            if ch
+                                .input_tx
+                                .as_ref()
+                                .is_none_or(|tx| tx.send(WriterInput::Network(chunk)).is_err())
+                            {
                                 io.consumed(stream_id, n);
                             }
                         }
@@ -1746,7 +1772,18 @@ pub async fn run_channel_session_with(
                 }
             }
             Wakeup::OpenReady => {}
-            Wakeup::Reaped(done) => {
+            Wakeup::Reaped(reaping::ReapEvent::LeaderExited(done)) => {
+                if let Some(ch) = channels
+                    .get_mut(&done.stream)
+                    .filter(|ch| ch.instance == done.instance)
+                {
+                    ch.ending = true;
+                    // Scope cleanup advances before workers join. Keep the
+                    // writer alive for parser replies until real reader EOF.
+                    reaps.retire(ch.instance);
+                }
+            }
+            Wakeup::Reaped(reaping::ReapEvent::Complete(done)) => {
                 if done.code.is_none() {
                     log::warn!(
                         "channel {}/{} reaped without an exit status",
@@ -1815,6 +1852,7 @@ pub async fn run_channel_session_with(
                 // is still running.
             }
             Wakeup::AckTick => {
+                reaps.observe_active();
                 let now = std::time::Instant::now();
                 // Flush a pending echo_ack per channel: input advanced but no
                 // output happened (the program silently ate a keystroke).
@@ -1872,6 +1910,7 @@ pub async fn run_channel_session_with(
             &chan_out_tx,
             &update,
             &producer,
+            &mut reaps,
         );
         let mut finished = Vec::new();
         for (&stream, ch) in channels.iter_mut() {
@@ -2290,6 +2329,7 @@ fn complete_opens(
     chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     update: &SessionUpdate,
     context: &ProducerContext,
+    reaps: &mut ReapSet,
 ) {
     // At most MAX_CHANNELS jobs can be active or unresolved in this session.
     let completed: Vec<_> = opening
@@ -2345,7 +2385,7 @@ fn complete_opens(
                 // bridge scheduling must not hold up restart publication.
                 drop(epoch);
                 if let Some(bridges) = committed {
-                    start_installed(io, channels, chan_out_tx, bridges, context);
+                    start_installed(io, channels, chan_out_tx, bridges, context, reaps);
                 }
             }
         }
@@ -2583,7 +2623,7 @@ impl<'a> PreparedInstallation<'a> {
         self.entry.insert(Channel {
             _open_slot: Some(slot),
             producer: self.producer,
-            input_tx: self.input_tx,
+            input_tx: Some(self.input_tx),
             input_budget: self.input_budget,
             resize,
             screen,
@@ -2596,6 +2636,7 @@ impl<'a> PreparedInstallation<'a> {
             request: self.request,
             wait: Some(wait),
             terminal_code: None,
+            ending: false,
         });
         bridges
     }
@@ -2609,6 +2650,13 @@ struct IoOwnedWait {
     workers: [crate::session_manager::WorkerReceipt; 2],
 }
 impl ChannelWait for IoOwnedWait {
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        if let Some(code) = self.reaped {
+            Some(LeaderStatus::Exited { code })
+        } else {
+            self.child.poll_leader_status()
+        }
+    }
     fn poll_exit(&mut self) -> ChildStatus {
         if self.reaped.is_none() {
             match self.child.poll_exit() {
@@ -2618,7 +2666,7 @@ impl ChannelWait for IoOwnedWait {
         }
         for worker in &self.workers {
             match worker.joined() {
-                None => return ChildStatus::Running,
+                None => return ChildStatus::WaitingForWorkers,
                 Some(Err(error)) => return ChildStatus::Unknown(error),
                 Some(Ok(())) => {}
             }
@@ -2662,7 +2710,30 @@ fn start_installed(
     chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
     bridges: InstalledBridges,
     context: &ProducerContext,
+    reaps: &mut ReapSet,
 ) {
+    let ch = channels
+        .get_mut(&bridges.stream)
+        .expect("committed installation");
+    // Custody precedes callbacks, worker scheduling and publication. On unwind
+    // ReapSet transfers this exact owner to factory retirement synchronously.
+    reaps.start_active(
+        bridges.stream,
+        bridges.instance,
+        ch.wait.take().expect("installed child custody"),
+        ch._open_slot.take(),
+    );
+    let workers = spawn_installed_workers(io, ch, chan_out_tx, bridges);
+    reaps.attach_workers(ch.instance, workers);
+    publish_installed(io, ch, context);
+}
+
+fn spawn_installed_workers(
+    io: &SessionIo,
+    ch: &mut Channel,
+    chan_out_tx: &mpsc::Sender<(u8, u64, Option<Vec<u8>>)>,
+    bridges: InstalledBridges,
+) -> [crate::session_manager::WorkerReceipt; 2] {
     let InstalledBridges {
         stream,
         instance,
@@ -2670,8 +2741,6 @@ fn start_installed(
         writer,
         input_rx,
     } = bridges;
-    let ch = channels.get_mut(&stream).expect("committed installation");
-    // Only the actual model determines recoverability, never the requested flag.
     let recoverable = ch.screen.has_screen();
     ch.screened = recoverable;
     ch.gate = io.send_gate(
@@ -2690,13 +2759,12 @@ fn start_installed(
     let reporter = io.consumption_reporter();
     let writer =
         io.spawn_blocking_owned(move || channel_writer_loop(stream, input_rx, writer, reporter));
-    ch.wait = Some(Box::new(IoOwnedWait {
-        child: ch.wait.take().expect("installed child custody"),
-        reaped: None,
-        workers: [reader, writer],
-    }));
-    io.set_stream_resyncable(stream, recoverable);
-    io.channel_opened(context.attachment, stream);
+    [reader, writer]
+}
+
+fn publish_installed(io: &SessionIo, ch: &mut Channel, context: &ProducerContext) {
+    io.set_stream_resyncable(ch.request.stream, ch.screened);
+    io.channel_opened(context.attachment, ch.request.stream);
     checkpoint(io, ch);
 }
 
@@ -2721,7 +2789,16 @@ fn install_open(
         return;
     };
     let bridges = prepared.commit(spawned, open_slot);
-    start_installed(io, channels, chan_out_tx, bridges, context);
+    let ch = channels
+        .get_mut(&bridges.stream)
+        .expect("fixture installation");
+    let workers = spawn_installed_workers(io, ch, chan_out_tx, bridges);
+    ch.wait = Some(Box::new(IoOwnedWait {
+        child: ch.wait.take().expect("fixture child custody"),
+        reaped: None,
+        workers,
+    }));
+    publish_installed(io, ch, context);
 }
 
 /// Send `ServerRecord::Refused` for `stream` with `reason` on
@@ -3089,10 +3166,20 @@ pub(crate) mod tests {
         waited: Arc<Mutex<Vec<u8>>>,
         wait_hold: Arc<(Mutex<bool>, std::sync::Condvar)>,
         exited: Arc<AtomicBool>,
+        leader_exited: Arc<AtomicBool>,
         observed: bool,
     }
 
     impl ChannelWait for FakeWait {
+        fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+            Some(if self.leader_exited.load(Ordering::SeqCst) {
+                LeaderStatus::Exited {
+                    code: Some(self.code),
+                }
+            } else {
+                LeaderStatus::Running
+            })
+        }
         fn poll_exit(&mut self) -> ChildStatus {
             let mut observed = self.waited.lock().unwrap();
             if !self.observed {
@@ -3149,6 +3236,8 @@ pub(crate) mod tests {
         /// tests open one line channel and watch its reader.
         reads: Arc<AtomicUsize>,
         exit_code: i32,
+        /// Independent leader exit while a same-session reader remains alive.
+        leader_exited: Arc<AtomicBool>,
         /// Streams whose `ChannelWait::kill`/`wait` was called, in call
         /// order -- how a test checks that a channel still running when the
         /// session ends was reaped rather than leaked.
@@ -3189,6 +3278,7 @@ pub(crate) mod tests {
                 enders: Mutex::new(Vec::new()),
                 reads: Arc::new(AtomicUsize::new(0)),
                 exit_code: 0,
+                leader_exited: Arc::new(AtomicBool::new(false)),
                 killed: Arc::new(Mutex::new(Vec::new())),
                 waited: Arc::new(Mutex::new(Vec::new())),
                 force_no_screen: Mutex::new(false),
@@ -3308,6 +3398,7 @@ pub(crate) mod tests {
                     waited: self.waited.clone(),
                     wait_hold: self.wait_hold.clone(),
                     exited,
+                    leader_exited: self.leader_exited.clone(),
                     observed: false,
                 }),
             };
@@ -3500,7 +3591,7 @@ pub(crate) mod tests {
             let channel = Channel {
                 _open_slot: None,
                 input_budget: producer.input_budget.channel(),
-                input_tx,
+                input_tx: Some(input_tx),
                 resize: Box::new(TransactionPty {
                     fail: ioctl_fails,
                     events: events.clone(),
@@ -3532,9 +3623,11 @@ pub(crate) mod tests {
                     waited: Arc::default(),
                     wait_hold: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                     exited: Arc::new(AtomicBool::new(true)),
+                    leader_exited: Arc::new(AtomicBool::new(false)),
                     observed: false,
                 })),
                 terminal_code: None,
+                ending: false,
                 producer: ProducerState::new(ChannelInstance::new(1).unwrap(), &producer),
             };
             Self {

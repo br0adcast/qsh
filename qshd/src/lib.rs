@@ -65,6 +65,8 @@ pub mod helper;
 pub mod log;
 #[cfg(feature = "system")]
 pub mod nonce_pool;
+#[cfg(target_os = "linux")]
+mod process_scope;
 pub mod pty;
 pub mod screen;
 pub mod screen_budget;

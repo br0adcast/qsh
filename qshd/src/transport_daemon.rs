@@ -400,11 +400,13 @@ async fn handle_transport_control_connection(
             write_half.write_all(response.to_line()?.as_bytes()).await?;
         }
         ControlRequest::Stop => {
-            write_half.write_all(b"{\"stopped\":true}\n").await?;
-            // Ignore the send error: the receiver may have already closed
-            // (the daemon is shutting down via another signal) -- that's
-            // not a connection failure.
-            let _ = stop_tx.send(()).await;
+            stop_tx
+                .send(())
+                .await
+                .context("requesting transport shutdown")?;
+            // This acknowledges accepted work. Joined daemon completion is
+            // observed independently; owned cleanup may still be pending.
+            write_half.write_all(b"{\"stopping\":true}\n").await?;
         }
     }
 
@@ -497,16 +499,20 @@ mod tests {
     ) -> std::path::PathBuf {
         let path = dir.join("control.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        // No receiver: a `STOP` is answered, and its send ignored.
-        let (stop_tx, _) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(super::serve_transport_control(
-            listener,
-            Arc::new(Mutex::new(Vec::new())),
-            vec![1],
-            stop_tx,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            gate,
-        ));
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            // This fixture accepts one STOP without ending its control loop.
+            let _receiver = stop_rx;
+            super::serve_transport_control(
+                listener,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![1],
+                stop_tx,
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                gate,
+            )
+            .await;
+        });
         path
     }
 
@@ -550,7 +556,7 @@ mod tests {
         drop(held);
         let reply = ask.await.unwrap();
         assert!(
-            matches!(reply, crate::control::ControlReply::Answered(ref line) if line.contains("stopped")),
+            matches!(reply, crate::control::ControlReply::Answered(ref line) if line.contains("stopping")),
             "{reply:?}"
         );
     }

@@ -42,7 +42,9 @@
 //! the attempt.
 
 use std::fs::File;
-use std::io::{BufRead, Read, Write};
+use std::io::Write;
+#[cfg(not(target_os = "linux"))]
+use std::io::{BufRead, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -1067,7 +1069,18 @@ impl Drop for StagedImage {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[path = "update_scope.rs"]
+mod native_self_check;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
+    native_self_check::run(path, timeout)
+}
+
 /// Run `<path> self-check`, bounded by `timeout`, and read its line.
+/// Non-Linux cleanup remains a separate platform acceptance requirement.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
     let mut child = spawn_self_check(path)?;
     let deadline = Instant::now() + timeout;
@@ -1121,12 +1134,26 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
     loop {
         let spawned = {
             let _permit = spawn_permit();
-            Command::new(path)
+            let mut command = Command::new(path);
+            command
                 .arg("self-check")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::process::CommandExt;
+                // Child-only setup, acknowledged by Command's exec-error pipe.
+                unsafe {
+                    command.pre_exec(|| {
+                        if nix::libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            command.spawn()
         };
         match spawned {
             Ok(child) => return Ok(child),
@@ -1145,6 +1172,7 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 #[cfg(test)]
 mod tests {
     include!("update_open_tests.rs");
+    include!("update_scope_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
     use std::os::fd::AsRawFd;

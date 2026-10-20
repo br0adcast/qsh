@@ -323,8 +323,12 @@ fn stop_daemon_and_wait_with(sock: &Path, patience: Duration, read: Duration) ->
         if let Ok(ControlReply::Answered(line)) =
             client_request_with_timeout(sock, &ControlRequest::Stop, read)
         {
-            let ack = serde_json::from_str::<serde_json::Value>(&line)
-                .is_ok_and(|v| v["stopped"] == serde_json::Value::Bool(true));
+            let ack = serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|v| {
+                // Older peers used "stopped" for the same acknowledgement.
+                // Neither reply replaces the actual exit observation below.
+                v["stopping"] == serde_json::Value::Bool(true)
+                    || v["stopped"] == serde_json::Value::Bool(true)
+            });
             if ack {
                 stop_answered = true;
                 break;
@@ -1325,6 +1329,33 @@ mod tests {
     }
 
     const STOPPED: &str = "{\"stopped\":true}";
+
+    #[test]
+    fn stopping39_ack_waits_for_real_exit_and_reports_still_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let pid = std::process::id();
+        let stops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = stops.clone();
+        let daemon = FakeDaemon::start(&sock, move |line| match line {
+            "STATUS" => Some(status_line(pid)),
+            "STOP" => {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some("{\"stopping\":true}".into())
+            }
+            _ => None,
+        });
+        let outcome = stop_daemon_and_wait_with(&sock, Duration::from_millis(100), TEST_TIMEOUT);
+        drop(daemon); // Join the fake peer before asserting on the RED path.
+        assert_eq!(
+            outcome,
+            StopOutcome::StillThere {
+                pid,
+                stop_answered: true
+            }
+        );
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn stopping_where_there_is_no_socket_is_no_daemon_at_once() {

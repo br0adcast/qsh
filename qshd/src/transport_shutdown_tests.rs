@@ -159,9 +159,12 @@ async fn stop_with_held_cleanup(replace: bool) {
     .await
     .unwrap()
     .unwrap();
-    assert!(
-        matches!(reply, crate::control::ControlReply::Answered(line) if line.contains("stopped"))
-    );
+    let stop_ack = match reply {
+        crate::control::ControlReply::Answered(line) => {
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        }
+        other => panic!("STOP did not answer: {other:?}"),
+    };
     let current = usize::from(replace);
     tokio::time::timeout(Duration::from_secs(5), runs[current].cleaning.notified())
         .await
@@ -199,5 +202,41 @@ async fn stop_with_held_cleanup(replace: bool) {
     assert!(
         returned_early.is_none(),
         "daemon completed before owned backend cleanup"
+    );
+    assert_eq!(
+        stop_ack["stopping"], true,
+        "ack must describe the pending cleanup"
+    );
+    assert!(
+        stop_ack.get("stopped").is_none(),
+        "ack cannot claim completed cleanup"
+    );
+}
+
+#[tokio::test]
+async fn stopping39_failed_enqueue_never_acknowledges_success() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+    drop(stop_rx);
+    client.write_all(b"STOP\n").await.unwrap();
+    let result = super::handle_transport_control_connection(
+        server,
+        Arc::new(Mutex::new(Vec::new())),
+        Vec::new(),
+        stop_tx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(tokio::sync::RwLock::new(())),
+    )
+    .await;
+    let mut reply = Vec::new();
+    client.read_to_end(&mut reply).await.unwrap();
+    assert!(
+        result.is_err(),
+        "a closed shutdown receiver cannot accept STOP"
+    );
+    assert!(
+        reply.is_empty(),
+        "failed enqueue emitted a success acknowledgement"
     );
 }

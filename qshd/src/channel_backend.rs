@@ -18,7 +18,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use portable_pty::{Child, CommandBuilder, PtySize};
+#[cfg(not(target_os = "linux"))]
+use portable_pty::Child;
+use portable_pty::{CommandBuilder, PtySize};
 
 use transport::auth::Principal;
 use transport::channel::{ChannelKind, OpenRequest};
@@ -77,6 +79,9 @@ impl ChannelSpawner for PtyChannelSpawner {
         }
         TerminalSize::new(req.cols, req.rows)
             .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let process_view = crate::process_scope::prepare()
+            .map_err(|error| custody.refuse_before_creation(error))?;
         let screen = make_screen(req, owner, Arc::clone(&self.budget))
             .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
@@ -106,19 +111,25 @@ impl ChannelSpawner for PtyChannelSpawner {
             ),
         }
         .map_err(|e| custody.refuse_before_creation(format!("could not open channel: {e:#}")))?;
+        // portable-pty has completed its owned setsid/exec handshake. Retain
+        // the unreaped leader before any fallible descriptor preparation.
+        #[cfg(target_os = "linux")]
+        let wait = crate::process_scope::own_child(child, process_view);
+        #[cfg(not(target_os = "linux"))]
+        let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
         drop(permit);
-        finish_personal_spawn(master, child, screen, custody)
+        finish_personal_spawn(master, wait, screen, custody)
     }
 }
 
 /// Assemble the spawned PTY at the descriptor-preparation boundary.
 fn finish_personal_spawn(
     master: Box<dyn portable_pty::MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    wait: Box<dyn ChannelWait>,
     screen: Box<dyn SessionScreen>,
     custody: &OpenCustody,
 ) -> Result<UninstalledChannel, SpawnFailure> {
-    let construction = custody.protect(Box::new(ChildWait(child)), screen);
+    let construction = custody.protect(wait, screen);
     let reader = master
         .try_clone_reader()
         .map_err(|e| custody.failure(format!("reading from the channel is unavailable: {e:#}")))?;
@@ -248,8 +259,10 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 
 /// Waits for the channel's child and reports its code. Blocking, which is
 /// why `run_channel_session` calls it on a blocking task.
+#[cfg(not(target_os = "linux"))]
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
+#[cfg(not(target_os = "linux"))]
 impl ChannelWait for ChildWait {
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
         use transport::channel_server::ChildStatus;
@@ -439,7 +452,7 @@ mod tests {
                     assert_eq!(code, Some(7));
                     break;
                 }
-                ChildStatus::Running => {
+                ChildStatus::Running | ChildStatus::WaitingForWorkers => {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "owned shell did not finish"

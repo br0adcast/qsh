@@ -11,6 +11,10 @@ mod terminal_replies {
         fn absorb(&mut self, bytes: &[u8]) -> Result<Vec<u8>, ScreenReplyError> {
             match bytes {
                 b"query" => Ok(b"reply".to_vec()),
+                b"eof-query" => {
+                    self.deadline = Some(std::time::Instant::now() + Duration::from_secs(60));
+                    Ok(Vec::new())
+                }
                 b"deferred-query" => {
                     self.deadline = Some(std::time::Instant::now());
                     Ok(Vec::new())
@@ -23,7 +27,11 @@ mod terminal_replies {
             self.deadline
         }
         fn flush_pending_output(&mut self) -> Result<Vec<u8>, ScreenReplyError> {
-            Ok(self.deadline.take().map(|_| b"reply".to_vec()).unwrap_or_default())
+            Ok(self
+                .deadline
+                .take()
+                .map(|_| b"reply".to_vec())
+                .unwrap_or_default())
         }
         fn repaint(&mut self) -> Result<ScreenRepaint, ScreenReplyError> {
             Ok(ScreenRepaint {
@@ -97,7 +105,7 @@ mod terminal_replies {
     async fn reply44_actual_writer_keeps_fifo_and_only_reports_network_bytes() {
         let mut rig = ResizeRig::new(false, false);
         let (tx, rx) = mpsc::unbounded_channel();
-        rig.channel.input_tx = tx;
+        rig.channel.input_tx = Some(tx);
         let network = rig
             .channel
             .input_budget
@@ -106,6 +114,8 @@ mod terminal_replies {
             .unwrap();
         rig.channel
             .input_tx
+            .as_ref()
+            .expect("fixture input sender")
             .send(WriterInput::Network(network))
             .unwrap();
         assert!(admit_terminal_reply(
@@ -121,6 +131,8 @@ mod terminal_replies {
             .unwrap();
         rig.channel
             .input_tx
+            .as_ref()
+            .expect("fixture input sender")
             .send(WriterInput::Network(network))
             .unwrap();
         assert_eq!(
@@ -166,7 +178,7 @@ mod terminal_replies {
         let session_budget = crate::channel_input::SessionInputBudget::new();
         rig.channel.input_budget = session_budget.channel();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        rig.channel.input_tx = tx;
+        rig.channel.input_tx = Some(tx);
         assert!(admit_terminal_reply(
             &rig.io,
             &mut rig.channel,
@@ -196,7 +208,7 @@ mod terminal_replies {
         let mut sibling = ResizeRig::new(false, false);
         sibling.channel.input_budget = session_budget.channel();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        sibling.channel.input_tx = tx;
+        sibling.channel.input_tx = Some(tx);
         assert!(admit_terminal_reply(
             &sibling.io,
             &mut sibling.channel,
@@ -214,7 +226,7 @@ mod terminal_replies {
     fn reply44_tiny_local_batches_stop_at_item_cap() {
         let mut rig = ResizeRig::new(false, false);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        rig.channel.input_tx = tx;
+        rig.channel.input_tx = Some(tx);
         for _ in 0..64 {
             assert!(admit_terminal_reply(
                 &rig.io,
@@ -280,7 +292,7 @@ mod terminal_replies {
         let mut rig = ResizeRig::new(false, false);
         screen(&mut rig, false, b"old geometry reply");
         let (tx, mut rx) = mpsc::unbounded_channel();
-        rig.channel.input_tx = tx;
+        rig.channel.input_tx = Some(tx);
         assert!(rig.resize(1, 100, 30));
         assert_eq!(
             *rig.events.lock().unwrap(),

@@ -3989,7 +3989,7 @@ pub(crate) mod tests {
             loop {
                 match channel.wait.poll_exit() {
                     ChildStatus::Reaped { code } => break code,
-                    ChildStatus::Running => {
+                    ChildStatus::Running | ChildStatus::WaitingForWorkers => {
                         assert!(std::time::Instant::now() < deadline, "exit receipt missing");
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
