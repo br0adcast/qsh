@@ -181,3 +181,194 @@ fn capacity_owned_callback_survives_retired_receiver_and_registration_during_dra
         "retired result receiver detached a still-running callback from drain"
     );
 }
+
+#[test]
+fn capacity_boundary_retired_tiny_replies_keep_the_global_entry_ceiling() {
+    use crate::control_budget::GLOBAL_RESPONSE_ENTRIES;
+    let lifecycle = Arc::new(Lifecycle::default());
+    let record =
+        crate::channel::encode_server(&crate::channel::ServerRecord::ExitStatusUnavailable {
+            stream: 16,
+        });
+    assert_eq!(record.len(), 6);
+    let mut held = Vec::new();
+    while held.len() < GLOBAL_RESPONSE_ENTRIES {
+        let (mut io, _inbound, mut outbound) = SessionIo::test_pair();
+        io.lifecycle = lifecycle.clone();
+        let remaining =
+            (GLOBAL_RESPONSE_ENTRIES - held.len()).min(crate::channel_timeline::ORDINARY_ENTRIES);
+        for _ in 0..remaining {
+            io.send(CONTROL_STREAM, record.clone());
+        }
+        drop(io);
+        while let Ok(item) = outbound.try_recv() {
+            assert!(matches!(item, SessionOutbound::ReservedControl { .. }));
+            held.push(item);
+        }
+    }
+    assert_eq!(
+        lifecycle.control_budget.retained_for_test(),
+        (GLOBAL_RESPONSE_ENTRIES * 6, GLOBAL_RESPONSE_ENTRIES, 0)
+    );
+    let (mut io, _input, mut output) = SessionIo::test_pair();
+    io.lifecycle = lifecycle.clone();
+    for _ in 0..8 {
+        io.send(CONTROL_STREAM, record.clone());
+    }
+    assert!(matches!(
+        output.try_recv(),
+        Ok(SessionOutbound::ResourceExhausted { .. })
+    ));
+    assert!(
+        output.try_recv().is_err(),
+        "one bounded terminal item, no repeated rejection queue"
+    );
+    drop(io);
+    drop(held.pop());
+    let (mut replacement, _input, mut output) = SessionIo::test_pair();
+    replacement.lifecycle = lifecycle.clone();
+    replacement.send(CONTROL_STREAM, record.clone());
+    let refunded = output.try_recv().unwrap();
+    assert!(matches!(refunded, SessionOutbound::ReservedControl { .. }));
+    assert_eq!(
+        lifecycle.control_budget.retained_for_test().1,
+        GLOBAL_RESPONSE_ENTRIES
+    );
+    let (mut other, _input, mut output) = SessionIo::test_pair();
+    other.lifecycle = lifecycle.clone();
+    other.send(CONTROL_STREAM, record);
+    assert!(matches!(
+        output.try_recv(),
+        Ok(SessionOutbound::ResourceExhausted { .. })
+    ));
+    drop((replacement, other, held, refunded));
+    assert_eq!(lifecycle.control_budget.retained_for_test(), (0, 0, 0));
+}
+
+struct FiniteControlBackend;
+impl SessionBackend for FiniteControlBackend {
+    fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        io.send(
+            CONTROL_STREAM,
+            crate::channel::encode_server(&crate::channel::ServerRecord::Restarting),
+        );
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test]
+async fn capacity_boundary_backend_eof_retains_ack_debt_and_stop_joins_without_peer_ack() {
+    CONTROL_BACKEND_EOF.with(|count| count.set(0));
+    CONTROL_RELIABLE_PEAK.with(|peak| peak.set(0));
+    let mut rig = delivery_rig(Arc::new(FiniteControlBackend), |_| {}).await;
+    let (closed_sender, closed_receiver) = mpsc::unbounded_channel();
+    drop(closed_receiver);
+    drop(std::mem::replace(&mut rig.backend_out, closed_sender));
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        while CONTROL_BACKEND_EOF.with(|count| count.get()) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let before_stop = rig.lifecycle.control_budget.retained_for_test();
+    let stayed_pending = !rig.bridge.is_finished();
+    let eof_count = CONTROL_BACKEND_EOF.with(|count| count.get());
+    let no_normal_end = rig.done_rx.try_recv().is_err();
+    // STOP is a teardown signal, never a request to await an uncooperative ACK.
+    rig.lifecycle.shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), &mut rig.bridge)
+        .await
+        .expect("stopped bridge joins despite withheld ACK")
+        .unwrap();
+    rig.lifecycle.drain().await.unwrap();
+    assert!(reached.is_ok());
+    assert!(
+        stayed_pending && no_normal_end,
+        "backend EOF cannot discard owed control"
+    );
+    assert_eq!(eof_count, 1, "the closed backend receiver must be masked");
+    assert_eq!(
+        before_stop,
+        (5, 1, 0),
+        "retired backend still owns real unacknowledged bytes"
+    );
+    assert_eq!(rig.lifecycle.control_budget.retained_for_test(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn capacity_boundary_stale_overload_cannot_retire_a_replacement_attachment() {
+    CONTROL_PRODUCER_FENCE.with(|fence| fence.set(None));
+    let mut rig = delivery_rig(Arc::new(EchoBackend), |_| {}).await;
+    let old = AttachmentContext::for_connection(&rig.client, 0);
+    // Attach has priority over queued backend items in the actual bridge.
+    rig.attach_a_new_connection();
+    rig.backend_sends(SessionOutbound::ResourceExhausted { origin: old });
+    rig.backend_sends(SessionOutbound::NotifyDelivered {
+        stream_id: CONTROL_STREAM,
+        token: 0x2601,
+    });
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if CONTROL_PRODUCER_FENCE.with(|fence| fence.get()) == Some(0x2601) {
+                return true;
+            }
+            tokio::select! {
+                _ = rig.done_rx.recv() => return false,
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await;
+    rig.lifecycle.shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), &mut rig.bridge)
+        .await
+        .expect("replacement bridge joins on STOP")
+        .unwrap();
+    rig.lifecycle.drain().await.unwrap();
+    assert!(
+        reached.unwrap(),
+        "stale abort closed replacement before its progress marker"
+    );
+}
+
+#[test]
+fn capacity_boundary_repeated_attachments_keep_one_pending_overload_notification() {
+    let (io, _inbound, mut outbound) = SessionIo::test_pair();
+    let lifecycle = io.lifecycle.clone();
+    let record = crate::channel::encode_server(&crate::channel::ServerRecord::Refused {
+        stream: 16,
+        reason: "r".repeat(crate::shell_frame::CONTROL_RECORD_MAX - 1),
+    });
+    assert_eq!(record.len(), crate::control_budget::MAX_RECORD);
+    io.send(CONTROL_STREAM, record.clone());
+    for generation in 1..=MAX_SESSIONS_TOTAL as u64 {
+        io.set_control_origin(AttachmentContext {
+            generation,
+            session_id: generation + 1,
+            features: crate::Features::SUPPORTED,
+        });
+        io.send(CONTROL_STREAM, record.clone());
+    }
+    let latest_abort = io.control().origin.lock().unwrap().requested_abort;
+    drop(io);
+    let mut items = Vec::new();
+    while let Ok(item) = outbound.try_recv() {
+        items.push(item);
+    }
+    let replies = items
+        .iter()
+        .filter(|item| matches!(item, SessionOutbound::ReservedControl { .. }))
+        .count();
+    let overloads = items
+        .iter()
+        .filter(|item| matches!(item, SessionOutbound::ResourceExhausted { .. }))
+        .count();
+    drop(items);
+    assert_eq!(lifecycle.control_budget.retained_for_test(), (0, 0, 0));
+    assert_eq!(latest_abort.unwrap().generation, MAX_SESSIONS_TOTAL as u64);
+    assert_eq!(replies, 1);
+    assert_eq!(
+        overloads, 1,
+        "generation churn must not mint exempt terminal queue entries"
+    );
+}

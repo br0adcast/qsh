@@ -61,12 +61,14 @@ impl Drop for TaskOwner {
 #[derive(Default)]
 pub(super) struct Lifecycle {
     pub(super) shutdown: Shutdown,
+    pub(super) control_budget: crate::control_budget::GlobalBudget,
     owner: TaskOwner,
 }
 impl Lifecycle {
     pub(super) fn new(shutdown: Shutdown) -> Arc<Self> {
         Arc::new(Self {
             shutdown,
+            control_budget: crate::control_budget::GlobalBudget::default(),
             owner: TaskOwner::default(),
         })
     }

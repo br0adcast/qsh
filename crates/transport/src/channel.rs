@@ -821,6 +821,64 @@ pub fn decode_client(raw: &RawRecord) -> Result<ClientRecord, ChannelCodecError>
 }
 
 /// Encode a record the server sends on [`CONTROL_STREAM`].
+pub(crate) const OVERSIZED_CONTROL_DIAGNOSTIC: &str =
+    "server diagnostic exceeded control-record limit";
+
+pub(crate) fn bounded_control_diagnostic(detail: String, payload_prefix: usize) -> String {
+    if detail
+        .len()
+        .checked_add(payload_prefix)
+        .is_none_or(|n| n > crate::shell_frame::CONTROL_RECORD_MAX)
+    {
+        OVERSIZED_CONTROL_DIAGNOSTIC.into()
+    } else {
+        detail
+    }
+}
+
+fn encode_owned_diagnostic(kind: u8, prefix: &[u8], detail: String) -> Vec<u8> {
+    let detail = bounded_control_diagnostic(detail, prefix.len());
+    let payload_len = prefix
+        .len()
+        .checked_add(detail.len())
+        .expect("bounded diagnostic payload");
+    let total = payload_len
+        .checked_add(5)
+        .expect("bounded diagnostic record");
+    let mut bytes = detail.into_bytes();
+    // Discard excess provider allocation capacity before this encoding can be
+    // retained in a queue. The ordinary Vec growth bound applies thereafter.
+    if bytes.capacity() > total {
+        bytes = bytes.into_boxed_slice().into_vec();
+    }
+    let text_len = bytes.len();
+    bytes.reserve(5 + prefix.len());
+    bytes.resize(total, 0);
+    bytes.copy_within(0..text_len, 5 + prefix.len());
+    bytes[0] = kind;
+    bytes[1..5].copy_from_slice(&(payload_len as u32).to_be_bytes());
+    bytes[5..5 + prefix.len()].copy_from_slice(prefix);
+    bytes
+}
+
+/// Consume potentially large diagnostic storage rather than retaining a
+/// separate payload Vec and encoded Vec. Sizes are checked before allocation.
+pub(crate) fn encode_server_owned(rec: ServerRecord) -> Vec<u8> {
+    match rec {
+        ServerRecord::Refused { stream, reason } => {
+            encode_owned_diagnostic(REC_REFUSED, &[stream], reason)
+        }
+        ServerRecord::UpdateResult(UpdateResult::Rejected { code, detail }) => {
+            encode_owned_diagnostic(
+                REC_UPDATE_RESULT,
+                &[RESULT_REJECTED, code.to_wire()],
+                detail,
+            )
+        }
+        other => encode_server(&other),
+    }
+}
+
 pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
     match rec {
         ServerRecord::ProtocolError { code } => {

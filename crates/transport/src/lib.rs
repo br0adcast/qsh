@@ -15,7 +15,7 @@ pub mod channel_server;
 pub mod channel_timeline;
 mod congestion;
 pub mod conn;
-#[cfg(all(test, feature = "tokio-driver"))]
+#[cfg(feature = "tokio-driver")]
 mod control_budget;
 pub mod cookie;
 #[cfg(feature = "tokio-driver")]

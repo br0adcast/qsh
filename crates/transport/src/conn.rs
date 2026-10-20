@@ -1584,6 +1584,21 @@ impl Connection {
         Ok(out)
     }
 
+    /// Whole-record admission transfers the source allocation to this call;
+    /// a blocked record is returned unchanged with its caller's custody intact.
+    pub(crate) fn try_send_owned_bounded(
+        &mut self,
+        now: Instant,
+        stream: u8,
+        bytes: Vec<u8>,
+        max_unacked: usize,
+    ) -> Result<Vec<Datagram>, (SendBlocked, Vec<u8>)> {
+        match self.try_send_bounded(now, stream, &bytes, max_unacked) {
+            Ok(datagrams) => Ok(datagrams),
+            Err(reason) => Err((reason, bytes)),
+        }
+    }
+
     /// Queue bytes of stream `stream_id` for reliable sending. Before reaching
     /// `Live`, no datagrams are emitted -- bytes accumulate and go out on the
     /// transition.

@@ -92,3 +92,64 @@ fn snapshot_envelope_covers_maximum_active_commands_and_every_other_draining_ide
     );
     assert_eq!(MAX_SNAPSHOT, 36_391);
 }
+
+#[test]
+fn owned_control_diagnostics_preserve_wire_maxima_and_replace_oversize_explicitly() {
+    use crate::channel::{decode_server, encode_server_owned, OVERSIZED_CONTROL_DIAGNOSTIC};
+    use crate::shell_frame::{RecordDeframer, CONTROL_RECORD_MAX};
+    for (prefix, is_update) in [(1, false), (2, true)] {
+        let valid = "r".repeat(CONTROL_RECORD_MAX - prefix);
+        let record = if is_update {
+            ServerRecord::UpdateResult(UpdateResult::Rejected {
+                code: RejectCode::DiskError,
+                detail: valid,
+            })
+        } else {
+            ServerRecord::Refused {
+                stream: 16,
+                reason: valid,
+            }
+        };
+        let expected = encode_server(&record);
+        let owned = encode_server_owned(record);
+        assert_eq!(owned, expected);
+        assert_eq!(owned.len(), MAX_RECORD);
+        let oversized = "é".repeat(CONTROL_RECORD_MAX);
+        let record = if is_update {
+            ServerRecord::UpdateResult(UpdateResult::Rejected {
+                code: RejectCode::DiskError,
+                detail: oversized,
+            })
+        } else {
+            ServerRecord::Refused {
+                stream: 16,
+                reason: oversized,
+            }
+        };
+        let bounded = encode_server_owned(record);
+        assert!(bounded.len() < 128);
+        let raw = RecordDeframer::for_control().push(&bounded).pop().unwrap();
+        let expected = if is_update {
+            ServerRecord::UpdateResult(UpdateResult::Rejected {
+                code: RejectCode::DiskError,
+                detail: OVERSIZED_CONTROL_DIAGNOSTIC.into(),
+            })
+        } else {
+            ServerRecord::Refused {
+                stream: 16,
+                reason: OVERSIZED_CONTROL_DIAGNOSTIC.into(),
+            }
+        };
+        assert_eq!(decode_server(&raw).unwrap(), expected);
+    }
+    let mut oversized_capacity = String::with_capacity(CONTROL_RECORD_MAX);
+    oversized_capacity.push('x');
+    let bounded = encode_server_owned(ServerRecord::Refused {
+        stream: 16,
+        reason: oversized_capacity,
+    });
+    assert!(
+        bounded.capacity() <= bounded.len() * 2,
+        "spare provider allocation must not bypass accounting"
+    );
+}

@@ -93,7 +93,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
@@ -471,6 +471,16 @@ pub enum SessionInbound {
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    /// One pre-reserved control item, with exact enqueue-generation custody.
+    ReservedControl {
+        origin: AttachmentContext,
+        bytes: Vec<u8>,
+        delivery: ControlDelivery,
+    },
+    /// Fixed terminal overload request; the bridge validates its exact origin.
+    ResourceExhausted {
+        origin: AttachmentContext,
+    },
     ChannelOpened {
         stream: u8,
         origin: AttachmentContext,
@@ -564,11 +574,37 @@ pub enum SessionOutbound {
 /// that happens to be carrying it right now.
 pub type LoginId = [u8; 16];
 
+/// Opaque, non-cloneable control delivery custody. Created only by SessionIo.
+pub struct ControlDelivery {
+    part: crate::control_budget::ResponsePart,
+    charge: Option<OutputCharge>,
+}
+
+#[derive(Default)]
+struct ControlOrigin {
+    attachment: AttachmentContext,
+    aborting: bool,
+    requested_abort: Option<AttachmentContext>,
+    abort_notification_queued: bool,
+}
+struct SessionControl {
+    budget: crate::control_budget::SessionBudget,
+    origin: Mutex<ControlOrigin>,
+}
+impl SessionControl {
+    fn take_abort(&self, fallback: AttachmentContext) -> AttachmentContext {
+        let mut state = self.origin.lock().unwrap();
+        state.abort_notification_queued = false;
+        state.requested_abort.take().unwrap_or(fallback)
+    }
+}
+
 /// A backend's handle to its session: receive [`SessionInbound`] events, send
 /// outbound [`SessionOutbound`]. The backend never sees the socket or the
 /// `Connection`.
 pub struct SessionIo {
     lifecycle: Arc<Lifecycle>,
+    control: OnceLock<Arc<SessionControl>>,
     resume_snapshots: channel_bridge::SnapshotMailbox,
     inbound: mpsc::Receiver<SessionInbound>,
     outbound: mpsc::UnboundedSender<SessionOutbound>,
@@ -587,6 +623,105 @@ pub struct SessionIo {
 }
 
 impl SessionIo {
+    fn control(&self) -> &Arc<SessionControl> {
+        self.control.get_or_init(|| {
+            Arc::new(SessionControl {
+                budget: self.lifecycle.control_budget.session(self.principal.uid),
+                origin: Mutex::new(ControlOrigin::default()),
+            })
+        })
+    }
+
+    pub(crate) fn control_budget(&self) -> &crate::control_budget::SessionBudget {
+        &self.control().budget
+    }
+
+    fn set_control_origin(&self, attachment: AttachmentContext) {
+        let mut state = self.control().origin.lock().unwrap();
+        if state.attachment != attachment {
+            state.attachment = attachment;
+            state.aborting = false;
+        }
+    }
+
+    pub(crate) fn resource_exhausted(&self, origin: AttachmentContext) {
+        let mut state = self.control().origin.lock().unwrap();
+        if state.attachment != origin || state.aborting {
+            return;
+        }
+        state.aborting = true;
+        state.requested_abort = Some(origin);
+        if state.abort_notification_queued {
+            return;
+        }
+        state.abort_notification_queued = true;
+        drop(state);
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ResourceExhausted { origin });
+    }
+
+    /// The caller reserved the complete encoding before accepting its effect.
+    pub(crate) fn send_reserved_control(
+        &self,
+        origin: AttachmentContext,
+        mut bytes: Vec<u8>,
+        part: crate::control_budget::ResponsePart,
+    ) {
+        let state = self.control().origin.lock().unwrap();
+        if state.attachment != origin || state.aborting {
+            return;
+        }
+        drop(state);
+        if bytes.len() != part.encoded_bytes() {
+            self.resource_exhausted(origin);
+            return;
+        }
+        if bytes.capacity() > bytes.len().saturating_mul(2) {
+            bytes = bytes.into_boxed_slice().into_vec();
+        }
+        let charge = self
+            .gates
+            .admit(crate::channel::CONTROL_STREAM, bytes.len() as u64)
+            .map(|gate| OutputCharge {
+                gate,
+                bytes: bytes.len() as u64,
+            });
+        let _ = self.outbound.send(SessionOutbound::ReservedControl {
+            origin,
+            bytes,
+            delivery: ControlDelivery { part, charge },
+        });
+    }
+
+    fn send_control(&self, origin: AttachmentContext, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let state = self.control().origin.lock().unwrap();
+        if state.attachment != origin || state.aborting {
+            return;
+        }
+        drop(state);
+        let permit = match self
+            .control_budget()
+            .reserve(crate::control_budget::Response::Ordinary(bytes.len()))
+        {
+            Ok(permit) => permit,
+            Err(crate::control_budget::CapacityError::Retired) => return,
+            Err(_) => {
+                self.resource_exhausted(origin);
+                return;
+            }
+        };
+        let mut owner = permit.into_owner();
+        let Some(part) = owner.take_record(bytes.len()) else {
+            self.resource_exhausted(origin);
+            return;
+        };
+        self.send_reserved_control(origin, bytes, part);
+    }
+
     /// Register descendant cleanup synchronously from this owned backend.
     /// The backend's registered parent stays alive through this registration,
     /// so drain cannot observe an empty owner between admission and publication.
@@ -609,22 +744,43 @@ impl SessionIo {
         }
     }
     pub(crate) fn channel_opened(&self, origin: AttachmentContext, stream: u8) {
-        let _ = self
-            .outbound
-            .send(SessionOutbound::ChannelOpened { stream, origin });
+        self.send_control(
+            origin,
+            crate::channel::encode_server(&crate::channel::ServerRecord::Opened { stream }),
+        );
     }
     pub(crate) fn channel_refused(&self, origin: AttachmentContext, stream: u8, reason: String) {
-        let _ = self.outbound.send(SessionOutbound::ChannelRefused {
-            stream,
+        // Normalize before encoder allocation; the maximum is derived from
+        // the actual one-byte stream prefix, not an arbitrary diagnostic cap.
+        let reason = crate::channel::bounded_control_diagnostic(reason, 1);
+        let n = reason.len().checked_add(6).expect("bounded refusal length");
+        let permit = match self
+            .control_budget()
+            .reserve(crate::control_budget::Response::Ordinary(n))
+        {
+            Ok(permit) => permit,
+            Err(crate::control_budget::CapacityError::Retired) => return,
+            Err(_) => {
+                self.resource_exhausted(origin);
+                return;
+            }
+        };
+        let mut owner = permit.into_owner();
+        let part = owner.take_record(n).expect("one pre-reserved refusal");
+        self.send_reserved_control(
             origin,
-            reason,
-        });
+            crate::channel::encode_server_owned(crate::channel::ServerRecord::Refused {
+                stream,
+                reason,
+            }),
+            part,
+        );
     }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should
     /// then wind down.
     pub async fn recv(&mut self) -> Option<SessionInbound> {
-        tokio::select! {
+        let received = tokio::select! {
             biased;
             _ = self.lifecycle.shutdown.requested() => {
                 self.gates.close_all();
@@ -633,7 +789,12 @@ impl SessionIo {
                 None
             }
             inbound = self.inbound.recv() => inbound,
+        };
+        if let Some(SessionInbound::Live(origin) | SessionInbound::ResumeReset(origin)) = &received
+        {
+            self.set_control_origin(*origin);
         }
+        received
     }
 
     /// Whose session this is. A backend that spawns a process runs it as
@@ -657,6 +818,11 @@ impl SessionIo {
     /// that saw only the connection's tail would let a producer faster than
     /// the bridge fill it past the gate's marks.
     pub fn send(&self, stream_id: u8, data: Vec<u8>) {
+        if stream_id == crate::channel::CONTROL_STREAM {
+            let origin = self.control().origin.lock().unwrap().attachment;
+            self.send_control(origin, data);
+            return;
+        }
         let n = data.len() as u64;
         // Counted before the bridge can take them, never after: taken first,
         // they would count forever.
@@ -776,6 +942,11 @@ impl SessionIo {
     /// answer carries `token` back: a backend that reuses a stream number
     /// tells whose request it answers by it.
     pub fn notify_delivered(&self, stream_id: u8, token: u64) {
+        if stream_id == crate::channel::CONTROL_STREAM
+            && self.control().origin.lock().unwrap().aborting
+        {
+            return;
+        }
         let _ = self
             .outbound
             .send(SessionOutbound::NotifyDelivered { stream_id, token });
@@ -864,6 +1035,7 @@ impl SessionIo {
         (
             SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -924,6 +1096,9 @@ impl ConsumptionReporter {
 impl Drop for SessionIo {
     fn drop(&mut self) {
         self.gates.close_all();
+        if let Some(control) = self.control.get() {
+            control.budget.retire();
+        }
     }
 }
 
@@ -3057,6 +3232,7 @@ impl SessionManager {
         let gates = Arc::new(GateTable::new());
         let io = SessionIo {
             lifecycle: ctx.lifecycle.clone(),
+            control: OnceLock::new(),
             resume_snapshots: channel_bridge::SnapshotMailbox::default(),
             inbound: in_rx,
             outbound: out_tx,
@@ -3430,6 +3606,76 @@ async fn on_routed_datagram(
     AttachResult::Applied
 }
 
+struct PendingControl {
+    origin: AttachmentContext,
+    bytes: Vec<u8>,
+    delivery: ControlDelivery,
+}
+
+fn drain_reserved_control(
+    conn: &mut Connection,
+    generation: u64,
+    pending: &mut VecDeque<PendingControl>,
+    ledger: &mut crate::control_budget::ControlLedger,
+    parked: bool,
+    now: Instant,
+    out: &mut Vec<Datagram>,
+) {
+    let stream = crate::channel::CONTROL_STREAM;
+    if ledger.generation() != generation {
+        // The old Connection's representation was actually destroyed. Future
+        // effect owners remain elsewhere; replacing this ledger refunds none.
+        *ledger = crate::control_budget::ControlLedger::new(
+            generation,
+            conn.stream_progress(stream).queued,
+        );
+    }
+    let progress = conn.stream_progress(stream);
+    ledger.acknowledge(generation, progress.queued.saturating_sub(progress.unacked));
+    while let Some(item) = pending.pop_front() {
+        if item.origin.generation != generation
+            || item.origin.session_id != conn.session_id()
+            || parked
+        {
+            continue;
+        }
+        let start = conn.stream_progress(stream).queued;
+        match conn.try_send_owned_bounded(
+            now,
+            stream,
+            item.bytes,
+            crate::control_budget::SESSION_BYTES,
+        ) {
+            Ok(datagrams) => {
+                let progress = conn.stream_progress(stream);
+                if let Some(charge) = item.delivery.charge {
+                    charge.transfer(progress.unacked);
+                }
+                assert!(
+                    ledger
+                        .register(generation, start, progress.queued, item.delivery.part)
+                        .is_ok(),
+                    "whole control enqueue and reserved length diverged"
+                );
+                #[cfg(test)]
+                CONTROL_RELIABLE_PEAK.with(|peak| peak.set(peak.get().max(progress.unacked)));
+                out.extend(datagrams);
+            }
+            Err((crate::conn::SendBlocked::WouldBlock, bytes)) => {
+                pending.push_front(PendingControl { bytes, ..item });
+                break;
+            }
+            Err((reason, bytes)) => {
+                pending.push_front(PendingControl { bytes, ..item });
+                if reason == crate::conn::SendBlocked::OffsetSpaceExhausted {
+                    conn.abandon();
+                }
+                break;
+            }
+        }
+    }
+}
+
 /// What woke the persistent bridge loop.
 enum Wakeup {
     /// An incoming datagram routed from the manager (`None` = router gone).
@@ -3607,9 +3853,18 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // is not `Clone`, so there is no second spawn to guard against.
     let resume_snapshots = io.resume_snapshots.clone();
     let lifecycle = io.lifecycle.clone();
+    let control = io.control().clone();
+    let control_budget = control.budget.clone();
+    io.set_control_origin(AttachmentContext::for_connection(&conn, 0));
     lifecycle.spawn(async move { backend.run(io).await });
     let mut link = BackendLink::new(io_inbound_tx, consumption);
     link.channel_output.snapshots = resume_snapshots;
+    let mut pending_control = VecDeque::new();
+    let mut control_delivery = crate::control_budget::ControlLedger::new(
+        0,
+        conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
+    );
+    let mut backend_finished = false;
 
     // `first_live_sent` is BRIDGE-level, spanning every connection this
     // backend drives: a reattach never re-sends `Live` (it sends
@@ -3699,7 +3954,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
                     _ = timer => Wakeup::Timeout,
-                    o = backend_out_rx.recv(), if !link.channel_output.receive_fenced() => Wakeup::Backend(o),
+                    o = backend_out_rx.recv(), if !backend_finished && !link.channel_output.receive_fenced() => Wakeup::Backend(o),
                     _ = std::future::ready(()), if drain_pending => Wakeup::Drain,
                     // Room in the backend's queue for what waits (spec
                     // §4.10.2): the bridge never stands on its backend.
@@ -3716,6 +3971,30 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         let mut writable: Vec<u8> = Vec::new();
 
         match wakeup {
+            Wakeup::Backend(Some(SessionOutbound::ReservedControl {
+                origin,
+                bytes,
+                delivery,
+            })) => {
+                pending_control.push_back(PendingControl {
+                    origin,
+                    bytes,
+                    delivery,
+                });
+            }
+            Wakeup::Backend(Some(SessionOutbound::ResourceExhausted { origin })) => {
+                // One fixed mailbox replaces repeated generation notifications;
+                // validate its latest request only after the signal is consumed.
+                let origin = control.take_abort(origin);
+                if origin.session_id == conn.session_id()
+                    && origin.generation == link.ledger.generation()
+                {
+                    control_budget.retire();
+                    out.extend(
+                        conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted),
+                    );
+                }
+            }
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
             Wakeup::Dgram(Some((src, bytes))) => {
                 if let AttachResult::Rejected(session_id) = on_routed_datagram(
@@ -3853,30 +4132,12 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             Wakeup::Backend(Some(SessionOutbound::Consumed { stream_id, n })) => {
                 link.ledger.reported(&mut conn, now, stream_id, n, &mut out);
             }
-            // The backend finished (the shell/tmux hybrid exited on its own):
-            // tell the peer the session is over -- exactly as
-            // `CloseKind::Graceful` below does for a Close it RECEIVED,
-            // except here the bridge is the one INITIATING it, and this arm
-            // returns at once instead of looping back to poll anything.
-            // `conn.close(now)` is a no-op by its own guard if `conn` is
-            // already `Closed` (a `parked` bridge, retained after an earlier
-            // death for a possible warm reattach). The graceful end below
-            // still tells the router to remove that parked entry, or hold it
-            // only until a pending proof finishes. A proof that succeeds after
-            // this bridge exits takes the ordinary cold-create fallback.
+            // Backend EOF ends admission but is not a delivery receipt. The
+            // receiver is disabled thereafter, so pending ACK debt cannot spin.
             Wakeup::Backend(None) => {
-                deactivate(&mut was_active, &active_count);
-                out.extend(conn.close(now));
-                send_all(&socket, &out).await;
-                let _ = done_tx.send(SessionEnded {
-                    session_id: conn.session_id(),
-                    token,
-                    graceful: true,
-                });
-                // Whatever waited goes to the backend first; a backend whose
-                // io is gone with it takes nothing, and this ends at once.
-                link.finish(lifecycle.clone());
-                return;
+                backend_finished = true;
+                #[cfg(test)]
+                CONTROL_BACKEND_EOF.with(|count| count.set(count.get() + 1));
             }
             // Warm reattach (see `apply_control`); also revives a parked bridge.
             Wakeup::Control(Some(control)) => {
@@ -3915,6 +4176,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 }
             }
         }
+
+        drain_reserved_control(
+            &mut conn,
+            link.ledger.generation(),
+            &mut pending_control,
+            &mut control_delivery,
+            parked,
+            now,
+            &mut out,
+        );
 
         // Timers after EVERY wake-up (spec §4.1): a datagram, the backend's
         // output or a control message can be ready on every turn, and a fresh
@@ -3960,6 +4231,17 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 active_count.fetch_sub(1, Ordering::SeqCst);
             }
             was_active = now_active;
+        }
+
+        if backend_finished && pending_control.is_empty() && control_delivery.is_empty() {
+            deactivate(&mut was_active, &active_count);
+            let _ = done_tx.send(SessionEnded {
+                session_id: conn.session_id(),
+                token,
+                graceful: true,
+            });
+            link.finish(lifecycle.clone());
+            return;
         }
 
         match closed {
@@ -4752,6 +5034,7 @@ thread_local! {
     /// generated by a producer. Current-thread tests have separate local peaks.
     static CONTROL_RELIABLE_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CONTROL_PRODUCER_FENCE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static CONTROL_BACKEND_EOF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The bridge's side of its backend (spec §4.10): what goes in, and what the
@@ -7954,6 +8237,7 @@ mod tests {
             backend: Arc::new(EchoBackend),
             io: SessionIo {
                 lifecycle: bridge_owner,
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8336,6 +8620,7 @@ mod tests {
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8427,6 +8712,7 @@ mod tests {
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8514,6 +8800,7 @@ mod tests {
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8567,6 +8854,8 @@ mod tests {
     /// A bridge driving a real accepted connection, with `backend` behind
     /// it: what a delivery test needs to steer and to watch.
     struct DeliveryRig {
+        bridge: tokio::task::JoinHandle<()>,
+        lifecycle: Arc<Lifecycle>,
         client: Connection,
         client_sock: UdpSocket,
         peer: SocketAddr,
@@ -8609,7 +8898,8 @@ mod tests {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<BridgeControl>();
         let (done_tx, done_rx) = mpsc::unbounded_channel::<SessionEnded>();
         let backend_out = out_tx.clone();
-        tokio::spawn(run_backend_bridge(BridgeSpawn {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let bridge = tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             committed: CommittedAdmission(AuthAcceptance {
                 session_id: conn.session_id(),
@@ -8626,7 +8916,8 @@ mod tests {
             token,
             backend,
             io: SessionIo {
-                lifecycle: Arc::new(Lifecycle::default()),
+                lifecycle: lifecycle.clone(),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -8639,6 +8930,8 @@ mod tests {
             gates,
         }));
         DeliveryRig {
+            bridge,
+            lifecycle,
             client,
             client_sock,
             peer,
@@ -11797,6 +12090,7 @@ mod tests {
             backend: Arc::new(ChattyBackend { log: log.clone() }),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -16175,6 +16469,7 @@ mod tests {
                 backend: Arc::new(EndAfterParking(Mutex::new(Some(cue_rx)))),
                 io: SessionIo {
                     lifecycle: Arc::new(Lifecycle::default()),
+                    control: OnceLock::new(),
                     resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
@@ -16827,6 +17122,7 @@ mod tests {
                 backend: Arc::new(ForwardingBackend(heard_tx)),
                 io: SessionIo {
                     lifecycle: Arc::new(Lifecycle::default()),
+                    control: OnceLock::new(),
                     resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                     inbound: in_rx,
                     outbound: out_tx,
@@ -17161,6 +17457,7 @@ mod tests {
             backend: Arc::new(InboundKindsBackend(heard_tx)),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
@@ -17389,6 +17686,7 @@ mod tests {
             backend: Arc::new(ForwardingBackend(heard_tx)),
             io: SessionIo {
                 lifecycle: Arc::new(Lifecycle::default()),
+                control: OnceLock::new(),
                 resume_snapshots: channel_bridge::SnapshotMailbox::default(),
                 inbound: in_rx,
                 outbound: out_tx,
