@@ -357,6 +357,73 @@ mod state_tests {
         assert_ne!(st.frame(1250, 100), st.terminal.frame());
     }
 
+    fn interrupted_csi_frame(chunks: &[&[u8]]) -> terminal::Frame {
+        let mut state = ShellState::new(20, 1, prediction::DisplayPreference::Always, false);
+        state.on_input(b"h", 1000, 100);
+        let mut echoed = encode_record(REC_DATA, b"h");
+        echoed.extend(encode_record(REC_ECHO_ACK, &1u64.to_be_bytes()));
+        let mut frame = state.on_stream0(&echoed, 1050, 100);
+        for chunk in chunks {
+            frame = state.on_input(chunk, 1100, 100);
+        }
+        frame
+    }
+
+    #[test]
+    fn interrupted_csi_recovers_through_the_engine_at_every_chunk_boundary() {
+        for (bytes, arrow, expected_col) in [
+            (&b"\x1b[1;\x1b[C"[..], &b"\x1b[C"[..], 2),
+            (&b"\x1b[ \x1b[D"[..], &b"\x1b[D"[..], 0),
+            (&b"\x1b[\x1b\x1b[C"[..], &b"\x1b[C"[..], 2),
+            (&b"\x1b[1;\x1bOC"[..], &b"\x1bOC"[..], 2),
+            (&b"\x1b[1;\x1bOD"[..], &b"\x1bOD"[..], 0),
+        ] {
+            let expected = interrupted_csi_frame(&[arrow]);
+            assert_eq!(expected.cursor_col, expected_col);
+            let with_text = [bytes, b"x"].concat();
+            let expected_text = interrupted_csi_frame(&[arrow, b"x"]);
+            assert_eq!(expected_text.cell(0, expected_col).ch, 'x');
+            for split in 0..=bytes.len() {
+                assert_eq!(
+                    interrupted_csi_frame(&[&bytes[..split], &bytes[split..]]),
+                    expected,
+                    "arrow {bytes:?}, split {split}"
+                );
+            }
+            for split in 0..=with_text.len() {
+                assert_eq!(
+                    interrupted_csi_frame(&[&with_text[..split], &with_text[split..]]),
+                    expected_text,
+                    "following text {with_text:?}, split {split}"
+                );
+            }
+            let chunks: Vec<_> = with_text.chunks(1).collect();
+            assert_eq!(interrupted_csi_frame(&chunks), expected_text);
+        }
+    }
+
+    #[test]
+    fn interrupted_csi_controls_preserve_valid_h_and_normal_ss3_arrows() {
+        for bytes in [&b"\x1b[C"[..], &b"\x1bOC"[..]] {
+            let expected = interrupted_csi_frame(&[bytes]);
+            assert_eq!(expected.cursor_col, 2);
+            assert!(expected.cells[1..].iter().all(|cell| cell.ch == ' '));
+            for split in 0..=bytes.len() {
+                assert_eq!(
+                    interrupted_csi_frame(&[&bytes[..split], &bytes[split..]]),
+                    expected
+                );
+            }
+        }
+        for split in 0..=3 {
+            let bytes = b"\x1b[h";
+            let frame = interrupted_csi_frame(&[&bytes[..split], &bytes[split..]]);
+            assert_eq!(frame.cursor_col, 1);
+            assert_eq!(frame.cell(0, 0).ch, 'h');
+            assert!(frame.cells[1..].iter().all(|cell| cell.ch == ' '));
+        }
+    }
+
     /// The "terminal + prediction + deframer" bundle without a network:
     /// `on_input` overlays echo instantly, receiving framed output with
     /// ECHO_ACK confirms the prediction.
