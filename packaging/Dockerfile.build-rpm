@@ -66,6 +66,7 @@ RUN dnf -y install epel-release \
         gnupg2 \
         make \
         perl-core \
+        patch \
         python3 \
         file \
         pam-devel \
@@ -157,14 +158,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
     && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
-# A step of its own so that changing the pin below does not fetch the
-# toolchain again. An exact version, for the same reason the base is a
-# digest: this tool decides what the package looks like -- `variants.qshd`,
-# `auto-req`, and the `target/release/` prefix that follows `--target` --
-# and a range would let a release be built by a tool nobody chose. (A bare
-# `cargo-generate-rpm@0.21` is not a pin but an error: cargo answers
-# "unexpected end of input while parsing minor version number".)
-RUN cargo install 'cargo-generate-rpm@=0.21.0' --locked \
+# Keep tool installation separate from the toolchain layer. This same pinned
+# source patch is used for hosted client packaging; no package-byte repair.
+COPY rpm-tool /tmp/qsh-rpm-tool
+RUN bash /tmp/qsh-rpm-tool/install.sh \
+    && rm -rf /tmp/qsh-rpm-tool \
     && chmod -R a+rX /usr/local/cargo
 
 # The linker for the foreign target. Cargo reads this per target, so the

@@ -141,7 +141,7 @@ jobs:
       - name: Build existing package-floor image
         env:
           FORMAT: ${{ matrix.format }}
-        run: docker build -f "packaging/Dockerfile.build-$FORMAT" -t qsh-native-floor .
+        run: docker build -f "packaging/Dockerfile.build-$FORMAT" -t qsh-native-floor packaging
       - name: Qualify both GNU architectures inside the actual floor
         env:
           FORMAT: ${{ matrix.format }}

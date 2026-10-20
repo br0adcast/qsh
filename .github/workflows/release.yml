@@ -62,16 +62,11 @@ jobs:
       - name: Install native musl and packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
-          # Exact patch pins, not `cargo-deb@3.8`: current cargo parses that
-          # as a truncated SemVer and refuses it outright ("unexpected end of
-          # input while parsing minor version number"), which failed this
-          # whole job -- and with it every client package -- before a single
-          # build step ran. `=3.8.0`/`=0.21.0` are the same versions the
-          # server-package containers pin (packaging/Dockerfile.build-deb,
-          # packaging/Dockerfile.build-rpm); the syntax changed, the meaning
-          # ("3.8", "0.21") did not.
-          cargo install 'cargo-deb@=3.8.0' 'cargo-generate-rpm@=0.21.0' --locked
+          sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg python3 patch curl
+          # The RPM installer checksum-pins the selected tool and applies the
+          # reviewed archive-size source fix identically to the server builder.
+          cargo install 'cargo-deb@=3.8.0' --locked
+          bash packaging/rpm-tool/install.sh
 
       - name: Build the pinned native backend and products
         run: |
