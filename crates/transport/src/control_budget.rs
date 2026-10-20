@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{futures::Notified, Notify};
 
 use crate::channel::{CHANNEL_SNAPSHOT_MAX, MAX_CHANNELS};
 use crate::channel_timeline::ORDINARY_ENTRIES;
@@ -71,7 +72,7 @@ struct GlobalState {
     principals: BTreeMap<u32, usize>,
 }
 #[derive(Default, Clone)]
-pub(crate) struct GlobalBudget(Arc<Mutex<GlobalState>>);
+pub(crate) struct GlobalBudget(Arc<Mutex<GlobalState>>, Arc<Notify>);
 #[derive(Default)]
 struct SessionState {
     retired: bool,
@@ -86,6 +87,12 @@ pub(crate) struct SessionBudget {
     uid: u32,
 }
 impl GlobalBudget {
+    /// Register and enable this waiter before checking admission, then keep
+    /// servicing the runner while waiting. Refunds wake all registered owners;
+    /// there is no accumulated queue of capacity events.
+    pub(crate) fn changed(&self) -> Notified<'_> {
+        self.1.notified()
+    }
     #[cfg(test)]
     pub(crate) fn retained_for_test(&self) -> (usize, usize, usize) {
         let state = self.0.lock().unwrap();
@@ -185,6 +192,26 @@ pub(crate) struct ResponseOwner {
 pub(crate) struct ResponsePart(Arc<ResponsePermit>, usize);
 
 impl ResponsePermit {
+    /// Before issuing any record lease, refund conservative ordinary preflight
+    /// bytes. Mandatory envelopes retain their future outcome allowance.
+    pub(crate) fn shrink_ordinary(&mut self, bytes: usize) -> Result<(), CapacityError> {
+        if self.class != 0 || bytes == 0 || bytes > self.bytes {
+            return Err(CapacityError::InvalidSize);
+        }
+        let refund = self.bytes - bytes;
+        if refund == 0 {
+            return Ok(());
+        }
+        let mut global = self.session.global.0.lock().unwrap();
+        let mut state = self.session.state.lock().unwrap();
+        global.bytes -= refund;
+        state.bytes[self.class] -= refund;
+        self.bytes = bytes;
+        drop(state);
+        drop(global);
+        self.session.global.1.notify_waiters();
+        Ok(())
+    }
     pub(crate) fn into_owner(self) -> ResponseOwner {
         let records_left = match self.class {
             1 => 2, // Opened followed by a terminal outcome, or one refusal.
@@ -281,11 +308,15 @@ impl Drop for ResponsePermit {
         global.response_entries -= 1;
         state.entries[self.class] -= 1;
         state.bytes[self.class] -= self.bytes;
+        drop(state);
+        drop(global);
+        self.session.global.1.notify_waiters();
     }
 }
-/// Owned by the supervisor, never the blocking callback or result receiver.
-/// Dropping this guard releases capacity; runtime integration must retain it
-/// across receiver loss, callback panic and the actual JoinHandle await.
+/// Shared only by the finite job owner and registered callback/completion
+/// leases. Receiver loss cannot refund running work; callback custody lasts
+/// through actual blocking join and manager reaping. A chain owner also retains
+/// capacity for its future callback phases.
 #[must_use = "keep the permit in the supervisor until the actual worker joins"]
 pub(crate) struct JobPermit {
     session: SessionBudget,
@@ -302,6 +333,9 @@ impl Drop for JobPermit {
             global.principals.remove(&self.session.uid);
         }
         state.jobs[self.class] = false;
+        drop(state);
+        drop(global);
+        self.session.global.1.notify_waiters();
     }
 }
 
@@ -309,6 +343,7 @@ impl Drop for JobPermit {
 mod tests {
     use super::*;
     include!("control_budget_wire_tests.rs");
+    include!("control_budget_refund_tests.rs");
 
     #[test]
     fn mandatory_envelopes_have_finite_nonclone_record_leases() {
