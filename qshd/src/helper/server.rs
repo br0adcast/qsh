@@ -92,6 +92,7 @@ use super::config::HelperConfig;
 #[cfg(test)]
 use super::config::PAM_SERVICE;
 use super::monitor::{self, run_monitor, MonitorPlan};
+use super::pam_completion::PamCompletion;
 use super::pending::{Pending, PendingTable, PendingWhat};
 use super::protocol::{
     decode, encode, AuthRequest, AuthResponse, ChannelId, MonitorEvent, MonitorRequest, Nonce,
@@ -491,10 +492,8 @@ struct LoopState {
     /// seams in the loop's one `poll`, which is what keeps a slow channel
     /// from stopping every other session on the machine.
     pending: PendingTable,
-    /// Pids the helper has already given up on -- a verifying child whose
-    /// verdict it will not use, and every monitor it has stopped talking to
-    /// -- see `reap`'s docs for why they still need a place to be reaped
-    /// from.
+    /// Legacy unsupported-platform child retirement. Qualified Linux
+    /// verification never moves exact custody out of the bounded pending table.
     orphans: Vec<Pid>,
     /// Channels `Request::Close` has been forwarded to a monitor for, keyed
     /// to the deadline by which that monitor must have reported the exit --
@@ -578,18 +577,37 @@ struct LoopState {
     /// "no incarnation" everywhere it travels (`transport::Principal`'s own
     /// field, for a verifier that keeps nothing per login).
     next_incarnation: u64,
+    /// Fixed aggregate survives retirement of physically joined monitors.
+    pam_cleanup: PamCompletion,
+    /// Sticky cooperative teardown policy; never renewed admission.
+    stopping: bool,
 }
 
 /// One login's monitor, as the helper holds it.
 struct Monitor {
-    /// The helper's end of the seam to it. Dropping this is what tells a
-    /// monitor its login is over: its own end then reaches end-of-file, it
-    /// takes its shells down and exits.
+    /// The helper's private seam. Write-half shutdown ends the login while
+    /// the read half retains final cleanup evidence through actual child wait.
     seam: UnixStream,
     /// The monitor's process, so the helper can reap it -- and, past
     /// [`MONITOR_GRACE_PERIOD`], kill it.
     pid: Pid,
     reaped: bool,
+    /// End requested; the read half and admission remain owned through PAM completion.
+    write_closed: bool,
+    stop_attempted: bool,
+    completion: Option<PamCompletion>,
+    seam_closed: bool,
+    wait_lost: bool,
+    failure: Option<MonitorFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorFailure {
+    Shutdown(i32),
+    Send(i32),
+    Stream,
+    Wait(i32),
+    DuplicateCompletion,
 }
 
 /// One login's own bookkeeping: which account it belongs to (fixed for the
@@ -837,6 +855,8 @@ enum WhyFinished {
     /// The entry's own deadline passed with nothing said. Nothing is read:
     /// the child is killed and whoever is waiting for it is refused.
     Expired,
+    #[cfg(target_os = "linux")]
+    Progress,
 }
 
 /// What a seam's handler tells the loop to do next.
@@ -903,7 +923,7 @@ fn serve(
     // Read before `admitted` is consumed below, so the counter can start
     // past every login seeded out of it.
     let seeded = admitted.len();
-    let mut state = LoopState {
+    let mut shutdown = HelperShutdown::new(LoopState {
         live: HashMap::new(),
         pending: PendingTable::default(),
         orphans: Vec::new(),
@@ -936,7 +956,10 @@ fn serve(
         retired: HashSet::new(),
         highest_channel_id: 0,
         next_incarnation: 1 + seeded as u64,
-    };
+        pam_cleanup: PamCompletion::NotOpened,
+        stopping: false,
+    });
+    let state = &mut shutdown.state;
     // Borrowed once, for the whole loop: both are owned locals that outlive
     // it, and everything below takes them immutably.
     let seams = Seams {
@@ -957,7 +980,12 @@ fn serve(
         // against it -- the same shape the report pipes use, and for the
         // same reason (the array must not borrow the table it was built
         // from).
-        let monitor_logins: Vec<MonitorOwner> = state.monitors.keys().copied().collect();
+        let monitor_logins: Vec<MonitorOwner> = state
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| !monitor.seam_closed)
+            .map(|(owner, _)| *owner)
+            .collect();
         let mut fds: Vec<PollFd> = Vec::with_capacity(2 + report_fds.len() + monitor_logins.len());
         fds.push(PollFd::new(channels.as_fd(), PollFlags::POLLIN));
         fds.push(PollFd::new(auth.as_fd(), PollFlags::POLLIN));
@@ -1043,102 +1071,187 @@ fn serve(
         // seams leaves the suite green, and a descriptor-number race is not
         // reachable on demand -- so this is reasoning, not coverage: treat
         // it as load-bearing when you edit it.
-        settle_ready_pending(seams, &mut state, &config, &ready_reports);
+        settle_ready_pending(seams, state, &config, &ready_reports);
         // And the monitors, before the seams too, for the same reason: a
         // channel whose start this pass finishes frees its id, and an
         // `Open` served first could otherwise be refused for an id that is
         // about to be free.
-        serve_ready_monitors(seams, &mut state, &ready_monitors);
+        serve_ready_monitors(seams, state, &ready_monitors);
         if channel_ready {
-            if let Next::Stop = serve_channel_seam(&channels, &mut state, &config, switches) {
+            if let Next::Stop = serve_channel_seam(&channels, state, &config, switches) {
                 break;
             }
         }
         if auth_ready {
-            if let Next::Stop = serve_auth_seam(seams, &mut state, &config, switches) {
+            if let Next::Stop = serve_auth_seam(seams, state, &config, switches) {
                 break;
             }
         }
-        expire_pending(seams, &mut state, &config, Instant::now());
-        reap(&channels, &mut state);
+        expire_pending(seams, state, &config, Instant::now());
+        #[cfg(target_os = "linux")]
+        progress_verifications(seams, state, &config);
+        reap(&channels, state);
     }
 
     // `break`, not `return`, at each of the three ways out above: this
     // helper is LEAVING, and every live login's PAM session still has to be
     // closed by the process that opened it.
-    end_the_monitors(&mut state);
+    shutdown.end_the_monitors(seams, &config);
 }
 
-/// The helper is stopping: let every live monitor close its login's PAM
-/// session before this process goes.
-///
-/// # Why this exists at all
-///
-/// Dropping a monitor's seam is how a login is ended everywhere else
-/// ([`forget_login`]), and it works because the monitor is still there to
-/// read the end-of-file and run `monitor::Session::close`. Letting `serve`
-/// simply return would drop the same seams -- `LoopState` owns them -- and
-/// then immediately race them: `run` exits the process, the monitors'
-/// parent-death signal fires, and each gets a `SIGKILL` somewhere in the
-/// middle of the close it had just started. Measured, on the branch that
-/// added that signal: a login ended by `Request::LoginEnded` closed its
-/// session (`Exited(0)`, `closed=true`), the same login with the helper
-/// stopping did not (`Signaled(SIGKILL)`, `closed=false`) -- where the
-/// revision before the signal closed it.
-///
-/// So the seams go FIRST, on their own, and the monitors get their moment
-/// before this process leaves.
-///
-/// # What it does not cover
-///
-/// A helper that DIES -- killed, crashed -- never reaches this line, and
-/// then the parent-death signal is exactly right: a root process with an
-/// open session, reparented to init and surviving a restart of the service,
-/// is worse than an unclosed session. This function is about the other
-/// case, the one the signal made worse: a helper that leaves on purpose,
-/// which is the ordinary end of a daemon whose worker has gone.
-///
-/// [`MONITOR_GRACE_PERIOD`] is the budget, the same number the helper
-/// already gives a monitor to finish something it was asked to do. A close
-/// that needs longer than this loses the rest of it to the parent-death
-/// signal when the process exits -- the same trade-off as everywhere else
-/// here, one level up, and the reason a monitor bounds its own close
-/// (`monitor::MonitorPlan::session_close_budget`) rather than trusting this
-/// budget to be generous.
-fn end_the_monitors(state: &mut LoopState) {
-    // The seam of each goes with the entry, which is what each monitor is
-    // waiting to see close.
-    let mut leaving: Vec<Pid> = state
-        .monitors
-        .drain()
-        .filter_map(|(_, monitor)| (!monitor.reaped).then_some(monitor.pid))
-        .collect();
-    if leaving.is_empty() {
-        return;
+/// Owns the existing serve state through monitor receipt/wait drainage.
+/// Linux verification owners remain retained through native cleanup and wait.
+/// Worker and monitor-descendant custody remain separately unqualified.
+struct HelperShutdown {
+    state: LoopState,
+    first_monitor_failure: Option<MonitorShutdownFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorShutdownFailure {
+    Monitor(MonitorFailure),
+    MissingOwner,
+    Poll(i32),
+}
+
+impl HelperShutdown {
+    fn new(state: LoopState) -> Self {
+        Self {
+            state,
+            first_monitor_failure: None,
+        }
     }
-    let give_up_at = Instant::now() + MONITOR_GRACE_PERIOD;
-    loop {
-        // `reap_orphan` answers "gone", by the same `WNOHANG` pass the loop
-        // uses: a monitor that has finished is reaped here rather than left
-        // for an init this process is about to hand it to.
-        leaving.retain(|pid| !reap_orphan(*pid));
-        if leaving.is_empty() {
+
+    fn observe_monitor_failures(&mut self) {
+        // Once observed, a fault cannot change or disappear on a later report.
+        if self.first_monitor_failure.is_some() {
             return;
         }
-        if Instant::now() >= give_up_at {
-            break;
+        self.first_monitor_failure = self
+            .state
+            .monitors
+            .values()
+            .find_map(|monitor| monitor.failure.map(MonitorShutdownFailure::Monitor));
+        if self.first_monitor_failure.is_none()
+            && self
+                .state
+                .retired
+                .iter()
+                .any(|owner| !self.state.monitors.contains_key(owner))
+        {
+            self.first_monitor_failure = Some(MonitorShutdownFailure::MissingOwner);
         }
-        std::thread::sleep(REAP_INTERVAL);
+        if let Some(failure) = self.first_monitor_failure {
+            crate::log::error(
+                "helper",
+                &format!("monitor cleanup remains unresolved: {failure:?}"),
+            );
+        }
     }
-    crate::log::warn(
-        "helper",
-        &format!(
-            "{} monitor(s) had not finished closing their logins' sessions within \
-         {MONITOR_GRACE_PERIOD:?} of this helper stopping; what is left of those sessions goes \
-         unclosed",
-            leaving.len()
-        ),
-    );
+
+    fn begin_monitor_stop(&mut self, seams: Seams<'_>) {
+        self.state.stopping = true;
+        // Both active and already retiring incarnations keep their readable
+        // seams. The ordinary retirement route closes input after shell receipts.
+        let owners: Vec<_> = self.state.monitors.keys().copied().collect();
+        for owner in owners {
+            retire_login(seams.channels, &mut self.state, owner);
+        }
+    }
+
+    fn end_the_monitors(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        self.begin_monitor_stop(seams);
+        loop {
+            self.observe_monitor_failures();
+            if self.state.monitors.is_empty()
+                && self.state.retired.is_empty()
+                && self.state.live.is_empty()
+                && self.verifications_settled()
+            {
+                return;
+            }
+            self.monitor_pass(seams, config);
+        }
+    }
+
+    fn verifications_settled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.state.pending.verifying() == 0 && self.state.orphans.is_empty()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        } // unsupported-platform custody remains separately unqualified
+    }
+
+    fn monitor_pass(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        #[cfg(target_os = "linux")]
+        let reports = self.state.pending.poll_fds();
+        #[cfg(not(target_os = "linux"))]
+        let reports: Vec<RawFd> = Vec::new();
+        let owners: Vec<_> = self
+            .state
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| !monitor.seam_closed)
+            .map(|(owner, _)| *owner)
+            .collect();
+        let mut fds = Vec::with_capacity(reports.len() + owners.len());
+        for fd in &reports {
+            // SAFETY: PendingTable retains this exact report descriptor through
+            // the poll, including answered entries; no mutation occurs here.
+            fds.push(PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(*fd) },
+                PollFlags::POLLIN,
+            ));
+        }
+        fds.extend(
+            owners.iter().map(|owner| {
+                PollFd::new(self.state.monitors[owner].seam.as_fd(), PollFlags::POLLIN)
+            }),
+        );
+        let (ready_reports, ready) =
+            match poll(&mut fds, PollTimeout::try_from(REAP_INTERVAL).unwrap()) {
+                Ok(_) => (
+                    reports
+                        .iter()
+                        .zip(&fds[..reports.len()])
+                        .filter(|(_, fd)| fd.any().unwrap_or(true))
+                        .map(|(fd, _)| *fd)
+                        .collect::<Vec<_>>(),
+                    owners
+                        .iter()
+                        .zip(&fds[reports.len()..])
+                        .filter(|(_, fd)| fd.any().unwrap_or(true))
+                        .map(|(owner, _)| *owner)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(nix::Error::EINTR) => (Vec::new(), Vec::new()),
+                Err(error) => {
+                    self.first_monitor_failure
+                        .get_or_insert(MonitorShutdownFailure::Poll(error as i32));
+                    // A hard poll error is unresolved ownership, not an empty drain.
+                    // Bound retry work while retaining every descriptor and charge.
+                    std::thread::sleep(REAP_INTERVAL);
+                    (Vec::new(), Vec::new())
+                }
+            };
+        drop(fds);
+        settle_ready_pending(seams, &mut self.state, config, &ready_reports);
+        serve_ready_monitors(seams, &mut self.state, &ready);
+        #[cfg(target_os = "linux")]
+        {
+            expire_pending(seams, &mut self.state, config, Instant::now());
+            progress_verifications(seams, &mut self.state, config);
+        }
+        reap_owned_monitors(seams.channels, &mut self.state);
+        let retired: Vec<_> = self.state.retired.iter().copied().collect();
+        for owner in retired {
+            finish_retired(&mut self.state, owner);
+        }
+        self.observe_monitor_failures();
+    }
 }
 
 /// Read one message from the channel seam and act on it.
@@ -1565,8 +1678,8 @@ fn serve_auth_seam(
                 crate::log::warn(
                     "helper",
                     &format!(
-                        "refusing a Verify request: already checking {MAX_VERIFYING} \
-                     proofs at once"
+                        "refusing a Verify request: already holding {MAX_VERIFYING} \
+                     live or unresolved verifications"
                     ),
                 );
                 reply(
@@ -1607,7 +1720,14 @@ fn serve_auth_seam(
                 config,
                 switches,
             ) {
-                Ok((report, child)) => {
+                Ok(start) => {
+                    let VerificationStart {
+                        report,
+                        child,
+                        deadline,
+                        #[cfg(target_os = "linux")]
+                        custody,
+                    } = start;
                     // And this request now leaves the handler unanswered:
                     // `Verified` or `Refused` goes out from the loop once
                     // this child has spoken, or once its deadline has
@@ -1616,10 +1736,13 @@ fn serve_auth_seam(
                     // machine, for as long as one account's home directory
                     // felt like taking.
                     state.pending.insert(Pending {
-                        deadline: Instant::now() + config.verify_timeout,
+                        deadline,
                         what: PendingWhat::Verify {
                             report,
                             child,
+                            answered: false,
+                            #[cfg(target_os = "linux")]
+                            custody: Some(Box::new(custody)),
                             id,
                             // Bounded HERE too, and for the same reason the
                             // address below is. The name the CHILD was
@@ -1786,14 +1909,85 @@ fn forget_login(sock: &UnixStream, state: &mut LoopState, login: LoginId) {
 }
 
 fn finish_retired(state: &mut LoopState, owner: MonitorOwner) {
-    if state.retired.contains(&owner) && !state.live.values().any(|slot| slot.owner() == owner) {
-        state.retired.remove(&owner);
-        if let Some(monitor) = state.monitors.remove(&owner) {
-            if !monitor.reaped {
-                state.orphans.push(monitor.pid);
-            }
+    finish_retired_using(state, owner, |seam| {
+        seam.shutdown(std::net::Shutdown::Write)
+    });
+}
+
+fn finish_retired_using(
+    state: &mut LoopState,
+    owner: MonitorOwner,
+    shutdown: impl FnOnce(&UnixStream) -> std::io::Result<()>,
+) {
+    if !state.retired.contains(&owner) || state.live.values().any(|slot| slot.owner() == owner) {
+        return;
+    }
+    let Some(monitor) = state.monitors.get_mut(&owner) else {
+        return;
+    };
+    if monitor.reaped && !monitor.wait_lost && monitor.failure.is_none() {
+        if let Some(result) = monitor.completion {
+            state.pam_cleanup.merge(result);
+            state.monitors.remove(&owner);
+            state.retired.remove(&owner);
+            return;
         }
     }
+    // A final receipt already reports completed PAM work. Retain only the
+    // remaining wait obligation rather than issuing a new shutdown request.
+    if monitor.completion.is_none() {
+        request_monitor_end_using(monitor, shutdown);
+    }
+}
+
+fn request_monitor_end_using(
+    monitor: &mut Monitor,
+    shutdown: impl FnOnce(&UnixStream) -> std::io::Result<()>,
+) {
+    if monitor.stop_attempted {
+        return;
+    }
+    monitor.stop_attempted = true;
+    match shutdown(&monitor.seam) {
+        Ok(()) => monitor.write_closed = true,
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            // Retry on a later bounded pass, never an unbounded syscall loop.
+            monitor.stop_attempted = false;
+        }
+        Err(error) => {
+            monitor.failure.get_or_insert(MonitorFailure::Shutdown(
+                error.raw_os_error().unwrap_or(nix::libc::EIO),
+            ));
+        }
+    }
+}
+
+fn record_monitor_wait_failure(monitor: &mut Monitor, error: i32) {
+    monitor.wait_lost = true;
+    monitor.failure.get_or_insert(MonitorFailure::Wait(error));
+}
+
+fn poll_monitor_wait_using(
+    monitor: &mut Monitor,
+    mut wait: impl FnMut() -> nix::Result<nix::sys::wait::WaitStatus>,
+) -> bool {
+    use nix::sys::wait::WaitStatus;
+    if !monitor_signal_authority(monitor) {
+        return false;
+    }
+    match wait() {
+        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => true,
+        Err(nix::Error::EINTR) => false,
+        Err(error) => {
+            record_monitor_wait_failure(monitor, error as i32);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn monitor_signal_authority(monitor: &Monitor) -> bool {
+    !monitor.reaped && !monitor.wait_lost
 }
 
 fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
@@ -1817,6 +2011,15 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
                 incarnation: owner.incarnation,
             },
         );
+    }
+    // Monitor fork publication is synchronous before Open is sent. A login
+    // without a monitor or live slot acquired no PAM/process obligation. An
+    // already retained owner is never repaired by this absence check.
+    if !state.retired.contains(&owner)
+        && !state.monitors.contains_key(&owner)
+        && !state.live.values().any(|slot| slot.owner() == owner)
+    {
+        return;
     }
     state.retired.insert(owner);
     let ids: Vec<_> = state
@@ -1864,10 +2067,9 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
 }
 
 fn detach_monitor(state: &mut LoopState, owner: MonitorOwner) {
-    if let Some(monitor) = state.monitors.remove(&owner) {
-        if !monitor.reaped {
-            state.orphans.push(monitor.pid);
-        }
+    if let Some(monitor) = state.monitors.get_mut(&owner) {
+        monitor.seam_closed = true;
+        monitor.failure.get_or_insert(MonitorFailure::Stream);
     }
 }
 
@@ -1881,7 +2083,7 @@ fn detach_monitor(state: &mut LoopState, owner: MonitorOwner) {
 /// the device again, under a login of its own.
 fn lose_monitor(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner, why: &str) {
     if let Some(monitor) = state.monitors.get(&owner) {
-        if !monitor.reaped {
+        if monitor_signal_authority(monitor) {
             crate::log::warn("helper", &format!("login monitor cannot serve: {why}"));
             log_failed_kill(
                 nix::sys::signal::kill(monitor.pid, nix::sys::signal::Signal::SIGKILL),
@@ -1913,13 +2115,24 @@ fn tell_monitor(
     let Some(monitor) = state.monitors.get(&owner) else {
         return;
     };
+    if monitor.seam_closed {
+        return;
+    }
     let failed = match encode(request) {
         Ok(bytes) => channel::send(&monitor.seam, &bytes, None)
             .err()
-            .map(|e| e.to_string()),
-        Err(e) => Some(e.to_string()),
+            .map(|e| (e.to_string(), e.raw_os_error().unwrap_or(nix::libc::EIO))),
+        Err(e) => Some((e.to_string(), nix::libc::EINVAL)),
     };
-    if let Some(why) = failed {
+    if let Some((why, errno)) = failed {
+        if state.stopping {
+            // A cooperative-stop send failure is not authority to guess a
+            // monitor PID signal. Keep its read route and all cleanup debt.
+            if let Some(monitor) = state.monitors.get_mut(&owner) {
+                monitor.failure.get_or_insert(MonitorFailure::Send(errno));
+            }
+            return;
+        }
         lose_monitor(sock, state, owner, &format!("could not be reached ({why})"));
     }
 }
@@ -1938,6 +2151,16 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
         };
         let message = match channel::recv(&monitor.seam) {
             Ok(Some((bytes, fd))) if fd.is_none() => bytes,
+            Ok(None) => {
+                if let Some(monitor) = state.monitors.get_mut(&owner) {
+                    monitor.seam_closed = true;
+                    if monitor.completion.is_none() {
+                        monitor.failure.get_or_insert(MonitorFailure::Stream);
+                    }
+                }
+                retire_login(seams.channels, state, owner);
+                continue;
+            }
             _ => {
                 detach_monitor(state, owner);
                 retire_login(seams.channels, state, owner);
@@ -1951,7 +2174,21 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
                 continue;
             }
         };
+        if let MonitorEvent::SessionClosed { result } = event {
+            if let Some(monitor) = state.monitors.get_mut(&owner) {
+                if monitor.completion.is_some() {
+                    monitor
+                        .failure
+                        .get_or_insert(MonitorFailure::DuplicateCompletion);
+                } else {
+                    monitor.completion = Some(result);
+                }
+            }
+            retire_login(seams.channels, state, owner);
+            continue;
+        }
         let id = match &event {
+            MonitorEvent::SessionClosed { .. } => unreachable!(),
             MonitorEvent::Started { id }
             | MonitorEvent::Failed { id, .. }
             | MonitorEvent::Exited { id, .. }
@@ -1968,6 +2205,7 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             continue;
         }
         match event {
+            MonitorEvent::SessionClosed { .. } => unreachable!(),
             MonitorEvent::Started { id } => finish_channel(seams.channels, state, id, StartupReport::Started),
             MonitorEvent::Failed { id, errno } => finish_channel(seams.channels, state, id,
                 StartupReport::Failed(nix::Error::from_raw(errno))),
@@ -1980,6 +2218,43 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             MonitorEvent::Noted { id, what } => crate::log::info("helper", &format!("the PAM stack of login {:02x}{:02x}.. admitted channel {id} and said: {what}", owner.login[0], owner.login[1])),
             MonitorEvent::SignalFailed { id, signal, errno } => crate::log::warn("helper",
                 &format!("signal {signal} to channel {id}'s process failed in the monitor of login {:02x}{:02x}..: {} -- the process may outlive its channel (does the service unit grant CAP_KILL?)", owner.login[0], owner.login[1], nix::Error::from_raw(errno))),
+        }
+    }
+}
+
+/// Observe only retained monitor children; never run legacy forced escalation.
+fn reap_owned_monitors(sock: &UnixStream, state: &mut LoopState) {
+    use nix::sys::wait::{waitpid, WaitPidFlag};
+
+    // Snapshot first: `forget_login` mutates `monitors`, so mutating it
+    // while iterating it directly would be a borrow conflict.
+    let monitors: Vec<_> = state
+        .monitors
+        .iter()
+        .filter(|(_, monitor)| monitor_signal_authority(monitor))
+        .map(|(owner, monitor)| (*owner, monitor.pid))
+        .collect();
+    for (owner, pid) in monitors {
+        let gone = match state.monitors.get_mut(&owner) {
+            Some(monitor) => {
+                poll_monitor_wait_using(monitor, || waitpid(pid, Some(WaitPidFlag::WNOHANG)))
+            }
+            None => continue,
+        };
+        if gone {
+            if let Some(monitor) = state.monitors.get_mut(&owner) {
+                monitor.reaped = true;
+            }
+            // Actual wait does not discard queued shell/PAM completion evidence.
+            retire_login(sock, state, owner);
+        } else if state
+            .monitors
+            .get(&owner)
+            .is_some_and(|monitor| monitor.wait_lost)
+        {
+            // The original incarnation may no longer admit new work after
+            // irrecoverable wait loss, even if its socket remains readable.
+            retire_login(sock, state, owner);
         }
     }
 }
@@ -2010,34 +2285,14 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
 /// LOGIN'S MONITOR killed -- see that constant's docs for why the helper's
 /// escalation is one level up from the monitor's own.
 fn reap(sock: &UnixStream, state: &mut LoopState) {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-
-    // Snapshot first: `forget_login` mutates `monitors`, so mutating it
-    // while iterating it directly would be a borrow conflict.
-    let monitors: Vec<_> = state
-        .monitors
-        .iter()
-        .filter(|(_, monitor)| !monitor.reaped)
-        .map(|(owner, monitor)| (*owner, monitor.pid))
-        .collect();
-    for (owner, pid) in monitors {
-        let gone = loop {
-            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => break true,
-                Err(nix::Error::EINTR) => continue,
-                _ => break false,
-            }
-        };
-        if gone {
-            if let Some(monitor) = state.monitors.get_mut(&owner) {
-                monitor.reaped = true;
-            }
-            // The socket may still hold Failed + CleanupComplete. Keep reading
-            // it until EOF rather than losing the proof after the first event.
-            retire_login(sock, state, owner);
-        }
-    }
+    reap_owned_monitors(sock, state);
     state.orphans.retain(|&pid| !reap_orphan(pid));
+    // A transient half-shutdown interruption needs another bounded attempt
+    // even if no socket event arrives. Admission bounds this owner snapshot.
+    let retired: Vec<_> = state.retired.iter().copied().collect();
+    for owner in retired {
+        finish_retired(state, owner);
+    }
 
     let now = Instant::now();
 
@@ -2567,6 +2822,7 @@ fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
 /// account with a few hundred groups does), so the child's one `write` is
 /// not necessarily atomic and the rest can arrive in pieces. The loop must
 /// not be parked waiting for them.
+#[cfg(any(test, not(target_os = "linux")))]
 fn verdict_from_pipe(report: &OwnedFd, deadline: Instant) -> Option<Verdict> {
     let mut record = Vec::new();
     let mut chunk = [0u8; 512];
@@ -2696,7 +2952,14 @@ impl<'a> VerdictCursor<'a> {
 /// A terminal or a seam left open in a process that goes on to read an
 /// account's own files is exactly what [`close_other_descriptors`] exists
 /// to rule out.
-#[allow(clippy::too_many_arguments)]
+struct VerificationStart {
+    report: OwnedFd,
+    child: Pid,
+    deadline: Instant,
+    #[cfg(target_os = "linux")]
+    custody: super::verification::VerificationChild,
+}
+
 fn fork_verification(
     login: &str,
     public_key: &[u8],
@@ -2705,12 +2968,24 @@ fn fork_verification(
     nonce: &Nonce,
     config: &HelperConfig,
     switches: AccountSwitches,
-) -> anyhow::Result<(OwnedFd, Pid)> {
+) -> anyhow::Result<VerificationStart> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
 
+    #[cfg(target_os = "linux")]
+    let deadline = Instant::now() + config.verify_timeout;
+    #[cfg(target_os = "linux")]
+    let view = crate::process_scope::prepare()
+        .map_err(anyhow::Error::msg)
+        .context("preparing exact verification-child custody before fork")?;
     let (report_read, report_write) =
         pipe2(OFlag::O_CLOEXEC).context("opening the verification report pipe")?;
+    #[cfg(target_os = "linux")]
+    nix::fcntl::fcntl(
+        report_read.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
+    )
+    .context("making verification reports nonblocking before fork")?;
     // Read here, by the parent, for the same reason a monitor reads it
     // here: `getrlimit` is a libc call, and the child has closing to do
     // before it may make any.
@@ -2729,8 +3004,22 @@ fn fork_verification(
             // Our own copy of the write end has to close before anything
             // reads the pipe, or it never reaches end-of-file even once
             // the child's copy is gone.
+            #[cfg(target_os = "linux")]
+            let custody = super::verification::VerificationChild::new(
+                std::num::NonZeroU32::new(child.as_raw() as u32).unwrap(),
+                view,
+                deadline,
+            );
             drop(report_write);
-            Ok((report_read, child))
+            #[cfg(not(target_os = "linux"))]
+            let deadline = Instant::now() + config.verify_timeout;
+            Ok(VerificationStart {
+                report: report_read,
+                child,
+                deadline,
+                #[cfg(target_os = "linux")]
+                custody,
+            })
         }
         ForkResult::Child => {
             // The whole body under a `catch_unwind`, because the `_exit`
@@ -2751,6 +3040,28 @@ fn fork_verification(
                 // this child's own copy -- goes with the rest; nothing here
                 // reads the pipe.
                 close_other_descriptors(report_write.as_raw_fd(), fd_limit);
+                #[cfg(target_os = "linux")]
+                {
+                    let (tag, value) = match nix::unistd::setsid() {
+                        Ok(sid) => (1u8, sid.as_raw()),
+                        Err(error) => (2u8, error as i32),
+                    };
+                    let mut stage = [0u8; 5];
+                    stage[0] = tag;
+                    stage[1..].copy_from_slice(&value.to_ne_bytes());
+                    let mut written = 0;
+                    while written < stage.len() {
+                        match nix::unistd::write(report_write, &stage[written..]) {
+                            Ok(0) => unsafe { nix::libc::_exit(127) },
+                            Ok(count) => written += count,
+                            Err(nix::Error::EINTR) => continue,
+                            Err(_) => unsafe { nix::libc::_exit(127) },
+                        }
+                    }
+                    if tag != 1 {
+                        unsafe { nix::libc::_exit(127) };
+                    }
+                }
                 let verdict = match verify_proof_after_nonce(
                     login,
                     public_key,
@@ -3217,6 +3528,12 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
             drop(monitor_end);
             Ok(Monitor {
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
                 seam: helper_end,
                 pid: child,
             })
@@ -3358,183 +3675,301 @@ fn finish_pending(
             apply_channel_verdict(seams.channels, state, what, StartupReport::TimedOut)
         }
         PendingWhat::Verify {
-            report: report_pipe,
+            report,
             child,
+            answered,
+            #[cfg(target_os = "linux")]
+            mut custody,
             id,
             login,
             login_id,
             rhost,
         } => {
-            // Whatever the verdict, this child is finished: it wrote its
-            // record and `_exit`ed, or it is about to be killed. Either
-            // way NOTHING waits for it here -- `reap`'s `WNOHANG` pass
-            // buries it.
-            state.orphans.push(child);
-            let verdict = match why {
-                WhyFinished::Spoke => verdict_from_pipe(&report_pipe, deadline),
-                WhyFinished::Expired => {
-                    // The child is stuck in something with no deadline of
-                    // its own: a name service that never answers, a home
-                    // directory on a mount that has stopped. SIGKILL
-                    // rather than SIGHUP -- it is this helper's own code,
-                    // it installs no handler, and a process stuck in an
-                    // uninterruptible read would ignore anything catchable
-                    // in any case. Not followed by a blocking wait, for
-                    // the same reason the channel arm above does not wait:
-                    // that would freeze the whole single-threaded helper
-                    // one step past the budget meant to bound it.
-                    log_failed_kill(
-                        nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL),
-                        child,
-                        "SIGKILL on verification timeout",
-                    );
-                    crate::log::warn(
-                        "helper",
-                        &format!(
-                            "the child verifying a proof for {login} said nothing \
-                         within {:?}; killed, and the proof refused",
-                            config.verify_timeout
-                        ),
-                    );
-                    None
-                }
-            };
-            let answer = match verdict {
-                Some(Verdict::Admitted {
-                    account,
-                    identity,
-                    algorithm,
-                }) => {
-                    // Fix F2, unchanged by the fork: the login exists from
-                    // THIS moment, not only once it opens a first channel --
-                    // and this is the one place it can come to exist at all
-                    // (see `LoopState::logins`). A refusal here (the cap,
-                    // or this token already bound to a different account)
-                    // refuses the WHOLE verification, exactly as a bad
-                    // signature would, and carries the same
-                    // `REFUSED_REASON` so the two cannot be told apart.
-                    //
-                    // `rhost` is cloned into `ensure_login`, which keeps its
-                    // own copy on the login entry, so that the accept line
-                    // below can still use the one this process already
-                    // sanitized rather than reading it back out of state.
-                    match ensure_login(state, login_id, &account, rhost.clone()) {
-                        Ok(incarnation) => {
-                            // §10's accept line: a public contract, close
-                            // to `sshd`'s own wording so an existing
-                            // `fail2ban` filter needs only a small edit.
-                            // `login` and `rhost` are ALREADY
-                            // `sanitized_login_name`/`sanitized_rhost` --
-                            // set once, on `PendingWhat::Verify`, the one
-                            // door anything external takes into this root
-                            // process's log -- and `identity` is already
-                            // `SHA256:<fingerprint>`, so this line needs no
-                            // sanitizing of its own, only assembly.
-                            crate::log::info(
+            #[cfg(target_os = "linux")]
+            {
+                let mut answered = answered;
+                let now = Instant::now();
+                let (result, complete) = match custody.as_mut() {
+                    Some(custody) => {
+                        let update = custody.poll(&report, state.stopping, now);
+                        if let Some((signal, error)) = update.signal_failure {
+                            crate::log::error(
                                 "helper",
                                 &format!(
-                                    "Accepted signature for {login} from {rhost} key \
-                                 {algorithm} {identity}"
+                                    "verification cleanup signal {signal} failed: errno {error}"
                                 ),
                             );
-                            let response = Response::Verified {
-                                uid: account.uid.as_raw(),
-                                name: account.name.clone(),
-                                identity,
-                                incarnation,
-                            };
-                            // Exactly what came off the pipe, and never a
-                            // second `account::lookup`: repeating that
-                            // lookup on the loop is the unbounded
-                            // name-service call this entire fork exists to
-                            // be rid of. This cache tracks UID admission;
-                            // channel policy comes from the bound login.
-                            state.verified.insert(account.uid, account);
-                            response
                         }
-                        Err(reason) => {
-                            crate::log::warn(
-                                "helper",
-                                &format!(
-                                    "a Verify request that otherwise checked out was \
-                                 refused: {}",
-                                    crate::log::one_line(reason)
-                                ),
-                            );
-                            Response::Refused {
-                                reason: REFUSED_REASON.to_string(),
-                            }
-                        }
+                        (
+                            update.result,
+                            matches!(
+                                update.cleanup,
+                                crate::process_scope::scope::Progress::Complete(_)
+                            ),
+                        )
+                    }
+                    None => {
+                        // Missing exact ownership is permanent Unknown, not
+                        // authority to act on the diagnostic child number.
+                        (
+                            (!answered).then_some(Err(super::startup::Failure::Protocol)),
+                            false,
+                        )
+                    }
+                };
+                if !answered {
+                    if let Some(result) = result {
+                        let verdict = result.ok().and_then(|record| decode_verdict(&record));
+                        publish_verification(
+                            seams,
+                            state,
+                            VerificationReply {
+                                id,
+                                login: &login,
+                                login_id,
+                                rhost: &rhost,
+                            },
+                            verdict,
+                            why,
+                        );
+                        answered = true;
                     }
                 }
-                Some(Verdict::Refused {
-                    reason,
-                    unknown_account,
-                }) => {
-                    // The DETAILED reason to the log; the worker gets only
-                    // the fixed `REFUSED_REASON` -- see that constant's
-                    // docs for why. The reason travels back from the child
-                    // rather than being logged there, so that every line
-                    // about a refusal still comes from the one privileged
-                    // process that has a log at all.
-                    // `one_line`: the child's words about a proof the worker
-                    // chose -- an error text may quote it.
-                    crate::log::warn(
-                        "helper",
-                        &format!(
-                            "a Verify request was refused: {}",
-                            crate::log::one_line(&reason)
-                        ),
-                    );
-                    // §10's refuse line, the mirror of the accept line
-                    // above -- `sshd`'s own two shapes, picked by
-                    // `unknown_account`, which the child decided rather
-                    // than this site guessing it back out of `reason`'s
-                    // free-form words. `login`/`rhost` are the same
-                    // sanitized copies the accept line uses; the WIRE
-                    // answer stays the single `REFUSED_REASON` below
-                    // either way, so this line changes nothing the worker
-                    // can observe.
-                    if unknown_account {
-                        crate::log::warn(
-                            "helper",
-                            &format!("Failed signature for invalid user {login} from {rhost}"),
-                        );
-                    } else {
-                        crate::log::warn(
-                            "helper",
-                            &format!("Failed signature for {login} from {rhost}"),
-                        );
-                    }
-                    Response::Refused {
-                        reason: REFUSED_REASON.to_string(),
-                    }
+                if !(answered && complete) {
+                    state.pending.insert(Pending {
+                        deadline,
+                        what: PendingWhat::Verify {
+                            report,
+                            child,
+                            answered,
+                            custody,
+                            id,
+                            login,
+                            login_id,
+                            rhost,
+                        },
+                    });
                 }
-                None => {
-                    // An incomplete verdict is a refusal, ALWAYS -- see
-                    // `verdict_from_pipe` for why end-of-file here cannot
-                    // mean what it means for a channel's startup report.
-                    // The expired case has already logged a line of its
-                    // own above; this covers a child that died, was killed
-                    // from outside, or wrote something that is not a
-                    // verdict.
-                    if matches!(why, WhyFinished::Spoke) {
+                let _ = config; // request budgets were captured before fork
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let report_pipe = report;
+                // Whatever the verdict, this child is finished: it wrote its
+                // record and `_exit`ed, or it is about to be killed. Either
+                // way NOTHING waits for it here -- `reap`'s `WNOHANG` pass
+                // buries it.
+                state.orphans.push(child);
+                let verdict = match why {
+                    WhyFinished::Spoke => verdict_from_pipe(&report_pipe, deadline),
+                    WhyFinished::Expired => {
+                        // The child is stuck in something with no deadline of
+                        // its own: a name service that never answers, a home
+                        // directory on a mount that has stopped. SIGKILL
+                        // rather than SIGHUP -- it is this helper's own code,
+                        // it installs no handler, and a process stuck in an
+                        // uninterruptible read would ignore anything catchable
+                        // in any case. Not followed by a blocking wait, for
+                        // the same reason the channel arm above does not wait:
+                        // that would freeze the whole single-threaded helper
+                        // one step past the budget meant to bound it.
+                        log_failed_kill(
+                            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL),
+                            child,
+                            "SIGKILL on verification timeout",
+                        );
                         crate::log::warn(
                             "helper",
                             &format!(
-                                "the child verifying a proof for {login} ended without \
-                             a usable verdict; refusing"
+                                "the child verifying a proof for {login} said nothing \
+                         within {:?}; killed, and the proof refused",
+                                config.verify_timeout
                             ),
                         );
+                        None
                     }
+                };
+
+                let _ = answered;
+                publish_verification(
+                    seams,
+                    state,
+                    VerificationReply {
+                        id,
+                        login: &login,
+                        login_id,
+                        rhost: &rhost,
+                    },
+                    verdict,
+                    why,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn progress_verifications(seams: Seams<'_>, state: &mut LoopState, config: &HelperConfig) {
+    for fd in state.pending.verification_fds() {
+        if let Some(pending) = state.pending.take_ready(fd) {
+            finish_pending(seams, state, config, pending, WhyFinished::Progress);
+        }
+    }
+}
+
+struct VerificationReply<'a> {
+    id: super::protocol::AuthRequestId,
+    login: &'a str,
+    login_id: LoginId,
+    rhost: &'a str,
+}
+
+fn publish_verification(
+    seams: Seams<'_>,
+    state: &mut LoopState,
+    request: VerificationReply<'_>,
+    verdict: Option<Verdict>,
+    why: WhyFinished,
+) {
+    let VerificationReply {
+        id,
+        login,
+        login_id,
+        rhost,
+    } = request;
+    // A late completed proof cannot recreate admission after sticky stop.
+    let verdict = if state.stopping { None } else { verdict };
+    let answer = match verdict {
+        Some(Verdict::Admitted {
+            account,
+            identity,
+            algorithm,
+        }) => {
+            // Fix F2, unchanged by the fork: the login exists from
+            // THIS moment, not only once it opens a first channel --
+            // and this is the one place it can come to exist at all
+            // (see `LoopState::logins`). A refusal here (the cap,
+            // or this token already bound to a different account)
+            // refuses the WHOLE verification, exactly as a bad
+            // signature would, and carries the same
+            // `REFUSED_REASON` so the two cannot be told apart.
+            //
+            // `rhost` is cloned into `ensure_login`, which keeps its
+            // own copy on the login entry, so that the accept line
+            // below can still use the one this process already
+            // sanitized rather than reading it back out of state.
+            match ensure_login(state, login_id, &account, rhost.to_string()) {
+                Ok(incarnation) => {
+                    // §10's accept line: a public contract, close
+                    // to `sshd`'s own wording so an existing
+                    // `fail2ban` filter needs only a small edit.
+                    // `login` and `rhost` are ALREADY
+                    // `sanitized_login_name`/`sanitized_rhost` --
+                    // set once, on `PendingWhat::Verify`, the one
+                    // door anything external takes into this root
+                    // process's log -- and `identity` is already
+                    // `SHA256:<fingerprint>`, so this line needs no
+                    // sanitizing of its own, only assembly.
+                    crate::log::info(
+                        "helper",
+                        &format!(
+                            "Accepted signature for {login} from {rhost} key \
+                                 {algorithm} {identity}"
+                        ),
+                    );
+                    let response = Response::Verified {
+                        uid: account.uid.as_raw(),
+                        name: account.name.clone(),
+                        identity,
+                        incarnation,
+                    };
+                    // Exactly what came off the pipe, and never a
+                    // second `account::lookup`: repeating that
+                    // lookup on the loop is the unbounded
+                    // name-service call this entire fork exists to
+                    // be rid of. This cache tracks UID admission;
+                    // channel policy comes from the bound login.
+                    state.verified.insert(account.uid, account);
+                    response
+                }
+                Err(reason) => {
+                    crate::log::warn(
+                        "helper",
+                        &format!(
+                            "a Verify request that otherwise checked out was \
+                                 refused: {}",
+                            crate::log::one_line(reason)
+                        ),
+                    );
                     Response::Refused {
                         reason: REFUSED_REASON.to_string(),
                     }
                 }
-            };
-            reply(seams.auth, &AuthResponse { id, body: answer });
+            }
         }
-    }
+        Some(Verdict::Refused {
+            reason,
+            unknown_account,
+        }) => {
+            // The DETAILED reason to the log; the worker gets only
+            // the fixed `REFUSED_REASON` -- see that constant's
+            // docs for why. The reason travels back from the child
+            // rather than being logged there, so that every line
+            // about a refusal still comes from the one privileged
+            // process that has a log at all.
+            // `one_line`: the child's words about a proof the worker
+            // chose -- an error text may quote it.
+            crate::log::warn(
+                "helper",
+                &format!(
+                    "a Verify request was refused: {}",
+                    crate::log::one_line(&reason)
+                ),
+            );
+            // §10's refuse line, the mirror of the accept line
+            // above -- `sshd`'s own two shapes, picked by
+            // `unknown_account`, which the child decided rather
+            // than this site guessing it back out of `reason`'s
+            // free-form words. `login`/`rhost` are the same
+            // sanitized copies the accept line uses; the WIRE
+            // answer stays the single `REFUSED_REASON` below
+            // either way, so this line changes nothing the worker
+            // can observe.
+            if unknown_account {
+                crate::log::warn(
+                    "helper",
+                    &format!("Failed signature for invalid user {login} from {rhost}"),
+                );
+            } else {
+                crate::log::warn(
+                    "helper",
+                    &format!("Failed signature for {login} from {rhost}"),
+                );
+            }
+            Response::Refused {
+                reason: REFUSED_REASON.to_string(),
+            }
+        }
+        None => {
+            // An incomplete verdict is a refusal, ALWAYS -- see
+            // `verdict_from_pipe` for why end-of-file here cannot
+            // mean what it means for a channel's startup report.
+            // The expired case has already logged a line of its
+            // own above; this covers a child that died, was killed
+            // from outside, or wrote something that is not a
+            // verdict.
+            if matches!(why, WhyFinished::Spoke) {
+                crate::log::warn(
+                    "helper",
+                    &format!("verification for {login} has no usable verdict; refusing"),
+                );
+            }
+            Response::Refused {
+                reason: REFUSED_REASON.to_string(),
+            }
+        }
+    };
+    reply(seams.auth, &AuthResponse { id, body: answer });
 }
 
 /// Apply what a monitor said about one channel it was asked to start.
@@ -4186,6 +4621,11 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 pub(crate) mod tests {
     include!("log_tests.rs");
     include!("monitor_scope_tests.rs");
+    include!("monitor_retirement_tests.rs");
+    include!("monitor_completion_tests.rs");
+    include!("shutdown_owner_tests.rs");
+    include!("monitor_shutdown_tests.rs");
+    include!("verification_lifecycle_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -6121,6 +6561,8 @@ pub(crate) mod tests {
             settle_ready_pending(self.seams(), state, config, &ready);
             serve_ready_monitors(self.seams(), state, &ready_monitors);
             expire_pending(self.seams(), state, config, Instant::now());
+            #[cfg(target_os = "linux")]
+            progress_verifications(self.seams(), state, config);
         }
     }
 
@@ -6262,6 +6704,8 @@ pub(crate) mod tests {
             retired: HashSet::new(),
             highest_channel_id: 0,
             next_incarnation: 1,
+            pam_cleanup: PamCompletion::NotOpened,
+            stopping: false,
         }
     }
 
@@ -6325,6 +6769,8 @@ pub(crate) mod tests {
             retired: HashSet::new(),
             highest_channel_id: 0,
             next_incarnation: 1,
+            pam_cleanup: PamCompletion::NotOpened,
+            stopping: false,
         }
     }
 
@@ -8188,6 +8634,12 @@ pub(crate) mod tests {
             monitor_owner,
             Monitor {
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
                 seam: helper_end,
                 pid: Pid::from_raw(i32::MAX),
             },
@@ -9316,6 +9768,35 @@ pub(crate) mod tests {
         let request = proof_for_login(&key, &my_login(), [8u8; 32], nonce, [53u8; 16]);
         let id = seam.serve_auth(&mut state, request, &config, switches);
 
+        #[cfg(target_os = "linux")]
+        let mut verification_pin = {
+            use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+            let fd = state.pending.verification_fds()[0];
+            let pending = state.pending.take_ready(fd).unwrap();
+            let child = match &pending.what {
+                PendingWhat::Verify { child, .. } => *child,
+                _ => unreachable!(),
+            };
+            state.pending.insert(pending);
+            let pin = helper40_pin_verification(&mut state);
+            // Observe the exact reserved child without consuming the product
+            // owner's final wait. Preserve the panic barrier's exit-code proof.
+            let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+            let status = loop {
+                match waitid(
+                    Id::Pid(child),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                ) {
+                    Ok(WaitStatus::StillAlive) | Err(nix::Error::EINTR) => {}
+                    Ok(status) => break status,
+                    Err(error) => panic!("observe owned panic child: {error}"),
+                }
+                assert!(Instant::now() < deadline, "panic child did not exit");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(status, WaitStatus::Exited(child, PANICKED_CHILD_EXIT));
+            pin
+        };
         seam.settle(&mut state, &config);
 
         let answer = next_answer(&seam.worker_auth);
@@ -9326,15 +9807,31 @@ pub(crate) mod tests {
              never an admission; got {:?}",
             answer.body
         );
-        let child = *state
-            .orphans
-            .last()
-            .expect("the child is left for `reap` to bury");
-        assert_eq!(
-            exit_status_of(child, "the child that panicked must have ENDED"),
-            nix::sys::wait::WaitStatus::Exited(child, PANICKED_CHILD_EXIT),
-            "the child must leave by its own `_exit`, not by unwinding out of the fork"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                state.pending.verifying(),
+                0,
+                "actual cleanup refunds admission"
+            );
+            assert!(state.orphans.is_empty(), "no numeric orphan transfer");
+            assert!(matches!(
+                verification_pin.observe(&mut crate::process_scope::Native),
+                crate::process_scope::Evidence::Exited
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let child = *state
+                .orphans
+                .last()
+                .expect("the child is left for `reap` to bury");
+            assert_eq!(
+                exit_status_of(child, "the child that panicked must have ENDED"),
+                nix::sys::wait::WaitStatus::Exited(child, PANICKED_CHILD_EXIT),
+                "the child must leave by its own `_exit`, not by unwinding out of the fork"
+            );
+        }
     }
 
     /// And the same for the other of the two children: a panic in a
@@ -10969,6 +11466,8 @@ pub(crate) mod tests {
             "setup: the verification must be waiting on a child of its own"
         );
 
+        #[cfg(target_os = "linux")]
+        let mut verification_pin = helper40_pin_verification(&mut state);
         seam.settle(&mut state, &config);
 
         let answer = next_answer(&seam.worker_auth);
@@ -10982,14 +11481,36 @@ pub(crate) mod tests {
             !state.verified.contains_key(&my_uid()),
             "a proof nobody ever finished checking must admit nobody"
         );
-        let child = *state
-            .orphans
-            .first()
-            .expect("the child is left for `reap` to bury, never waited for here");
-        assert_killed_and_reaped(
-            child,
-            "a verification that outlived its deadline must be killed, not merely refused",
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                state.pending.verifying(),
+                0,
+                "native cleanup plus actual final wait releases admission"
+            );
+            assert!(
+                state.orphans.is_empty(),
+                "no raw verification orphan remains"
+            );
+            assert!(
+                matches!(
+                    verification_pin.observe(&mut crate::process_scope::Native),
+                    crate::process_scope::Evidence::Exited
+                ),
+                "the exact timed-out verifier must exit before its charge is refunded"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let child = *state
+                .orphans
+                .first()
+                .expect("the child is left for `reap` to bury, never waited for here");
+            assert_killed_and_reaped(
+                child,
+                "a verification that outlived its deadline must be killed, not merely refused",
+            );
+        }
     }
 
     /// A proof whose nonce is already spent must not merely be REFUSED on the
@@ -11140,6 +11661,9 @@ pub(crate) mod tests {
             what: PendingWhat::Verify {
                 report,
                 child: Pid::from_raw(999_999),
+                answered: false,
+                #[cfg(target_os = "linux")]
+                custody: None,
                 id: 1,
                 login: "filler".to_string(),
                 login_id: [0u8; 16],
@@ -11327,19 +11851,63 @@ pub(crate) mod tests {
         }
     }
 
-    /// A verdict that starts arriving and then stops is refused at the
-    /// ENTRY'S OWN deadline, through the loop's own settling path: the loop
-    /// is never parked waiting for the rest. No child at all -- the test
-    /// holds the pipe's write end open with half a record in it, which is
-    /// what a child whose one `write` was split past `PIPE_BUF` and which
-    /// then stalled leaves behind.
-    ///
-    /// Pins both halves: `verdict_from_pipe` honouring the deadline it is
-    /// given, and `finish_pending` handing it the entry's own. A rescue
-    /// thread closes the write end after `RESCUE_AFTER`, so a regression
-    /// fails the elapsed-time assertion below instead of hanging the run.
+    /// A partial record cannot park the helper. Linux uses a real owned child
+    /// retaining its writer: refusal follows the original deadline, while
+    /// admission stays charged through native cleanup and actual final wait.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_verdict_that_stops_arriving_is_refused_at_its_own_deadline() {
+        let whole = encode_verdict(&Verdict::Admitted {
+            account: distinctive_account(),
+            identity: "SHA256:partial".into(),
+            algorithm: "ED25519".into(),
+        });
+        let mut fixture = Helper40VerificationFixture::new(whole[..whole.len() / 2].to_vec(), true);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let pending = fixture.pending(deadline, 77);
+        let fd = match &pending.what {
+            PendingWhat::Verify { report, .. } => report.as_raw_fd(),
+            _ => unreachable!(),
+        };
+        let mut state = empty_state();
+        let seam = DirectSeam::new();
+        state.pending.insert(pending);
+        let started = Instant::now();
+        settle_ready_pending(seam.seams(), &mut state, &test_config(), &[fd]);
+        let first_pass = started.elapsed();
+        let partial_charged = state.pending.verifying();
+        let mut pinned = helper40_pin_verification(&mut state);
+        seam.settle(&mut state, &test_config());
+        let answer = next_answer(&seam.worker_auth);
+        let elapsed = started.elapsed();
+        let admitted = !state.verified.is_empty();
+        let charged = state.pending.verifying();
+        let exited = matches!(
+            pinned.observe(&mut crate::process_scope::Native),
+            crate::process_scope::Evidence::Exited
+        );
+        drop(state);
+        drop(fixture);
+        assert!(
+            first_pass < Duration::from_millis(100),
+            "partial input cannot park the helper until its deadline"
+        );
+        assert_eq!(partial_charged, 1);
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "unfinished verification cannot be refused before its original deadline"
+        );
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(answer.id, 77);
+        assert!(matches!(answer.body, Response::Refused { reason } if reason == REFUSED_REASON));
+        assert!(!admitted);
+        assert_eq!(charged, 0);
+        assert!(exited, "exact child termination precedes admission refund");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_verdict_that_stops_arriving_is_refused_at_its_own_deadline_legacy() {
         const BUDGET: Duration = Duration::from_millis(200);
         const RESCUE_AFTER: Duration = Duration::from_secs(4);
 
@@ -11364,6 +11932,9 @@ pub(crate) mod tests {
             what: PendingWhat::Verify {
                 report,
                 child: Pid::from_raw(999_999),
+                answered: false,
+                #[cfg(target_os = "linux")]
+                custody: None,
                 id: 77,
                 login: "partial".to_string(),
                 login_id: [13u8; 16],

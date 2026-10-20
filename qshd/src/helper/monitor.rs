@@ -93,7 +93,8 @@ use transport::LoginId;
 
 use super::account::Account;
 use super::channel;
-use super::pam::{Cred, Pam, PamError};
+use super::pam::{Cred, Pam, PamError, PamStartFailure};
+use super::pam_completion::{PamCompletion, PamStep};
 use super::protocol::{decode, encode, ChannelId, MonitorEvent, MonitorRequest};
 use super::server::{
     become_account_checks, child_env, close_other_descriptors, login_shell, shell_basename,
@@ -316,10 +317,10 @@ struct Shell {
 ///
 /// **Only what was opened is closed.** A `pam_acct_mgmt` that refused left
 /// no session and no credentials, so its exit runs `pam_end` alone. That is
-/// what the two flags below are for. `pam_end` runs always, exactly once --
-/// in `Pam`'s own `Drop`.
+/// what the two flags below are for. `pam_end` runs once on consuming close,
+/// with `Pam`'s `Drop` retained as fallback for an unfinished transaction.
 struct Session {
-    /// The transaction. `pam_end` runs when this is dropped, and only then.
+    /// The transaction, explicitly ended by consuming close; Drop is fallback.
     pam: Pam,
     /// Whether `pam_setcred(PAM_ESTABLISH_CRED)` returned success, and so
     /// whether there is anything for `PAM_DELETE_CRED` to take down.
@@ -340,16 +341,61 @@ struct Session {
     groups: Vec<Gid>,
 }
 
+#[derive(Debug)]
+struct SessionFailure {
+    why: String,
+    cleanup: PamCompletion,
+}
+impl From<String> for SessionFailure {
+    fn from(why: String) -> Self {
+        Self {
+            why,
+            cleanup: PamCompletion::NotOpened,
+        }
+    }
+}
+impl From<&str> for SessionFailure {
+    fn from(why: &str) -> Self {
+        Self::from(why.to_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupStep {
+    CloseSession,
+    DeleteCred,
+    End,
+}
+
+fn native_cleanup_step(pam: &mut Pam, step: CleanupStep) -> PamStep {
+    match step {
+        CleanupStep::CloseSession => {
+            PamStep::Attempted(pam.close_session().map_or_else(|e| e.code, |_| 0))
+        }
+        CleanupStep::DeleteCred => {
+            PamStep::Attempted(pam.setcred(Cred::Delete).map_or_else(|e| e.code, |_| 0))
+        }
+        CleanupStep::End => PamStep::Attempted(
+            pam.finish()
+                .expect("owned session retains live PAM transaction"),
+        ),
+    }
+}
+
 impl Session {
     /// Open this login's session: the whole opening half of §6.4, in order.
     ///
-    /// On failure nothing is left open -- what got as far as succeeding is
-    /// taken down again by [`Session::close`] before this returns -- and
-    /// the `Err` is the line the helper logs: the call that refused, and
-    /// what the modules said on the way. A string rather than the
-    /// [`PamError`] itself, because the messages are read off the handle
-    /// and the handle has to be ended before this returns.
-    fn begin(plan: &MonitorPlan) -> Result<Session, String> {
+    /// On failure every acquired cleanup step is attempted before returning.
+    /// The error keeps the original refusal separately from cleanup evidence;
+    /// messages must be read before the owned transaction is ended.
+    fn begin(plan: &MonitorPlan) -> Result<Session, SessionFailure> {
+        Self::begin_using(plan, Self::close)
+    }
+
+    fn begin_using(
+        plan: &MonitorPlan,
+        close: impl FnOnce(Session) -> PamCompletion,
+    ) -> Result<Session, SessionFailure> {
         // The one place this process blocks outside its poll loop, and
         // until now the one place nothing bounded -- see
         // [`SessionDeadline`] for what that cost. Armed for the whole of
@@ -368,9 +414,14 @@ impl Session {
         }
         let pam = match start_transaction(plan) {
             Ok(pam) => pam,
-            // Nothing started: no handle to read messages from, nothing to
-            // end, nothing to close.
-            Err(e) => return Err(sanitized_detail(&e.to_string())),
+            // Owned construction may already have rolled back an acquired
+            // transaction. Preserve that result independently of the refusal.
+            Err(failure) => {
+                return Err(SessionFailure {
+                    why: sanitized_detail(&failure.error.to_string()),
+                    cleanup: failure.cleanup,
+                })
+            }
         };
         let mut session = Session {
             pam,
@@ -389,14 +440,14 @@ impl Session {
                 Err(e) => {
                     let why =
                         sanitized_detail(&format!("capture PAM session supplementary groups: {e}"));
-                    session.close();
-                    Err(why)
+                    let cleanup = close(session);
+                    Err(SessionFailure { why, cleanup })
                 }
             },
             Err(e) => {
                 let why = session.refusal_detail(&e);
-                session.close();
-                Err(why)
+                let cleanup = close(session);
+                Err(SessionFailure { why, cleanup })
             }
         }
     }
@@ -430,22 +481,31 @@ impl Session {
     /// Close what was opened, in the reverse order, and end the
     /// transaction.
     ///
-    /// Nothing is reported: this runs when the login is over, which is to
-    /// say when the seam this process reports on has already gone (see
-    /// [`run_monitor`]) -- and on the one other path, a refused open, the
-    /// refusal itself is what the helper is told. A `pam_close_session`
-    /// that fails is a module's business with its own log; there is nothing
-    /// this process could do about it either way.
-    fn close(mut self) {
-        if self.session_open {
-            let _ = self.pam.close_session();
+    /// Every attempted cleanup status is independent from the authentication verdict.
+    fn close(self) -> PamCompletion {
+        self.close_using(native_cleanup_step)
+    }
+
+    fn close_using(
+        mut self,
+        mut step: impl FnMut(&mut Pam, CleanupStep) -> PamStep,
+    ) -> PamCompletion {
+        let close_session = if self.session_open {
+            step(&mut self.pam, CleanupStep::CloseSession)
+        } else {
+            PamStep::Skipped
+        };
+        let delete_cred = if self.cred_established {
+            step(&mut self.pam, CleanupStep::DeleteCred)
+        } else {
+            PamStep::Skipped
+        };
+        let end = step(&mut self.pam, CleanupStep::End);
+        PamCompletion::Finished {
+            close_session,
+            delete_cred,
+            end,
         }
-        if self.cred_established {
-            let _ = self.pam.setcred(Cred::Delete);
-        }
-        // `pam_end`, exactly once, in `Pam`'s `Drop` -- and after the two
-        // calls above, never instead of them.
-        drop(self.pam);
     }
 
     /// What the modules said as ERRORS while this session was opened
@@ -782,25 +842,25 @@ fn pam_origin(rhost: &str) -> Result<String, PamError> {
 /// `config::HelperConfig::pam_confdir`, and `scripts/check-pam-linkage.sh`,
 /// which is what actually checks it.
 #[cfg(not(test))]
-fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
+fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamStartFailure> {
     let origin = pam_origin(&plan.rhost)?;
-    Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin)
+    Pam::start_owned(&plan.pam_service, &plan.account.name, &plan.tty, &origin)
 }
 
 /// [`start_transaction`], for the tests: a stack in a directory of the
 /// test's own, so the PAM tests need no root and touch no `/etc/pam.d`.
 #[cfg(test)]
-fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamError> {
+fn start_transaction(plan: &MonitorPlan) -> Result<Pam, PamStartFailure> {
     let origin = pam_origin(&plan.rhost)?;
     match &plan.pam_confdir {
-        Some(dir) => Pam::start_confdir(
+        Some(dir) => Pam::start_confdir_owned(
             dir,
             &plan.pam_service,
             &plan.account.name,
             &plan.tty,
             &origin,
         ),
-        None => Pam::start(&plan.pam_service, &plan.account.name, &plan.tty, &origin),
+        None => Pam::start_owned(&plan.pam_service, &plan.account.name, &plan.tty, &origin),
     }
 }
 
@@ -1032,7 +1092,8 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     }
     let mut shells = Vec::new();
     let mut session = None;
-    serve(&plan, &seam, &mut shells, &mut session);
+    let mut cleanup = PamCompletion::NotOpened;
+    serve(&plan, &seam, &mut shells, &mut session, &mut cleanup);
     // The shells first, then the session: a session closed under a live
     // shell would be closed while the thing it was opened for is still
     // running, and the modules that count logins (`pam_systemd`,
@@ -1050,8 +1111,9 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
         // escalation needs a monitor that has a channel to fail to report,
         // and this one has none left.
         let _deadline = SessionDeadline::armed(plan.session_close_budget);
-        session.close();
+        cleanup.merge(session.close());
     }
+    tell(&seam, &MonitorEvent::SessionClosed { result: cleanup });
     // SAFETY: `_exit` ends the process immediately, running no atexit
     // handlers and no Rust `Drop` impls -- which is what has to happen
     // here, in a process that shares its parent's image.
@@ -1066,6 +1128,7 @@ fn serve(
     seam: &UnixStream,
     shells: &mut Vec<Shell>,
     session: &mut Option<Session>,
+    cleanup: &mut PamCompletion,
 ) {
     // Channels a `MonitorRequest::Close` has sent `SIGHUP`, keyed to the
     // deadline by which the escalation to `SIGKILL` follows -- the helper's
@@ -1128,7 +1191,7 @@ fn serve(
         }
         #[cfg(not(target_os = "linux"))]
         report_startups(seam, shells, &ready);
-        if seam_ready && !serve_request(plan, seam, shells, session, &mut closing) {
+        if seam_ready && !serve_request(plan, seam, shells, session, cleanup, &mut closing) {
             return;
         }
         #[cfg(not(target_os = "linux"))]
@@ -1146,6 +1209,7 @@ fn serve_request(
     seam: &UnixStream,
     shells: &mut Vec<Shell>,
     session: &mut Option<Session>,
+    cleanup: &mut PamCompletion,
     closing: &mut HashMap<ChannelId, Instant>,
 ) -> bool {
     let (bytes, slave) = match channel::recv(seam) {
@@ -1190,9 +1254,14 @@ fn serve_request(
                         }
                         *session = Some(opened);
                     }
-                    Err(why) => {
-                        // Session::begin has already cleaned up any opened
-                        // PAM state. This login gets no shell, now or later.
+                    Err(SessionFailure {
+                        why,
+                        cleanup: failed_cleanup,
+                    }) => {
+                        cleanup.merge(failed_cleanup);
+                        // Session::begin attempted every acquired cleanup step;
+                        // its result remains independent from the refusal.
+                        // This login gets no shell, now or later.
                         // The monitor ENDS: a login whose account
                         // stack refused it must not be left with a process
                         // that could still fork a shell outside any
@@ -1860,6 +1929,7 @@ fn fork_shell(
 
 #[cfg(test)]
 mod tests {
+    include!("session_cleanup_tests.rs");
     use super::*;
 
     fn current_account_name() -> String {
@@ -1973,6 +2043,7 @@ mod tests {
             session_budget: Duration::from_secs(1),
             session_close_budget: Duration::from_secs(1),
         })
+        .map_err(|failure| failure.error)
     }
 
     /// Capture the actual module environment, including IPv6 scope removal.

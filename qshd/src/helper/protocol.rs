@@ -433,6 +433,11 @@ pub enum MonitorEvent {
         /// `i32` for the same reason [`MonitorEvent::Failed`]'s is.
         errno: i32,
     },
+    /// The monitor completed its acquired PAM cleanup steps; neither child
+    /// exit nor a channel receipt substitutes for this monitor-level evidence.
+    SessionClosed {
+        result: super::pam_completion::PamCompletion,
+    },
 }
 
 /// A request on the authentication seam: a [`Request`] and the number the

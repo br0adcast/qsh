@@ -24,6 +24,7 @@ use transport::session_manager::NonceSource;
 
 use crate::helper::protocol::Nonce;
 use crate::helper::spawner::{EndWorker, HelperAuth, AUTH_POOL_THREAD, HELPER_ANSWER_TIMEOUT};
+use crate::helper::worker_threads::{Role as ThreadRole, WorkerThreads};
 
 /// How many nonces the pool keeps ready.
 ///
@@ -65,14 +66,19 @@ pub(crate) const POOL_THREAD_GONE_REASON: &str =
 
 /// How the pool starts its thread -- [`spawn_pool_thread`] outside tests. A
 /// parameter only so a test can make that fail.
-type SpawnThread = fn(Box<dyn FnOnce() + Send>) -> io::Result<()>;
+type SpawnThread =
+    fn(Box<dyn FnOnce() + Send>) -> io::Result<std::thread::JoinHandle<io::Result<()>>>;
 
 /// Starts the pool's thread, under its name.
-fn spawn_pool_thread(body: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+fn spawn_pool_thread(
+    body: Box<dyn FnOnce() + Send>,
+) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
     std::thread::Builder::new()
         .name(AUTH_POOL_THREAD.to_string())
-        .spawn(body)
-        .map(|_| ())
+        .spawn(move || {
+            body();
+            Ok(())
+        })
 }
 
 /// How long the whole warm-up in [`PooledNonces::start`] may take: one
@@ -102,6 +108,7 @@ pub struct PooledNonces {
     /// The client every nonce comes from and goes back to -- the same one
     /// the pool's thread holds.
     helper: Arc<HelperAuth>,
+    auxiliary: Mutex<Option<WorkerThreads>>,
 }
 
 /// What the pool and its thread share.
@@ -160,6 +167,22 @@ impl State {
 }
 
 impl PooledNonces {
+    /// Add the fourth fixed handle before publishing the pool to the manager.
+    pub(crate) fn start_owned(
+        helper: Arc<HelperAuth>,
+        owner: &mut WorkerThreads,
+    ) -> io::Result<Arc<Self>> {
+        let pool = Self::start(helper)?;
+        let custody = pool
+            .auxiliary
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("nonce pool custody is transferred once");
+        owner.absorb(custody);
+        Ok(pool)
+    }
+
     /// Fill the pool, then start the thread that keeps it filled.
     ///
     /// The filling happens here, before this returns, so that the first
@@ -233,16 +256,30 @@ impl PooledNonces {
         warm_up(&shared, &helper, Instant::now() + WARM_UP_BUDGET);
         let thread_shared = Arc::clone(&shared);
         let thread_helper = Arc::clone(&helper);
-        if let Err(e) = spawn(Box::new(move || {
+        let thread = match spawn(Box::new(move || {
             keep_filled(thread_shared, thread_helper, end_worker)
         })) {
-            let fetched: Vec<Nonce> = shared.lock().ready.drain(..).map(|(n, _)| n).collect();
-            for nonce in fetched {
-                helper.release(nonce);
+            Ok(thread) => thread,
+            Err(e) => {
+                let fetched: Vec<Nonce> = shared.lock().ready.drain(..).map(|(n, _)| n).collect();
+                for nonce in fetched {
+                    helper.release(nonce);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-        Ok(Arc::new(PooledNonces { shared, helper }))
+        };
+        let mut auxiliary = WorkerThreads::default();
+        let stopping = shared.clone();
+        auxiliary.register(ThreadRole::NoncePool, thread, move || {
+            stopping.lock().closing = true;
+            stopping.wake.notify_one();
+            Ok(())
+        });
+        Ok(Arc::new(PooledNonces {
+            shared,
+            helper,
+            auxiliary: Mutex::new(Some(auxiliary)),
+        }))
     }
 
     /// The nonces ready right now, oldest first.
@@ -284,6 +321,9 @@ impl NonceSource for PooledNonces {
     /// Aged ones met on the way are left for the pool's thread to give back.
     fn issue(&self) -> Result<Nonce, String> {
         let mut state = self.shared.lock();
+        if state.closing {
+            return Err("nonce issuance stopped".to_string());
+        }
         state.expire(self.shared.max_age, Instant::now());
         let nonce = state.ready.pop_front().map(|(nonce, _)| nonce);
         drop(state);
@@ -308,6 +348,14 @@ impl Drop for PooledNonces {
     fn drop(&mut self) {
         self.shared.lock().closing = true;
         self.shared.wake.notify_one();
+        if let Some(mut owner) = self
+            .auxiliary
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            owner.stop_and_join();
+        }
     }
 }
 
@@ -437,6 +485,7 @@ impl Drop for PoolThreadExit {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("nonce_pool_auxiliary_tests.rs");
     use super::*;
     use std::collections::HashSet;
     use std::os::unix::net::UnixStream;
@@ -1178,7 +1227,9 @@ pub(crate) mod tests {
     }
 
     /// Starts nothing -- for a pool whose thread cannot start.
-    fn spawn_nothing(_body: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+    fn spawn_nothing(
+        _body: Box<dyn FnOnce() + Send>,
+    ) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
         Err(io::Error::other("this test starts no thread"))
     }
 

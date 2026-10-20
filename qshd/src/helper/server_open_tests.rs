@@ -224,6 +224,12 @@ mod open24_receipts {
                 seam: parent,
                 pid,
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [
@@ -331,6 +337,12 @@ mod open24_receipts {
                 seam: parent,
                 pid: Pid::from_raw(1),
                 reaped: true,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [
@@ -365,6 +377,12 @@ mod open24_receipts {
                 seam: parent,
                 pid,
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [

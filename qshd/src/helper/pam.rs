@@ -49,6 +49,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 
+use super::pam_completion::{PamCompletion, PamStep};
 use nix::libc;
 
 // Values from Linux-PAM's `<security/_pam_types.h>` (1.5.3). They are part
@@ -169,6 +170,21 @@ pub(super) struct PamError {
     pub(super) code: c_int,
     /// Which call it was, or what stopped the call being made.
     pub(super) what: &'static str,
+}
+
+/// A refused constructor retains cleanup evidence if pam_start succeeded.
+#[derive(Debug)]
+pub(super) struct PamStartFailure {
+    pub(super) error: PamError,
+    pub(super) cleanup: PamCompletion,
+}
+impl From<PamError> for PamStartFailure {
+    fn from(error: PamError) -> Self {
+        Self {
+            error,
+            cleanup: PamCompletion::NotOpened,
+        }
+    }
 }
 
 impl fmt::Display for PamError {
@@ -377,12 +393,22 @@ impl Pam {
     /// Start a transaction for `user` with the stack in
     /// `/etc/pam.d/<service>`, and record the terminal and the client's
     /// address for the modules.
+    #[cfg(test)]
     pub(super) fn start(
         service: &str,
         user: &str,
         tty: &str,
         rhost: &str,
     ) -> Result<Pam, PamError> {
+        Self::start_owned(service, user, tty, rhost).map_err(|failure| failure.error)
+    }
+
+    pub(super) fn start_owned(
+        service: &str,
+        user: &str,
+        tty: &str,
+        rhost: &str,
+    ) -> Result<Pam, PamStartFailure> {
         Pam::begin(Stack::System, service, user, tty, rhost)
     }
 
@@ -398,6 +424,17 @@ impl Pam {
         tty: &str,
         rhost: &str,
     ) -> Result<Pam, PamError> {
+        Self::start_confdir_owned(dir, service, user, tty, rhost).map_err(|failure| failure.error)
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_confdir_owned(
+        dir: &Path,
+        service: &str,
+        user: &str,
+        tty: &str,
+        rhost: &str,
+    ) -> Result<Pam, PamStartFailure> {
         let dir = c_string(
             dir.as_os_str().as_bytes(),
             "the PAM configuration directory holds a NUL byte",
@@ -411,7 +448,7 @@ impl Pam {
         user: &str,
         tty: &str,
         rhost: &str,
-    ) -> Result<Pam, PamError> {
+    ) -> Result<Pam, PamStartFailure> {
         // Everything that can fail without PAM fails first, while there is
         // nothing to end.
         let service = c_string(service.as_bytes(), "the PAM service name holds a NUL byte")?;
@@ -452,18 +489,52 @@ impl Pam {
             return Err(PamError {
                 code,
                 what: "pam_start",
-            });
+            }
+            .into());
         }
-        let mut pam = Pam {
+        let pam = Pam {
             handle,
             service,
             last_code: code,
             conv,
         };
-        // A failure from here on drops `pam`, which ends the handle.
-        pam.set_item(PAM_TTY, &tty, "pam_set_item(PAM_TTY)")?;
-        pam.set_item(PAM_RHOST, &rhost, "pam_set_item(PAM_RHOST)")?;
-        Ok(pam)
+        pam.configure_using(
+            &tty,
+            &rhost,
+            |pam, item, value, what| pam.set_item(item, value, what),
+            |handle, last_code| {
+                // SAFETY: configure_using ends its exclusively owned live handle once.
+                unsafe { pam_end(handle, last_code) }
+            },
+        )
+    }
+
+    fn configure_using(
+        mut self,
+        tty: &CStr,
+        rhost: &CStr,
+        mut set_item: impl FnMut(&mut Self, c_int, &CStr, &'static str) -> Result<(), PamError>,
+        end: impl FnOnce(*mut PamHandle, c_int) -> c_int,
+    ) -> Result<Self, PamStartFailure> {
+        for (item, value, what) in [
+            (PAM_TTY, tty, "pam_set_item(PAM_TTY)"),
+            (PAM_RHOST, rhost, "pam_set_item(PAM_RHOST)"),
+        ] {
+            if let Err(error) = set_item(&mut self, item, value, what) {
+                let ended = self
+                    .finish_using(end)
+                    .expect("live constructed transaction");
+                return Err(PamStartFailure {
+                    error,
+                    cleanup: PamCompletion::Finished {
+                        close_session: PamStep::Skipped,
+                        delete_cred: PamStep::Skipped,
+                        end: PamStep::Attempted(ended),
+                    },
+                });
+            }
+        }
+        Ok(self)
     }
 
     /// The account stack's verdict: expired, locked, not allowed here.
@@ -558,19 +629,28 @@ impl Pam {
     ///
     /// Returns whether this call ended the transaction.
     ///
-    /// `last_code` reaches only the modules' cleanup functions (the ones
-    /// registered with `pam_set_data`); no stock module shows what it got
-    /// without privileges, so which code is passed has no test here.
+    /// `last_code` reaches the modules' cleanup functions through `pam_end`.
+    /// The real-handle boundary control verifies its input is preserved,
+    /// including when the explicit end attempt reports failure.
     fn end(&mut self) -> bool {
+        self.finish().is_some()
+    }
+
+    /// Report an actual end attempt; a null handle has no remaining obligation.
+    pub(super) fn finish(&mut self) -> Option<c_int> {
+        self.finish_using(|handle, last_code| {
+            // SAFETY: finish_using takes the sole live handle before this call;
+            // conversation state remains alive until after pam_end returns.
+            unsafe { pam_end(handle, last_code) }
+        })
+    }
+
+    fn finish_using(&mut self, end: impl FnOnce(*mut PamHandle, c_int) -> c_int) -> Option<c_int> {
         if self.handle.is_null() {
-            return false;
+            return None;
         }
-        // SAFETY: `handle` is live and is never used again. The
-        // conversation state it points at is still alive: `conv` is dropped
-        // after this.
-        unsafe { pam_end(self.handle, self.last_code) };
-        self.handle = ptr::null_mut();
-        true
+        let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
+        Some(end(handle, self.last_code))
     }
 }
 
@@ -2157,5 +2237,98 @@ mod tests {
             grown < TRANSACTION_NOISE,
             "starting and ending {ROUNDS} transactions must not grow the heap, grew {grown} bytes"
         );
+    }
+    #[test]
+    fn pam40_explicit_finish_reports_error_and_never_ends_twice() {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+            "helper::pam::tests::pam40_explicit_finish_reports_error_and_never_ends_twice_body",
+        );
+        assert!(
+            status.success(),
+            "owned finish control failed ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "runs only in the owned explicit-finish subprocess"]
+    fn pam40_explicit_finish_reports_error_and_never_ends_twice_body() {
+        let dir = confdir(&[("qshd-test-finish", PERMIT_STACK)]);
+        let mut pam = start_in(dir.path(), "qshd-test-finish");
+        pam.record(17, "controlled prior PAM result").unwrap_err();
+        let mut calls = 0;
+        let result = pam.finish_using(|handle, last_code| {
+            calls += 1;
+            assert_eq!(last_code, 17, "preserve original pam_end input semantics");
+            // Release the real library handle even though this seam reports error.
+            assert_eq!(unsafe { pam_end(handle, last_code) }, PAM_SUCCESS);
+            PAM_SYSTEM_ERR
+        });
+        let released = pam.handle.is_null();
+        let repeated = pam.finish_using(|_, _| panic!("ended handle used again"));
+        drop(pam);
+        assert_eq!(
+            result,
+            Some(4),
+            "explicit end must report the actual failure"
+        );
+        assert!(released, "end failure still invalidates the handle");
+        assert_eq!(repeated, None);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn pam40_constructor_rollback_preserves_cleanup_failure() {
+        let (status, stdout, stderr) = super::super::spawner::tests::run_isolated(
+            "helper::pam::tests::pam40_constructor_rollback_preserves_cleanup_failure_body",
+        );
+        assert!(
+            status.success(),
+            "owned constructor control failed ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "runs only in the owned constructor rollback subprocess"]
+    fn pam40_constructor_rollback_preserves_cleanup_failure_body() {
+        let dir = confdir(&[("qshd-test-constructor", PERMIT_STACK)]);
+        let before = Pam::start_confdir_owned(dir.path(), "bad\0service", "test", "tty", "origin")
+            .unwrap_err();
+        assert_eq!(before.cleanup, PamCompletion::NotOpened);
+        let pam = start_in(dir.path(), "qshd-test-constructor");
+        let mut item_calls = Vec::new();
+        let mut end_calls = 0;
+        let failed = pam
+            .configure_using(
+                c"/dev/pts/0",
+                c"203.0.113.7",
+                |pam, item, value, what| {
+                    item_calls.push(item);
+                    if item == PAM_RHOST {
+                        pam.record(PAM_SYSTEM_ERR, what)
+                    } else {
+                        pam.set_item(item, value, what)
+                    }
+                },
+                |handle, last_code| {
+                    end_calls += 1;
+                    assert_eq!(last_code, PAM_SYSTEM_ERR);
+                    assert_eq!(unsafe { pam_end(handle, last_code) }, PAM_SUCCESS);
+                    26
+                },
+            )
+            .unwrap_err();
+        assert_eq!(item_calls, [3, 4]);
+        assert_eq!(end_calls, 1);
+        assert_eq!(failed.error.what, "pam_set_item(PAM_RHOST)");
+        assert_eq!(
+            failed.cleanup,
+            PamCompletion::Finished {
+                close_session: PamStep::Skipped,
+                delete_cred: PamStep::Skipped,
+                end: PamStep::Attempted(26),
+            },
+            "a transaction existed and its actual rollback end failed"
+        );
+        assert!(!failed.cleanup.succeeded());
     }
 }

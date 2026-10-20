@@ -154,6 +154,165 @@ impl StartupReader {
     }
 }
 
+/// Incremental verification framing. A private stage precedes a bounded verdict.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct VerificationUpdate {
+    pub(crate) established: Option<SessionEstablished>,
+    pub(crate) result: Option<Result<Vec<u8>, Failure>>,
+}
+
+pub(crate) struct VerificationReader {
+    sid: u32,
+    deadline: Instant,
+    max_verdict: usize,
+    header: [u8; 5],
+    filled: usize,
+    established: bool,
+    header_error: bool,
+    ambiguous: bool,
+    body: Vec<u8>,
+    body_seen: usize,
+    eof: bool,
+    decided: bool,
+    reported: bool,
+    failure: Option<Failure>,
+}
+impl VerificationReader {
+    pub(crate) fn new(sid: u32, deadline: Instant, max_verdict: usize) -> Self {
+        assert!(sid > 0 && sid <= i32::MAX as u32);
+        Self {
+            sid,
+            deadline,
+            max_verdict,
+            header: [0; 5],
+            filled: 0,
+            established: false,
+            header_error: false,
+            ambiguous: false,
+            body: Vec::with_capacity(max_verdict),
+            body_seen: 0,
+            eof: false,
+            decided: false,
+            reported: false,
+            failure: None,
+        }
+    }
+    fn fail(&mut self, failure: Failure) {
+        if !self.decided {
+            self.decided = true;
+            self.failure = Some(failure);
+            self.body.clear();
+        }
+    }
+    pub(crate) fn cancel(&mut self) {
+        self.fail(Failure::Cancelled);
+    }
+    pub(crate) fn finished(&self) -> bool {
+        self.eof
+    }
+    /// Only a terminal owned producer stream before any session stage proves
+    /// the child performed no descendant-producing work. Cancellation is not proof.
+    pub(crate) fn pre_session_terminal(&self) -> bool {
+        self.eof
+            && !self.established
+            && !self.ambiguous
+            && (self.filled == 0 || (self.header_error && self.body_seen == 0))
+    }
+    /// Consume at most 512 bytes per pass and yield on Interrupted. Deadline and
+    /// refusal are sticky, but queued startup authority is still consumed.
+    pub(crate) fn poll(&mut self, input: &mut impl Read, now: Instant) -> VerificationUpdate {
+        if self.eof {
+            return VerificationUpdate::default();
+        }
+        if now >= self.deadline {
+            self.fail(Failure::TimedOut);
+        }
+        let mut update = VerificationUpdate::default();
+        let mut chunk = [0u8; 512];
+        let mut consumed = 0;
+        while consumed < chunk.len() {
+            let header = self.filled < self.header.len();
+            let size = if header {
+                self.header.len() - self.filled
+            } else {
+                chunk.len() - consumed
+            };
+            let size = size.min(chunk.len() - consumed);
+            let count = match input.read(&mut chunk[..size]) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break
+                }
+                Err(_) => {
+                    self.ambiguous = true;
+                    self.fail(Failure::Read);
+                    break;
+                }
+                Ok(0) => {
+                    self.eof = true;
+                    if self.filled != self.header.len() {
+                        self.ambiguous |= self.filled != 0;
+                        self.fail(Failure::Protocol);
+                    } else if !self.decided {
+                        self.decided = true;
+                    }
+                    break;
+                }
+                Ok(count) => count,
+            };
+            consumed += count;
+            if header {
+                self.header[self.filled..self.filled + count].copy_from_slice(&chunk[..count]);
+                self.filled += count;
+                if self.filled == self.header.len() {
+                    let value = i32::from_ne_bytes(self.header[1..].try_into().unwrap());
+                    match self.header[0] {
+                        1 if !self.ambiguous && value > 0 && value as u32 == self.sid => {
+                            self.established = true;
+                            update.established = Some(SessionEstablished(self.sid));
+                        }
+                        2 if !self.ambiguous && (1..=4095).contains(&value) => {
+                            self.header_error = true;
+                            self.fail(Failure::Os(value));
+                        }
+                        _ => {
+                            self.ambiguous = true;
+                            self.fail(Failure::Protocol);
+                        }
+                    }
+                }
+            } else {
+                self.body_seen = self
+                    .body_seen
+                    .saturating_add(count)
+                    .min(self.max_verdict.saturating_add(1));
+                if self.header_error || self.body_seen > self.max_verdict {
+                    self.ambiguous = true;
+                    self.fail(Failure::Protocol);
+                } else if self.failure.is_none() {
+                    self.body.extend_from_slice(&chunk[..count]);
+                }
+            }
+        }
+        if self.decided && !self.reported {
+            self.reported = true;
+            update.result = Some(match self.failure {
+                Some(failure) => Err(failure),
+                None => Ok(std::mem::take(&mut self.body)),
+            });
+        }
+        update
+    }
+}
+
+#[cfg(test)]
+#[path = "verification_reader_tests.rs"]
+mod verification_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

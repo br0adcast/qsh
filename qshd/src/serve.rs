@@ -527,7 +527,12 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // service at once rather than after a process tree exists.
         return crate::helper::split_and_run(
             helper_config,
-            move |spawner, helper_auth, login_ends| {
+            move |mut spawner, mut helper_auth, login_ends| {
+                // Fixed custody is outside all published Arc clients. On an
+                // early construction failure it stops/joins started siblings.
+                let mut auxiliary = crate::helper::worker_threads::WorkerThreads::default();
+                auxiliary.absorb(spawner.take_auxiliary());
+                auxiliary.absorb(helper_auth.take_auxiliary());
                 // Built HERE, in the worker, after the split -- unlike the
                 // personal mode's, below: the helper-backed source of nonces and
                 // verdicts exists only on this side of the fork. The pool, above
@@ -536,8 +541,11 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                 // one. It draws from the one helper client there is, and fills
                 // itself before the runtime below exists.
                 let helper_auth = Arc::new(helper_auth);
-                let nonces = crate::nonce_pool::PooledNonces::start(Arc::clone(&helper_auth))
-                    .context("starting the nonce pool")?;
+                let nonces = crate::nonce_pool::PooledNonces::start_owned(
+                    Arc::clone(&helper_auth),
+                    &mut auxiliary,
+                )
+                .context("starting the nonce pool")?;
                 // A fresh allowlist that nothing else holds: see
                 // `refuse_the_allowlist_path` for why both halves matter.
                 let auth = system_server_auth(
@@ -551,6 +559,9 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                     .enable_all()
                     .build()
                     .context("creating the tokio runtime")?;
+                // Legacy serve return/cancellation is not a manager drain
+                // receipt. The auxiliary owner's fallback joins its threads,
+                // but cannot certify worker/global cleanup or producer settlement.
                 runtime.block_on(transport_daemon::run_serve_loop(
                     socket,
                     keypair.private,

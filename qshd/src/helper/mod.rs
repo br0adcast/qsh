@@ -34,6 +34,7 @@ mod monitor;
 /// tests and carried `#[cfg_attr(not(test), allow(dead_code))]`; the
 /// allowance went with the caller's arrival, as it was promised it would.
 mod pam;
+pub mod pam_completion;
 /// The helper's waiting room: requests whose child has not spoken yet.
 /// Private to `helper` -- nothing outside it has any business holding one.
 mod pending;
@@ -46,6 +47,9 @@ mod shell_owner;
 pub mod spawner;
 #[cfg(target_os = "linux")]
 mod startup;
+#[cfg(target_os = "linux")]
+mod verification;
+pub(crate) mod worker_threads;
 
 use anyhow::Context;
 

@@ -296,17 +296,8 @@ fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
             }
         }
         let member_product_exited = case.jobs.as_ref().unwrap().member.exited();
-        if mode == "login-ended" {
-            // This case isolates scope-before-PAM ordering while the helper
-            // remains alive. Immediate helper exit while a retired monitor
-            // closes its transaction is separate shutdown-coordination coverage.
-            while (!closed.exists() || !case.jobs.as_ref().unwrap().monitor.exited())
-                && Instant::now() < deadline
-            {
-                early_close |= !case.jobs.as_ref().unwrap().member.exited() && closed.exists();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        // Do not keep the helper alive for PAM closure: LoginEnded followed by
+        // immediate helper stop is the original retiring-monitor regression.
         let elapsed = started.elapsed();
         let joined = case.finish(); // exact-instance cleanup and real join precede assertions
         eprintln!("owned helper acceptance {mode}: receipt={receipt}, member_exited={member_product_exited}, closed={}, joined={joined}", closed.exists());

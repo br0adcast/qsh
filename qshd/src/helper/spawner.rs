@@ -48,6 +48,7 @@ use super::protocol::{
     decode, encode, AuthRequest, AuthRequestId, AuthResponse, ChannelId, CleanupKind, Nonce,
     Request, Response,
 };
+use super::worker_threads::{Role as ThreadRole, WorkerThreads};
 
 /// The most bytes of a thread's name Linux keeps: `TASK_COMM_LEN` is 16,
 /// with the terminating NUL. A longer name is cut to this silently, so
@@ -172,6 +173,7 @@ const TELL_RETRY_DELAY: Duration = Duration::from_millis(500);
 pub(crate) enum Wake {
     Late(Nonce),
     Flush,
+    Finish(Instant),
 }
 
 /// Where the worker hands on the end of a login the HELPER reported
@@ -358,6 +360,7 @@ pub struct HelperChannelSpawner {
     /// open be given up on must not wait out the production budget to see
     /// it.
     open_timeout: Duration,
+    auxiliary: Mutex<Option<WorkerThreads>>,
 }
 
 /// What a caller is waiting for on one channel id.
@@ -399,6 +402,15 @@ impl Pending {
 }
 
 impl HelperChannelSpawner {
+    /// Production takes custody before publishing this client in an Arc.
+    pub(crate) fn take_auxiliary(&mut self) -> WorkerThreads {
+        self.auxiliary
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("channel reader custody is transferred once")
+    }
+
     /// Take the worker's end of the pair and start the reader thread.
     ///
     /// Does not end the process if the reader thread later notices the
@@ -526,7 +538,10 @@ impl HelperChannelSpawner {
         let waiting_thread = Arc::clone(&waiting);
         let disconnected_locally = Arc::new(AtomicBool::new(false));
         let disconnected_locally_thread = Arc::clone(&disconnected_locally);
-        std::thread::Builder::new()
+        let stop_socket = sock.try_clone()?;
+        let stop_flag = disconnected_locally.clone();
+        let mut auxiliary = WorkerThreads::default();
+        let reader = std::thread::Builder::new()
             .name(CHANNEL_READER_THREAD.to_string())
             .spawn(move || {
                 read_loop(
@@ -535,8 +550,13 @@ impl HelperChannelSpawner {
                     disconnected_locally_thread,
                     on_helper_gone,
                     login_ended,
-                )
+                );
+                Ok(())
             })?;
+        auxiliary.register(ThreadRole::ChannelReader, reader, move || {
+            stop_flag.store(true, Ordering::SeqCst);
+            stop_socket.shutdown(std::net::Shutdown::Both)
+        });
         Ok(HelperChannelSpawner {
             opens: transport::channel_open::ChannelOpenRegistry::new(Default::default()),
             budget,
@@ -545,36 +565,24 @@ impl HelperChannelSpawner {
             waiting,
             disconnected_locally,
             open_timeout,
+            auxiliary: Mutex::new(Some(auxiliary)),
         })
     }
 }
 
 impl Drop for HelperChannelSpawner {
-    /// Shuts the connection down rather than merely dropping our own copy
-    /// of the descriptor.
-    ///
-    /// The reader thread owns its OWN `try_clone`'d copy (so does every
-    /// `HelperWait` that is still alive), so dropping only `self.tx` would
-    /// leave the socket referenced -- and so, from the far end's point of
-    /// view, open -- for as long as that thread runs, which is forever: it
-    /// has no other way to learn the spawner is gone. `shutdown` is not
-    /// reference-counted the way `close` is: it acts on the connection
-    /// itself, so one call here is visible on every `dup`'d descriptor at
-    /// once, including the reader thread's, AND is visible to whatever is
-    /// on the other end (the helper, or in a test, whatever stands in for
-    /// it) exactly as if the worker process itself had exited. The reader
-    /// thread's next `recv` then returns rather than blocking forever, and
-    /// ends the thread.
-    ///
-    /// Marks [`HelperChannelSpawner::disconnected_locally`] first, and
-    /// BEFORE shutting down -- once the socket closes, the reader thread
-    /// (and any `HelperWait` already blocked in `wait()`) can wake up and
-    /// read that flag at any moment, so it must already be `true` by then,
-    /// not "soon after."
+    /// Standalone fixtures retain local custody. Production transfers it to
+    /// the serving worker before Arc publication, so dropping a client cannot
+    /// shut a seam while its global owner still owes an ordered thread drain.
     fn drop(&mut self) {
-        self.disconnected_locally.store(true, Ordering::SeqCst);
-        let tx = self.tx.lock().expect("the helper socket is never poisoned");
-        let _ = tx.shutdown(std::net::Shutdown::Both);
+        if let Some(mut owner) = self
+            .auxiliary
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            owner.stop_and_join();
+        }
     }
 }
 
@@ -1306,6 +1314,20 @@ type RecvMessage = fn(&UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd
 /// left until then (see `HelperAuth::with_io`).
 type SendMessage = fn(&UnixStream, &[u8]) -> io::Result<()>;
 
+type SpawnAuxiliary = fn(
+    &str,
+    Box<dyn FnOnce() -> io::Result<()> + Send>,
+) -> io::Result<std::thread::JoinHandle<io::Result<()>>>;
+
+fn spawn_auxiliary(
+    name: &str,
+    body: Box<dyn FnOnce() -> io::Result<()> + Send>,
+) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(body)
+}
+
 /// What a failed send on the seam is called in the log and in errors. A send
 /// that timed out on a full socket -- the helper has stopped reading -- says
 /// so, rather than "Resource temporarily unavailable".
@@ -1369,6 +1391,7 @@ pub struct HelperAuth {
     /// drives [`AuthSeam::route`] itself -- a late nonce. The reader holds a
     /// sender of its own.
     late: Sender<Wake>,
+    auxiliary: Mutex<Option<WorkerThreads>>,
 }
 
 /// What [`HelperAuth`] and its reader thread share.
@@ -1393,6 +1416,7 @@ struct AuthSeam {
     /// so they leave in the order they were queued. Never held across any
     /// input or output.
     tells: Mutex<Tells>,
+    late_after_seal: Arc<AtomicBool>,
     /// Tell sends that failed since the last one that did not -- counted for
     /// the log, which says so at 1, 2, 4, 8... in a row.
     failed_tell_sends: AtomicU64,
@@ -1414,6 +1438,7 @@ struct AuthSeam {
 /// its own bound ([`MAX_QUEUED_RELEASES`], [`MAX_QUEUED_LOGIN_ENDS`]).
 #[derive(Default)]
 struct Tells {
+    sealed: bool,
     queue: VecDeque<Request>,
     releases: usize,
     login_ends: usize,
@@ -1549,9 +1574,13 @@ impl AuthSeam {
     /// Past its kind's bound, a release is dropped, with a line in the log
     /// (see [`MAX_QUEUED_RELEASES`]). A login's end is not: the worker is
     /// ended instead (see [`MAX_QUEUED_LOGIN_ENDS`]), and the end is queued
-    /// all the same -- only a test's hook returns.
+    /// all the same if the queue remains open when a returning hook completes.
     fn queue_tell(&self, body: Request) {
         let mut tells = self.lock_tells();
+        if tells.sealed {
+            self.late_after_seal.store(true, Ordering::SeqCst);
+            return;
+        }
         let over_bound = match body {
             Request::LoginEnded { .. } => tells.login_ends >= MAX_QUEUED_LOGIN_ENDS,
             _ => tells.releases >= MAX_QUEUED_RELEASES,
@@ -1573,6 +1602,10 @@ impl AuthSeam {
             }
             (self.end_worker)(LOGIN_ENDS_OVERFLOW_REASON);
             tells = self.lock_tells();
+            if tells.sealed {
+                self.late_after_seal.store(true, Ordering::SeqCst);
+                return;
+            }
         }
         tells.push_back(body);
     }
@@ -1729,7 +1762,7 @@ fn hand_to_releaser(late_nonces: &Sender<Wake>, nonce: Nonce) {
 /// wake it any more. A login's end whose send failed is sent again after
 /// [`TELL_RETRY_DELAY`], woken or not. If the thread stops any other way --
 /// a panic -- its [`ReleaserExit`] says so, and ends the worker.
-fn send_tells(seam: Arc<AuthSeam>, wakes: Receiver<Wake>) {
+fn send_tells(seam: Arc<AuthSeam>, wakes: Receiver<Wake>) -> io::Result<()> {
     let _exit = ReleaserExit {
         seam: Arc::clone(&seam),
     };
@@ -1745,7 +1778,19 @@ fn send_tells(seam: Arc<AuthSeam>, wakes: Receiver<Wake>) {
         match wake {
             Ok(Wake::Late(nonce)) => seam.queue_tell(Request::ReleaseNonce { nonce }),
             Ok(Wake::Flush) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(Wake::Finish(deadline)) => {
+                // Reader/pool/manager producers must have settled before a
+                // qualified finish. Seal atomically; any later required tell
+                // remains a retained owner fault, not a successful silent drop.
+                seam.lock_tells().sealed = true;
+                let sender = seam.lock_sender();
+                let flushed = seam
+                    .flush_tells(&sender, deadline)
+                    .map_err(io::Error::other);
+                let closed = sender.shutdown(std::net::Shutdown::Write);
+                return flushed.and(closed);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         retry = seam.send_queued().is_err();
     }
@@ -1861,6 +1906,15 @@ fn timed_out(budget: Duration) -> AuthError {
 }
 
 impl HelperAuth {
+    /// Production takes custody before publishing this client in an Arc.
+    pub(crate) fn take_auxiliary(&mut self) -> WorkerThreads {
+        self.auxiliary
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("authentication thread custody is transferred once")
+    }
+
     /// Take the worker's end of the authentication seam, and start its
     /// reader thread.
     ///
@@ -2011,6 +2065,29 @@ impl HelperAuth {
         recv: RecvMessage,
         send: SendMessage,
     ) -> io::Result<HelperAuth> {
+        Self::build_with_spawn(
+            sock,
+            timeout,
+            verify_timeout,
+            on_helper_gone,
+            end_worker,
+            recv,
+            send,
+            spawn_auxiliary,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_spawn(
+        sock: UnixStream,
+        timeout: Duration,
+        verify_timeout: Duration,
+        on_helper_gone: Box<dyn FnOnce() + Send>,
+        end_worker: EndWorker,
+        recv: RecvMessage,
+        send: SendMessage,
+        spawn: SpawnAuxiliary,
+    ) -> io::Result<HelperAuth> {
         // A send to a helper that has stopped reading fails within the
         // budget a nonce's answer gets, instead of blocking forever -- and
         // holding the send lock all that while -- once the socket's buffer
@@ -2033,6 +2110,7 @@ impl HelperAuth {
             }),
             disconnected_locally: AtomicBool::new(false),
             tells: Mutex::new(Tells::default()),
+            late_after_seal: Arc::new(AtomicBool::new(false)),
             failed_tell_sends: AtomicU64::new(0),
             dropped_releases: AtomicU64::new(0),
             login_end_stuck: AtomicBool::new(false),
@@ -2043,20 +2121,44 @@ impl HelperAuth {
         // gone: the reader's, when the reader ends, and this value's, when
         // it is dropped.
         let (late, late_rx) = mpsc::channel::<Wake>();
+        let stop_read = reading.try_clone()?;
+        let mut auxiliary = WorkerThreads::default();
+        auxiliary.watch(ThreadRole::TellReleaser, seam.late_after_seal.clone());
         let releaser_seam = Arc::clone(&seam);
-        std::thread::Builder::new()
-            .name(AUTH_RELEASE_THREAD.to_string())
-            .spawn(move || send_tells(releaser_seam, late_rx))?;
+        let release_thread = spawn(
+            AUTH_RELEASE_THREAD,
+            Box::new(move || send_tells(releaser_seam, late_rx)),
+        )?;
+        let finish = late.clone();
+        auxiliary.register(ThreadRole::TellReleaser, release_thread, move || {
+            finish
+                .send(Wake::Finish(Instant::now() + timeout))
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "tell releaser already stopped")
+                })
+        });
         let reader_seam = Arc::clone(&seam);
         let reader_late = late.clone();
-        std::thread::Builder::new()
-            .name(AUTH_READER_THREAD.to_string())
-            .spawn(move || read_answers(reader_seam, reading, recv, on_helper_gone, reader_late))?;
+        let reader_thread = spawn(
+            AUTH_READER_THREAD,
+            Box::new(move || {
+                read_answers(reader_seam, reading, recv, on_helper_gone, reader_late);
+                Ok(())
+            }),
+        )?;
+        let stopping_seam = seam.clone();
+        auxiliary.register(ThreadRole::AuthReader, reader_thread, move || {
+            stopping_seam
+                .disconnected_locally
+                .store(true, Ordering::SeqCst);
+            stop_read.shutdown(std::net::Shutdown::Read)
+        });
         Ok(HelperAuth {
             seam,
             timeout,
             verify_timeout,
             late,
+            auxiliary: Mutex::new(Some(auxiliary)),
         })
     }
 
@@ -2220,26 +2322,19 @@ impl HelperAuth {
 }
 
 impl Drop for HelperAuth {
-    /// Shuts the connection down rather than merely dropping this copy of
-    /// the descriptor: the reader thread holds a copy of its own and would
-    /// otherwise wait on it for ever, and the helper would never see this
-    /// seam close. `shutdown` acts on the connection, so the reader's next
-    /// receive returns and the thread ends.
-    ///
-    /// Marks the disconnect as local first, before the reader can wake and
-    /// read the flag -- see [`HelperChannelSpawner`]'s `Drop`, which does
-    /// the same for the same reason.
-    ///
-    /// What is still queued goes out first, within one budget. Past that
-    /// nothing is lost that matters: the helper's loop ends once this seam
-    /// closes, and every login it trusted goes with it.
+    /// Local fixture cleanup joins the reader before the final ordered tell
+    /// flush and releaser join. A transferred production owner preserves the
+    /// writable seam independently of this client's Arc lifetime. This is
+    /// auxiliary custody, not a proof of manager/required-producer settlement.
     fn drop(&mut self) {
-        self.seam.disconnected_locally.store(true, Ordering::SeqCst);
-        let sender = self.seam.lock_sender();
-        let _ = self
-            .seam
-            .flush_tells(&sender, Instant::now() + self.timeout);
-        let _ = sender.shutdown(std::net::Shutdown::Both);
+        if let Some(mut auxiliary) = self
+            .auxiliary
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            auxiliary.stop_and_join();
+        }
     }
 }
 
@@ -2375,6 +2470,7 @@ impl LoginSink for HelperAuth {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("spawner_auxiliary_tests.rs");
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
