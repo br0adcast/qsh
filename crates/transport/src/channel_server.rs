@@ -383,6 +383,12 @@ enum UpdateSlot {
     Idle,
     /// The daemon is deciding an offer (off the loop).
     Deciding,
+    /// The original attachment must commit Accept before receiving can start.
+    Accepting {
+        size: u64,
+        transfer: Box<dyn UpdateTransfer>,
+        committed: tokio::sync::oneshot::Receiver<()>,
+    },
     /// Accepted: `remaining` more bytes are expected on `UPDATE_STREAM`, each
     /// handed to the blocking receiver through `tx`.
     Receiving {
@@ -396,6 +402,7 @@ enum UpdateSlot {
 /// What a blocking call into the daemon came back with.
 enum DaemonReply {
     Offer {
+        origin: AttachmentContext,
         size: u64,
         decision: Result<Box<dyn UpdateTransfer>, UpdateAnswer>,
     },
@@ -462,15 +469,29 @@ fn send_about_result(io: &SessionIo, waiter: AboutWaiter, result: &AboutResult) 
     io.send_reserved_control(waiter.origin, bytes, part);
 }
 
+struct UpdateChain {
+    origin: AttachmentContext,
+    response: crate::control_budget::ResponseOwner,
+    job: crate::control_job::JobOwner,
+}
+
 /// Everything one session keeps about updating the daemon.
 struct SessionUpdate {
     about: Option<AboutFlight>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     restart_rx: Option<watch::Receiver<RestartSignal>>,
-    replies_tx: mpsc::UnboundedSender<DaemonReply>,
-    replies_rx: mpsc::UnboundedReceiver<DaemonReply>,
+    chain: Option<UpdateChain>,
+    replies_rx: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<DaemonReply, crate::session_manager::CallbackFailure>,
+        >,
+    >,
     slot: UpdateSlot,
-    task: Option<tokio::task::JoinHandle<UpdateTaskEnd>>,
+    task: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<UpdateTaskEnd, crate::session_manager::CallbackFailure>,
+        >,
+    >,
     /// The restart this session last told its client `Restarting` about.
     /// A watch channel keeps only the latest value, so a runner busy
     /// elsewhere can see `Draining` without ever having seen `Announced`, or
@@ -501,13 +522,12 @@ impl SessionUpdate {
                 rx.mark_changed();
             }
         }
-        let (replies_tx, replies_rx) = mpsc::unbounded_channel();
         SessionUpdate {
             about: None,
             daemon,
             restart_rx,
-            replies_tx,
-            replies_rx,
+            chain: None,
+            replies_rx: None,
             slot: UpdateSlot::Idle,
             task: None,
             announced: None,
@@ -578,64 +598,139 @@ impl SessionUpdate {
         }
     }
 
-    fn offer(&mut self, io: &SessionIo, offer: UpdateOffer) {
+    fn offer(
+        &mut self,
+        io: &SessionIo,
+        origin: AttachmentContext,
+        offer: UpdateOffer,
+        response: Option<crate::control_budget::ResponsePermit>,
+    ) {
         let Some(daemon) = self.daemon.clone() else {
             return;
         };
+        let mut response = response
+            .expect("offer effects require response preflight")
+            .into_owner();
         if !matches!(self.slot, UpdateSlot::Idle) {
-            send_answer(io, UpdateAnswer::InProgress);
+            send_reserved_answer(io, origin, &mut response, UpdateAnswer::InProgress);
             return;
         }
+        let mut job = match crate::control_job::JobOwner::reserve(
+            io.control_budget(),
+            crate::control_budget::Job::Update,
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                send_reserved_answer(io, origin, &mut response, UpdateAnswer::ResourceExhausted);
+                return;
+            }
+        };
+        let lease = job.take_worker().expect("reserved offer phase");
+        self.chain = Some(UpdateChain {
+            origin,
+            response,
+            job,
+        });
         self.slot = UpdateSlot::Deciding;
         let from = io.principal().clone();
-        let replies = self.replies_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        self.replies_rx = Some(io.spawn_callback(lease, move || {
             let decision = daemon.offer(&from, &offer);
-            let _ = replies.send(DaemonReply::Offer {
+            DaemonReply::Offer {
+                origin,
                 size: offer.size,
                 decision,
-            });
-        });
+            }
+        }));
     }
 
     fn on_reply(&mut self, io: &SessionIo, reply: DaemonReply) {
+        let DaemonReply::Offer { origin, .. } = &reply;
+        if *origin != io.processed_attachment() {
+            self.slot = UpdateSlot::Idle;
+            self.chain = None;
+            return;
+        }
         match reply {
             DaemonReply::Offer {
                 decision: Err(refusal),
                 ..
             } => {
                 self.slot = UpdateSlot::Idle;
-                send_answer(io, refusal);
+                let mut chain = self.chain.take().expect("reserved offer chain");
+                send_reserved_answer(io, chain.origin, &mut chain.response, refusal);
             }
             DaemonReply::Offer {
                 size,
                 decision: Ok(transfer),
+                ..
             } => {
-                let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                let stall = self
-                    .daemon
-                    .as_ref()
-                    .map_or(TRANSFER_STALL, |d| d.stall_timeout());
-                self.handed = 0;
-                self.taken.store(0, Ordering::SeqCst);
-                let taken = Arc::clone(&self.taken);
-                let reporter = io.consumption_reporter();
-                self.task = Some(tokio::task::spawn_blocking(move || {
-                    receive_and_verify(rx, transfer, size, stall, &reporter, &taken)
-                }));
-                // An empty image is already whole: dropping `tx` here tells
-                // the receiver so.
-                self.slot = if size == 0 {
-                    UpdateSlot::Finishing
-                } else {
-                    UpdateSlot::Receiving {
-                        tx,
-                        remaining: size,
-                    }
+                let chain = self.chain.as_mut().expect("reserved offer chain");
+                let part = chain.response.take_record(6).expect("reserved Accept");
+                let committed = io.commit_update(chain.origin, part);
+                self.slot = UpdateSlot::Accepting {
+                    size,
+                    transfer,
+                    committed,
                 };
-                send_answer(io, UpdateAnswer::Accept);
             }
         }
+    }
+
+    fn on_acceptance(&mut self, io: &SessionIo, committed: bool) {
+        let slot = std::mem::replace(&mut self.slot, UpdateSlot::Idle);
+        let UpdateSlot::Accepting { size, transfer, .. } = slot else {
+            unreachable!("one pending acceptance receipt");
+        };
+        if !committed {
+            self.chain = None;
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let stall = self
+            .daemon
+            .as_ref()
+            .map_or(TRANSFER_STALL, |d| d.stall_timeout());
+        self.handed = 0;
+        self.taken.store(0, Ordering::SeqCst);
+        let taken = Arc::clone(&self.taken);
+        let reporter = io.consumption_reporter();
+        let lease = self
+            .chain
+            .as_mut()
+            .expect("accepted update chain")
+            .job
+            .take_worker()
+            .expect("reserved receive/verify phase");
+        self.task = Some(io.spawn_callback(lease, move || {
+            receive_and_verify(rx, transfer, size, stall, &reporter, &taken)
+        }));
+        self.slot = if size == 0 {
+            UpdateSlot::Finishing
+        } else {
+            UpdateSlot::Receiving {
+                tx,
+                remaining: size,
+            }
+        };
+    }
+
+    fn send_result(&mut self, io: &SessionIo, result: UpdateResult) {
+        let result = match result {
+            UpdateResult::Rejected { code, detail } => UpdateResult::Rejected {
+                code,
+                detail: crate::channel::bounded_control_diagnostic(detail, 2),
+            },
+            result => result,
+        };
+        let bytes = encode_server(&ServerRecord::UpdateResult(result));
+        let part = self
+            .chain
+            .as_mut()
+            .expect("accepted outcome reservation")
+            .response
+            .take_record(bytes.len())
+            .expect("finite reserved update outcome");
+        io.send_session_control(bytes, part);
     }
 
     /// Bytes on `UPDATE_STREAM`. Without an accepted transfer in this
@@ -739,31 +834,46 @@ impl SessionUpdate {
             UpdateTaskEnd::Verified(transfer) => {
                 // Said before the attempt: once it succeeds, nothing of this
                 // process is left to say anything.
-                send_result(io, UpdateResult::Restarting);
-                self.task = Some(tokio::task::spawn_blocking(move || {
-                    UpdateTaskEnd::Failed(transfer.restart())
-                }));
+                self.send_result(io, UpdateResult::Restarting);
+                let lease = self
+                    .chain
+                    .as_mut()
+                    .expect("accepted update chain")
+                    .job
+                    .take_worker()
+                    .expect("reserved restart phase");
+                self.task = Some(
+                    io.spawn_callback(lease, move || UpdateTaskEnd::Failed(transfer.restart())),
+                );
             }
             UpdateTaskEnd::Failed(result) => {
-                send_result(io, result);
+                self.send_result(io, result);
                 self.slot = UpdateSlot::Idle;
+                self.chain = None;
             }
         }
     }
 }
 
-fn send_answer(io: &SessionIo, answer: UpdateAnswer) {
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::UpdateAnswer(answer)),
-    );
-}
-
-fn send_result(io: &SessionIo, result: UpdateResult) {
-    io.send(
-        CONTROL_STREAM,
-        encode_server(&ServerRecord::UpdateResult(result)),
-    );
+fn send_reserved_answer(
+    io: &SessionIo,
+    origin: AttachmentContext,
+    response: &mut crate::control_budget::ResponseOwner,
+    answer: UpdateAnswer,
+) {
+    if matches!(
+        answer,
+        UpdateAnswer::ResourceExhausted | UpdateAnswer::ProviderFailed
+    ) && !origin.features.contains(crate::Features::RESOURCE_LIMITS)
+    {
+        io.close_session(origin);
+        return;
+    }
+    let bytes = encode_server(&ServerRecord::UpdateAnswer(answer));
+    let part = response
+        .take_record(bytes.len())
+        .expect("reserved update answer");
+    io.send_reserved_control(origin, bytes, part);
 }
 
 /// The blocking half of a transfer: take the image as it arrives, then
@@ -826,24 +936,45 @@ async fn restart_signal_changed(rx: &mut Option<watch::Receiver<RestartSignal>>)
     *rx.borrow_and_update()
 }
 
-/// The next reply from a blocking call into the daemon. The session holds a
-/// sender itself, so this never ends on its own.
-async fn next_reply(rx: &mut mpsc::UnboundedReceiver<DaemonReply>) -> DaemonReply {
-    match rx.recv().await {
-        Some(reply) => reply,
-        None => std::future::pending().await,
+/// One bounded result from an actual-joined offer callback.
+async fn next_reply(
+    rx: &mut Option<
+        tokio::sync::oneshot::Receiver<
+            Result<DaemonReply, crate::session_manager::CallbackFailure>,
+        >,
+    >,
+) -> Option<DaemonReply> {
+    let result = match rx.as_mut() {
+        Some(rx) => rx.await,
+        None => return std::future::pending().await,
+    };
+    *rx = None;
+    result.ok().and_then(Result::ok)
+}
+
+async fn acceptance_committed(slot: &mut UpdateSlot) -> bool {
+    match slot {
+        UpdateSlot::Accepting { committed, .. } => committed.await.is_ok(),
+        _ => std::future::pending().await,
     }
 }
 
-/// Waits for the running update task, and clears the slot it was in.
-async fn join_update(task: &mut Option<tokio::task::JoinHandle<UpdateTaskEnd>>) -> UpdateTaskEnd {
+/// One phase result is published only after actual blocking join.
+async fn join_update(
+    task: &mut Option<
+        tokio::sync::oneshot::Receiver<
+            Result<UpdateTaskEnd, crate::session_manager::CallbackFailure>,
+        >,
+    >,
+) -> UpdateTaskEnd {
     let end = match task.as_mut() {
-        Some(handle) => handle.await.unwrap_or_else(|_| {
-            UpdateTaskEnd::Failed(UpdateResult::Rejected {
+        Some(receiver) => match receiver.await {
+            Ok(Ok(end)) => end,
+            _ => UpdateTaskEnd::Failed(UpdateResult::Rejected {
                 code: RejectCode::Other,
-                detail: "the update task failed".to_string(),
-            })
-        }),
+                detail: "the update provider failed".to_string(),
+            }),
+        },
         None => std::future::pending().await,
     };
     *task = None;
@@ -1477,7 +1608,8 @@ enum Wakeup {
     /// The restart signal moved.
     Restart(RestartSignal),
     /// A blocking call into the daemon came back.
-    Reply(DaemonReply),
+    Reply(Option<DaemonReply>),
+    Acceptance(bool),
     /// This session's update task ended.
     Update(UpdateTaskEnd),
 }
@@ -1695,13 +1827,26 @@ pub async fn run_channel_session_with(
                         break;
                     }
                 };
-                let about_response = if update.daemon.is_some()
-                    && matches!(decode_client(raw), Ok(ClientRecord::AboutRequest))
-                {
-                    match io
-                        .control_budget()
-                        .reserve(crate::control_budget::Response::Ordinary(ABOUT_RECORD_MAX))
-                    {
+                let response_class = if update.daemon.is_some() {
+                    match decode_client(raw) {
+                        Ok(ClientRecord::AboutRequest) => {
+                            Some(crate::control_budget::Response::Ordinary(ABOUT_RECORD_MAX))
+                        }
+                        Ok(ClientRecord::UpdateOffer(_))
+                            if matches!(update.slot, UpdateSlot::Idle) =>
+                        {
+                            Some(crate::control_budget::Response::Update)
+                        }
+                        Ok(ClientRecord::UpdateOffer(_)) => {
+                            Some(crate::control_budget::Response::Ordinary(6))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let response = if let Some(class) = response_class {
+                    match io.control_budget().reserve(class) {
                         Ok(response) => Some(response),
                         Err(_) => {
                             control_blocked = true;
@@ -1724,7 +1869,7 @@ pub async fn run_channel_session_with(
                     &executor,
                     &mut opening,
                     raw,
-                    about_response,
+                    response,
                     &mut term,
                     &mut update,
                     &producer,
@@ -1752,19 +1897,28 @@ pub async fn run_channel_session_with(
                 refund();
             }
         }
+        // Accept is committed before the peer can send valid image bytes.
+        // Observe its ready receipt before polling inbound data, preserving
+        // fairness among all the ordinary runner arms in the inner select.
         let wakeup = tokio::select! {
-            _ = std::future::ready(()), if more_control => Wakeup::ControlReady,
-            _ = &mut capacity_changed, if control_blocked => Wakeup::CapacityReady,
-            about = next_about(&mut update.about) => Wakeup::About(about),
-            ev = io.recv() => Wakeup::Inbound(ev),
-            c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
-            _ = ack_tick.tick() => Wakeup::AckTick,
-            _ = producer.ready.notified() => Wakeup::OutputReady,
-            _ = producer.opens.notified() => Wakeup::OpenReady,
-            done = reaps.next(), if !reaps.is_empty() => Wakeup::Reaped(done),
-            signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
-            reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
-            end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
+            biased;
+            committed = acceptance_committed(&mut update.slot) => Wakeup::Acceptance(committed),
+            wakeup = async {
+                tokio::select! {
+                    _ = std::future::ready(()), if more_control => Wakeup::ControlReady,
+                    _ = &mut capacity_changed, if control_blocked => Wakeup::CapacityReady,
+                    about = next_about(&mut update.about) => Wakeup::About(about),
+                    ev = io.recv() => Wakeup::Inbound(ev),
+                    c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
+                    _ = ack_tick.tick() => Wakeup::AckTick,
+                    _ = producer.ready.notified() => Wakeup::OutputReady,
+                    _ = producer.opens.notified() => Wakeup::OpenReady,
+                    done = reaps.next(), if !reaps.is_empty() => Wakeup::Reaped(done),
+                    signal = restart_signal_changed(&mut update.restart_rx) => Wakeup::Restart(signal),
+                    reply = next_reply(&mut update.replies_rx) => Wakeup::Reply(reply),
+                    end = join_update(&mut update.task), if update.task.is_some() => Wakeup::Update(end),
+                }
+            } => wakeup,
         };
 
         match wakeup {
@@ -2047,7 +2201,19 @@ pub async fn run_channel_session_with(
                     }
                 }
             }
-            Wakeup::Reply(reply) => update.on_reply(&io, reply),
+            Wakeup::Reply(Some(reply)) => update.on_reply(&io, reply),
+            Wakeup::Reply(None) => {
+                update.slot = UpdateSlot::Idle;
+                if let Some(mut chain) = update.chain.take() {
+                    send_reserved_answer(
+                        &io,
+                        chain.origin,
+                        &mut chain.response,
+                        UpdateAnswer::ProviderFailed,
+                    );
+                }
+            }
+            Wakeup::Acceptance(committed) => update.on_acceptance(&io, committed),
             Wakeup::Update(end) => update.on_task_end(&io, end),
         }
         if reaps.is_empty() && producer.opens.occupied() == 0 {
@@ -2114,6 +2280,7 @@ pub async fn run_channel_session_with(
     // reader waiting on its shut gate wakes and ends instead of waiting for
     // a bridge that is gone.
     opening.clear();
+    update.slot = UpdateSlot::Idle;
     producer.input_budget.close();
     io.close_send_gates();
     begin_reap_all(&io, &mut channels, &mut reaps);
@@ -2126,8 +2293,13 @@ pub async fn run_channel_session_with(
             signal = restart_signal_changed(&mut update.restart_rx) => {
                 if signal.phase == RestartPhase::Announced { update.join(signal.restart); }
             }
-            reply = next_reply(&mut update.replies_rx) => update.on_reply(&io, reply),
-            end = join_update(&mut update.task), if update.task.is_some() => update.on_task_end(&io, end),
+            _ = next_reply(&mut update.replies_rx), if update.replies_rx.is_some() => {
+                update.slot = UpdateSlot::Idle;
+                update.chain = None;
+            }
+            _ = join_update(&mut update.task), if update.task.is_some() => {
+                update.chain = None;
+            }
         }
     }
     // A session that ends while a restart is under way has, by now, ended
@@ -2235,7 +2407,7 @@ fn apply_control_record(
     executor: &crate::channel_open::ChannelOpenExecutor,
     opening: &mut HashMap<u8, crate::channel_open::OpenJob>,
     raw: RawRecord,
-    about_response: Option<crate::control_budget::ResponsePermit>,
+    response: Option<crate::control_budget::ResponsePermit>,
     term: &mut Option<String>,
     update: &mut SessionUpdate,
     context: &ProducerContext,
@@ -2369,8 +2541,10 @@ fn apply_control_record(
                 }
             }
         }
-        Ok(ClientRecord::AboutRequest) => update.about(io, context.attachment, about_response),
-        Ok(ClientRecord::UpdateOffer(offer)) => update.offer(io, offer),
+        Ok(ClientRecord::AboutRequest) => update.about(io, context.attachment, response),
+        Ok(ClientRecord::UpdateOffer(offer)) => {
+            update.offer(io, context.attachment, offer, response)
+        }
         Err(ChannelCodecError::UnknownKind(_)) => {}
         Err(ChannelCodecError::Malformed)
             if matches!(raw.kind, 0x11 | crate::channel::REC_RESIZE_REQUEST) =>
@@ -2947,6 +3121,7 @@ pub(crate) mod tests {
     include!("channel_server_sync_deadline_tests.rs");
     include!("channel_server_control_bounds_tests.rs");
     include!("channel_server_about_bounds_tests.rs");
+    include!("channel_server_update_bounds_tests.rs");
     use super::*;
     use crate::channel::{decode_server, encode_client, ChannelKind, ClientRecord, OpenRequest};
     use crate::channel::{
@@ -3479,7 +3654,21 @@ pub(crate) mod tests {
             let msg = match msg {
                 // This standalone fixture consumes its owned record. Dropping
                 // that guard is not evidence of a real transport ACK.
-                SessionOutbound::ReservedControl {
+                SessionOutbound::UpdateAccept {
+                    bytes,
+                    delivery,
+                    committed,
+                    ..
+                } => {
+                    let _ = committed.send(());
+                    drop(delivery);
+                    SessionOutbound::Data(StreamData {
+                        stream_id: CONTROL_STREAM,
+                        data: bytes,
+                    })
+                }
+                SessionOutbound::ReservedSessionControl { bytes, delivery }
+                | SessionOutbound::ReservedControl {
                     bytes, delivery, ..
                 } => {
                     drop(delivery);

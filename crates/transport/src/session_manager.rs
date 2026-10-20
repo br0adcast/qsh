@@ -481,6 +481,20 @@ pub enum SessionOutbound {
         bytes: Vec<u8>,
         delivery: ControlDelivery,
     },
+    /// An offer becomes accepted only when its original attachment commits the
+    /// complete reserved Accept record. Dropped receipt means no receive effects.
+    UpdateAccept {
+        origin: AttachmentContext,
+        bytes: Vec<u8>,
+        delivery: ControlDelivery,
+        committed: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Outcome of an already accepted backend operation. The bridge binds it
+    /// to its current committed connection, not the callback's start origin.
+    ReservedSessionControl {
+        bytes: Vec<u8>,
+        delivery: ControlDelivery,
+    },
     /// Fixed terminal overload request; the bridge validates its exact origin.
     ResourceExhausted {
         origin: AttachmentContext,
@@ -669,6 +683,10 @@ impl SessionIo {
         self.lifecycle.spawn_callback(lease, work)
     }
 
+    pub(crate) fn processed_attachment(&self) -> AttachmentContext {
+        self.control().origin.lock().unwrap().attachment
+    }
+
     fn set_control_origin(&self, attachment: AttachmentContext) {
         let mut state = self.control().origin.lock().unwrap();
         if state.attachment != attachment {
@@ -740,6 +758,58 @@ impl SessionIo {
             bytes,
             delivery: ControlDelivery { part, charge },
         });
+    }
+
+    pub(crate) fn commit_update(
+        &self,
+        origin: AttachmentContext,
+        part: crate::control_budget::ResponsePart,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (committed, receipt) = tokio::sync::oneshot::channel();
+        let bytes = crate::channel::encode_server(&crate::channel::ServerRecord::UpdateAnswer(
+            crate::channel::UpdateAnswer::Accept,
+        ));
+        assert_eq!(bytes.len(), part.encoded_bytes());
+        let state = self.control().origin.lock().unwrap();
+        if state.attachment != origin || state.aborting {
+            return receipt;
+        }
+        drop(state);
+        let delivery = self.operation_delivery(bytes.len(), part);
+        let _ = self.outbound.send(SessionOutbound::UpdateAccept {
+            origin,
+            bytes,
+            delivery,
+            committed,
+        });
+        receipt
+    }
+
+    pub(crate) fn send_session_control(
+        &self,
+        bytes: Vec<u8>,
+        part: crate::control_budget::ResponsePart,
+    ) {
+        assert_eq!(bytes.len(), part.encoded_bytes());
+        let delivery = self.operation_delivery(bytes.len(), part);
+        let _ = self
+            .outbound
+            .send(SessionOutbound::ReservedSessionControl { bytes, delivery });
+    }
+
+    fn operation_delivery(
+        &self,
+        bytes: usize,
+        part: crate::control_budget::ResponsePart,
+    ) -> ControlDelivery {
+        let charge = self
+            .gates
+            .admit(crate::channel::CONTROL_STREAM, bytes as u64)
+            .map(|gate| OutputCharge {
+                gate,
+                bytes: bytes as u64,
+            });
+        ControlDelivery { part, charge }
     }
 
     fn send_control(&self, origin: AttachmentContext, bytes: Vec<u8>) {
@@ -3656,9 +3726,11 @@ async fn on_routed_datagram(
 }
 
 struct PendingControl {
-    origin: AttachmentContext,
+    // None is a retained accepted-operation outcome, bound only on enqueue.
+    origin: Option<AttachmentContext>,
     bytes: Vec<u8>,
     delivery: ControlDelivery,
+    committed: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 fn drain_reserved_control(
@@ -3682,10 +3754,16 @@ fn drain_reserved_control(
     let progress = conn.stream_progress(stream);
     ledger.acknowledge(generation, progress.queued.saturating_sub(progress.unacked));
     while let Some(item) = pending.pop_front() {
-        if item.origin.generation != generation
-            || item.origin.session_id != conn.session_id()
-            || parked
-        {
+        if item.origin.is_some_and(|origin| {
+            origin.generation != generation || origin.session_id != conn.session_id()
+        }) {
+            continue;
+        }
+        if parked {
+            if item.origin.is_none() {
+                pending.push_front(item);
+                break;
+            }
             continue;
         }
         let start = conn.stream_progress(stream).queued;
@@ -3709,6 +3787,10 @@ fn drain_reserved_control(
                 #[cfg(test)]
                 CONTROL_RELIABLE_PEAK.with(|peak| peak.set(peak.get().max(progress.unacked)));
                 out.extend(datagrams);
+                // Whole reliable enqueue commits acceptance; this is not ACK.
+                if let Some(committed) = item.committed {
+                    let _ = committed.send(());
+                }
             }
             Err((crate::conn::SendBlocked::WouldBlock, bytes)) => {
                 pending.push_front(PendingControl { bytes, ..item });
@@ -4026,9 +4108,31 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 delivery,
             })) => {
                 pending_control.push_back(PendingControl {
-                    origin,
+                    origin: Some(origin),
                     bytes,
                     delivery,
+                    committed: None,
+                });
+            }
+            Wakeup::Backend(Some(SessionOutbound::UpdateAccept {
+                origin,
+                bytes,
+                delivery,
+                committed,
+            })) => {
+                pending_control.push_back(PendingControl {
+                    origin: Some(origin),
+                    bytes,
+                    delivery,
+                    committed: Some(committed),
+                });
+            }
+            Wakeup::Backend(Some(SessionOutbound::ReservedSessionControl { bytes, delivery })) => {
+                pending_control.push_back(PendingControl {
+                    origin: None,
+                    bytes,
+                    delivery,
+                    committed: None,
                 });
             }
             Wakeup::Backend(Some(
@@ -17794,4 +17898,5 @@ mod tests {
     include!("session_manager_auth_tests.rs");
     include!("session_manager_recovery_tests.rs");
     include!("session_manager_control_bounds_tests.rs");
+    include!("session_manager_update_bounds_tests.rs");
 }

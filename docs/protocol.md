@@ -2151,6 +2151,14 @@ replaced). An unknown code is kept as such
 and `_`, at most `MAX_ARCH_LEN` = 32 bytes. `PROTOCOL_VERSION` is `2`;
 `qshd self-check` advertises `protocols:[2]`.
 
+An update is accepted only after its reserved `Accept` record is committed to
+its original authenticated transport. Before that commitment, a replaced
+attachment's offer decision is discarded and receiving does not start. After
+acceptance the operation survives a warm attachment replacement; newly produced
+results target the currently authenticated attachment. Records already queued
+on a replaced transport are not relabelled or replayed. As with other transport
+teardown, replacement does not guarantee receipt of an unacknowledged old record.
+
 The `screen` flag is what the client *asks for*, not what it gets: the
 server declares a channel's recoverability from the spawned channel's own
 answer (whether it has a screen model), both at open and again after a warm
