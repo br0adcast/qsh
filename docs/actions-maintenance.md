@@ -51,3 +51,24 @@ Keep failed checks visible and investigate them before merging. If a failure
 is independently shown to be unrelated, record that evidence and any diagnostic
 rerun explicitly. Include upstream revisions, relevant migration decisions and
 completed validation in the PR so the next update has a traceable starting point.
+
+## Release source qualification
+
+Tag publication requires the complete ordinary CI workflow at the release
+run's exact commit: macOS portable tests; formatting, Clippy, workspace unit
+and integration tests, and separate doctests; and the privileged disposable
+container tier with its required-test and silent-skip checks. Native crypto,
+package builds and installed-package acceptance remain required independently.
+
+The release workflow calls the local reusable CI definition from its own
+commit. Source checkouts use `github.sha` and log and verify the actual checked
+out commit, run ID and attempt. A rerun retains the original event's SHA; it
+does not qualify the current tip of a branch or tag instead. A previous main
+or PR merge-ref success is not substituted for this qualification.
+
+Branch package dispatches still assemble, scan and upload artifacts without
+running another full ordinary suite. They cannot publish. Only the separate
+tag-only publication job has `contents: write`, and it requires successful
+ordinary CI and artifact assembly. Failed or skipped qualification prevents
+publication; do not add `always()` or `continue-on-error` to bypass that gate.
+An ordinary CI dispatch can qualify a branch explicitly without packaging.
