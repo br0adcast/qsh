@@ -556,6 +556,10 @@ impl StdClient {
     }
 
     /// Start one recovery attempt across the complete eligible endpoint catalog.
+    /// Unlike single-endpoint transport-only connections, shared recovery
+    /// requires negotiated `AUTH_ACCEPTED`, even with a weaker configured
+    /// minimum. Admission requires its session-bound record; owner cancellation
+    /// or closure also terminates scheduling.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_recovery_with(
         endpoints: Vec<RecoveryEndpoint>,

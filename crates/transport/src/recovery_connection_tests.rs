@@ -222,3 +222,181 @@ fn shared_recovery_authenticated_protocol_failure_keeps_exact_consumed_source() 
         .poll_recovery_handshake(now + Duration::from_secs(1))
         .is_empty());
 }
+
+#[test]
+fn shared_recovery_requires_committed_acceptance_capability_before_live_or_send() {
+    let (mut client, mut config, now) = fixture();
+    config.features =
+        Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
+    let outgoing = start(&mut client, now);
+    for datagram in &outgoing {
+        client.recovery_handshake_sent(now, datagram.to, true);
+    }
+    assert!(client.send(now, 16, b"must remain untrusted").is_empty());
+    client.poll_events();
+    let mut server = Connection::new(config);
+    let response = server.on_datagram(now, address(99), &outgoing[1].bytes);
+    assert_eq!(response.len(), 1, "actual authenticated Noise msg2");
+    let emitted = client.on_datagram(now, address(1), &response[0].bytes);
+    let events = client.poll_events();
+    assert_eq!(client.state(), LinkState::Closed);
+    assert!(
+        client.keys.is_none(),
+        "unsupported recovery cannot install keys"
+    );
+    assert!(emitted.is_empty(), "queued application data cannot escape");
+    assert!(!events.contains(&Event::HandshakeDone));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::MissingRequiredFeatures { required, enabled }
+            if required.contains(Features::AUTH_ACCEPTED)
+                && !enabled.contains(Features::AUTH_ACCEPTED)
+    )));
+    assert_eq!(
+        client.recovery_handshake().unwrap().selected(),
+        Some(address(1)),
+        "the exact consumed candidate remains attributable"
+    );
+    assert!(client
+        .poll_recovery_handshake(now + Duration::from_secs(1))
+        .is_empty());
+}
+
+#[test]
+fn shared_recovery_preserves_configured_minimum_and_does_not_expand_offer() {
+    for excluded in [Features::AUTH_ACCEPTED, Features::CHANNEL_GEOMETRY] {
+        let (mut client, mut config, now) = fixture();
+        client.required_features = Features::CHANNEL_GEOMETRY;
+        client.allowed_features =
+            Features::from_bits(Features::SUPPORTED.bits() & !excluded.bits());
+        config.features = Features::SUPPORTED;
+        let outgoing = start(&mut client, now);
+        assert_eq!(client.offered_features, client.allowed_features);
+        client.recovery_handshake_sent(now, address(0), true);
+        let mut server = Connection::new(config);
+        let response = server.on_datagram(now, address(99), &outgoing[0].bytes);
+        client.poll_events();
+        assert!(client
+            .on_datagram(now, address(0), &response[0].bytes)
+            .is_empty());
+        assert_eq!(client.state(), LinkState::Closed);
+        assert_eq!(client.required_features, Features::CHANNEL_GEOMETRY);
+        assert!(client.poll_events().iter().any(|event| matches!(
+            event,
+            Event::MissingRequiredFeatures { required, enabled }
+                if *required == Features::CHANNEL_GEOMETRY | Features::AUTH_ACCEPTED
+                    && !enabled.contains(excluded)
+        )));
+    }
+}
+
+#[test]
+fn shared_recovery_rejection_does_not_leak_its_minimum_into_single_endpoint_restart() {
+    let (mut client, mut config, now) = fixture();
+    config.features =
+        Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
+    let outgoing = start(&mut client, now);
+    client.recovery_handshake_sent(now, address(0), true);
+    let mut server = Connection::new(config.clone());
+    let response = server.on_datagram(now, address(99), &outgoing[0].bytes);
+    client.on_datagram(now, address(0), &response[0].bytes);
+    assert_eq!(client.state(), LinkState::Closed);
+    assert!(client.keys.is_none());
+    assert_eq!(client.required_features, Features::NONE);
+
+    // This restart rejected before keys or application state existed. It
+    // does not qualify resetting a previously established connection (#148).
+    let later = now + Duration::from_secs(1);
+    let outgoing = client.start_session(later, address(0), StartKind::Cold, [6; 16]);
+    assert!(client.recovery_handshake().is_none());
+    let mut server = Connection::new(config);
+    let response = server.on_datagram(later, address(99), &outgoing[0].bytes);
+    client.poll_events();
+    client.on_datagram(later, address(0), &response[0].bytes);
+    assert_eq!(client.state(), LinkState::Live);
+    assert!(!client.features().contains(Features::AUTH_ACCEPTED));
+    assert!(client.poll_events().contains(&Event::HandshakeDone));
+}
+
+#[test]
+fn shared_recovery_retries_until_explicit_owner_retirement_or_cancellation() {
+    for cancel in [false, true] {
+        let (mut client, config, now) = fixture();
+        let outgoing = start(&mut client, now);
+        for datagram in &outgoing {
+            client.recovery_handshake_sent(now, datagram.to, true);
+        }
+        let mut server = Connection::new(config);
+        let response = server.on_datagram(now, address(99), &outgoing[0].bytes);
+        client.on_datagram(now, address(0), &response[0].bytes);
+        assert_eq!(client.state(), LinkState::Live);
+        let retries = client.poll_recovery_handshake(now + Duration::from_millis(500));
+        assert_eq!(
+            retries.len(),
+            2,
+            "msg2 alone cannot retire authentication work"
+        );
+        for datagram in &retries {
+            client.recovery_handshake_sent(now + Duration::from_millis(500), datagram.to, true);
+        }
+        if cancel {
+            client.abandon();
+        } else {
+            // The owner may retire a timed-out attempt; no new implicit timer.
+            client.stop_recovery_handshake();
+        }
+        assert!(client
+            .poll_recovery_handshake(now + Duration::from_secs(2))
+            .is_empty());
+        let Frame::Handshake { body, .. } = parse(&outgoing[0].bytes).unwrap() else {
+            panic!("msg1");
+        };
+        let echo = body[..COOKIE_ECHO_LEN].try_into().unwrap();
+        let cookie = crate::wire::encode_cookie_reply(&echo, &[7; COOKIE_LEN]);
+        assert!(client
+            .on_datagram(now + Duration::from_secs(3), address(0), &cookie)
+            .is_empty());
+        assert!(client
+            .poll_recovery_handshake(now + Duration::from_secs(4))
+            .is_empty());
+    }
+}
+
+#[test]
+fn shared_recovery_fresh_attempt_can_select_remaining_endpoint_after_rejection() {
+    let (mut client, mut config, now) = fixture();
+    let mut old_config = config.clone();
+    old_config.features =
+        Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
+    let outgoing = start(&mut client, now);
+    client.recovery_handshake_sent(now, address(1), true);
+    let mut old_server = Connection::new(old_config);
+    let old_response = old_server.on_datagram(now, address(99), &outgoing[1].bytes);
+    client.on_datagram(now, address(1), &old_response[0].bytes);
+    assert_eq!(client.state(), LinkState::Closed);
+    client.poll_events();
+
+    let later = now + Duration::from_secs(1);
+    let outgoing = client.start_recovery(
+        later,
+        vec![RecoveryEndpoint {
+            address: 0,
+            endpoint: address(0),
+        }],
+        StartKind::Warm,
+        [5; 16],
+    );
+    client.recovery_handshake_sent(later, address(0), true);
+    assert!(client
+        .on_datagram(later, address(1), &old_response[0].bytes)
+        .is_empty());
+    assert_eq!(client.state(), LinkState::Connecting);
+    assert!(client.poll_events().is_empty());
+    config.features = Features::SUPPORTED;
+    let mut server = Connection::new(config);
+    let response = server.on_datagram(later, address(99), &outgoing[0].bytes);
+    client.on_datagram(later, address(0), &response[0].bytes);
+    assert_eq!(client.state(), LinkState::Live);
+    assert_eq!(client.active_path(), Some(address(0)));
+    assert!(client.features().contains(Features::AUTH_ACCEPTED));
+}

@@ -132,7 +132,8 @@ fn shared_recovery_driver_signs_only_selected_transcript_and_stops_on_acceptance
             remote_static_pub: Some(server_key.public),
             auth: AuthPolicy::SshSignature,
             features: Features::SUPPORTED,
-            required_features: Features::AUTH_ACCEPTED,
+            // The shared profile itself must require explicit acceptance.
+            required_features: Features::NONE,
         },
         [16; 16],
         StartKind::Warm,
@@ -360,5 +361,102 @@ fn shared_recovery_progress_reports_actual_checks_and_source_before_protocol_fai
     assert!(
         selected[0].0 < failed,
         "failure must already have an exact consumed source"
+    );
+}
+
+#[test]
+fn shared_recovery_driver_rejects_no_acceptance_peer_before_signing_or_data() {
+    struct NoProof(AtomicUsize);
+    impl AuthSigner for NoProof {
+        fn sign(
+            &self,
+            _: &[u8; 32],
+            _: Option<&[u8; AUTH_NONCE_LEN]>,
+        ) -> Result<AuthRecord, AuthError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(AuthError::Backend(
+                "controlled unexpected proof request".into(),
+            ))
+        }
+    }
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let server_key = crate::handshake::generate_keypair();
+    let client_key = crate::handshake::generate_keypair();
+    let mut server = Connection::new(ConnectionConfig {
+        role: crate::Role::Server,
+        local_static_priv: server_key.private,
+        remote_static_pub: None,
+        auth: AuthPolicy::Allowlist(vec![client_key.public]),
+        features: Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits()),
+        required_features: Features::NONE,
+    });
+    let (tx, events) = mpsc::channel();
+    let signer = Arc::new(NoProof(AtomicUsize::new(0)));
+    let client = Recovery16Client(StdClient::connect_recovery_with(
+        vec![RecoveryEndpoint {
+            address: 0,
+            endpoint: socket.local_addr().unwrap(),
+        }],
+        ConnectionConfig {
+            role: crate::Role::Client,
+            local_static_priv: client_key.private,
+            remote_static_pub: Some(server_key.public),
+            auth: AuthPolicy::SshSignature,
+            features: Features::SUPPORTED,
+            required_features: Features::NONE,
+        },
+        [147; 16],
+        StartKind::Warm,
+        Arc::new(OkBinder),
+        Arc::new(Auth17WireEvents(Mutex::new(tx))),
+        Some(signer.clone()),
+        DriverSetup::default(),
+    ));
+    client
+        .0
+        .send_bytes(16, b"must not leave before admission".to_vec());
+    let mut buffer = [0; 65536];
+    let (len, from) = socket.recv_from(&mut buffer).unwrap();
+    let response = server.on_datagram(Instant::now(), from, &buffer[..len]);
+    assert_eq!(response.len(), 1, "actual Noise responder");
+    socket.send_to(&response[0].bytes, from).unwrap();
+    let mut observed = Vec::new();
+    loop {
+        let event = events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owned driver closed");
+        let closed = event == Auth17WireEvent::Closed;
+        observed.push(event);
+        if closed {
+            break;
+        }
+    }
+    client.0.detach();
+    assert_eq!(
+        signer.0.load(Ordering::SeqCst),
+        0,
+        "rejected peer cannot start a proof"
+    );
+    assert!(!observed.contains(&Auth17WireEvent::Live));
+    assert!(!observed
+        .iter()
+        .any(|event| matches!(event, Auth17WireEvent::Accepted(_))));
+    assert!(observed.iter().any(|event| matches!(event,
+        Auth17WireEvent::Failure(crate::ProtocolFailure::MissingRequiredFeatures { required, enabled })
+            if required.contains(Features::AUTH_ACCEPTED) && !enabled.contains(Features::AUTH_ACCEPTED)
+    )));
+    socket.set_nonblocking(true).unwrap();
+    while let Ok((len, src)) = socket.recv_from(&mut buffer) {
+        server.on_datagram(Instant::now(), src, &buffer[..len]);
+    }
+    assert!(
+        !server
+            .poll_events()
+            .iter()
+            .any(|event| matches!(event, Event::StreamData { .. })),
+        "joined driver emitted neither proof nor queued application data"
     );
 }
