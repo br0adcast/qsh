@@ -90,6 +90,12 @@ RUN dnf -y install epel-release \
 # instead sounds tidier and is worse: it takes `filesystem`'s %pretrans
 # with it, and without that the transaction genuinely fails.)
 #
+# glibc-headers has a shell %pre script too. Unlike a failing %post,
+# that prevents its payload from being installed. Once the initial
+# transaction has established the filesystem, install that package in a
+# checked transaction with scripts disabled. Disabling scripts for the
+# initial transaction would also skip filesystem's required %pretrans.
+#
 # The libgcc_s.so symlink is made by hand because rustc passes `-lgcc_s`
 # and nothing in this sysroot provides that name: Rocky's `libgcc` package
 # ships the runtime `libgcc_s.so.1` alone, and the development symlink
@@ -99,6 +105,10 @@ RUN mkdir -p /usr/aarch64-linux-gnu/sys-root \
         --forcearch=aarch64 --releasever=8 --nogpgcheck \
         --setopt=install_weak_deps=False \
         install glibc-devel libgcc pam-devel || true; } \
+    && dnf -y --installroot=/usr/aarch64-linux-gnu/sys-root \
+        --forcearch=aarch64 --releasever=8 --nogpgcheck \
+        --setopt=install_weak_deps=False --setopt=tsflags=noscripts \
+        install glibc-headers \
     && dnf clean all --installroot=/usr/aarch64-linux-gnu/sys-root \
     && rm -rf /usr/aarch64-linux-gnu/sys-root/var/lib/rpm \
     && ln -sf libgcc_s.so.1 /usr/aarch64-linux-gnu/sys-root/usr/lib64/libgcc_s.so \
@@ -118,7 +128,11 @@ RUN set -eu; \
     sysglibc=$(ls "$sysroot"/usr/lib64/libc-*.so | sed 's|.*/libc-\(.*\)\.so$|\1|'); \
     [ "$sysglibc" = "$QSHD_GLIBC_FLOOR" ] \
         || { echo "the aarch64 sysroot carries glibc $sysglibc, not the $QSHD_GLIBC_FLOOR this image promises -- the arm package would have a floor of its own" >&2; exit 1; }; \
-    printf 'int main(void){return 0;}\n' > /tmp/probe.c; \
+    headerglibc=$(printf '#include <features.h>\n__GLIBC__.__GLIBC_MINOR__\n' \
+        | aarch64-linux-gnu-gcc -E -P -x c - | tr -d '[:space:]'); \
+    [ "$headerglibc" = "$QSHD_GLIBC_FLOOR" ] \
+        || { echo "the aarch64 headers carry glibc $headerglibc, not $QSHD_GLIBC_FLOOR" >&2; exit 1; }; \
+    printf '#include <features.h>\n#include <stdio.h>\n#include <security/pam_appl.h>\n#ifndef __aarch64__\n#error not an aarch64 compiler\n#endif\nint main(void){return 0;}\n' > /tmp/probe.c; \
     aarch64-linux-gnu-gcc -o /tmp/probe /tmp/probe.c -lpam -lgcc_s; \
     readelf -d /tmp/probe | grep -q 'NEEDED.*libpam\.so\.0' \
         || { echo "the cross link produced no libpam.so.0 dependency" >&2; exit 1; }; \
