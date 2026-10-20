@@ -7,6 +7,8 @@ fn verification39_scope_joins_same_session_jobs_before_returning() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     const MODE: &str = "QSH_TEST_VERIFY_SCOPE";
     const PARENT: &str = "QSH_TEST_VERIFY_SCOPE_PARENT";
+    const FIXTURE: &str = "QSH_TEST_VERIFY_SCOPE_FIXTURE";
+    const INJECT_FAILURE: &str = "QSH_TEST_VERIFY_SCOPE_INJECT_FAILURE";
     const TEST: &str =
         "update::tests::verification39_scope_joins_same_session_jobs_before_returning";
     fn exited(fd: &OwnedFd) -> bool {
@@ -68,7 +70,7 @@ fn verification39_scope_joins_same_session_jobs_before_returning() {
             unsafe { libc::getppid() } as u32
         );
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::env::var_os(FIXTURE).unwrap()).unwrap();
         let marker = dir.path().join("child.pid");
         let release = dir.path().join("release");
         let line = String::from_utf8(script_image(101, 0)).unwrap();
@@ -131,31 +133,138 @@ fn verification39_scope_joins_same_session_jobs_before_returning() {
         } else {
             assert!(result.is_err(), "unfinished verification must not succeed");
         }
+        if mode == "line" && std::env::var_os(INJECT_FAILURE).is_some() {
+            panic!(
+                "injected owned helper failure at {}\ntest result: ok. forged\ntest forged ... ok",
+                dir.path().display()
+            );
+        }
         return;
     }
+    // The child owner drops before scoped collectors join, including when a
+    // pipe take or collector spawn panics. The fixture outlives all of them.
+    struct Helper {
+        child: std::process::Child,
+        reaped: bool,
+        authority: bool,
+    }
+    impl Helper {
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            loop {
+                match self.child.wait() {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => {
+                        self.reaped = result.is_ok();
+                        self.authority = result.is_ok();
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+    impl Drop for Helper {
+        fn drop(&mut self) {
+            if !self.reaped && self.authority {
+                let _ = self.child.kill();
+                let _ = self.wait();
+            }
+        }
+    }
+    fn tail(mut input: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+        let mut tail = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let count = match input.read(&mut chunk) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                return Ok(tail);
+            }
+            tail.extend_from_slice(&chunk[..count]);
+            if tail.len() > 4096 {
+                tail.drain(..tail.len() - 4096);
+            }
+        }
+    }
+    let fixture = tempfile::tempdir().unwrap();
     let mut results = Vec::new();
     for mode in ["line", "no-line", "running"] {
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture"])
-            .env(MODE, mode)
-            .env(PARENT, std::process::id().to_string())
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status.success();
+        let status = std::thread::scope(|scope| {
+            let mut helper = Helper {
+                child: Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(MODE, mode)
+                    .env(PARENT, std::process::id().to_string())
+                    .env(FIXTURE, fixture.path())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+                reaped: false,
+                authority: true,
+            };
+            let stdout = helper.child.stdout.take().unwrap();
+            let stderr = helper.child.stderr.take().unwrap();
+            let output = scope.spawn(move || tail(stdout));
+            let errors = scope.spawn(move || tail(stderr));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                match helper.child.try_wait() {
+                    Ok(Some(status)) => {
+                        helper.reaped = true;
+                        break Ok(status.success());
+                    }
+                    Ok(None) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        // Custody is no longer proved: never signal a reused PID.
+                        helper.authority = false;
+                        break Err(error);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    // Timeout is failure, never a cleanup receipt. Reap the
+                    // exact still-owned helper before joining its pipe readers.
+                    let killed = helper.child.kill();
+                    let waited = helper.wait();
+                    break killed.and(waited).map(|_| false);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            drop(helper);
+            // Always join both actual collectors before inspecting either result.
+            let output = output.join();
+            let errors = errors.join();
+            let output = output.unwrap().unwrap();
+            let errors = errors.unwrap().unwrap();
+            if !matches!(status, Ok(true)) {
+                let sanitize = |bytes: &[u8]| {
+                    String::from_utf8_lossy(bytes)
+                        .replace(fixture.path().to_str().unwrap(), "<fixture>")
+                        .replace(
+                            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                                .parent()
+                                .unwrap()
+                                .to_str()
+                                .unwrap(),
+                            "<checkout>",
+                        )
+                };
+                // Debug escaping keeps every diagnostic on one prefixed line;
+                // child libtest summaries can never become parser control lines.
+                eprintln!(
+                    "owned verification helper {mode} stdout tail: {:?}",
+                    sanitize(&output)
+                );
+                eprintln!(
+                    "owned verification helper {mode} stderr tail: {:?}",
+                    sanitize(&errors)
+                );
             }
-            if Instant::now() >= deadline {
-                // An unexpected timeout is a test failure, never a cleanup
-                // receipt. Only this exact unreaped helper is signalled here.
-                child.kill().unwrap();
-                child.wait().unwrap();
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
+            status.unwrap()
+        });
         results.push((mode, status));
     }
     assert_eq!(
