@@ -30,6 +30,7 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -73,11 +74,94 @@ pub fn key_fingerprint(key: &[u8; 32]) -> String {
     format!("SHA256:{}", BASE64.encode(digest).trim_end_matches('='))
 }
 
+/// Require a host identifier that round-trips through the pin store's record
+/// syntax. This is not DNS/IDNA validation; safe opaque identifiers are allowed.
+/// Rejection never echoes the caller's potentially hostile host text.
+pub fn validate_host_identifier(host: &str) -> Result<(), AuthError> {
+    if host.is_empty()
+        || host.starts_with('#')
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(AuthError::Backend(
+            "host identifier must be nonempty, not start with #, and contain no whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// One parsed `host port base64-key` line.
 struct Entry {
     host: String,
     port: u16,
     key: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+enum HostIdentity<'a> {
+    Ip(IpAddr),
+    Scoped(Ipv6Addr, &'a str),
+    Dns(&'a str),
+    Opaque(&'a str),
+}
+
+impl<'a> HostIdentity<'a> {
+    fn of(host: &'a str) -> Self {
+        if let Ok(ip) = host.parse() {
+            return Self::Ip(ip);
+        }
+        if let Some((address, zone)) = host.split_once('%') {
+            if !zone.is_empty() && !zone.contains('%') {
+                if let Ok(address) = address.parse() {
+                    return Self::Scoped(address, zone);
+                }
+            }
+        }
+        // Recognize ordinary ASCII DNS labels only. The original trailing dot
+        // stays in the comparison: absolute and search-list lookup can differ.
+        let labels = host.strip_suffix('.').unwrap_or(host);
+        let dns = !labels.is_empty()
+            && labels.len() <= 253
+            && labels.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            });
+        if dns {
+            Self::Dns(host)
+        } else {
+            Self::Opaque(host)
+        }
+    }
+
+    fn matches(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Ip(a), Self::Ip(b)) => a == b,
+            (Self::Scoped(a, az), Self::Scoped(b, bz)) => a == b && az == bz,
+            (Self::Dns(a), Self::Dns(b)) => a.eq_ignore_ascii_case(b),
+            (Self::Opaque(a), Self::Opaque(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+fn pinned_key(entries: &[Entry], host: &str, port: u16) -> Result<Option<[u8; 32]>, AuthError> {
+    let identity = HostIdentity::of(host);
+    let mut pinned = None;
+    for entry in entries {
+        if entry.port == port && identity.matches(HostIdentity::of(&entry.host)) {
+            if pinned.is_some_and(|seen| seen != entry.key) {
+                return Err(AuthError::Backend(
+                    "conflicting keys in equivalent QSH host-pin records; inspect the pin store and remove stale entries".into(),
+                ));
+            }
+            pinned = Some(entry.key);
+        }
+    }
+    Ok(pinned)
 }
 
 /// Parse a single line, or `None` if it is blank, a `#` comment, or
@@ -94,6 +178,7 @@ fn parse_line(line: &str) -> Option<Entry> {
     }
     let mut parts = line.split_whitespace();
     let host = parts.next()?;
+    validate_host_identifier(host).ok()?;
     let port = parts.next()?.parse::<u16>().ok()?;
     let key = parts.next()?;
     let decoded = BASE64.decode(key).ok()?;
@@ -107,10 +192,11 @@ fn parse_line(line: &str) -> Option<Entry> {
 
 /// The known-hosts file: `host port base64-key`, one entry per line, `#`
 /// comments and blank lines ignored -- the same shape as OpenSSH's own file.
-/// A `host`/`port` pair matches only itself: the host is compared for exact
-/// string equality (never a prefix or suffix) and the port for exact
-/// numeric equality, so `example.org:60022` is a distinct entry from
-/// `example.org:60023` or `evil-example.org:60022`.
+/// Lookup folds ordinary ASCII DNS letter case and compares strict IP literals
+/// by value within their family. Trailing-dot presence and IPv6 zone text stay
+/// significant. Unicode and other safe opaque identifiers match exactly; no
+/// IDNA, resolver or interface lookup is performed. Stored spelling is retained.
+/// Port equality is exact, and prefixes/suffixes never match another host.
 pub struct KnownHosts {
     path: PathBuf,
 }
@@ -139,39 +225,50 @@ impl KnownHosts {
         }
     }
 
-    /// What we know about `host:port`'s key. If the file holds more than
-    /// one entry for the same `host:port` (only possible via a hand-edited
-    /// file -- `pin` never writes a duplicate), the LAST one wins, so a
-    /// manually appended correction takes effect rather than being shadowed
-    /// by the stale line above it.
+    /// What we know about `host:port`'s key. Every equivalent entry must agree;
+    /// conflicting keys, including exact duplicate spellings, are an error.
+    /// A manual correction must remove stale rows instead of appending a new
+    /// winner. A single existing key still produces Known or Changed normally.
     pub fn check(&self, host: &str, port: u16, key: &[u8; 32]) -> Result<HostVerdict, AuthError> {
+        validate_host_identifier(host)?;
         let entries = self.read_entries()?;
-        match entries
-            .iter()
-            .rev()
-            .find(|e| e.host == host && e.port == port)
-        {
+        match pinned_key(&entries, host, port)? {
             None => Ok(HostVerdict::Unknown),
-            Some(e) if &e.key == key => Ok(HostVerdict::Known),
-            Some(e) => Ok(HostVerdict::Changed { pinned: e.key }),
+            Some(pinned) if &pinned == key => Ok(HostVerdict::Known),
+            Some(pinned) => Ok(HostVerdict::Changed { pinned }),
         }
     }
 
     /// Record `key` as this host's key. The caller has already shown the
     /// fingerprint and got a yes -- this function does not ask.
     ///
-    /// Pinning a `host:port` that already has an entry REPLACES it rather
-    /// than appending a second line, so a later `check` sees the new key
-    /// as `Known` instead of finding the old line first and reporting
-    /// `Changed` against a key the caller just approved.
+    /// An unambiguous exact spelling can be replaced. An equivalent same-key
+    /// entry is a no-op; replacing a different spelling or conflicting records
+    /// is refused for manual repair, never migrated behind the caller's back.
     ///
     /// Holds [`PinLock`] for the whole read-modify-write-rename, so a
     /// concurrent `pin` (even for a different host) waits instead of
     /// racing -- see the module doc-comment.
     pub fn pin(&self, host: &str, port: u16, key: &[u8; 32]) -> Result<(), AuthError> {
+        validate_host_identifier(host)?;
         let _lock = PinLock::acquire(&self.path)?;
 
         let mut entries = self.read_entries()?;
+        if let Some(pinned) = pinned_key(&entries, host, port)? {
+            if &pinned == key {
+                return Ok(());
+            }
+            let identity = HostIdentity::of(host);
+            if entries.iter().any(|entry| {
+                entry.port == port
+                    && entry.host != host
+                    && identity.matches(HostIdentity::of(&entry.host))
+            }) {
+                return Err(AuthError::Backend(
+                    "conflicting replacement would rewrite equivalent QSH host aliases; remove stale entries manually".into(),
+                ));
+            }
+        }
         entries.retain(|e| !(e.host == host && e.port == port));
         entries.push(Entry {
             host: host.to_string(),
@@ -199,19 +296,15 @@ impl KnownHosts {
         port: u16,
         key: &[u8; 32],
     ) -> Result<HostVerdict, AuthError> {
+        validate_host_identifier(host)?;
         let _lock = PinLock::acquire(&self.path)?;
 
         let mut entries = self.read_entries()?;
-        // The same "last line wins" as `check`.
-        if let Some(e) = entries
-            .iter()
-            .rev()
-            .find(|e| e.host == host && e.port == port)
-        {
-            return Ok(if &e.key == key {
+        if let Some(pinned) = pinned_key(&entries, host, port)? {
+            return Ok(if &pinned == key {
                 HostVerdict::Known
             } else {
-                HostVerdict::Changed { pinned: e.key }
+                HostVerdict::Changed { pinned }
             });
         }
         entries.push(Entry {
@@ -408,6 +501,269 @@ mod tests {
 
     fn base64_key(key: &[u8; 32]) -> String {
         BASE64.encode(key)
+    }
+
+    fn rejects_injected_pin(if_absent: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let hosts = KnownHosts::open(path.clone());
+        hosts.pin("sentinel.example", 60022, &[1; 32]).unwrap();
+        let before = fs::read(&path).unwrap();
+        // Fixed public pin bytes, not a private key or an account credential.
+        let injected = format!("prefix\nvictim.example 60022 {}\n#", base64_key(&[7; 32]));
+        let result = if if_absent {
+            hosts.pin_if_absent(&injected, 60022, &[9; 32]).map(|_| ())
+        } else {
+            hosts.pin(&injected, 60022, &[9; 32])
+        };
+        let victim = hosts.check("victim.example", 60022, &[7; 32]).unwrap();
+        let changed = fs::read(&path).unwrap() != before;
+        assert!(
+            result.is_err() && !changed && victim == HostVerdict::Unknown,
+            "unsafe pin accepted={}, store changed={changed}, injected victim={victim:?}",
+            result.is_ok()
+        );
+    }
+
+    #[test]
+    fn pin_host_identifier_cannot_inject_a_trusted_record() {
+        rejects_injected_pin(false);
+    }
+
+    #[test]
+    fn pin_host_identifier_if_absent_cannot_inject_a_trusted_record() {
+        rejects_injected_pin(true);
+    }
+
+    #[test]
+    fn pin_host_identifiers_are_rejected_before_any_filesystem_side_effect() {
+        let mut invalid: Vec<String> = [
+            "",
+            "#comment",
+            "two words",
+            "a\u{a0}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        invalid.extend(
+            (0..=32)
+                .chain(127..=159)
+                .map(|code| format!("a{}b", char::from_u32(code).unwrap())),
+        );
+        for host in invalid {
+            for operation in 0..3 {
+                let dir = tempfile::tempdir().unwrap();
+                let parent = dir.path().join("absent");
+                let hosts = KnownHosts::open(parent.join("known_hosts"));
+                let result = match operation {
+                    0 => hosts.check(&host, 60022, &[1; 32]).map(|_| ()),
+                    1 => hosts.pin(&host, 60022, &[1; 32]),
+                    _ => hosts.pin_if_absent(&host, 60022, &[1; 32]).map(|_| ()),
+                };
+                assert!(result.is_err(), "operation {operation} accepted {host:?}");
+                assert!(!parent.exists(), "invalid identifier created store state");
+            }
+        }
+    }
+
+    #[test]
+    fn pin_host_lookup_equivalence_is_conservative() {
+        for (stored, query, same) in [
+            ("Example.ORG", "example.org", true),
+            ("Example.ORG.", "example.org.", true),
+            ("example.org", "example.org.", false),
+            ("host", "HOST", true),
+            ("host", "host.", false),
+            ("2001:DB8::1", "2001:db8:0:0:0:0:0:1", true),
+            ("fe80::a%eth0", "FE80:0:0:0:0:0:0:a%eth0", true),
+            ("fe80::a%eth0", "fe80::a%ETH0", false),
+            ("fe80::a%2", "fe80::a%02", false),
+            ("fe80::a%2", "fe80::a%eth0", false),
+            ("fe80::a%2", "fe80::a", false),
+            ("192.0.2.1", "::ffff:192.0.2.1", false),
+            ("192.0.2.1", "192.0.2.01", false),
+            ("2001:db8::1", "[2001:db8::1]", false),
+            ("HOST_NAME", "host_name", false),
+            ("Bücher.example", "bücher.example", false),
+            ("bücher.example", "xn--bcher-kva.example", false),
+            ("XN--BCHER-KVA.example", "xn--bcher-kva.EXAMPLE", true),
+            ("opaque,token", "opaque,token", true),
+            ("opaque,token", "OPAQUE,token", false),
+            ("name#tag", "name#tag", true),
+            ("name#tag", "NAME#tag", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("known_hosts");
+            let hosts = KnownHosts::open(path.clone());
+            hosts.pin(stored, 60022, &[1; 32]).unwrap();
+            let before = fs::read(&path).unwrap();
+            let expected = if same {
+                HostVerdict::Known
+            } else {
+                HostVerdict::Unknown
+            };
+            assert_eq!(
+                hosts.check(query, 60022, &[1; 32]).unwrap(),
+                expected,
+                "{stored:?} vs {query:?}"
+            );
+            assert_eq!(
+                hosts.check(query, 60023, &[1; 32]).unwrap(),
+                HostVerdict::Unknown
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "lookup must not migrate spelling"
+            );
+            if same {
+                assert_eq!(
+                    hosts.pin_if_absent(query, 60022, &[2; 32]).unwrap(),
+                    HostVerdict::Changed { pinned: [1; 32] }
+                );
+                hosts.pin(query, 60022, &[1; 32]).unwrap();
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    before,
+                    "same-key alias is a byte-preserving no-op"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pin_host_conflicting_duplicate_or_equivalent_records_are_ambiguous() {
+        for (first, second) in [
+            ("same.example", "same.example"),
+            ("Example.org", "example.ORG"),
+            ("2001:DB8::1", "2001:db8:0:0::1"),
+            ("fe80::a%eth0", "FE80:0:0:0:0:0:0:a%eth0"),
+        ] {
+            for reverse in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("known_hosts");
+                let keys = if reverse {
+                    [[2; 32], [1; 32]]
+                } else {
+                    [[1; 32], [2; 32]]
+                };
+                let before = format!(
+                    "{first} 60022 {}\n{second} 60022 {}\nother.example 60022 {}\n",
+                    base64_key(&keys[0]),
+                    base64_key(&keys[1]),
+                    base64_key(&[9; 32])
+                );
+                fs::write(&path, &before).unwrap();
+                let hosts = KnownHosts::open(path.clone());
+                for query in [first, second] {
+                    for offered in [[1; 32], [2; 32], [3; 32]] {
+                        let outcomes = [
+                            hosts.check(query, 60022, &offered).map(|_| ()),
+                            hosts.pin_if_absent(query, 60022, &offered).map(|_| ()),
+                            hosts.pin(query, 60022, &offered),
+                        ];
+                        for outcome in outcomes {
+                            assert!(outcome.is_err(), "ambiguous pin selected a key for {query}");
+                            assert!(outcome.unwrap_err().to_string().contains("conflicting"));
+                        }
+                        assert_eq!(fs::read(&path).unwrap(), before.as_bytes());
+                    }
+                }
+                assert_eq!(
+                    hosts.check("other.example", 60022, &[9; 32]).unwrap(),
+                    HostVerdict::Known
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pin_host_same_key_aliases_are_known_but_cross_alias_replacement_is_refused() {
+        for duplicate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("known_hosts");
+            let mut before = format!("Example.org 60022 {}\n", base64_key(&[1; 32]));
+            if duplicate {
+                before.push_str(&format!("example.ORG 60022 {}\n", base64_key(&[1; 32])));
+            }
+            fs::write(&path, &before).unwrap();
+            let hosts = KnownHosts::open(path.clone());
+            assert_eq!(
+                hosts.check("EXAMPLE.ORG", 60022, &[1; 32]).unwrap(),
+                HostVerdict::Known
+            );
+            assert_eq!(
+                hosts.pin_if_absent("example.org", 60022, &[2; 32]).unwrap(),
+                HostVerdict::Changed { pinned: [1; 32] }
+            );
+            hosts.pin("example.org", 60022, &[1; 32]).unwrap();
+            assert!(hosts.pin("example.org", 60022, &[2; 32]).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before.as_bytes());
+            if duplicate {
+                assert!(hosts.pin("Example.org", 60022, &[2; 32]).is_err());
+                assert_eq!(fs::read(&path).unwrap(), before.as_bytes());
+            } else {
+                hosts.pin("Example.org", 60022, &[2; 32]).unwrap();
+                assert_eq!(
+                    hosts.check("EXAMPLE.ORG", 60022, &[2; 32]).unwrap(),
+                    HostVerdict::Known
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pin_host_equivalent_first_pins_race_without_creating_conflicting_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = [("Race.Example", [1; 32]), ("race.example", [2; 32])].map(|(host, key)| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                KnownHosts::open(path).pin_if_absent(host, 60022, &key)
+            })
+        });
+        barrier.wait();
+        let [first, second] = workers;
+        let outcomes = [first.join(), second.join()];
+        let outcomes = outcomes.map(|result| result.unwrap().unwrap());
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|v| **v == HostVerdict::Unknown)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|v| matches!(v, HostVerdict::Changed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let winner = match outcomes {
+            [HostVerdict::Unknown, HostVerdict::Changed { pinned }] => {
+                assert_eq!(pinned, [1; 32]);
+                pinned
+            }
+            [HostVerdict::Changed { pinned }, HostVerdict::Unknown] => {
+                assert_eq!(pinned, [2; 32]);
+                pinned
+            }
+            _ => panic!("one unambiguous first pin required"),
+        };
+        assert_eq!(
+            KnownHosts::open(path)
+                .check("RACE.EXAMPLE", 60022, &winner)
+                .unwrap(),
+            HostVerdict::Known
+        );
     }
 
     #[test]

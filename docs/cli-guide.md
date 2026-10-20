@@ -23,8 +23,9 @@ privileged helper and PAM. Without an explicit user, qsh reads `USER`, then
 All addresses in one command must identify the same server. Their pinned qsh
 keys must agree before the first attempt. An unpinned address can inherit the
 shared expected key after a successful authenticated handshake, and authenticated
-spare paths are also remembered. Conflicting keys stop the client with exit 11;
-a stored key is never silently overwritten.
+spare paths are also remembered. Pins for different endpoints that disagree stop
+the client with exit 11; a stored key is never silently overwritten. Ambiguous
+records for one equivalent endpoint are refused as described below.
 
 qsh sessions use IPv4. The parser accepts bracketed IPv6 addresses, such as
 `'[2001:db8::1]:60022,ssh'`, and SSH or knocking can use them, but the subsequent
@@ -59,6 +60,25 @@ otherwise supply their own key. The accepted key is stored in:
 | Platform | qsh server-key store |
 | --- | --- |
 | Linux and macOS | `$XDG_CONFIG_HOME/qsh/known_hosts`, otherwise `~/.config/qsh/known_hosts`. |
+
+Pin identifiers must be nonempty, contain no whitespace or control characters,
+and not start with `#` (the store's comment syntax). Rejected identifiers are
+never trimmed or rewritten into a different identity. Ordinary ASCII DNS names
+match without regard to letter case; standard IP literals match by value within
+the same address family. Trailing-dot presence remains significant: `host` and
+`host.` can resolve differently through a search list. IPv6 zone text remains
+exact, so `%eth0`, `%ETH0`, `%2`, and no zone are distinct. Unicode names and
+other safe opaque identifiers retain exact spelling; no IDNA, resolver or
+interface-based equivalence is inferred. Stored spelling is not migrated.
+
+Every equivalent record must agree on one key. Conflicting keys, including
+duplicate rows with the exact same spelling, make that endpoint ambiguous and
+cause a pin-store error. Appending a correction no longer selects the last row:
+inspect the store and remove stale conflicting entries before retrying. qsh
+does not select a matching offered key from conflicts or repair them silently.
+A unique stored key that differs from the offered key still produces the
+ordinary changed-key refusal. This QSH pin format is separate from OpenSSH's
+host-list syntax; the CLI still owns comma-separated address settings.
 
 Session tokens live in the adjacent `sessions` directory. XDG overrides must be
 absolute paths; empty or relative values use the defaults above.

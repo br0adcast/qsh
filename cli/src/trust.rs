@@ -702,6 +702,59 @@ mod tests {
         KnownHosts::open(dir.join("known_hosts"))
     }
 
+    #[test]
+    fn equivalent_host_pin_still_reports_changed_key_without_prompt_or_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        store.pin("Example.ORG", 60022, &[1; 32]).unwrap();
+        let before = std::fs::read(store.path()).unwrap();
+        let ask = recorder(true);
+        let result = server_key_with_discovered("example.org", 60022, &store, &ask, Ok([2; 32]));
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, TrustError::KeyChanged { host, pinned, offered, .. }
+            if host == "example.org" && pinned == &[1; 32] && offered == &[2; 32])
+        );
+        let shown = error.to_string();
+        assert!(shown.contains(&key_fingerprint(&[1; 32])));
+        assert!(shown.contains(&key_fingerprint(&[2; 32])));
+        assert!(ask.asked.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn ambiguous_equivalent_pins_refuse_before_discovery_or_confirmation() {
+        struct NoDiscovery;
+        impl Discover for NoDiscovery {
+            fn key(&self, _: SocketAddr) -> KeyResult {
+                panic!("ambiguous trust cannot initiate discovery")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = hosts(dir.path());
+        let before = format!(
+            "Example.org 60022 {}\nexample.ORG 60022 {}\n",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [1; 32]),
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2; 32]),
+        );
+        std::fs::write(store.path(), &before).unwrap();
+        let ask = recorder(true);
+        let result = server_key(
+            "example.org",
+            60022,
+            "127.0.0.1:60022".parse().unwrap(),
+            &store,
+            &[],
+            &ask,
+            &NoDiscovery,
+        );
+        assert!(
+            matches!(result, Err(TrustError::Store(ref reason)) if reason.contains("conflicting"))
+        );
+        assert!(ask.asked.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(store.path()).unwrap(), before.as_bytes());
+    }
+
     struct PinDuringPrompt {
         path: std::path::PathBuf,
         key: [u8; 32],
