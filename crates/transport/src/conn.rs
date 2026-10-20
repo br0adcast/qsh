@@ -1209,6 +1209,9 @@ impl Connection {
     }
 
     /// Start one recovery handshake over the complete eligible catalog.
+    /// Requires negotiated `AUTH_ACCEPTED` in addition to the configured
+    /// minimum, before Live or queued output. The offered bits are unchanged.
+    /// Ordinary single-endpoint starts retain the configured feature minimum.
     pub fn start_recovery(
         &mut self,
         now: Instant,
@@ -2591,10 +2594,18 @@ impl Connection {
             self.set_state(LinkState::Closed);
             return out;
         }
-        if !msg2.enabled.contains(self.required_features) {
+        // Shared recovery has no trustworthy completion boundary without the
+        // explicit admission record. Keep this attempt-local: a later ordinary
+        // transport-only start still uses the caller's configured minimum.
+        let required = if self.recovery_handshake.is_some() {
+            self.required_features | Features::AUTH_ACCEPTED
+        } else {
+            self.required_features
+        };
+        if !msg2.enabled.contains(required) {
             self.handshake = None;
             self.events.push(Event::MissingRequiredFeatures {
-                required: self.required_features,
+                required,
                 enabled: msg2.enabled,
             });
             self.set_state(LinkState::Closed);

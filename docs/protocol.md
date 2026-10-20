@@ -943,6 +943,15 @@ geometry, buffered output and final Exit retain their existing meanings.
 
 ### Shared recovery handshakes
 
+Shared recovery requires `auth-accepted` in addition to the caller's configured
+feature minimum, before Live, proof production or queued application output.
+A responder missing it is an authenticated protocol rejection for that exact
+candidate, not evidence of admission or failure of every endpoint. Ordinary
+single-endpoint transport-only profiles may still negotiate without the bit;
+shared recovery does not infer acceptance from msg2, DATA, PONG or geometry.
+The offered feature set and the configured minimum for later ordinary starts
+remain unchanged.
+
 A recovery attempt uses one Noise initiator, client socket, session token and
 expected server key across its complete eligible physical endpoint catalog.
 Logical aliases share physical sends while retaining their completion
