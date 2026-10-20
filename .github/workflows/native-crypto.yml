@@ -61,7 +61,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install native prerequisites
         shell: bash
         run: |
@@ -135,7 +135,7 @@ jobs:
       matrix:
         format: [deb, rpm]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install explicit ARM emulator
         run: sudo apt-get update && sudo apt-get install -y qemu-user-static
       - name: Build existing package-floor image
