@@ -105,6 +105,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg

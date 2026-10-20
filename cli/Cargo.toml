@@ -106,7 +106,8 @@ separate package."""
 # and libpam -- account lookup (NSS) and PAM both load modules at run time,
 # which a static binary cannot do. `$auto` restores cargo-deb's own ldd-based
 # inference, which the base section turned off.
-depends = "$auto"
+# The account-creation tool is not an ELF dependency; configure runs postinst.
+depends = "$auto, passwd"
 assets = [
     ["target/release/qshd", "usr/bin/", "755"],
     ["../packaging/qshd-system.service", "usr/lib/systemd/system/qshd.service", "644"],
@@ -152,6 +153,9 @@ summary = "The daemon behind qsh, a terminal session that survives a network cha
 # exists and an ldd-based fallback otherwise, so the release pipeline should
 # pass `--auto-req` explicitly if the two must not diverge.
 auto-req = "auto"
+# Commands used by %post, with real script-phase flags from the pinned tool.
+# Keep automatic ELF requirements above; systemctl remains optional.
+requires-post = { "/usr/bin/getent" = "*", "/usr/sbin/useradd" = "*" }
 assets = [
     { source = "target/release/qshd", dest = "/usr/bin/qshd", mode = "755" },
     { source = "../packaging/qshd-system.service", dest = "/usr/lib/systemd/system/qshd.service", mode = "644" },

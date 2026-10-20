@@ -245,6 +245,21 @@ ok "$container is really running $actual_machine"
 
 "$docker" cp "$pkg" "$container:/tmp/$base"
 
+# Validate actual generated metadata before a base image's preinstalled tools
+# can hide a missing maintainer-script dependency.
+case $fmt in
+  deb)
+    dependencies=$(dexec dpkg-deb -f "/tmp/$base" Depends) || die "could not query Debian dependencies"
+    ;;
+  rpm)
+    dependencies=$(dexec rpm -qp --qf '[%{REQUIRENAME}\t%{REQUIREFLAGS}\n]' "/tmp/$base") ||
+      die "could not query RPM dependency flags"
+    ;;
+esac
+printf '%s\n' "$dependencies" | bash "$root/packaging/check-maintainer-dependencies.sh" "$fmt" ||
+  die "$base lacks required account-creation dependencies"
+ok "generated maintainer-script dependencies are present"
+
 case $fmt in
   deb)
     dexec sh -c 'export DEBIAN_FRONTEND=noninteractive; dpkg -i "$1" || true; apt-get update -qq && apt-get -f install -y -qq' _ "/tmp/$base" \
