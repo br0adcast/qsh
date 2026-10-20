@@ -34,6 +34,8 @@ const UNREACHABLE_AFTER_MS: i64 = transport::HANDSHAKE_GIVE_UP_AFTER.as_millis()
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Verdict {
+    /// Local whole-write refusal; do not try another key or fallback.
+    LocalSendFailure(client::channel::ChannelSendError),
     /// The server explicitly accepted this exact transport admission.
     Working,
     /// Authenticated protocol rejection; another key cannot repair it.
@@ -128,6 +130,7 @@ pub struct Events {
     credits: AtomicBool,
     protocol_failure: Mutex<Option<transport::ProtocolFailure>>,
     session_abort: Mutex<Option<transport::SessionAbortReason>>,
+    input_failure: AtomicBool,
     /// Bytes handed to the main loop and not written to the terminal yet.
     queued: Mutex<usize>,
     room: Condvar,
@@ -147,10 +150,19 @@ impl Events {
             credits: AtomicBool::new(false),
             protocol_failure: Mutex::new(None),
             session_abort: Mutex::new(None),
+            input_failure: AtomicBool::new(false),
             queued: Mutex::new(0),
             room: Condvar::new(),
             released: AtomicBool::new(false),
             recovery_progress: None,
+        }
+    }
+
+    /// Coalesce one terminal local input failure per exact stamped attempt.
+    pub fn input_failed(&self, failure: crate::session::LocalInputFailure) {
+        if !self.released.load(Ordering::SeqCst) && !self.input_failure.swap(true, Ordering::SeqCst)
+        {
+            let _ = self.tx.send(crate::session::UiEvent::InputFailure(failure));
         }
     }
 
@@ -172,6 +184,10 @@ impl Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        self.input_failed(crate::session::LocalInputFailure::Accepted(failure));
+    }
+
     fn on_recovery_progress(&self, progress: RecoveryProgress) {
         if let Some(observer) = &self.recovery_progress {
             observer(progress);
@@ -360,6 +376,13 @@ pub fn auth_for(
     }
 }
 
+/// A session token and the invocation's retained application-input budget.
+/// A replacement token must keep the same budget until its old drivers settle.
+pub struct AttemptScope {
+    pub token: [u8; 16],
+    pub input_budget: transport::client_input_budget::ClientInputBudget,
+}
+
 enum AttemptTarget {
     Single(SocketAddr),
     Shared(Vec<transport::recovery_handshake::RecoveryEndpoint>),
@@ -379,7 +402,7 @@ impl Attempt {
         local_priv: [u8; 32],
         login: Login,
         tx: Sender<crate::session::UiEvent>,
-        token: [u8; 16],
+        scope: AttemptScope,
     ) -> Attempt {
         Self::open_target(
             AttemptTarget::Single(addr),
@@ -387,7 +410,7 @@ impl Attempt {
             local_priv,
             login,
             tx,
-            token,
+            scope,
             None,
         )
     }
@@ -400,7 +423,7 @@ impl Attempt {
         local_priv: [u8; 32],
         login: Login,
         tx: Sender<crate::session::UiEvent>,
-        token: [u8; 16],
+        scope: AttemptScope,
         progress: Arc<dyn Fn(RecoveryProgress) + Send + Sync>,
     ) -> Attempt {
         Self::open_target(
@@ -409,7 +432,7 @@ impl Attempt {
             local_priv,
             login,
             tx,
-            token,
+            scope,
             Some(progress),
         )
     }
@@ -420,9 +443,13 @@ impl Attempt {
         local_priv: [u8; 32],
         login: Login,
         tx: Sender<crate::session::UiEvent>,
-        token: [u8; 16],
+        scope: AttemptScope,
         progress: Option<Arc<dyn Fn(RecoveryProgress) + Send + Sync>>,
     ) -> Attempt {
+        let AttemptScope {
+            token,
+            input_budget,
+        } = scope;
         let (auth, signer) = auth_for(&login);
         let mut events = Events::new(tx);
         events.recovery_progress = progress;
@@ -448,6 +475,7 @@ impl Attempt {
         // the terminal (reported by `interactive`); the control stream
         // and the proof's stream on delivery.
         let setup = DriverSetup {
+            input_budget: Some(input_budget),
             default_consumption: transport::Consumption::Explicit,
             stream_consumption: vec![
                 (
@@ -1197,5 +1225,25 @@ mod tests {
             .events
             .on_session_aborted(transport::SessionAbortReason::ResourceExhausted);
         assert_eq!(*stale.events.session_abort.lock().unwrap(), None);
+    }
+    #[test]
+    fn client179_local_input_failure_coalesces_before_closed() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = Events::new(tx);
+        let first =
+            crate::session::LocalInputFailure::Rejected(transport::driver_std::SendBlocked::Full);
+        events.input_failed(first);
+        events.on_input_failure(transport::driver_std::InputFailure::OffsetSpaceExhausted {
+            stream_id: 30,
+        });
+        events.on_state(LinkState::Closed);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            got,
+            [
+                crate::session::UiEvent::InputFailure(first),
+                crate::session::UiEvent::Link(LinkState::Closed)
+            ]
+        );
     }
 }

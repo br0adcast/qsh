@@ -7,6 +7,8 @@
 //! it (termios, signals, the socket) stay thin enough to have little left to
 //! get wrong.
 
+use std::collections::VecDeque;
+
 use client::channel::ChannelId;
 use client::ShellState;
 use prediction::DisplayPreference;
@@ -19,6 +21,7 @@ use transport::{LinkState, Stats};
 
 use crate::args::PredictMode;
 use crate::escape::{Command, Escape, Piece, Prefix};
+use crate::input_ingress::{InputBytes, INGRESS_READS};
 use crate::mouse::MouseShift;
 use crate::statusline::{self, Link};
 use crate::window::{self, Boxed, Outcome, Roads, Row};
@@ -47,17 +50,29 @@ const LINE_REFRESH_MS: i64 = 1_000;
 /// Bound on `ShellChannel::Opening`'s queued keystrokes. The round trip to
 /// confirm a channel is ordinarily far shorter than a human can type, but
 /// nothing here can force the far side to ever answer at all -- and a real
-/// terminal limits typeahead too. Past this many bytes, further keystrokes
-/// are dropped rather than queued without bound.
+/// terminal limits typeahead too. A whole record exceeding this bound causes
+/// explicit local input failure; accepted typeahead is never clipped.
 const MAX_QUEUED_INPUT_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LocalInputFailure {
+    Channel(client::channel::ChannelSendError),
+    Rejected(transport::driver_std::SendBlocked),
+    Accepted(transport::driver_std::InputFailure),
+    IngressFull,
+    OpeningFull,
+    NotReady,
+}
+
 /// Everything that can happen to the client.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum UiEvent {
     /// Authenticated terminal failure for the exact stamped live link.
     SessionAborted(transport::SessionAbortReason),
+    /// Explicit synchronous rejection or accepted-input failure; never replay it.
+    InputFailure(LocalInputFailure),
     /// Raw bytes read from the local keyboard.
-    Stdin(Vec<u8>),
+    Stdin(InputBytes),
     /// Framed shell-output records for the shell channel, decoded from
     /// whichever wire stream `main` has bound it to.
     Stream0(Vec<u8>),
@@ -112,7 +127,7 @@ pub enum UiEvent {
 }
 
 /// What the caller must do. The session never performs an effect itself.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Action {
     /// Bytes for the local terminal.
     Write(Vec<u8>),
@@ -120,7 +135,7 @@ pub enum Action {
     /// `Live`.
     OpenShell { cols: u16, rows: u16 },
     /// Bytes for a channel.
-    SendChannel { ch: ChannelId, bytes: Vec<u8> },
+    SendChannel { ch: ChannelId, bytes: InputBytes },
     /// Latest physical intent; hold wire submission until the debounce expires.
     DeferResize { cols: u16, rows: u16 },
     /// A new size for a channel.
@@ -178,7 +193,7 @@ enum Open {
 /// recovering rather than a fresh session, does not open a second), a place
 /// to hold keyboard bytes typed before the far side confirms it, and, once
 /// confirmed, which number to address it by.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 enum ShellChannel {
     /// Never asked to open one.
     Unopened,
@@ -187,18 +202,19 @@ enum ShellChannel {
     /// ordinarily far shorter than a human can type, but a busy daemon can
     /// still stretch it long enough for a few keystrokes to land first, and
     /// dropping those silently would be a real, if rare, bug. Bounded by
-    /// [`MAX_QUEUED_INPUT_BYTES`] -- a real terminal limits typeahead too.
-    Opening { queued: Vec<u8> },
+    /// [`MAX_QUEUED_INPUT_BYTES`] and sixteen owned records; overflow fails
+    /// explicitly without changing the accepted prefix.
+    Opening { queued: VecDeque<InputBytes> },
     /// Confirmed: this is the channel input, resizes, and the far side's
     /// own channel events all address.
     Ready(ChannelId),
     /// Final output is readable, but input and resize are closed.
     Draining(ChannelId),
     /// The link is gone: `ch` is the channel the shell had (when it was
-    /// confirmed), for the reconnect to find again. Input goes nowhere.
+    /// confirmed), for the reconnect to find again. Remote input fails locally.
     Detached { ch: Option<ChannelId> },
     /// A new connection reached the session; waiting for the server's list
-    /// of what it still runs (`on_announced`). Input goes nowhere.
+    /// of what it still runs (`on_announced`). Remote input fails locally.
     Reattaching { ch: Option<ChannelId> },
 }
 
@@ -237,6 +253,8 @@ pub struct Session {
     resize_notice: Option<String>,
     continuity_notice: Option<OutputGapCause>,
     session_abort: Option<transport::SessionAbortReason>,
+    input_failed: bool,
+    read_only_notice: bool,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
     pending_size: Option<(u16, u16)>,
@@ -268,8 +286,8 @@ pub struct Session {
     /// closes. When the window closes the key goes nowhere, but the
     /// `strip` part is handed back to `mouse`: it may be the cut end of a
     /// paste, and dropped it would leave the paste open for good.
-    window_held: Vec<u8>,
-    window_tail: Vec<u8>,
+    window_held: InputBytes,
+    window_tail: InputBytes,
     /// The roads from the last snapshot, in command-line order.
     roads: Vec<window::Road>,
     recovery_view: Option<crate::recovery_status::View>,
@@ -284,8 +302,8 @@ pub struct Session {
     shell_mouse: bool,
     /// The selected history frame stays fixed until a navigation key arrives.
     history_frame: Option<terminal::Frame>,
-    history_held: Vec<u8>,
-    history_tail: Vec<u8>,
+    history_held: InputBytes,
+    history_tail: InputBytes,
 }
 
 impl Session {
@@ -339,6 +357,8 @@ impl Session {
             resize_notice: None,
             continuity_notice: None,
             session_abort: None,
+            input_failed: false,
+            read_only_notice: false,
             pending_size: None,
             resize_due_ms: 0,
             lost_since_ms: None,
@@ -349,8 +369,8 @@ impl Session {
             mouse: MouseShift::new(),
             line_shown: chrome.line,
             window: None,
-            window_held: Vec::new(),
-            window_tail: Vec::new(),
+            window_held: InputBytes::default(),
+            window_tail: InputBytes::default(),
             roads: Vec::new(),
             recovery_view: None,
             silent_secs: 0,
@@ -358,8 +378,8 @@ impl Session {
             line_refreshed_ms: 0,
             shell_mouse: false,
             history_frame: None,
-            history_held: Vec::new(),
-            history_tail: Vec::new(),
+            history_held: InputBytes::default(),
+            history_tail: InputBytes::default(),
         }
     }
 
@@ -377,6 +397,25 @@ impl Session {
                     actions.len() - 1,
                     Action::Notice(crate::connect::abort_line(reason)),
                 );
+                actions
+            }
+            UiEvent::InputFailure(failure) => {
+                if self.input_failed {
+                    return Vec::new();
+                }
+                self.input_failed = true;
+                let mut actions = self.leave(1);
+                let message = match failure {
+                    LocalInputFailure::Channel(error) => format!("qsh: local channel write was not accepted ({error:?})"),
+                    LocalInputFailure::Accepted(transport::driver_std::InputFailure::OffsetSpaceExhausted { stream_id }) => format!(
+                        "qsh: accepted input on stream {stream_id} exceeded transport offset space; input was not replayed"
+                    ),
+                    LocalInputFailure::Rejected(reason) => format!("qsh: local input was not accepted ({reason:?})"),
+                    LocalInputFailure::IngressFull => "qsh: keyboard input buffer limit reached".into(),
+                    LocalInputFailure::OpeningFull => "qsh: input buffer limit reached while opening the shell".into(),
+                    LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
+                };
+                actions.insert(actions.len() - 1, Action::Notice(message));
                 actions
             }
             UiEvent::Stdin(bytes) => self.on_stdin(bytes, now_ms),
@@ -585,7 +624,9 @@ impl Session {
         if let ShellChannel::Reattaching { ch } = self.shell_channel {
             return match ch {
                 Some(ch) if live.contains(&ch) => {
-                    self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
+                    self.shell_channel = ShellChannel::Opening {
+                        queued: VecDeque::new(),
+                    };
                     Vec::new()
                 }
                 _ => {
@@ -601,7 +642,9 @@ impl Session {
         if live.is_empty() {
             // Our session came back, but everything in it has ended. Nothing
             // to adopt: open a shell the way a fresh session would.
-            self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
+            self.shell_channel = ShellChannel::Opening {
+                queued: VecDeque::new(),
+            };
             vec![Action::OpenShell { cols, rows }]
         } else {
             // Only ordered Geometry establishes the retained shell's size.
@@ -621,8 +664,24 @@ impl Session {
     }
 
     pub fn on_channel_draining(&mut self, ch: ChannelId) {
+        if self.shell_channel != ShellChannel::Draining(ch) {
+            self.read_only_notice = false;
+        }
         self.shell_channel = ShellChannel::Draining(ch);
         self.pending_size = None;
+        self.release_draining_input();
+    }
+
+    fn release_draining_input(&mut self) {
+        if matches!(self.shell_channel, ShellChannel::Draining(_))
+            && self.window.is_none()
+            && self.history_frame.is_none()
+        {
+            // The channel no longer accepts remote input. Escape's fixed
+            // paste/command state remains; no unfinished remote mouse payload
+            // may pin ingress while final output/Exit is still readable.
+            self.mouse = MouseShift::new();
+        }
     }
 
     /// Called only after the channel owner validated lifecycle and geometry.
@@ -713,18 +772,20 @@ impl Session {
     /// never actually requested.
     pub fn assume_channel_opening(&mut self) {
         if self.shell_channel == ShellChannel::Unopened {
-            self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
+            self.shell_channel = ShellChannel::Opening {
+                queued: VecDeque::new(),
+            };
         }
     }
 
     /// The far side confirmed the shell channel: input may flow from now on.
     /// Flushes whatever was typed and queued while it was still `Opening`,
     /// through the exact same path an immediate keystroke takes -- so a
-    /// queued keystroke's echo is predicted just like any other, only later.
+    /// queued keystroke's echo is predicted only after its eventual admission.
     pub fn on_channel_ready(&mut self, ch: ChannelId, now_ms: i64) -> Vec<Action> {
         let queued = match std::mem::replace(&mut self.shell_channel, ShellChannel::Ready(ch)) {
             ShellChannel::Opening { queued } => queued,
-            _ => Vec::new(),
+            _ => VecDeque::new(),
         };
         if self.raw_cols != 0
             && self.raw_rows != 0
@@ -734,8 +795,8 @@ impl Session {
             self.pending_size = Some(self.desired_size());
         }
         let mut actions = self.due_resize(now_ms);
-        if !queued.is_empty() {
-            actions.extend(self.send_now(ch, queued, now_ms));
+        for bytes in queued {
+            actions.extend(self.send_now(ch, bytes, now_ms));
         }
         actions
     }
@@ -776,11 +837,14 @@ impl Session {
 
     /// Splits keyboard bytes into input and prefix commands (spec §8.3), in
     /// order. Input goes to the shell, or to the window while one is open.
-    fn on_stdin(&mut self, bytes: Vec<u8>, now_ms: i64) -> Vec<Action> {
+    fn on_stdin(&mut self, bytes: InputBytes, now_ms: i64) -> Vec<Action> {
+        let origin = bytes.origin();
+        let pieces = self.escape.feed(&bytes);
+        drop(bytes);
         let mut actions = Vec::new();
-        for piece in self.escape.feed(&bytes) {
+        for piece in pieces {
             match piece {
-                Piece::Input(input) => actions.extend(self.on_input(input, now_ms)),
+                Piece::Input(input) => actions.extend(self.on_input(origin.derived(input), now_ms)),
                 Piece::Command(Command::Leave) => {
                     // Leaving on the user's own instruction is not a shell
                     // that exited: code 1, not 0. The session stays on the
@@ -824,20 +888,29 @@ impl Session {
     }
 
     /// Keyboard input that is not a prefix command.
-    fn on_input(&mut self, input: Vec<u8>, now_ms: i64) -> Vec<Action> {
+    fn on_input(&mut self, input: InputBytes, now_ms: i64) -> Vec<Action> {
         if self.window.is_some() {
             return self.on_window_input(input, now_ms);
         }
         if self.history_frame.is_some() {
             return self.on_history_input(input, now_ms);
         }
+        if matches!(self.shell_channel, ShellChannel::Draining(_)) {
+            self.release_draining_input();
+            if std::mem::replace(&mut self.read_only_notice, true) {
+                return Vec::new();
+            }
+            return vec![Action::Notice(
+                "qsh: shell input is closed; waiting for final output".into(),
+            )];
+        }
         let shift = u16::from(self.line_on() && self.shell_mouse);
         let shell_rows = self
             .rows
             .saturating_sub(shift)
             .min(self.logical_size.rows());
-        let input = self.mouse.apply_bounded(
-            &input,
+        let input = self.mouse.apply_owned_bounded(
+            input,
             shift,
             self.cols.min(self.logical_size.cols()),
             shell_rows,
@@ -851,21 +924,23 @@ impl Session {
     fn close_history(&mut self) {
         self.history_frame = None;
         self.history_held.clear();
-        self.mouse.hand_back(std::mem::take(&mut self.history_tail));
+        self.mouse
+            .hand_back_owned(std::mem::take(&mut self.history_tail));
         self.shell.set_history_view(false);
+        self.release_draining_input();
     }
 
-    fn on_history_input(&mut self, input: Vec<u8>, now_ms: i64) -> Vec<Action> {
+    fn on_history_input(&mut self, input: InputBytes, now_ms: i64) -> Vec<Action> {
         let mut held = std::mem::take(&mut self.history_held);
-        held.append(&mut self.history_tail);
-        held.extend(input);
-        let (bytes, tail) = self.mouse.strip(&held);
+        held.append(std::mem::take(&mut self.history_tail));
+        held.append(input);
+        let (bytes, tail) = self.mouse.strip_owned(held);
         self.history_tail = tail;
         let mut i = 0;
         while i < bytes.len() {
             let len = if bytes[i] == 0x1b && matches!(bytes.get(i + 1), Some(b'[' | b'O')) {
                 let Some(len) = crate::escape::sequence_len(&bytes[i..]) else {
-                    self.history_held.extend_from_slice(&bytes[i..]);
+                    self.history_held.append(bytes.copy_range(i..bytes.len()));
                     break;
                 };
                 len
@@ -907,21 +982,23 @@ impl Session {
     fn close_window(&mut self) {
         self.window = None;
         self.window_held.clear();
-        self.mouse.hand_back(std::mem::take(&mut self.window_tail));
+        self.mouse
+            .hand_back_owned(std::mem::take(&mut self.window_tail));
+        self.release_draining_input();
     }
 
     /// Keys for the open window. The help closes on any key, and the key
     /// goes nowhere; the connection-state window reads arrows, digits,
     /// `Enter`, `Esc` and `q`. What follows a key that closes the window in
     /// the same read goes nowhere either.
-    fn on_window_input(&mut self, input: Vec<u8>, now_ms: i64) -> Vec<Action> {
+    fn on_window_input(&mut self, input: InputBytes, now_ms: i64) -> Vec<Action> {
         let mut held = std::mem::take(&mut self.window_held);
-        held.append(&mut self.window_tail);
-        held.extend_from_slice(&input);
+        held.append(std::mem::take(&mut self.window_tail));
+        held.append(input);
         // Mouse reports and pastes are not key presses: they never drive a
         // window (an SGR report's digits would pick rows, a pasted `2\r`
         // would switch roads).
-        let (mut bytes, tail) = self.mouse.strip(&held);
+        let (mut bytes, tail) = self.mouse.strip_owned(held);
         // A key sequence cut off at the end waits, whole, for the rest.
         let (keys, cut) = window::keys(&bytes);
         self.window_held = bytes.split_off(bytes.len() - cut);
@@ -1060,11 +1137,10 @@ impl Session {
 
     /// Sends keyboard bytes to the shell channel once it is confirmed, or
     /// queues them if it is not there yet -- see `ShellChannel::Opening`'s
-    /// own doc for why a queue and not a drop. Bytes typed before the
-    /// channel is even `Opening` (the link itself is not `Live` yet) are
-    /// dropped: rare enough, and remote enough from the far side ever
-    /// existing at all, that it is not worth a place to hold them.
-    fn queue_or_send(&mut self, bytes: Vec<u8>, now_ms: i64) -> Vec<Action> {
+    /// own doc for its whole-record limits. Input without a usable or Opening
+    /// channel fails explicitly. Confirmed Draining input is handled as
+    /// read-only before this method, preserving the remote exit status.
+    fn queue_or_send(&mut self, bytes: InputBytes, now_ms: i64) -> Vec<Action> {
         let ready = match &self.shell_channel {
             ShellChannel::Ready(ch) => Some(*ch),
             _ => None,
@@ -1073,26 +1149,36 @@ impl Session {
             return self.send_now(ch, bytes, now_ms);
         }
         if let ShellChannel::Opening { queued } = &mut self.shell_channel {
-            let room = MAX_QUEUED_INPUT_BYTES.saturating_sub(queued.len());
-            let take = bytes.len().min(room);
-            queued.extend_from_slice(&bytes[..take]);
+            let held: usize = queued.iter().map(InputBytes::len).sum();
+            if bytes.len() > MAX_QUEUED_INPUT_BYTES.saturating_sub(held)
+                || queued.len() == INGRESS_READS
+            {
+                return self.handle(
+                    UiEvent::InputFailure(LocalInputFailure::OpeningFull),
+                    now_ms,
+                );
+            }
+            queued.push_back(bytes);
+            return Vec::new();
         }
-        Vec::new()
+        self.handle(UiEvent::InputFailure(LocalInputFailure::NotReady), now_ms)
     }
 
-    /// Sends `bytes` to the confirmed channel `ch` right now, and predicts
-    /// their echo. The one place that actually calls
-    /// `Action::SendChannel` -- both an immediate keystroke and a queue
-    /// flushed by `on_channel_ready` go through here, so both get their
-    /// echo predicted the same way.
-    fn send_now(&mut self, ch: ChannelId, bytes: Vec<u8>, now_ms: i64) -> Vec<Action> {
-        let mut actions = vec![Action::SendChannel {
-            ch,
-            bytes: bytes.clone(),
-        }];
-        let frame = self.shell.on_input(&bytes, now_ms, self.rtt_ms);
-        actions.extend(self.paint_at(&frame, now_ms));
-        actions
+    /// Prepare owned input for the confirmed channel. Immediate input and
+    /// Opening typeahead share this path; only the executor's subsequent
+    /// successful admission authorizes prediction and painting.
+    fn send_now(&mut self, ch: ChannelId, bytes: InputBytes, _now_ms: i64) -> Vec<Action> {
+        vec![Action::SendChannel { ch, bytes }]
+    }
+
+    /// Called by the executor only after the complete input was admitted.
+    /// Preparing an action, or a recoverable path loss, is not rejection.
+    pub fn input_admitted(&mut self, ch: ChannelId, bytes: &[u8], now_ms: i64) -> Vec<Action> {
+        if self.shell_channel != ShellChannel::Ready(ch) {
+            return Vec::new();
+        }
+        let frame = self.shell.on_input(bytes, now_ms, self.rtt_ms);
+        self.paint_at(&frame, now_ms)
     }
 
     fn on_link(&mut self, state: LinkState, now_ms: i64) -> Vec<Action> {
@@ -1139,7 +1225,9 @@ impl Session {
                 };
                 if matches!(state, LinkState::Live) && self.shell_channel == ShellChannel::Unopened
                 {
-                    self.shell_channel = ShellChannel::Opening { queued: Vec::new() };
+                    self.shell_channel = ShellChannel::Opening {
+                        queued: VecDeque::new(),
+                    };
                     let (cols, rows) = self.desired_size();
                     actions.push(Action::OpenShell { cols, rows });
                 }
@@ -1457,11 +1545,13 @@ impl Session {
         // state than that frame describes.
         self.last_frame = None;
         actions.push(Action::Write(bytes));
-        actions.push(Action::Exit(if self.session_abort.is_some() {
-            1
-        } else {
-            code
-        }));
+        actions.push(Action::Exit(
+            if self.session_abort.is_some() || self.input_failed {
+                1
+            } else {
+                code
+            },
+        ));
         actions
     }
 }
@@ -1480,6 +1570,12 @@ fn seconds_until(until_ms: i64, now_ms: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn ingress_input(bytes: Vec<u8>) -> InputBytes {
+        crate::input_ingress::IngressBudget::default()
+            .admit_owned(bytes)
+            .expect("fixture input fits ingress")
+    }
+
     use super::*;
     use render::TermCaps;
 
@@ -1488,7 +1584,8 @@ mod tests {
         let mut s = Session::new(20, 5, TermCaps::truecolor(), PredictMode::Always, plain());
         s.on_link(LinkState::Live, 0);
         s.on_channel_ready(16, 0);
-        s.handle(UiEvent::Stdin(b"predicted".to_vec()), 10);
+        s.handle(UiEvent::Stdin(ingress_input(b"predicted".to_vec())), 10);
+        s.input_admitted(16, b"predicted", 10);
         assert!(s.shell.prediction_active());
         s.on_geometry(
             GeometryRecord {
@@ -1574,7 +1671,7 @@ mod tests {
         s.assume_channel_opening();
         assert!(s.on_snapshot(&[], &[16], 0).is_empty());
         s.on_channel_draining(16);
-        assert!(sent(&s.handle(UiEvent::Stdin(b"no".to_vec()), 1)).is_empty());
+        assert!(sent(&s.handle(UiEvent::Stdin(ingress_input(b"no".to_vec())), 1)).is_empty());
         s.on_resize(30, 7, 2);
         assert!(control(&s.on_tick(1000)).is_empty());
         assert!(s.on_channel_exit(16, 37, 1001).contains(&Action::Exit(37)));
@@ -2001,7 +2098,7 @@ mod tests {
             },
             1,
         );
-        s.handle(UiEvent::Stdin(b"\x1ds".to_vec()), 2);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1ds".to_vec())), 2);
         assert!(
             s.last_frame.as_ref().unwrap().cells[..80]
                 .iter()
@@ -2015,7 +2112,7 @@ mod tests {
             "details must preserve active protocol brightness"
         );
         for now in 3..40 {
-            s.handle(UiEvent::Stdin(b"\x1b[B".to_vec()), now);
+            s.handle(UiEvent::Stdin(ingress_input(b"\x1b[B".to_vec())), now);
         }
         let text: String = s
             .draw_window()
@@ -2026,7 +2123,7 @@ mod tests {
             .map(|c| c.ch)
             .collect();
         assert!(text.contains("host-12.example"), "{text}");
-        let actions = s.handle(UiEvent::Stdin(b"\r".to_vec()), 40);
+        let actions = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 40);
         assert!(!actions.iter().any(|a| matches!(a, Action::UseRoad(_))));
         assert!(sent(&actions).is_empty());
         s.on_reattached(41);
@@ -2080,7 +2177,7 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SendChannel { bytes, .. } => Some(bytes.clone()),
+                Action::SendChannel { bytes, .. } => Some(bytes.as_slice().to_vec()),
                 _ => None,
             })
             .flatten()
@@ -2128,7 +2225,7 @@ mod tests {
     fn scroll_mode_enters_and_navigation_stays_on_the_client() {
         let mut s = session_with_history();
         let live = shown_row(&s, 1);
-        let actions = s.handle(UiEvent::Stdin(b"\x1d[".to_vec()), 2);
+        let actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 2);
         assert!(sent(&actions).is_empty());
         assert!(shown_row(&s, 0).contains("scroll: 0/36"));
         for (key, offset) in [
@@ -2141,32 +2238,35 @@ mod tests {
             (b"g".as_slice(), 36),
             (b"G".as_slice(), 0),
         ] {
-            let actions = s.handle(UiEvent::Stdin(key.to_vec()), 3);
+            let actions = s.handle(UiEvent::Stdin(ingress_input(key.to_vec())), 3);
             assert!(sent(&actions).is_empty(), "scroll keys are local: {key:?}");
             assert_eq!(s.shell.display_offset(), offset, "key {key:?}");
         }
         assert_eq!(shown_row(&s, 1), live);
-        s.handle(UiEvent::Stdin(b"\x1b[5~".to_vec()), 4);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1b[5~".to_vec())), 4);
         assert_ne!(shown_row(&s, 1), live);
-        let actions = s.handle(UiEvent::Stdin(b"qignored".to_vec()), 5);
+        let actions = s.handle(UiEvent::Stdin(ingress_input(b"qignored".to_vec())), 5);
         assert!(sent(&actions).is_empty(), "the closing read is local too");
         assert_eq!(shown_row(&s, 1), live);
         assert!(!shown_row(&s, 0).contains("scroll:"));
-        assert_eq!(sent(&s.handle(UiEvent::Stdin(b"x".to_vec()), 6)), b"x");
+        assert_eq!(
+            sent(&s.handle(UiEvent::Stdin(ingress_input(b"x".to_vec())), 6)),
+            b"x"
+        );
     }
 
     #[test]
     fn scroll_mode_keeps_the_view_when_output_arrives_even_at_the_bottom() {
         for key in [b"".as_slice(), b"\x1b[5~".as_slice()] {
             let mut s = session_with_history();
-            s.handle(UiEvent::Stdin(b"\x1d[".to_vec()), 2);
-            s.handle(UiEvent::Stdin(key.to_vec()), 3);
+            s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 2);
+            s.handle(UiEvent::Stdin(ingress_input(key.to_vec())), 3);
             let before = s.last_frame.as_ref().unwrap().cells[40..].to_vec();
             s.handle(UiEvent::Stream0(record(b"new001\r\nnew002\r\n")), 4);
             assert_eq!(s.last_frame.as_ref().unwrap().cells[40..], before);
             let offset = if key.is_empty() { 2 } else { 7 };
             assert!(shown_row(&s, 0).contains(&format!("scroll: {offset}/38")));
-            s.handle(UiEvent::Stdin(b"\x1b".to_vec()), 5);
+            s.handle(UiEvent::Stdin(ingress_input(b"\x1b".to_vec())), 5);
             assert_eq!(s.shell.display_offset(), 0);
             assert!(shown_row(&s, 4).contains("new002"));
         }
@@ -2175,39 +2275,42 @@ mod tests {
     #[test]
     fn scroll_mode_reads_a_split_arrow_and_drops_pastes() {
         let mut s = session_with_history();
-        s.handle(UiEvent::Stdin(b"\x1d[".to_vec()), 2);
-        assert!(sent(&s.handle(UiEvent::Stdin(b"\x1b[".to_vec()), 3)).is_empty());
-        s.handle(UiEvent::Stdin(b"A".to_vec()), 4);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 2);
+        assert!(sent(&s.handle(UiEvent::Stdin(ingress_input(b"\x1b[".to_vec())), 3)).is_empty());
+        s.handle(UiEvent::Stdin(ingress_input(b"A".to_vec())), 4);
         assert_eq!(s.shell.display_offset(), 1);
-        s.handle(UiEvent::Stdin(b"\x1b[200~qgG\x1b[201~".to_vec()), 5);
+        s.handle(
+            UiEvent::Stdin(ingress_input(b"\x1b[200~qgG\x1b[201~".to_vec())),
+            5,
+        );
         assert!(shown_row(&s, 0).contains("scroll: 1/36"));
     }
 
     #[test]
     fn scroll_mode_reset_discards_the_history_and_returns_live() {
         let mut s = session_with_history();
-        s.handle(UiEvent::Stdin(b"\x1d[g".to_vec()), 2);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[g".to_vec())), 2);
         s.handle(UiEvent::StreamReset, 3);
         assert_eq!(s.shell.display_offset(), 0);
         assert!(!shown_row(&s, 0).contains("scroll:"));
-        s.handle(UiEvent::Stdin(b"\x1d[".to_vec()), 4);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 4);
         assert!(shown_row(&s, 0).contains("no history"));
     }
 
     #[test]
     fn scroll_mode_can_go_home_repeatedly_and_zero_disables_history() {
         let mut s = session_with_history();
-        s.handle(UiEvent::Stdin(b"\x1d[gg".to_vec()), 2);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[gg".to_vec())), 2);
         assert_eq!(s.shell.display_offset(), 36);
-        s.handle(UiEvent::Stdin(b"q".to_vec()), 3);
+        s.handle(UiEvent::Stdin(ingress_input(b"q".to_vec())), 3);
         s.set_history_limit(0);
         s.handle(
             UiEvent::Stream0(record(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n")),
             4,
         );
-        s.handle(UiEvent::Stdin(b"\x1d[".to_vec()), 5);
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 5);
         assert!(shown_row(&s, 0).contains("no history"));
-        let a = s.handle(UiEvent::Stdin(b"gg\x1b[5~".to_vec()), 6);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"gg\x1b[5~".to_vec())), 6);
         assert!(sent(&a).is_empty());
         assert_eq!(s.shell.display_offset(), 0);
     }
@@ -2218,7 +2321,7 @@ mod tests {
     #[test]
     fn keyboard_bytes_reach_the_shell_channel_untouched() {
         let mut s = ready_session();
-        let a = s.handle(UiEvent::Stdin(b"ls\r\x03\x1b[A".to_vec()), 0);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"ls\r\x03\x1b[A".to_vec())), 0);
         assert_eq!(sent(&a), b"ls\r\x03\x1b[A");
     }
 
@@ -2472,7 +2575,7 @@ mod tests {
     fn the_escape_leaves_with_an_error_code() {
         let mut s = session();
         let _ = s.handle(UiEvent::Link(LinkState::PathDown), 0);
-        let a = s.handle(UiEvent::Stdin(vec![0x1d, b'.']), 100);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'.'])), 100);
         assert!(
             a.iter().any(|x| matches!(x, Action::Exit(1))),
             "Ctrl-] . must leave, and not pretend the shell exited: {a:?}"
@@ -2488,7 +2591,10 @@ mod tests {
     #[test]
     fn a_key_after_the_prefix_that_is_no_command_is_swallowed() {
         let mut s = ready_session();
-        let a = s.handle(UiEvent::Stdin(vec![b'a', 0x1d, b'x', b'b']), 0);
+        let a = s.handle(
+            UiEvent::Stdin(ingress_input(vec![b'a', 0x1d, b'x', b'b'])),
+            0,
+        );
         assert_eq!(sent(&a), b"ab", "the prefix and its key go nowhere");
         assert!(!a.iter().any(|x| matches!(x, Action::Exit(_))));
     }
@@ -2505,14 +2611,18 @@ mod tests {
                 let mut session = ready_session();
                 let mut delivered = Vec::new();
                 for chunk in [&bytes[..split], &bytes[split..]] {
-                    delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                    delivered.extend(sent(
+                        &session.handle(UiEvent::Stdin(ingress_input(chunk.to_vec())), 1000),
+                    ));
                 }
                 assert_eq!(delivered, bytes, "split {split}");
             }
             let mut session = ready_session();
             let mut delivered = Vec::new();
             for chunk in bytes.chunks(1) {
-                delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                delivered.extend(sent(
+                    &session.handle(UiEvent::Stdin(ingress_input(chunk.to_vec())), 1000),
+                ));
             }
             assert_eq!(delivered, bytes);
         }
@@ -2537,7 +2647,9 @@ mod tests {
                 }
                 let mut delivered = Vec::new();
                 for chunk in payload.chunks(997) {
-                    delivered.extend(sent(&s.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                    delivered.extend(sent(
+                        &s.handle(UiEvent::Stdin(ingress_input(chunk.to_vec())), 1000),
+                    ));
                 }
                 assert_eq!(delivered, payload, "prediction must never truncate input");
                 assert!(!s.shell.prediction_active());
@@ -2560,8 +2672,8 @@ mod tests {
                 let mut s = Session::new(20, 5, TermCaps::truecolor(), PredictMode::Never, chrome);
                 s.on_link(LinkState::Live, 0);
                 s.on_channel_ready(16, 0);
-                let mut actions = s.handle(UiEvent::Stdin(bytes[..cut].to_vec()), 0);
-                actions.extend(s.handle(UiEvent::Stdin(bytes[cut..].to_vec()), 1));
+                let mut actions = s.handle(UiEvent::Stdin(ingress_input(bytes[..cut].to_vec())), 0);
+                actions.extend(s.handle(UiEvent::Stdin(ingress_input(bytes[cut..].to_vec())), 1));
                 assert_eq!(sent(&actions), bytes, "cut {cut}, prefix {key}");
                 // Sending input may also repaint the existing frame.
                 assert!(actions
@@ -2580,9 +2692,9 @@ mod tests {
     #[test]
     fn the_escape_works_when_split_across_reads() {
         let mut s = session();
-        let first = s.handle(UiEvent::Stdin(vec![0x1d]), 0);
+        let first = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d])), 0);
         assert!(sent(&first).is_empty(), "the first half is held, not sent");
-        let second = s.handle(UiEvent::Stdin(vec![b'.']), 10);
+        let second = s.handle(UiEvent::Stdin(ingress_input(vec![b'.'])), 10);
         assert!(second.iter().any(|x| matches!(x, Action::Exit(1))));
     }
 
@@ -2591,10 +2703,10 @@ mod tests {
     #[test]
     fn a_held_prefix_is_swallowed_with_the_key_after_it() {
         let mut s = ready_session();
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d]), 0);
-        let a = s.handle(UiEvent::Stdin(vec![b'x']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d])), 0);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![b'x'])), 10);
         assert!(sent(&a).is_empty(), "{a:?}");
-        let a = s.handle(UiEvent::Stdin(vec![b'y']), 20);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![b'y'])), 20);
         assert_eq!(sent(&a), b"y", "and only that one key");
     }
 
@@ -2603,9 +2715,9 @@ mod tests {
     #[test]
     fn the_prefix_twice_sends_one_and_holds_none() {
         let mut s = ready_session();
-        let a = s.handle(UiEvent::Stdin(vec![0x1d, 0x1d]), 0);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, 0x1d])), 0);
         assert_eq!(sent(&a), vec![0x1d], "one goes out");
-        let b = s.handle(UiEvent::Stdin(vec![b'.']), 10);
+        let b = s.handle(UiEvent::Stdin(ingress_input(vec![b'.'])), 10);
         assert_eq!(sent(&b), b".", "nothing was held");
         assert!(!b.iter().any(|x| matches!(x, Action::Exit(_))));
     }
@@ -2640,7 +2752,7 @@ mod tests {
             !live.iter().any(|a| matches!(a, Action::OpenShell { .. })),
             "a resumed session's shell is announced, not opened: {live:?}"
         );
-        let typed = s.handle(UiEvent::Stdin(b"x".to_vec()), 5);
+        let typed = s.handle(UiEvent::Stdin(ingress_input(b"x".to_vec())), 5);
         assert!(sent(&typed).is_empty(), "no channel to send to yet");
         let announced = s.on_announced(&[16], 10);
         assert!(
@@ -2723,7 +2835,7 @@ mod tests {
     fn queued_keystrokes_before_ready_flush_to_the_confirmed_channel_not_a_constant() {
         let mut s = session();
         s.on_link(LinkState::Live, 0);
-        let queued = s.handle(UiEvent::Stdin(b"ls\r".to_vec()), 5);
+        let queued = s.handle(UiEvent::Stdin(ingress_input(b"ls\r".to_vec())), 5);
         assert!(
             sent(&queued).is_empty(),
             "nothing sent yet: the channel is not confirmed"
@@ -2732,7 +2844,7 @@ mod tests {
         let flushed = s.on_channel_ready(37, 10);
         assert!(
             flushed.iter().any(
-                |a| matches!(a, Action::SendChannel { ch, bytes } if *ch == 37 && bytes == b"ls\r")
+                |a| matches!(a, Action::SendChannel { ch, bytes } if *ch == 37 && bytes.as_slice() == b"ls\r")
             ),
             "the queued keystrokes must flush to channel 37, not a hardcoded number: {flushed:?}"
         );
@@ -2745,20 +2857,16 @@ mod tests {
     fn queued_keystrokes_before_ready_are_capped() {
         let mut s = session();
         s.on_link(LinkState::Live, 0);
-        let huge = vec![b'x'; 128 * 1024];
-        let _ = s.handle(UiEvent::Stdin(huge), 5);
-
+        for _ in 0..16 {
+            let _ = s.handle(UiEvent::Stdin(ingress_input(vec![b'x'; 4096])), 5);
+        }
+        let overflow = s.handle(UiEvent::Stdin(ingress_input(vec![b'z'; 4096])), 6);
+        assert!(matches!(overflow.last(), Some(Action::Exit(1))));
         let flushed = s.on_channel_ready(37, 10);
-        let sent_len: usize = flushed
-            .iter()
-            .filter_map(|a| match a {
-                Action::SendChannel { bytes, .. } => Some(bytes.len()),
-                _ => None,
-            })
-            .sum();
-        assert!(
-            sent_len <= 64 * 1024,
-            "queued keystrokes must be capped rather than growing without bound, got {sent_len}"
+        assert_eq!(
+            sent(&flushed),
+            vec![b'x'; 64 * 1024],
+            "whole accepted prefix, no clipped suffix"
         );
     }
 
@@ -2821,11 +2929,11 @@ mod tests {
     #[test]
     fn the_prefix_r_asks_to_reconnect_and_sends_nothing() {
         let mut s = ready_session();
-        let a = s.handle(UiEvent::Stdin(b"ab\x1dr".to_vec()), 0);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"ab\x1dr".to_vec())), 0);
         assert_eq!(sent(&a), b"ab", "what came before the escape still goes");
         assert!(a.contains(&Action::Reconnect), "{a:?}");
-        let a = s.handle(UiEvent::Stdin(vec![0x1d]), 1);
-        let a2 = s.handle(UiEvent::Stdin(vec![b'r']), 2);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d])), 1);
+        let a2 = s.handle(UiEvent::Stdin(ingress_input(vec![b'r'])), 2);
         assert!(sent(&a).is_empty() && sent(&a2).is_empty());
         assert!(
             a2.contains(&Action::Reconnect),
@@ -2841,7 +2949,7 @@ mod tests {
         let mut s = Session::new(20, 5, TermCaps::truecolor(), PredictMode::Always, plain());
         let _ = s.on_link(LinkState::Live, 0);
         let _ = s.on_channel_ready(16, 0);
-        let a = s.handle(UiEvent::Stdin(b"\x1drls".to_vec()), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\x1drls".to_vec())), 10);
         assert_eq!(a, vec![Action::Reconnect], "nothing sent, nothing painted");
     }
 
@@ -2849,9 +2957,9 @@ mod tests {
     fn keys_typed_while_the_link_is_gone_go_nowhere() {
         let mut s = ready_session();
         let _ = s.on_link_gone(0);
-        let a = s.handle(UiEvent::Stdin(b"ls\r".to_vec()), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"ls\r".to_vec())), 10);
         assert!(sent(&a).is_empty(), "a dead channel gets nothing: {a:?}");
-        let a = s.handle(UiEvent::Stdin(vec![0x1d, b'.']), 20);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'.'])), 20);
         assert!(
             a.contains(&Action::Exit(1)),
             "the way out still works: {a:?}"
@@ -2929,7 +3037,7 @@ mod tests {
         let a = s.on_announced(&[16], 20);
         assert!(a.is_empty(), "snapshot does not commit geometry");
         let _ = s.on_channel_ready(16, 21);
-        let a = s.handle(UiEvent::Stdin(b"x".to_vec()), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"x".to_vec())), 30);
         assert_eq!(sent(&a), b"x", "input flows again");
     }
 
@@ -3340,7 +3448,7 @@ mod tests {
             0,
         );
         s.handle(UiEvent::Tick, 1_000);
-        s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 1_001);
+        s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'h'])), 1_001);
         let hidden = s.handle(UiEvent::Resumed, 1_002);
         assert!(!screen_text(&hidden, 60, 5).contains("a:1"));
         assert_eq!(s.desired_size(), (60, 5));
@@ -3365,7 +3473,7 @@ mod tests {
             },
             1_003,
         );
-        s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 1_004);
+        s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'h'])), 1_004);
         let shown = s.handle(UiEvent::Resumed, 1_005);
         assert!(row0(&shown, 60, 5).ends_with("b:2  42 ms "));
         assert_eq!(s.desired_size(), (60, 4));
@@ -3397,7 +3505,7 @@ mod tests {
     #[test]
     fn hiding_the_line_gives_the_shell_its_row_back() {
         let mut s = lined(80, 24);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'h']), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'h'])), 0);
         assert_eq!(s.desired_size(), (80, 24));
         assert_eq!(s.size(), (80, 23));
         let a = s.handle(UiEvent::Tick, 1_000);
@@ -3415,22 +3523,22 @@ mod tests {
     fn keys_go_to_the_window_not_the_shell() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let a = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         assert!(s.window_open());
         assert!(sent(&a).is_empty());
-        let a = s.handle(UiEvent::Stdin(b"ls\x1b[B".to_vec()), 20);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"ls\x1b[B".to_vec())), 20);
         assert!(
             sent(&a).is_empty(),
             "nothing typed into the window reaches the shell: {a:?}"
         );
-        let a = s.handle(UiEvent::Stdin(b"\r".to_vec()), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 30);
         assert!(
             a.contains(&Action::UseRoad("127.0.0.1:2".parse().unwrap())),
             "{a:?}"
         );
         let _ = s.handle(UiEvent::RoadSwitched { ok: true }, 40);
         assert!(!s.window_open(), "a switch that worked closes the window");
-        let a = s.handle(UiEvent::Stdin(b"x".to_vec()), 50);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"x".to_vec())), 50);
         assert_eq!(sent(&a), b"x");
     }
 
@@ -3441,10 +3549,10 @@ mod tests {
     fn the_digits_of_a_key_sequence_pick_no_row() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
-        let _ = s.handle(UiEvent::Stdin(b"\x1b[1;2".to_vec()), 20);
-        let _ = s.handle(UiEvent::Stdin(b"A\x1b[12~".to_vec()), 30);
-        let a = s.handle(UiEvent::Stdin(b"\r".to_vec()), 40);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[1;2".to_vec())), 20);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"A\x1b[12~".to_vec())), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 40);
         assert!(!a.iter().any(|x| matches!(x, Action::UseRoad(_))), "{a:?}");
         assert!(s.window_open());
     }
@@ -3456,14 +3564,17 @@ mod tests {
     fn closing_the_window_mid_paste_does_not_leave_the_paste_open() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         // The frame shows a mouse-tracking application, so clicks are moved.
         let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?1000h\x1b[?1006h")), 15);
-        let _ = s.handle(UiEvent::Stdin(b"q\x1b[200~pasted\x1b[20".to_vec()), 20);
+        let _ = s.handle(
+            UiEvent::Stdin(ingress_input(b"q\x1b[200~pasted\x1b[20".to_vec())),
+            20,
+        );
         assert!(!s.window_open(), "q closes the window");
-        let a = s.handle(UiEvent::Stdin(b"1~".to_vec()), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"1~".to_vec())), 30);
         assert_eq!(sent(&a), b"\x1b[201~", "the paste's end reaches the shell");
-        let a = s.handle(UiEvent::Stdin(b"\x1b[<0;10;5M".to_vec()), 40);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[<0;10;5M".to_vec())), 40);
         assert_eq!(
             sent(&a),
             b"\x1b[<0;10;4M",
@@ -3475,7 +3586,10 @@ mod tests {
     fn a_switch_that_failed_keeps_the_window() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's', b'2', b'\r']), 10);
+        let _ = s.handle(
+            UiEvent::Stdin(ingress_input(vec![0x1d, b's', b'2', b'\r'])),
+            10,
+        );
         let _ = s.handle(UiEvent::RoadSwitched { ok: false }, 20);
         assert!(s.window_open());
     }
@@ -3484,7 +3598,7 @@ mod tests {
     fn the_window_follows_a_resize() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         let a = s.handle(UiEvent::Resized { cols: 40, rows: 10 }, 20);
         let text = screen_text(&a, 40, 10);
         assert!(text.contains("Connection state"), "{text}");
@@ -3497,7 +3611,7 @@ mod tests {
     #[test]
     fn enter_never_switches_to_a_road_out_of_sight() {
         use transport::paths::PathState;
-        let three = UiEvent::Roads {
+        let three = || UiEvent::Roads {
             roads: vec![
                 road("a:1", 1, true, PathState::Verified, Some(40)),
                 road("b:2", 2, false, PathState::Verified, Some(38)),
@@ -3506,8 +3620,8 @@ mod tests {
         };
         // The snapshot shrinks under the selection.
         let mut s = lined(80, 24);
-        let _ = s.handle(three.clone(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's', b'3']), 10);
+        let _ = s.handle(three(), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's', b'3'])), 10);
         let _ = s.handle(
             UiEvent::Roads {
                 roads: vec![
@@ -3517,7 +3631,7 @@ mod tests {
             },
             20,
         );
-        let a = s.handle(UiEvent::Stdin(b"\r".to_vec()), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 30);
         assert!(
             a.contains(&Action::UseRoad("127.0.0.1:2".parse().unwrap())),
             "the selection moved to the last row left: {a:?}"
@@ -3525,9 +3639,12 @@ mod tests {
 
         // A terminal of three rows: the box has room for one road only.
         let mut s = lined(80, 3);
-        let _ = s.handle(three, 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's', b'3', b'\r']), 10);
-        let a = s.handle(UiEvent::Stdin(vec![b'2', b'\r']), 20);
+        let _ = s.handle(three(), 0);
+        let _ = s.handle(
+            UiEvent::Stdin(ingress_input(vec![0x1d, b's', b'3', b'\r'])),
+            10,
+        );
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![b'2', b'\r'])), 20);
         assert!(
             !a.iter().any(|x| matches!(x, Action::UseRoad(_))),
             "neither road 3 nor road 2 is on screen: {a:?}"
@@ -3540,13 +3657,13 @@ mod tests {
     fn a_window_too_big_for_the_terminal_does_not_stay_open() {
         let mut s = lined(6, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         assert!(!s.window_open());
-        let a = s.handle(UiEvent::Stdin(b"x".to_vec()), 20);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"x".to_vec())), 20);
         assert_eq!(sent(&a), b"x");
 
         let mut s = lined(80, 24);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'?']), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'?'])), 0);
         assert!(s.window_open());
         let _ = s.handle(UiEvent::Resized { cols: 6, rows: 24 }, 10);
         assert!(!s.window_open(), "shrunk out of sight");
@@ -3558,7 +3675,7 @@ mod tests {
     fn mouse_reports_and_pastes_do_not_drive_the_roads_window() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         let mut inputs: Vec<Vec<u8>> = vec![
             // SGR: its digits would be `Pick`s.
             b"\x1b[<0;10;2M".to_vec(),
@@ -3572,7 +3689,7 @@ mod tests {
         inputs.push(b"\x1b[<0;1".to_vec());
         inputs.push(b"2;2M".to_vec());
         for (i, input) in inputs.into_iter().enumerate() {
-            let a = s.handle(UiEvent::Stdin(input.clone()), 20 + i as i64);
+            let a = s.handle(UiEvent::Stdin(ingress_input(input.clone())), 20 + i as i64);
             assert!(s.window_open(), "{input:?} closed the window");
             assert!(sent(&a).is_empty(), "{input:?}: {a:?}");
             assert!(
@@ -3580,7 +3697,7 @@ mod tests {
                 "{input:?}: {a:?}"
             );
         }
-        let a = s.handle(UiEvent::Stdin(b"\r".to_vec()), 40);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 40);
         assert!(
             !a.iter().any(|x| matches!(x, Action::UseRoad(_))),
             "the selection is still on the road in use: {a:?}"
@@ -3590,11 +3707,11 @@ mod tests {
     #[test]
     fn a_mouse_report_does_not_close_the_help() {
         let mut s = lined(80, 24);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'?']), 0);
-        let _ = s.handle(UiEvent::Stdin(b"\x1b[<0;10;5M".to_vec()), 10);
-        let _ = s.handle(UiEvent::Stdin(b"\x1b[<0;10;5m".to_vec()), 11);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'?'])), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[<0;10;5M".to_vec())), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[<0;10;5m".to_vec())), 11);
         assert!(s.window_open());
-        let a = s.handle(UiEvent::Stdin(b"z".to_vec()), 20);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"z".to_vec())), 20);
         assert!(!s.window_open(), "a real key still closes it");
         assert!(sent(&a).is_empty());
     }
@@ -3602,7 +3719,7 @@ mod tests {
     #[test]
     fn the_prefix_leaves_keeping_the_session() {
         let mut s = lined(80, 24);
-        let a = s.handle(UiEvent::Stdin(vec![0x1d, b'.']), 0);
+        let a = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'.'])), 0);
         let keep = a.iter().position(|x| *x == Action::Keep).expect("keep");
         let exit = a
             .iter()
@@ -3614,9 +3731,9 @@ mod tests {
     #[test]
     fn the_help_closes_on_any_key() {
         let mut s = lined(80, 24);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'?']), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'?'])), 0);
         assert!(s.window_open());
-        let a = s.handle(UiEvent::Stdin(b"z".to_vec()), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"z".to_vec())), 10);
         assert!(!s.window_open());
         assert!(sent(&a).is_empty(), "the key that closed it goes nowhere");
     }
@@ -3624,12 +3741,12 @@ mod tests {
     #[test]
     fn the_prefix_s_closes_any_window() {
         let mut s = lined(80, 24);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b'?']), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'?'])), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
         assert!(!s.window_open());
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 20);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 20);
         assert!(s.window_open());
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 30);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 30);
         assert!(!s.window_open());
     }
 
@@ -3639,11 +3756,11 @@ mod tests {
     fn an_arrow_split_across_reads_is_still_an_arrow() {
         let mut s = lined(80, 24);
         let _ = s.handle(roads_event(), 0);
-        let _ = s.handle(UiEvent::Stdin(vec![0x1d, b's']), 10);
-        let _ = s.handle(UiEvent::Stdin(b"\x1b[".to_vec()), 20);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b's'])), 10);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[".to_vec())), 20);
         assert!(s.window_open());
-        let _ = s.handle(UiEvent::Stdin(b"B".to_vec()), 30);
-        let a = s.handle(UiEvent::Stdin(b"\r".to_vec()), 40);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(b"B".to_vec())), 30);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\r".to_vec())), 40);
         assert!(
             a.contains(&Action::UseRoad("127.0.0.1:2".parse().unwrap())),
             "{a:?}"
@@ -3667,14 +3784,14 @@ mod tests {
         let mut s = lined(80, 24);
         // The shell turned SGR mouse tracking on.
         let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?1000h\x1b[?1006h")), 0);
-        let a = s.handle(UiEvent::Stdin(b"\x1b[<0;10;5M".to_vec()), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[<0;10;5M".to_vec())), 10);
         assert_eq!(sent(&a), b"\x1b[<0;10;4M");
     }
 
     #[test]
     fn without_mouse_tracking_the_bytes_are_untouched() {
         let mut s = lined(80, 24);
-        let a = s.handle(UiEvent::Stdin(b"\x1b[<0;10;5M".to_vec()), 10);
+        let a = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[<0;10;5M".to_vec())), 10);
         assert_eq!(sent(&a), b"\x1b[<0;10;5M");
     }
 
@@ -3720,4 +3837,5 @@ mod tests {
         assert!(abort.iter().any(|action| matches!(action, Action::Exit(1))));
         assert!(abort.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("ended the session") && !text.contains("resource limit"))));
     }
+    include!("input_bounds_tests.rs");
 }

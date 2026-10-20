@@ -1,0 +1,331 @@
+//! Owned keyboard ingress and provenance through bounded parser buffers.
+//!
+//! Counters cover unique reads, logical source bytes and raw source capacity.
+//! Parser/action copies have a separate four-phase content allowance; these
+//! counters are not an allocator or RSS measurement. Range provenance keeps a
+//! suffix from retaining already-consumed reads during continuous input.
+
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+pub const INGRESS_BYTES: usize = 64 * 1024;
+pub const INGRESS_READS: usize = 16;
+pub const READ_BYTES: usize = 4096;
+
+#[derive(Clone, Debug)]
+pub struct IngressBudget(Arc<Mutex<State>>);
+
+#[derive(Debug)]
+struct State {
+    bytes: usize,
+    reads: usize,
+    capacity: usize,
+    byte_limit: usize,
+    read_limit: usize,
+}
+
+impl Default for IngressBudget {
+    fn default() -> Self {
+        Self::with_limits(INGRESS_BYTES, INGRESS_READS)
+    }
+}
+
+#[derive(Debug)]
+pub struct IngressFull {
+    pub bytes: Vec<u8>,
+}
+
+impl IngressBudget {
+    fn with_limits(byte_limit: usize, read_limit: usize) -> Self {
+        Self(Arc::new(Mutex::new(State {
+            bytes: 0,
+            reads: 0,
+            capacity: 0,
+            byte_limit,
+            read_limit,
+        })))
+    }
+
+    fn reserve(&self, bytes: usize, capacity: usize) -> Option<Arc<ReadPermit>> {
+        let mut state = self.0.lock().expect("keyboard ingress budget");
+        if bytes > state.byte_limit.saturating_sub(state.bytes)
+            || capacity > state.byte_limit.saturating_sub(state.capacity)
+            || state.reads == state.read_limit
+        {
+            return None;
+        }
+        state.bytes += bytes;
+        state.capacity += capacity;
+        state.reads += 1;
+        drop(state);
+        Some(Arc::new(ReadPermit {
+            budget: self.clone(),
+            bytes,
+            capacity,
+        }))
+    }
+
+    /// The reader calls this on its fixed stack scratch, before heap copying.
+    pub fn admit_slice(&self, bytes: &[u8]) -> Result<InputBytes, IngressFull> {
+        if bytes.is_empty() {
+            return Ok(InputBytes::default());
+        }
+        let permit = self
+            .reserve(bytes.len(), bytes.len())
+            .ok_or_else(|| IngressFull { bytes: Vec::new() })?;
+        let data = bytes.to_vec();
+        // Do not publish an allocation larger than the reserved source phase.
+        if data.capacity() > permit.capacity {
+            return Err(IngressFull { bytes: data });
+        }
+        Ok(InputBytes::admitted(data, permit))
+    }
+
+    /// An already-owned producer receives its complete unchanged allocation
+    /// back on rejection. Empty input retains neither allocation nor lease.
+    pub fn admit_owned(&self, bytes: Vec<u8>) -> Result<InputBytes, IngressFull> {
+        if bytes.is_empty() {
+            return Ok(InputBytes::default());
+        }
+        let Some(permit) = self.reserve(bytes.len(), bytes.capacity()) else {
+            return Err(IngressFull { bytes });
+        };
+        Ok(InputBytes::admitted(bytes, permit))
+    }
+
+    pub fn usage(&self) -> (usize, usize, usize) {
+        let state = self.0.lock().expect("keyboard ingress budget");
+        (state.bytes, state.reads, state.capacity)
+    }
+}
+
+#[derive(Debug)]
+struct ReadPermit {
+    budget: IngressBudget,
+    bytes: usize,
+    capacity: usize,
+}
+impl Drop for ReadPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.0.lock().expect("keyboard ingress budget");
+        state.bytes -= self.bytes;
+        state.reads -= 1;
+        state.capacity -= self.capacity;
+    }
+}
+
+/// Shared custody is deduplicated by actual permit identity, never reissued.
+#[derive(Clone, Debug, Default)]
+struct Owners(Option<Arc<Vec<Arc<ReadPermit>>>>);
+impl Owners {
+    fn one(permit: Arc<ReadPermit>) -> Self {
+        Self(Some(Arc::new(vec![permit])))
+    }
+    fn same(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                Arc::ptr_eq(a, b)
+                    || (a.len() == b.len()
+                        && a.iter().zip(b.iter()).all(|(a, b)| Arc::ptr_eq(a, b)))
+            }
+            _ => false,
+        }
+    }
+    fn extend_unique(&self, into: &mut Vec<Arc<ReadPermit>>) {
+        if let Some(owners) = &self.0 {
+            for owner in owners.iter() {
+                if !into.iter().any(|held| Arc::ptr_eq(owner, held)) {
+                    into.push(owner.clone());
+                }
+            }
+        }
+        assert!(
+            into.len() <= INGRESS_READS,
+            "one ingress provenance set is bounded by read admission"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct Span {
+    end: usize,
+    owners: Owners,
+}
+
+#[derive(Debug, Default)]
+struct Sources {
+    len: usize,
+    spans: Vec<Span>,
+}
+impl Sources {
+    fn push(&mut self, len: usize, owners: Owners) {
+        if len == 0 {
+            return;
+        }
+        self.len += len;
+        if let Some(last) = self
+            .spans
+            .last_mut()
+            .filter(|last| last.owners.same(&owners))
+        {
+            last.end = self.len;
+        } else {
+            self.spans.push(Span {
+                end: self.len,
+                owners,
+            });
+        }
+    }
+    fn append(&mut self, other: Self) {
+        let mut start = 0;
+        for span in other.spans {
+            self.push(span.end - start, span.owners);
+            start = span.end;
+        }
+    }
+    fn slice(&self, range: Range<usize>) -> Self {
+        assert!(range.start <= range.end && range.end <= self.len);
+        let mut out = Self::default();
+        let first = self.spans.partition_point(|span| span.end <= range.start);
+        let mut start = first.checked_sub(1).map_or(0, |i| self.spans[i].end);
+        for span in &self.spans[first..] {
+            if start >= range.end {
+                break;
+            }
+            let len = span.end.min(range.end) - start.max(range.start);
+            out.push(len, span.owners.clone());
+            start = span.end;
+        }
+        out
+    }
+    fn owners(&self) -> Owners {
+        let mut owners = Vec::new();
+        for span in &self.spans {
+            span.owners.extend_unique(&mut owners);
+        }
+        if owners.is_empty() {
+            Owners::default()
+        } else {
+            Owners(Some(Arc::new(owners)))
+        }
+    }
+}
+
+/// Non-cloneable payload. Field order destroys storage before final custody.
+/// Equality compares its value, while ownership is verified through counters.
+#[derive(Debug, Default)]
+pub struct InputBytes {
+    bytes: Vec<u8>,
+    sources: Sources,
+}
+impl PartialEq for InputBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for InputBytes {}
+impl InputBytes {
+    fn admitted(bytes: Vec<u8>, permit: Arc<ReadPermit>) -> Self {
+        let mut sources = Sources::default();
+        sources.push(bytes.len(), Owners::one(permit));
+        Self { bytes, sources }
+    }
+    /// Only standalone, borrowed parser helpers use this. Production stdin
+    /// obtains its source through IngressBudget and retains it through parsing.
+    pub(crate) fn unleased(bytes: Vec<u8>) -> Self {
+        let mut sources = Sources::default();
+        sources.push(bytes.len(), Owners::default());
+        Self { bytes, sources }
+    }
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn append(&mut self, mut other: Self) {
+        self.bytes.append(&mut other.bytes);
+        self.sources.append(other.sources);
+    }
+    pub(crate) fn copy_range(&self, range: Range<usize>) -> Self {
+        Self {
+            bytes: self.bytes[range.clone()].to_vec(),
+            sources: self.sources.slice(range),
+        }
+    }
+    pub(crate) fn origin(&self) -> InputOrigin {
+        InputOrigin(self.sources.owners())
+    }
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+    pub(crate) fn split_off(&mut self, at: usize) -> Self {
+        let tail_sources = self.sources.slice(at..self.len());
+        let head_sources = self.sources.slice(0..at);
+        let bytes = self.bytes.split_off(at);
+        self.sources = head_sources;
+        Self {
+            bytes,
+            sources: tail_sources,
+        }
+    }
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        assert!(
+            self.sources.owners().0.is_none(),
+            "guarded parser output must retain custody"
+        );
+        self.bytes
+    }
+    #[cfg(test)]
+    fn owner_count(&self) -> usize {
+        self.sources.owners().0.map_or(0, |owners| owners.len())
+    }
+}
+impl std::ops::Deref for InputBytes {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+pub(crate) struct InputOrigin(Owners);
+impl InputOrigin {
+    pub(crate) fn derived(&self, bytes: Vec<u8>) -> InputBytes {
+        let mut sources = Sources::default();
+        sources.push(bytes.len(), self.0.clone());
+        InputBytes { bytes, sources }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct InputBuilder {
+    bytes: Vec<u8>,
+    sources: Sources,
+}
+impl InputBuilder {
+    pub(crate) fn original(&mut self, input: &InputBytes, range: Range<usize>) {
+        self.bytes.extend_from_slice(&input.bytes[range.clone()]);
+        self.sources.append(input.sources.slice(range));
+    }
+    pub(crate) fn derived(&mut self, bytes: &[u8], input: &InputBytes, range: Range<usize>) {
+        self.bytes.extend_from_slice(bytes);
+        self.sources
+            .push(bytes.len(), input.sources.slice(range).owners());
+    }
+    pub(crate) fn finish(self) -> InputBytes {
+        InputBytes {
+            bytes: self.bytes,
+            sources: self.sources,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    include!("input_ingress_tests.rs");
+}

@@ -180,6 +180,9 @@ impl Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id != CONTROL_STREAM {
             return;
@@ -241,7 +244,9 @@ fn connect(
 
 fn ask_about(home: &Path, client: &StdClient, events: &Events) -> About {
     let before = events.control().len();
-    client.send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::AboutRequest));
+    client
+        .send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::AboutRequest))
+        .expect("fixture input admitted");
     let mut found = None;
     assert!(
         wait_for(Duration::from_secs(15), || {
@@ -258,20 +263,24 @@ fn ask_about(home: &Path, client: &StdClient, events: &Events) -> About {
 }
 
 fn offer(client: &StdClient, image: &[u8], build: u64) {
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
-            build,
-            checksum: sha256(image),
-            arch: std::env::consts::ARCH.to_string(),
-            size: image.len() as u64,
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
+                build,
+                checksum: sha256(image),
+                arch: std::env::consts::ARCH.to_string(),
+                size: image.len() as u64,
+            })),
+        )
+        .expect("fixture input admitted");
 }
 
 fn send_image(client: &StdClient, image: &[u8]) {
     for chunk in image.chunks(64 * 1024) {
-        client.send_bytes(UPDATE_STREAM, chunk.to_vec());
+        client
+            .send_bytes_bounded(UPDATE_STREAM, chunk.to_vec(), Duration::from_secs(30))
+            .expect("fixture input admitted");
     }
 }
 
@@ -333,17 +342,19 @@ fn protocol2_client_cannot_allocate_a_connection_on_published_v050() {
         events.clone(),
         None,
     );
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: true,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: true,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(!wait_for(Duration::from_secs(3), || events
         .records
         .lock()

@@ -189,6 +189,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -278,21 +281,25 @@ fn the_announced_terminal_type_reaches_the_shell() {
 
     // Announced BEFORE the channel is opened: the daemon spawns each
     // channel's process with what it knew at that moment.
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Term("rxvt-unicode-256color".to_string())),
-    );
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Term("rxvt-unicode-256color".to_string())),
+        )
+        .expect("fixture input admitted");
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             events
@@ -307,7 +314,9 @@ fn the_announced_terminal_type_reaches_the_shell() {
         "the daemon must confirm the shell channel is open"
     );
 
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"echo T=$TERM\n".to_vec());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"echo T=$TERM\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             String::from_utf8_lossy(&events.collected.lock().expect("collected").shell_output)

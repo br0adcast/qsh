@@ -193,6 +193,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -262,17 +265,19 @@ fn connect_and_open_shell(
         "the handshake with the transport-ensure daemon must complete"
     );
 
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             events
@@ -323,14 +328,18 @@ fn transport_ensure_serves_independent_shell_channels() {
 
     let marker1 = "MARK1-42-MARK1";
     let marker2 = "MARK2-56-MARK2";
-    client1.send_bytes(
-        FIRST_CHANNEL_STREAM,
-        b"echo MARK1-$((6*7))-MARK1\n".to_vec(),
-    );
-    client2.send_bytes(
-        FIRST_CHANNEL_STREAM,
-        b"echo MARK2-$((7*8))-MARK2\n".to_vec(),
-    );
+    client1
+        .send_bytes(
+            FIRST_CHANNEL_STREAM,
+            b"echo MARK1-$((6*7))-MARK1\n".to_vec(),
+        )
+        .expect("fixture input admitted");
+    client2
+        .send_bytes(
+            FIRST_CHANNEL_STREAM,
+            b"echo MARK2-$((7*8))-MARK2\n".to_vec(),
+        )
+        .expect("fixture input admitted");
 
     assert!(
         wait_until(|| {

@@ -59,6 +59,9 @@ impl Echoes {
 }
 
 impl ClientEvents for Echoes {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == STREAM {
             self.state.lock().expect("echo state").bytes += data.len() as u64;
@@ -134,7 +137,9 @@ fn one_run(mib: usize) -> Duration {
     let total = data.len() as u64;
     let started = Instant::now();
     for piece in data.chunks(PIECE) {
-        client.send_bytes(STREAM, piece.to_vec());
+        client
+            .send_bytes_bounded(STREAM, piece.to_vec(), Duration::from_secs(30))
+            .expect("fixture input admitted");
     }
     assert!(
         echoes.wait(Duration::from_secs(300), |r| r.bytes >= total),

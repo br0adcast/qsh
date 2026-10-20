@@ -212,6 +212,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -320,17 +323,19 @@ fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
     // must open the pseudo-terminal at this size from the first frame, not
     // at the default with a resize following.
     let open_stream = FIRST_CHANNEL_STREAM;
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: open_stream,
-            kind: ChannelKind::Shell,
-            cols: 100,
-            rows: 30,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: open_stream,
+                kind: ChannelKind::Shell,
+                cols: 100,
+                rows: 30,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
 
     assert!(
         wait_until(|| {
@@ -353,7 +358,9 @@ fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
     // for the wrong reason.
     let marker = 11 * 13;
     let needle = format!("MARK-{marker}-MARK");
-    client.send_bytes(open_stream, b"echo MARK-$((11*13))-MARK\n".to_vec());
+    client
+        .send_bytes(open_stream, b"echo MARK-$((11*13))-MARK\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             let collected = events.collected.lock().expect("collected");
@@ -368,7 +375,9 @@ fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
     // client already knows it closed its own channel). A natural exit is
     // what proves `ServerRecord::Exit` reaches the client, and that it names
     // the right stream.
-    client.send_bytes(open_stream, b"exit\n".to_vec());
+    client
+        .send_bytes(open_stream, b"exit\n".to_vec())
+        .expect("fixture input admitted");
 
     assert!(
         wait_until(|| {
@@ -435,7 +444,9 @@ fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
         .expect("collected")
         .live));
 
-    client.send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::AboutRequest));
+    client
+        .send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::AboutRequest))
+        .expect("fixture input admitted");
     assert!(wait_until(|| events
         .collected
         .lock()
@@ -445,15 +456,17 @@ fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
         .any(
             |r| matches!(r, ServerRecord::About(about) if about.mode == DaemonMode::Managed)
         )));
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
-            build: u64::MAX,
-            checksum: [9; 32],
-            arch: std::env::consts::ARCH.to_string(),
-            size: 1,
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
+                build: u64::MAX,
+                checksum: [9; 32],
+                arch: std::env::consts::ARCH.to_string(),
+                size: 1,
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(wait_until(|| events
         .collected
         .lock()
@@ -526,17 +539,19 @@ fn serve_sends_a_command_channel_in_full_with_the_header_under_aead() {
 
     let stream = FIRST_CHANNEL_STREAM;
     let started = Instant::now();
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream,
-            kind: ChannelKind::Command,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: format!("seq 1 {LAST}").into_bytes(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: format!("seq 1 {LAST}").into_bytes(),
+            })),
+        )
+        .expect("fixture input admitted");
     let want: Vec<u8> = (1..=LAST)
         .flat_map(|i| format!("{i}\r\n").into_bytes())
         .collect();
@@ -630,17 +645,19 @@ fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
         .live));
     let stuck = FIRST_CHANNEL_STREAM;
     let shell = FIRST_CHANNEL_STREAM + 1;
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: stuck,
-            kind: ChannelKind::Command,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: b"sh -c 'stty raw -echo; echo ready-$((6*7)); exec sleep 120'".to_vec(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: stuck,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: b"sh -c 'stty raw -echo; echo ready-$((6*7)); exec sleep 120'".to_vec(),
+            })),
+        )
+        .expect("fixture input admitted");
     let output = |second: bool| {
         let c = events.collected.lock().expect("collected");
         String::from_utf8_lossy(if second {
@@ -655,26 +672,32 @@ fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
         "{}",
         output(false)
     );
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: shell,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: shell,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(wait_until(|| events
         .collected
         .lock()
         .expect("collected")
         .control
         .contains(&ServerRecord::Opened { stream: shell })));
-    client.send_bytes(stuck, vec![b'x'; PASTE]);
+    client
+        .send_bytes(stuck, vec![b'x'; PASTE])
+        .expect("fixture input admitted");
     std::thread::sleep(Duration::from_secs(2));
-    client.send_bytes(shell, b"echo alive-$((6*7))\n".to_vec());
+    client
+        .send_bytes(shell, b"echo alive-$((6*7))\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| output(true).contains("alive-42")),
         "the other channel answers while the paste is held: {}",
@@ -685,11 +708,15 @@ fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
         held >= PASTE as u64 - transport::reliability::STREAM_WINDOW - 256 * 1024,
         "the daemon took at most a window and what the terminal buffers; the client still has {held} of {PASTE}"
     );
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Close { stream: stuck }),
-    );
-    client.send_bytes(shell, b"echo still-$((5*5))\n".to_vec());
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Close { stream: stuck }),
+        )
+        .expect("fixture input admitted");
+    client
+        .send_bytes(shell, b"echo still-$((5*5))\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| output(true).contains("still-25")),
         "{}",

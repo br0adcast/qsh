@@ -3947,6 +3947,7 @@ mod recovery_tests;
 pub(crate) mod tests {
     use super::*;
     include!("conn_capacity_tests.rs");
+    include!("client_input_queue_tests.rs");
     use crate::handshake::generate_keypair;
     use crate::handshake_payload::{encode_msg1_without_tail, StartKind};
     use crate::reliability::MAX_IN_FLIGHT;

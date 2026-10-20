@@ -69,14 +69,16 @@ fn cancellation_during_channel_open_prevents_remote_exec() {
             &cancel,
         )
         .unwrap();
-        substrate.open(&OpenRequest {
-            stream: 16,
-            kind: ChannelKind::Command,
-            cols: 0,
-            rows: 0,
-            screen: false,
-            command: b"must not run after cancellation".to_vec(),
-        });
+        substrate
+            .open(&OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Command,
+                cols: 0,
+                rows: 0,
+                screen: false,
+                command: b"must not run after cancellation".to_vec(),
+            })
+            .expect("fixture channel operation admitted");
         wait_for(|| server.sftp_channels.opened.load(Ordering::SeqCst) == 1);
         assert_eq!(activity.exec.load(Ordering::SeqCst), 0);
         if cancelled {
@@ -100,26 +102,30 @@ fn cancellation_during_channel_open_prevents_remote_exec() {
             // Cleanup has its own explicit authorization. It does not revive
             // the default generation or permit its start/allowlist commands.
             let mut cleanup = substrate.with_cancel(&knock::Cancel::new());
-            cleanup.open(&OpenRequest {
-                stream: 17,
-                kind: ChannelKind::Command,
-                cols: 0,
-                rows: 0,
-                screen: false,
-                command: b"remove owned staging file".to_vec(),
-            });
-            wait_for(|| server.sftp_channels.opened.load(Ordering::SeqCst) == 2);
-            gate.notify_one();
-            wait_for(|| activity.exec.load(Ordering::SeqCst) == 1);
-            for (stream, command) in [(18, "start daemon"), (19, "update allowlist")] {
-                substrate.open(&OpenRequest {
-                    stream,
+            cleanup
+                .open(&OpenRequest {
+                    stream: 17,
                     kind: ChannelKind::Command,
                     cols: 0,
                     rows: 0,
                     screen: false,
-                    command: command.as_bytes().to_vec(),
-                });
+                    command: b"remove owned staging file".to_vec(),
+                })
+                .expect("fixture channel operation admitted");
+            wait_for(|| server.sftp_channels.opened.load(Ordering::SeqCst) == 2);
+            gate.notify_one();
+            wait_for(|| activity.exec.load(Ordering::SeqCst) == 1);
+            for (stream, command) in [(18, "start daemon"), (19, "update allowlist")] {
+                substrate
+                    .open(&OpenRequest {
+                        stream,
+                        kind: ChannelKind::Command,
+                        cols: 0,
+                        rows: 0,
+                        screen: false,
+                        command: command.as_bytes().to_vec(),
+                    })
+                    .expect("fixture channel operation admitted");
             }
             wait_for(|| refusals.0.load(Ordering::SeqCst) == 3);
             assert_eq!(server.sftp_channels.opened.load(Ordering::SeqCst), 2);

@@ -13,6 +13,8 @@ mod channel_reply_delivery;
 #[cfg(feature = "tokio-driver")]
 pub mod channel_server;
 pub mod channel_timeline;
+pub mod client_input_budget;
+mod client_input_queue;
 mod congestion;
 pub mod conn;
 #[cfg(feature = "tokio-driver")]

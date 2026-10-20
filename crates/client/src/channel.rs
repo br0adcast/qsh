@@ -23,6 +23,25 @@ use transport::channel_geometry::{
 /// A channel's identity, which is also the transport stream it uses.
 pub type ChannelId = u8;
 
+/// Local whole-operation admission failure. Capacity/closure are distinct
+/// from an authenticated protocol failure and never request remote abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelSendError {
+    Full,
+    Gone,
+    OnDriverThread,
+    NotReady,
+    NoChannel,
+    InvalidRequest,
+    Protocol(ChannelProtocolError),
+}
+
+impl From<ChannelProtocolError> for ChannelSendError {
+    fn from(error: ChannelProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
 /// Capacity available to one not-yet-decoded record. Reservations in other
 /// streams and decoded early events have already been subtracted by the owner.
 #[derive(Clone, Copy)]
@@ -70,8 +89,8 @@ pub trait ChannelSubstrate: Send {
         _id: ResizeRequestId,
         _cols: u16,
         _rows: u16,
-    ) -> Result<(), ChannelProtocolError> {
-        Err(ChannelProtocolError::UnsupportedProfile)
+    ) -> Result<(), ChannelSendError> {
+        Err(ChannelProtocolError::UnsupportedProfile.into())
     }
     /// The owner retires framing only after its final ordered output is released.
     fn retire_channel(&mut self, _ch: ChannelId) {}
@@ -81,15 +100,17 @@ pub trait ChannelSubstrate: Send {
     fn reset_attachment(&mut self) {}
     fn protocol_failed(&mut self, _error: ChannelProtocolError) {}
 
-    fn open(&mut self, req: &OpenRequest);
+    fn open(&mut self, req: &OpenRequest) -> Result<(), ChannelSendError>;
     /// Tell the far side what terminal this client's emulator is, for every
     /// channel opened after this. SSH carries the same fact in `pty-req`;
     /// a substrate whose transport has nowhere to put it does nothing, and
     /// the far side keeps whatever default it had.
-    fn announce_term(&mut self, _term: &str) {}
-    fn send(&mut self, ch: ChannelId, data: &[u8]);
-    fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16);
-    fn close(&mut self, ch: ChannelId);
+    fn announce_term(&mut self, _term: &str) -> Result<(), ChannelSendError> {
+        Ok(())
+    }
+    fn send(&mut self, ch: ChannelId, data: &[u8]) -> Result<(), ChannelSendError>;
+    fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> Result<(), ChannelSendError>;
+    fn close(&mut self, ch: ChannelId) -> Result<(), ChannelSendError>;
     /// Bytes that arrived on `stream`, and what they turned out to mean.
     /// The substrate owns whatever framing its transport uses: qsh deframes
     /// records here, and a substrate with no framing (SSH) simply reports
@@ -159,6 +180,11 @@ pub enum SubstrateEvent {
 /// What the session tells its owner after taking an event in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
+    /// A deferred local outbound operation failed; no remote abort is implied.
+    SendFailure {
+        ch: ChannelId,
+        error: ChannelSendError,
+    },
     Geometry {
         ch: ChannelId,
         record: GeometryRecord,
@@ -282,11 +308,6 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         }
     }
 
-    /// Picks a free stream, marks it `Opening` and asks the substrate to
-    /// open it. `None` means every stream number from `FIRST_CHANNEL_STREAM`
-    /// to 255 is currently in use (open or not yet reused after closing) --
-    /// this library is linked into a long-lived host application, so it
-    /// must never panic over a resource it can simply decline to hand out.
     /// Announce the client's terminal type. Call it before opening any
     /// channel: the far side spawns each channel's process with whatever it
     /// knew at that moment, so an announcement after the fact reaches
@@ -296,15 +317,18 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// leaves it on its own default -- the caller cannot tell, and does not
     /// need to: the terminal type is an optimisation of key encoding, never
     /// a precondition for the channel.
-    pub fn announce_term(&mut self, term: &str) {
-        self.substrate.announce_term(term);
+    pub fn announce_term(&mut self, term: &str) -> Result<(), ChannelSendError> {
+        self.substrate.announce_term(term)
     }
 
-    pub fn open_shell(&mut self, cols: u16, rows: u16) -> Option<ChannelId> {
+    /// Admit a complete Open before allocating its identity/Opening state.
+    /// `NoChannel` means every stream number is still in use; sink refusal
+    /// returns its local error without consuming an identity.
+    pub fn open_shell(&mut self, cols: u16, rows: u16) -> Result<ChannelId, ChannelSendError> {
         self.open(ChannelKind::Shell, Vec::new(), cols, rows)
     }
 
-    /// See [`Self::open_shell`]. Also `None` if `command` is longer than
+    /// See [`Self::open_shell`]. Returns `InvalidRequest` if `command` exceeds
     /// [`MAX_COMMAND_LEN`] -- the wire's own length field is not the place
     /// to discover that (see [`Self::open`]'s doc).
     ///
@@ -315,13 +339,21 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
     /// screen model in `ServerRecord::Opened` if the peer has one), and a
     /// command channel has none. Latent only because nothing calls this yet
     /// (the console client opens a shell channel only).
-    pub fn open_command(&mut self, command: &[u8], cols: u16, rows: u16) -> Option<ChannelId> {
+    pub fn open_command(
+        &mut self,
+        command: &[u8],
+        cols: u16,
+        rows: u16,
+    ) -> Result<ChannelId, ChannelSendError> {
+        if command.len() > MAX_COMMAND_LEN {
+            return Err(ChannelSendError::InvalidRequest);
+        }
         self.open(ChannelKind::Command, command.to_vec(), cols, rows)
     }
 
-    /// Common to [`Self::open_shell`]/[`Self::open_command`]. `None` if
-    /// every stream number is spoken for ([`Self::free_stream`]), or if
-    /// `command` is longer than [`MAX_COMMAND_LEN`] -- rejected here,
+    /// Common to [`Self::open_shell`]/[`Self::open_command`]. Reports
+    /// `NoChannel` when every identity is occupied ([`Self::free_stream`]),
+    /// or `InvalidRequest` for an oversized command -- rejected here,
     /// before it ever reaches the substrate, rather than let a record the
     /// far side's `take_open` will call `Malformed` go out over the wire:
     /// that record's channel would sit `Opening` forever, since a malformed
@@ -333,10 +365,13 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         command: Vec<u8>,
         cols: u16,
         rows: u16,
-    ) -> Option<ChannelId> {
+    ) -> Result<ChannelId, ChannelSendError> {
         self.admission_started = true;
-        if self.failure.is_some() || command.len() > MAX_COMMAND_LEN {
-            return None;
+        if let Some(error) = self.failure {
+            return Err(error.into());
+        }
+        if command.len() > MAX_COMMAND_LEN {
+            return Err(ChannelSendError::InvalidRequest);
         }
         // Zero OPEN dimensions retain their no-PTY meaning. Nonzero local
         // dimensions use the same adapter as the shell model.
@@ -346,10 +381,13 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         } else {
             (cols, rows)
         };
-        let ch = self
+        let Some(ch) = self
             .ordered
             .as_ref()
-            .map_or_else(|| self.free_stream(), |state| state.free_stream())?;
+            .map_or_else(|| self.free_stream(), |state| state.free_stream())
+        else {
+            return Err(ChannelSendError::NoChannel);
+        };
         let req = OpenRequest {
             stream: ch,
             kind,
@@ -358,10 +396,10 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
             screen: matches!(kind, ChannelKind::Shell),
             command,
         };
-        self.substrate.open(&req);
+        self.substrate.open(&req)?;
         if let Some(state) = &mut self.ordered {
             state.open(req);
-            return Some(ch);
+            return Ok(ch);
         }
         self.channels.insert(
             ch,
@@ -371,7 +409,7 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
                 buffered_bytes: 0,
             },
         );
-        Some(ch)
+        Ok(ch)
     }
 
     /// A stream number to open a new channel on, or `None` if every number
@@ -409,14 +447,13 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         matches!(self.channels.get(&ch), Some(ChannelState::Ready(_)))
     }
 
-    /// A no-op unless `ch` is `Ready`: bytes for a channel the far side has
-    /// not confirmed yet (or has already ended) would reach a stream that
-    /// does not exist there, and be dropped in silence -- the same barrier
-    /// `on_event` already enforces for data arriving the other way.
-    pub fn send(&mut self, ch: ChannelId, data: &[u8]) {
-        if self.is_ready(ch) {
-            self.substrate.send(ch, data);
+    /// Admit the complete input only for a confirmed writable channel.
+    /// A retained Ready channel remains writable during recoverable path loss.
+    pub fn send(&mut self, ch: ChannelId, data: &[u8]) -> Result<(), ChannelSendError> {
+        if !self.is_ready(ch) {
+            return Err(ChannelSendError::NotReady);
         }
+        self.substrate.send(ch, data)
     }
 
     /// Update physical intent without making it eligible for a wire request.
@@ -429,44 +466,46 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         )
     }
 
-    pub fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> ResizeDisposition {
+    pub fn resize(
+        &mut self,
+        ch: ChannelId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ResizeDisposition, ChannelSendError> {
         if let Some(state) = &mut self.ordered {
             return state.resize(&mut self.substrate, ch, cols, rows);
         }
         if self.failure.is_some() {
-            return ResizeDisposition::Rejected(ResizeRejection::Failed);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::Failed));
         }
         if cols == 0 || rows == 0 {
-            return ResizeDisposition::Rejected(ResizeRejection::ZeroViewport);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::ZeroViewport));
         }
         if let Some(ChannelState::Ready(req)) = self.channels.get_mut(&ch) {
             if req.cols == 0 || req.rows == 0 {
-                return ResizeDisposition::Rejected(ResizeRejection::NoPty);
+                return Ok(ResizeDisposition::Rejected(ResizeRejection::NoPty));
             }
             let size = terminal_size::TerminalSize::for_viewport(cols, rows);
             let (cols, rows) = (size.cols(), size.rows());
+            self.substrate.resize(ch, cols, rows)?;
             req.cols = cols;
             req.rows = rows;
-            self.substrate.resize(ch, cols, rows);
-            return ResizeDisposition::Sent;
+            return Ok(ResizeDisposition::Sent);
         }
-        ResizeDisposition::Rejected(ResizeRejection::NotReady)
+        Ok(ResizeDisposition::Rejected(ResizeRejection::NotReady))
     }
 
-    /// A no-op unless `ch` is `Ready`, for the same reason as [`Self::send`].
-    /// A channel still `Opening` has no substrate-side handle to close yet;
-    /// there is no way here to cancel an in-flight open, so closing one
-    /// before it is confirmed is simply ignored rather than left to race
-    /// with a later `Opened`.
-    pub fn close(&mut self, ch: ChannelId) {
+    /// Retire a channel only after its whole Close was admitted.
+    pub fn close(&mut self, ch: ChannelId) -> Result<(), ChannelSendError> {
         if let Some(state) = &mut self.ordered {
-            state.close(&mut self.substrate, ch);
-            return;
+            return state.close(&mut self.substrate, ch);
         }
-        if self.is_ready(ch) {
-            self.substrate.close(ch);
-            self.channels.insert(ch, ChannelState::Gone);
+        if !self.is_ready(ch) {
+            return Err(ChannelSendError::NotReady);
         }
+        self.substrate.close(ch)?;
+        self.channels.insert(ch, ChannelState::Gone);
+        Ok(())
     }
 
     /// Feed bytes that arrived on `stream` and get back what they meant for
@@ -773,27 +812,31 @@ mod tests {
         fn resize_semantics(&self) -> ResizeSemantics {
             ResizeSemantics::Unconfirmed
         }
-        fn open(&mut self, req: &OpenRequest) {
+        fn open(&mut self, req: &OpenRequest) -> Result<(), ChannelSendError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("open {}", req.stream));
             self.opens.lock().unwrap().push(req.clone());
+            Ok(())
         }
-        fn send(&mut self, ch: ChannelId, data: &[u8]) {
+        fn send(&mut self, ch: ChannelId, data: &[u8]) -> Result<(), ChannelSendError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("send {ch} {}", String::from_utf8_lossy(data)));
+            Ok(())
         }
-        fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) {
+        fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) -> Result<(), ChannelSendError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("resize {ch} {cols}x{rows}"));
+            Ok(())
         }
-        fn close(&mut self, ch: ChannelId) {
+        fn close(&mut self, ch: ChannelId) -> Result<(), ChannelSendError> {
             self.calls.lock().unwrap().push(format!("close {ch}"));
+            Ok(())
         }
         fn on_bytes(&mut self, stream: u8, bytes: &[u8]) -> Vec<SubstrateEvent> {
             self.calls.lock().unwrap().push(format!(
@@ -830,7 +873,7 @@ mod tests {
 
     #[test]
     fn ordered_qsh_opened_alone_does_not_release_ready() {
-        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| Ok(())));
         let ch = session.open_shell(80, 24).unwrap();
         let events = session.on_bytes(
             transport::channel::CONTROL_STREAM,
@@ -843,7 +886,7 @@ mod tests {
     #[test]
     fn ordered_qsh_resize_does_not_commit_before_a_correlated_result() {
         use transport::channel_geometry::{ChannelInstance, GeometryOutcome, GeometryRecord};
-        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let mut session = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| Ok(())));
         let ch = session.open_shell(80, 24).unwrap();
         session.on_bytes(
             transport::channel::CONTROL_STREAM,
@@ -862,7 +905,7 @@ mod tests {
             ))
             .unwrap(),
         );
-        session.resize(ch, 100, 30);
+        session.resize(ch, 100, 30).unwrap();
         assert!(session.is_ready(ch));
         let geometry = session.committed_geometry(ch).unwrap();
         assert_eq!(
@@ -883,9 +926,9 @@ mod tests {
         assert_eq!((req.cols, req.rows), (2, 2));
         s.on_event(SubstrateEvent::Opened(ch));
         calls.lock().unwrap().clear();
-        s.resize(ch, 0, 0);
+        s.resize(ch, 0, 0).unwrap();
         assert!(calls.lock().unwrap().is_empty());
-        s.resize(ch, 1, 65535);
+        s.resize(ch, 1, 65535).unwrap();
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             &[format!("resize {ch} 2x256")]
@@ -913,14 +956,17 @@ mod tests {
     /// refuses it outright rather than let it become a wire record the far
     /// side's `take_open` will call `Malformed` -- which leaves the channel
     /// stuck `Opening` forever, since a malformed `OPEN` gets no `REFUSED`
-    /// in reply. `open_command` reports the same way `free_stream`
-    /// exhaustion already does: `None`, no panic, no channel inserted.
+    /// in reply. `open_command` returns `InvalidRequest` without inserting a
+    /// channel; exhausted stream identities return the distinct `NoChannel`.
     #[test]
     fn a_command_longer_than_the_cap_is_refused_without_reaching_the_substrate() {
         let (mut s, calls) = session();
         let oversized = vec![b'x'; transport::channel::MAX_COMMAND_LEN + 1];
 
-        assert_eq!(s.open_command(&oversized, 80, 24), None);
+        assert_eq!(
+            s.open_command(&oversized, 80, 24),
+            Err(ChannelSendError::InvalidRequest)
+        );
         assert!(
             calls.lock().unwrap().is_empty(),
             "the substrate must never see an open() call for an oversized command"
@@ -999,7 +1045,9 @@ mod tests {
         assert!(!session.is_ready(ch));
         assert_eq!(
             session.open_shell(80, 24),
-            None,
+            Err(ChannelSendError::Protocol(
+                ChannelProtocolError::EarlyOutputOverflow
+            )),
             "failed attempt cannot open another channel"
         );
     }
@@ -1250,7 +1298,7 @@ mod tests {
         assert!(late.is_empty(), "data for a finished channel is dropped");
     }
 
-    /// `send`, `resize` and `close` are a no-op for a channel that is not
+    /// `send` and `close` explicitly reject a channel that is not
     /// `Ready` (still `Opening`, or a stream nobody ever opened): the
     /// substrate is never called, symmetrically with how `on_event` already
     /// drops incoming data for a channel that is not `Ready`. Sending
@@ -1258,7 +1306,7 @@ mod tests {
     /// created yet, and vanish there in silence -- the barrier belongs on
     /// both sides of the seam, not just the receiving one.
     #[test]
-    fn send_resize_and_close_are_no_ops_for_a_channel_that_is_not_ready() {
+    fn unready_outbound_operations_do_not_reach_the_substrate() {
         let (mut s, calls) = session();
         let opening = s
             .open_shell(80, 24)
@@ -1267,9 +1315,9 @@ mod tests {
 
         for ch in [opening, unknown] {
             calls.lock().unwrap().clear();
-            s.send(ch, b"nope");
-            s.resize(ch, 100, 40);
-            s.close(ch);
+            assert_eq!(s.send(ch, b"nope"), Err(ChannelSendError::NotReady));
+            s.resize(ch, 100, 40).unwrap();
+            assert_eq!(s.close(ch), Err(ChannelSendError::NotReady));
             assert!(
                 calls.lock().unwrap().is_empty(),
                 "no substrate call for a channel that is not ready: {:?}",
@@ -1355,7 +1403,7 @@ mod tests {
                 .open_shell(80, 24)
                 .expect("forty cycles must not exhaust the stream range");
             s.on_event(SubstrateEvent::Opened(ch));
-            s.close(ch);
+            s.close(ch).unwrap();
         }
         let mut streams: Vec<u8> = opens.lock().unwrap().iter().map(|r| r.stream).collect();
         let total = streams.len();
@@ -1369,13 +1417,13 @@ mod tests {
     }
 
     /// Once every stream number in the valid range is open, `open_shell`
-    /// (and `open_command`) return `None` instead of panicking -- the old
+    /// (and `open_command`) report `NoChannel` instead of panicking -- the old
     /// bug's `.expect()` would have crashed the host application here.
     #[test]
-    fn every_stream_in_the_valid_range_being_open_yields_none() {
+    fn every_stream_in_the_valid_range_being_open_reports_exhaustion() {
         let (mut s, _) = session();
         let mut opened = 0u32;
-        while s.open_shell(80, 24).is_some() {
+        while s.open_shell(80, 24).is_ok() {
             opened += 1;
             assert!(opened <= 1000, "must terminate well within the u8 range");
         }
@@ -1385,30 +1433,30 @@ mod tests {
             "every stream from FIRST_CHANNEL_STREAM to 255 got handed out"
         );
         assert!(
-            s.open_command(b"tmux -C attach", 0, 0).is_none(),
+            s.open_command(b"tmux -C attach", 0, 0).is_err(),
             "no stream numbers remain for a command channel either"
         );
     }
 
     /// Once every stream number has been used at least once, the LOWEST
-    /// `Gone` number is reused rather than `open_shell` returning `None`
+    /// `Gone` number is reused rather than `open_shell` reporting `NoChannel`
     /// forever: a `Gone` entry stays in the map (never deleted) precisely so
     /// this reuse remains possible once the untouched pool runs dry.
     #[test]
     fn once_every_stream_has_been_used_the_lowest_gone_one_is_reused() {
         let (mut s, _) = session();
         let mut streams = Vec::new();
-        while let Some(ch) = s.open_shell(80, 24) {
+        while let Ok(ch) = s.open_shell(80, 24) {
             streams.push(ch);
         }
         assert!(
-            s.open_shell(80, 24).is_none(),
+            s.open_shell(80, 24).is_err(),
             "sanity check: the range must be exhausted here"
         );
 
         // Mark every channel `Gone` via a real terminal event: these
-        // channels were never confirmed `Ready`, and `close` is a no-op for
-        // anything else (see `send_resize_and_close_are_no_ops_...`).
+        // channels were never confirmed `Ready`, so local Close would return
+        // NotReady without retiring them.
         for &ch in &streams {
             s.on_event(SubstrateEvent::Exit { ch, code: 0 });
         }
@@ -1530,3 +1578,7 @@ mod tests {
 #[cfg(test)]
 #[path = "channel_ordered_tests.rs"]
 mod ordered_tests;
+
+#[cfg(test)]
+#[path = "channel_send_tests.rs"]
+mod send_tests;

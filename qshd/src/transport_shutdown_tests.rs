@@ -62,6 +62,9 @@ impl Binder for Noop {
     }
 }
 impl ClientEvents for Noop {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, _stream: u8, _data: Vec<u8>) {}
     fn on_state(&self, _state: LinkState) {}
     fn on_stats(&self, _stats: Stats) {}

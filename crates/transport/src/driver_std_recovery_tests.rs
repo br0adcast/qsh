@@ -257,6 +257,9 @@ fn shared_recovery_progress_reports_actual_checks_and_source_before_protocol_fai
     }
     struct Capture(Mutex<Sender<Trace>>);
     impl ClientEvents for Capture {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _: u8, _: Vec<u8>) {}
         fn on_stats(&self, _: Stats) {}
         fn on_reset(&self, _: u8) {}

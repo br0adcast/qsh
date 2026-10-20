@@ -70,7 +70,35 @@ impl Drop for ActivityGuard<'_> {
     }
 }
 
+type TrialFailure = (::connect::reconnect::RoundEnd, Option<String>);
+
 impl Climb<'_> {
+    /// The accepted shared attempt uses the same startup admission as direct QSH.
+    pub(super) fn shared_trial(
+        &self,
+        att: attempt::Attempt,
+        addr: usize,
+    ) -> Result<(attempt::Attempt, Trial), TrialFailure> {
+        let (verdict, att, trial) = self.trial_for_attempt(att);
+        if let Verdict::LocalSendFailure(error) = verdict {
+            if let Some(recovery) = self.recovery {
+                recovery.local_send_failed(self.revision);
+            }
+            self.forget(&att);
+            return Err((
+                ::connect::reconnect::RoundEnd::LocalSendFailure { addr },
+                Some(format!(
+                    "qsh: local startup write was not accepted ({error:?})"
+                )),
+            ));
+        }
+        if verdict != Verdict::Working {
+            self.forget(&att);
+            return Err((::connect::reconnect::RoundEnd::AllFailed, None));
+        }
+        Ok((att, trial))
+    }
+
     pub(super) fn run_shared_recovery(&mut self, cancel: &knock::Cancel) -> Climbed {
         use ::connect::reconnect::RoundEnd;
         let failed = || Climbed::Failed {
@@ -223,7 +251,7 @@ impl Climb<'_> {
                 self.setup.keypair.private,
                 login,
                 self.tx.clone(),
-                self.setup.token,
+                self.setup.attempt_scope(),
                 Arc::new(move |event| {
                     observer
                         .lock()
@@ -341,11 +369,10 @@ impl Climb<'_> {
                     .address
                     .0;
                 let att = owned.0.take().expect("accepted attempt");
-                let (verdict, att, trial) = self.trial_for_attempt(att);
-                if verdict != Verdict::Working {
-                    self.forget(&att);
-                    return failed();
-                }
+                let (att, trial) = match self.shared_trial(att, i) {
+                    Ok(ready) => ready,
+                    Err((end, line)) => return Climbed::Failed { end, line },
+                };
                 let (outcome, _) = self.logged_in(att, trial, endpoint, identity.qsh_key);
                 if self.interrupted() {
                     return failed();

@@ -434,6 +434,9 @@ impl Default for ShellRunEvents {
 }
 
 impl ClientEvents for ShellRunEvents {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -586,17 +589,19 @@ impl Session {
             None => (ChannelKind::Shell, Vec::new()),
             Some(command) => (ChannelKind::Command, command.as_bytes().to_vec()),
         };
-        self.client.send_bytes(
-            CONTROL_STREAM,
-            encode_client(&ClientRecord::Open(OpenRequest {
-                stream: FIRST_CHANNEL_STREAM,
-                kind,
-                cols: 80,
-                rows: 24,
-                screen: false,
-                command,
-            })),
-        );
+        self.client
+            .send_bytes(
+                CONTROL_STREAM,
+                encode_client(&ClientRecord::Open(OpenRequest {
+                    stream: FIRST_CHANNEL_STREAM,
+                    kind,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command,
+                })),
+            )
+            .expect("fixture input admitted");
     }
 
     /// A second command channel in the same login. Its output can be a fixture file.
@@ -606,17 +611,19 @@ impl Session {
 
     /// Unique streams let a test observe successive channels without stale Exit records.
     pub(crate) fn run_command_on_stream(&self, stream: u8, command: &str) {
-        self.client.send_bytes(
-            CONTROL_STREAM,
-            encode_client(&ClientRecord::Open(OpenRequest {
-                stream,
-                kind: ChannelKind::Command,
-                cols: 80,
-                rows: 24,
-                screen: false,
-                command: command.as_bytes().to_vec(),
-            })),
-        );
+        self.client
+            .send_bytes(
+                CONTROL_STREAM,
+                encode_client(&ClientRecord::Open(OpenRequest {
+                    stream,
+                    kind: ChannelKind::Command,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: command.as_bytes().to_vec(),
+                })),
+            )
+            .expect("fixture input admitted");
         assert!(
             wait_until(|| self
                 .control_records()
@@ -724,14 +731,16 @@ impl Session {
         // A resumed channel can replay earlier output; only this command's marker counts.
         let marker = format!("QSHD_SYSTEM_MODE_SHELL_DONE_{:016x}", OsRng.next_u64());
         let seen_before = self.output().matches(&marker).count();
-        self.client.send_bytes(
-            FIRST_CHANNEL_STREAM,
-            format!(
-                "unset HISTFILE; {command}; printf '{}'\n",
-                octal_escape(&marker)
+        self.client
+            .send_bytes(
+                FIRST_CHANNEL_STREAM,
+                format!(
+                    "unset HISTFILE; {command}; printf '{}'\n",
+                    octal_escape(&marker)
+                )
+                .into_bytes(),
             )
-            .into_bytes(),
-        );
+            .expect("fixture input admitted");
         assert!(
             wait_until(|| self.output().matches(&marker).count() > seen_before),
             "the shell must run the command and print the marker that follows it; got: {:?}",
@@ -782,7 +791,8 @@ impl Session {
 
     pub(crate) fn exit_shell(&self) {
         self.client
-            .send_bytes(FIRST_CHANNEL_STREAM, b"exit\n".to_vec());
+            .send_bytes(FIRST_CHANNEL_STREAM, b"exit\n".to_vec())
+            .expect("fixture input admitted");
     }
 
     /// Ends the session the way a client that means to leave does: a `Close`

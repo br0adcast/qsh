@@ -180,6 +180,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -304,17 +307,19 @@ fn a_signed_console_client_reaches_the_daemon_the_app_started() {
         "the signed client's handshake with the transport-ensure daemon must complete"
     );
 
-    console.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    console
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             events
@@ -329,10 +334,12 @@ fn a_signed_console_client_reaches_the_daemon_the_app_started() {
         "a key in authorized_keys must get a shell channel from the app's own daemon"
     );
 
-    console.send_bytes(
-        FIRST_CHANNEL_STREAM,
-        b"echo SIGNED-$((6*7))-SIGNED\n".to_vec(),
-    );
+    console
+        .send_bytes(
+            FIRST_CHANNEL_STREAM,
+            b"echo SIGNED-$((6*7))-SIGNED\n".to_vec(),
+        )
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             String::from_utf8_lossy(&events.collected.lock().expect("collected").shell_output)
@@ -351,17 +358,21 @@ fn a_signed_console_client_reaches_the_daemon_the_app_started() {
         wait_until(|| stranger_events.collected.lock().expect("collected").live),
         "the stranger's own Noise handshake must complete before its refusal means anything"
     );
-    stranger_client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    stranger_client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .unwrap_or_else(|rejected| {
+            assert_eq!(rejected.reason, transport::driver_std::SendBlocked::Gone)
+        });
     // An ABSENCE, so a fixed window rather than a poll: nothing that arrives
     // later could make the daemon right.
     std::thread::sleep(Duration::from_millis(500));

@@ -73,6 +73,13 @@ struct GateState {
     metadata_blocked: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClientAdmission {
+    Admitted,
+    Full,
+    Closed,
+}
+
 /// One stream's gate. Shared (`Arc`) between whoever refreshes it and
 /// whoever produces.
 #[derive(Debug)]
@@ -163,6 +170,24 @@ impl SendGate {
         let mut st = self.state.lock().expect("send gate");
         st.pending += n;
         self.recompute(&mut st);
+    }
+
+    /// Check and debit a client record under this one gate lock. The outer
+    /// client command mutex orders this with its global reservation/publication.
+    pub(crate) fn admit_client(&self, n: u64, bounded: bool) -> ClientAdmission {
+        let mut st = self.state.lock().expect("send gate");
+        if st.closed {
+            return ClientAdmission::Closed;
+        }
+        // The hysteresis gate controls when to start a whole chunk, not its
+        // size or remote credit. A chunk may cross the high mark; its exact
+        // byte/entry bound was already reserved from the shared client budget.
+        if bounded && !Self::effective_open(&st) {
+            return ClientAdmission::Full;
+        }
+        st.pending += n;
+        self.recompute(&mut st);
+        ClientAdmission::Admitted
     }
 
     /// The driver took `n` admitted bytes into the connection, whose tail on

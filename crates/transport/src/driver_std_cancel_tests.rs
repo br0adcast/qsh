@@ -35,6 +35,9 @@ fn processed_detach_discards_an_already_queued_signing_result() {
         entered: Sender<()>,
     }
     impl ClientEvents for HeldLive {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _: u8, _: Vec<u8>) {}
         fn on_stats(&self, _: Stats) {}
         fn on_reset(&self, _: u8) {}
@@ -104,7 +107,7 @@ fn processed_detach_discards_an_already_queued_signing_result() {
         3,
         "fixture, parked driver and signer thread own the only references"
     );
-    client.0.tx.lock().unwrap().send(Command::Detach).unwrap();
+    client.0.stop.fetch_max(2, Ordering::SeqCst);
     sign_release.send(()).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     while Arc::strong_count(&signer) != 2 && Instant::now() < until {
