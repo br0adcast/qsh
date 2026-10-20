@@ -46,7 +46,7 @@ jobs:
     # the job.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain and targets
         run: |
@@ -126,7 +126,7 @@ jobs:
           cp target/*/debian/*.deb dist/
           cp target/*/generate-rpm/*.rpm dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-${{ matrix.target }}
           path: dist/
@@ -137,7 +137,7 @@ jobs:
     # `linux` job's timeout for why this is bounded at all.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain and targets
         run: |
@@ -210,7 +210,7 @@ jobs:
             tar czf "dist/$stage.tar.gz" "$stage"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
           path: dist/
@@ -237,14 +237,14 @@ jobs:
     # the `linux` job's timeout comment for why this is bounded at all.
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Docker ships on GitHub's ubuntu-latest runners already; the script
       # drives it directly (build the image, then run itself inside it).
       - name: Build the server packages
         run: packaging/build-server-packages.sh all
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: server-packages
           path: dist/
@@ -280,7 +280,7 @@ jobs:
       matrix:
         glob: ['qshd_*_amd64.deb', 'qshd-*.x86_64.rpm']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install the toolchain and the musl target
         run: |
@@ -292,7 +292,7 @@ jobs:
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: server-packages
           path: dist
@@ -332,7 +332,7 @@ jobs:
       matrix:
         glob: ['qshd_*_arm64.deb', 'qshd-*.aarch64.rpm']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # v4.4.0, pinned by commit for the same reason Swatinem/rust-cache
       # above is: a mutable tag must not change what a release run does.
@@ -340,7 +340,7 @@ jobs:
         with:
           platforms: arm64
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: server-packages
           path: dist
@@ -371,9 +371,9 @@ jobs:
     # Just checksumming and, on a tag, an upload -- no build here.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
@@ -420,7 +420,7 @@ jobs:
       # server packages -- .deb and .rpm, x86_64 and aarch64 -- from
       # `server-packages`) plus their checksums; make them downloadable
       # either way, not just print the checksums to the log.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/
