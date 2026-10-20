@@ -631,6 +631,9 @@ fn write_transport_ready(
     w.flush().context("flushing output")
 }
 
+/// Bound contention separately from the client's total ensure budget.
+const ENSURE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 /// The `transport-ensure` subcommand: a self-installing SELF-DAEMONIZING
 /// server for the NEW transport, that survives the SSH `exec` closing.
 /// Mirrors the structure of the removed qsh path's
@@ -654,7 +657,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
 
     let cache_dir = default_cache_dir();
     let sock_path = control_sock_path(&cache_dir);
-    let transaction = control::EnsureLock::acquire(&sock_path)
+    let transaction = control::EnsureLock::acquire(&sock_path, ENSURE_LOCK_WAIT)
         .context("locking the transport ensure transaction")?;
 
     // The server Noise key is read/created from the same file the daemon

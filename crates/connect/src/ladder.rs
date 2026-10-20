@@ -98,6 +98,10 @@ pub enum NoAnswerWhy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectOutcome {
     Connected,
+    /// Explicit authenticated terminal server failure; no fallback is useful.
+    SessionAborted {
+        reason: u8,
+    },
     /// No handshake: nothing answered qsh there, as far as can be seen.
     NoAnswer(NoAnswerWhy),
     /// The host name does not resolve: nothing can be tried there, ssh
@@ -194,6 +198,10 @@ pub struct Failure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GiveUp {
+    SessionAborted {
+        addr: usize,
+        reason: u8,
+    },
     KeyChanged {
         addr: usize,
     },
@@ -302,6 +310,12 @@ impl Ladder {
                     addr: self.at,
                     port: self.addrs[self.at].qsh_port,
                 }),
+                DirectOutcome::SessionAborted { reason } => {
+                    self.end(Action::GiveUp(GiveUp::SessionAborted {
+                        addr: self.at,
+                        reason,
+                    }))
+                }
                 DirectOutcome::KeyChanged => self.key_changed(),
                 DirectOutcome::Declined => {
                     self.not_in(
@@ -371,6 +385,12 @@ impl Ladder {
                     addr: self.at,
                     port,
                 }),
+                DirectOutcome::SessionAborted { reason } => {
+                    self.end(Action::GiveUp(GiveUp::SessionAborted {
+                        addr: self.at,
+                        reason,
+                    }))
+                }
                 DirectOutcome::KeyChanged => self.key_changed(),
                 DirectOutcome::Declined => {
                     self.not_in(
@@ -955,5 +975,29 @@ mod tests {
         let mut l = Ladder::new(vec![with_ssh("a")]);
         l.on(d(D::NoAnswer(silent())));
         l.on(s(S::NeedsPrompt));
+    }
+    #[test]
+    fn capacity_ladder_abort_stops_keys_addresses_and_ssh_fallback() {
+        for background in [false, true] {
+            for after_ssh in [false, true] {
+                let addresses = vec![with_ssh("first.example"), with_ssh("second.example")];
+                let mut ladder = if background {
+                    Ladder::background(addresses, 0)
+                } else {
+                    Ladder::new(addresses)
+                };
+                if after_ssh {
+                    assert_eq!(ladder.on(d(D::Refused)), Action::TrySsh { addr: 0 });
+                    assert!(matches!(
+                        ladder.on(s(S::Ready { port: 60001 })),
+                        Action::TryDirectAfterSsh { .. }
+                    ));
+                }
+                assert_eq!(
+                    ladder.on(d(D::SessionAborted { reason: 1 })),
+                    Action::GiveUp(GiveUp::SessionAborted { addr: 0, reason: 1 })
+                );
+            }
+        }
     }
 }

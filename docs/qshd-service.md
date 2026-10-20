@@ -721,6 +721,32 @@ for those versions needs that one edit.
   channel receives the exact group list left by the full PAM session opening,
   including additions, removals, or an empty list. Authorization-file access
   keeps the NSS baseline; another login cannot inherit these session groups.
+- The packaged PAM profiles check `/etc/nologin` and `/run/nologin` at
+  admission of a new PAM session, using the module's normal root exception.
+  The daemon's separate `--permit-root` restriction still applies. Both
+  profiles run `pam_loginuid` for audit identity; Debian explicitly runs
+  `pam_limits`, while Fedora retains the limits policy from `system-auth`.
+  The required `auth` entry must remain: signature authentication replaces
+  `pam_authenticate`, but credential establishment still uses that stack.
+- PAM admission happens at the first channel Open in a logical login, after
+  signature verification and before the user's process starts. An authenticated
+  connection that has not opened a channel has not yet passed PAM. Additional
+  channels, Warm reattachment and Cold backend replacement within the same
+  live login incarnation retain its PAM context, including established limits.
+  An empty channel set does not itself end that login. A new incarnation,
+  including reuse of a token after the previous login has ended, checks current
+  policy again. A Fresh transport result alone does not imply a new PAM session.
+- `pam_loginuid` sets the audit UID inherited by executed account processes
+  where the kernel supports it. Its normal `PAM_IGNORE` compatibility behavior
+  remains in effect when audit support is absent or the UID namespace does not
+  support assignment; the package does not require `auditd`. An actual assignment
+  error fails session setup. Container tests of audit assignment require a
+  supported environment; they do not establish enforcing SELinux behavior or
+  successful completion of every PAM close operation.
+- Package upgrades preserve administrator-edited `/etc/pam.d/qshd`. Merge new
+  defaults into a customized profile deliberately; an upgrade does not silently
+  rewrite it. The admission and limits behavior above describes the packaged
+  defaults and the distribution stacks they include.
 - `/etc/pam.d/qshd` is a real, editable configuration file, and an
   administrator is expected to open it — but a module that decides by
   client address (`pam_access`, `pam_rhosts`) would be trusting a value

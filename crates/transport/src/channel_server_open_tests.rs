@@ -3,6 +3,38 @@ mod open24_tests {
     use super::*;
     use std::sync::Condvar;
 
+    fn process_fixture_live(io: &mut SessionIo) {
+        let mut event = std::pin::pin!(io.recv());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(event.as_mut(), &mut context),
+            std::task::Poll::Ready(Some(SessionInbound::Live(_)))
+        ));
+    }
+    fn reserved_open_control(
+        message: SessionOutbound,
+    ) -> Option<(AttachmentContext, ServerRecord)> {
+        let SessionOutbound::ReservedControl {
+            origin,
+            bytes,
+            delivery,
+        } = message
+        else {
+            return None;
+        };
+        let mut records = RecordDeframer::for_control().push(&bytes);
+        assert_eq!(records.len(), 1);
+        let record = decode_server(&records.pop().unwrap()).unwrap();
+        drop(delivery); // Standalone fixture consumption, not real ACK proof.
+        Some((origin, record))
+    }
+    fn reserved_open_refusal(message: SessionOutbound) -> Option<(AttachmentContext, u8, String)> {
+        let (origin, record) = reserved_open_control(message)?;
+        match record {
+            ServerRecord::Refused { stream, reason } => Some((origin, stream, reason)),
+            _ => None,
+        }
+    }
     struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
@@ -124,20 +156,14 @@ mod open24_tests {
         let other_observer = tokio::spawn({
             let ended = ended.clone();
             async move {
-                let mut records = RecordDeframer::for_control();
                 while let Some(message) = other_output.recv().await {
-                    if let SessionOutbound::Data(data) = message {
-                        if data.stream_id != CONTROL_STREAM {
-                            continue;
-                        }
-                        for raw in records.push(&data.data) {
-                            if matches!(decode_server(&raw), Ok(ServerRecord::About(_)))
-                                && !ended.load(Ordering::SeqCst)
-                            {
-                                progress.send(3).unwrap();
-                                return;
-                            }
-                        }
+                    if matches!(
+                        reserved_open_control(message),
+                        Some((_, ServerRecord::About(_)))
+                    ) && !ended.load(Ordering::SeqCst)
+                    {
+                        progress.send(3).unwrap();
+                        return;
                     }
                 }
             }
@@ -363,13 +389,11 @@ mod open24_tests {
             .unwrap();
         let answered = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
-                if let Some(SessionOutbound::Data(data)) = output.recv().await {
-                    let mut records = RecordDeframer::for_control();
-                    if records
-                        .push(&data.data)
-                        .iter()
-                        .any(|raw| matches!(decode_server(raw), Ok(ServerRecord::About(_))))
-                    {
+                if let Some(message) = output.recv().await {
+                    if matches!(
+                        reserved_open_control(message),
+                        Some((_, ServerRecord::About(_)))
+                    ) {
                         break;
                     }
                 }
@@ -493,6 +517,13 @@ mod open24_tests {
                 SessionOutbound::ChannelOpened { .. } => stale.push("Opened"),
                 SessionOutbound::ChannelRefused { .. } => stale.push("Refused"),
                 SessionOutbound::ChannelExit { .. } => stale.push("Exit"),
+                message @ SessionOutbound::ReservedControl { .. } => {
+                    match reserved_open_control(message) {
+                        Some((_, ServerRecord::Opened { .. })) => stale.push("Opened"),
+                        Some((_, ServerRecord::Refused { .. })) => stale.push("Refused"),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
             if done {
@@ -532,7 +563,8 @@ mod open24_tests {
             );
             let daemon = FakeDaemon::new();
             let update = SessionUpdate::new(with_daemon(&daemon));
-            let (io, _input, mut output) = channel_pair();
+            let (mut io, _input, mut output) = channel_pair();
+            process_fixture_live(&mut io);
             let mut channels = HashMap::new();
             let job = reserve_open(
                 &io,
@@ -557,7 +589,15 @@ mod open24_tests {
                 .restart_tx
                 .send_replace(RestartSignal::idle(published_epoch));
             context.attachment.generation = generation;
-            let mut opening = HashMap::from([(16, job)]);
+            let [response, terminal] = io.control_budget().reserve_open().unwrap();
+            let mut opening = HashMap::from([(
+                16,
+                PendingOpen {
+                    job,
+                    response: response.into_owner(),
+                    terminal: terminal.into_owner(),
+                },
+            )]);
             let (out_tx, _out_rx) = mpsc::channel(1);
             complete_opens(
                 &io,
@@ -571,7 +611,7 @@ mod open24_tests {
             let message = output.try_recv();
             if should_refuse {
                 assert!(
-                    matches!(message, Ok(SessionOutbound::ChannelRefused { stream: 16, origin, reason }) if origin.generation == 0 && reason == "exact original request failure")
+                    matches!(message.ok().and_then(reserved_open_refusal), Some((origin, 16, reason)) if origin.generation == 0 && reason == "exact original request failure")
                 );
             } else {
                 assert!(matches!(message, Err(mpsc::error::TryRecvError::Empty)), "stale completion emitted output: epoch {published_epoch}, attachment {generation}");
@@ -619,7 +659,8 @@ mod open24_tests {
         let spawner = FakeSpawner::new();
         let executor =
             crate::channel_open::ChannelOpenExecutor::new(spawner, context.opens.registry.clone());
-        let (io, _input, mut output) = channel_pair();
+        let (mut io, _input, mut output) = channel_pair();
+        process_fixture_live(&mut io);
         let wake = Arc::new(RefusalPublicationWake {
             publication: daemon.restart_tx.clone(),
             completed: AtomicBool::new(false),
@@ -630,6 +671,7 @@ mod open24_tests {
         assert!(output.poll_recv(&mut poll_context).is_pending());
         let mut channels = HashMap::new();
         let mut opening = HashMap::new();
+        let [response, terminal] = io.control_budget().reserve_open().unwrap();
         open_channel_async(
             &io,
             &mut channels,
@@ -647,6 +689,8 @@ mod open24_tests {
             1,
             &update,
             &context,
+            response.into_owner(),
+            terminal.into_owner(),
         );
         let refusal = output.try_recv();
         drop(output);
@@ -654,8 +698,8 @@ mod open24_tests {
             publisher.join().unwrap();
         }
         assert!(matches!(
-            refusal,
-            Ok(SessionOutbound::ChannelRefused { stream: 16, .. })
+            refusal.ok().and_then(reserved_open_refusal),
+            Some((_, 16, _))
         ));
         assert!(
             wake.completed.load(Ordering::SeqCst),
@@ -1009,7 +1053,8 @@ mod open24_tests {
         );
         let mut context = channel_producer();
         context.opens = allocated.unwrap();
-        let (io, _input, mut output) = channel_pair();
+        let (mut io, _input, mut output) = channel_pair();
+        process_fixture_live(&mut io);
         let result = reserve_open(
             &io,
             &mut HashMap::new(),
@@ -1028,8 +1073,8 @@ mod open24_tests {
         );
         assert!(result.is_none());
         assert!(matches!(
-            output.try_recv(),
-            Ok(SessionOutbound::ChannelRefused { stream: 16, .. })
+            output.try_recv().ok().and_then(reserved_open_refusal),
+            Some((_, 16, _))
         ));
     }
 

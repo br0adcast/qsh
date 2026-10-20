@@ -440,12 +440,26 @@ fn read_address(index: usize, raw: &str) -> Result<Written, ArgError> {
         host: host.to_string(),
         what,
     };
+    // Reject record controls before syntax errors can interpolate the target.
+    // Empty/bracket/port syntax keeps its existing dedicated diagnostics.
+    if !target.is_empty() && sshauth::known_hosts::validate_host_identifier(target).is_err() {
+        return Err(bad(
+            "",
+            "host must not start with # or contain whitespace or control characters".into(),
+        ));
+    }
     // A host-part error shows the host part only (it ends before the first
     // comma, so no setting text can reach it); with no host read, `?`.
     let (host, port) = split_host_port(target).map_err(|what| {
         let shown = if what == "no host" { "" } else { target };
         bad(shown, what)
     })?;
+    if sshauth::known_hosts::validate_host_identifier(&host).is_err() {
+        return Err(bad(
+            "",
+            "host must not start with # or contain whitespace or control characters".into(),
+        ));
+    }
 
     let mut ssh = SshSetting::Inherit;
     let mut knock = KnockSetting::Inherit;
@@ -750,6 +764,45 @@ mod tests {
         assert!(!a.verbose);
         assert!(one(&a).ssh.is_none());
         assert_eq!(a.addresses.len(), 1);
+    }
+
+    #[test]
+    fn unsafe_pin_host_identifiers_are_refused_without_echoing_the_payload() {
+        for target in [
+            "bad\ninjected",
+            "bad\n:bad",
+            "[bad\n",
+            "two words",
+            "bad\tname",
+            "bad\0name",
+            "bad\u{2028}name",
+            "#comment",
+            "[#comment]",
+        ] {
+            let result = parse_args(&argv(&[target]));
+            assert!(result.is_err(), "unsafe host must be rejected");
+            let error = result.err().unwrap();
+            assert!(
+                matches!(&error, ArgError::BadAddress { index: 1, host, .. } if host.is_empty())
+            );
+            let shown = error.to_string();
+            assert!(shown.starts_with("address 1 (?):"));
+            assert!(!shown.contains(target), "do not echo rejected host data");
+        }
+    }
+
+    #[test]
+    fn safe_pin_host_spelling_and_address_settings_are_preserved() {
+        for (target, host) in [
+            ("Example.ORG.", "Example.ORG."),
+            ("name#tag", "name#tag"),
+            ("bücher.example", "bücher.example"),
+            ("[FE80::a%eth0]:60022", "FE80::a%eth0"),
+            ("server,ssh", "server"),
+        ] {
+            let parsed = parse_args(&argv(&[target])).unwrap();
+            assert_eq!(one(&parsed).host, host);
+        }
     }
 
     /// `user@host` now selects the account, instead of being dropped.

@@ -346,10 +346,23 @@ mod open24_exec_tests {
             ) -> String {
                 tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
-                        if let SessionOutbound::ChannelRefused { reason, .. } =
-                            output.recv().await.unwrap()
-                        {
-                            return reason;
+                        match output.recv().await.unwrap() {
+                            SessionOutbound::ChannelRefused { reason, .. } => return reason,
+                            SessionOutbound::ReservedControl { bytes, .. } => {
+                                // Standalone fixture consumption, not peer ACK.
+                                let raw = transport::shell_frame::RecordDeframer::for_control()
+                                    .push(&bytes)
+                                    .remove(0);
+                                if let transport::channel::ServerRecord::Refused {
+                                    stream,
+                                    reason,
+                                } = transport::channel::decode_server(&raw).unwrap()
+                                {
+                                    assert_eq!(stream, 16);
+                                    return reason;
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 })

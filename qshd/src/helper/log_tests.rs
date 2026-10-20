@@ -69,6 +69,7 @@ fn diagnostic_flood_and_eof_preserve_authentication_and_channel_progress() {
     let request = Request::Open {
         id: 1,
         uid: me_uid(),
+        name: my_login(),
         login: [0; 16],
         cols: 80,
         rows: 24,

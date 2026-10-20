@@ -54,6 +54,8 @@ const MAX_QUEUED_INPUT_BYTES: usize = 64 * 1024;
 /// Everything that can happen to the client.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum UiEvent {
+    /// Authenticated terminal failure for the exact stamped live link.
+    SessionAborted(transport::SessionAbortReason),
     /// Raw bytes read from the local keyboard.
     Stdin(Vec<u8>),
     /// Framed shell-output records for the shell channel, decoded from
@@ -234,6 +236,7 @@ pub struct Session {
     geometry_instance: Option<ChannelInstance>,
     resize_notice: Option<String>,
     continuity_notice: Option<OutputGapCause>,
+    session_abort: Option<transport::SessionAbortReason>,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
     pending_size: Option<(u16, u16)>,
@@ -335,6 +338,7 @@ impl Session {
             geometry_instance: None,
             resize_notice: None,
             continuity_notice: None,
+            session_abort: None,
             pending_size: None,
             resize_due_ms: 0,
             lost_since_ms: None,
@@ -361,6 +365,20 @@ impl Session {
 
     pub fn handle(&mut self, ev: UiEvent, now_ms: i64) -> Vec<Action> {
         match ev {
+            UiEvent::SessionAborted(reason) => {
+                if self.session_abort.is_some() {
+                    return Vec::new();
+                }
+                self.session_abort = Some(reason);
+                let mut actions = self.leave(1);
+                // `leave` ends with Exit; capture the diagnostic after terminal
+                // restoration actions, before the executor stops at that Exit.
+                actions.insert(
+                    actions.len() - 1,
+                    Action::Notice(crate::connect::abort_line(reason)),
+                );
+                actions
+            }
             UiEvent::Stdin(bytes) => self.on_stdin(bytes, now_ms),
             UiEvent::Stream0(bytes) => {
                 let frame = self.shell.on_stream0(&bytes, now_ms, self.rtt_ms);
@@ -1439,7 +1457,11 @@ impl Session {
         // state than that frame describes.
         self.last_frame = None;
         actions.push(Action::Write(bytes));
-        actions.push(Action::Exit(code));
+        actions.push(Action::Exit(if self.session_abort.is_some() {
+            1
+        } else {
+            code
+        }));
         actions
     }
 }
@@ -2469,6 +2491,31 @@ mod tests {
         let a = s.handle(UiEvent::Stdin(vec![b'a', 0x1d, b'x', b'b']), 0);
         assert_eq!(sent(&a), b"ab", "the prefix and its key go nowhere");
         assert!(!a.iter().any(|x| matches!(x, Action::Exit(_))));
+    }
+
+    #[test]
+    fn interrupted_csi_prediction_preserves_original_channel_bytes() {
+        for bytes in [
+            &b"\x1b[1;\x1b[Ctext"[..],
+            &b"\x1b[\x1b\x1b[Dtext"[..],
+            &b"\x1b[1;\x1bOCtext"[..],
+            &b"\x1b[htext"[..],
+        ] {
+            for split in 0..=bytes.len() {
+                let mut session = ready_session();
+                let mut delivered = Vec::new();
+                for chunk in [&bytes[..split], &bytes[split..]] {
+                    delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+                }
+                assert_eq!(delivered, bytes, "split {split}");
+            }
+            let mut session = ready_session();
+            let mut delivered = Vec::new();
+            for chunk in bytes.chunks(1) {
+                delivered.extend(sent(&session.handle(UiEvent::Stdin(chunk.to_vec()), 1000)));
+            }
+            assert_eq!(delivered, bytes);
+        }
     }
 
     #[test]
@@ -3638,5 +3685,39 @@ mod tests {
         let frame = s.shell.frame(10, 0);
         assert_eq!(frame.rows, 4);
         assert_eq!(frame.cell(0, 0).ch, 'h');
+    }
+    #[test]
+    fn capacity_cli_abort_remains_failure_through_closed_and_duplicate_events() {
+        let mut session = ready_session();
+        let abort = session.handle(
+            UiEvent::SessionAborted(transport::SessionAbortReason::ResourceExhausted),
+            0,
+        );
+        let closed = session.handle(UiEvent::Link(LinkState::Closed), 0);
+        assert!(abort.iter().any(|action| matches!(action, Action::Exit(1))));
+        assert!(abort.iter().any(
+            |action| matches!(action, Action::Notice(text) if text.contains("resource limit"))
+        ));
+        assert!(closed
+            .iter()
+            .any(|action| matches!(action, Action::Exit(1))));
+        let duplicate = session.handle(
+            UiEvent::SessionAborted(transport::SessionAbortReason::ResourceExhausted),
+            1,
+        );
+        assert!(!duplicate
+            .iter()
+            .any(|action| matches!(action, Action::Notice(_))));
+    }
+
+    #[test]
+    fn capacity_cli_unknown_abort_is_generic_failure_not_success() {
+        let mut session = ready_session();
+        let abort = session.handle(
+            UiEvent::SessionAborted(transport::SessionAbortReason::Unknown(200)),
+            0,
+        );
+        assert!(abort.iter().any(|action| matches!(action, Action::Exit(1))));
+        assert!(abort.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("ended the session") && !text.contains("resource limit"))));
     }
 }

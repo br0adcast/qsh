@@ -337,6 +337,8 @@ pub enum Event {
     StreamData { stream_id: u8, data: Vec<u8> },
     /// Link state change.
     StateChanged(LinkState),
+    /// Authenticated terminal peer failure, delivered before Closed.
+    SessionAborted(crate::SessionAbortReason),
     /// The connection migrated to a new source address (roaming).
     Rehomed { peer: SocketAddr },
     /// Server-side: output was desynced during a long absence and the client
@@ -425,6 +427,34 @@ pub enum AcceptOutcome {
         /// The nonce this handshake's msg2 carried. The probation stage
         /// checks the client's proof echoes exactly this one back.
         nonce: [u8; AUTH_NONCE_LEN],
+    },
+}
+
+/// Internal router choice after all msg1 validation, before fresh msg2 work.
+pub(crate) enum Msg2Resolution {
+    Fresh(Msg2Inputs),
+    // Only the optional async manager requests cached replies.
+    #[cfg(any(feature = "tokio-driver", test))]
+    Cached,
+}
+
+pub(crate) struct AcceptedHandshake {
+    pub(crate) conn: Connection,
+    pub(crate) client_key: [u8; 32],
+    pub(crate) msg1: Msg1Payload,
+    pub(crate) out: Vec<Datagram>,
+    pub(crate) nonce: [u8; AUTH_NONCE_LEN],
+}
+
+// Like AcceptOutcome, this is immediately destructured rather than stored.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ResolvedAccept {
+    Rejected,
+    Fresh(AcceptedHandshake),
+    #[cfg(any(feature = "tokio-driver", test))]
+    Cached {
+        client_key: [u8; 32],
+        msg1: Msg1Payload,
     },
 }
 
@@ -552,6 +582,7 @@ pub struct Connection {
     /// teardown) from a `Closed` reached via the `DEATH_AFTER` liveness timeout
     /// (retain the backend). Read through [`Connection::closed_gracefully`].
     closed_gracefully: bool,
+    session_abort: Option<crate::SessionAbortReason>,
     session_id: u64,
     /// Set by [`Connection::set_death_after`]; `None` leaves the role's own
     /// default in force.
@@ -888,6 +919,7 @@ impl Connection {
             keys: None,
             state: LinkState::Connecting,
             closed_gracefully: false,
+            session_abort: None,
             session_id: 0,
             death_after_override: None,
             resumed: false,
@@ -974,40 +1006,76 @@ impl Connection {
         msg1_bytes: &[u8],
         resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Inputs>,
     ) -> AcceptOutcome {
+        match Self::accept_resolved(cfg, now, src, msg1_bytes, &mut |msg1| {
+            resolve(msg1).map(Msg2Resolution::Fresh)
+        }) {
+            ResolvedAccept::Rejected => AcceptOutcome::Rejected,
+            ResolvedAccept::Fresh(AcceptedHandshake {
+                conn,
+                client_key,
+                msg1,
+                out,
+                nonce,
+            }) => AcceptOutcome::Accepted {
+                conn,
+                client_key,
+                msg1,
+                out,
+                nonce,
+            },
+            #[cfg(any(feature = "tokio-driver", test))]
+            ResolvedAccept::Cached { .. } => {
+                unreachable!("fresh-only adapter requested cached msg2")
+            }
+        }
+    }
+
+    /// Validate msg1 once for either a fresh accept or a cached response.
+    /// Cached returns before session-id generation, msg2 writing and key split;
+    /// it does not bypass any cookie gate owned by the caller or checks here.
+    pub(crate) fn accept_resolved(
+        cfg: ConnectionConfig,
+        now: Instant,
+        src: SocketAddr,
+        msg1_bytes: &[u8],
+        resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
+    ) -> ResolvedAccept {
         let mut conn = Connection::new(cfg);
         let payload_bytes = {
             let hs = match conn.handshake.as_mut() {
                 Some(h) => h,
-                None => return AcceptOutcome::Rejected,
+                None => return ResolvedAccept::Rejected,
             };
             match hs.read_msg(msg1_bytes) {
                 Ok(p) => p,
-                Err(_) => return AcceptOutcome::Rejected,
+                Err(_) => return ResolvedAccept::Rejected,
             }
         };
         let client_key = match conn.handshake.as_ref().and_then(Handshake::remote_static) {
             Some(k) if conn.auth.admits(&k) => k,
-            _ => return AcceptOutcome::Rejected,
+            _ => return ResolvedAccept::Rejected,
         };
         let msg1 = match parse_msg1(&payload_bytes) {
             Ok(m) => m,
-            Err(_) => return AcceptOutcome::Rejected,
+            Err(_) => return ResolvedAccept::Rejected,
         };
         // The client must announce the method this server actually runs:
         // silently downgrading a signature client to the allowlist path (or
         // the other way round) would leave one side thinking it authenticated.
         if msg1.method != conn.auth.method() {
-            return AcceptOutcome::Rejected;
+            return ResolvedAccept::Rejected;
         }
         let features = Features::negotiate(msg1.offered, conn.allowed_features);
         if !features.contains(conn.required_features) {
-            return AcceptOutcome::Rejected;
+            return ResolvedAccept::Rejected;
         }
         // The only call to `resolve`, and the last point at which this
         // handshake can still be refused -- see this function's docs.
         let Msg2Inputs { resumed, nonce } = match resolve(&msg1) {
-            Some(inputs) => inputs,
-            None => return AcceptOutcome::Rejected,
+            Some(Msg2Resolution::Fresh(inputs)) => inputs,
+            #[cfg(any(feature = "tokio-driver", test))]
+            Some(Msg2Resolution::Cached) => return ResolvedAccept::Cached { client_key, msg1 },
+            None => return ResolvedAccept::Rejected,
         };
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
@@ -1038,13 +1106,13 @@ impl Connection {
             bytes: encode_handshake(Kind::HandshakeResp, &msg2),
         }];
         conn.set_state(LinkState::Live);
-        AcceptOutcome::Accepted {
+        ResolvedAccept::Fresh(AcceptedHandshake {
             conn,
             client_key,
             msg1,
             out,
             nonce,
-        }
+        })
     }
 
     /// Start the connection. The client builds the IK initiator, remembers the
@@ -1071,6 +1139,8 @@ impl Connection {
         msg1_payload: &[u8],
     ) -> Vec<Datagram> {
         self.recovery_handshake = None;
+        self.session_abort = None;
+        self.closed_gracefully = false;
         self.last_recv_auth = now;
         // Both liveness clocks start here, for the same reason
         // [`Connection::request_ping`] restarts both: whatever reads
@@ -1512,6 +1582,22 @@ impl Connection {
         let mut out = Vec::new();
         self.flush_senders(now, &mut out);
         Ok(out)
+    }
+
+    /// Consume a whole source Vec after copying into the reliable sender. A
+    /// blocked record is returned unchanged. Callers account source scratch and
+    /// reliable bytes independently while both exist; this is not zero-copy.
+    pub(crate) fn try_send_consuming_bounded(
+        &mut self,
+        now: Instant,
+        stream: u8,
+        bytes: Vec<u8>,
+        max_unacked: usize,
+    ) -> Result<Vec<Datagram>, (SendBlocked, Vec<u8>)> {
+        match self.try_send_bounded(now, stream, &bytes, max_unacked) {
+            Ok(datagrams) => Ok(datagrams),
+            Err(reason) => Err((reason, bytes)),
+        }
     }
 
     /// Queue bytes of stream `stream_id` for reliable sending. Before reaching
@@ -2006,6 +2092,34 @@ impl Connection {
         self.closed_gracefully = true;
         self.set_state(LinkState::Closed);
         out
+    }
+
+    /// Best-effort authenticated terminal failure. The fixed service frame
+    /// bypasses reliable-stream credit; legacy peers receive ordinary Close.
+    /// Neither packet emission nor local Closed proves peer delivery or cleanup.
+    pub fn abort_session(
+        &mut self,
+        now: Instant,
+        reason: crate::SessionAbortReason,
+    ) -> Vec<Datagram> {
+        if self.keys.is_none() || self.state == LinkState::Closed {
+            return Vec::new();
+        }
+        self.session_abort = Some(reason);
+        if !self.features.contains(Features::RESOURCE_LIMITS) {
+            return self.close(now);
+        }
+        let mut out = Vec::new();
+        self.emit_frames(vec![StreamFrame::SessionAbort { reason }], &mut out);
+        self.closed_gracefully = true;
+        self.set_state(LinkState::Closed);
+        out
+    }
+
+    /// The authenticated terminal reason for this transport, when known.
+    /// Legacy Close and liveness loss carry no reason.
+    pub fn session_abort_reason(&self) -> Option<crate::SessionAbortReason> {
+        self.session_abort
     }
 
     /// Drop the connection on the spot WITHOUT telling the peer: no `Close`
@@ -2916,6 +3030,16 @@ impl Connection {
                         self.ping_unanswered_since = None;
                     }
                 }
+                StreamFrame::SessionAbort { reason } => {
+                    if !self.features.contains(Features::RESOURCE_LIMITS) {
+                        continue;
+                    }
+                    self.session_abort = Some(reason);
+                    self.events.push(Event::SessionAborted(reason));
+                    self.closed_gracefully = true;
+                    self.set_state(LinkState::Closed);
+                    break;
+                }
                 StreamFrame::Close { .. } => {
                     // A received Close is a GRACEFUL shutdown: flag it before the
                     // state change so the driver can tear the backend down
@@ -3787,6 +3911,7 @@ mod recovery_tests;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("conn_capacity_tests.rs");
     use crate::handshake::generate_keypair;
     use crate::handshake_payload::{encode_msg1_without_tail, StartKind};
     use crate::reliability::MAX_IN_FLIGHT;
@@ -4592,7 +4717,7 @@ pub(crate) mod tests {
     #[test]
     fn a_msg2_enabling_what_was_not_offered_closes_the_connection() {
         for (offer, enabled) in [
-            (Features::SUPPORTED, Features::from_bits(1 << 5)),
+            (Features::SUPPORTED, Features::from_bits(1 << 6)),
             (Features::NONE, Features::HEADER_AAD),
             (Features::SUPPORTED, Features::from_bits(1 << 30)),
         ] {
@@ -4757,17 +4882,17 @@ pub(crate) mod tests {
     }
 
     /// Review of slice 3, minor 4: a msg1 built by hand may offer what this
-    /// build does not implement (bit 3, reserved), but the client does not
+    /// build does not implement (bit 6, reserved), but the client does not
     /// take a msg2 that enables it -- it offered only what it can do. What
     /// it implements still goes through.
     #[test]
     fn a_hand_built_msg1_offers_only_what_this_build_implements() {
         let unknown = Features::from_bits(1 << 30);
         let offered = Features::from_bits(
-            Features::SUPPORTED.bits() | Features::from_bits(1 << 5).bits() | unknown.bits(),
+            Features::SUPPORTED.bits() | Features::from_bits(1 << 6).bits() | unknown.bits(),
         );
         for (enabled, live) in [
-            (Features::from_bits(1 << 5), false),
+            (Features::from_bits(1 << 6), false),
             (unknown, false),
             (Features::HEADER_AAD, true),
             (Features::AUTH_ACCEPTED, true),
@@ -5584,6 +5709,75 @@ pub(crate) mod tests {
                 panic!("the handshake must be accepted");
             };
             assert_eq!(got, nonce, "accept must not alter the nonce it was given");
+        }
+    }
+
+    #[test]
+    fn cached_resolution_follows_every_msg1_validation_gate() {
+        for failure in ["none", "noise", "key", "payload", "method", "features"] {
+            let server = generate_keypair();
+            let client = generate_keypair();
+            let mut initiator = Handshake::new_initiator(&client.private, &server.public);
+            let payload = crate::handshake_payload::encode_msg1(&Msg1Payload {
+                offered: if failure == "features" {
+                    Features::NONE
+                } else {
+                    Features::SUPPORTED
+                },
+                start_kind: StartKind::Warm,
+                token: [17; 16],
+                method: if failure == "method" {
+                    AuthMethod::SshSignature
+                } else {
+                    AuthMethod::Allowlist
+                },
+            });
+            let mut body = initiator.write_msg(if failure == "payload" {
+                &[0xff]
+            } else {
+                &payload
+            });
+            if failure == "noise" {
+                body[0] ^= 1;
+            }
+            let cfg = ConnectionConfig {
+                required_features: if failure == "features" {
+                    Features::CHANNEL_GEOMETRY
+                } else {
+                    Features::NONE
+                },
+                features: Features::SUPPORTED,
+                role: Role::Server,
+                local_static_priv: server.private,
+                remote_static_pub: None,
+                auth: AuthPolicy::Allowlist(if failure == "key" {
+                    Vec::new()
+                } else {
+                    vec![client.public]
+                }),
+            };
+            let mut calls = 0;
+            let result = Connection::accept_resolved(
+                cfg,
+                Instant::now(),
+                addr("198.51.100.7:40000"),
+                &body,
+                &mut |_| {
+                    calls += 1;
+                    Some(Msg2Resolution::Cached)
+                },
+            );
+            if failure == "none" {
+                let ResolvedAccept::Cached { client_key, msg1 } = result else {
+                    panic!("validated cached outcome");
+                };
+                assert_eq!(client_key, client.public);
+                assert_eq!(msg1.token, [17; 16]);
+                assert_eq!(calls, 1);
+            } else {
+                assert!(matches!(result, ResolvedAccept::Rejected), "gate {failure}");
+                assert_eq!(calls, 0, "gate {failure} must precede cache resolution");
+            }
         }
     }
 
@@ -12136,5 +12330,22 @@ pub(crate) mod tests {
         );
         assert!(server.credits_due.is_empty(), "and owes nothing");
         assert_eq!(server.service_since, None);
+    }
+    #[test]
+    fn capacity_wire_authenticated_abort_is_terminal_without_control_credit() {
+        let (mut client, mut server, caddr, saddr) = established_pair();
+        client.poll_events();
+        server.poll_events();
+        let packet = sealed_proof_packet(&mut server, caddr, &[0x0a, 1]);
+        client.on_datagram(Instant::now(), saddr, &packet);
+        assert_eq!(
+            client.state(),
+            LinkState::Closed,
+            "authenticated resource abort must terminate rather than wait for control credit"
+        );
+        assert!(
+            client.closed_gracefully(),
+            "abort must not trigger warm reconnect"
+        );
     }
 }

@@ -1171,10 +1171,12 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 
 #[cfg(test)]
 mod tests {
+    include!("update_restart_bounds_tests.rs");
     include!("update_open_tests.rs");
     include!("update_scope_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
     use std::time::Duration;

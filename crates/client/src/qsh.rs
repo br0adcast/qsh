@@ -222,6 +222,7 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
             ServerRecord::ChannelSnapshot(snapshot) => SubstrateEvent::Snapshot(snapshot),
             // The daemon talking about itself: handed up as it came.
             record @ (ServerRecord::About(_)
+            | ServerRecord::AboutUnavailable(_)
             | ServerRecord::UpdateAnswer(_)
             | ServerRecord::UpdateResult(_)
             | ServerRecord::Restarting) => SubstrateEvent::Daemon(record),
@@ -936,5 +937,16 @@ mod geometry_profile_tests {
             vec![SubstrateEvent::ProtocolFailure(error)]
         );
         assert_eq!(sub.protocol_error(), Some(error));
+    }
+    #[test]
+    fn capacity_wire_about_unavailable_is_a_typed_daemon_result_not_silence() {
+        let mut substrate = QshSubstrate::new(|_, _| {});
+        let record =
+            ServerRecord::AboutUnavailable(transport::channel::AboutUnavailable::ResourceExhausted);
+        let bytes = transport::channel::encode_server(&record);
+        assert_eq!(
+            substrate.on_stream(CONTROL_STREAM, &bytes),
+            vec![SubstrateEvent::Daemon(record)]
+        );
     }
 }

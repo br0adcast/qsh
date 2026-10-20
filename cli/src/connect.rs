@@ -38,6 +38,8 @@ pub enum Verdict {
     Working,
     /// Authenticated protocol rejection; another key cannot repair it.
     ProtocolFailure(transport::ProtocolFailure),
+    /// Authenticated terminal server abort; never try another key or fallback.
+    SessionAborted(transport::SessionAbortReason),
     /// No acceptance arrived after the handshake before closure or the failure
     /// budget. Worth trying the next key; silence cannot prove why it failed.
     AuthRefused,
@@ -125,6 +127,7 @@ pub struct Events {
     /// Whether the connection runs with stream credits (spec §4.13).
     credits: AtomicBool,
     protocol_failure: Mutex<Option<transport::ProtocolFailure>>,
+    session_abort: Mutex<Option<transport::SessionAbortReason>>,
     /// Bytes handed to the main loop and not written to the terminal yet.
     queued: Mutex<usize>,
     room: Condvar,
@@ -143,6 +146,7 @@ impl Events {
             acceptance: Mutex::new(None),
             credits: AtomicBool::new(false),
             protocol_failure: Mutex::new(None),
+            session_abort: Mutex::new(None),
             queued: Mutex::new(0),
             room: Condvar::new(),
             released: AtomicBool::new(false),
@@ -207,6 +211,21 @@ impl ClientEvents for Events {
             .get_or_insert(failure);
     }
 
+    fn on_session_aborted(&self, reason: transport::SessionAbortReason) {
+        if self.released.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut saved = self.session_abort.lock().expect("session abort");
+        if saved.is_some() {
+            return;
+        }
+        *saved = Some(reason);
+        drop(saved);
+        let _ = self
+            .tx
+            .send(crate::session::UiEvent::SessionAborted(reason));
+    }
+
     fn on_features(&self, features: transport::Features) {
         self.credits.store(
             features.contains(transport::Features::STREAM_CREDIT),
@@ -248,6 +267,31 @@ impl ClientEvents for Events {
 /// record's header already names the component.
 fn send_error_line(to: SocketAddr, text: &str) -> String {
     format!("a send to {to} failed: {text}")
+}
+
+pub(crate) fn abort_code(reason: transport::SessionAbortReason) -> u8 {
+    match reason {
+        transport::SessionAbortReason::ResourceExhausted => 1,
+        transport::SessionAbortReason::Unknown(code) => code,
+    }
+}
+
+pub fn abort_line_code(reason: u8) -> String {
+    abort_line(match reason {
+        1 => transport::SessionAbortReason::ResourceExhausted,
+        other => transport::SessionAbortReason::Unknown(other),
+    })
+}
+
+pub(crate) fn abort_line(reason: transport::SessionAbortReason) -> String {
+    match reason {
+        transport::SessionAbortReason::ResourceExhausted => {
+            "The server ended the session because its resource limit was reached.".into()
+        }
+        transport::SessionAbortReason::Unknown(code) => {
+            format!("The server ended the session (unknown reason {code}).")
+        }
+    }
 }
 
 /// What one batch of the main loop handed to the terminal, by stream (spec
@@ -528,6 +572,9 @@ impl Attempt {
             .expect("protocol failure")
         {
             return Verdict::ProtocolFailure(failure);
+        }
+        if let Some(reason) = *self.events.session_abort.lock().expect("session abort") {
+            return Verdict::SessionAborted(reason);
         }
         let refused = self.port_refusal();
         let reached_live = self.events.reached_live.load(Ordering::SeqCst);
@@ -1118,5 +1165,37 @@ mod tests {
         attempt.events.on_state(LinkState::Live);
         assert_eq!(attempt.events.first_live_at.get(), Some(&first_live));
         assert_eq!(attempt.verdict(), Verdict::AuthRefused);
+    }
+    #[test]
+    fn capacity_cli_abort_callback_precedes_closed_and_does_not_duplicate() {
+        let (events, rx) = events();
+        let reason = transport::SessionAbortReason::ResourceExhausted;
+        events.on_session_aborted(reason);
+        events.on_session_aborted(reason);
+        events.on_state(LinkState::Closed);
+        let got: Vec<_> = rx.try_iter().collect();
+        assert!(
+            matches!(got.as_slice(), [crate::session::UiEvent::SessionAborted(found), crate::session::UiEvent::Link(LinkState::Closed)] if *found == reason)
+        );
+    }
+
+    #[test]
+    fn capacity_cli_abort_prevents_startup_even_if_acceptance_already_arrived() {
+        let attempt = unstarted_attempt();
+        attempt.events.on_auth_accepted(test_acceptance());
+        attempt
+            .events
+            .on_session_aborted(transport::SessionAbortReason::ResourceExhausted);
+        attempt.events.on_state(LinkState::Closed);
+        assert_eq!(
+            attempt.settle_until(|| panic!("aborted startup"), || false),
+            Verdict::SessionAborted(transport::SessionAbortReason::ResourceExhausted)
+        );
+        let stale = unstarted_attempt();
+        stale.events.release();
+        stale
+            .events
+            .on_session_aborted(transport::SessionAbortReason::ResourceExhausted);
+        assert_eq!(*stale.events.session_abort.lock().unwrap(), None);
     }
 }

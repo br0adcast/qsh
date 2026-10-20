@@ -102,6 +102,7 @@ impl Tty {
         let mut answer = Vec::new();
         for attempt in 0..=CONFIRM_RETRIES {
             answer.clear();
+            let mut overflow = false;
             loop {
                 if cancel.is_cancelled() || crate::signals::termination_requested() {
                     return Err(ssh::SshError::Cancelled);
@@ -127,10 +128,19 @@ impl Tty {
                     Ok(0) => return Ok(false),
                     Ok(_) if byte[0] == b'\n' => break,
                     Ok(_) if answer.len() < 128 => answer.push(byte[0]),
-                    Ok(_) => return Ok(false),
+                    // Keep the rest of this rejected line away from later
+                    // questions, while retaining the same cancellation checks.
+                    Ok(_) => {
+                        overflow = true;
+                        #[cfg(test)]
+                        tests::DISCARD_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return Ok(false),
                 }
+            }
+            if overflow {
+                return Ok(false);
             }
             match String::from_utf8_lossy(&answer)
                 .trim()
@@ -278,6 +288,7 @@ impl ssh::AuthPrompter for SshPrompter {
 
 #[cfg(test)]
 mod tests {
+    include!("prompt_overflow_tests.rs");
     use super::*;
     use std::io::Read;
 
@@ -443,6 +454,92 @@ mod tests {
         assert!(seen.contains("?]0;name?"), "{seen:?}");
         assert!(seen.contains("line one line ?[2Jtwo"), "{seen:?}");
         assert!(seen.contains("Code?[8m: "), "{seen:?}");
+    }
+
+    #[test]
+    fn unicode_controls_in_keyboard_interactive_reach_only_the_display_filter() {
+        let _serialize = crate::tty::SIGNAL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let path = nix::unistd::ttyname(&pty.slave).unwrap();
+        let before = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+        let mut master = File::from(pty.master);
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            use ssh::AuthPrompter as _;
+            let tty = Tty::at(path);
+            let answers = SshPrompter(tty.clone()).keyboard_interactive(
+                "challenge\u{202e}name",
+                "one\u{2028}two\u{2066}three\u{2069}",
+                &[
+                    ssh::Prompt {
+                        text: "code\u{200f} echo-end: ".into(),
+                        echo: true,
+                    },
+                    ssh::Prompt {
+                        text: "secret\u{061c}\u{2029} secret-end: ".into(),
+                        echo: false,
+                    },
+                ],
+            );
+            tty.say("prompt-fixture-done");
+            let _ = done.send(());
+            answers
+        });
+        // Match unchanged ASCII suffixes so the original unsafe implementation
+        // still completes the interaction before the display assertions fail.
+        let mut seen = read_until(&mut master, "echo-end: ");
+        let visible_sent = master.write_all("visible-中文\n".as_bytes()).is_ok();
+        seen.push_str(&read_until(&mut master, "secret-end: "));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let quiet = loop {
+            if nix::sys::termios::tcgetattr(&pty.slave).is_ok_and(|state| {
+                !state
+                    .local_flags
+                    .contains(nix::sys::termios::LocalFlags::ECHO)
+            }) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        // Disposable fixture answer, never an account credential. A directional
+        // control in the answer must remain byte-exact and must not be echoed.
+        let fixture_answer = "fixture-\u{202e}answer";
+        let secret_sent = quiet
+            && master
+                .write_all(format!("{fixture_answer}\n").as_bytes())
+                .is_ok();
+        let finished = secret_sent
+            && completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+        if finished {
+            seen.push_str(&read_until(&mut master, "prompt-fixture-done"));
+        }
+        // Query restoration while the master is still open: after master
+        // hangup tcgetattr on its slave can legitimately return EIO.
+        let after = nix::sys::termios::tcgetattr(&pty.slave);
+        // Closing our only master also releases a blocked slave read on a
+        // failure path. Always join the owned reader before any assertion.
+        drop(master);
+        let answers = worker.join();
+        assert!(visible_sent && quiet && secret_sent && finished);
+        let answers = answers.unwrap().unwrap();
+        assert_eq!(answers[0].as_str(), "visible-中文");
+        assert_eq!(answers[1].as_str(), fixture_answer);
+        assert!(
+            !seen.contains(fixture_answer),
+            "the fixture answer was echoed"
+        );
+        assert!(seen.contains("challenge?name"));
+        assert!(seen.contains("one two?three?"));
+        assert!(seen.contains("code? echo-end: "));
+        assert!(seen.contains("secret?  secret-end: "));
+        assert_eq!(after.unwrap().local_flags, before.local_flags);
     }
 
     /// Reads `master` until `last` has arrived, or 5 s have passed; what was

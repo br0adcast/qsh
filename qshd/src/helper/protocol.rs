@@ -68,6 +68,11 @@ pub enum Request {
         /// logged in. The helper refuses a uid it has not verified itself --
         /// the worker saying "this is alice's session" proves nothing.
         uid: u32,
+        /// The canonical account name returned by `Response::Verified`,
+        /// carried unchanged from the session's principal. UID alone cannot
+        /// distinguish account aliases with different home, shell or PAM policy.
+        /// Both UID and name must match this login's immutable binding.
+        name: String,
         /// Which LOGIN this channel belongs to -- the router's own token for
         /// the device (`transport::LoginId`), stable across a warm reattach
         /// even though the session id is not. The login must already be on
@@ -76,9 +81,8 @@ pub enum Request {
         /// one for a login that has ended, expired, or never proved anything
         /// is refused. A login belongs to exactly one account for its whole
         /// life: the helper also refuses an `Open` that names a different uid
-        /// for the login. This is what a PAM session (from the next task on)
-        /// is keyed by, since it belongs to the login, not to any one channel
-        /// or connection.
+        /// or canonical account name for the login. A PAM session is keyed by
+        /// this login, rather than by any one channel or connection.
         login: LoginId,
         cols: u16,
         rows: u16,
@@ -519,6 +523,7 @@ mod tests {
             Request::Open {
                 id: 7,
                 uid: 1000,
+                name: "alice".into(),
                 login: [3u8; 16],
                 cols: 80,
                 rows: 24,
@@ -546,6 +551,18 @@ mod tests {
             let bytes = encode(&req).expect("encodes");
             assert_eq!(decode::<Request>(&bytes).expect("decodes"), req);
         }
+    }
+
+    #[test]
+    fn an_open_without_an_account_name_is_not_a_valid_request() {
+        let mut request = serde_json::json!({"Open": {
+            "id": 1, "uid": 1000, "name": "alice", "login": vec![3; 16],
+            "cols": 80, "rows": 24, "term": null, "echo": true,
+            "shell": false, "command": "true"
+        }});
+        assert!(decode::<Request>(&serde_json::to_vec(&request).unwrap()).is_ok());
+        request["Open"].as_object_mut().unwrap().remove("name");
+        assert!(decode::<Request>(&serde_json::to_vec(&request).unwrap()).is_err());
     }
 
     #[test]
@@ -659,6 +676,7 @@ mod tests {
         let req = Request::Open {
             id: 1,
             uid: 1000,
+            name: "alice".into(),
             login: [3u8; 16],
             cols: 80,
             rows: 24,

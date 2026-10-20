@@ -2,9 +2,56 @@
 
 use std::fmt;
 use std::future::{poll_fn, Future};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
+
+use crate::control_job::JobLease;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackFailure {
+    Panicked,
+}
+
+/// Rust does not promise that a panic payload has a nonpanicking destructor.
+/// A second panic while disposing it is exceptional: abort rather than leak an
+/// arbitrary payload, recursively unwind, or report successful cleanup.
+fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    match catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        Ok(()) => {}
+        Err(_secondary_payload) => std::process::abort(),
+    }
+}
+
+struct PanicPayload(Option<Box<dyn std::any::Any + Send>>);
+impl Drop for PanicPayload {
+    fn drop(&mut self) {
+        if let Some(payload) = self.0.take() {
+            dispose_panic_payload(payload);
+        }
+    }
+}
+
+/// Completion remains in the existing JoinSet until the manager observes the
+/// real blocking join. Publication and undeliverable-result destruction happen
+/// outside its mutex, before the finite worker lease is refunded.
+struct CallbackCompletion {
+    _lease: JobLease,
+    publication: Option<Box<dyn FnOnce() + Send>>,
+}
+impl Drop for CallbackCompletion {
+    fn drop(&mut self) {
+        // Unexpected owner cancellation detaches tasks. Their completed output
+        // may then be discarded without normal manager publication; contain
+        // result destruction there as well, after actual callback completion.
+        if let Some(publication) = self.publication.take() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(publication))) {
+                dispose_panic_payload(payload);
+            }
+        }
+    }
+}
 
 /// Sticky daemon stop request. Clones observe the same request even if they
 /// subscribe after it was issued. A request is not a cleanup receipt.
@@ -74,7 +121,7 @@ impl WorkerReceipt {
 
 #[derive(Default)]
 struct TaskOwner {
-    tasks: Mutex<JoinSet<()>>,
+    tasks: Mutex<JoinSet<Option<CallbackCompletion>>>,
     failure: Mutex<Option<ShutdownError>>,
 }
 impl Drop for TaskOwner {
@@ -92,12 +139,14 @@ impl Drop for TaskOwner {
 #[derive(Default)]
 pub(super) struct Lifecycle {
     pub(super) shutdown: Shutdown,
+    pub(super) control_budget: crate::control_budget::GlobalBudget,
     owner: TaskOwner,
 }
 impl Lifecycle {
     pub(super) fn new(shutdown: Shutdown) -> Arc<Self> {
         Arc::new(Self {
             shutdown,
+            control_budget: crate::control_budget::GlobalBudget::default(),
             owner: TaskOwner::default(),
         })
     }
@@ -108,7 +157,38 @@ impl Lifecycle {
             .tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .spawn(future);
+            .spawn(async move {
+                future.await;
+                None
+            });
+    }
+    pub(super) fn spawn_callback<T: Send + 'static>(
+        &self,
+        lease: JobLease,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> oneshot::Receiver<Result<T, CallbackFailure>> {
+        let (sender, receiver) = oneshot::channel();
+        self.owner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn_blocking(move || {
+                let result = catch_unwind(AssertUnwindSafe(work))
+                    .map_err(|payload| PanicPayload(Some(payload)));
+                Some(CallbackCompletion {
+                    _lease: lease,
+                    publication: Some(Box::new(move || {
+                        let result = result.map_err(|payload| {
+                            drop(payload);
+                            CallbackFailure::Panicked
+                        });
+                        // A missing receiver destroys its result inside the
+                        // manager's catch scope, never inside a running worker.
+                        drop(sender.send(result));
+                    })),
+                })
+            });
+        receiver
     }
     pub(super) fn spawn_blocking(&self, work: impl FnOnce() + Send + 'static) -> WorkerReceipt {
         let receipt = WorkerReceipt::default();
@@ -142,12 +222,28 @@ impl Lifecycle {
                 .poll_join_next(cx)
         })
         .await?;
-        if let Err(error) = completed {
+        let failure = match completed {
+            Ok(Some(mut completion)) => {
+                let publication = completion.publication.take().unwrap();
+                match catch_unwind(AssertUnwindSafe(publication)) {
+                    Ok(()) => None,
+                    Err(payload) => {
+                        dispose_panic_payload(payload);
+                        Some(ShutdownError("callback result publication panicked".into()))
+                    }
+                }
+                // Completion still owns its lease here. No await separates
+                // actual join, caught publication and this final refund.
+            }
+            Ok(None) => None,
+            Err(error) => Some(ShutdownError(error.to_string())),
+        };
+        if let Some(failure) = failure {
             self.owner
                 .failure
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert_with(|| ShutdownError(error.to_string()));
+                .get_or_insert(failure);
         }
         Some(())
     }
@@ -168,6 +264,7 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("session_lifecycle_callback_tests.rs");
     use std::task::Poll;
     use tokio::sync::{oneshot, Notify};
 

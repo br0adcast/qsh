@@ -545,6 +545,33 @@ mod tests {
     use super::test_support as support_home;
 
     #[test]
+    fn installation_approval_propagates_confirmation_cancellation() {
+        use bringup::InstallApproval;
+        let cancel = knock::Cancel::new();
+        cancel.cancel();
+        let offer = bringup::InstallOffer {
+            username: "fixture".into(),
+            host: "host.invalid".into(),
+            ssh_port: 22,
+            image: bringup::ImageRequest::new(
+                bringup::Platform::from_uname("Linux", "x86_64").unwrap(),
+                "0.5.0",
+            )
+            .unwrap(),
+            remote_path: "/fixture/qshd".into(),
+        };
+        let result = InstallQuestion(Tty::at("/nonexistent/qsh-confirmation-fixture"))
+            .approve(&offer, &cancel);
+        assert!(
+            matches!(
+                result,
+                Err(bringup::BringUpError::Ssh(ssh::SshError::Cancelled))
+            ),
+            "prompt cancellation must abort approval, not become a refusal or success"
+        );
+    }
+
+    #[test]
     fn unreadable_stores_stop_foreground_and_background_before_ssh() {
         for background in [false, true] {
             for system_fails in [false, true] {

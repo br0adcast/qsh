@@ -79,7 +79,10 @@ impl KeystrokeParser {
     }
 
     fn esc(&mut self, byte: u8) -> Vec<KeyAction> {
-        if byte == b'[' {
+        if byte == 0x1b {
+            // A repeated ESC starts a new escape instead of dispatching the old one.
+            Vec::new()
+        } else if byte == b'[' {
             self.state = State::Csi;
             Vec::new()
         } else {
@@ -91,8 +94,12 @@ impl KeystrokeParser {
     }
 
     fn csi(&mut self, byte: u8) -> Vec<KeyAction> {
-        // The CSI final byte is 0x40..=0x7e. Parameters/intermediates precede it.
-        if (0x40..=0x7e).contains(&byte) {
+        // ESC abandons the partial CSI and introduces a fresh escape sequence.
+        // Other CSI finals remain 0x40..=0x7e, after parameters/intermediates.
+        if byte == 0x1b {
+            self.state = State::Esc;
+            Vec::new()
+        } else if (0x40..=0x7e).contains(&byte) {
             self.state = State::Ground;
             vec![KeyAction::Csi(byte as char)]
         } else {
@@ -184,5 +191,36 @@ mod tests {
     fn lone_esc_letter_is_esc_dispatch() {
         // ESC followed by a printable char (not '[') -- an escape sequence.
         assert_eq!(run(b"\x1bM"), vec![KeyAction::Esc]);
+    }
+
+    #[test]
+    fn interrupted_csi_restarts_at_the_latest_escape() {
+        for bytes in [
+            &b"\x1b[1;\x1b[C"[..],
+            &b"\x1b[ \x1b[C"[..],
+            &b"\x1b[\x1b\x1b[C"[..],
+        ] {
+            assert_eq!(run(bytes), vec![KeyAction::Csi('C')], "{bytes:?}");
+        }
+        assert_eq!(
+            run(b"\x1b\x1b[Dtext"),
+            vec![
+                KeyAction::Csi('D'),
+                KeyAction::Print('t'),
+                KeyAction::Print('e'),
+                KeyAction::Print('x'),
+                KeyAction::Print('t'),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_valid_csi_final_including_h_remains_a_control() {
+        for final_byte in 0x40..=0x7e {
+            assert_eq!(
+                run(&[0x1b, b'[', final_byte]),
+                vec![KeyAction::Csi(final_byte as char)]
+            );
+        }
     }
 }

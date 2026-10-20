@@ -13,6 +13,81 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts/build-openssl.sh'
 
 
+def bounded_diagnostic(output, fixture):
+    if isinstance(output, bytes):
+        output = output.decode('utf-8', errors='replace')
+    output = (output or '').replace(str(fixture), '<fixture>')
+    output = output.replace(str(ROOT), '<checkout>')
+    output = ''.join(c if c in '\n\t' or c.isprintable() else '?' for c in output)
+    return output[-4096:]
+
+
+def run_owned_build(command, env, fixture, timeout=20):
+    """The result deadline fails the test; cleanup keeps its process owner."""
+    child = subprocess.Popen(command, env=env, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except BaseException as failure:
+        # The builder owns separately sessioned commands. Killing its process
+        # group cannot replace its SIGTERM handler and command/staging cleanup.
+        try:
+            print('Native fixture cancelled; graceful cleanup pending.', file=sys.stderr)
+            if isinstance(failure, subprocess.TimeoutExpired):
+                for label, output in [('stdout', failure.stdout), ('stderr', failure.stderr)]:
+                    print(label + ' tail: ' + bounded_diagnostic(output, fixture), file=sys.stderr)
+        except BaseException:
+            # A broken diagnostic sink or second interrupt cannot drop custody
+            # or replace the original deadline/interruption failure.
+            pass
+        finally:
+            while child.returncode is None:
+                try:
+                    child.terminate()
+                    break
+                except ProcessLookupError:
+                    break
+                except (KeyboardInterrupt, InterruptedError):
+                    continue
+            while True:
+                try:
+                    stdout, stderr = child.communicate()
+                    break
+                except (KeyboardInterrupt, InterruptedError):
+                    # Do not unwind TemporaryDirectory cleanup while this child
+                    # still owns native commands, staging or the cache lock.
+                    continue
+        if isinstance(failure, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(
+                [bounded_diagnostic(str(arg), fixture) for arg in command], timeout,
+                output=bounded_diagnostic(stdout, fixture),
+                stderr=bounded_diagnostic(stderr, fixture)) from None
+        raise
+    return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+
+
+def reap_owned_children(force):
+    """Only for a dedicated Linux regression subprocess with one waiter."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if force:
+            children = Path('/proc/self/task/' + str(os.getpid()) + '/children')
+            for pid in children.read_text().split():
+                # These are direct/adopted, unreaped children of this owner.
+                # Signal before wait; no unrelated or reused PID is eligible.
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid == 0:
+            time.sleep(0.01)
+    return False
+
+
 class NativeBuildTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='qsh-native-build-test-')
@@ -24,10 +99,10 @@ class NativeBuildTests(unittest.TestCase):
 
     def run_build(self, *extra):
         env = dict(os.environ, HISTFILE='/dev/null', CARGO_BUILD_JOBS='2')
-        return subprocess.run(
+        return run_owned_build(
             ['bash', str(SCRIPT), '--target', 'x86_64-unknown-linux-musl',
              '--cache', str(self.cache), '--archive', str(self.archive), *extra],
-            env=env, text=True, capture_output=True, timeout=20)
+            env=env, fixture=self.root)
 
     def test_corrupt_archive_is_rejected_before_build_or_cache_publication(self):
         result = self.run_build()
@@ -103,11 +178,11 @@ install_sw:
                    PATH=str(self.tools) + os.pathsep + os.environ['PATH'],
                    QSH_TEST_BUILD_COUNT=str(self.count))
         env.update(overrides)
-        return subprocess.run(
+        return run_owned_build(
             ['bash', str(self.scripts / 'build-openssl.sh'),
              '--target', 'x86_64-unknown-linux-gnu', '--cache', str(self.cache),
              '--archive', str(self.archive), '--cc', 'cc', *extra],
-            env=env, text=True, capture_output=True, timeout=20)
+            env=env, fixture=self.root)
 
     # These are tested against the real pinned metadata in the first class.
     def test_corrupt_archive_is_rejected_before_build_or_cache_publication(self):
@@ -219,6 +294,104 @@ install_sw:
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.count.read_text().splitlines(), ['build'])
 
+    @unittest.skipUnless(hasattr(__import__('socket'), 'AF_UNIX'), 'requires Unix socket barrier')
+    def test_timeout_retains_fixture_until_graceful_cleanup_finishes(self):
+        import socket
+        import threading
+        from unittest import mock
+        address = self.root / 'cleanup.sock'
+        program = self.root / 'held-cleanup.py'
+        program.write_text("""import signal
+import socket
+import sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+def stop(_signal, _frame):
+    s.sendall(b'T')
+    assert s.recv(1) == b'R'
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+s.sendall(b'S')
+while True:
+    signal.pause()
+""")
+        result = []
+        def invoke():
+            try:
+                # Even an interrupted diagnostic write must retain cleanup.
+                with mock.patch('builtins.print', side_effect=KeyboardInterrupt):
+                    run_owned_build([sys.executable, str(program), str(address)],
+                                    dict(os.environ), self.root, timeout=2)
+            except BaseException as error:
+                result.append(error)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(address))
+            listener.listen(1)
+            listener.settimeout(5)
+            worker = threading.Thread(target=invoke)
+            worker.start()
+            connection = None
+            try:
+                connection, _ = listener.accept()
+                connection.settimeout(5)
+                self.assertEqual(connection.recv(1), b'S', 'handler was not installed')
+                self.assertEqual(connection.recv(1), b'T', 'TERM did not start cleanup')
+                self.assertTrue(worker.is_alive(), 'timeout dropped its process owner')
+                self.assertTrue(program.is_file(), 'fixture removed during cleanup')
+                self.assertEqual(result, [], 'timeout returned before cleanup release')
+            finally:
+                if connection is not None:
+                    connection.sendall(b'R')
+                    connection.close()
+                # Deliberately retain ownership if graceful cleanup is pending.
+                worker.join()
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], subprocess.TimeoutExpired)
+        self.assertEqual(result[0].timeout, 2, 'cleanup exit0 must still fail the deadline')
+
+    @unittest.skipUnless(sys.platform == 'linux', 'owned timeout oracle uses Linux prctl')
+    def test_timed_out_build_finishes_owned_cleanup_before_raising(self):
+        if os.environ.get('QSH_TEST_TIMEOUT_OWNER') != '1':
+            child = subprocess.Popen([
+                sys.executable, '-B', str(Path(__file__).resolve()),
+                'BuildCacheTests.test_timed_out_build_finishes_owned_cleanup_before_raising'],
+                env=dict(os.environ, QSH_TEST_TIMEOUT_OWNER='1'),
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                stdout, stderr = child.communicate()
+            finally:
+                if child.returncode is None:
+                    child.terminate()
+                    child.communicate()
+            self.assertEqual(child.returncode, 0, stderr + stdout)
+            return
+        import ctypes
+        self.assertEqual(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0), 0)
+        # An interrupted regression owner still runs its child-reaping finally.
+        def interrupted(_signal, _frame):
+            raise InterruptedError('owned timeout regression cancelled')
+        signal.signal(signal.SIGTERM, interrupted)
+        hold = self.root / 'hold'
+        os.mkfifo(hold)
+        self.cache.mkdir()
+        sentinel = self.cache / 'unrelated'
+        sentinel.write_text('keep')
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired) as timed_out:
+                self.run_build(QSH_TEST_BUILD_HOLD=str(hold))
+            self.assertEqual(timed_out.exception.timeout, 20)
+            output = timed_out.exception.stderr or b''
+            if isinstance(output, str):
+                output = output.encode()
+            self.assertIn(b'held', output, 'timeout must follow real make readiness')
+            self.assertTrue(reap_owned_children(False), 'timeout returned with live native children')
+            self.assertEqual(list(self.cache.glob('.stage-*')), [])
+            self.assertEqual(list(self.cache.glob('*.lock')), [])
+            self.assertEqual(list(self.cache.glob('*/manifest.json')), [])
+            self.assertEqual(sentinel.read_text(), 'keep')
+        finally:
+            self.assertTrue(reap_owned_children(True), 'owned regression descendants were not reaped')
+
     @unittest.skipUnless(sys.platform == 'linux', 'owned subreaper oracle uses Linux prctl')
     def test_cancelled_build_reaps_its_children_and_removes_only_its_staging(self):
         if os.environ.get('QSH_TEST_REAP_OWNER') != '1':
@@ -233,26 +406,6 @@ install_sw:
             return
         import ctypes
         self.assertEqual(ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0), 0)
-
-        def reap_descendants(force):
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if force:
-                    children = Path('/proc/self/task/' + str(os.getpid()) + '/children')
-                    for pid in children.read_text().split():
-                        # Only our adopted children, not yet waited/reaped by
-                        # anyone else, can appear here. Never signal after wait.
-                        try:
-                            os.kill(int(pid), signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                try:
-                    pid, _ = os.waitpid(-1, os.WNOHANG)
-                except ChildProcessError:
-                    return True
-                if pid == 0:
-                    time.sleep(0.01)
-            return False
 
         hold = self.root / 'hold'
         os.mkfifo(hold)
@@ -280,7 +433,7 @@ install_sw:
             child.terminate()
             child.wait(timeout=10)
             self.assertNotEqual(child.returncode, 0)
-            self.assertTrue(reap_descendants(False), "native descendants survived cancellation")
+            self.assertTrue(reap_owned_children(False), "native descendants survived cancellation")
             self.assertEqual(list(self.cache.glob('.stage-*')), [])
             self.assertEqual(list(self.cache.glob('*.lock')), [])
             self.assertEqual(list(self.cache.glob('*/manifest.json')), [])
@@ -293,7 +446,7 @@ install_sw:
                 except ProcessLookupError:
                     pass
             child.communicate(timeout=10)
-            self.assertTrue(reap_descendants(True), 'owned fixture descendants were not reaped')
+            self.assertTrue(reap_owned_children(True), 'owned fixture descendants were not reaped')
 
 
 class QualificationIsolationTests(unittest.TestCase):

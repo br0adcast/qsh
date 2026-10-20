@@ -6,5 +6,8 @@
 # refuses EVERY login, with "authentication failed" on the wire and the
 # real reason only in the daemon's log.
 auth     required  pam_permit.so
+account  required  pam_nologin.so
 account  include   common-account
+session  required  pam_loginuid.so
+session  required  pam_limits.so
 session  include   common-session

@@ -204,9 +204,13 @@ impl Ensure {
         }
     }
 
-    fn finish(mut self) -> (bool, String, String) {
+    fn finish(self) -> (bool, String, String) {
+        self.finish_within(Duration::from_secs(15))
+    }
+
+    fn finish_within(mut self, patience: Duration) -> (bool, String, String) {
         use std::io::{Seek, SeekFrom};
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + patience;
         let child = self.child.as_mut().unwrap();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -225,6 +229,312 @@ impl Ensure {
         (status.success(), out, err)
     }
 }
+
+// This helper runs only in a dedicated subprocess. The marker acknowledges
+// actual lock custody; stdin EOF releases it without involving a daemon.
+#[test]
+fn ensure_lock_holder_process() {
+    let Some(home) = std::env::var_os("QSH_TEST_ENSURE_LOCK_HOLDER") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(home.join("qsh/control.sock.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    std::fs::write(home.join("holder-ready"), b"held").unwrap();
+    let mut byte = [0];
+    let _ = std::io::stdin().read(&mut byte).unwrap();
+    drop(lock);
+    std::fs::write(home.join("holder-released"), b"released").unwrap();
+}
+
+struct OwnedLockProcess(Option<Child>);
+
+impl OwnedLockProcess {
+    fn spawn(home: &Path, test: &str, budget: Option<u64>) -> Self {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home)
+            .env("HISTFILE", "/dev/null")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_AGENT_PID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(budget) = budget {
+            command.env("QSH_TEST_ENSURE_LOCK_WAITER", home);
+            command.env("QSH_TEST_ENSURE_LOCK_BUDGET_MS", budget.to_string());
+        } else {
+            command.env("QSH_TEST_ENSURE_LOCK_HOLDER", home);
+        }
+        Self(Some(command.spawn().unwrap()))
+    }
+
+    fn start_holder(home: &Path) -> Self {
+        std::fs::create_dir(home.join("qsh")).unwrap();
+        let mut holder = Self::spawn(home, "ensure_lock_holder_process", None);
+        holder.await_marker(&home.join("holder-ready"));
+        holder
+    }
+
+    fn alive(&mut self) -> bool {
+        if self.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            self.0.take(); // Reaped PID must never be signalled by Drop.
+            false
+        } else {
+            true
+        }
+    }
+
+    fn await_marker(&mut self, marker: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(self.alive(), "lock fixture exited before its receipt");
+            assert!(Instant::now() < deadline, "lock fixture gave no receipt");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait(mut self, patience: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + patience;
+        loop {
+            if let Some(status) = self.0.as_mut().unwrap().try_wait().unwrap() {
+                self.0.take();
+                return status;
+            }
+            assert!(Instant::now() < deadline, "lock fixture did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn finish(self, patience: Duration) {
+        let status = self.wait(patience);
+        assert!(status.success(), "lock fixture failed: {status}");
+    }
+
+    fn release(mut self, home: &Path) {
+        drop(self.0.as_mut().unwrap().stdin.take());
+        self.finish(Duration::from_secs(2));
+        assert_eq!(
+            std::fs::read(home.join("holder-released")).unwrap(),
+            b"released"
+        );
+    }
+}
+
+impl Drop for OwnedLockProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn ensure_command_times_out_without_ready_or_mutating_the_live_holder() {
+    use std::os::unix::fs::MetadataExt;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let descendants = Descendants::own();
+    let mut holder = OwnedLockProcess::start_holder(home.path());
+    let path = home.path().join("qsh/control.sock.lock");
+    let before = std::fs::metadata(&path).unwrap();
+    let result = Ensure::start(home.path(), 0).finish_within(Duration::from_secs(7));
+    assert!(
+        !result.0,
+        "a contending ensure must fail within its lock budget"
+    );
+    assert!(
+        result.1.is_empty(),
+        "no READY before acquiring the transaction"
+    );
+    assert!(result
+        .2
+        .contains("locking the transport ensure transaction"));
+    assert!(result.2.contains("timed out"), "{}", result.2);
+    assert!(holder.alive(), "holder remains alive");
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+    assert_eq!(
+        std::fs::read_dir(home.path().join("qsh")).unwrap().count(),
+        1
+    );
+    let contender = OpenOptions::new().write(true).open(&path).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1,
+        "the live holder still excludes independent contenders"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
+    drop(holder);
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    drop(contender);
+    descendants.reap();
+}
+// The counter and signal disposition belong only to this self-reexec child.
+static WAITER_SIGNALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn waiter_signal(_: libc::c_int) {
+    WAITER_SIGNALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn ensure_lock_waiter_process() {
+    let Some(home) = std::env::var_os("QSH_TEST_ENSURE_LOCK_WAITER") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    let budget = std::env::var("QSH_TEST_ENSURE_LOCK_BUDGET_MS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = waiter_signal as *const () as usize;
+        assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+            0
+        );
+        let mut set = std::mem::zeroed();
+        assert_eq!(libc::sigemptyset(&mut set), 0);
+        assert_eq!(libc::sigaddset(&mut set, libc::SIGUSR1), 0);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()),
+            0
+        );
+    }
+    std::fs::write(home.join("waiter-ready"), b"ready").unwrap();
+    let result = qshd::control::EnsureLock::acquire(&socket(&home), Duration::from_millis(budget));
+    let outcome = match result {
+        Ok(lock) => {
+            drop(lock);
+            "acquired"
+        }
+        Err(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            "timed-out"
+        }
+    };
+    let signals = WAITER_SIGNALS.load(std::sync::atomic::Ordering::Relaxed);
+    std::fs::write(home.join("waiter-result"), format!("{outcome}:{signals}")).unwrap();
+}
+
+#[test]
+fn zero_budget_attempts_once_without_waiting_for_a_held_lock() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let descendants = Descendants::own();
+    let holder = OwnedLockProcess::start_holder(home.path());
+    let waiter = OwnedLockProcess::spawn(home.path(), "ensure_lock_waiter_process", Some(0));
+    waiter.finish(Duration::from_secs(2));
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("waiter-result")).unwrap(),
+        "timed-out:0"
+    );
+    holder.release(home.path());
+    let waiter = OwnedLockProcess::spawn(home.path(), "ensure_lock_waiter_process", Some(0));
+    waiter.finish(Duration::from_secs(2));
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("waiter-result")).unwrap(),
+        "acquired:0"
+    );
+    assert!(Descendants::children().is_empty());
+    descendants.reap();
+}
+
+#[test]
+fn graceful_holder_release_allows_waiter_before_its_deadline() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let descendants = Descendants::own();
+    let holder = OwnedLockProcess::start_holder(home.path());
+    let mut waiter = OwnedLockProcess::spawn(home.path(), "ensure_lock_waiter_process", Some(2000));
+    waiter.await_marker(&home.path().join("waiter-ready"));
+    assert!(!home.path().join("waiter-result").exists());
+    holder.release(home.path());
+    waiter.finish(Duration::from_secs(2));
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("waiter-result")).unwrap(),
+        "acquired:0"
+    );
+    assert!(Descendants::children().is_empty());
+    descendants.reap();
+}
+
+#[test]
+fn delivered_signals_do_not_renew_the_wait_budget() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let descendants = Descendants::own();
+    let holder = OwnedLockProcess::start_holder(home.path());
+    let mut waiter = OwnedLockProcess::spawn(home.path(), "ensure_lock_waiter_process", Some(200));
+    waiter.await_marker(&home.path().join("waiter-ready"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while waiter.alive() {
+        assert!(Instant::now() < deadline, "signals renewed the wait budget");
+        // The unreaped direct child still owns this PID, including if it exits
+        // between try_wait and kill. No unrelated process can reuse it here.
+        assert_eq!(
+            unsafe { libc::kill(waiter.0.as_ref().unwrap().id() as i32, libc::SIGUSR1) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let result = std::fs::read_to_string(home.path().join("waiter-result")).unwrap();
+    let count = result
+        .strip_prefix("timed-out:")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert!(count > 0, "at least one actual signal must be delivered");
+    holder.release(home.path());
+    assert!(Descendants::children().is_empty());
+    descendants.reap();
+}
+
+#[test]
+fn terminating_a_waiter_does_not_unlock_or_remove_the_holder() {
+    use std::os::unix::process::ExitStatusExt;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let descendants = Descendants::own();
+    let mut holder = OwnedLockProcess::start_holder(home.path());
+    let mut waiter = OwnedLockProcess::spawn(home.path(), "ensure_lock_waiter_process", Some(2000));
+    waiter.await_marker(&home.path().join("waiter-ready"));
+    assert_eq!(
+        unsafe { libc::kill(waiter.0.as_ref().unwrap().id() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = waiter.wait(Duration::from_secs(2));
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(holder.alive());
+    let error = qshd::control::EnsureLock::acquire(&socket(home.path()), Duration::ZERO)
+        .err()
+        .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    holder.release(home.path());
+    drop(qshd::control::EnsureLock::acquire(&socket(home.path()), Duration::ZERO).unwrap());
+    assert!(home.path().join("qsh/control.sock.lock").exists());
+    assert!(Descendants::children().is_empty());
+    descendants.reap();
+}
+
 impl Drop for Ensure {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {

@@ -30,7 +30,7 @@ use std::fs::File;
 use std::io::Read;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
 use std::thread::ThreadId;
@@ -41,6 +41,10 @@ use nix::sys::termios::{self, SetArg, Termios};
 #[cfg(test)]
 #[path = "tty/panic_tests.rs"]
 mod panic_tests;
+
+#[cfg(test)]
+#[path = "tty/echo_ownership_tests.rs"]
+mod echo_ownership_tests;
 
 /// What a panic hook needs to put the terminal back. A hook runs on
 /// whichever thread panicked, so this cannot live in the guard.
@@ -544,11 +548,16 @@ impl Drop for RawMode {
 /// are put back when the guard drops.
 ///
 /// One guard at a time per process: the settings a handler restores live in
-/// one static slot, because a signal handler can take no lock.
+/// one static slot, because a signal handler can take no lock. Nested or
+/// concurrent acquisition returns EBUSY. Deferred signals retain their
+/// process-wide stop/termination action; a previous custom handler may run on
+/// the replaying thread rather than its original delivery thread.
 pub struct EchoOff {
     fd: RawFd,
-    saved: Termios,
-    previous: Vec<(libc::c_int, libc::sigaction)>,
+    saved: libc::termios,
+    previous: [MaybeUninit<libc::sigaction>; ECHO_SIGNALS.len()],
+    installed: usize,
+    active: bool,
 }
 
 /// The signals that would end or stop the process with echo still off.
@@ -559,19 +568,26 @@ const ECHO_SIGNALS: [libc::c_int; 5] = [
     libc::SIGHUP,
     libc::SIGTSTP,
 ];
+const ECHO_BUSY: u32 = 1;
+const ECHO_ACTIVE: u32 = 2;
+const ECHO_RESERVED: u32 = 4;
+const ECHO_PENDING_SHIFT: u32 = 3;
+const ECHO_PENDING: u32 = 31 << ECHO_PENDING_SHIFT;
+static ECHO_REPLAY: AtomicU32 = AtomicU32::new(0);
 
-/// What a signal handler needs while an `EchoOff` lives: written before the
-/// handlers go in, and `fd` set last; a handler reads nothing unless `fd`
-/// is set.
 struct EchoSlot {
-    fd: AtomicI32,
+    state: AtomicU32,
+    fd: UnsafeCell<RawFd>,
     saved: UnsafeCell<MaybeUninit<libc::termios>>,
     quiet: UnsafeCell<MaybeUninit<libc::termios>>,
 }
 
-// SAFETY: `saved` and `quiet` are written only while `fd` is -1 and no
-// handler of ours is installed, and only read by the handler after it has
-// seen `fd` set (release/acquire).
+// SAFETY: every payload access holds BUSY in the single atomic state word.
+// Enter claims RESERVED before writing; handlers read only ACTIVE while BUSY.
+// Drop cannot restore/reuse payload until the handler releases BUSY, including
+// across stop/continue. Pending-signal publication CASes that same word, so
+// release either captures a signal or makes its callback retry acquisition.
+// After release an old owner only replays local signals, never accesses payload.
 unsafe impl Sync for EchoSlot {}
 
 /// Every test in the crate that turns echo off, installs a signal handler,
@@ -583,95 +599,263 @@ unsafe impl Sync for EchoSlot {}
 pub(crate) static SIGNAL_TESTS: Mutex<()> = Mutex::new(());
 
 static ECHO_SLOT: EchoSlot = EchoSlot {
-    fd: AtomicI32::new(-1),
+    state: AtomicU32::new(0),
+    fd: UnsafeCell::new(-1),
     saved: UnsafeCell::new(MaybeUninit::uninit()),
     quiet: UnsafeCell::new(MaybeUninit::uninit()),
 };
 
-/// Only async-signal-safe calls: `tcsetattr`, `sigaction`, `raise`.
-extern "C" fn restore_and_reraise(sig: libc::c_int) {
-    let fd = ECHO_SLOT.fd.load(Ordering::Acquire);
-    // SAFETY: the slot is filled before `fd` is set (see `EchoSlot`); the
-    // rest are plain libc calls on values this handler owns.
-    unsafe {
-        if fd >= 0 {
-            libc::tcsetattr(fd, libc::TCSANOW, (*ECHO_SLOT.saved.get()).as_ptr());
-        }
-        let mut default: libc::sigaction = std::mem::zeroed();
-        default.sa_sigaction = libc::SIG_DFL;
-        libc::sigemptyset(&mut default.sa_mask);
-        libc::sigaction(sig, &default, std::ptr::null_mut());
-        // Not blocked inside this handler (`SA_NODEFER`), so the default
-        // action happens right here: the process ends -- or stops, and
-        // comes back on SIGCONT.
-        libc::raise(sig);
-        if fd >= 0 && ECHO_SLOT.fd.load(Ordering::Acquire) == fd {
-            libc::tcsetattr(fd, libc::TCSANOW, (*ECHO_SLOT.quiet.get()).as_ptr());
-            catch(sig);
+fn echo_signal_bit(sig: libc::c_int) -> u32 {
+    match sig {
+        libc::SIGINT => 1 << ECHO_PENDING_SHIFT,
+        libc::SIGTERM => 2 << ECHO_PENDING_SHIFT,
+        libc::SIGQUIT => 4 << ECHO_PENDING_SHIFT,
+        libc::SIGHUP => 8 << ECHO_PENDING_SHIFT,
+        libc::SIGTSTP => 16 << ECHO_PENDING_SHIFT,
+        _ => 0,
+    }
+}
+
+/// No handler waits: publish to a busy owner, or acquire its released gate.
+fn echo_signal_claim(state: &AtomicU32, bit: u32, mut observed: u32) -> Option<u32> {
+    loop {
+        let next = if observed & ECHO_BUSY != 0 {
+            observed | bit
+        } else {
+            observed | ECHO_BUSY
+        };
+        match state.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) if observed & ECHO_BUSY != 0 => return None,
+            Ok(_) => return Some(observed),
+            Err(now) => observed = now,
         }
     }
 }
 
-/// Installs `restore_and_reraise` for `sig`; the handler it replaces.
-///
+/// Payload ownership has ended before any replay. Only the replayed signal is
+/// temporarily unblocked, including when this owner originally blocked it.
+/// Deferred delivery uses the current disposition and may run on this thread
+/// rather than the thread that first delivered it. This guard preserves the
+/// process-wide stop/termination action, not callback thread identity/siginfo.
+fn echo_replay(pending: u32) {
+    let pending = pending & ECHO_PENDING;
+    if pending == 0 {
+        return;
+    }
+    // Nested synchronous replay publishes to this fixed word and returns.
+    // The outer replay owner drains iteratively rather than growing a stack
+    // once per pending wave. External asynchronous nesting is still possible.
+    let mut observed = ECHO_REPLAY.fetch_or(pending, Ordering::AcqRel) | pending;
+    loop {
+        if observed & ECHO_BUSY != 0 {
+            return;
+        }
+        match ECHO_REPLAY.compare_exchange_weak(
+            observed,
+            observed | ECHO_BUSY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(now) => observed = now,
+        }
+    }
+    let errno = nix::errno::Errno::last_raw();
+    loop {
+        let batch = ECHO_REPLAY.fetch_and(ECHO_BUSY, Ordering::AcqRel);
+        for sig in ECHO_SIGNALS {
+            if batch & echo_signal_bit(sig) == 0 {
+                continue;
+            }
+            // SAFETY: fixed valid masks/signals and signal-safe libc calls.
+            // Unexpected syscall failure cannot silently discard an already
+            // delivered signal or resume secret input without protection.
+            unsafe {
+                let mut one: libc::sigset_t = std::mem::zeroed();
+                let mut saved: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut one);
+                libc::sigaddset(&mut one, sig);
+                if libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, &mut saved) != 0
+                    || libc::raise(sig) != 0
+                    || libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut()) != 0
+                {
+                    libc::_exit(128 + sig);
+                }
+            }
+        }
+        if ECHO_REPLAY
+            .compare_exchange(ECHO_BUSY, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    nix::errno::Errno::set_raw(errno);
+}
+
+fn echo_release(phase: u32) {
+    let pending = ECHO_SLOT.state.swap(phase, Ordering::AcqRel);
+    echo_replay(pending);
+}
+
+/// Only lock-free atomics, fixed storage and async-signal-safe libc calls.
+extern "C" fn restore_and_reraise(sig: libc::c_int) {
+    let errno = nix::errno::Errno::last_raw();
+    let bit = echo_signal_bit(sig);
+    let observed = ECHO_SLOT.state.load(Ordering::Acquire);
+    if let Some(phase) = echo_signal_claim(&ECHO_SLOT.state, bit, observed) {
+        if phase & ECHO_ACTIVE != 0 {
+            // SAFETY: this callback owns BUSY and ACTIVE pins initialized payload.
+            // Drop/reentry cannot touch it even while default SIGTSTP stops us.
+            unsafe {
+                let fd = *ECHO_SLOT.fd.get();
+                if libc::tcsetattr(fd, libc::TCSANOW, (*ECHO_SLOT.saved.get()).as_ptr()) != 0 {
+                    libc::_exit(128 + sig);
+                }
+                let mut default: libc::sigaction = std::mem::zeroed();
+                default.sa_sigaction = libc::SIG_DFL;
+                libc::sigemptyset(&mut default.sa_mask);
+                if libc::sigaction(sig, &default, std::ptr::null_mut()) != 0
+                    || libc::raise(sig) != 0
+                    || catch(sig).is_err()
+                {
+                    libc::_exit(128 + sig);
+                }
+                // Protection is installed BEFORE quiet mode resumes. Otherwise
+                // a second stop/termination could leave echo off at default.
+                #[cfg(test)]
+                echo_ownership_tests::before_resume_quiet(sig);
+                if libc::tcsetattr(fd, libc::TCSANOW, (*ECHO_SLOT.quiet.get()).as_ptr()) != 0 {
+                    libc::_exit(128 + sig);
+                }
+            }
+            echo_release(ECHO_ACTIVE);
+        } else {
+            // Selected before teardown, invoked after it: no old payload or
+            // disposition writes. Forward through the current disposition.
+            let pending = ECHO_SLOT.state.swap(0, Ordering::AcqRel);
+            echo_replay(pending | bit);
+        }
+    }
+    nix::errno::Errno::set_raw(errno);
+}
+
 /// # Safety
-/// Changes the process's disposition for `sig`.
-unsafe fn catch(sig: libc::c_int) -> libc::sigaction {
+/// Caller owns BUSY while modifying the guard's process-wide dispositions.
+unsafe fn catch(sig: libc::c_int) -> Result<libc::sigaction, nix::Error> {
     let mut ours: libc::sigaction = std::mem::zeroed();
     ours.sa_sigaction = restore_and_reraise as extern "C" fn(libc::c_int) as libc::sighandler_t;
     ours.sa_flags = libc::SA_RESTART | libc::SA_NODEFER;
     libc::sigemptyset(&mut ours.sa_mask);
     let mut previous: libc::sigaction = std::mem::zeroed();
-    libc::sigaction(sig, &ours, &mut previous);
-    previous
+    if libc::sigaction(sig, &ours, &mut previous) != 0 {
+        return Err(nix::Error::last());
+    }
+    Ok(previous)
 }
 
 impl EchoOff {
+    /// Returns EBUSY if another guard or signal transition owns the process slot.
+    /// The descriptor must remain open until this guard drops.
     pub fn enter(fd: RawFd) -> Result<EchoOff, nix::Error> {
-        // SAFETY: the descriptor outlives this guard.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let saved = termios::tcgetattr(borrowed)?;
-        let mut quiet = saved.clone();
-        quiet.local_flags.remove(termios::LocalFlags::ECHO);
-        debug_assert_eq!(
-            ECHO_SLOT.fd.load(Ordering::Acquire),
-            -1,
-            "one EchoOff at a time: another guard holds the signal slot"
-        );
+        ECHO_SLOT
+            .state
+            .compare_exchange(
+                0,
+                ECHO_RESERVED | ECHO_BUSY,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .map_err(|_| nix::Error::EBUSY)?;
+        let result = Self::enter_held(fd);
+        echo_release(if result.is_ok() { ECHO_ACTIVE } else { 0 });
+        result
+    }
 
-        // SAFETY: no handler of ours is installed and `fd` is unset, so
-        // nothing reads the slot while it is written.
-        unsafe {
-            (*ECHO_SLOT.saved.get()).write(saved.clone().into());
-            (*ECHO_SLOT.quiet.get()).write(quiet.clone().into());
+    fn enter_held(fd: RawFd) -> Result<EchoOff, nix::Error> {
+        // SAFETY: tcgetattr validates even an invalid caller-supplied descriptor;
+        // initialization is used only after success. No forged BorrowedFd needed.
+        let mut original = MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(nix::Error::last());
         }
-        ECHO_SLOT.fd.store(fd, Ordering::Release);
-        // SAFETY: the handler only touches the slot filled just above.
-        let previous = ECHO_SIGNALS
-            .iter()
-            .map(|&sig| (sig, unsafe { catch(sig) }))
-            .collect();
-        let guard = EchoOff {
+        let saved = unsafe { original.assume_init() };
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        let mut guard = EchoOff {
             fd,
             saved,
-            previous,
+            previous: [const { MaybeUninit::uninit() }; ECHO_SIGNALS.len()],
+            installed: 0,
+            active: false,
         };
-        // On failure the guard drops: the handlers go back, echo stays on.
-        termios::tcsetattr(borrowed, SetArg::TCSANOW, &quiet)?;
+        // SAFETY: enter owns RESERVED+BUSY; no callback can read this payload.
+        unsafe {
+            *ECHO_SLOT.fd.get() = fd;
+            (*ECHO_SLOT.saved.get()).write(saved);
+            (*ECHO_SLOT.quiet.get()).write(quiet);
+        }
+        for sig in ECHO_SIGNALS {
+            // SAFETY: our RESERVED+BUSY ownership covers each installed action.
+            match unsafe { catch(sig) } {
+                Ok(previous) => {
+                    guard.previous[guard.installed].write(previous);
+                    guard.installed += 1;
+                }
+                Err(error) => {
+                    guard.restore_held();
+                    return Err(error);
+                }
+            }
+        }
+        #[cfg(test)]
+        echo_ownership_tests::before_enter_quiet(fd);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            let error = nix::Error::last();
+            guard.restore_held();
+            return Err(error);
+        }
+        guard.active = true;
         Ok(guard)
+    }
+
+    fn restore_held(&self) {
+        // SAFETY: caller owns BUSY; only installed entries are initialized.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+            for (index, sig) in ECHO_SIGNALS.iter().take(self.installed).enumerate() {
+                // With fixed valid signals/action pointers POSIX gives no
+                // expected failure here. Never release the slot with our old
+                // handler still installed if the OS nevertheless rejects it.
+                if libc::sigaction(*sig, self.previous[index].as_ptr(), std::ptr::null_mut()) != 0 {
+                    libc::_exit(128 + sig);
+                }
+            }
+        }
     }
 }
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        // SAFETY: as in `enter`.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.saved);
-        for (sig, previous) in &self.previous {
-            // SAFETY: puts back exactly what `enter` found.
-            unsafe { libc::sigaction(*sig, previous, std::ptr::null_mut()) };
+        if !self.active {
+            return;
         }
-        ECHO_SLOT.fd.store(-1, Ordering::Release);
+        while ECHO_SLOT
+            .state
+            .compare_exchange(
+                ECHO_ACTIVE,
+                ECHO_ACTIVE | ECHO_BUSY,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // Only ordinary code waits. An interrupt on this thread queues and
+            // returns while BUSY is held, so it cannot wait on its own Drop.
+            std::thread::yield_now();
+        }
+        self.restore_held();
+        echo_release(0);
     }
 }
 

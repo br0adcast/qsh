@@ -906,6 +906,7 @@ impl HelperChannelSpawner {
         let request = Request::Open {
             id,
             uid: owner.uid,
+            name: owner.name.clone(),
             login,
             cols: req.cols,
             rows: req.rows,
@@ -3122,10 +3123,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The uid in the `Open` the helper receives is the OWNER's -- the
-    /// session's, as `spawn` was handed it -- not the worker's own account
-    /// and not a placeholder. The helper opens a channel only for that uid,
-    /// so anything else would open another account's channel, or none. A
+    /// The UID and canonical name in `Open` are the OWNER's -- the session's,
+    /// as `spawn` was handed it. Both identify the immutable account binding;
+    /// neither may be the worker's account or a placeholder. A
     /// stub records what arrives; the owner's uid is one no test process
     /// runs as, so it cannot match by coincidence.
     #[test]
@@ -3144,7 +3144,10 @@ pub(crate) mod tests {
                 reason: "this stub opens nothing".to_string(),
             };
             channel::send(&helper, &encode(&refusal).expect("encode"), None).expect("reply");
-            uid
+            let name = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["Open"]["name"]
+                .as_str()
+                .map(str::to_owned);
+            (uid, name)
         });
 
         let spawner = Arc::new(HelperChannelSpawner::new(worker).expect("spawner"));
@@ -3161,8 +3164,8 @@ pub(crate) mod tests {
         assert!(result.is_err(), "the stub refuses every channel");
         assert_eq!(
             stub.join().expect("join"),
-            4242,
-            "the Open must carry the uid of the session that asked for the channel"
+            (4242, Some("alice".to_string())),
+            "the Open must carry both UID and canonical name of the session owner"
         );
     }
 
