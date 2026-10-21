@@ -475,6 +475,12 @@ pub enum SessionInbound {
 
 /// What a backend sends towards its connection.
 pub enum SessionOutbound {
+    /// Ordered retirement barrier after admitted Open jobs settle. The flag
+    /// distinguishes published decisions from same-attachment nondelivery.
+    RetirementReady {
+        origin: AttachmentContext,
+        decisions_complete: bool,
+    },
     /// One pre-reserved control item, with exact enqueue-generation custody.
     ReservedControl {
         origin: AttachmentContext,
@@ -643,15 +649,52 @@ struct TerminalRequest {
 struct ControlOrigin {
     attachment: AttachmentContext,
     aborting: bool,
+    /// Irreversible revocation; callbacks admitted earlier retain their owners.
+    retiring: Option<Instant>,
     requested_abort: Option<TerminalRequest>,
     abort_notification_queued: bool,
 }
 struct SessionControl {
+    retire_backend: tokio::sync::Notify,
+    retire_bridge: tokio::sync::Notify,
     terminal_ready: tokio::sync::Notify,
     budget: crate::control_budget::SessionBudget,
     origin: Mutex<ControlOrigin>,
 }
 impl SessionControl {
+    fn new(global: &crate::control_budget::GlobalBudget, uid: u32) -> Self {
+        Self {
+            retire_backend: tokio::sync::Notify::new(),
+            retire_bridge: tokio::sync::Notify::new(),
+            terminal_ready: tokio::sync::Notify::new(),
+            budget: global.session(uid),
+            origin: Mutex::new(ControlOrigin::default()),
+        }
+    }
+    fn retire(&self) {
+        // This lock is also the Open-admission/final-installation boundary.
+        let mut state = self
+            .origin
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.retiring.get_or_insert_with(Instant::now);
+        drop(state);
+        self.retire_backend.notify_one();
+        self.retire_bridge.notify_one();
+    }
+    fn retirement_deadline(&self) -> Option<Instant> {
+        self.origin.lock().map_or(Some(Instant::now()), |state| {
+            state
+                .retiring
+                .map(|at| at + crate::conn::CLIENT_DEATH_AFTER)
+        })
+    }
+    fn retiring(&self) -> bool {
+        self.origin
+            .lock()
+            .map_or(true, |state| state.retiring.is_some())
+    }
+
     fn take_priority_abort(&self) -> Option<TerminalRequest> {
         // The ordinary queued alias may remain behind a snapshot fence.
         // Keep its latch until that alias is actually consumed: generation
@@ -692,12 +735,33 @@ pub struct SessionIo {
 impl SessionIo {
     fn control(&self) -> &Arc<SessionControl> {
         self.control.get_or_init(|| {
-            Arc::new(SessionControl {
-                terminal_ready: tokio::sync::Notify::new(),
-                budget: self.lifecycle.control_budget.session(self.principal.uid),
-                origin: Mutex::new(ControlOrigin::default()),
-            })
+            Arc::new(SessionControl::new(
+                &self.lifecycle.control_budget,
+                self.principal.uid,
+            ))
         })
+    }
+
+    pub(crate) fn retiring(&self) -> bool {
+        self.control().retiring()
+    }
+
+    /// No callback, I/O or await runs inside this admission/installation lock.
+    pub(crate) fn admit_effect<T>(&self, effect: impl FnOnce() -> T) -> Result<T, ()> {
+        let state = self.control().origin.lock().map_err(|_| ())?;
+        if state.retiring.is_some() {
+            return Err(());
+        }
+        let result = effect();
+        drop(state);
+        Ok(result)
+    }
+
+    pub(crate) fn retirement_ready(&self, origin: AttachmentContext, decisions_complete: bool) {
+        let _ = self.outbound.send(SessionOutbound::RetirementReady {
+            origin,
+            decisions_complete,
+        });
     }
 
     pub(crate) fn control_budget(&self) -> &crate::control_budget::SessionBudget {
@@ -957,6 +1021,12 @@ impl SessionIo {
     /// (the connection closed or the manager shut down) -- the backend should
     /// then wind down.
     pub async fn recv(&mut self) -> Option<SessionInbound> {
+        let control = self.control().clone();
+        if control.retiring() {
+            self.inbound.close();
+            while self.inbound.try_recv().is_ok() {}
+            return None;
+        }
         let received = tokio::select! {
             biased;
             _ = self.lifecycle.shutdown.requested() => {
@@ -965,6 +1035,7 @@ impl SessionIo {
                 while self.inbound.try_recv().is_ok() {}
                 None
             }
+            _ = control.retire_backend.notified() => None,
             inbound = self.inbound.recv() => inbound,
         };
         if let Some(SessionInbound::Live(origin) | SessionInbound::ResumeReset(origin)) = &received
@@ -1620,6 +1691,7 @@ enum BridgeControl {
 /// persistent bridge task run per entry; the `Connection` they drive is
 /// SWAPPABLE (warm reattach) while the backend keeps running.
 struct BackendEntry {
+    admission: Arc<SessionControl>,
     /// The session currently bound to this token. Updated on every (re)attach;
     /// guards `reclaim` so a same-token swap is not reclaimed by a stale
     /// end-signal from the connection it replaced.
@@ -1713,6 +1785,8 @@ struct Router {
     sessions: HashMap<u64, DgramTx>,
     /// Token -> backend entry, one per device.
     backends: HashMap<[u8; 16], BackendEntry>,
+    /// Moved entries remain charged until their exact old bridge ends.
+    retiring: HashMap<u64, BackendEntry>,
     /// The `session_id`s currently in PROBATION (see `crate::probation`):
     /// accepted on the signature path, routed so their proof can arrive, but
     /// bound to nothing. Kept apart from `backends` so what an unproven peer
@@ -1742,6 +1816,7 @@ impl Router {
             revisions: BindingRevisions::new(MAX_SESSIONS_TOTAL + MAX_PROBATION),
             sessions: HashMap::new(),
             backends: HashMap::new(),
+            retiring: HashMap::new(),
             probation: HashMap::new(),
             ended_logins: Vec::new(),
             cookies: CookieCheck::new(Instant::now()),
@@ -1863,11 +1938,14 @@ impl Router {
             .backends
             .remove(&token)
             .expect("just found under the same key, on this one task");
-        // A LIVE entry's stable datagram sender lives in `sessions`; a
-        // RETAINED one's was moved into `parked_dgram` when it died, and
-        // goes when `entry` is dropped at the end of this scope. Doing both
-        // covers either state without having to ask which this one is in.
-        self.sessions.remove(&entry.session_id);
+        // Revoke effects synchronously, then retain only the exact old route
+        // for admitted outcomes and their ACKs. A retained route is restored
+        // from parked_dgram; it cannot be used to resume this backend again.
+        entry.admission.retire();
+        if let Some(route) = entry.parked_dgram.as_ref() {
+            self.sessions.insert(entry.session_id, route.clone());
+        }
+        self.retiring.insert(entry.session_id, entry);
         self.revisions.invalidate(token);
         log::info!("login ended (reported over for good from outside the router)");
         true
@@ -2022,6 +2100,16 @@ impl Router {
         ended: SessionEnded,
         now: tokio::time::Instant,
     ) -> Option<[u8; 32]> {
+        if self.retiring.contains_key(&ended.session_id) {
+            // A Death notification can already be queued when retirement
+            // starts. It never proves that this bridge released custody.
+            if ended.phase == SessionEndPhase::Final {
+                self.sessions.remove(&ended.session_id);
+                self.retiring.remove(&ended.session_id);
+            }
+            // Never mutate a newer token binding or scrub its possibly reused key.
+            return None;
+        }
         let dg_tx = self.sessions.remove(&ended.session_id);
         // Read before the entry is borrowed, not because the borrow checker
         // insists but because the question is about the probation table and
@@ -2114,8 +2202,14 @@ impl Router {
     /// Whether another session would fit: this account is under its own cap,
     /// and the daemon as a whole is under the ceiling.
     fn has_room_for(&self, owner: u32) -> bool {
-        let owned = self.backends.values().filter(|e| e.owner == owner).count();
-        owned < MAX_SESSIONS_PER_OWNER && self.backends.len() < MAX_SESSIONS_TOTAL
+        let owned = self
+            .backends
+            .values()
+            .chain(self.retiring.values())
+            .filter(|e| e.owner == owner)
+            .count();
+        owned < MAX_SESSIONS_PER_OWNER
+            && self.backends.len() + self.retiring.len() < MAX_SESSIONS_TOTAL
     }
 
     /// Evict the oldest `Retained` entry among those matching `owner_filter`
@@ -2177,7 +2271,12 @@ impl Router {
         if self.has_room_for(owner) {
             return true;
         }
-        let owned = self.backends.values().filter(|e| e.owner == owner).count();
+        let owned = self
+            .backends
+            .values()
+            .chain(self.retiring.values())
+            .filter(|e| e.owner == owner)
+            .count();
         if owned >= MAX_SESSIONS_PER_OWNER {
             if self.evict_oldest_retained(Some(owner)) {
                 log::warn!("per-owner session cap reached, evicted the caller's own oldest retained backend");
@@ -2315,13 +2414,21 @@ struct Rebind<'a> {
     incarnation: u64,
 }
 
-/// Signalled by a per-session task when its session has ended, so the router
-/// can apply the lifecycle policy (immediate teardown vs retain).
+/// A bridge's parked notification or final route-custody receipt. Parking
+/// retains the task; only Final can settle a revoked route and its cap charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEndPhase {
+    Parked,
+    Final,
+}
+
 struct SessionEnded {
+    phase: SessionEndPhase,
     session_id: u64,
     token: [u8; 16],
-    /// `true` if the connection closed gracefully (a received `Close`) -- tear
-    /// down at once; `false` on an unexpected death (`DEATH_AFTER`) -- retain.
+    /// Ordinary graceful close versus unexpected death. For a revoked route,
+    /// true additionally requires complete exact decisions and final control ACKs;
+    /// cancellation/deadline is nondelivery, independently of the Final phase.
     graceful: bool,
 }
 
@@ -3266,6 +3373,7 @@ impl SessionManager {
                                 router,
                                 ctx.auth,
                                 SessionEnded {
+                                    phase: SessionEndPhase::Final,
                                     session_id: new_id,
                                     token,
                                     graceful: false,
@@ -3442,6 +3550,7 @@ impl SessionManager {
             gates: Arc::clone(&gates),
         };
 
+        let admission_owner = io.control().clone();
         // Stable datagram route + control channel into the persistent bridge.
         // A proven probation's route becomes the bridge's own: same sender
         // under the same `session_id`, same queue, nothing lost in between.
@@ -3461,6 +3570,7 @@ impl SessionManager {
         let superseded = router.backends.insert(
             token,
             BackendEntry {
+                admission: admission_owner,
                 session_id,
                 control: ctl_tx,
                 last_msg1_body: msg1_body,
@@ -4085,6 +4195,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     if conn.features().contains(crate::Features::AUTH_ACCEPTED) {
         let Some(datagrams) = committed.enqueue(&mut conn, now) else {
             let _ = done_tx.send(SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: conn.session_id(),
                 token,
                 graceful: false,
@@ -4113,6 +4224,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
     );
     let mut backend_finished = false;
+    let mut retirement_barrier = None;
 
     // `first_live_sent` is BRIDGE-level, spanning every connection this
     // backend drives: a reattach never re-sends `Live` (it sends
@@ -4162,6 +4274,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         CloseKind::None => {}
         kind => {
             let _ = done_tx.send(SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: conn.session_id(),
                 token,
                 graceful: matches!(kind, CloseKind::Graceful),
@@ -4171,9 +4284,19 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     }
 
     loop {
+        if control.retiring() {
+            link.inbound.revoke();
+        }
         // While parked the connection is `Closed` (deaf, no timers), so poll
         // without a timeout.
-        let next = if parked { None } else { conn.next_timeout() };
+        let retirement_deadline = control.retirement_deadline();
+        let next = match (
+            if parked { None } else { conn.next_timeout() },
+            retirement_deadline,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let timer = async move {
             match next {
                 Some(deadline) => {
@@ -4199,6 +4322,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             _ = lifecycle.shutdown.requested() => break,
             c = control_rx.recv(), if control_open => Wakeup::Control(c),
             _ = control.terminal_ready.notified() => Wakeup::Terminal,
+            _ = control.retire_bridge.notified() => Wakeup::Timeout,
             w = async {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
@@ -4219,7 +4343,32 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // say so.
         let mut writable: Vec<u8> = Vec::new();
 
+        if retirement_deadline.is_some_and(|deadline| now >= deadline) {
+            log::warn!("revoked session retirement ended without acknowledged refusal delivery");
+            out.extend(conn.close(now));
+            send_all(&socket, &out).await;
+            break;
+        }
         match wakeup {
+            Wakeup::Backend(Some(SessionOutbound::RetirementReady {
+                origin,
+                decisions_complete,
+            })) => {
+                if decisions_complete
+                    && origin.session_id == conn.session_id()
+                    && origin.generation == link.ledger.generation()
+                {
+                    retirement_barrier = Some(origin);
+                    backend_finished = true;
+                    #[cfg(test)]
+                    CONTROL_RETIREMENT_BARRIER.with(|barrier| barrier.set(Some(origin)));
+                } else if control.retiring() {
+                    log::warn!("revoked session retirement lacks complete decisions for its exact attachment");
+                    out.extend(conn.close(now));
+                    send_all(&socket, &out).await;
+                    break;
+                }
+            }
             Wakeup::Terminal => {
                 if let Some(request) = control.take_priority_abort() {
                     apply_terminal_request(
@@ -4309,6 +4458,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 .await
                 {
                     let _ = done_tx.send(SessionEnded {
+                        phase: SessionEndPhase::Final,
                         session_id,
                         token,
                         graceful: false,
@@ -4433,6 +4583,18 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             // Backend EOF ends admission but is not a delivery receipt. The
             // receiver is disabled thereafter, so pending ACK debt cannot spin.
             Wakeup::Backend(None) => {
+                if control.retiring()
+                    && retirement_barrier
+                        != Some(AttachmentContext::for_connection(
+                            &conn,
+                            link.ledger.generation(),
+                        ))
+                {
+                    log::warn!("revoked session retirement ended without an exact admitted-decision barrier");
+                    out.extend(conn.close(now));
+                    send_all(&socket, &out).await;
+                    break;
+                }
                 backend_finished = true;
                 #[cfg(test)]
                 CONTROL_BACKEND_EOF.with(|count| count.set(count.get() + 1));
@@ -4451,6 +4613,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 .await
                 {
                     let _ = done_tx.send(SessionEnded {
+                        phase: SessionEndPhase::Final,
                         session_id,
                         token,
                         graceful: false,
@@ -4511,7 +4674,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         tokio::select! {
             biased;
             _ = lifecycle.shutdown.requested() => break,
-            _ = link.wait_below_pending_cap(&mut conn, &mut out) => {}
+            _ = link.wait_below_pending_cap(&control, &mut conn, &mut out) => {}
         }
         if !out.is_empty() {
             send_all(&socket, &out).await;
@@ -4533,6 +4696,13 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             was_active = now_active;
         }
 
+        let retirement_delivered = retirement_barrier
+            == Some(AttachmentContext::for_connection(
+                &conn,
+                link.ledger.generation(),
+            ))
+            && pending_control.is_empty()
+            && link.control_delivery.is_empty();
         if backend_finished && pending_control.is_empty() && link.control_delivery.is_empty() {
             // EOF becomes graceful only after admitted control delivery settles.
             // A parked connection is already Closed, so close remains a no-op.
@@ -4540,9 +4710,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             send_all(&socket, &out).await;
             deactivate(&mut was_active, &active_count);
             let _ = done_tx.send(SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: conn.session_id(),
                 token,
-                graceful: true,
+                graceful: !control.retiring() || retirement_delivered,
             });
             link.finish(lifecycle.clone());
             return;
@@ -4558,9 +4729,10 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 // before it stops recomputing.
                 deactivate(&mut was_active, &active_count);
                 let _ = done_tx.send(SessionEnded {
+                    phase: SessionEndPhase::Final,
                     session_id: conn.session_id(),
                     token,
-                    graceful: true,
+                    graceful: !control.retiring() || retirement_delivered,
                 });
                 link.finish(lifecycle.clone());
                 return;
@@ -4584,6 +4756,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                     // double-decrement.
                     deactivate(&mut was_active, &active_count);
                     let _ = done_tx.send(SessionEnded {
+                        phase: SessionEndPhase::Parked,
                         session_id: conn.session_id(),
                         token,
                         graceful: false,
@@ -4652,6 +4825,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // live entry nor wrongly re-retains). A send error means the router is
     // already gone (shutdown), which is fine.
     let _ = done_tx.send(SessionEnded {
+        phase: SessionEndPhase::Final,
         session_id: conn.session_id(),
         token,
         graceful: false,
@@ -5234,6 +5408,7 @@ struct Inbound {
     pending: VecDeque<Waiting>,
     /// Stream bytes in `pending`.
     pending_bytes: usize,
+    revoked: bool,
 }
 
 impl Inbound {
@@ -5242,7 +5417,14 @@ impl Inbound {
             tx,
             pending: VecDeque::new(),
             pending_bytes: 0,
+            revoked: false,
         }
+    }
+
+    fn revoke(&mut self) {
+        self.revoked = true;
+        self.pending.clear();
+        self.pending_bytes = 0;
     }
 
     fn has_pending(&self) -> bool {
@@ -5260,6 +5442,9 @@ impl Inbound {
     /// whatever waits already, or hand it over at once if nothing does and
     /// there is room. The stream bytes handed over now, if any.
     fn push(&mut self, ev: SessionInbound, generation: u64) -> Option<Handed> {
+        if self.revoked {
+            return None;
+        }
         let waiting = Waiting { ev, generation };
         let handed = waiting.handed();
         if self.pending.is_empty() {
@@ -5339,6 +5524,7 @@ thread_local! {
     static CONTROL_RELIABLE_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static CONTROL_PRODUCER_FENCE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static CONTROL_BACKEND_EOF: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CONTROL_RETIREMENT_BARRIER: std::cell::Cell<Option<AttachmentContext>> = const { std::cell::Cell::new(None) };
 }
 
 /// The bridge's side of its backend (spec §4.10): what goes in, and what the
@@ -5393,8 +5579,23 @@ impl BackendLink {
     /// Past `PENDING_CAP`: wait for the backend, as every build before
     /// credits did (spec §4.10.5, §4.10.7), in both modes -- the windows
     /// bound each stream, not the session (see `PENDING_CAP`).
-    async fn wait_below_pending_cap(&mut self, conn: &mut Connection, out: &mut Vec<Datagram>) {
-        self.wait_below(PENDING_CAP, conn, out).await;
+    async fn wait_below_pending_cap(
+        &mut self,
+        control: &SessionControl,
+        conn: &mut Connection,
+        out: &mut Vec<Datagram>,
+    ) {
+        if control.retiring() {
+            self.inbound.revoke();
+            return;
+        }
+        // Retiring backends no longer consume. Do not let their former
+        // application backlog fence outcome/ACK/deadline processing forever.
+        tokio::select! {
+            biased;
+            _ = control.retire_bridge.notified() => self.inbound.revoke(),
+            _ = self.wait_below(PENDING_CAP, conn, out) => {}
+        }
     }
 
     /// Wait for the backend while more than `cap` stream bytes wait for it.
@@ -6538,6 +6739,7 @@ mod tests {
         router.backends.insert(
             token,
             BackendEntry {
+                admission: Arc::new(SessionControl::new(&Lifecycle::default().control_budget, 0)),
                 session_id,
                 control: ctl_tx,
                 last_msg1_body: Vec::new(),
@@ -6970,6 +7172,7 @@ mod tests {
 
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: sid,
                 token,
                 graceful: true,
@@ -7002,6 +7205,7 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: sid,
                 token,
                 graceful: false,
@@ -7067,6 +7271,7 @@ mod tests {
         let t1 = tokio::time::Instant::now();
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: new_sid,
                 token,
                 graceful: false,
@@ -7097,6 +7302,7 @@ mod tests {
         let (_ctl, _dg) = synthetic_live_entry(&mut router, graceful, 1);
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: 1,
                 token: graceful,
                 graceful: true,
@@ -7114,6 +7320,7 @@ mod tests {
         let (_ctl2, _dg2) = synthetic_live_entry(&mut router, retained, 2);
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 2,
                 token: retained,
                 graceful: false,
@@ -7137,6 +7344,7 @@ mod tests {
         let (_ctl3, _dg3) = synthetic_live_entry(&mut router, evicted, 3);
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 3,
                 token: evicted,
                 graceful: false,
@@ -7205,6 +7413,7 @@ mod tests {
             &mut router,
             &auth,
             SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: 1,
                 token: graceful,
                 graceful: true,
@@ -7224,6 +7433,7 @@ mod tests {
             &mut router,
             &auth,
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 2,
                 token: retained,
                 graceful: false,
@@ -7244,44 +7454,40 @@ mod tests {
         );
     }
 
-    /// A login reported over from OUTSIDE takes its LIVE session down -- and
-    /// the datagram ROUTE is the half that matters. Dropping the entry alone
-    /// only drops the bridge's control channel, which a live bridge reacts
-    /// to by merely not polling that arm any more (`Wakeup::Control(None)`);
-    /// what actually ends it is its `dgram_rx` reaching end-of-file
-    /// (`Wakeup::Dgram(None)`), and that sender lives in `sessions`, not in
-    /// the entry. Delete the `sessions.remove` line from `Router::end_login`
-    /// and this assertion fails -- together with the full-stack test below,
-    /// which is the point of it: without that line a live bridge never ends
-    /// at all, so neither does its backend. Measured, not assumed.
+    /// External login end revokes effects immediately while the old exact route
+    /// remains available for already admitted refusal outcomes and their ACKs.
     #[tokio::test]
-    async fn a_login_ended_from_outside_takes_its_live_session_with_it() {
+    async fn a_login_ended_from_outside_retires_its_live_session_until_bridge_completion() {
         let mut router = Router::new();
         let token = [31u8; 16];
         let (mut ctl_rx, mut dg_rx) = synthetic_live_entry(&mut router, token, 1);
-
-        assert!(
-            router.end_login(token, 0),
-            "a login with a session must report that there was one to end"
+        let admission = router.backends[&token].admission.clone();
+        assert!(router.end_login(token, 0));
+        assert!(!router.backends.contains_key(&token));
+        assert!(admission.retiring());
+        assert!(router.retiring.contains_key(&1));
+        assert!(matches!(
+            dg_rx.try_recv_or_why(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            ctl_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        router.on_session_ended(
+            SessionEnded {
+                phase: SessionEndPhase::Final,
+                session_id: 1,
+                token,
+                graceful: true,
+            },
+            tokio::time::Instant::now(),
         );
-
-        assert!(
-            !router.backends.contains_key(&token),
-            "the entry must be gone"
-        );
-        // BOUNDED, both of them. A channel whose sender is still alive
-        // never yields and never closes, so a bare `recv().await` here does
-        // not fail when the route is left behind -- it hangs, and this file
-        // has no per-test timeout. Caught by running exactly that mutation.
-        assert_eq!(
-            closed_within(dg_rx.recv()).await,
-            Some(None),
-            "the bridge's datagram route must be closed -- that is what ends a LIVE bridge"
-        );
+        assert!(!router.retiring.contains_key(&1));
+        assert_eq!(closed_within(dg_rx.recv()).await, Some(None));
         assert_eq!(
             closed_within(ctl_rx.recv()).await.map(|c| c.is_none()),
-            Some(true),
-            "and its control channel with it"
+            Some(true)
         );
     }
 
@@ -7546,6 +7752,7 @@ mod tests {
         keep_alive.push((c, d));
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 1,
                 token: victim,
                 graceful: false,
@@ -7761,6 +7968,7 @@ mod tests {
         // A stale (older) session_id for the same token.
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 299u64,
                 token,
                 graceful: false,
@@ -7803,6 +8011,7 @@ mod tests {
         let t_oldest = tokio::time::Instant::now();
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 1,
                 token: oldest,
                 graceful: false,
@@ -7822,6 +8031,7 @@ mod tests {
         let t_newer = tokio::time::Instant::now();
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 2,
                 token: newer_retained,
                 graceful: false,
@@ -8049,6 +8259,7 @@ mod tests {
         let shared: SharedAllowlist = Arc::new(Mutex::new(vec![key, other_key]));
         let ended = router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id: sid,
                 token,
                 graceful: true,
@@ -8090,6 +8301,7 @@ mod tests {
         let shared: SharedAllowlist = Arc::new(Mutex::new(vec![key]));
         let ended = router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: sid,
                 token,
                 graceful: false,
@@ -9169,6 +9381,7 @@ mod tests {
         server_kp: crate::handshake::Keypair,
         token: [u8; 16],
         backend_out: mpsc::UnboundedSender<SessionOutbound>,
+        admission: Arc<SessionControl>,
         dg_tx: DgramTx,
         ctl_tx: mpsc::UnboundedSender<BridgeControl>,
         done_rx: mpsc::UnboundedReceiver<SessionEnded>,
@@ -9206,6 +9419,17 @@ mod tests {
         let (done_tx, done_rx) = mpsc::unbounded_channel::<SessionEnded>();
         let backend_out = out_tx.clone();
         let lifecycle = Arc::new(Lifecycle::default());
+        let io = SessionIo {
+            lifecycle: lifecycle.clone(),
+            control: OnceLock::new(),
+            resume_snapshots: channel_bridge::SnapshotMailbox::default(),
+            inbound: in_rx,
+            outbound: out_tx,
+            principal: test_principal(),
+            login: token,
+            gates: Arc::clone(&gates),
+        };
+        let admission = io.control().clone();
         let bridge = tokio::spawn(run_backend_bridge(BridgeSpawn {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             committed: CommittedAdmission(AuthAcceptance {
@@ -9222,16 +9446,7 @@ mod tests {
             },
             token,
             backend,
-            io: SessionIo {
-                lifecycle: lifecycle.clone(),
-                control: OnceLock::new(),
-                resume_snapshots: channel_bridge::SnapshotMailbox::default(),
-                inbound: in_rx,
-                outbound: out_tx,
-                principal: test_principal(),
-                login: token,
-                gates: Arc::clone(&gates),
-            },
+            io,
             start: BridgeStart::default(),
             active_count: Arc::new(AtomicUsize::new(0)),
             gates,
@@ -9245,6 +9460,7 @@ mod tests {
             server_kp,
             token,
             backend_out,
+            admission,
             dg_tx,
             ctl_tx,
             done_rx,
@@ -13436,6 +13652,7 @@ mod tests {
         keep_alive.push((c, d));
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 0,
                 token: retained,
                 graceful: false,
@@ -13487,6 +13704,7 @@ mod tests {
         router.backends.get_mut(&retained).expect("entry").owner = 1000;
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 0,
                 token: retained,
                 graceful: false,
@@ -13539,6 +13757,7 @@ mod tests {
         keep_alive.push((c, d));
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 99,
                 token: foreign,
                 graceful: false,
@@ -13760,6 +13979,7 @@ mod tests {
         keep_alive.push(synthetic_live_entry(&mut router, retained, 1));
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 1,
                 token: retained,
                 graceful: false,
@@ -15941,6 +16161,7 @@ mod tests {
             .await;
             SessionManager::on_probation_ended(&wiring.ctx(), &mut router, new).await;
             let incarnation = router.backends[&token].incarnation;
+            let retiring_session = router.backends[&token].session_id;
             assert!(
                 router.end_login(token, incarnation),
                 "real terminal-deletion path"
@@ -15951,7 +16172,12 @@ mod tests {
                 !router.backends.contains_key(&token),
                 "returning to an absent token cannot make an old proof current again"
             );
-            assert!(router.sessions.is_empty());
+            assert_eq!(router.sessions.len(), 1);
+            assert!(
+                router.sessions.contains_key(&retiring_session)
+                    && router.retiring.contains_key(&retiring_session),
+                "only the revoked route remains until its exact bridge finishes"
+            );
             assert!(router.probation.is_empty());
         })
         .await
@@ -15983,6 +16209,7 @@ mod tests {
             let died = tokio::time::Instant::now();
             router.on_session_ended(
                 SessionEnded {
+                    phase: SessionEndPhase::Parked,
                     session_id: 1,
                     token,
                     graceful: false,
@@ -16051,6 +16278,7 @@ mod tests {
             router.backends.get_mut(&returning).expect("entry").owner = test_principal().uid;
             router.on_session_ended(
                 SessionEnded {
+                    phase: SessionEndPhase::Parked,
                     session_id: 1,
                     token: returning,
                     graceful: false,
@@ -16062,6 +16290,7 @@ mod tests {
             router.backends.get_mut(&abandoned).expect("entry").owner = 2;
             router.on_session_ended(
                 SessionEnded {
+                    phase: SessionEndPhase::Parked,
                     session_id: 2,
                     token: abandoned,
                     graceful: false,
@@ -16171,6 +16400,7 @@ mod tests {
                 &mut router,
                 &plain.auth,
                 SessionEnded {
+                    phase: SessionEndPhase::Final,
                     session_id: 1,
                     token,
                     graceful: true,
@@ -16205,6 +16435,7 @@ mod tests {
                 &mut router,
                 &wiring.auth,
                 SessionEnded {
+                    phase: SessionEndPhase::Final,
                     session_id: 1,
                     token,
                     graceful: true,
@@ -16274,6 +16505,7 @@ mod tests {
             router,
             &wiring.auth,
             SessionEnded {
+                phase: SessionEndPhase::Final,
                 session_id,
                 token,
                 graceful: true,
@@ -16482,6 +16714,7 @@ mod tests {
                     &mut router,
                     &wiring.auth,
                     SessionEnded {
+                        phase: SessionEndPhase::Parked,
                         session_id: 2,
                         token,
                         graceful: false,
@@ -16547,6 +16780,11 @@ mod tests {
             router,
             &wiring.auth,
             SessionEnded {
+                phase: if graceful {
+                    SessionEndPhase::Final
+                } else {
+                    SessionEndPhase::Parked
+                },
                 session_id,
                 token,
                 graceful,
@@ -16869,6 +17107,7 @@ mod tests {
             let died = tokio::time::Instant::now();
             router.on_session_ended(
                 SessionEnded {
+                    phase: SessionEndPhase::Parked,
                     session_id: 1,
                     token,
                     graceful: false,
@@ -16941,6 +17180,7 @@ mod tests {
         let died = tokio::time::Instant::now();
         router.on_session_ended(
             SessionEnded {
+                phase: SessionEndPhase::Parked,
                 session_id: 1,
                 token,
                 graceful: false,
@@ -18033,4 +18273,5 @@ mod tests {
     include!("session_manager_snapshot_bounds_tests.rs");
     include!("session_manager_restart_bounds_tests.rs");
     include!("session_manager_repaint_bounds_tests.rs");
+    include!("session_manager_refusal_retirement_tests.rs");
 }
