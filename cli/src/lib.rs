@@ -8,6 +8,7 @@ pub mod background;
 pub mod climb;
 pub mod connect;
 pub mod escape;
+pub mod input_ingress;
 mod install_ui;
 pub mod keys;
 pub mod knock_spec;

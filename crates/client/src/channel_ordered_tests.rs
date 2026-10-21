@@ -19,7 +19,7 @@ fn wire(record: ShellRecord) -> Vec<u8> {
 
 #[test]
 fn early_declared_data_over_cap_fails_from_header_before_payload() {
-    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| {}));
+    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| Ok(())));
     let mut header = vec![REC_DATA];
     header.extend_from_slice(&(65537u32).to_be_bytes());
     assert_eq!(
@@ -35,7 +35,7 @@ fn early_declared_data_over_cap_fails_from_header_before_payload() {
 
 #[test]
 fn unknown_partial_records_share_declared_capacity_budget() {
-    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| {}));
+    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| Ok(())));
     let mut header = vec![REC_DATA];
     header.extend_from_slice(&(65536u32).to_be_bytes());
     for ch in 16..23 {
@@ -51,7 +51,7 @@ fn unknown_partial_records_share_declared_capacity_budget() {
 
 #[test]
 fn geometry_before_opened_releases_geometry_ready_and_data_in_order() {
-    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| {}));
+    let mut session = ChannelSession::new(QshSubstrate::new(|_, _| Ok(())));
     let ch = session.open_shell(80, 24).unwrap();
     let mut batch = wire(ShellRecord::Geometry(initial()));
     batch.extend(wire(ShellRecord::Data(b"tail".to_vec())));
@@ -81,7 +81,7 @@ use transport::channel::{
     OpenClassification,
 };
 use transport::shell_frame::RecordDeframer;
-type Sink = Box<dyn FnMut(u8, Vec<u8>) + Send>;
+type Sink = Box<dyn FnMut(u8, Vec<u8>) -> Result<(), ChannelSendError> + Send>;
 type Session = ChannelSession<QshSubstrate<Sink>>;
 fn logged() -> (Session, Arc<Mutex<Vec<ClientRecord>>>) {
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -92,6 +92,7 @@ fn logged() -> (Session, Arc<Mutex<Vec<ClientRecord>>>) {
                 seen.lock().unwrap().push(decode_client(&raw).unwrap());
             }
         }
+        Ok(())
     });
     (ChannelSession::new(QshSubstrate::new(sink)), sent)
 }
@@ -99,7 +100,7 @@ fn geometry(s: &mut Session, record: GeometryRecord) -> Vec<SessionEvent> {
     s.on_bytes(16, &wire(ShellRecord::Geometry(record)))
 }
 fn ready(s: &mut Session) {
-    assert_eq!(s.open_shell(80, 24), Some(16));
+    assert_eq!(s.open_shell(80, 24), Ok(16));
     assert!(s
         .on_bytes(
             CONTROL_STREAM,
@@ -183,8 +184,8 @@ fn resize_records(sent: &Arc<Mutex<Vec<ClientRecord>>>) -> Vec<(u64, u16, u16)> 
 fn late_result_commits_a_then_sends_latest_b_and_duplicate_is_idempotent() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    assert_eq!(s.resize(16, 100, 30), ResizeDisposition::Sent);
-    assert_eq!(s.resize(16, 120, 40), ResizeDisposition::Coalesced);
+    assert_eq!(s.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
+    assert_eq!(s.resize(16, 120, 40).unwrap(), ResizeDisposition::Coalesced);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
     assert_eq!(
         geometry(&mut s, applied(1, 100, 30)),
@@ -203,8 +204,8 @@ fn late_result_commits_a_then_sends_latest_b_and_duplicate_is_idempotent() {
 fn return_to_old_desired_waits_for_inflight_result() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
-    s.resize(16, 80, 24);
+    s.resize(16, 100, 30).unwrap();
+    s.resize(16, 80, 24).unwrap();
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
     geometry(&mut s, applied(1, 100, 30));
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (2, 80, 24)]);
@@ -213,7 +214,7 @@ fn return_to_old_desired_waits_for_inflight_result() {
 fn refusal_latch_transfers_same_instance_and_new_intent_can_retry() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     let refusal = GeometryRecord {
         request_id: 1,
         outcome: GeometryOutcome::Refused(ResizeRefusal::ResourceLimit),
@@ -224,7 +225,7 @@ fn refusal_latch_transfers_same_instance_and_new_intent_can_retry() {
         .iter()
         .any(|e| matches!(e, SessionEvent::ResizeRefused { .. })));
     assert!(s.is_ready(16));
-    assert_eq!(s.resize(16, 100, 30), ResizeDisposition::Unchanged);
+    assert_eq!(s.resize(16, 100, 30).unwrap(), ResizeDisposition::Unchanged);
     assert!(!geometry(&mut s, refusal)
         .iter()
         .any(|e| matches!(e, SessionEvent::ResizeRefused { .. })));
@@ -236,8 +237,8 @@ fn refusal_latch_transfers_same_instance_and_new_intent_can_retry() {
     snapshot(&mut s, 1, false);
     geometry(&mut s, initial());
     assert!(resize_records(&new_sent).is_empty());
-    s.resize(16, 120, 40);
-    s.resize(16, 100, 30);
+    s.resize(16, 120, 40).unwrap();
+    s.resize(16, 100, 30).unwrap();
     geometry(&mut s, applied(1, 120, 40));
     assert_eq!(resize_records(&new_sent), vec![(1, 120, 40), (2, 100, 30)]);
 }
@@ -272,7 +273,7 @@ fn early_exit_retains_partial_deframer_until_draining_tail_and_real_exit() {
     );
     assert!(!s.is_ready(16));
     assert_eq!(
-        s.resize(16, 100, 30),
+        s.resize(16, 100, 30).unwrap(),
         ResizeDisposition::Rejected(ResizeRejection::Ended)
     );
     assert_eq!(
@@ -299,7 +300,7 @@ fn early_exit_retains_partial_deframer_until_draining_tail_and_real_exit() {
 fn hot_reset_preserves_request_scope_and_replay_resolves_it() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     s.reset_stream(16);
     assert!(!s.is_ready(16));
     geometry(&mut s, initial());
@@ -307,7 +308,7 @@ fn hot_reset_preserves_request_scope_and_replay_resolves_it() {
     s.reset_stream(16);
     geometry(&mut s, applied(1, 100, 30));
     assert!(s.is_ready(16));
-    assert_eq!(s.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(s.resize(16, 120, 40).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (2, 120, 40)]);
 }
 #[test]
@@ -330,7 +331,7 @@ fn unknown_correlation_is_terminal_and_no_later_ready_or_data_escapes() {
 fn repeated_snapshot_after_resize_does_not_reject_updated_effective_dimensions() {
     let (mut s, _) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     geometry(&mut s, applied(1, 100, 30));
     let list = ChannelSnapshot::new(
         vec![ActiveChannel {
@@ -540,7 +541,7 @@ fn no_pty_geometry_preserves_either_zero_open_exactly() {
             ]
         );
         assert_eq!(
-            s.resize(ch, 80, 24),
+            s.resize(ch, 80, 24).unwrap(),
             ResizeDisposition::Rejected(ResizeRejection::NoPty)
         );
         assert!(resize_records(&sent).is_empty());
@@ -561,7 +562,7 @@ fn no_pty_geometry_preserves_either_zero_open_exactly() {
 fn fresh_instance_does_not_inherit_predecessor_refusal() {
     let (mut s, _) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     geometry(
         &mut s,
         GeometryRecord {
@@ -581,7 +582,7 @@ fn fresh_instance_does_not_inherit_predecessor_refusal() {
             ..initial()
         },
     );
-    assert_eq!(s.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(s.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
 }
 #[test]
@@ -620,7 +621,7 @@ fn retired_stream_does_not_retain_new_partial_input() {
 }
 #[test]
 fn direct_decoder_batch_is_bounded_before_accumulating_output_events() {
-    let mut sub = QshSubstrate::new(|_, _| {});
+    let mut sub = QshSubstrate::new(|_, _| Ok(()));
     let bytes = wire(ShellRecord::Data(vec![])).repeat(257);
     let events = sub.on_stream(16, &bytes);
     assert_eq!(
@@ -635,8 +636,16 @@ fn direct_decoder_batch_is_bounded_before_accumulating_output_events() {
 fn ordered_substrate_refuses_uncorrelated_resize_encoder() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sink = sent.clone();
-    let mut sub = QshSubstrate::new(move |_, bytes| sink.lock().unwrap().push(bytes));
-    sub.resize(16, 100, 30);
+    let mut sub = QshSubstrate::new(move |_, bytes| {
+        sink.lock().unwrap().push(bytes);
+        Ok(())
+    });
+    assert_eq!(
+        sub.resize(16, 100, 30),
+        Err(ChannelSendError::Protocol(
+            ChannelProtocolError::UnsupportedProfile
+        ))
+    );
     assert!(sent.lock().unwrap().is_empty());
     assert_eq!(
         sub.protocol_error(),
@@ -647,7 +656,7 @@ fn ordered_substrate_refuses_uncorrelated_resize_encoder() {
 fn applied_result_must_match_the_correlated_requested_size() {
     let (mut s, _) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     assert_eq!(
         geometry(&mut s, applied(1, 120, 40)),
         vec![SessionEvent::ProtocolFailure(
@@ -657,7 +666,7 @@ fn applied_result_must_match_the_correlated_requested_size() {
 }
 #[test]
 fn unknown_extension_body_is_skipped_without_early_payload_charge() {
-    let mut sub = QshSubstrate::new(|_, _| {});
+    let mut sub = QshSubstrate::new(|_, _| Ok(()));
     let mut bytes = transport::shell_frame::encode_record(0x70, &vec![0; 600_000]);
     bytes.extend(wire(ShellRecord::Data(b"known".to_vec())));
     assert_eq!(
@@ -672,7 +681,7 @@ fn unknown_extension_body_is_skipped_without_early_payload_charge() {
 fn same_refused_intent_survives_two_attachment_transitions_without_retry() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     geometry(
         &mut s,
         GeometryRecord {
@@ -685,7 +694,7 @@ fn same_refused_intent_survives_two_attachment_transitions_without_retry() {
         s.reset_attachment();
         snapshot(&mut s, 1, false);
         geometry(&mut s, initial());
-        assert_eq!(s.resize(16, 100, 30), ResizeDisposition::Unchanged);
+        assert_eq!(s.resize(16, 100, 30).unwrap(), ResizeDisposition::Unchanged);
     }
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
 }
@@ -694,7 +703,7 @@ fn contradictory_duplicate_and_wrong_instance_are_terminal() {
     for instance in [1, 2] {
         let (mut s, _) = logged();
         ready(&mut s);
-        s.resize(16, 100, 30);
+        s.resize(16, 100, 30).unwrap();
         geometry(&mut s, applied(1, 100, 30));
         let record = GeometryRecord {
             instance: ChannelInstance::new(instance).unwrap(),
@@ -769,7 +778,7 @@ fn full_identity_namespace_retires_then_reuses_stream_without_old_state() {
         event,
         SessionEvent::ProtocolFailure(_) | SessionEvent::Ready(_)
     )));
-    assert_eq!(s.open_shell(80, 24), Some(16));
+    assert_eq!(s.open_shell(80, 24), Ok(16));
     assert!(s
         .on_bytes(
             CONTROL_STREAM,
@@ -794,9 +803,9 @@ fn full_identity_namespace_retires_then_reuses_stream_without_old_state() {
 #[test]
 fn initial_not_ready_resize_is_rejected_without_retaining_a_hidden_request() {
     let (mut s, sent) = logged();
-    assert_eq!(s.open_shell(80, 24), Some(16));
+    assert_eq!(s.open_shell(80, 24), Ok(16));
     assert_eq!(
-        s.resize(16, 100, 30),
+        s.resize(16, 100, 30).unwrap(),
         ResizeDisposition::Rejected(ResizeRejection::NotReady)
     );
     s.on_bytes(
@@ -810,9 +819,9 @@ fn initial_not_ready_resize_is_rejected_without_retaining_a_hidden_request() {
 fn resize_during_hot_reset_coalesces_behind_the_existing_pending_request() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     s.reset_stream(16);
-    assert_eq!(s.resize(16, 120, 40), ResizeDisposition::Coalesced);
+    assert_eq!(s.resize(16, 120, 40).unwrap(), ResizeDisposition::Coalesced);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
     geometry(&mut s, applied(1, 100, 30));
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (2, 120, 40)]);
@@ -932,7 +941,10 @@ fn newer_instance_snapshot_retires_old_partial_header_before_new_geometry() {
 fn replacement_retires_partial_parser(split: usize) {
     let (mut session, sent) = logged();
     ready(&mut session);
-    assert_eq!(session.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(
+        session.resize(16, 100, 30).unwrap(),
+        ResizeDisposition::Sent
+    );
     let old_data = wire(ShellRecord::Data(b"old partial body".to_vec()));
     assert!(session.on_bytes(16, &old_data[..split]).is_empty());
     assert!(session.substrate.has_partial_input(16));
@@ -965,7 +977,10 @@ fn replacement_retires_partial_parser(split: usize) {
             bytes: b"new body".to_vec()
         }]
     );
-    assert_eq!(session.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(
+        session.resize(16, 120, 40).unwrap(),
+        ResizeDisposition::Sent
+    );
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (1, 120, 40)]);
 }
 
@@ -1014,7 +1029,7 @@ fn close_and_vanished_preserve_retired_instance_and_continuity() {
             }),
         );
         if local_close {
-            session.close(16);
+            session.close(16).unwrap();
         } else {
             let empty = ChannelSnapshot::new(vec![], vec![]).unwrap();
             assert_eq!(
@@ -1044,12 +1059,12 @@ fn local_stream_reuse_keeps_retired_frontier_for_snapshot_and_geometry() {
     for metadata in [true, false] {
         let (mut session, _) = logged();
         ready(&mut session);
-        session.close(16);
+        session.close(16).unwrap();
         // Occupy the remaining finite namespace so local OPEN reuses stream 16.
         for expected in 17..=255 {
-            assert_eq!(session.open_shell(80, 24), Some(expected));
+            assert_eq!(session.open_shell(80, 24), Ok(expected));
         }
-        assert_eq!(session.open_shell(80, 24), Some(16));
+        assert_eq!(session.open_shell(80, 24), Ok(16));
         let events = if metadata {
             snapshot(&mut session, 1, false)
         } else {
@@ -1121,7 +1136,10 @@ fn repeated_same_instance_snapshot_preserves_partial_header_and_exit_tail() {
 fn newer_snapshot_clears_predecessor_continuity_refusal_and_ready_allocation() {
     let (mut session, sent) = logged();
     ready(&mut session);
-    assert_eq!(session.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(
+        session.resize(16, 100, 30).unwrap(),
+        ResizeDisposition::Sent
+    );
     geometry(
         &mut session,
         GeometryRecord {
@@ -1153,7 +1171,10 @@ fn newer_snapshot_clears_predecessor_continuity_refusal_and_ready_allocation() {
             ..initial()
         },
     );
-    assert_eq!(session.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(
+        session.resize(16, 100, 30).unwrap(),
+        ResizeDisposition::Sent
+    );
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (1, 100, 30)]);
 }
 
@@ -1161,8 +1182,8 @@ fn newer_snapshot_clears_predecessor_continuity_refusal_and_ready_allocation() {
 fn deferred_physical_intent_prevents_an_obsolete_coalesced_resize() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
-    s.resize(16, 120, 40);
+    s.resize(16, 100, 30).unwrap();
+    s.resize(16, 120, 40).unwrap();
     let before = sent.lock().unwrap().len();
     s.defer_resize(16, 140, 50);
     assert_eq!(sent.lock().unwrap().len(), before);
@@ -1172,7 +1193,7 @@ fn deferred_physical_intent_prevents_an_obsolete_coalesced_resize() {
         before,
         "C must wait for the owner's debounce; B must never go out"
     );
-    assert_eq!(s.resize(16, 140, 50), ResizeDisposition::Sent);
+    assert_eq!(s.resize(16, 140, 50).unwrap(), ResizeDisposition::Sent);
     assert!(
         matches!(sent.lock().unwrap().last(), Some(ClientRecord::ResizeRequest { request_id, cols: 140, rows: 50, .. }) if request_id.get() == 2)
     );
@@ -1210,7 +1231,7 @@ fn intent_import_rejects_direct_lifecycle_admission() {
 fn deferred_intent_transfers_before_metadata_and_preserves_offline_revisions() {
     let (mut s, _) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
+    s.resize(16, 100, 30).unwrap();
     geometry(
         &mut s,
         GeometryRecord {
@@ -1230,7 +1251,7 @@ fn deferred_intent_transfers_before_metadata_and_preserves_offline_revisions() {
         resize_records(&sent).is_empty(),
         "transferred physical intent is still debouncing"
     );
-    assert_eq!(fresh.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(fresh.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
     assert_eq!(
         resize_records(&sent),
         vec![(1, 100, 30)],
@@ -1242,15 +1263,15 @@ fn deferred_intent_transfers_before_metadata_and_preserves_offline_revisions() {
 fn zero_viewport_suspends_coalesced_intent_across_a_result() {
     let (mut s, sent) = logged();
     ready(&mut s);
-    s.resize(16, 100, 30);
-    s.resize(16, 120, 40);
+    s.resize(16, 100, 30).unwrap();
+    s.resize(16, 120, 40).unwrap();
     assert_eq!(
         s.defer_resize(16, 0, 0),
         ResizeDisposition::Rejected(ResizeRejection::ZeroViewport)
     );
     geometry(&mut s, applied(1, 100, 30));
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
-    assert_eq!(s.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(s.resize(16, 120, 40).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30), (2, 120, 40)]);
 }
 
@@ -1258,7 +1279,7 @@ fn zero_viewport_suspends_coalesced_intent_across_a_result() {
 fn review_early_geometry_preserves_imported_away_and_back_refusal_revision() {
     let (mut old, _) = logged();
     ready(&mut old);
-    assert_eq!(old.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(old.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
     geometry(
         &mut old,
         GeometryRecord {
@@ -1283,7 +1304,7 @@ fn review_early_geometry_preserves_imported_away_and_back_refusal_revision() {
     assert!(events.contains(&SessionEvent::Ready(16)));
     assert!(resize_records(&sent).is_empty());
     assert_eq!(
-        fresh.resize(16, 100, 30),
+        fresh.resize(16, 100, 30).unwrap(),
         ResizeDisposition::Sent,
         "physical away/back after early Geometry is a new revision, not the old refusal"
     );
@@ -1294,7 +1315,7 @@ fn review_early_geometry_preserves_imported_away_and_back_refusal_revision() {
 fn review_early_geometry_keeps_latest_deferred_intent_ineligible_at_snapshot() {
     let (mut old, _) = logged();
     ready(&mut old);
-    assert_eq!(old.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(old.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
     let intent = old.into_attachment_intent();
     let (mut fresh, sent) = logged();
     fresh.import_attachment_intent(intent).unwrap();
@@ -1309,7 +1330,7 @@ fn review_early_geometry_keeps_latest_deferred_intent_ineligible_at_snapshot() {
         resize_records(&sent).is_empty(),
         "snapshot must not restore/send the older eligible size over the latest deferred intent"
     );
-    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(fresh.resize(16, 120, 40).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
 }
 
@@ -1317,7 +1338,7 @@ fn review_early_geometry_keeps_latest_deferred_intent_ineligible_at_snapshot() {
 fn review_early_geometry_preserves_zero_viewport_suspension() {
     let (mut old, _) = logged();
     ready(&mut old);
-    old.resize(16, 100, 30);
+    old.resize(16, 100, 30).unwrap();
     let (mut fresh, sent) = logged();
     fresh
         .import_attachment_intent(old.into_attachment_intent())
@@ -1329,7 +1350,7 @@ fn review_early_geometry_preserves_zero_viewport_suspension() {
     );
     snapshot(&mut fresh, 1, false);
     assert!(resize_records(&sent).is_empty());
-    assert_eq!(fresh.resize(16, 100, 30), ResizeDisposition::Sent);
+    assert_eq!(fresh.resize(16, 100, 30).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 100, 30)]);
 }
 
@@ -1337,7 +1358,7 @@ fn review_early_geometry_preserves_zero_viewport_suspension() {
 fn review_early_geometry_preserves_latest_intent_across_another_transfer() {
     let (mut old, _) = logged();
     ready(&mut old);
-    old.resize(16, 100, 30);
+    old.resize(16, 100, 30).unwrap();
     let (mut middle, _) = logged();
     middle
         .import_attachment_intent(old.into_attachment_intent())
@@ -1354,7 +1375,7 @@ fn review_early_geometry_preserves_latest_intent_across_another_transfer() {
     snapshot(&mut fresh, 1, false);
     geometry(&mut fresh, initial());
     assert!(resize_records(&sent).is_empty());
-    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(fresh.resize(16, 120, 40).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
 }
 
@@ -1363,7 +1384,7 @@ fn review_early_geometry_keeps_refusal_and_new_instance_fences() {
     for same_instance in [true, false] {
         let (mut old, _) = logged();
         ready(&mut old);
-        old.resize(16, 100, 30);
+        old.resize(16, 100, 30).unwrap();
         geometry(
             &mut old,
             GeometryRecord {
@@ -1392,7 +1413,7 @@ fn review_early_geometry_keeps_refusal_and_new_instance_fences() {
         snapshot(&mut fresh, instance, false);
         assert!(resize_records(&sent).is_empty());
         assert_eq!(
-            fresh.resize(16, 100, 30),
+            fresh.resize(16, 100, 30).unwrap(),
             if same_instance {
                 ResizeDisposition::Unchanged
             } else {
@@ -1406,12 +1427,12 @@ fn review_early_geometry_keeps_refusal_and_new_instance_fences() {
 fn review_early_geometry_keeps_a_new_local_open_intent_separate() {
     let (mut old, _) = logged();
     ready(&mut old);
-    old.resize(16, 100, 30);
+    old.resize(16, 100, 30).unwrap();
     let (mut fresh, sent) = logged();
     fresh
         .import_attachment_intent(old.into_attachment_intent())
         .unwrap();
-    assert_eq!(fresh.open_shell(80, 24), Some(16));
+    assert_eq!(fresh.open_shell(80, 24), Ok(16));
     assert!(geometry(
         &mut fresh,
         GeometryRecord {
@@ -1430,7 +1451,7 @@ fn review_early_geometry_keeps_a_new_local_open_intent_separate() {
     );
     assert!(fresh.is_ready(16));
     assert!(resize_records(&sent).is_empty());
-    assert_eq!(fresh.resize(16, 120, 40), ResizeDisposition::Sent);
+    assert_eq!(fresh.resize(16, 120, 40).unwrap(), ResizeDisposition::Sent);
     assert_eq!(resize_records(&sent), vec![(1, 120, 40)]);
 }
 
@@ -1502,6 +1523,7 @@ fn unavailable_exit_leaves_a_healthy_sibling_writable() {
     let seen = sent.clone();
     let sink: Sink = Box::new(move |stream, bytes| {
         seen.lock().unwrap().push((stream, bytes));
+        Ok(())
     });
     let mut s = ChannelSession::new(QshSubstrate::new(sink));
     ready(&mut s);
@@ -1533,7 +1555,7 @@ fn unavailable_exit_leaves_a_healthy_sibling_writable() {
             bytes: b"alive".to_vec()
         }]
     );
-    s.send(sibling, b"still writable");
+    s.send(sibling, b"still writable").unwrap();
     assert!(sent
         .lock()
         .unwrap()

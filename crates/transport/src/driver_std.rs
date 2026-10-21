@@ -51,19 +51,20 @@
 //! cancellation or closure retires scheduling. Sweep completion and selection
 //! turnover belong to the recovery owner, not to the driver's Live event.
 //!
-//! Graceful stop vs. detach. `Command::Close` (`StdClient::close`) emits the
+//! Graceful stop vs. detach. `StdClient::close` emits the
 //! client's `Close` frame (`Connection::close`) and flushes it to the socket
 //! before the loop exits, so the server tears the backend down immediately
 //! instead of retaining it for a warm reconnect -- this is what a
-//! user-initiated disconnect uses. `Command::Detach` (`StdClient::detach`)
+//! user-initiated disconnect uses. `StdClient::detach`
 //! ends the loop WITHOUT calling `Connection::close`: no further datagram
 //! goes out at all, so the server just sees silence and treats it exactly
 //! like any other liveness-timeout death -- it RETAINS the backend for a
 //! later warm reattach. This is what the app's own internal forced reconnect
 //! uses, so a follow-up reconnect gets a warm reattach (echo-ack/prediction
 //! state survives) instead of degenerating into a cold create. Detach is
-//! STICKY: once `Command::Detach` has been processed, the command channel
-//! later disconnecting (the client handle dropped without an explicit call)
+//! STICKY: close/detach use an independent atomic signal, checked before
+//! every bounded command turn. Once detach has been requested, the command
+//! channel later disconnecting (the client handle dropped without an explicit call)
 //! can never resurrect a graceful `Close` -- see the `graceful` flag in
 //! `run_driver`.
 //!
@@ -149,13 +150,15 @@
 //! visible anywhere.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crate::auth::{encode_auth_record, AuthSigner, AUTH_NONCE_LEN, AUTH_STREAM};
+use crate::client_input_budget::ClientInputBudget;
+use crate::client_input_queue::{DriverConnection, InputQueue, InputRecord, INPUT_TURN};
 use crate::conn::{
     Connection, ConnectionConfig, Consumption, Datagram, Event, LinkState, Stats, StreamClass,
     StreamProgress, UseRoadError,
@@ -164,7 +167,7 @@ use crate::features::Features;
 use crate::handshake_payload::StartKind;
 use crate::paths::RoadInfo;
 use crate::recovery_handshake::RecoveryEndpoint;
-use crate::send_gate::{GateKind, GateTable, GateWait};
+use crate::send_gate::{ClientAdmission, GateKind, GateTable, GateWait};
 use crate::udp_buffers::{tune_udp_buffers, BufferReport};
 
 /// Upper bound on the loop's sleep: how often the driver wakes up to check
@@ -254,6 +257,9 @@ pub trait ClientEvents: Send + Sync {
     fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
     /// Authenticated terminal peer failure, delivered before Closed.
     fn on_session_aborted(&self, _reason: crate::SessionAbortReason) {}
+    /// Accepted local input could not reach the transport. Delivered before
+    /// Closed; the owner must report failure, never silently replay the input.
+    fn on_input_failure(&self, failure: InputFailure);
     /// Committed server admission for this exact active transport.
     fn on_auth_accepted(&self, _accepted: crate::AuthAcceptance) {}
     /// Actual shared-handshake sends and consumed-source selection. The owner
@@ -313,21 +319,29 @@ pub enum SendBlocked {
     OnDriverThread,
 }
 
+/// A terminal local failure discovered after whole-record admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputFailure {
+    OffsetSpaceExhausted { stream_id: u8 },
+}
+
+/// A whole owned record that was not accepted. No bytes were queued or
+/// partially appended; callers may retry or report an explicit failure.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SendRejected {
+    pub reason: SendBlocked,
+    pub data: Vec<u8>,
+}
+
 /// A command to the driver thread.
 enum Command {
     #[cfg(test)]
     UnconsumedForTest(Sender<Vec<(u8, u64)>>),
     Send {
         stream_id: u8,
-        data: Vec<u8>,
+        record: InputRecord,
     },
     Rebind,
-    /// Graceful stop: emit the client's `Close` frame before tearing down (see
-    /// the module doc). Used by `StdClient::close`.
-    Close,
-    /// Silent local teardown: no `Close` frame goes on the wire (see the
-    /// module doc). Used by `StdClient::detach`.
-    Detach,
     /// How long to tolerate silence before declaring the link dead. A command
     /// rather than a field of `ConnectionConfig` because the connection lives
     /// on the driver thread and every other setting reaches it the same way.
@@ -353,13 +367,6 @@ enum Command {
     SetStreamClass {
         stream_id: u8,
         class: StreamClass,
-    },
-    /// Bytes a bounded producer admitted through the stream's gate (see
-    /// `StdClient::send_bytes_bounded`): taken into the connection, and off
-    /// the gate's pending count in the same step.
-    SendGated {
-        stream_id: u8,
-        data: Vec<u8>,
     },
     /// The owner took `n` bytes of a stream counted explicitly (see
     /// `StdClient::consumed`).
@@ -393,6 +400,9 @@ pub struct DriverSetup {
     pub default_consumption: Consumption,
     /// Per-stream declarations, applied after the default.
     pub stream_consumption: Vec<(u8, Consumption)>,
+    /// Share this invocation budget across replacement/retired drivers.
+    /// None creates an independent default budget for this client.
+    pub input_budget: Option<ClientInputBudget>,
 }
 
 #[derive(Default)]
@@ -406,6 +416,8 @@ struct RoadSnapshot {
 /// so the type can be shared through `Arc`.
 pub struct StdClient {
     tx: Mutex<Sender<Command>>,
+    input_budget: ClientInputBudget,
+    stop: Arc<AtomicU8>,
     stats: Arc<Mutex<Stats>>,
     /// What the server answered about this handshake: whether it landed on
     /// the session named by the token, or on a fresh one. Set on the driver
@@ -498,6 +510,9 @@ impl StdClient {
         setup: DriverSetup,
     ) -> StdClient {
         let (tx, rx) = mpsc::channel::<Command>();
+        let input_budget = setup.input_budget.clone().unwrap_or_default();
+        let stop = Arc::new(AtomicU8::new(0));
+        let stop_thread = Arc::clone(&stop);
         let stats = Arc::new(Mutex::new(Stats::default()));
         let stats_thread = Arc::clone(&stats);
         let resumed = Arc::new(AtomicBool::new(false));
@@ -527,6 +542,7 @@ impl StdClient {
                 signer,
                 setup,
                 rx,
+                stop_thread,
                 stats_thread,
                 resumed_thread,
                 closed_gracefully_thread,
@@ -541,6 +557,8 @@ impl StdClient {
         let driver_thread = Some(handle.thread().id());
         StdClient {
             tx: Mutex::new(tx),
+            input_budget,
+            stop,
             stats,
             resumed,
             closed_gracefully,
@@ -624,6 +642,8 @@ impl StdClient {
         let (tx, _rx) = mpsc::channel::<Command>();
         StdClient {
             tx: Mutex::new(tx),
+            input_budget: ClientInputBudget::default(),
+            stop: Arc::new(AtomicU8::new(2)),
             driver_thread: None,
             stats: Arc::new(Mutex::new(Stats::default())),
             resumed: Arc::new(AtomicBool::new(false)),
@@ -719,13 +739,68 @@ impl StdClient {
             .clone()
     }
 
-    /// Queue bytes of stream `stream_id` for reliable sending.
-    pub fn send_bytes(&self, stream_id: u8, data: Vec<u8>) {
-        let _ = self
-            .tx
-            .lock()
-            .expect("command channel mutex")
-            .send(Command::Send { stream_id, data });
+    /// Atomically accept a whole owned record without waiting for credit.
+    /// Source API change for 0.6.0: Full/Gone return the original Vec unchanged.
+    /// All application streams share byte/entry custody until actual ACK or
+    /// teardown; LinkDown never refunds accepted input. Empty input is a no-op.
+    pub fn send_bytes(&self, stream_id: u8, data: Vec<u8>) -> Result<(), SendRejected> {
+        self.admit_bytes(stream_id, data, false)
+    }
+
+    fn admit_bytes(&self, stream_id: u8, data: Vec<u8>, bounded: bool) -> Result<(), SendRejected> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let tx = self.tx.lock().expect("command channel mutex");
+        if self.is_gone() || self.stop.load(Ordering::SeqCst) != 0 {
+            return Err(SendRejected {
+                reason: SendBlocked::Gone,
+                data,
+            });
+        }
+        let permit = match self.input_budget.reserve_owned(data.len(), data.capacity()) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => unreachable!("nonempty input has a record obligation"),
+            Err(()) => {
+                return Err(SendRejected {
+                    reason: SendBlocked::Full,
+                    data,
+                })
+            }
+        };
+        let n = data.len() as u64;
+        let gate = self.gates.gate(stream_id, GateKind::Pipe);
+        match gate.admit_client(n, bounded) {
+            ClientAdmission::Admitted => {}
+            ClientAdmission::Full => {
+                drop(permit);
+                return Err(SendRejected {
+                    reason: SendBlocked::Full,
+                    data,
+                });
+            }
+            ClientAdmission::Closed => {
+                drop(permit);
+                return Err(SendRejected {
+                    reason: SendBlocked::Gone,
+                    data,
+                });
+            }
+        }
+        match tx.send(Command::Send {
+            stream_id,
+            record: InputRecord::new(data, permit),
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::SendError(Command::Send { record, .. })) => {
+                gate.withdraw(n);
+                Err(SendRejected {
+                    reason: SendBlocked::Gone,
+                    data: record.into_bytes(),
+                })
+            }
+            Err(_) => unreachable!("this publication contains only owned input"),
+        }
     }
 
     /// Declare `stream_id`'s class for the fairness rule and the congestion
@@ -748,38 +823,41 @@ impl StdClient {
     /// opens again once its driver has ended), or this is the driver thread
     /// itself (`OnDriverThread`, at once: a `ClientEvents` callback would be
     /// waiting for itself -- the same guard `stream_progress` has).
-    /// `send_bytes` stays as it was: keystrokes, pastes and resizes are
-    /// fire-and-forget.
+    /// Both APIs share whole-record byte/entry admission and per-stream FIFO;
+    /// this variant additionally waits for and atomically rechecks its gate.
     pub fn send_bytes_bounded(
         &self,
         stream_id: u8,
         data: Vec<u8>,
         timeout: Duration,
-    ) -> Result<(), SendBlocked> {
-        if self.driver_thread.is_none() {
-            return Err(SendBlocked::Gone);
+    ) -> Result<(), SendRejected> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.is_gone() || self.stop.load(Ordering::SeqCst) != 0 {
+            return Err(SendRejected {
+                reason: SendBlocked::Gone,
+                data,
+            });
         }
         if self.driver_thread == Some(thread::current().id()) {
-            return Err(SendBlocked::OnDriverThread);
+            return Err(SendRejected {
+                reason: SendBlocked::OnDriverThread,
+                data,
+            });
         }
         let gate = self.gates.gate(stream_id, GateKind::Pipe);
         match gate.wait_open_for(timeout) {
-            GateWait::Open => {}
-            GateWait::TimedOut => return Err(SendBlocked::Full),
-            GateWait::Closed => return Err(SendBlocked::Gone),
+            GateWait::Open => self.admit_bytes(stream_id, data, true),
+            GateWait::TimedOut => Err(SendRejected {
+                reason: SendBlocked::Full,
+                data,
+            }),
+            GateWait::Closed => Err(SendRejected {
+                reason: SendBlocked::Gone,
+                data,
+            }),
         }
-        let n = data.len() as u64;
-        gate.admit(n);
-        let sent = self
-            .tx
-            .lock()
-            .expect("command channel mutex")
-            .send(Command::SendGated { stream_id, data });
-        if sent.is_err() {
-            let _ = gate.transfer(n, 0);
-            return Err(SendBlocked::Gone);
-        }
-        Ok(())
     }
 
     /// Whether the driver has ended -- however it ended: `close`, `detach`,
@@ -858,11 +936,7 @@ impl StdClient {
     /// the server tears the backend down immediately (see the module doc).
     /// For a user-initiated disconnect.
     pub fn close(&self) {
-        let _ = self
-            .tx
-            .lock()
-            .expect("command channel mutex")
-            .send(Command::Close);
+        self.stop.fetch_max(1, Ordering::SeqCst);
         self.join_driver();
     }
 
@@ -872,21 +946,17 @@ impl StdClient {
     /// module doc). For the app's own internal forced reconnect -- NOT a
     /// user-initiated disconnect, which must keep using `close`.
     pub fn detach(&self) {
-        let _ = self
-            .tx
-            .lock()
-            .expect("command channel mutex")
-            .send(Command::Detach);
+        self.stop.fetch_max(2, Ordering::SeqCst);
         self.join_driver();
     }
 
-    /// Wait for the driver thread to finish after a teardown command
-    /// (`Close`/`Detach`) was sent. Guards against self-join. Callbacks
+    /// Wait for the driver thread to finish after its sticky teardown signal
+    /// was set. Guards against self-join. Callbacks
     /// (`ClientEvents`/`Binder`) run ON THE DRIVER THREAD; if a platform
     /// callback synchronously calls `close`/`detach`, `join` would block the
     /// driver waiting on itself -- deadlock. On its own thread we settle for
-    /// having signaled the command: the driver will finish on its own once it
-    /// returns from the callback and processes the command.
+    /// having set the signal: the driver will finish on its own once it
+    /// returns from the callback and checks the signal.
     fn join_driver(&self) {
         if self.driver_thread == Some(thread::current().id()) {
             return;
@@ -1078,6 +1148,7 @@ fn run_driver(
     signer: Option<Arc<dyn AuthSigner>>,
     setup: DriverSetup,
     rx: Receiver<Command>,
+    stop: Arc<AtomicU8>,
     shared_stats: Arc<Mutex<Stats>>,
     resumed_flag: Arc<AtomicBool>,
     closed_gracefully_flag: Arc<AtomicBool>,
@@ -1109,7 +1180,12 @@ fn run_driver(
 
     let mut sends = SendRecord::new(last_send_error, Arc::clone(&events));
     let allowlist_proof = matches!(cfg.auth, crate::conn::AuthPolicy::Allowlist(_));
-    let mut conn = Connection::new(cfg);
+    let mut owned = DriverConnection {
+        connection: Connection::new(cfg),
+        inputs: InputQueue::default(),
+    };
+    let conn = &mut owned.connection;
+    let inputs = &mut owned.inputs;
     // Before msg1: no byte can arrive before these are in force.
     conn.set_default_consumption(setup.default_consumption);
     for (stream_id, consumption) in setup.stream_consumption {
@@ -1133,7 +1209,7 @@ fn run_driver(
             conn.start_recovery(start, endpoints, start_kind, session_token)
         }
     };
-    send_recovery_aware(&socket, &first_msg1, &mut sends, &mut conn);
+    send_recovery_aware(&socket, &first_msg1, &mut sends, conn);
 
     // The handshake retransmit timer is driven by the driver: during
     // `Connecting` the core doesn't ask to be woken for it.
@@ -1158,22 +1234,28 @@ fn run_driver(
 
     loop {
         // 1. Commands from the channel (at the start of the iteration).
-        let mut should_close = false;
+        let mut should_close = stop.load(Ordering::SeqCst) != 0;
         // Whether the teardown (once `should_close` is set) puts a `Close`
         // frame on the wire. Defaults to `true` so an implicit drop (the
         // channel disconnecting without an explicit `close`/`detach` call)
-        // keeps today's behavior. `Command::Detach` flips it to `false` and
+        // keeps today's behavior. The sticky detach signal makes it `false` and
         // it STAYS false for the rest of this teardown -- in particular the
         // `Disconnected` arm below never sets it back to `true`, so a detach
         // can never be "resurrected" into a graceful Close by the client
         // handle being dropped afterward.
-        let mut graceful = true;
-        loop {
+        let mut graceful = stop.load(Ordering::SeqCst) != 2;
+        let mut command_count = 0;
+        while !should_close && command_count < INPUT_TURN {
+            let disposition = stop.load(Ordering::SeqCst);
+            if disposition != 0 {
+                should_close = true;
+                graceful &= disposition != 2;
+                break;
+            }
+            command_count += 1;
             match rx.try_recv() {
-                Ok(Command::Send { stream_id, data }) => {
-                    let now = Instant::now();
-                    let out = conn.send(now, stream_id, &data);
-                    send_all(&socket, &out, &mut sends);
+                Ok(Command::Send { stream_id, record }) => {
+                    inputs.push(stream_id, record);
                 }
                 Ok(Command::Rebind) => {
                     if let Some((new_sock, buffers)) = make_socket(binder.as_ref()) {
@@ -1227,14 +1309,6 @@ fn run_driver(
                 Ok(Command::SetStreamClass { stream_id, class }) => {
                     conn.set_stream_class(stream_id, class)
                 }
-                Ok(Command::SendGated { stream_id, data }) => {
-                    let now = Instant::now();
-                    let n = data.len() as u64;
-                    let out = conn.send(now, stream_id, &data);
-                    send_all(&socket, &out, &mut sends);
-                    let tail = conn.stream_progress(stream_id).unacked;
-                    let _ = gates.gate(stream_id, GateKind::Pipe).transfer(n, tail);
-                }
                 #[cfg(test)]
                 Ok(Command::UnconsumedForTest(reply)) => {
                     let _ = reply.send(conn.unconsumed_streams());
@@ -1244,20 +1318,29 @@ fn run_driver(
                     let out = conn.on_consumed(now, stream_id, n);
                     send_all(&socket, &out, &mut sends);
                 }
-                Ok(Command::Close) => should_close = true,
-                Ok(Command::Detach) => {
-                    should_close = true;
-                    graceful = false;
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The client was dropped without close()/detach() --
-                    // finish up. Doesn't touch `graceful`: if a Detach was
-                    // already processed above in this same drain, it stays
+                    // finish up. Doesn't touch `graceful`: if detach was
+                    // already requested above in this same turn, it stays
                     // non-graceful (sticky); otherwise this preserves the
                     // pre-existing implicit-drop behavior.
                     should_close = true;
                     break;
+                }
+            }
+        }
+        let disposition = stop.load(Ordering::SeqCst);
+        should_close |= disposition != 0;
+        graceful &= disposition != 2;
+        inputs.acknowledge(conn);
+        if !should_close {
+            match inputs.drain(conn, Instant::now(), &gates) {
+                Ok(out) => send_all(&socket, &out, &mut sends),
+                Err(failure) => {
+                    report_input_failure(conn, events.as_ref(), &stop, failure);
+                    should_close = true;
+                    graceful = false;
                 }
             }
         }
@@ -1320,6 +1403,9 @@ fn run_driver(
         //    timer, clamped above by the command poll interval.
         let now = Instant::now();
         let mut deadline = conn.next_timeout();
+        if command_count == INPUT_TURN || inputs.turn_full() {
+            deadline = Some(now); // bounded work remains: service UDP, then continue promptly
+        }
         let handshake_deadline = if let Some(schedule) = conn.recovery_handshake() {
             schedule.next_deadline()
         } else {
@@ -1373,7 +1459,7 @@ fn run_driver(
             Ok((len, src)) => {
                 out.extend(conn.on_datagram(now, src, &buf[..len]));
                 // And whatever else has already arrived, up to a bound.
-                out.extend(drain_ready(&socket, &mut conn, &mut buf, READY_DRAIN_MAX));
+                out.extend(drain_ready(&socket, conn, &mut buf, READY_DRAIN_MAX));
             }
             // A read timeout needs nothing of its own: the timers below run
             // after every wake-up.
@@ -1411,7 +1497,7 @@ fn run_driver(
             send_all(&socket, &conn.retransmit_handshake(), &mut sends);
             handshake_sent_at = now;
         }
-        send_recovery_aware(&socket, &out, &mut sends, &mut conn);
+        send_recovery_aware(&socket, &out, &mut sends, conn);
 
         // The active path is settled by now (roaming re-points `conn`'s peer
         // synchronously inside `on_datagram`, above) -- published BEFORE the
@@ -1436,7 +1522,7 @@ fn run_driver(
         }
 
         // 4. Forward core events and statistics.
-        for ev in poll_events_abandoning_on_exhaustion(&mut conn) {
+        for ev in poll_events_abandoning_on_exhaustion(conn) {
             // Signing starts the moment the handshake ends, and again after
             // every re-handshake (see the module doc for the ordering this
             // does and does not guarantee). Signing happens off this thread
@@ -1522,6 +1608,20 @@ fn run_driver(
             break;
         }
     }
+}
+
+/// No peer Close or replay: failure is observable before the local Closed,
+/// while accepted records still belong to the not-yet-destroyed connection.
+pub(crate) fn report_input_failure(
+    conn: &mut Connection,
+    events: &dyn ClientEvents,
+    stop: &AtomicU8,
+    failure: InputFailure,
+) {
+    stop.fetch_max(2, Ordering::SeqCst);
+    events.on_input_failure(failure);
+    conn.abandon();
+    events.on_state(LinkState::Closed);
 }
 
 /// Produce this handshake's proof off the driver thread and report the
@@ -1770,6 +1870,9 @@ mod tests {
     fn authenticated_protocol_errors_reach_owner_before_closed() {
         struct Capture(Mutex<Vec<Option<crate::ProtocolFailure>>>);
         impl ClientEvents for Capture {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _: u8, _: Vec<u8>) {}
             fn on_stats(&self, _: Stats) {}
             fn on_reset(&self, _: u8) {}
@@ -1825,6 +1928,9 @@ mod tests {
 
     struct NullEvents;
     impl ClientEvents for NullEvents {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
         fn on_state(&self, _state: LinkState) {}
         fn on_stats(&self, _stats: Stats) {}
@@ -1847,6 +1953,9 @@ mod tests {
         }
     }
     impl ClientEvents for ResetCountEvents {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
         fn on_state(&self, _state: LinkState) {}
         fn on_stats(&self, _stats: Stats) {}
@@ -1963,7 +2072,10 @@ mod tests {
     #[test]
     fn dead_client_is_inert() {
         let client = StdClient::dead();
-        client.send_bytes(0, b"x".to_vec());
+        assert_eq!(
+            client.send_bytes(0, b"x".to_vec()).unwrap_err().reason,
+            SendBlocked::Gone
+        );
         client.rebind();
         assert_eq!(client.stats(), Stats::default());
         client.close();
@@ -1983,6 +2095,9 @@ mod tests {
         told: Mutex<Vec<(SocketAddr, SendFailure)>>,
     }
     impl ClientEvents for SendErrorEvents {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
         fn on_state(&self, _state: LinkState) {}
         fn on_stats(&self, _stats: Stats) {}
@@ -2108,6 +2223,9 @@ mod tests {
         tx: Mutex<Sender<LinkState>>,
     }
     impl ClientEvents for StateEvents {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
         fn on_state(&self, state: LinkState) {
             let _ = self.tx.lock().expect("state channel mutex").send(state);
@@ -2404,6 +2522,9 @@ mod tests {
             result_tx: Mutex<Sender<(Duration, Option<StreamProgress>)>>,
         }
         impl ClientEvents for CallbackEvents {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
             fn on_state(&self, _state: LinkState) {}
             fn on_stats(&self, _stats: Stats) {
@@ -3162,6 +3283,7 @@ mod tests {
                 signer,
                 DriverSetup::default(),
                 rx,
+                Arc::new(AtomicU8::new(0)),
                 stats,
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
@@ -3990,7 +4112,9 @@ mod tests {
             match state_rx.recv_timeout(remaining) {
                 Ok(LinkState::Live) if !asked => {
                     asked = true;
-                    client.send_bytes(9, b"end it".to_vec());
+                    client
+                        .send_bytes(9, b"end it".to_vec())
+                        .expect("input admitted");
                 }
                 Ok(LinkState::Closed) => break,
                 Ok(_) => continue,
@@ -4023,6 +4147,9 @@ mod tests {
         let client_kp = crate::handshake::generate_keypair();
         struct Quiet;
         impl ClientEvents for Quiet {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _: u8, _: Vec<u8>) {}
             fn on_state(&self, _: LinkState) {}
             fn on_stats(&self, _: Stats) {}
@@ -4055,17 +4182,25 @@ mod tests {
         for _ in 0..8 {
             client
                 .send_bytes_bounded(30, vec![0u8; 64 * 1024], Duration::from_secs(1))
+                .map_err(|rejected| rejected.reason)
                 .expect("room below the high mark");
         }
         let started = Instant::now();
         assert_eq!(
-            client.send_bytes_bounded(30, vec![0u8; 64 * 1024], Duration::from_millis(300)),
+            client
+                .send_bytes_bounded(30, vec![0u8; 64 * 1024], Duration::from_millis(300))
+                .map_err(|rejected| rejected.reason),
             Err(SendBlocked::Full)
         );
         assert!(started.elapsed() >= Duration::from_millis(250));
         let p = client.stream_progress(30).expect("the driver answers");
-        assert_eq!(p.queued, 512 * 1024, "the refused chunk was not queued");
+        assert_eq!(
+            p.queued, 0,
+            "not Live: source must not enter the reliable sender"
+        );
+        assert_eq!(client.input_budget.usage(), (512 * 1024, 8, 1024 * 1024));
         client.detach();
+        assert_eq!(client.input_budget.usage(), (0, 0, 0));
     }
 
     /// Spec §4.7.3: against a peer that acknowledges, a producer pushing far
@@ -4077,6 +4212,7 @@ mod tests {
         for _ in 0..32 {
             client
                 .send_bytes_bounded(30, vec![1u8; 64 * 1024], Duration::from_secs(10))
+                .map_err(|rejected| rejected.reason)
                 .expect("the gate opens as the peer acknowledges");
             let p = client.stream_progress(30).expect("the driver answers");
             assert!(p.unacked <= 576 * 1024, "tail {} KiB", p.unacked / 1024);
@@ -4095,6 +4231,9 @@ mod tests {
             result_tx: Mutex<Sender<(Duration, Result<(), SendBlocked>)>>,
         }
         impl ClientEvents for CallbackEvents {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _: u8, _: Vec<u8>) {}
             fn on_state(&self, _: LinkState) {}
             fn on_stats(&self, _: Stats) {
@@ -4106,7 +4245,9 @@ mod tests {
                 };
                 self.fired.store(true, Ordering::SeqCst);
                 let started = Instant::now();
-                let r = client.send_bytes_bounded(30, b"x".to_vec(), Duration::from_secs(5));
+                let r = client
+                    .send_bytes_bounded(30, b"x".to_vec(), Duration::from_secs(5))
+                    .map_err(|rejected| rejected.reason);
                 let _ = self
                     .result_tx
                     .lock()
@@ -4158,6 +4299,7 @@ mod tests {
         for _ in 0..8 {
             client
                 .send_bytes_bounded(30, vec![0u8; 64 * 1024], Duration::from_secs(1))
+                .map_err(|rejected| rejected.reason)
                 .expect("room");
         }
         assert!(!client.is_gone());
@@ -4166,7 +4308,9 @@ mod tests {
             let client = Arc::clone(&client);
             thread::spawn(move || {
                 let started = Instant::now();
-                let r = client.send_bytes_bounded(30, vec![0u8; 1024], Duration::from_secs(30));
+                let r = client
+                    .send_bytes_bounded(30, vec![0u8; 1024], Duration::from_secs(30))
+                    .map_err(|rejected| rejected.reason);
                 (started.elapsed(), r)
             })
         };
@@ -4178,7 +4322,9 @@ mod tests {
         assert!(client.is_gone());
         let started = Instant::now();
         assert_eq!(
-            client.send_bytes_bounded(31, vec![0u8; 1024], Duration::from_secs(30)),
+            client
+                .send_bytes_bounded(31, vec![0u8; 1024], Duration::from_secs(30))
+                .map_err(|rejected| rejected.reason),
             Err(SendBlocked::Gone)
         );
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -4192,6 +4338,9 @@ mod tests {
     fn a_driver_that_panics_leaves_its_producers_gone() {
         struct PanicWhenArmed(AtomicBool);
         impl ClientEvents for PanicWhenArmed {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _: u8, _: Vec<u8>) {}
             fn on_state(&self, _: LinkState) {}
             fn on_stats(&self, _: Stats) {
@@ -4224,13 +4373,16 @@ mod tests {
         for _ in 0..8 {
             client
                 .send_bytes_bounded(30, vec![0u8; 64 * 1024], Duration::from_secs(1))
+                .map_err(|rejected| rejected.reason)
                 .expect("room");
         }
         let waiter = {
             let client = Arc::clone(&client);
             thread::spawn(move || {
                 let started = Instant::now();
-                let r = client.send_bytes_bounded(30, vec![0u8; 1024], Duration::from_secs(30));
+                let r = client
+                    .send_bytes_bounded(30, vec![0u8; 1024], Duration::from_secs(30))
+                    .map_err(|rejected| rejected.reason);
                 (started.elapsed(), r)
             })
         };
@@ -4251,7 +4403,9 @@ mod tests {
         assert!(client.is_gone());
         let started = Instant::now();
         assert_eq!(
-            client.send_bytes_bounded(30, b"x".to_vec(), Duration::from_secs(30)),
+            client
+                .send_bytes_bounded(30, b"x".to_vec(), Duration::from_secs(30))
+                .map_err(|rejected| rejected.reason),
             Err(SendBlocked::Gone)
         );
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -4293,6 +4447,7 @@ mod tests {
                 for chunk in image.chunks(CHUNK) {
                     if client
                         .send_bytes_bounded(30, chunk.to_vec(), Duration::from_secs(30))
+                        .map_err(|rejected| rejected.reason)
                         .is_err()
                     {
                         break;
@@ -4307,7 +4462,9 @@ mod tests {
             .expect("the upload's first segment arrives");
         assert_eq!(stream, 30);
         let pressed_at = Instant::now();
-        client.send_bytes(16, b"k".to_vec());
+        client
+            .send_bytes(16, b"k".to_vec())
+            .expect("input admitted");
         let keystroke_at = arrived
             .recv_timeout(Duration::from_secs(2))
             .ok()
@@ -4372,6 +4529,9 @@ mod tests {
         live: Mutex<Sender<()>>,
     }
     impl ClientEvents for HeardLog {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _: u8, _: Vec<u8>) {}
         fn on_state(&self, state: LinkState) {
             if state == LinkState::Live {
@@ -4448,6 +4608,7 @@ mod tests {
         let setup = DriverSetup {
             default_consumption: crate::conn::Consumption::Explicit,
             stream_consumption: Vec::new(),
+            input_budget: None,
         };
         let data = vec![b'w'; 2 * 1024 * 1024];
         let (client, chunks, progress) =
@@ -4506,6 +4667,9 @@ mod tests {
         bytes: Mutex<Vec<(u8, Vec<u8>)>>,
     }
     impl ClientEvents for Auth17Events {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, stream: u8, bytes: Vec<u8>) {
             self.bytes.lock().unwrap().push((stream, bytes));
         }
@@ -4611,6 +4775,9 @@ mod tests {
     fn capacity_wire_driver_reports_terminal_reason_before_same_batch_closed() {
         struct Capture(Mutex<Vec<Option<crate::SessionAbortReason>>>);
         impl ClientEvents for Capture {
+            fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, _: u8, _: Vec<u8>) {}
             fn on_reset(&self, _: u8) {}
             fn on_stats(&self, _: Stats) {}
@@ -4637,4 +4804,5 @@ mod tests {
         );
         assert_eq!(state, LinkState::Closed);
     }
+    include!("driver_std_input_bounds_tests.rs");
 }

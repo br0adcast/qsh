@@ -1093,3 +1093,136 @@ fn ended_shell_on_authenticated_resume_delivers_its_retained_exit() {
     assert!(!screen.has("Start a new session?"));
     assert!(!screen.has("the shell on the server ended while the link was down"));
 }
+
+#[test]
+fn input_during_reconnect_reaches_the_retained_shell_exactly_once() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    let offset = verbose_log(config.path()).len();
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(wait_until(|| verbose_log(config.path())
+        .get(offset..)
+        .is_some_and(|log| log.contains("letting the live link go"))));
+    // The relay is still cut: this command is intentionally typed before
+    // Ready, not fenced away from the recoverable interval under test.
+    client.type_line("QSH_PENDING=$(( ${QSH_PENDING:-0} + 1 )); printf '\\r\\nQUEUED-%s:%s\\r\\n' \"$QSH_PENDING\" \"$QSH_MARK\"");
+    client.master.write_all(b"\x1d?").unwrap();
+    assert!(
+        wait_until(|| {
+            let mut model = terminal::TerminalCore::new(COLS, ROWS);
+            model.feed(&screen.bytes());
+            model
+                .frame()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("this help")
+        }),
+        "local help proves the preceding input was processed while detached: {}",
+        screen.text()
+    );
+    assert!(client.child.try_wait().unwrap().is_none());
+    client.master.write_all(b"\x1b").unwrap();
+    relay.restore();
+    assert!(
+        wait_until(|| verbose_log(config.path())
+            .get(offset..)
+            .is_some_and(|log| log.contains("shell channel 16 ready"))),
+        "fresh actual Ready: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        wait_until(|| screen.has("QUEUED-1:kept")),
+        "{}",
+        screen.text()
+    );
+    client.type_line("printf '\\r\\nPENDING-COUNT-%s\\r\\n' \"$QSH_PENDING\"");
+    assert!(
+        wait_until(|| screen.has("PENDING-COUNT-1")),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.has("QUEUED-2:kept"));
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn authenticated_session_loss_discards_pending_before_consent_without_cold_replay() {
+    let _serial = serialised();
+    let (mut daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    let offset = verbose_log(config.path()).len();
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(wait_until(|| verbose_log(config.path())
+        .get(offset..)
+        .is_some_and(|log| log.contains("letting the live link go"))));
+    client.type_line("QSH_PENDING=bad; printf '\\r\\nOLD-PENDING-%s\\r\\n' EXECUTED");
+    client.master.write_all(b"\x1d?").unwrap();
+    assert!(
+        wait_until(|| {
+            let mut model = terminal::TerminalCore::new(COLS, ROWS);
+            model.feed(&screen.bytes());
+            model
+                .frame()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("this help")
+        }),
+        "pending command was processed before loss: {}",
+        screen.text()
+    );
+    client.master.write_all(b"\x1b").unwrap();
+    daemon.track_shell_starts();
+    daemon.restart(); // same authenticated server key, but no retained session
+    relay.restore();
+    assert!(
+        wait_until(|| screen.has("Start a new session? [Y/n]")),
+        "{}",
+        screen.text()
+    );
+    let before_consent = screen.text();
+    assert_eq!(before_consent.matches("discarded pending input").count(), 1);
+    assert!(
+        before_consent.find("discarded pending input").unwrap()
+            < before_consent.find("Start a new session?").unwrap()
+    );
+    assert_eq!(
+        daemon.shell_starts(),
+        0,
+        "loss cannot open a shell without consent"
+    );
+    let ready_offset = verbose_log(config.path()).len();
+    client.master.write_all(b"yes\n").unwrap();
+    assert!(
+        wait_until(|| verbose_log(config.path())
+            .get(ready_offset..)
+            .is_some_and(|log| log.contains("shell channel 16 ready"))),
+        "{}",
+        verbose_log(config.path())
+    );
+    client.type_line("printf '\\r\\nCOLD-PENDING-%s\\r\\n' \"${QSH_PENDING:-empty}\"");
+    assert!(
+        wait_until(|| screen.has("COLD-PENDING-empty")),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.has("OLD-PENDING-EXECUTED"));
+    assert_eq!(daemon.shell_starts(), 1);
+    exit_cleanly(&mut client, &screen, &daemon);
+}

@@ -31,6 +31,10 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundEnd {
+    /// The client could not admit a startup write. Never retry or replay it.
+    LocalSendFailure {
+        addr: usize,
+    },
     /// Explicit authenticated terminal failure, not another failed round.
     SessionAborted {
         addr: usize,
@@ -65,6 +69,7 @@ pub enum Order {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
+    LocalSendFailure { addr: usize },
     SessionAborted { addr: usize, reason: u8 },
     KeyChanged { addr: usize },
     SessionGone { addr: usize },
@@ -131,6 +136,7 @@ impl Reconnect {
                     };
                     Order::Nothing
                 }
+                RoundEnd::LocalSendFailure { addr } => self.stop(Stop::LocalSendFailure { addr }),
                 RoundEnd::SessionAborted { addr, reason } => {
                     self.stop(Stop::SessionAborted { addr, reason })
                 }
@@ -361,6 +367,19 @@ mod tests {
                 addr: 0,
                 reason: 200
             })
+        );
+        assert_eq!(reconnect.phase(), Phase::Over);
+    }
+    #[test]
+    fn client179_local_admission_failure_stops_recovery_without_replay() {
+        let mut reconnect = Reconnect::new(0);
+        reconnect.on(Event::LinkDead, secs(0));
+        assert_eq!(
+            reconnect.on(
+                Event::RoundOver(RoundEnd::LocalSendFailure { addr: 0 }),
+                secs(1)
+            ),
+            Order::Stop(Stop::LocalSendFailure { addr: 0 })
         );
         assert_eq!(reconnect.phase(), Phase::Over);
     }

@@ -1789,6 +1789,9 @@ mod tests {
     #[derive(Default)]
     struct Live(Mutex<bool>);
     impl transport::driver_std::ClientEvents for Live {
+        fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _stream_id: u8, _data: Vec<u8>) {}
         fn on_state(&self, state: transport::LinkState) {
             if state == transport::LinkState::Live {

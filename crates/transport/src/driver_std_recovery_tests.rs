@@ -257,6 +257,9 @@ fn shared_recovery_progress_reports_actual_checks_and_source_before_protocol_fai
     }
     struct Capture(Mutex<Sender<Trace>>);
     impl ClientEvents for Capture {
+        fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+            panic!("unexpected accepted-input failure: {failure:?}");
+        }
         fn on_bytes(&self, _: u8, _: Vec<u8>) {}
         fn on_stats(&self, _: Stats) {}
         fn on_reset(&self, _: u8) {}
@@ -417,7 +420,8 @@ fn shared_recovery_driver_rejects_no_acceptance_peer_before_signing_or_data() {
     ));
     client
         .0
-        .send_bytes(16, b"must not leave before admission".to_vec());
+        .send_bytes(16, b"must not leave before admission".to_vec())
+        .expect("fixture application input admitted locally before peer response");
     let mut buffer = [0; 65536];
     let (len, from) = socket.recv_from(&mut buffer).unwrap();
     let response = server.on_datagram(Instant::now(), from, &buffer[..len]);

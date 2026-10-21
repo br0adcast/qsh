@@ -102,7 +102,11 @@ mod async_open_tests {
                 .clear();
         }
     }
-    type Client = ChannelSession<QshSubstrate<Box<dyn FnMut(u8, Vec<u8>) + Send>>>;
+    type Client = ChannelSession<
+        QshSubstrate<
+            Box<dyn FnMut(u8, Vec<u8>) -> Result<(), client::channel::ChannelSendError> + Send>,
+        >,
+    >;
     fn deliver(client: &mut Client, message: SessionOutbound) -> Vec<SessionEvent> {
         let (stream, bytes) = match message {
             SessionOutbound::ChannelOpened { stream, .. } => (
@@ -187,7 +191,9 @@ mod async_open_tests {
         };
         input.send(SessionInbound::Live(initial)).await.unwrap();
         let sent = Arc::new(Mutex::new(Vec::new()));
-        let sink: Box<dyn FnMut(u8, Vec<u8>) + Send> = {
+        let sink: Box<
+            dyn FnMut(u8, Vec<u8>) -> Result<(), client::channel::ChannelSendError> + Send,
+        > = {
             let input = input.clone();
             let sent = sent.clone();
             Box::new(move |stream, bytes| {
@@ -198,6 +204,7 @@ mod async_open_tests {
                         data: bytes,
                     }))
                     .unwrap();
+                Ok(())
             })
         };
         let mut client = ChannelSession::new(QshSubstrate::new(sink));

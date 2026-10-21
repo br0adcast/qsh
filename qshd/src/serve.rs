@@ -1362,6 +1362,9 @@ mod tests {
         }
 
         impl ClientEvents for Events {
+            fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+                panic!("unexpected accepted-input failure: {failure:?}");
+            }
             fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
                 if stream_id == 0 {
                     let mut received = self.received();
@@ -1532,7 +1535,8 @@ mod tests {
                 &key_path,
                 Arc::clone(&a_events),
             ));
-            a.send_bytes(0, b"hello".to_vec());
+            a.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
             assert!(
                 wait_until(TEST_WAIT, || a_events.received().bytes == b"hello"),
                 "setup: the first client must get its session"
@@ -1560,7 +1564,8 @@ mod tests {
                 let probing = Arc::clone(&probing);
                 move || {
                     while probing.load(Ordering::SeqCst) {
-                        a.send_bytes(0, b".".to_vec());
+                        a.send_bytes(0, b".".to_vec())
+                            .expect("fixture input admitted");
                         std::thread::sleep(PROBE_EVERY);
                     }
                 }
@@ -1581,7 +1586,8 @@ mod tests {
                 &key_path,
                 Arc::clone(&b_events),
             );
-            b.send_bytes(0, b"hello".to_vec());
+            b.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
             std::thread::sleep(WATCH);
             let watch_until = Instant::now();
             probing.store(false, Ordering::SeqCst);
@@ -1912,7 +1918,8 @@ mod tests {
                     &key_path,
                     Arc::clone(&a_events),
                 ));
-                a.send_bytes(0, b"hello".to_vec());
+                a.send_bytes(0, b"hello".to_vec())
+                    .expect("fixture input admitted");
                 assert!(
                     wait_until(TEST_WAIT, || a_events.received().bytes == b"hello"),
                     "setup: A must get its session"
@@ -1925,7 +1932,8 @@ mod tests {
                     &key_path,
                     Arc::clone(&c_events),
                 );
-                c.send_bytes(0, b"hello".to_vec());
+                c.send_bytes(0, b"hello".to_vec())
+                    .expect("fixture input admitted");
                 assert!(
                     wait_until(TEST_WAIT, || c_events.received().bytes == b"hello"),
                     "setup: C must get its session"
@@ -1968,7 +1976,8 @@ mod tests {
                     let probing = Arc::clone(&probing);
                     move || {
                         while probing.load(Ordering::SeqCst) {
-                            a.send_bytes(0, b".".to_vec());
+                            a.send_bytes(0, b".".to_vec())
+                                .expect("fixture input admitted");
                             std::thread::sleep(PROBE_EVERY);
                         }
                     }
@@ -1998,7 +2007,9 @@ mod tests {
                             &key_path,
                             Arc::new(Events::default()),
                         );
-                        client.send_bytes(0, b"hello".to_vec());
+                        client
+                            .send_bytes(0, b"hello".to_vec())
+                            .expect("fixture input admitted");
                         client
                     })
                     .collect();

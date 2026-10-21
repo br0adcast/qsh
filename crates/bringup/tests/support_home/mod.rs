@@ -121,7 +121,8 @@ impl Sandbox {
             rows: 0,
             screen: false,
             command: script.as_bytes().to_vec(),
-        });
+        })
+        .expect("environment check Open admitted");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut out = Vec::new();
         loop {

@@ -120,6 +120,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self
@@ -258,17 +261,19 @@ fn start_daemon() -> (Daemon, std::path::PathBuf, TempDir) {
 /// Opens the shell channel on `FIRST_CHANNEL_STREAM` and waits for the
 /// daemon's confirmation, the way `serve_terminal_type.rs` does inline.
 fn open_shell_channel(client: &StdClient, events: &Arc<Events>) {
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| {
             events
@@ -393,8 +398,12 @@ fn a_session_moves_to_a_live_road_when_its_own_goes_away() {
     client.set_paths(vec![relay.front, direct]);
 
     open_shell_channel(&client, &events);
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"MARK=road-$((6*7))\n".to_vec());
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"echo M=$MARK\n".to_vec());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"MARK=road-$((6*7))\n".to_vec())
+        .expect("fixture input admitted");
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"echo M=$MARK\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| shell_text(&events).contains("M=road-42")),
         "the shell answers through the first road; got: {}",
@@ -410,7 +419,9 @@ fn a_session_moves_to_a_live_road_when_its_own_goes_away() {
     );
 
     // The same shell, not a new one: it still knows the variable.
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"echo AGAIN=$MARK\n".to_vec());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"echo AGAIN=$MARK\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| shell_text(&events).contains("AGAIN=road-42")),
         "the shell after the move is the same shell; got: {}",
@@ -492,8 +503,12 @@ fn a_session_moved_by_hand_stays_on_the_chosen_road_and_the_daemon_follows() {
     );
 
     open_shell_channel(&client, &events);
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"MARK=hand-$((6*7))\n".to_vec());
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"echo M=$MARK\n".to_vec());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"MARK=hand-$((6*7))\n".to_vec())
+        .expect("fixture input admitted");
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"echo M=$MARK\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| shell_text(&events).contains("M=hand-42")),
         "the shell answers through the relay; got: {}",
@@ -529,7 +544,9 @@ fn a_session_moved_by_hand_stays_on_the_chosen_road_and_the_daemon_follows() {
 
     // The daemon followed: with the relay gone, the same shell still answers.
     relay.stop();
-    client.send_bytes(FIRST_CHANNEL_STREAM, b"echo AGAIN=$MARK\n".to_vec());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, b"echo AGAIN=$MARK\n".to_vec())
+        .expect("fixture input admitted");
     assert!(
         wait_until(|| shell_text(&events).contains("AGAIN=hand-42")),
         "the daemon sends down the chosen road; got: {}",
