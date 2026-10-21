@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Terminal core built on `alacritty_terminal`.
 //!
 //! This module's job is to wrap a mature emulator: take a byte stream from

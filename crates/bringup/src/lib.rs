@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Finds or installs a verified `qshd` over SSH so the client can log in
 //! over qsh. Shared by the console client and, after part 3, the app, so it
 //! knows nothing about its caller: sockets come through `SocketBind`,

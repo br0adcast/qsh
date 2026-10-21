@@ -64,6 +64,11 @@ jobs:
           prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Check safe library targets
+        run: >-
+          cargo check --all-targets --locked
+          -p bringup -p client -p connect -p knock -p logging
+          -p prediction -p render -p ssh -p terminal -p terminal-size
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Portable CLI tests

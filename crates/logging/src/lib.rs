@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Shared logging for `qsh` and `qshd`: one line format, a rotating file
 //! sink and a `log::Log` with a per-component filter. Logging is best
 //! effort: it never panics and never reports write errors.
