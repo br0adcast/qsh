@@ -28,8 +28,10 @@
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Read;
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
@@ -50,6 +52,9 @@ mod echo_ownership_tests;
 /// whichever thread panicked, so this cannot live in the guard.
 struct Saved {
     fd: RawFd,
+    generation: u64,
+    suspend_policy: crate::signals::DeferredSuspend,
+    cooked_for_stop: bool,
     termios: Termios,
     /// The thread that entered raw mode: the only one whose panic ends the
     /// session, and so the only one whose panic may touch the terminal.
@@ -233,9 +238,27 @@ fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd), nix::Error> {
 }
 
 /// Raw mode for the lifetime of the value.
+/// Terminal lifecycle calls stay on the entering thread; a shared or moved
+/// guard would let stop/disposition transitions race a replacement owner.
+///
+/// ```
+/// // Positive path-resolution control for the two trait failures below.
+/// let _: Option<qsh::tty::RawMode> = None;
+/// ```
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<qsh::tty::RawMode>();
+/// ```
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<qsh::tty::RawMode>();
+/// ```
 pub struct RawMode {
-    fd: RawFd,
-    saved: Termios,
+    // Terminal lifecycle calls belong to the entering thread, as does the
+    // owner-thread panic handoff. Prevent a concurrent restore/stop/new-owner
+    // race across unlocked disposition changes without stop-world machinery.
+    _thread_affine: PhantomData<Rc<()>>,
+    generation: u64,
     /// Told when the thread writing stderr into the log is done
     /// ([`RawMode::set_stderr_to_log`]).
     stderr_logged: Mutex<Option<Receiver<()>>>,
@@ -245,13 +268,9 @@ impl RawMode {
     /// Switches `fd` into raw mode, remembering what to put back.
     ///
     /// `SAVED` is a single, process-wide slot, so a process is expected to
-    /// hold at most one `RawMode` at a time. Entering a second descriptor
-    /// while an earlier guard is still alive overwrites the slot, so a panic
-    /// afterwards would restore only the second descriptor and leave the
-    /// first stuck in raw mode. Entering the *same* descriptor twice is
-    /// worse: the second call would capture the already-raw settings as the
-    /// "original", so dropping both guards in order would put the terminal
-    /// back into raw mode instead of out of it.
+    /// hold at most one `RawMode` at a time. A second entry is rejected
+    /// before terminal modes change. The private generation also prevents an
+    /// already-restored old guard from consuming a later owner's Saved state.
     ///
     /// The calling thread is remembered as the one raw mode belongs to (see
     /// [`RawMode::install_panic_hook`]).
@@ -260,22 +279,39 @@ impl RawMode {
         // the returned guard; we only borrow it for termios calls.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
         let saved = termios::tcgetattr(borrowed)?;
+        let policy = crate::signals::DeferredSuspend::enter()?;
+        let generation = policy.generation();
         let mut raw = saved.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw)?;
-
-        if let Ok(mut slot) = SAVED.lock() {
-            *slot = Some(Saved {
-                fd,
-                termios: saved.clone(),
-                thread: std::thread::current().id(),
-                stderr: None,
-                alt: None,
-            });
+        if let Err(error) = apply_raw(borrowed, &raw) {
+            // Even a failed set must not be called cooked without rollback.
+            let rollback = termios::tcsetattr(borrowed, SetArg::TCSANOW, &saved);
+            if rollback.is_ok() {
+                policy.finish_cooked()?;
+            }
+            rollback?;
+            return Err(error);
         }
-        Ok(RawMode {
+        let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            drop(slot);
+            termios::tcsetattr(borrowed, SetArg::TCSANOW, &saved)?;
+            policy.finish_cooked()?;
+            return Err(nix::Error::EBUSY);
+        }
+        *slot = Some(Saved {
             fd,
-            saved,
+            generation,
+            suspend_policy: policy,
+            cooked_for_stop: false,
+            termios: saved,
+            thread: std::thread::current().id(),
+            stderr: None,
+            alt: None,
+        });
+        Ok(RawMode {
+            _thread_affine: PhantomData,
+            generation,
             stderr_logged: Mutex::new(None),
         })
     }
@@ -291,7 +327,7 @@ impl RawMode {
         let Ok(mut slot) = SAVED.lock() else {
             return Err(nix::Error::EDEADLK);
         };
-        let Some(saved) = slot.as_mut().filter(|s| s.fd == self.fd) else {
+        let Some(saved) = slot.as_mut().filter(|s| s.generation == self.generation) else {
             return Err(nix::Error::EBADF);
         };
         if saved.stderr.is_some() {
@@ -361,7 +397,7 @@ impl RawMode {
         let Ok(mut slot) = SAVED.lock() else {
             return Err(nix::Error::EDEADLK);
         };
-        let Some(saved) = slot.as_mut().filter(|s| s.fd == self.fd) else {
+        let Some(saved) = slot.as_mut().filter(|s| s.generation == self.generation) else {
             return Err(nix::Error::EBADF);
         };
         if saved.alt.is_none() {
@@ -375,7 +411,7 @@ impl RawMode {
     pub fn alternate_screen(&self) -> bool {
         SAVED.lock().ok().is_some_and(|slot| {
             slot.as_ref()
-                .filter(|s| s.fd == self.fd)
+                .filter(|s| s.generation == self.generation)
                 .and_then(|s| s.alt)
                 .is_some_and(|a| a.on)
         })
@@ -387,15 +423,71 @@ impl RawMode {
     /// raw mode. `reenter` comes back to both. Unlike `restore` this keeps
     /// everything else as it is: the slot, stderr set aside, what to put
     /// back at the end.
-    pub fn suspend(&self) {
-        if let Ok(mut slot) = SAVED.lock() {
-            if let Some(saved) = slot.as_mut().filter(|s| s.fd == self.fd) {
-                leave_alt_screen(&mut saved.alt);
+    pub fn suspend(&self) -> Result<(), nix::Error> {
+        let result = {
+            let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = slot
+                .as_mut()
+                .filter(|s| s.generation == self.generation)
+                .ok_or(nix::Error::EINVAL)?;
+            leave_alt_screen(&mut saved.alt);
+            // Generation custody covers the syscall, not only its inputs:
+            // restore/new entry cannot overtake this old owner's tcsetattr.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(saved.fd) };
+            let result = termios::tcsetattr(borrowed, SetArg::TCSANOW, &saved.termios);
+            if result.is_ok() {
+                saved.cooked_for_stop = true;
+            }
+            result
+        };
+        if result.is_err() {
+            self.abandon_saved();
+        }
+        result
+    }
+
+    /// Performs the checked stop/reinstall transition after confirmed suspend.
+    /// Never holds Saved across a signal or installs for a stale generation.
+    pub fn stop(&self) -> Result<(), nix::Error> {
+        {
+            let slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+            if !slot
+                .as_ref()
+                .is_some_and(|s| s.generation == self.generation && s.cooked_for_stop)
+            {
+                return Err(nix::Error::EINVAL);
             }
         }
-        // SAFETY: as in `enter` -- the descriptor outlives this guard.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.saved);
+        let result = crate::signals::stop(self.generation);
+        if result.is_err() {
+            self.abandon_saved();
+        }
+        result
+    }
+
+    /// Lose descriptor custody on an unconfirmed terminal transition. The
+    /// fixed policy stays poisoned/deferred; no later Drop can touch a reused fd.
+    fn abandon_saved(&self) {
+        let saved = self.take_saved();
+        if let Some(mut saved) = saved {
+            if let Some(original) = saved.stderr.take() {
+                put_stderr_back(original);
+            }
+            // DeferredSuspend's Drop poisons the fixed state outside SAVED.
+            drop(saved);
+        }
+    }
+
+    fn take_saved(&self) -> Option<Saved> {
+        let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|s| s.generation == self.generation)
+        {
+            slot.take()
+        } else {
+            None
+        }
     }
 
     /// Re-applies raw mode to a terminal that has been put back into cooked
@@ -420,21 +512,27 @@ impl RawMode {
     /// not entered again: a second switch would save the cursor a second
     /// time, over the position the switch back at the end must put back.
     pub fn reenter(&self) -> Result<(), nix::Error> {
-        // SAFETY: as in `enter` -- the descriptor outlives this guard.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let mut raw = self.saved.clone();
-        termios::cfmakeraw(&mut raw);
-        let result = termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw);
-        if let Ok(mut slot) = SAVED.lock() {
-            if let Some(alt) = slot
+        let result = {
+            let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = slot
                 .as_mut()
-                .filter(|s| s.fd == self.fd)
-                .and_then(|s| s.alt.as_mut())
-                .filter(|a| !a.on)
-            {
-                write_fd(alt.out, ALT_SCREEN_ON);
-                alt.on = true;
+                .filter(|s| s.generation == self.generation)
+                .ok_or(nix::Error::EINVAL)?;
+            let borrowed = unsafe { BorrowedFd::borrow_raw(saved.fd) };
+            let mut raw = saved.termios.clone();
+            termios::cfmakeraw(&mut raw);
+            let result = termios::tcsetattr(borrowed, SetArg::TCSANOW, &raw);
+            if result.is_ok() {
+                saved.cooked_for_stop = false;
+                if let Some(alt) = saved.alt.as_mut().filter(|a| !a.on) {
+                    write_fd(alt.out, ALT_SCREEN_ON);
+                    alt.on = true;
+                }
             }
+            result
+        };
+        if result.is_err() {
+            self.abandon_saved();
         }
         result
     }
@@ -443,36 +541,20 @@ impl RawMode {
     /// and stderr if it was set aside. Safe to call more than once: the
     /// ordinary exit path calls it and `Drop` calls it again, and only the
     /// first switches back to the terminal's own screen.
-    pub fn restore(&self) {
-        // Clear the slot once it is put back, so a later, unrelated panic
-        // finds nothing to act on. Left in place, a stale entry would make
-        // the panic hook re-apply these settings to `self.fd` after the OS
-        // may have already reused that number for something else. Only
-        // clear it if it is still ours -- a later `enter()` on another
-        // descriptor may have overwritten it, and that entry is not ours to
-        // touch.
-        let mut original_stderr = None;
-        if let Ok(mut slot) = SAVED.lock() {
-            if slot.as_ref().map(|s| s.fd) == Some(self.fd) {
-                if let Some(mut saved) = slot.take() {
-                    leave_alt_screen(&mut saved.alt);
-                    original_stderr = saved.stderr;
-                }
-            }
-        }
-        // SAFETY: as in `enter` -- the descriptor outlives this guard.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &self.saved);
-        if let Some(original) = original_stderr {
-            put_stderr_back(original);
-        }
-        // fd 2 no longer writes into the pipe: its thread ends as soon as it
-        // has logged what was left -- unless a program started meanwhile
-        // still holds the pipe as its stderr, which is not waited for.
+    pub fn restore(&self) -> Result<(), nix::Error> {
+        let result = if let Some(saved) = self.take_saved() {
+            restore_saved(saved, false)
+        } else if crate::signals::DeferredSuspend::is_poisoned(self.generation) {
+            Err(nix::Error::EIO)
+        } else {
+            Ok(())
+        };
+        // No Saved lock or suspend owner remains across stderr's bounded join.
         let finished = self.stderr_logged.lock().ok().and_then(|mut l| l.take());
         if let Some(finished) = finished {
             let _ = finished.recv_timeout(STDERR_DRAIN);
         }
+        result
     }
 
     /// Makes a panic on the thread that entered raw mode restore the
@@ -491,39 +573,28 @@ impl RawMode {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let current = std::thread::current();
-            if let Ok(mut slot) = SAVED.lock() {
-                match on_panic(slot.as_ref().map(|s| s.thread), current.id()) {
-                    OnPanic::Print => {}
-                    OnPanic::LogOnly => {
-                        crate::log::error(&format!(
-                            "thread '{}' panicked: {info}",
-                            current.name().unwrap_or("<unnamed>")
-                        ));
-                        return;
-                    }
-                    OnPanic::RestoreThenPrint => {
-                        crate::log::error(&format!(
-                            "thread '{}' panicked: {info}",
-                            current.name().unwrap_or("<unnamed>")
-                        ));
-                        if let Some(saved) = slot.as_mut() {
-                            // A panic can interrupt a paint before its mode
-                            // bookkeeping is updated. Reset the complete set
-                            // directly on the renderer's active descriptor.
-                            if let Some(alt) = saved.alt.filter(|alt| alt.on) {
-                                write_fd(alt.out, render::renderer::RESET_TERMINAL_MODES);
-                            }
-                            leave_alt_screen(&mut saved.alt);
-                            // SAFETY: the descriptor is the process's own
-                            // terminal, open for the life of the process.
-                            let borrowed = unsafe { BorrowedFd::borrow_raw(saved.fd) };
-                            let _ = termios::tcsetattr(borrowed, SetArg::TCSANOW, &saved.termios);
-                            if let Some(original) = saved.stderr.take() {
-                                put_stderr_back(original);
-                            }
-                        }
-                    }
-                }
+            let (disposition, saved) = {
+                let mut slot = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+                let disposition = on_panic(slot.as_ref().map(|s| s.thread), current.id());
+                let saved = if disposition == OnPanic::RestoreThenPrint {
+                    slot.take()
+                } else {
+                    None
+                };
+                (disposition, saved)
+            };
+            if disposition != OnPanic::Print {
+                crate::log::error(&format!(
+                    "thread '{}' panicked: {info}",
+                    current.name().unwrap_or("<unnamed>")
+                ));
+            }
+            if disposition == OnPanic::LogOnly {
+                return;
+            }
+            if let Some(saved) = saved {
+                // Poisoned deferral on failure, never claim a cooked restore.
+                let _ = restore_saved(saved, true);
             }
             previous(info);
         }));
@@ -531,8 +602,32 @@ impl RawMode {
 }
 impl Drop for RawMode {
     fn drop(&mut self) {
-        self.restore();
+        let _ = self.restore();
     }
+}
+
+fn apply_raw(fd: BorrowedFd<'_>, settings: &Termios) -> Result<(), nix::Error> {
+    #[cfg(test)]
+    crate::signals::suspend_tests::before_raw(fd.as_raw_fd())?;
+    termios::tcsetattr(fd, SetArg::TCSANOW, settings)
+}
+
+/// Consumes one exact generation. Terminal restoration and pending-signal
+/// replay occur after removing Saved and releasing its mutex on every path.
+fn restore_saved(mut saved: Saved, reset_modes: bool) -> Result<(), nix::Error> {
+    if reset_modes {
+        if let Some(alt) = saved.alt.filter(|alt| alt.on) {
+            write_fd(alt.out, render::renderer::RESET_TERMINAL_MODES);
+        }
+    }
+    leave_alt_screen(&mut saved.alt);
+    let borrowed = unsafe { BorrowedFd::borrow_raw(saved.fd) };
+    let result = termios::tcsetattr(borrowed, SetArg::TCSANOW, &saved.termios);
+    if let Some(original) = saved.stderr.take() {
+        put_stderr_back(original);
+    }
+    result?; // the policy Drop poisons fixed state, retaining no fd, on failure
+    saved.suspend_policy.finish_cooked()
 }
 
 /// Echo off for the lifetime of the value: used while a passphrase is typed.
@@ -882,7 +977,7 @@ mod tests {
     /// `SAVED` is one process-wide slot. Serialize the tests that touch it
     /// (via `enter`/`restore`) so parallel test threads cannot interleave
     /// their writes to it and make `restoring_clears_the_saved_slot` flaky.
-    static SAVED_SLOT_TESTS: Mutex<()> = Mutex::new(());
+    use super::SIGNAL_TESTS as SAVED_SLOT_TESTS;
 
     /// Raw mode is the whole point: no echo, no line discipline, and signal
     /// characters delivered as bytes rather than turned into signals.
@@ -932,8 +1027,8 @@ mod tests {
         let fd = pty.slave.as_raw_fd();
         let before = termios::tcgetattr(&pty.slave).expect("tcgetattr");
         let raw = RawMode::enter(fd).expect("enter raw mode");
-        raw.restore();
-        raw.restore();
+        raw.restore().unwrap();
+        raw.restore().unwrap();
         let after = termios::tcgetattr(&pty.slave).expect("tcgetattr");
         assert_eq!(before.local_flags, after.local_flags);
     }
@@ -948,7 +1043,7 @@ mod tests {
         let pty = openpty(None, None).expect("openpty");
         let fd = pty.slave.as_raw_fd();
         let raw = RawMode::enter(fd).expect("enter raw mode");
-        raw.restore();
+        raw.restore().unwrap();
 
         let slot = SAVED.lock().expect("saved lock");
         assert!(
@@ -1079,7 +1174,7 @@ mod tests {
             raw.set_stderr_to_log().expect("stderr to the log");
             to_fd2("LIB-LINE-ONE\nLIB-");
             to_fd2("PART\r\n\nNO-NEWLINE-AT-END");
-            raw.restore();
+            raw.restore().unwrap();
             to_fd2("AFTER-RESTORE\n");
             return;
         }
@@ -1087,7 +1182,7 @@ mod tests {
         to_fd2("WHILE-RAW\n");
         match case.as_str() {
             "restore" => {
-                raw.restore();
+                raw.restore().unwrap();
                 to_fd2("AFTER-RESTORE\n");
             }
             "panics" => {
@@ -1110,7 +1205,7 @@ mod tests {
                 // SAFETY: `kept` is open for as long as raw mode lasts.
                 let flags = unsafe { libc::fcntl(kept, libc::F_GETFD) };
                 to_fd2(&format!("CLOEXEC={}\n", flags & libc::FD_CLOEXEC != 0));
-                raw.restore();
+                raw.restore().unwrap();
             }
             other => panic!("unknown case {other}"),
         }
@@ -1134,8 +1229,8 @@ mod tests {
         raw.set_stderr_aside(aside).expect("set stderr aside");
         match case {
             "alt-restore" => {
-                raw.restore();
-                raw.restore();
+                raw.restore().unwrap();
+                raw.restore().unwrap();
                 to_fd2(&format!("AFTER-RESTORE ON={}\n", raw.alternate_screen()));
             }
             "alt-panics" => {
@@ -1144,7 +1239,7 @@ mod tests {
                 panic!("MAIN-THREAD-PANIC");
             }
             "alt-suspend" => {
-                raw.suspend();
+                raw.suspend().unwrap();
                 to_fd2(&format!(
                     "SUSPENDED COOKED={} ON={}\n",
                     cooked(),
@@ -1157,7 +1252,7 @@ mod tests {
                     cooked(),
                     raw.alternate_screen()
                 ));
-                raw.restore();
+                raw.restore().unwrap();
             }
             "alt-sigcont-only" => {
                 // A stop the client did not see coming (SIGSTOP), then
@@ -1165,7 +1260,7 @@ mod tests {
                 // entered again -- that would save the cursor a second time,
                 // over the one the switch back puts back.
                 raw.reenter().expect("reenter");
-                raw.restore();
+                raw.restore().unwrap();
             }
             other => panic!("unknown case {other}"),
         }

@@ -1,21 +1,28 @@
-//! Signals, reduced to four flags the main loop reads at its own pace.
+//! Foreground job control and deferred signals while RawMode owns the terminal.
 //!
 //! A signal handler runs at an arbitrary point in the program, so almost
 //! nothing is safe to call from one: allocating, locking a mutex or printing
 //! are all ways to deadlock rarely and unreproducibly. Storing into an
-//! `AtomicBool` is safe, so that is all the handlers do.
+//! lock-free atomic is safe. A late suspend callback may also forward through
+//! the current disposition using signal-safe libc::raise.
 //!
 //! `SA_RESTART` is deliberately NOT set: a blocked read of stdin returning
 //! `EINTR` is how the loop learns to look at these flags at all.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 static RESIZED: AtomicBool = AtomicBool::new(false);
 static RESUMED: AtomicBool = AtomicBool::new(false);
 static TERMINATE: AtomicBool = AtomicBool::new(false);
-static SUSPEND: AtomicBool = AtomicBool::new(false);
+// The low bits are fixed policy flags; high bits are a non-wrapping owner
+// generation. An old Saved guard cannot restore a replacement's disposition.
+const DEFERRED: u64 = 1;
+const PENDING: u64 = 2;
+const POISONED: u64 = 4;
+const FLAGS: u64 = 7;
+static SUSPEND: AtomicU64 = AtomicU64::new(0);
 
 /// What arrived since the last look. `terminate` is a GROUP: SIGTERM,
 /// SIGHUP, SIGINT and SIGQUIT all mean the same thing to this program --
@@ -44,7 +51,39 @@ extern "C" fn on_terminate(_: libc::c_int) {
 }
 
 extern "C" fn on_tstp(_: libc::c_int) {
-    SUSPEND.store(true, Ordering::SeqCst);
+    let errno = nix::errno::Errno::last_raw();
+    let mut observed = SUSPEND.load(Ordering::SeqCst);
+    loop {
+        if observed & DEFERRED == 0 {
+            // Selected before policy teardown, delivered after it: do not
+            // restore an old handler. The current default/EchoOff/raw owner
+            // handles replay after this callback returns and unblocks TSTP.
+            if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
+                unsafe { libc::_exit(128 + libc::SIGTSTP) };
+            }
+            break;
+        }
+        match SUSPEND.compare_exchange(
+            observed,
+            observed | PENDING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(current) => observed = current,
+        }
+    }
+    nix::errno::Errno::set_raw(errno);
+}
+
+#[cfg(test)]
+#[path = "signals/suspend_tests.rs"]
+pub(crate) mod suspend_tests;
+
+fn set_tstp(handler: SigHandler) -> Result<SigAction, nix::Error> {
+    #[cfg(test)]
+    suspend_tests::before_action(handler)?;
+    unsafe { signal::sigaction(Signal::SIGTSTP, &action(handler)) }
 }
 
 /// The disposition every handler here is installed with. Empty flags on
@@ -57,8 +96,11 @@ fn action(handler: SigHandler) -> SigAction {
 
 /// Installs the handlers. Idempotent -- installing twice is the same as once.
 pub fn install() -> Result<(), nix::Error> {
-    // SAFETY: every handler only stores into a static AtomicBool, which is
-    // async-signal-safe.
+    if SUSPEND.load(Ordering::SeqCst) & FLAGS != 0 {
+        return Err(nix::Error::EBUSY);
+    }
+    // SAFETY: handlers use lock-free atomics; late TSTP callbacks forward
+    // only with signal-safe libc calls and preserve errno.
     unsafe {
         signal::sigaction(Signal::SIGWINCH, &action(SigHandler::Handler(on_winch)))?;
         signal::sigaction(Signal::SIGCONT, &action(SigHandler::Handler(on_cont)))?;
@@ -74,15 +116,38 @@ pub fn install() -> Result<(), nix::Error> {
         // window before raw mode is on.
         signal::sigaction(Signal::SIGINT, &action(SigHandler::Handler(on_terminate)))?;
         signal::sigaction(Signal::SIGQUIT, &action(SigHandler::Handler(on_terminate)))?;
-        // SIGTSTP's default stops the process on the spot, with the
-        // terminal still raw and on the alternate screen, under the shell
-        // that takes it over. Caught, it is the loop that stops the process
-        // ([`stop`]), once the terminal is handed back. Raw mode has `ISIG`
-        // off, so a `Ctrl-Z` is a byte for the remote side, as before: this
-        // is `kill -TSTP`.
-        signal::sigaction(Signal::SIGTSTP, &action(SigHandler::Handler(on_tstp)))?;
+        // Cooked foreground phases may block in DNS/SSH without a polling
+        // loop. RawMode installs the narrower deferred policy before raw mode.
+        set_tstp(SigHandler::SigDfl)?;
     }
     Ok(())
+}
+
+/// Replay only TSTP, even if the terminal owner originally blocked it.
+/// The request may have been handled on another unblocked thread. Preserve
+/// all other mask bits and errno, including across a real stop/continue.
+fn replay_tstp() -> Result<(), nix::Error> {
+    let errno = nix::errno::Errno::last_raw();
+    let result = unsafe {
+        let mut one: libc::sigset_t = std::mem::zeroed();
+        let mut saved: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut one);
+        libc::sigaddset(&mut one, libc::SIGTSTP);
+        let unblocked = libc::pthread_sigmask(libc::SIG_UNBLOCK, &one, &mut saved);
+        if unblocked != 0 {
+            Err(nix::Error::from_raw(unblocked))
+        } else {
+            let raised = signal::raise(Signal::SIGTSTP);
+            let restored = libc::pthread_sigmask(libc::SIG_SETMASK, &saved, std::ptr::null_mut());
+            if restored != 0 {
+                Err(nix::Error::from_raw(restored))
+            } else {
+                raised
+            }
+        }
+    };
+    nix::errno::Errno::set_raw(errno);
+    result
 }
 
 /// Stops the process as SIGTSTP's own default would, and returns once it is
@@ -92,14 +157,128 @@ pub fn install() -> Result<(), nix::Error> {
 /// A process group the kernel counts as orphaned -- one no shell of the same
 /// session could ever continue -- is not stopped by SIGTSTP at all: this then
 /// returns at once, and the loop comes straight back.
-pub fn stop() {
-    // SAFETY: the default disposition and back to our handler, which only
-    // stores into a static AtomicBool; `raise` names the calling thread, so
-    // the stop happens before it returns.
-    unsafe {
-        let _ = signal::sigaction(Signal::SIGTSTP, &action(SigHandler::SigDfl));
-        let _ = signal::raise(Signal::SIGTSTP);
-        let _ = signal::sigaction(Signal::SIGTSTP, &action(SigHandler::Handler(on_tstp)));
+pub(crate) fn stop(generation: u64) -> Result<(), nix::Error> {
+    validate_deferred(generation)?;
+    set_tstp(SigHandler::SigDfl)?;
+    replay_tstp()?;
+    // A continued old caller may not overwrite a replacement or EchoOff owner.
+    validate_deferred(generation)?;
+    set_tstp(SigHandler::Handler(on_tstp))?;
+    Ok(())
+}
+
+fn validate_deferred(generation: u64) -> Result<(), nix::Error> {
+    let observed = SUSPEND.load(Ordering::SeqCst);
+    if observed & !FLAGS == generation && observed & (DEFERRED | POISONED) == DEFERRED {
+        Ok(())
+    } else {
+        Err(nix::Error::EINVAL)
+    }
+}
+
+/// The single non-clone suspend-policy owner, held by tty::Saved. Dropping
+/// without confirmed cooked restoration poisons fixed state rather than enabling
+/// an unsafe default stop. No descriptor is stored in this policy state.
+pub(crate) struct DeferredSuspend {
+    generation: u64,
+    finished: bool,
+}
+
+impl DeferredSuspend {
+    pub(crate) fn enter() -> Result<Self, nix::Error> {
+        let observed = SUSPEND.load(Ordering::SeqCst);
+        if observed & FLAGS != 0 {
+            return Err(nix::Error::EBUSY);
+        }
+        let generation = observed
+            .checked_add(FLAGS + 1)
+            .ok_or(nix::Error::EOVERFLOW)?;
+        SUSPEND
+            .compare_exchange(
+                observed,
+                generation | DEFERRED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| nix::Error::EBUSY)?;
+        let owner = Self {
+            generation,
+            finished: false,
+        };
+        // This conventional handler-before-raw ordering cannot recall a kernel
+        // default action already selected on another thread before installation.
+        if let Err(error) = set_tstp(SigHandler::Handler(on_tstp)) {
+            let _ = owner.finish_cooked();
+            return Err(error);
+        }
+        Ok(owner)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn finish_cooked(mut self) -> Result<(), nix::Error> {
+        let mut observed = SUSPEND.load(Ordering::SeqCst);
+        if observed & !FLAGS != self.generation || observed & (DEFERRED | POISONED) != DEFERRED {
+            return Err(nix::Error::EINVAL);
+        }
+        // Called only after a successful termios restore, outside Saved's lock.
+        set_tstp(SigHandler::SigDfl)?;
+        loop {
+            if observed & !FLAGS != self.generation || observed & (DEFERRED | POISONED) != DEFERRED
+            {
+                return Err(nix::Error::EINVAL);
+            }
+            match SUSPEND.compare_exchange(
+                observed,
+                self.generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+        self.finished = true;
+        if observed & PENDING != 0 {
+            if let Err(error) = replay_tstp() {
+                // Cooked is confirmed, but this failed owner cannot reenter.
+                let _ = SUSPEND.compare_exchange(
+                    self.generation,
+                    self.generation | DEFERRED | POISONED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_poisoned(generation: u64) -> bool {
+        let observed = SUSPEND.load(Ordering::SeqCst);
+        observed & !FLAGS == generation && observed & POISONED != 0
+    }
+}
+
+impl Drop for DeferredSuspend {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut observed = SUSPEND.load(Ordering::SeqCst);
+        while observed & !FLAGS == self.generation && observed & DEFERRED != 0 {
+            match SUSPEND.compare_exchange(
+                observed,
+                observed | POISONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
     }
 }
 
@@ -139,7 +318,7 @@ pub fn take_pending() -> Pending {
         resized: RESIZED.swap(false, Ordering::SeqCst),
         resumed: RESUMED.swap(false, Ordering::SeqCst),
         terminate: TERMINATE.swap(false, Ordering::SeqCst),
-        suspend: SUSPEND.swap(false, Ordering::SeqCst),
+        suspend: SUSPEND.fetch_and(!PENDING, Ordering::SeqCst) & PENDING != 0,
     }
 }
 
@@ -264,6 +443,39 @@ mod tests {
         assert!(take_pending().terminate, "SIGQUIT must be seen, not fatal");
     }
 
+    #[test]
+    fn foreground_install_uses_default_stop_even_without_a_polling_loop() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        install().unwrap();
+        let current = unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut current),
+                0
+            );
+            current.sa_sigaction
+        };
+        assert_eq!(
+            current,
+            libc::SIG_DFL,
+            "foreground blocking work must stop without polling"
+        );
+    }
+
+    #[test]
+    fn foreground_policy_preserves_other_signal_owners() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        install().expect("install");
+        let _ = take_pending();
+        raise(Signal::SIGWINCH).unwrap();
+        raise(Signal::SIGCONT).unwrap();
+        raise(Signal::SIGINT).unwrap();
+        assert!(termination_requested(), "cancellation must remain visible");
+        let pending = take_pending();
+        assert!(pending.resized && pending.resumed && pending.terminate);
+        assert!(!pending.suspend);
+    }
+
     /// A stop request is caught, not obeyed on the spot: the loop hands the
     /// terminal back first.
     #[test]
@@ -271,10 +483,12 @@ mod tests {
         let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         install().expect("install");
         let _ = take_pending();
+        let owner = DeferredSuspend::enter().unwrap();
         raise(Signal::SIGTSTP).expect("raise");
         let pending = take_pending();
         assert!(pending.suspend, "SIGTSTP must be seen");
         assert!(!take_pending().suspend, "and taken once");
+        owner.finish_cooked().unwrap();
     }
 
     /// Coming back from the background is its own event: the terminal was
