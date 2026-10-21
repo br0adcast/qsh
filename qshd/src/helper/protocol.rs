@@ -362,6 +362,8 @@ pub enum CleanupKind {
 /// neither an exit status nor disconnection proves either cleanup fact.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MonitorEvent {
+    /// Private owned startup proof, before NSS/PAM or descendant creation.
+    SessionEstablished { sid: u32 },
     /// No shell was created, or the monitor completed its owned cleanup scope.
     CleanupComplete { id: ChannelId, kind: CleanupKind },
     /// The shell exec'd -- the same moment, and the same evidence (the

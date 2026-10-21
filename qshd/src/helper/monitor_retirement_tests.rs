@@ -13,7 +13,9 @@ fn pam40_retirement_retains_readable_seam_and_admission_after_shell_cleanup() {
     state.monitors.insert(
         owner,
         Monitor {
-            seam,
+            process: MonitorProcess::Controlled(seam),
+            #[cfg(target_os = "linux")]
+            signal_failure: None,
             pid: Pid::this(),
             reaped: true,
             write_closed: false,
@@ -37,10 +39,10 @@ fn pam40_retirement_retains_readable_seam_and_admission_after_shell_cleanup() {
     let mut returned = [0; 20];
     if let Some(monitor) = state.monitors.get_mut(&owner) {
         monitor
-            .seam
+            .seam()
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        monitor.seam.read_exact(&mut returned).unwrap();
+        monitor.seam().read_exact(&mut returned).unwrap();
     }
     assert_eq!(
         &returned, b"final cleanup result",
@@ -73,7 +75,9 @@ fn pam40_retiring_pam_owner_cannot_admit_an_extra_login() {
     state.monitors.insert(
         owner,
         Monitor {
-            seam,
+            process: MonitorProcess::Controlled(seam),
+            #[cfg(target_os = "linux")]
+            signal_failure: None,
             pid: Pid::this(),
             reaped: true,
             write_closed: false,

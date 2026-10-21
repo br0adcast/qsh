@@ -304,6 +304,42 @@ pub(super) fn worker_clients(
     worker_auth: UnixStream,
     config: &HelperConfig,
 ) -> anyhow::Result<(HelperChannelSpawner, HelperAuth, LoginEndedReports)> {
+    let end_worker: EndWorker = Arc::new(super::end_the_worker);
+    worker_clients_with_hooks(
+        worker_channels,
+        worker_auth,
+        config,
+        end_worker.clone(),
+        end_worker.clone(),
+        end_worker,
+    )
+}
+
+pub(super) fn worker_clients_with_stop(
+    worker_channels: UnixStream,
+    worker_auth: UnixStream,
+    config: &HelperConfig,
+    stop: super::worker_stop::WorkerStop,
+) -> anyhow::Result<(HelperChannelSpawner, HelperAuth, LoginEndedReports)> {
+    use super::worker_protocol::StopReason;
+    worker_clients_with_hooks(
+        worker_channels,
+        worker_auth,
+        config,
+        stop.fatal_hook(StopReason::ChannelLost),
+        stop.fatal_hook(StopReason::AuthLost),
+        stop.fatal_hook(StopReason::RequiredTellLost),
+    )
+}
+
+fn worker_clients_with_hooks(
+    worker_channels: UnixStream,
+    worker_auth: UnixStream,
+    config: &HelperConfig,
+    channel_gone: EndWorker,
+    auth_failure: EndWorker,
+    login_end_lost: EndWorker,
+) -> anyhow::Result<(HelperChannelSpawner, HelperAuth, LoginEndedReports)> {
     // Bounded by the SAME constant as the opposite direction, and for the
     // same reason: the two carry the same news about the same logins. See
     // `MAX_QUEUED_LOGIN_ENDS` for how that number is derived from the
@@ -315,11 +351,11 @@ pub(super) fn worker_clients(
     let spawner = HelperChannelSpawner::with_budget_hook(
         worker_channels,
         budget,
-        || super::end_the_worker(HELPER_GONE_REASON),
+        move || channel_gone(HELPER_GONE_REASON),
         Box::new(
             move |login, incarnation| match reporter.report(login, incarnation) {
                 Ok(()) => {}
-                Err(LoginEndNotReported::Queued(bound)) => super::end_the_worker(&format!(
+                Err(LoginEndNotReported::Queued(bound)) => login_end_lost(&format!(
                     "{HELPER_LOGIN_ENDS_OVERFLOW_REASON} ({bound} already waiting)"
                 )),
                 Err(LoginEndNotReported::RouterGone) => {
@@ -329,7 +365,7 @@ pub(super) fn worker_clients(
         ),
     )
     .context("starting the helper client")?;
-    let auth = HelperAuth::new_with_hook(worker_auth, config, Arc::new(super::end_the_worker))
+    let auth = HelperAuth::new_with_hook(worker_auth, config, auth_failure)
         .context("starting the helper's authentication client")?;
     Ok((spawner, auth, reports))
 }

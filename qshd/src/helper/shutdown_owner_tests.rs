@@ -257,7 +257,7 @@ mod pam40_shutdown_owner {
         assert!(owner.state.retired.contains(&monitor_owner));
         channel::send(&peer, b"still owned", None).unwrap();
         assert_eq!(
-            channel::recv(&owner.state.monitors[&monitor_owner].seam)
+            channel::recv(owner.state.monitors[&monitor_owner].seam())
                 .unwrap()
                 .unwrap()
                 .0,

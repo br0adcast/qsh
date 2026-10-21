@@ -663,6 +663,10 @@ const SESSION_DEADLINE_FIRINGS: usize = 2;
 /// monitor cannot say so in the log.
 const SESSION_DEADLINE_EXIT: i32 = 70;
 
+/// A private session stage was not established; PAM has not been entered.
+#[cfg(target_os = "linux")]
+const SESSION_ESTABLISH_FAILED_EXIT: i32 = 74;
+
 /// What the monitor exits with when it cannot arm its parent-death signal.
 ///
 /// Beside [`SESSION_DEADLINE_EXIT`] and for the same reason: a muted
@@ -1083,6 +1087,23 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
         // handlers and no Rust `Drop` impls -- which is what has to happen
         // in a child that shares its parent's image.
         unsafe { nix::libc::_exit(PDEATHSIG_REFUSED_EXIT) }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // This private stage precedes every NSS/PAM/descendant-producing action.
+        // Failed setup/publication keeps parent authority exact-child-only.
+        let established = nix::unistd::setsid().and_then(|sid| {
+            let bytes = encode(&MonitorEvent::SessionEstablished {
+                sid: sid.as_raw() as u32,
+            })
+            .map_err(|_| nix::Error::EINVAL)?;
+            channel::send(&seam, &bytes, None).map_err(|error| {
+                nix::Error::from_raw(error.raw_os_error().unwrap_or(nix::libc::EIO))
+            })
+        });
+        if established.is_err() {
+            unsafe { nix::libc::_exit(SESSION_ESTABLISH_FAILED_EXIT) }
+        }
     }
     // The one way a test can reach [`run_monitor`]'s panic guard; see the
     // flag's own docs for why nothing else can.

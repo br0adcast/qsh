@@ -240,3 +240,120 @@ async fn stopping39_failed_enqueue_never_acknowledges_success() {
         "failed enqueue emitted a success acknowledgement"
     );
 }
+
+#[cfg(all(feature = "system", target_os = "linux"))]
+#[tokio::test]
+async fn worker40_owned_manager_observes_stop_requested_before_its_first_poll() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let key = generate_keypair();
+    let stop = transport::Shutdown::default();
+    stop.request();
+    let runs = [HeldRun::new(), HeldRun::new()];
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::run_serve_loop_until_shutdown(
+            socket,
+            key.private,
+            ServerAuth {
+                allowlist: Arc::new(Mutex::new(Vec::new())),
+                verifier: None,
+                server_pub: key.public,
+                self_principal: Principal {
+                    uid: 1000,
+                    name: "fixture".into(),
+                    identity: "allowlist".into(),
+                    incarnation: 0,
+                },
+                nonces: Arc::new(crate::RandomNonces),
+                logins: Arc::new(crate::ForgetNothing),
+            },
+            Arc::new(HeldCleanup {
+                runs,
+                next: AtomicUsize::new(0),
+            }),
+            transport::LoginEndedReports::none(),
+            stop,
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "actual worker manager ignored sticky stop");
+    assert!(result.unwrap().is_ok());
+}
+
+#[cfg(all(feature = "system", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker40_owned_manager_retains_authenticated_backend_through_actual_cleanup() {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    let server = generate_keypair();
+    let client_key = generate_keypair();
+    let runs = [HeldRun::new(), HeldRun::new()];
+    let _release_on_unwind = ReleaseOnDrop(runs.clone());
+    let stop = transport::Shutdown::default();
+    let mut manager = tokio::spawn(super::run_serve_loop_until_shutdown(
+        socket,
+        server.private,
+        ServerAuth {
+            allowlist: Arc::new(Mutex::new(vec![client_key.public])),
+            verifier: None,
+            server_pub: server.public,
+            self_principal: Principal {
+                uid: 1000,
+                name: "fixture".into(),
+                identity: "allowlist".into(),
+                incarnation: 0,
+            },
+            nonces: Arc::new(crate::RandomNonces),
+            logins: Arc::new(crate::ForgetNothing),
+        },
+        Arc::new(HeldCleanup {
+            runs: runs.clone(),
+            next: AtomicUsize::new(0),
+        }),
+        transport::LoginEndedReports::none(),
+        stop.clone(),
+    ));
+    let client = StdClient::connect(
+        addr,
+        ConnectionConfig {
+            required_features: transport::Features::NONE,
+            features: transport::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: client_key.private,
+            remote_static_pub: Some(server.public),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        },
+        [40; 16],
+        StartKind::Cold,
+        Arc::new(Noop),
+        Arc::new(Noop),
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), runs[0].started.notified())
+        .await
+        .expect("authenticated worker backend started");
+    stop.request();
+    tokio::time::timeout(Duration::from_secs(5), runs[0].cleaning.notified())
+        .await
+        .expect("actual worker manager drove backend into cleanup");
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut manager)
+        .await
+        .ok();
+    runs[0].release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), runs[0].finished.notified())
+        .await
+        .expect("actual backend finished after release");
+    let returned_early = early.is_some();
+    let result = match early {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(5), manager)
+            .await
+            .expect("actual manager joined after backend release"),
+    };
+    client.close();
+    assert!(
+        !returned_early,
+        "worker manager returned while backend cleanup was held"
+    );
+    result.unwrap().unwrap();
+}

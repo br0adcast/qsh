@@ -168,11 +168,20 @@ impl State {
 
 impl PooledNonces {
     /// Add the fourth fixed handle before publishing the pool to the manager.
+    #[cfg(test)]
     pub(crate) fn start_owned(
         helper: Arc<HelperAuth>,
         owner: &mut WorkerThreads,
     ) -> io::Result<Arc<Self>> {
-        let pool = Self::start(helper)?;
+        Self::start_owned_with_hook(helper, owner, Arc::new(crate::helper::end_the_worker))
+    }
+
+    pub(crate) fn start_owned_with_hook(
+        helper: Arc<HelperAuth>,
+        owner: &mut WorkerThreads,
+        end_worker: EndWorker,
+    ) -> io::Result<Arc<Self>> {
+        let pool = Self::start_with(helper, POOL_MAX_AGE, end_worker, spawn_pool_thread)?;
         let custody = pool
             .auxiliary
             .lock()

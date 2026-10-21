@@ -290,6 +290,51 @@ pub async fn run_serve_loop(
     Ok(())
 }
 
+/// Initialization failure is not a joined manager receipt.
+#[cfg(feature = "system")]
+#[derive(Debug)]
+pub(crate) enum ServeLoopError {
+    Initialize(anyhow::Error),
+    Shutdown(transport::ShutdownError),
+}
+
+/// The system worker's owned manager boundary; cancellation is not completion.
+#[cfg(feature = "system")]
+pub(crate) async fn run_serve_loop_until_shutdown(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    login_ends: LoginEndedReports,
+    shutdown: transport::Shutdown,
+) -> std::result::Result<(), ServeLoopError> {
+    transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
+    socket.set_nonblocking(true).map_err(|error| {
+        ServeLoopError::Initialize(
+            anyhow::Error::new(error)
+                .context("switching the worker UDP socket to non-blocking mode"),
+        )
+    })?;
+    let socket = tokio::net::UdpSocket::from_std(socket).map_err(|error| {
+        ServeLoopError::Initialize(
+            anyhow::Error::new(error).context("adopting the worker UDP socket into tokio"),
+        )
+    })?;
+    // Retained by the caller until this real lifecycle drain returns. An error
+    // is not a producer-fence receipt, even though sibling tasks were joined.
+    SessionManager::serve_until_shutdown(
+        Arc::new(socket),
+        server_priv,
+        auth,
+        BackendFactory(backend),
+        Arc::new(AtomicUsize::new(0)),
+        login_ends,
+        shutdown,
+    )
+    .await
+    .map_err(ServeLoopError::Shutdown)
+}
+
 /// The transport daemon's control server: an `accept()` loop, a separate
 /// task per connection (one request line, one response, close). Shaped
 /// like the qsh path's `control::serve_control`, but with transport verbs

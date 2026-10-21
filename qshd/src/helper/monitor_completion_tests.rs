@@ -9,7 +9,9 @@ fn pam40_controlled_retiring_monitor(reaped: bool) -> (LoopState, MonitorOwner, 
     state.monitors.insert(
         owner,
         Monitor {
-            seam,
+            process: MonitorProcess::Controlled(seam),
+            #[cfg(target_os = "linux")]
+            signal_failure: None,
             pid: Pid::this(),
             reaped,
             write_closed: false,
@@ -128,8 +130,12 @@ fn pam40_monitor_wait_loss_retires_authentication_and_cannot_be_repaired_by_rece
     state.logins.insert(owner.login, login);
     state.verified.insert(account.uid, account);
     let seams = DirectSeam::new();
-    // No child exists here: waitpid(self) deterministically reports ECHILD.
-    // Empty shell/closing tables ensure this control never signals any PID.
+    // This is a socket model, not OS custody. Inject its lost-wait result;
+    // Linux production must never wait or signal the model's diagnostic PID.
+    assert!(!poll_monitor_wait_using(
+        state.monitors.get_mut(&owner).unwrap(),
+        || Err(nix::Error::ECHILD),
+    ));
     reap(&seams.helper, &mut state);
     assert!(state.monitors[&owner].wait_lost);
     assert_eq!(

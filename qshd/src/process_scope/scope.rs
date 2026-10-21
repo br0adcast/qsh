@@ -26,6 +26,13 @@ pub enum Progress {
     Unknown,
     Complete(i32),
 }
+/// Read-only reservation fact; observing this never performs a native lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedRoot {
+    Owned(std::num::NonZeroU32),
+    Released,
+    Lost,
+}
 #[derive(Debug, PartialEq, Eq)]
 pub enum LeaderStatus {
     Running,
@@ -56,6 +63,15 @@ pub struct Scope<C> {
     custody_lost: bool,
 }
 impl<C: ChildCustody> Scope<C> {
+    pub(crate) fn reserved_root(&self) -> ReservedRoot {
+        if self.completed.is_some() {
+            ReservedRoot::Released
+        } else if self.custody_lost {
+            ReservedRoot::Lost
+        } else {
+            ReservedRoot::Owned(self.child.leader_id())
+        }
+    }
     /// Caller owns this exact unreaped child and has authenticated setsid success.
     pub fn new(child: C, view: QualifiedProc) -> Self {
         let sid = child.leader_id();
@@ -125,7 +141,16 @@ impl<C: ChildCustody> Scope<C> {
     pub fn escalate(&mut self) {
         self.phase = Phase::Kill;
     }
+    /// Advance exact discovery/signals while reserving the leader for an
+    /// external private-receipt drain. Already-latched completion is unchanged;
+    /// this method never performs a new consuming wait.
+    pub fn step_without_reap(&mut self, ops: &mut impl ScopeOperations) -> Progress {
+        self.step_inner(ops, false)
+    }
     pub fn step(&mut self, ops: &mut impl ScopeOperations) -> Progress {
+        self.step_inner(ops, true)
+    }
+    fn step_inner(&mut self, ops: &mut impl ScopeOperations, allow_reap: bool) -> Progress {
         if let Some(code) = self.completed {
             return Progress::Complete(code);
         }
@@ -232,6 +257,11 @@ impl<C: ChildCustody> Scope<C> {
         {
             return Progress::Pending;
         }
+        if !allow_reap {
+            // A later allowed pass repeats all observations and begins its own
+            // fresh final census; this pass cannot pre-certify later closure.
+            return Progress::Pending;
+        }
         // A failed/unwinding final wait may already have released the SID.
         // Only a successful receipt below permits completed-state publication.
         self.custody_lost = true;
@@ -336,6 +366,7 @@ impl ScopeOperations for crate::process_scope::Native {
 
 #[cfg(test)]
 mod tests {
+    include!("scope_reap_gate_tests.rs");
     use super::*;
     use crate::process_scope::Operations;
     use std::{
@@ -422,6 +453,31 @@ mod tests {
             },
             events,
         )
+    }
+    #[test]
+    fn custody40_scope_projection_reserves_exit_and_retryable_unknown_until_final_wait() {
+        let (mut scope, mut ops, events) =
+            fixture(true, vec![Err(Failure::Errno(libc::EACCES)), Ok(vec![])]);
+        let owned = ReservedRoot::Owned(std::num::NonZeroU32::new(42).unwrap());
+        assert_eq!(scope.reserved_root(), owned);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(scope.poll_leader(), LeaderStatus::Exited(0));
+        assert_eq!(scope.reserved_root(), owned);
+        assert_eq!(scope.step(&mut ops), Progress::Unknown);
+        assert_eq!(
+            scope.reserved_root(),
+            owned,
+            "census denial does not release direct-child custody"
+        );
+        assert_eq!(scope.step(&mut ops), Progress::Complete(0));
+        let count = events.lock().unwrap().len();
+        assert_eq!(scope.reserved_root(), ReservedRoot::Released);
+        assert_eq!(scope.reserved_root(), ReservedRoot::Released);
+        assert_eq!(
+            events.lock().unwrap().len(),
+            count,
+            "projection never observes released child"
+        );
     }
     #[test]
     fn empty_sticky_drain_reaps_once_and_never_signals_after_reap() {
@@ -522,6 +578,33 @@ mod tests {
             } else {
                 Ok(91)
             }
+        }
+    }
+    #[test]
+    fn custody40_scope_projection_latches_observation_and_final_wait_loss() {
+        for observation_error in [true, false] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut scope = Scope::new(
+                FailedChild {
+                    events: events.clone(),
+                    observation_error,
+                    reap_error: !observation_error,
+                },
+                QualifiedProc {
+                    root: File::open("/dev/null").unwrap().into(),
+                },
+            );
+            let mut ops = Ops {
+                censuses: vec![Ok(vec![])].into(),
+                calls: vec![],
+            };
+            assert_eq!(scope.step(&mut ops), Progress::Unknown);
+            assert_eq!(scope.reserved_root(), ReservedRoot::Lost);
+            scope.child.reap_error = false; // A later successful lookup cannot restore reservation.
+            let count = events.lock().unwrap().len();
+            assert_eq!(scope.poll_leader(), LeaderStatus::Unknown);
+            assert_eq!(scope.reserved_root(), ReservedRoot::Lost);
+            assert_eq!(events.lock().unwrap().len(), count);
         }
     }
     #[test]

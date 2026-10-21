@@ -786,3 +786,7 @@ pub(crate) use pty::{own_child, prepare};
 pub(crate) mod fork;
 
 pub(crate) mod fork_child;
+
+#[cfg(feature = "system")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod adoption;

@@ -65,43 +65,60 @@ pub fn send(sock: &UnixStream, bytes: &[u8], fd: Option<BorrowedFd<'_>>) -> io::
 /// landing between `poll` waking the helper's loop and this call running
 /// must not be mistaken for the peer having failed.
 pub fn recv(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+    receive_with(|| receive_packet(sock), true)
+}
+
+/// One receive attempt for a live owner pump. EINTR yields without closing the
+/// seam or consuming its queued record; the next pass retries after other owners.
+pub(super) fn recv_once(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+    receive_with(|| receive_packet(sock), false)
+}
+
+fn receive_with<T>(
+    mut read: impl FnMut() -> io::Result<T>,
+    retry_interrupts: bool,
+) -> io::Result<T> {
+    loop {
+        match read() {
+            Err(error) if retry_interrupts && error.kind() == io::ErrorKind::Interrupted => {
+                continue
+            }
+            result => return result,
+        }
+    }
+}
+
+fn receive_packet(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
     let mut buf = vec![0u8; MAX_MESSAGE_LEN];
+    // Credential-enabled private monitor peers still carry one terminal fd.
+    #[cfg(target_os = "linux")]
+    let mut cmsg_space = nix::cmsg_space!([RawFd; 1], nix::libc::ucred);
+    #[cfg(not(target_os = "linux"))]
     let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
     // `iov` must outlive `msg` (nix ties `RecvMsg`'s lifetime to it), so it
     // stays in this scope rather than a nested block.
     let mut iov = [io::IoSliceMut::new(&mut buf)];
-    let msg = loop {
-        // `MSG_CMSG_CLOEXEC`: a descriptor the kernel installs here arrives
-        // close-on-exec, the way everything else either half opens does.
-        // The worker never execs today, so nothing rides out on one -- but
-        // "no descriptor of ours survives an exec" is a property worth
-        // holding by construction rather than by the absence of a call.
-        match recvmsg::<()>(
-            sock.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_space),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        ) {
-            Ok(msg) => break msg,
-            Err(nix::Error::EINTR) => continue,
-            Err(e) => return Err(io::Error::from(e)),
-        }
-    };
+    let msg = recvmsg::<()>(
+        sock.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_space),
+        MsgFlags::MSG_CMSG_CLOEXEC,
+    )
+    .map_err(io::Error::from)?;
 
     let bytes = msg.bytes;
+    let truncated = msg
+        .flags
+        .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC);
     let mut received_fd = None;
-    if bytes != 0 {
-        for cmsg in msg.cmsgs() {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                for raw in fds {
-                    // SAFETY: the kernel just installed this descriptor in
-                    // this process and named it here; nothing else owns it.
-                    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                    if received_fd.is_none() {
-                        received_fd = Some(owned);
-                    }
-                    // A second descriptor would be a protocol violation;
-                    // dropping the extra closes it rather than leaking it.
+    for cmsg in msg.cmsgs() {
+        if let ControlMessageOwned::ScmRights(fds) = cmsg {
+            for raw in fds {
+                // Every installed descriptor is owned even for a zero record;
+                // returning EOF below drops it rather than leaking it.
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                if received_fd.is_none() {
+                    received_fd = Some(owned);
                 }
             }
         }
@@ -109,6 +126,12 @@ pub fn recv(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>>
     // `msg` (and so `iov`'s borrow of `buf`) is not used past this point,
     // which is why `buf` can be mutated again below.
 
+    if truncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated helper message",
+        ));
+    }
     if bytes == 0 {
         return Ok(None);
     }
@@ -119,6 +142,38 @@ pub fn recv(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent40_interrupted_receive_yields_without_consuming_the_next_record() {
+        let mut attempts = 0;
+        let result = receive_with(
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(7)
+                }
+            },
+            false,
+        );
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(attempts, 1);
+        let mut attempts = 0;
+        let legacy = receive_with(
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(7)
+                }
+            },
+            true,
+        );
+        assert_eq!(legacy.unwrap(), 7);
+        assert_eq!(attempts, 4);
+    }
 
     #[test]
     fn a_message_crosses_the_pair() {
@@ -273,5 +328,98 @@ mod tests {
         std::fs::read_dir("/proc/self/fd")
             .expect("read /proc/self/fd")
             .count()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod monitor_ancillary_tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn monitor40_ancillary_ownership_isolated() {
+        const BODY: &str =
+            "helper::channel::monitor_ancillary_tests::monitor40_ancillary_ownership_body";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", BODY, "--ignored", "--test-threads=1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "owned ancillary control failed: stdout={:?}, stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    #[ignore = "runs only in the owned ancillary control process"]
+    fn monitor40_ancillary_ownership_body() {
+        fn count() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+        let selected = std::env::var("QSH_TEST_ANCILLARY_MODE").ok();
+        for mode in [
+            "credential-fd",
+            "zero",
+            "zero-credentialed",
+            "payload-truncated",
+            "control-truncated",
+        ] {
+            if selected.as_deref().is_some_and(|value| value != mode) {
+                continue;
+            }
+            let (sender, receiver) = pair().unwrap();
+            if mode != "zero" {
+                nix::sys::socket::setsockopt(&receiver, nix::sys::socket::sockopt::PassCred, &true)
+                    .unwrap();
+            }
+            let file = tempfile::tempfile().unwrap();
+            let bytes = match mode {
+                "zero" | "zero-credentialed" => Vec::new(),
+                "payload-truncated" => vec![b'x'; MAX_MESSAGE_LEN + 1],
+                _ => b"open".to_vec(),
+            };
+            if mode == "control-truncated" {
+                let rights = [file.as_raw_fd(); 16];
+                sendmsg::<()>(
+                    sender.as_raw_fd(),
+                    &[io::IoSlice::new(&bytes)],
+                    &[ControlMessage::ScmRights(&rights)],
+                    MsgFlags::empty(),
+                    None,
+                )
+                .unwrap();
+            } else {
+                send(&sender, &bytes, Some(file.as_fd())).unwrap();
+            }
+            let before = count();
+            let result = recv_once(&receiver);
+            let after = count();
+            match mode {
+                "credential-fd" => {
+                    let (payload, fd) = result.unwrap().unwrap();
+                    assert_eq!(payload, b"open");
+                    assert!(fd.is_some());
+                    assert_eq!(after, before + 1);
+                    drop(fd);
+                }
+                "zero" | "zero-credentialed" => {
+                    assert!(result.unwrap().is_none());
+                    assert_eq!(after, before, "zero packet must close installed rights");
+                }
+                _ => {
+                    assert!(
+                        matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidData),
+                        "mode={mode}"
+                    );
+                    assert_eq!(
+                        after, before,
+                        "rejected packet must close installed rights: {mode}"
+                    );
+                }
+            }
+            assert_eq!(count(), before, "no descriptor debt survives: {mode}");
+        }
     }
 }

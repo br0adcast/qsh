@@ -17,6 +17,16 @@ pub(crate) struct ChildOnly<C> {
     completed: Option<i32>,
 }
 impl<C: ChildCustody> ChildOnly<C> {
+    pub(crate) fn reserved_root(&self) -> super::scope::ReservedRoot {
+        use super::scope::ReservedRoot;
+        if self.completed.is_some() {
+            ReservedRoot::Released
+        } else if self.lost {
+            ReservedRoot::Lost
+        } else {
+            ReservedRoot::Owned(self.child.leader_id())
+        }
+    }
     /// Construct immediately after fork, before any fallible capture/setup.
     /// The proc view was qualified before fork in the same active PID namespace.
     pub(crate) fn new(child: C, view: QualifiedProc) -> Self {
@@ -225,6 +235,41 @@ mod tests {
         (ChildOnly::new(child, QualifiedProc { root: fd() }), calls)
     }
 
+    #[test]
+    fn custody40_child_only_projection_retains_exit_until_terminal_wait() {
+        use super::super::scope::ReservedRoot;
+        let (mut owner, calls) = owner(vec![Ok(Some(7)), Ok(Some(7))], Ok(7));
+        let owned = ReservedRoot::Owned(NonZeroU32::new(42).unwrap());
+        assert_eq!(owner.reserved_root(), owned);
+        assert_eq!(calls.borrow().observes, 0);
+        assert_eq!(owner.poll_leader(), LeaderStatus::Exited(7));
+        assert_eq!(owner.reserved_root(), owned);
+        assert_eq!(owner.step(&mut Ops::default(), true), Progress::Complete(7));
+        assert_eq!(owner.reserved_root(), ReservedRoot::Released);
+        assert_eq!(owner.reserved_root(), ReservedRoot::Released);
+        assert_eq!((calls.borrow().observes, calls.borrow().reaps), (2, 1));
+    }
+    #[test]
+    fn custody40_child_only_projection_latches_lost_wait() {
+        use super::super::scope::ReservedRoot;
+        for final_reap in [true, false] {
+            let observations = if final_reap {
+                vec![Ok(Some(7))]
+            } else {
+                vec![Err(Failure::Errno(libc::ECHILD))]
+            };
+            let (mut owner, calls) = owner(observations, Err(Failure::Errno(libc::ECHILD)));
+            assert_eq!(
+                owner.step(&mut Ops::default(), final_reap),
+                Progress::Unknown
+            );
+            assert_eq!(owner.reserved_root(), ReservedRoot::Lost);
+            let observes = calls.borrow().observes;
+            assert_eq!(owner.poll_leader(), LeaderStatus::Unknown);
+            assert_eq!(owner.reserved_root(), ReservedRoot::Lost);
+            assert_eq!(calls.borrow().observes, observes);
+        }
+    }
     #[test]
     fn helper39_child_only_stop_never_censuses_parent_session() {
         let (mut owner, calls) = owner(vec![], Ok(0));

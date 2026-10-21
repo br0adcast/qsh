@@ -382,11 +382,11 @@ impl PendingTable {
             .count()
     }
 
-    /// Whether the helper is waiting on anything at all -- what a test
-    /// that settles "everything pending" asks, now that a channel start
-    /// contributes no descriptor to [`PendingTable::poll_fds`] and an empty
-    /// poll set no longer means an empty table.
-    #[cfg(test)]
+    /// Whether any response obligation remains. The final physical report
+    /// preserves this independently of verification native custody: a channel
+    /// start contributes no descriptor to [`PendingTable::poll_fds`], so an
+    /// empty poll set does not mean an empty table.
+    #[cfg(any(test, target_os = "linux"))]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

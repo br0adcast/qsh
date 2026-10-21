@@ -35,6 +35,13 @@ pub(super) struct ShellOwner {
     signal_failure: Option<(i32, i32)>,
 }
 impl ShellOwner {
+    pub(super) fn reserved_root(&self) -> crate::process_scope::scope::ReservedRoot {
+        match self.state.as_ref().unwrap() {
+            State::ChildOnly(owner) => owner.reserved_root(),
+            State::Session(scope) => scope.reserved_root(),
+            State::Complete(_) => crate::process_scope::scope::ReservedRoot::Released,
+        }
+    }
     pub(super) fn new(pid: NonZeroU32, view: QualifiedProc) -> Self {
         Self {
             state: Some(State::ChildOnly(ChildOnly::new(ForkChild::new(pid), view))),
@@ -42,9 +49,18 @@ impl ShellOwner {
         }
     }
     pub(super) fn establish(&mut self, proof: SessionEstablished) -> bool {
+        self.establish_sid(proof.sid())
+    }
+    pub(super) fn establish_monitor(&mut self, proof: super::monitor_owner::Established) -> bool {
+        self.establish_sid(proof.sid())
+    }
+    pub(super) fn establish_worker(&mut self, proof: super::worker_owner::Established) -> bool {
+        self.establish_sid(proof.sid())
+    }
+    fn establish_sid(&mut self, sid: u32) -> bool {
         let state = self.state.take().unwrap();
         let (state, established) = match state {
-            State::ChildOnly(owner) => match owner.establish_session(proof.sid()) {
+            State::ChildOnly(owner) => match owner.establish_session(sid) {
                 Ok(scope) => (State::Session(scope), true),
                 Err(owner) => (State::ChildOnly(owner), false),
             },
@@ -79,11 +95,22 @@ impl ShellOwner {
     pub(super) fn take_signal_failure(&mut self) -> Option<(i32, i32)> {
         self.signal_failure.take()
     }
+    #[cfg(test)]
+    pub(super) fn inject_signal_failure(&mut self, failure: (i32, i32)) {
+        self.signal_failure = Some(failure);
+    }
     pub(super) fn progress(&mut self, pre_session_terminal: bool) -> Progress {
+        self.progress_inner(pre_session_terminal, true)
+    }
+    pub(super) fn progress_without_reap(&mut self) -> Progress {
+        self.progress_inner(false, false)
+    }
+    fn progress_inner(&mut self, pre_session_terminal: bool, allow_reap: bool) -> Progress {
         let mut ops = MonitorOps::new();
         let result = match self.state.as_mut().unwrap() {
             State::ChildOnly(owner) => owner.step(&mut ops, pre_session_terminal),
-            State::Session(scope) => scope.step(&mut ops),
+            State::Session(scope) if allow_reap => scope.step(&mut ops),
+            State::Session(scope) => scope.step_without_reap(&mut ops),
             State::Complete(code) => Progress::Complete(*code),
         };
         if self.signal_failure.is_none() {

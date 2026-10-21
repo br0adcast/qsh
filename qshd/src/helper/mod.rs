@@ -26,6 +26,8 @@ pub mod config;
 /// login's shells, and where the PAM session will live. Private to
 /// `helper` -- nothing outside it forks one or speaks to one.
 mod monitor;
+#[cfg(target_os = "linux")]
+mod monitor_owner;
 /// Linux-PAM, spoken directly: hand-written declarations, the conversation
 /// function, thin wrappers. Its caller is the per-login monitor, which
 /// opens and closes each login's session (`monitor::Session`); nothing
@@ -50,6 +52,22 @@ mod startup;
 #[cfg(target_os = "linux")]
 mod verification;
 pub(crate) mod worker_threads;
+// Staged private coordination foundation; not a worker/global drain receipt.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod worker_bootstrap;
+#[cfg(target_os = "linux")]
+mod worker_child;
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod worker_control;
+pub(crate) mod worker_drain;
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod worker_owner;
+#[cfg_attr(not(test), allow(dead_code))]
+mod worker_protocol;
+pub(crate) mod worker_stop;
 
 use anyhow::Context;
 
@@ -452,6 +470,56 @@ pub fn split_and_run(
         transport::session_manager::LoginEndedReports,
     ) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    split_with_clients(
+        config,
+        false,
+        |channels, auth, config, _control| spawner::worker_clients(channels, auth, config),
+        move |(spawner, auth, login_ends)| {
+            run_worker(spawner, auth, login_ends)?;
+            Ok(None)
+        },
+    )
+}
+
+/// Staged system-worker entry. The parent unified control pump is separate;
+/// this local outcome alone never certifies native/PAM/service completion.
+pub(crate) fn split_and_run_owned(
+    config: HelperConfig,
+    run_worker: impl FnOnce(
+        spawner::HelperChannelSpawner,
+        spawner::HelperAuth,
+        transport::session_manager::LoginEndedReports,
+        worker_stop::WorkerContext,
+    ) -> anyhow::Result<worker_drain::WorkerDrainOutcome>,
+) -> anyhow::Result<()> {
+    split_with_clients(
+        config,
+        true,
+        |channels, auth, config, control| {
+            // Executed only in the post-fork child, before any auxiliary starts.
+            let stop = worker_stop::WorkerStop::default();
+            let context = worker_stop::WorkerContext::new(stop.clone(), control)?;
+            let (spawner, auth, reports) =
+                spawner::worker_clients_with_stop(channels, auth, config, stop)?;
+            Ok((spawner, auth, reports, context))
+        },
+        move |(spawner, auth, reports, context)| {
+            run_worker(spawner, auth, reports, context).map(Some)
+        },
+    )
+}
+
+fn split_with_clients<T>(
+    config: HelperConfig,
+    owned: bool,
+    make_clients: impl FnOnce(
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        &HelperConfig,
+        Option<(std::os::unix::net::UnixStream, u32)>,
+    ) -> anyhow::Result<T>,
+    run_worker: impl FnOnce(T) -> anyhow::Result<Option<worker_drain::WorkerDrainOutcome>>,
+) -> anyhow::Result<()> {
     // A multi-threaded `fork` leaves the child holding locks -- the
     // allocator's among them -- that nobody in it will ever release, since
     // the thread that held them does not exist there. Refusing outright,
@@ -471,6 +539,26 @@ pub fn split_and_run(
              else in the process starts a thread"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    struct PreparedOwned {
+        worker: worker_bootstrap::Prepared,
+        adoption: server::AdoptionRuntime,
+    }
+    #[cfg(target_os = "linux")]
+    let prepared = if owned {
+        // The dedicated helper must qualify before creating its first child.
+        // Pair the two owners so an owned worker can never lose this prerequisite.
+        let adoption = server::AdoptionRuntime::prepare()
+            .context("qualifying helper adopted-child custody before fork")?;
+        let worker = worker_bootstrap::Prepared::new(config.startup_timeout)
+            .context("qualifying owned worker split before fork")?;
+        Some(PreparedOwned { worker, adoption })
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = owned; // Existing local-only system profile, not native qualification.
 
     // Two seams, not one, each with a reader thread of its own on the
     // worker's side. The channel seam's demultiplexes replies, descriptors
@@ -499,6 +587,16 @@ pub fn split_and_run(
     // lock held by a thread that does not exist in it.
     match unsafe { nix::unistd::fork() }.context("splitting into helper and worker")? {
         nix::unistd::ForkResult::Parent { child } => {
+            // FIRST parent action: reserve exact child custody before even
+            // closing inherited endpoints or dropping fallible client captures.
+            #[cfg(target_os = "linux")]
+            let worker = prepared.map(|prepared| {
+                let worker = prepared.worker.parent(
+                    std::num::NonZeroU32::new(child.as_raw() as u32)
+                        .expect("fork returned a positive child PID"),
+                );
+                (worker, prepared.adoption)
+            });
             // The helper has no business with the network: drop the worker's
             // ends of both pairs here and let the worker own them alone.
             drop(worker_channels);
@@ -515,40 +613,87 @@ pub fn split_and_run(
             // invariant this whole split exists for is that the privileged
             // process holds no network descriptor at all.
             drop(run_worker);
+            drop(make_clients);
+            #[cfg(target_os = "linux")]
+            if let Some((worker, adoption)) = worker {
+                server::run_with_owned_worker(
+                    helper_channels,
+                    helper_auth,
+                    config,
+                    helper_log,
+                    worker,
+                    adoption,
+                )
+            }
             server::run_with_diagnostics(helper_channels, helper_auth, config, helper_log)
         }
         nix::unistd::ForkResult::Child => {
-            drop(helper_channels);
-            drop(helper_auth);
-            drop(helper_log);
-            crate::log::use_worker_relay(worker_log)
-                .context("releasing the worker's privileged log descriptor")?;
-
-            // Armed once now, right after the fork, and again after the
-            // drop below -- see `arm_and_verify_pdeathsig`'s docs and this
-            // module's for why both, and why `SIGKILL`.
-            arm_and_verify_pdeathsig(helper_pid)?;
-
-            // The half that parses everything a stranger sends must not
-            // stay root. Dropped here, as early as possible -- before the
-            // spawner, before any thread, before the tokio runtime
-            // `run_worker` builds -- rather than deferred until the worker
-            // is already doing real work.
-            drop_worker_privileges(&config.worker_user)
-                .context("dropping the worker's privileges")?;
-
-            // The drop above just cleared the arming above -- `prctl(2)`
-            // documents `PR_SET_PDEATHSIG` as cleared by a change to the
-            // effective user or group id -- so it is redone here, not
-            // merely reasserted once at the top.
-            arm_and_verify_pdeathsig(helper_pid)?;
-
-            // Handed `config` -- the very settings the helper runs with on
-            // the other side of this fork. No test sees which settings this
-            // line passes (see `worker_clients`); it is the only one in scope.
-            let (spawner, auth, login_ends) =
-                spawner::worker_clients(worker_channels, worker_auth, &config)?;
-            run_worker(spawner, auth, login_ends)
+            #[cfg(target_os = "linux")]
+            let mut publisher = prepared.map(|prepared| {
+                // No helper adoption state belongs to the worker. Close its
+                // inherited owned proc handles before the mandatory FD sweep;
+                // leaving them to later Drop could close a reused descriptor.
+                drop(prepared.adoption);
+                prepared.worker.child()
+            });
+            // Retain private publication outside all fallible initialization.
+            let initialized = (|| {
+                drop(helper_channels);
+                drop(helper_auth);
+                drop(helper_log);
+                arm_and_verify_pdeathsig(helper_pid)?;
+                #[cfg(target_os = "linux")]
+                let control = match publisher.as_mut() {
+                    Some(publisher) => {
+                        // Full private stage precedes log setup, privilege-drop/
+                        // NSS and every descendant-producing action.
+                        publisher.establish()?;
+                        Some((publisher.reader()?, helper_pid.as_raw() as u32))
+                    }
+                    None => None,
+                };
+                #[cfg(not(target_os = "linux"))]
+                let control = None;
+                crate::log::use_worker_relay(worker_log)
+                    .context("releasing the worker's privileged log descriptor")?;
+                drop_worker_privileges(&config.worker_user)
+                    .context("dropping the worker's privileges")?;
+                // Credential changes clear PDEATHSIG; restore exact parent
+                // protection before constructing any auxiliary thread.
+                arm_and_verify_pdeathsig(helper_pid)?;
+                let clients = make_clients(worker_channels, worker_auth, &config, control)?;
+                run_worker(clients)
+            })();
+            #[cfg(target_os = "linux")]
+            if let Some(publisher) = publisher.as_mut() {
+                return match initialized {
+                    Ok(Some(outcome)) => publisher.finish(outcome),
+                    Ok(None) => {
+                        let _ = publisher.init_failed(nix::libc::ECANCELED);
+                        anyhow::bail!("owned worker returned without its retained completion")
+                    }
+                    Err(error) => {
+                        let errno = error
+                            .downcast_ref::<std::io::Error>()
+                            .and_then(std::io::Error::raw_os_error)
+                            .or_else(|| {
+                                error
+                                    .downcast_ref::<nix::errno::Errno>()
+                                    .map(|errno| *errno as i32)
+                            })
+                            .filter(|errno| *errno > 0)
+                            .unwrap_or(nix::libc::ECANCELED);
+                        if let Err(publication) = publisher.init_failed(errno) {
+                            crate::log::warn("worker", &format!("worker initialization outcome could not be delivered: {publication:#}"));
+                        }
+                        Err(error)
+                    }
+                };
+            }
+            match initialized? {
+                Some(outcome) => outcome.into_result(),
+                None => Ok(()),
+            }
         }
     }
 }
