@@ -198,7 +198,7 @@ fn child_process() {
         write_fd(libc::STDOUT_FILENO, &renderer.render(&source.frame()));
         if case == "suspended" {
             write_fd(libc::STDOUT_FILENO, &renderer.finish());
-            raw.suspend();
+            raw.suspend().unwrap();
         }
     }
     write_fd(libc::STDOUT_FILENO, READY.as_bytes());
@@ -211,7 +211,7 @@ fn child_process() {
         assert!(raw.alternate_screen());
         write_fd(libc::STDOUT_FILENO, WORKER_DONE.as_bytes());
         write_fd(libc::STDOUT_FILENO, &renderer.finish());
-        raw.restore();
+        raw.restore().unwrap();
         std::process::exit(0);
     }
     let _stdout_lock = std::io::stdout().lock();

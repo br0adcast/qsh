@@ -1435,17 +1435,8 @@ fn interactive(
 ) -> (i32, Links) {
     let out_fd = std::io::stdout().as_raw_fd();
 
-    // Signal handlers first: they ask the user nothing, so the ordering
-    // rule above does not apply to them, and installing them here means a
-    // failure is reported while the terminal is still completely untouched
-    // -- rather than after `RawMode::enter` has already put it in raw mode,
-    // where the message itself would come out with no line-ending
-    // translation.
-    if let Err(e) = signals::install() {
-        eprintln!("qsh: could not install signal handlers: {e}");
-        return (1, links);
-    }
-
+    // Common handlers were installed before login. RawMode owns the deferred
+    // TSTP policy and installs it before changing terminal modes.
     tty::RawMode::install_panic_hook();
     let raw = match tty::RawMode::enter(std::io::stdin().as_raw_fd()) {
         Ok(r) => r,
@@ -1539,9 +1530,17 @@ fn interactive(
             // the kernel does not stop comes straight back all the same.
             let _ = stdout.write_all(&sess.suspend());
             let _ = stdout.flush();
-            raw.suspend();
+            if let Err(error) = raw.suspend() {
+                log::error(&format!(
+                    "could not restore terminal before stopping: {error}"
+                ));
+                break 1;
+            }
             log::log("stopping (SIGTSTP)");
-            signals::stop();
+            if let Err(error) = raw.stop() {
+                log::error(&format!("could not complete terminal stop: {error}"));
+                break 1;
+            }
             log::log("continued");
             let later = signals::take_pending();
             pending.resized |= later.resized;
@@ -1559,10 +1558,11 @@ fn interactive(
             // terminal that echoes and buffers by line is not the way back,
             // so raw mode, the alternate screen (when the stop left it), the
             // mirrored modes, and the screen all need restoring first.
-            // Nothing to do but log a failure: the repaint below is still
-            // worth attempting, and the terminal is busy with a picture.
+            // An unconfirmed terminal transition cannot continue painting
+            // or reenter raw mode under a foreground/default stop policy.
             if let Err(e) = raw.reenter() {
-                log::log(&format!("could not restore raw mode: {e}"));
+                log::error(&format!("could not restore raw mode: {e}"));
+                break 1;
             }
             events.push(UiEvent::Resumed);
         }
@@ -1716,11 +1716,17 @@ fn interactive(
 
     // The terminal first: `close` joins the driver thread, and every
     // millisecond of that join is a millisecond the user's terminal is still
-    // in raw mode for no reason. Restoring costs nothing and cannot fail in
-    // a way that would stop the close. It switches back to the terminal's
+    // in raw mode for no reason. A restoration error sets a failure exit;
+    // driver cleanup still follows. It switches back to the terminal's
     // own screen, so every line printed from here on stays there.
     input.stop();
-    raw.restore();
+    let code = match raw.restore() {
+        Ok(()) => code,
+        Err(error) => {
+            eprintln!("qsh: could not restore terminal: {error}");
+            1
+        }
+    };
     for notice in &notices {
         eprintln!("{notice}");
     }
