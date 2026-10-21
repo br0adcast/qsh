@@ -57,7 +57,7 @@ pub const PATH_DOWN_AFTER: Duration = Duration::from_secs(3);
 /// toward this: the driver treats a thread freeze as a rebind/resume and
 /// restarts the liveness window (see `driver_std` and [`Connection::request_ping`]),
 /// so a phone that was asleep hot-migrates over UDP instead of slowly reconnecting.
-const CLIENT_DEATH_AFTER: Duration = Duration::from_secs(45);
+pub(crate) const CLIENT_DEATH_AFTER: Duration = Duration::from_secs(45);
 
 /// Server session lifetime: how long the server keeps a SILENT session alive and
 /// routable, so a returning client (a hot-roam over UDP, or a warm reattach by
