@@ -50,6 +50,8 @@ jobs:
         run: |
           bash scripts/qualify-darwin-direct-child.sh
           bash scripts/qualify-darwin-native-primitives.sh
+      - name: Inventory existing Darwin kernel artifact metadata
+        run: python3 scripts/inspect-darwin-kernel-artifacts.py
       - name: Install the toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Verify qualified compiler
