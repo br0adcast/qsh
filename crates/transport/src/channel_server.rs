@@ -1880,6 +1880,10 @@ pub async fn run_channel_session_with(
     let mut control_overflow_logged = false;
     // A protocol failure stops further application input for this attachment.
     let mut unsupported_control = false;
+    let mut retiring = false;
+    // Sticky only within this exact attachment. Removing a job is not proof
+    // that its decision was published; epoch/registry cancellation may drop it.
+    let mut decisions_complete = true;
     // The client's terminal type, once it says: every channel opened after
     // that is spawned with it. `None` until then, and for a client that
     // never says at all -- the spawner decides what to do with that.
@@ -1904,7 +1908,14 @@ pub async fn run_channel_session_with(
         let mut control_blocked = false;
         let mut applied = 0;
         let mut consumed = 0;
-        if !unsupported_control {
+        if io.retiring() {
+            retiring = true;
+            let discarded = control_buf.reset();
+            if discarded != 0 {
+                io.consumed(CONTROL_STREAM, discarded);
+            }
+        }
+        if !unsupported_control && !retiring {
             for _ in 0..crate::channel_timeline::ORDINARY_ENTRIES {
                 let raw = match control_buf.peek() {
                     Ok(Some(raw)) => raw,
@@ -2021,7 +2032,7 @@ pub async fn run_channel_session_with(
                     _ = std::future::ready(()), if more_control => Wakeup::ControlReady,
                     _ = &mut capacity_changed, if control_blocked => Wakeup::CapacityReady,
                     about = next_about(&mut update.about) => Wakeup::About(about),
-                    ev = io.recv() => Wakeup::Inbound(ev),
+                    ev = io.recv(), if !retiring => Wakeup::Inbound(ev),
                     c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
                     _ = ack_tick.tick() => Wakeup::AckTick,
                     _ = producer.ready.notified() => Wakeup::OutputReady,
@@ -2102,6 +2113,7 @@ pub async fn run_channel_session_with(
                     break;
                 }
                 producer.attachment = context;
+                decisions_complete = true;
                 // A cold attachment has no retained lifecycle inventory.
                 update.retry_announcement(&io);
             }
@@ -2112,6 +2124,7 @@ pub async fn run_channel_session_with(
                 }
                 opening.clear(); // Drop cancels; registry custody survives until proof.
                 producer.attachment = context;
+                decisions_complete = true;
                 // A new connection's control stream starts from its first
                 // byte: nothing half-read on the old one carries over.
                 let old_input = control_buf.reset();
@@ -2245,6 +2258,7 @@ pub async fn run_channel_session_with(
                     }
                 }
             }
+            Wakeup::Inbound(None) if io.retiring() => retiring = true,
             Wakeup::Inbound(None) => break,
             Wakeup::ChannelOut(Some((stream, instance, Some(chunk)))) => {
                 if let Some(ch) = channels
@@ -2311,18 +2325,21 @@ pub async fn run_channel_session_with(
                     update.pending_announcement = None;
                 }
                 opening.retain(|_, job| {
-                    signal.phase == RestartPhase::Idle
-                        && job.request().identity.invalidation_epoch == signal.invalidation_epoch
+                    let keep = signal.phase == RestartPhase::Idle
+                        && job.request().identity.invalidation_epoch == signal.invalidation_epoch;
+                    if !keep && job.request().identity.generation == producer.attachment.generation
+                    {
+                        decisions_complete = false;
+                    }
+                    keep
                 });
                 match signal.phase {
                     RestartPhase::Idle => {}
                     RestartPhase::Announced => {
-                        opening.clear();
                         update.announce(&io, signal.restart);
                         update.join(signal.restart);
                     }
                     RestartPhase::Draining => {
-                        opening.clear();
                         // A client about to lose its channels hears why first,
                         // even if the announcement itself was coalesced away.
                         update.announce(&io, signal.restart);
@@ -2356,7 +2373,7 @@ pub async fn run_channel_session_with(
                 update.confirm_released(restart);
             }
         }
-        complete_opens(
+        decisions_complete &= complete_opens(
             &io,
             &mut channels,
             &mut opening,
@@ -2365,6 +2382,12 @@ pub async fn run_channel_session_with(
             &producer,
             &mut reaps,
         );
+        if retiring && opening.is_empty() {
+            // This marker follows settled Open jobs, with explicit decision
+            // completeness. Actual cleanup below remains independently owned.
+            io.retirement_ready(producer.attachment, decisions_complete);
+            break;
+        }
         let mut finished = Vec::new();
         for (&stream, ch) in channels.iter_mut() {
             // Failure and pending ownership must come from ONE snapshot: a
@@ -2760,17 +2783,22 @@ fn open_channel_async(
             return;
         }
     };
-    let job = match admit_prepared_open(prepared, update, &context.opens.registry) {
-        Ok(job) => job,
-        Err(reason) => {
-            let reason = if reason == crate::channel_open::OpenRefusal::Restarting {
-                "the daemon is restarting"
-            } else {
-                "too many pending channels"
-            };
-            reserved_refusal(io, stream, reason.into(), context.attachment, response);
-            return;
-        }
+    let admitted =
+        io.admit_effect(|| admit_prepared_open(prepared, update, &context.opens.registry));
+    let job = match admitted {
+        Err(()) => return,
+        Ok(result) => match result {
+            Ok(job) => job,
+            Err(reason) => {
+                let reason = if reason == crate::channel_open::OpenRefusal::Restarting {
+                    "the daemon is restarting"
+                } else {
+                    "too many pending channels"
+                };
+                reserved_refusal(io, stream, reason.into(), context.attachment, response);
+                return;
+            }
+        },
     };
     // Capacity and identity are charged before scheduling any blocking work.
     if executor.submit(&job).is_err() {
@@ -2804,7 +2832,8 @@ fn complete_opens(
     update: &SessionUpdate,
     context: &ProducerContext,
     reaps: &mut ReapSet,
-) {
+) -> bool {
+    let mut decisions_complete = true;
     // At most MAX_CHANNELS jobs can be active or unresolved in this session.
     let completed: Vec<_> = opening
         .iter()
@@ -2822,7 +2851,13 @@ fn complete_opens(
         let request = job.request();
         let identity = request.identity;
         let req = request.request.clone();
-        if identity.generation != context.attachment.generation || channels.contains_key(&stream) {
+        if identity.generation != context.attachment.generation {
+            // The old attachment was deliberately superseded, not a missing
+            // decision of the current attachment.
+            continue;
+        }
+        if channels.contains_key(&stream) {
+            decisions_complete = false;
             continue;
         }
         match outcome {
@@ -2834,10 +2869,13 @@ fn complete_opens(
                 // follows this epoch check without awaiting another loop turn.
                 if current {
                     reserved_refusal(io, stream, reason, context.attachment, response);
+                } else {
+                    decisions_complete = false;
                 }
             }
             crate::channel_open::OpenOutcome::Ready(channel) => {
                 let Some(adopted) = job.try_adopt(channel) else {
+                    decisions_complete = false;
                     continue;
                 };
                 let Some(installation) =
@@ -2854,16 +2892,32 @@ fn complete_opens(
                             context.attachment,
                             response,
                         );
+                    } else {
+                        decisions_complete = false;
                     }
                     continue;
                 };
                 let Ok(epoch) = update.idle_epoch_guard() else {
+                    decisions_complete = false;
                     continue;
                 };
-                let committed = adopted.commit(&epoch, &identity, installation);
+                let committed = io.admit_effect(|| adopted.commit(&epoch, &identity, installation));
                 // Installation is now owned by the session. Backend callbacks and
                 // bridge scheduling must not hold up restart publication.
                 drop(epoch);
+                let committed = match committed {
+                    Ok(committed) => committed,
+                    Err(()) => {
+                        reserved_refusal(
+                            io,
+                            stream,
+                            "the login ended".into(),
+                            context.attachment,
+                            response,
+                        );
+                        continue;
+                    }
+                };
                 if let Some(bridges) = committed {
                     // The response owner remains outside guarded commit so a
                     // failed installation cannot wake budget waiters under the
@@ -2874,10 +2928,13 @@ fn complete_opens(
                         .producer
                         .terminal_response = Some(terminal);
                     start_installed(io, channels, chan_out_tx, bridges, context, reaps, response);
+                } else {
+                    decisions_complete = false;
                 }
             }
         }
     }
+    decisions_complete
 }
 
 struct PendingOpen {

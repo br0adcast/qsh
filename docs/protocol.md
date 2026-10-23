@@ -875,15 +875,18 @@ and counting payload alone would under-account by orders of magnitude.
 Crossing `EARLY_DATA_MAX` refuses the whole connection rather than dropping
 the excess.
 
-Nothing that arrives during probation is lost. The probation task does not
-read its datagram queue while a record is being verified (the verifier runs
+Within the existing bounds, data accepted from the handshake source during
+probation is retained. Other-source datagrams pumped before admission are
+discarded (§5). The probation task does not read its datagram queue while a
+record is being verified (the verifier runs
 off the task), and after the verdict the manager still needs a turn of its
 loop to bind the connection. So the queue goes with the connection: a cold
 create adopts the provisional route and its queue as the bridge's own, and
 the bridge reads them in order; a warm reattach empties the queue into the
 `Attach` it hands the running bridge, which runs those datagrams through the
-new connection before reading anything else. A road check sent while the
-proof is verified is answered.
+new connection before reading anything else. These queued datagrams are
+processed after committed adoption lifts the source binding, so normal
+admitted roaming applies then. A queued road check can be answered then too.
 
 Each pending admission holds a bounded observation of its token's binding
 revision. Effective create, replacement, reattachment, and terminal deletion
@@ -942,6 +945,15 @@ channel evidence; it does not revive an ended channel. Ordered snapshots,
 geometry, buffered output and final Exit retain their existing meanings.
 
 ### Shared recovery handshakes
+
+Shared recovery requires `auth-accepted` in addition to the caller's configured
+feature minimum, before Live, proof production or queued application output.
+A responder missing it is an authenticated protocol rejection for that exact
+candidate, not evidence of admission or failure of every endpoint. Ordinary
+single-endpoint transport-only profiles may still negotiate without the bit;
+shared recovery does not infer acceptance from msg2, DATA, PONG or geometry.
+The offered feature set and the configured minimum for later ordinary starts
+remain unchanged.
 
 A recovery attempt uses one Noise initiator, client socket, session token and
 expected server key across its complete eligible physical endpoint catalog.
@@ -1151,8 +1163,19 @@ back for.
 address pair, so changing address is not an event the protocol has to
 negotiate — it is something the server notices and follows.
 
-A datagram arriving from an address that is not the current peer moves the
-session only if **all** of these hold:
+A daemon connection still in probation is pinned to the source of its
+accepted handshake. A transport datagram from another source is discarded
+before AEAD, replay/liveness updates, key confirmation or frame handling,
+including a direct probe answer. Repeated probation setup cannot retarget
+this binding. Completing probation from a new source requires a fresh
+handshake; this does not blacklist any address or prevent fresh all-address
+attempts.
+Only committed bridge adoption (new session or warm attach) lifts the binding,
+before processing traffic queued during verification. A proof that verifies
+but is rejected at the binding/revision checks does not lift it.
+
+After that admission, a datagram arriving from an address that is not the
+current peer moves the session only if **all** of these hold:
 
 1. the header's `session_id` matches this connection's;
 2. the AEAD decrypts — with this session's keys, this counter as the nonce
@@ -2542,10 +2565,11 @@ new handshake's hash, and the daemon that checks it is the one holding
 
 ### 9.6 What a change of address can and cannot do
 
-Because the address is not an authenticator, in either direction. The seven
-conditions in §5 are the whole story, and the decisive ones are the second,
-third and fourth: the datagram must decrypt under this session's keys, with
-its own counter as the nonce and the associated data of §1.1; it must
+After committed admission, the address is not an authenticator in either
+direction. The seven roaming conditions in §5 apply, and the decisive ones
+are the second, third and fourth: the datagram must decrypt under this
+session's keys, with its own counter as the nonce and the associated data of
+§1.1; it must
 carry a counter above every counter seen so far; and it must not be a
 replay. (The first, a matching `session_id`, is in the clear and proves
 nothing on its own — it only says which session the sender is aiming at.)
@@ -2559,10 +2583,11 @@ original has already arrived and taken that counter, so the copy is a replay,
 **Against an on-path attacker it does not.** Say it plainly: someone who can
 *suppress* the original and forward the copy from their own address is not
 sending a replay — they are delivering a genuine, never-yet-seen datagram
-with a new maximum counter, from a new address. Every one of the seven
-conditions in `Connection::on_transport` is satisfied, and the server moves
-the session to them. There is no validation of the new path before the move —
-no equivalent of QUIC's `PATH_CHALLENGE` — and §9.2's own admission that an
+with a new maximum counter, from a new address. For an admitted connection,
+every one of the seven conditions in `Connection::on_transport` is satisfied,
+and the server moves the session to them. There is no validation of the new
+path before the move — no equivalent of QUIC's `PATH_CHALLENGE` — and §9.2's
+own admission that an
 on-path attacker can drop packets is exactly the capability this needs.
 
 What survives that is confidentiality and integrity: the attacker still
@@ -2575,12 +2600,21 @@ One more thing this deliberately does not defend against: when the peer
 genuinely does appear at a new address, the session follows it. That is the
 feature, and a NAT rebinding exercises it too.
 
-**What a peer can draw, and to where.** Every reply a daemon sends goes to
-the session's current peer address — the source of the latest datagram with
-a new maximum counter, as above. A peer that holds the session keys can
-therefore aim the replies at any address by forging its source, and this
-includes an unproven peer in probation (§9.7), whose Noise key is
-throwaway. So what one *frame* draws is kept small:
+**What a peer can draw, and to where.** Before committed admission, a
+daemon connection accepts transport only from its handshake's original
+source. A throwaway-key holder at another address cannot redirect its PONGs,
+ACKs, CREDITs, probe answers or subsequent timers by forging a new source.
+Existing immediate replies, delayed debt and timers remain addressed to the
+original source; the proof-start deadline remains five seconds. While a
+verification is awaited, probation does not pump transport. This is not a
+universal amplification ratio or return-reachability proof: initial handshake
+reflection and cookie/load policy remain as described in §2.7/§9.7.
+
+After admission, ordinary replies go to the current peer — the source of the
+latest new-maximum ordinary datagram — while probe answers go directly to
+the probe's source. A key-holding admitted peer can aim them at a forged
+source; new paths have no additional return-address challenge. What one
+*frame* draws is therefore still kept small:
 
 - a `PING` draws its `PONG` and at most one `CREDIT` — only for a stream
   whose sender may be stopped, the streams taking the copy in turn, each at

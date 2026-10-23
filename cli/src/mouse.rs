@@ -11,6 +11,8 @@
 //! each value plus 32). Pasted text is never rewritten: inside
 //! `ESC [ 200 ~` ... `ESC [ 201 ~` a report-shaped run is text.
 
+use crate::input_ingress::{InputBuilder, InputBytes};
+
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -29,7 +31,7 @@ pub struct MouseShift {
     /// `apply` and `strip` gets them. Without it the end of a large paste,
     /// split by a read inside `ESC [ 201 ~`, would leave `in_paste` set
     /// until the next paste, and no click would be moved up again.
-    held: Vec<u8>,
+    held: InputBytes,
 }
 
 /// One whole report at the start of a byte run.
@@ -83,7 +85,8 @@ impl MouseShift {
     /// Shift reports and discard coordinates outside the visible shell.
     /// Releases on the status line retain the ordinary drag-to-top behavior.
     pub fn apply_bounded(&mut self, input: &[u8], shift: u16, cols: u16, rows: u16) -> Vec<u8> {
-        self.apply_inside(input, shift, Some((cols, rows)))
+        self.apply_owned_bounded(InputBytes::unleased(input.to_vec()), shift, cols, rows)
+            .into_vec()
     }
 
     /// `bytes` with every mouse report moved up by `shift` rows: a press at
@@ -99,24 +102,40 @@ impl MouseShift {
     /// paste's text is then not kept from being moved, which is all it
     /// costs: the end marker still ends the paste.
     pub fn apply(&mut self, input: &[u8], shift: u16) -> Vec<u8> {
-        self.apply_inside(input, shift, None)
+        self.apply_inside(InputBytes::unleased(input.to_vec()), shift, None)
+            .into_vec()
     }
 
-    fn apply_inside(&mut self, input: &[u8], shift: u16, bounds: Option<(u16, u16)>) -> Vec<u8> {
+    pub(crate) fn apply_owned_bounded(
+        &mut self,
+        input: InputBytes,
+        shift: u16,
+        cols: u16,
+        rows: u16,
+    ) -> InputBytes {
+        self.apply_inside(input, shift, Some((cols, rows)))
+    }
+
+    fn apply_inside(
+        &mut self,
+        input: InputBytes,
+        shift: u16,
+        bounds: Option<(u16, u16)>,
+    ) -> InputBytes {
         let shift = u32::from(shift);
         let mut bytes = std::mem::take(&mut self.held);
-        bytes.extend_from_slice(input);
-        let mut out = Vec::with_capacity(bytes.len());
+        bytes.append(input);
+        let mut out = InputBuilder::default();
         let mut i = 0;
         while i < bytes.len() {
             let rest = &bytes[i..];
             if let Some(len) = self.paste_marker(rest) {
-                out.extend_from_slice(&rest[..len]);
+                out.original(&bytes, i..i + len);
                 i += len;
                 continue;
             }
             if self.unfinished(rest) && (self.in_paste || rest != b"\x1b[") {
-                self.held = rest.to_vec();
+                self.held = bytes.copy_range(i..bytes.len());
                 break;
             }
             if (shift > 0 || bounds.is_some()) && !self.in_paste {
@@ -139,18 +158,18 @@ impl MouseShift {
                         continue;
                     }
                     if r.y > shift {
-                        out.extend(r.at_row(r.y - shift));
+                        out.derived(&r.at_row(r.y - shift), &bytes, i..i + r.len);
                     } else if !r.is_press() {
-                        out.extend(r.at_row(1));
+                        out.derived(&r.at_row(1), &bytes, i..i + r.len);
                     }
                     i += r.len;
                     continue;
                 }
             }
-            out.push(bytes[i]);
+            out.original(&bytes, i..i + 1);
             i += 1;
         }
-        out
+        out.finish()
     }
 
     /// Input for a window: `bytes` without whole mouse reports and without
@@ -161,9 +180,14 @@ impl MouseShift {
     /// where it is the start of the end marker. A tail `apply` held goes in
     /// front of `bytes`.
     pub fn strip(&mut self, input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (bytes, tail) = self.strip_owned(InputBytes::unleased(input.to_vec()));
+        (bytes.into_vec(), tail.into_vec())
+    }
+
+    pub(crate) fn strip_owned(&mut self, input: InputBytes) -> (InputBytes, InputBytes) {
         let mut bytes = std::mem::take(&mut self.held);
-        bytes.extend_from_slice(input);
-        let mut out = Vec::with_capacity(bytes.len());
+        bytes.append(input);
+        let mut out = InputBuilder::default();
         let mut i = 0;
         while i < bytes.len() {
             let rest = &bytes[i..];
@@ -172,7 +196,7 @@ impl MouseShift {
                 continue;
             }
             if self.unfinished(rest) {
-                return (out, rest.to_vec());
+                return (out.finish(), bytes.copy_range(i..bytes.len()));
             }
             if self.in_paste {
                 i += 1;
@@ -182,17 +206,21 @@ impl MouseShift {
                 i += r.len;
                 continue;
             }
-            out.push(bytes[i]);
+            out.original(&bytes, i..i + 1);
             i += 1;
         }
-        (out, Vec::new())
+        (out.finish(), InputBytes::default())
     }
 
     /// Takes back an unfinished tail `strip` returned that its caller will
     /// not read (a window closed): it goes in front of the next bytes,
     /// whichever of `apply` and `strip` gets them.
-    pub fn hand_back(&mut self, mut tail: Vec<u8>) {
-        tail.append(&mut self.held);
+    pub fn hand_back(&mut self, tail: Vec<u8>) {
+        self.hand_back_owned(InputBytes::unleased(tail));
+    }
+
+    pub(crate) fn hand_back_owned(&mut self, mut tail: InputBytes) {
+        tail.append(std::mem::take(&mut self.held));
         self.held = tail;
     }
 

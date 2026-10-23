@@ -326,6 +326,32 @@ pub(crate) fn run(
     Ok(output)
 }
 
+fn outbound_error(error: client::channel::ChannelSendError) -> BringUpError {
+    use client::channel::ChannelSendError;
+    match error {
+        ChannelSendError::Full => BringUpError::Ssh(ssh::SshError::ResourceLimit(
+            "the SSH operation queue is full".into(),
+        )),
+        ChannelSendError::Gone => BringUpError::Ssh(ssh::SshError::Connect(
+            "the SSH operation queue is closed".into(),
+        )),
+        ChannelSendError::Protocol(error) => BringUpError::Ssh(ssh::SshError::Protocol(format!(
+            "the SSH channel profile failed: {error:?}"
+        ))),
+        error => BringUpError::InvalidRequest(format!(
+            "the SSH channel operation was refused: {error:?}"
+        )),
+    }
+}
+
+fn close_after_failure(sub: &mut dyn ChannelSubstrate, stream: u8) {
+    if let Err(error) = sub.close(stream) {
+        // Preserve the primary operation failure; actual worker teardown still
+        // belongs to the existing SSH connection owner, not this Close receipt.
+        log::debug!("cleanup channel Close refused after operation failure: {error:?}");
+    }
+}
+
 fn run_until_exit(
     sub: &mut dyn ChannelSubstrate,
     events: &Events,
@@ -346,17 +372,18 @@ fn run_until_exit(
         rows: 0,
         screen: false,
         command: shell::posix(script).into_bytes(),
-    });
+    })
+    .map_err(outbound_error)?;
     let started = Instant::now();
     loop {
         if cancel.is_cancelled() {
-            sub.close(stream);
+            close_after_failure(sub, stream);
             return Err(BringUpError::Ssh(ssh::SshError::Cancelled));
         }
         let event =
             events.recv_timeout(knock::SLICE.min(deadline.saturating_sub(started.elapsed())));
         if cancel.is_cancelled() {
-            sub.close(stream);
+            close_after_failure(sub, stream);
             return Err(BringUpError::Ssh(ssh::SshError::Cancelled));
         }
         match event {
@@ -370,7 +397,7 @@ fn run_until_exit(
                         Ok(Some(reason)) => return Err(lost(what, &reason)),
                         Ok(None) => {}
                         Err(error) => {
-                            sub.close(stream);
+                            close_after_failure(sub, stream);
                             return Err(error);
                         }
                     }
@@ -392,7 +419,7 @@ fn run_until_exit(
             }
         }
         if started.elapsed() > deadline {
-            sub.close(stream);
+            close_after_failure(sub, stream);
             return Err(BringUpError::EnsureFailed(format!(
                 "{what} did not finish within {} s",
                 deadline.as_secs()
@@ -449,18 +476,38 @@ mod tests {
     /// Records what `run` asks of the connection.
     #[derive(Default)]
     struct FakeSubstrate {
+        open_error: Option<client::channel::ChannelSendError>,
+        close_error: Option<client::channel::ChannelSendError>,
+        cancel_on_open: Option<knock::Cancel>,
         opened: Arc<Mutex<Vec<u8>>>,
         closed: Arc<Mutex<Vec<u8>>>,
     }
 
     impl ChannelSubstrate for FakeSubstrate {
-        fn open(&mut self, req: &OpenRequest) {
+        fn open(&mut self, req: &OpenRequest) -> Result<(), client::channel::ChannelSendError> {
+            if let Some(error) = self.open_error {
+                return Err(error);
+            }
             self.opened.lock().unwrap().push(req.stream);
+            if let Some(cancel) = &self.cancel_on_open {
+                cancel.cancel();
+            }
+            Ok(())
         }
-        fn send(&mut self, _: u8, _: &[u8]) {}
-        fn resize(&mut self, _: u8, _: u16, _: u16) {}
-        fn close(&mut self, ch: u8) {
+        fn send(&mut self, _: u8, _: &[u8]) -> Result<(), client::channel::ChannelSendError> {
+            Ok(())
+        }
+        fn resize(
+            &mut self,
+            _: u8,
+            _: u16,
+            _: u16,
+        ) -> Result<(), client::channel::ChannelSendError> {
+            Ok(())
+        }
+        fn close(&mut self, ch: u8) -> Result<(), client::channel::ChannelSendError> {
             self.closed.lock().unwrap().push(ch);
+            self.close_error.map_or(Ok(()), Err)
         }
         fn on_bytes(&mut self, _: u8, _: &[u8]) -> Vec<SubstrateEvent> {
             Vec::new()
@@ -916,5 +963,45 @@ mod tests {
         assert_eq!(out.code, 0);
         assert_eq!(out.stdout.len(), MAX_OUTPUT);
         assert!(out.stdout.iter().all(|b| *b == b'a'));
+    }
+    #[test]
+    fn client179_startup_refusal_is_immediate_and_cleanup_preserves_primary_error() {
+        use client::channel::ChannelSendError;
+        for error in [ChannelSendError::Full, ChannelSendError::Gone] {
+            let mut refused = FakeSubstrate {
+                open_error: Some(error),
+                ..Default::default()
+            };
+            let (result, _sender) = run_fed(
+                &mut refused,
+                Vec::new(),
+                Duration::from_secs(1),
+                &knock::Cancel::new(),
+            );
+            assert!(matches!(
+                (error, result),
+                (
+                    ChannelSendError::Full,
+                    Err(BringUpError::Ssh(ssh::SshError::ResourceLimit(_)))
+                ) | (
+                    ChannelSendError::Gone,
+                    Err(BringUpError::Ssh(ssh::SshError::Connect(_)))
+                )
+            ));
+            assert!(refused.opened.lock().unwrap().is_empty());
+            let cancel = knock::Cancel::new();
+            let mut cleanup = FakeSubstrate {
+                close_error: Some(error),
+                cancel_on_open: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let (result, _sender) =
+                run_fed(&mut cleanup, Vec::new(), Duration::from_secs(1), &cancel);
+            assert!(matches!(
+                result,
+                Err(BringUpError::Ssh(ssh::SshError::Cancelled))
+            ));
+            assert_eq!(*cleanup.closed.lock().unwrap(), vec![STREAM]);
+        }
     }
 }

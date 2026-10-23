@@ -97,6 +97,9 @@ pub enum NoAnswerWhy {
 /// How a qsh login went (steps 1 and 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectOutcome {
+    /// Local outbound admission failed; trying another key/transport cannot
+    /// replay a partially admitted operation safely.
+    LocalSendFailure,
     Connected,
     /// Explicit authenticated terminal server failure; no fallback is useful.
     SessionAborted {
@@ -198,6 +201,9 @@ pub struct Failure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GiveUp {
+    LocalSendFailure {
+        addr: usize,
+    },
     SessionAborted {
         addr: usize,
         reason: u8,
@@ -306,6 +312,9 @@ impl Ladder {
         match (self.step, outcome) {
             (Step::Over, _) => panic!("the ladder is over: nothing follows Connected or GiveUp"),
             (Step::Direct, Outcome::Direct(o)) => match o {
+                DirectOutcome::LocalSendFailure => {
+                    self.end(Action::GiveUp(GiveUp::LocalSendFailure { addr: self.at }))
+                }
                 DirectOutcome::Connected => self.end(Action::Connected {
                     addr: self.at,
                     port: self.addrs[self.at].qsh_port,
@@ -381,6 +390,9 @@ impl Ladder {
                 }
             },
             (Step::AfterSsh { port }, Outcome::Direct(o)) => match o {
+                DirectOutcome::LocalSendFailure => {
+                    self.end(Action::GiveUp(GiveUp::LocalSendFailure { addr: self.at }))
+                }
                 DirectOutcome::Connected => self.end(Action::Connected {
                     addr: self.at,
                     port,
@@ -996,6 +1008,30 @@ mod tests {
                 assert_eq!(
                     ladder.on(d(D::SessionAborted { reason: 1 })),
                     Action::GiveUp(GiveUp::SessionAborted { addr: 0, reason: 1 })
+                );
+            }
+        }
+    }
+    #[test]
+    fn client179_local_admission_failure_stops_keys_addresses_and_ssh() {
+        for background in [false, true] {
+            for after_ssh in [false, true] {
+                let addresses = vec![with_ssh("first.example"), with_ssh("second.example")];
+                let mut ladder = if background {
+                    Ladder::background(addresses, 0)
+                } else {
+                    Ladder::new(addresses)
+                };
+                if after_ssh {
+                    assert_eq!(ladder.on(d(D::Refused)), Action::TrySsh { addr: 0 });
+                    assert!(matches!(
+                        ladder.on(s(S::Ready { port: 60001 })),
+                        Action::TryDirectAfterSsh { .. }
+                    ));
+                }
+                assert_eq!(
+                    ladder.on(d(D::LocalSendFailure)),
+                    Action::GiveUp(GiveUp::LocalSendFailure { addr: 0 })
                 );
             }
         }

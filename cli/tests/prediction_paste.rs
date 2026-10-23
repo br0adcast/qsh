@@ -2,7 +2,7 @@
 mod support;
 
 use sha2::{Digest, Sha256};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -178,7 +178,32 @@ fn raw_and_bracketed_megabyte_pastes_arrive_with_adaptive_or_disabled_prediction
                 screen(&seen)
             );
             let deadline = Instant::now() + Duration::from_secs(20);
-            write_before(&mut client, &payload, deadline).expect("bounded PTY paste delivery");
+            if let Err(error) = write_before(&mut client, &payload, deadline) {
+                // Capture bounded fixture evidence before its temporary HOME and
+                // daemon are dropped. Do not hide an explicit input refusal
+                // behind the PTY writer's later deadline.
+                let log_tail = (|| -> io::Result<Vec<u8>> {
+                    let mut log = std::fs::File::open(config.path().join("qsh/log"))?;
+                    let start = log.metadata()?.len().saturating_sub(8192);
+                    log.seek(SeekFrom::Start(start))?;
+                    let mut tail = Vec::new();
+                    log.take(8192).read_to_end(&mut tail)?;
+                    Ok(tail)
+                })()
+                .unwrap_or_default();
+                let daemon_tail = {
+                    let output = daemon.output.lock().unwrap_or_else(|p| p.into_inner());
+                    String::from_utf8_lossy(&output[output.len().saturating_sub(4096)..])
+                        .into_owned()
+                };
+                panic!(
+                    "bounded PTY paste delivery {mode}/{bracketed}: {error}; screen: {}; \
+                     client log: {}; daemon: {}",
+                    screen(&seen),
+                    String::from_utf8_lossy(&log_tail),
+                    daemon_tail,
+                );
+            }
             assert!(
                 wait_before(deadline, || screen(&seen).contains("BUDGET-DONE-42")),
                 "paste {mode}/{bracketed}: {} daemon:{}",

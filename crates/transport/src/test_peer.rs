@@ -28,6 +28,9 @@ impl Binder for AnyNetwork {
 
 struct LiveSignal(Mutex<Sender<()>>);
 impl ClientEvents for LiveSignal {
+    fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, _: u8, _: Vec<u8>) {}
     fn on_state(&self, state: LinkState) {
         if state == LinkState::Live {
@@ -44,6 +47,9 @@ struct Chunks {
     live: Mutex<Sender<()>>,
 }
 impl ClientEvents for Chunks {
+    fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, _: u8, data: Vec<u8>) {
         let _ = self.chunks.lock().expect("chunks").send(data.len());
     }

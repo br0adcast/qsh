@@ -758,6 +758,7 @@ impl Links {
                     self.replacement_at = Some(addr);
                 }
                 let (code, line) = match stop {
+                    Stop::LocalSendFailure { .. } => (1, self.round_line.take()),
                     Stop::SessionAborted { reason, .. } => {
                         (1, Some(crate::connect::abort_line_code(reason)))
                     }
@@ -775,11 +776,16 @@ impl Links {
                 // `Session` puts the terminal back the way any exit of its
                 // own does (`Terminate` is the one way to ask it to); only
                 // the code is this order's, not its 0.
-                let mut actions: Vec<Action> = sess
-                    .handle(UiEvent::Terminate, now_ms)
-                    .into_iter()
-                    .filter(|a| !matches!(a, Action::Exit(_)))
-                    .collect();
+                let mut actions = if matches!(stop, Stop::SessionGone { .. }) {
+                    sess.discard_pending_input()
+                } else {
+                    Vec::new()
+                };
+                actions.extend(
+                    sess.handle(UiEvent::Terminate, now_ms)
+                        .into_iter()
+                        .filter(|a| !matches!(a, Action::Exit(_))),
+                );
                 actions.push(Action::Exit(code));
                 actions
             }
@@ -1214,38 +1220,48 @@ fn apply_actions(
                 }
             }
             channel_action => {
-                // Between two connections there is no channel to drive:
-                // `Session` asks for nothing then (and drops what is typed
-                // after `Ctrl-] r` in the same read).
                 let Some(live) = links.live.as_mut() else {
-                    log::log(&format!(
-                        "no link for {}; dropped",
-                        match &channel_action {
-                            Action::OpenShell { .. } => "opening the shell",
-                            Action::SendChannel { .. } => "input",
-                            _ => "a resize",
-                        }
+                    queue = VecDeque::from(sess.handle(
+                        UiEvent::InputFailure(session::LocalInputFailure::Channel(
+                            client::channel::ChannelSendError::NotReady,
+                        )),
+                        now_ms,
                     ));
                     continue;
                 };
-                match channel_action {
+                let result = match channel_action {
                     Action::OpenShell { cols, rows } => {
-                        match live.channel_session.open_shell(cols, rows) {
-                            Some(ch) => links.shell_channel = Some(ch),
-                            None => {
-                                notices.push(
-                                    "qsh: could not open shell channel: channel numbers exhausted"
-                                        .into(),
-                                );
-                                return Some(1);
-                            }
+                        live.channel_session.open_shell(cols, rows).map(|ch| {
+                            links.shell_channel = Some(ch);
+                            Vec::new()
+                        })
+                    }
+                    Action::SendChannel { ch, bytes } => live
+                        .channel_session
+                        .send(ch, &bytes)
+                        .map(|()| sess.input_admitted(ch, &bytes, now_ms)),
+                    Action::ResizeChannel { ch, cols, rows } => live
+                        .channel_session
+                        .resize(ch, cols, rows)
+                        .map(|_| Vec::new()),
+                    _ => unreachable!("every other action is handled above"),
+                };
+                match result {
+                    Ok(actions) => {
+                        // Admission's prediction/paint precedes the next
+                        // original action. The admitted prefix is never replayed.
+                        for action in actions.into_iter().rev() {
+                            queue.push_front(action);
                         }
                     }
-                    Action::SendChannel { ch, bytes } => live.channel_session.send(ch, &bytes),
-                    Action::ResizeChannel { ch, cols, rows } => {
-                        live.channel_session.resize(ch, cols, rows);
+                    Err(error) => {
+                        // Discard wholly unaccepted later fragments. Earlier
+                        // admitted writes already belong to the driver ledger.
+                        queue = VecDeque::from(sess.handle(
+                            UiEvent::InputFailure(session::LocalInputFailure::Channel(error)),
+                            now_ms,
+                        ));
                     }
-                    _ => unreachable!("every other action is handled above"),
                 }
             }
         }
@@ -1292,6 +1308,7 @@ fn channel_events(
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 *shell_channel = Some(ch);
                 actions.extend(sess.on_channel_ready(ch, now_ms()));
+                log::log(&format!("shell channel {ch} ready"));
             }
             SessionEvent::Announced { active, draining } => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
@@ -1318,6 +1335,14 @@ fn channel_events(
             SessionEvent::OutputContinuityLost { ch, cause, .. } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_output_gap(cause, now_ms()));
+            }
+            SessionEvent::SendFailure { error, .. } => {
+                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(sess.handle(
+                    UiEvent::InputFailure(session::LocalInputFailure::Channel(error)),
+                    now_ms(),
+                ));
+                return actions;
             }
             SessionEvent::ProtocolFailure(error) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
@@ -1410,17 +1435,8 @@ fn interactive(
 ) -> (i32, Links) {
     let out_fd = std::io::stdout().as_raw_fd();
 
-    // Signal handlers first: they ask the user nothing, so the ordering
-    // rule above does not apply to them, and installing them here means a
-    // failure is reported while the terminal is still completely untouched
-    // -- rather than after `RawMode::enter` has already put it in raw mode,
-    // where the message itself would come out with no line-ending
-    // translation.
-    if let Err(e) = signals::install() {
-        eprintln!("qsh: could not install signal handlers: {e}");
-        return (1, links);
-    }
-
+    // Common handlers were installed before login. RawMode owns the deferred
+    // TSTP policy and installs it before changing terminal modes.
     tty::RawMode::install_panic_hook();
     let raw = match tty::RawMode::enter(std::io::stdin().as_raw_fd()) {
         Ok(r) => r,
@@ -1514,9 +1530,17 @@ fn interactive(
             // the kernel does not stop comes straight back all the same.
             let _ = stdout.write_all(&sess.suspend());
             let _ = stdout.flush();
-            raw.suspend();
+            if let Err(error) = raw.suspend() {
+                log::error(&format!(
+                    "could not restore terminal before stopping: {error}"
+                ));
+                break 1;
+            }
             log::log("stopping (SIGTSTP)");
-            signals::stop();
+            if let Err(error) = raw.stop() {
+                log::error(&format!("could not complete terminal stop: {error}"));
+                break 1;
+            }
             log::log("continued");
             let later = signals::take_pending();
             pending.resized |= later.resized;
@@ -1534,31 +1558,18 @@ fn interactive(
             // terminal that echoes and buffers by line is not the way back,
             // so raw mode, the alternate screen (when the stop left it), the
             // mirrored modes, and the screen all need restoring first.
-            // Nothing to do but log a failure: the repaint below is still
-            // worth attempting, and the terminal is busy with a picture.
+            // An unconfirmed terminal transition cannot continue painting
+            // or reenter raw mode under a foreground/default stop policy.
             if let Err(e) = raw.reenter() {
-                log::log(&format!("could not restore raw mode: {e}"));
+                log::error(&format!("could not restore raw mode: {e}"));
+                break 1;
             }
             events.push(UiEvent::Resumed);
         }
         if pending.terminate {
             events.push(UiEvent::Terminate);
         }
-        match rx.recv_timeout(TICK) {
-            Ok(ev) => events.push(ev),
-            // The wait running out is not itself the tick -- see below.
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => events.push(UiEvent::Terminate),
-        }
-        // Scoop up whatever else is ALREADY queued, without waiting for it.
-        // A multi-packet delivery -- a repaint catching up on a long
-        // absence, in particular -- can land in this channel as several
-        // separate `Wire` events microseconds apart; batching them into one
-        // `events` Vec is what lets the accumulation below collapse them
-        // into one diff-paint instead of one per packet.
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
-        }
+        collect_ui_turn(&rx, &mut events);
         // A tick is due because time passed, not because the channel went
         // quiet. During a sustained burst of output (`yes`, a large `cat`, a
         // compile) `recv_timeout` never times out, and a tick derived from
@@ -1705,17 +1716,44 @@ fn interactive(
 
     // The terminal first: `close` joins the driver thread, and every
     // millisecond of that join is a millisecond the user's terminal is still
-    // in raw mode for no reason. Restoring costs nothing and cannot fail in
-    // a way that would stop the close. It switches back to the terminal's
+    // in raw mode for no reason. A restoration error sets a failure exit;
+    // driver cleanup still follows. It switches back to the terminal's
     // own screen, so every line printed from here on stays there.
     input.stop();
-    raw.restore();
+    let code = match raw.restore() {
+        Ok(()) => code,
+        Err(error) => {
+            eprintln!("qsh: could not restore terminal: {error}");
+            1
+        }
+    };
     for notice in &notices {
         eprintln!("{notice}");
     }
     display.physical = sess.physical_size();
     display.logical = sess.size();
     (code, links)
+}
+
+/// Collect receiver events in FIFO order after the current signal prefix.
+fn collect_ui_turn(rx: &Receiver<UiEvent>, events: &mut Vec<UiEvent>) {
+    const EXTERNAL_EVENTS: usize = 16;
+    let mut external = 0;
+    match rx.recv_timeout(TICK) {
+        Ok(ev) => {
+            events.push(ev);
+            external = 1;
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => events.push(UiEvent::Terminate),
+    }
+    // Keep consecutive output batched, with a finite turn even when producers
+    // keep filling the receiver. Signals and clock-derived Tick remain outside
+    // this external-event budget. Uncollected events retain their FIFO/custody.
+    for _ in external..EXTERNAL_EVENTS {
+        let Ok(ev) = rx.try_recv() else { break };
+        events.push(ev);
+    }
 }
 
 /// The input reader has one owner per interactive shell. Joining before cooked
@@ -1726,12 +1764,23 @@ struct InputReader {
 }
 impl InputReader {
     fn start(tx: Sender<UiEvent>) -> Self {
+        Self::start_fd(
+            tx,
+            std::io::stdin().as_raw_fd(),
+            qsh::input_ingress::IngressBudget::default(),
+        )
+    }
+
+    fn start_fd(
+        tx: Sender<UiEvent>,
+        stdin_fd: std::os::fd::RawFd,
+        budget: qsh::input_ingress::IngressBudget,
+    ) -> Self {
         let cancel = knock::Cancel::new();
         let stopped = cancel.clone();
         let thread = std::thread::spawn(move || {
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            let mut buf = [0u8; 4096];
-            while !stopped.is_cancelled() {
+            let mut buf = [0u8; qsh::input_ingress::READ_BYTES];
+            'reading: while !stopped.is_cancelled() {
                 let mut fd = libc::pollfd {
                     fd: stdin_fd,
                     events: libc::POLLIN,
@@ -1757,7 +1806,34 @@ impl InputReader {
                     }
                     break;
                 }
-                if tx.send(UiEvent::Stdin(buf[..n as usize].to_vec())).is_err() {
+                let input = loop {
+                    if stopped.is_cancelled() {
+                        break 'reading;
+                    }
+                    if let Ok(input) = budget.admit_slice(&buf[..n as usize]) {
+                        break input;
+                    }
+                    // Published after the complete preceding input prefix. No
+                    // read-ahead or newer Stdin publication can pass this fence.
+                    let (blocked, reply) =
+                        qsh::input_ingress::IngressBlocked::channel(budget.clone(), n as usize);
+                    if tx.send(UiEvent::IngressBlocked(blocked)).is_err() {
+                        break 'reading;
+                    }
+                    loop {
+                        if stopped.is_cancelled() {
+                            break 'reading;
+                        }
+                        // Keep the existing cancellation polling bound even
+                        // when the UI/Session still owns every ingress guard.
+                        match reply.recv_timeout(Duration::from_millis(20)) {
+                            Ok(true) => break,
+                            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'reading,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                };
+                if tx.send(UiEvent::Stdin(input)).is_err() {
                     break;
                 }
             }
@@ -1799,6 +1875,9 @@ fn set_stderr_aside(raw: &tty::RawMode) {
 mod tests {
     use super::*;
     include!("async_open_tests.rs");
+    include!("input_reader_tests.rs");
+    include!("input_action_tests.rs");
+    include!("input_turn_tests.rs");
 
     fn geometry_session() -> Session {
         geometry_session_with_cols(20)
@@ -1825,7 +1904,7 @@ mod tests {
     fn batched_output_flushes_before_geometry() {
         use transport::channel_geometry::{ChannelInstance, GeometryOutcome, GeometryRecord};
         use transport::shell_frame::{encode_shell, ShellRecord};
-        let mut channels = ChannelSession::new(QshSubstrate::new(|_, _| {}));
+        let mut channels = ChannelSession::new(QshSubstrate::new(|_, _| Ok(())));
         let ch = channels.open_shell(20, 5).unwrap();
         channels.on_event(client::channel::SubstrateEvent::Opened(ch));
         let initial = GeometryRecord {
@@ -1836,7 +1915,7 @@ mod tests {
             rows: 5,
         };
         channels.on_bytes(ch, &encode_shell(&ShellRecord::Geometry(initial)).unwrap());
-        channels.resize(ch, 40, 5);
+        channels.resize(ch, 40, 5).unwrap();
         let old = b"abcdefghijklmnopqrstu";
         let mut batch = encode_shell(&ShellRecord::Data(old.to_vec())).unwrap();
         batch.extend(
@@ -2247,6 +2326,58 @@ mod tests {
                 "duplicate Closed preserves the failure and notice"
             );
         }
+        // #179: the mandatory Result adaptation and post-admission failure
+        // must reach the same real executor before any same-batch Closed.
+        for failure in [
+            session::LocalInputFailure::Rejected(transport::driver_std::SendBlocked::Full),
+            session::LocalInputFailure::Rejected(transport::driver_std::SendBlocked::Gone),
+            session::LocalInputFailure::Accepted(
+                transport::driver_std::InputFailure::OffsetSpaceExhausted { stream_id: 30 },
+            ),
+        ] {
+            let event = || UiEvent::InputFailure(failure);
+            assert!(current_link_event(Some(8), 7, event()).is_none());
+            let mut sess = geometry_session();
+            let mut actions = sess.handle(event(), 0);
+            assert!(matches!(actions.last(), Some(Action::Exit(1))));
+            actions.extend(sess.handle(UiEvent::Link(LinkState::Closed), 0));
+            let mut stdout = Vec::new();
+            let mut notices = Vec::new();
+            assert_eq!(
+                apply_actions(actions, &mut stdout, &mut links, &mut sess, &mut notices, 0),
+                Some(1)
+            );
+            assert_eq!(notices.len(), 1);
+            assert!(notices[0].contains("input"));
+            assert!(sess.handle(event(), 1).is_empty());
+            let closed = sess.handle(UiEvent::Link(LinkState::Closed), 1);
+            assert_eq!(
+                apply_actions(closed, &mut stdout, &mut links, &mut sess, &mut notices, 1),
+                Some(1)
+            );
+            assert_eq!(notices.len(), 1);
+        }
+        // A Ready model cannot claim a send or prediction when its live
+        // execution target vanished before these actions were applied.
+        let budget = qsh::input_ingress::IngressBudget::default();
+        let mut sess = geometry_session();
+        sess.on_channel_ready(16, 0);
+        let actions = sess.handle(UiEvent::Stdin(budget.admit_slice(b"lost").unwrap()), 0);
+        let mut notices = Vec::new();
+        assert_eq!(
+            apply_actions(
+                actions,
+                &mut Vec::new(),
+                &mut links,
+                &mut sess,
+                &mut notices,
+                0
+            ),
+            Some(1),
+            "missing live target must reject explicitly, not silently discard"
+        );
+        assert_eq!(notices.len(), 1);
+        assert_eq!(budget.usage(), (0, 0, 0));
     }
 
     #[test]

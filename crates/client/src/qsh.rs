@@ -10,7 +10,8 @@ use input::Input;
 
 pub use crate::channel::ChannelProtocolError as QshProtocolError;
 use crate::channel::{
-    ChannelId, ChannelSubstrate, InputLimits, InputUsage, ResizeSemantics, SubstrateEvent,
+    ChannelId, ChannelSendError, ChannelSubstrate, InputLimits, InputUsage, ResizeSemantics,
+    SubstrateEvent,
 };
 use transport::channel::{
     decode_server, encode_client, ChannelCodecError, ClientRecord, OpenRequest, ServerRecord,
@@ -32,7 +33,7 @@ use transport::shell_frame::{decode_shell, ShellCodecError, ShellRecord};
 /// control records travel framed on [`CONTROL_STREAM`], and each channel's
 /// bytes travel framed (`Data`/`EchoAck`) on the stream that is the
 /// channel's own identity.
-pub struct QshSubstrate<F: FnMut(u8, Vec<u8>)> {
+pub struct QshSubstrate<F: FnMut(u8, Vec<u8>) -> Result<(), ChannelSendError>> {
     /// Where every outgoing frame is handed to, as `(stream, bytes)`.
     sink: F,
     protocol_error: Option<QshProtocolError>,
@@ -49,7 +50,7 @@ pub struct QshSubstrate<F: FnMut(u8, Vec<u8>)> {
     on_malformed_control: Box<dyn FnMut(&str) + Send>,
 }
 
-impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
+impl<F: FnMut(u8, Vec<u8>) -> Result<(), ChannelSendError>> QshSubstrate<F> {
     /// A fresh substrate with no channels open yet, handing every outgoing
     /// frame to `send` as `(stream, bytes)`.
     pub fn new(send: F) -> Self {
@@ -235,7 +236,9 @@ impl<F: FnMut(u8, Vec<u8>)> QshSubstrate<F> {
     }
 }
 
-impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
+impl<F: FnMut(u8, Vec<u8>) -> Result<(), ChannelSendError> + Send> ChannelSubstrate
+    for QshSubstrate<F>
+{
     fn input_usage(&self, ch: ChannelId) -> InputUsage {
         self.channels
             .get(&ch)
@@ -259,9 +262,9 @@ impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
         request_id: ResizeRequestId,
         cols: u16,
         rows: u16,
-    ) -> Result<(), QshProtocolError> {
+    ) -> Result<(), ChannelSendError> {
         if let Some(error) = self.protocol_error {
-            return Err(error);
+            return Err(error.into());
         }
         (self.sink)(
             CONTROL_STREAM,
@@ -272,8 +275,7 @@ impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
                 cols,
                 rows,
             }),
-        );
-        Ok(())
+        )
     }
     fn retire_channel(&mut self, ch: ChannelId) {
         self.end_channel(ch);
@@ -290,36 +292,43 @@ impl<F: FnMut(u8, Vec<u8>) + Send> ChannelSubstrate for QshSubstrate<F> {
         self.fail_protocol(error);
     }
 
-    fn open(&mut self, req: &OpenRequest) {
+    fn open(&mut self, req: &OpenRequest) -> Result<(), ChannelSendError> {
         (self.sink)(
             CONTROL_STREAM,
             encode_client(&ClientRecord::Open(req.clone())),
-        );
+        )
     }
 
     /// Channel input goes out raw, on the channel's own stream: the whole
     /// stream belongs to it, so it needs no envelope of its own.
-    fn send(&mut self, ch: ChannelId, data: &[u8]) {
-        (self.sink)(ch, data.to_vec());
+    fn send(&mut self, ch: ChannelId, data: &[u8]) -> Result<(), ChannelSendError> {
+        (self.sink)(ch, data.to_vec())
     }
 
-    fn announce_term(&mut self, term: &str) {
+    fn announce_term(&mut self, term: &str) -> Result<(), ChannelSendError> {
+        // An overlong optional name keeps the daemon default, as its decoder
+        // would; reject its size before allocating the encoded control record.
+        if term.len() > transport::channel::MAX_TERM_LEN {
+            return Ok(());
+        }
         (self.sink)(
             CONTROL_STREAM,
             encode_client(&ClientRecord::Term(term.to_string())),
-        );
+        )
     }
 
-    fn resize(&mut self, _ch: ChannelId, _cols: u16, _rows: u16) {
+    fn resize(&mut self, _ch: ChannelId, _cols: u16, _rows: u16) -> Result<(), ChannelSendError> {
         self.fail_protocol(QshProtocolError::UnsupportedProfile);
+        Err(QshProtocolError::UnsupportedProfile.into())
     }
 
-    fn close(&mut self, ch: ChannelId) {
+    fn close(&mut self, ch: ChannelId) -> Result<(), ChannelSendError> {
         (self.sink)(
             CONTROL_STREAM,
             encode_client(&ClientRecord::Close { stream: ch }),
-        );
+        )?;
         self.end_channel(ch);
+        Ok(())
     }
 
     /// The trait's inbound half, so a `ChannelSession` can own the only
@@ -360,11 +369,15 @@ mod tests {
     /// per outgoing frame, in order.
     type Sent = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
 
-    fn substrate() -> (QshSubstrate<impl FnMut(u8, Vec<u8>)>, Sent) {
+    type TestSink = Box<dyn FnMut(u8, Vec<u8>) -> Result<(), ChannelSendError> + Send>;
+    fn substrate() -> (QshSubstrate<TestSink>, Sent) {
         let sent: Sent = Arc::new(Mutex::new(Vec::new()));
         let s = sent.clone();
         (
-            QshSubstrate::new(move |stream, data| s.lock().unwrap().push((stream, data))),
+            QshSubstrate::new(Box::new(move |stream, data| {
+                s.lock().unwrap().push((stream, data));
+                Ok(())
+            }) as TestSink),
             sent,
         )
     }
@@ -382,8 +395,9 @@ mod tests {
             rows: 24,
             screen: true,
             command: Vec::new(),
-        });
-        sub.send(16, b"ls\r");
+        })
+        .unwrap();
+        sub.send(16, b"ls\r").unwrap();
 
         let sent = sent.lock().unwrap();
         assert_eq!(
@@ -406,7 +420,7 @@ mod tests {
     fn a_malformed_control_record_is_reported_not_silently_dropped() {
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let r = reports.clone();
-        let mut sub = QshSubstrate::new(|_, _| {})
+        let mut sub = QshSubstrate::new(|_, _| Ok(()))
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         // `0x20` is `REC_OPENED` (a known kind), whose payload must be
@@ -434,7 +448,7 @@ mod tests {
     fn an_unknown_control_record_kind_is_not_reported() {
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let r = reports.clone();
-        let mut sub = QshSubstrate::new(|_, _| {})
+        let mut sub = QshSubstrate::new(|_, _| Ok(()))
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         let unknown = encode_record(0x7f, b"a kind from a newer peer");
@@ -467,7 +481,7 @@ mod tests {
     fn a_control_overflow_is_reported_exactly_once() {
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let r = reports.clone();
-        let mut sub = QshSubstrate::new(|_, _| {})
+        let mut sub = QshSubstrate::new(|_, _| Ok(()))
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         let lie = control_overflow_lie();
@@ -504,7 +518,7 @@ mod tests {
     fn a_reset_link_lets_the_control_overflow_report_again() {
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let r = reports.clone();
-        let mut sub = QshSubstrate::new(|_, _| {})
+        let mut sub = QshSubstrate::new(|_, _| Ok(()))
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         let lie = control_overflow_lie();
@@ -527,7 +541,7 @@ mod tests {
     fn a_channel_overflow_is_reported_once_through_the_same_hook() {
         let reports: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let r = reports.clone();
-        let mut sub = QshSubstrate::new(|_, _| {})
+        let mut sub = QshSubstrate::new(|_, _| Ok(()))
             .on_malformed_control(move |msg| r.lock().unwrap().push(msg.to_string()));
 
         let mut lie = vec![0xffu8];
@@ -684,7 +698,7 @@ mod tests {
         let stray = encode_record(REC_DATA, b"first half second half");
         let split = stray.len() / 2;
         assert!(sub.on_stream(16, &stray[..split]).is_empty());
-        sub.close(16);
+        sub.close(16).unwrap();
 
         let fresh = encode_record(REC_DATA, b"brand new");
         assert_eq!(
@@ -814,7 +828,7 @@ mod geometry_profile_tests {
             ),
         ] {
             for split in 0..=bytes.len() {
-                let mut sub = QshSubstrate::new(|_, _| {});
+                let mut sub = QshSubstrate::new(|_, _| Ok(()));
                 let mut events = sub.on_stream(CONTROL_STREAM, &bytes[..split]);
                 events.extend(sub.on_stream(CONTROL_STREAM, &bytes[split..]));
                 assert_eq!(events, vec![expected.clone()]);
@@ -830,7 +844,7 @@ mod geometry_profile_tests {
         ]
         .concat();
         for split in 0..=bytes.len() {
-            let mut sub = QshSubstrate::new(|_, _| {});
+            let mut sub = QshSubstrate::new(|_, _| Ok(()));
             let mut events = sub.on_stream(16, &bytes[..split]);
             events.extend(sub.on_stream(16, &bytes[split..]));
             assert_eq!(
@@ -888,7 +902,7 @@ mod geometry_profile_tests {
             ]
             .concat();
             for split in 0..=bytes.len() {
-                let mut sub = QshSubstrate::new(|_, _| {});
+                let mut sub = QshSubstrate::new(|_, _| Ok(()));
                 let mut events = sub.on_stream(16, &bytes[..split]);
                 events.extend(sub.on_stream(16, &bytes[split..]));
                 assert_eq!(
@@ -911,7 +925,7 @@ mod geometry_profile_tests {
     }
     #[test]
     fn malformed_geometry_and_remote_protocol_error_are_explicit_and_terminal() {
-        let mut sub = QshSubstrate::new(|_, _| {});
+        let mut sub = QshSubstrate::new(|_, _| Ok(()));
         let error = QshProtocolError::Shell(ShellCodecError::Malformed);
         assert_eq!(
             sub.on_stream(16, &encode_record(REC_GEOMETRY, &[])),
@@ -940,7 +954,7 @@ mod geometry_profile_tests {
     }
     #[test]
     fn capacity_wire_about_unavailable_is_a_typed_daemon_result_not_silence() {
-        let mut substrate = QshSubstrate::new(|_, _| {});
+        let mut substrate = QshSubstrate::new(|_, _| Ok(()));
         let record =
             ServerRecord::AboutUnavailable(transport::channel::AboutUnavailable::ResourceExhausted);
         let bytes = transport::channel::encode_server(&record);

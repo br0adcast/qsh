@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Validated logical terminal geometry and bounded physical viewport geometry.
 //!
 //! Network boundaries should use [`TerminalSize::new`] to reject invalid sizes.

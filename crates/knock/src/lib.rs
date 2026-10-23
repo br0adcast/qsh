@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Port knocking: a short sequence of UDP datagrams and TCP connection
 //! attempts that makes a router open a port for this client's address.
 //!

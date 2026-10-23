@@ -1,0 +1,77 @@
+--- a/cargo-generate-rpm-0.21.0/src/config/mod.rs
++++ b/cargo-generate-rpm-0.21.0/src/config/mod.rs
+@@ -117,6 +117,17 @@
+             }
+         }
+         Ok(dependencies)
++    }
++
++    // Only unversioned file/package capabilities are supported by this metadata key.
++    fn table_to_post_dependencies(table: &Table) -> Result<Vec<Dependency>, ConfigError> {
++        table
++            .iter()
++            .map(|(name, value)| match value.as_str().map(str::trim) {
++                Some("" | "*") => Ok(Dependency::script_post(name)),
++                _ => Err(ConfigError::WrongDependencyVersion(name.clone())),
++            })
++            .collect()
+     }
+ 
+     pub fn create_rpm_builder(&self, cfg: BuilderConfig) -> Result<rpm::PackageBuilder, Error> {
+@@ -302,6 +313,12 @@
+             }
+         }
+ 
++        if let Some(requires_post) = metadata.get_table("requires-post")? {
++            for dependency in Self::table_to_post_dependencies(requires_post)? {
++                builder.requires(dependency);
++            }
++        }
++
+         let meta_aut_req = metadata.get_str("auto-req")?;
+         let auto_req = match (&cfg.args.auto_req, meta_aut_req) {
+             (crate::cli::AutoReqMode::Auto, Some("no" | "disabled")) => AutoReqMode::Disabled,
+@@ -452,6 +469,43 @@
+         let config = Config::new(std::env::current_dir().unwrap().as_path(), None, &[]).unwrap();
+         assert_eq!(config.manifest.package.unwrap().name, "cargo-generate-rpm");
+         assert_eq!(config.manifest_path, cargo_toml_path);
++    }
++
++    #[test]
++    fn test_post_dependencies_have_real_script_phase() {
++        let mut table = Table::new();
++        table.insert(
++            "/usr/bin/getent".to_string(),
++            Value::String("*".to_string()),
++        );
++        table.insert(
++            "/usr/sbin/useradd".to_string(),
++            Value::String("".to_string()),
++        );
++        assert_eq!(
++            Config::table_to_post_dependencies(&table).unwrap(),
++            vec![
++                Dependency::script_post("/usr/bin/getent"),
++                Dependency::script_post("/usr/sbin/useradd")
++            ]
++        );
++        for dependency in Config::table_to_post_dependencies(&table).unwrap() {
++            assert!(dependency.flags.contains(rpm::DependencyFlags::SCRIPT_POST));
++            assert_ne!(dependency.flags, rpm::DependencyFlags::ANY);
++            assert!(dependency.version.is_empty());
++        }
++    }
++
++    #[test]
++    fn test_post_dependencies_reject_unsupported_values() {
++        for value in [Value::String(">= 1".to_string()), Value::Integer(1)] {
++            let mut table = Table::new();
++            table.insert("tool".to_string(), value);
++            assert!(matches!(
++                Config::table_to_post_dependencies(&table),
++                Err(ConfigError::WrongDependencyVersion(name)) if name == "tool"
++            ));
++        }
+     }
+ 
+     #[test]

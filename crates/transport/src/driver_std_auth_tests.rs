@@ -10,6 +10,9 @@ enum Auth17WireEvent {
 
 struct Auth17WireEvents(Mutex<Sender<Auth17WireEvent>>);
 impl ClientEvents for Auth17WireEvents {
+    fn on_input_failure(&self, failure: crate::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, _: u8, _: Vec<u8>) {
         self.send(Auth17WireEvent::Bytes);
     }
@@ -155,6 +158,7 @@ impl Auth17WirePeer {
             DriverSetup {
                 default_consumption: consumption,
                 stream_consumption: vec![(AUTH_STREAM, Consumption::Explicit)],
+                input_budget: None,
             },
         );
         Self {

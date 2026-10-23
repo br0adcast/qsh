@@ -16,6 +16,7 @@ const POLL: Duration = Duration::from_millis(20);
 struct State {
     gate: RecoveryGate,
     revision: u64,
+    local_send_failure: bool,
     endpoints: Option<Vec<Option<SocketAddr>>>,
     ports: Vec<Option<u16>>,
     ssh: Option<(u64, knock::Cancel)>,
@@ -67,6 +68,7 @@ impl State {
     fn changed(&mut self, epoch: RecoveryEpoch) {
         self.cancel_ssh();
         self.revision += 1;
+        self.local_send_failure = false;
         self.qsh_activity.clear();
         self.observed_sweep = None;
         self.gate.reset(epoch);
@@ -81,6 +83,7 @@ impl Recovery {
             state: Mutex::new(State {
                 gate: RecoveryGate::new(epoch, (0..addresses).map(AddressId).collect()),
                 revision: 0,
+                local_send_failure: false,
                 endpoints: None,
                 ports: vec![None; addresses],
                 ssh: None,
@@ -165,8 +168,34 @@ impl Recovery {
         }
     }
 
+    /// Stop fallback for a current local admission refusal without invalidating
+    /// its terminal result. The same lock revokes any in-flight SSH publication.
+    pub fn local_send_failed(&self, revision: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || state.revision != revision {
+            return false;
+        }
+        state.local_send_failure = true;
+        state.qsh_activity.clear();
+        state.ssh_retry_at = None;
+        state.cancel_ssh();
+        true
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled()
+            || self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .local_send_failure
+    }
+
     pub fn begin_sweep(&self, sweep: SweepId) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || state.local_send_failure {
+            return;
+        }
         state.gate.begin_sweep(sweep);
         state.observed_sweep = Some(sweep);
         state.qsh_activity.clear();
@@ -181,7 +210,7 @@ impl Recovery {
         outcome: AddressOutcome,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.cancel.is_cancelled() || state.revision != revision {
+        if self.cancel.is_cancelled() || state.local_send_failure || state.revision != revision {
             return;
         }
         if epoch == self.epoch
@@ -201,7 +230,7 @@ impl Recovery {
 
     pub fn activity(&self) -> Activity {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let running = !self.cancel.is_cancelled();
+        let running = !self.cancel.is_cancelled() && !state.local_send_failure;
         Activity {
             qsh: if running {
                 let mut paths: Vec<_> = state
@@ -231,6 +260,7 @@ impl Recovery {
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.cancel.is_cancelled()
+            || state.local_send_failure
             || state.revision != revision
             || state.observed_sweep != Some(sweep)
             || address.0 >= state.ports.len()
@@ -280,7 +310,7 @@ impl Recovery {
 
     pub fn ssh_allowed(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !self.cancel.is_cancelled() && state.gate.ssh_allowed()
+        !self.cancel.is_cancelled() && !state.local_send_failure && state.gate.ssh_allowed()
     }
     pub fn retry_now(&self) {
         self.retry_now.store(true, Ordering::SeqCst);
@@ -310,7 +340,7 @@ impl Recovery {
 
     fn begin_ssh(&self) -> Option<SshAttempt> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.cancel.is_cancelled() || !state.gate.ssh_allowed() {
+        if self.cancel.is_cancelled() || state.local_send_failure || !state.gate.ssh_allowed() {
             return None;
         }
         state.cancel_ssh();
@@ -330,6 +360,7 @@ impl Recovery {
     fn publish_ready(&self, attempt: &SshAttempt, addr: usize, port: u16) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.cancel.is_cancelled()
+            || state.local_send_failure
             || attempt.cancel.is_cancelled()
             || attempt.epoch != self.epoch
             || state.revision != attempt.revision
@@ -366,7 +397,7 @@ impl Recovery {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .ssh_retry_at = Some(until);
-        while Instant::now() < until && !self.cancel.is_cancelled() {
+        while Instant::now() < until && !self.stopped() {
             if self.retry_now.swap(false, Ordering::SeqCst) {
                 break;
             }
@@ -692,6 +723,80 @@ mod tests {
             AddressOutcome::Failed,
         );
         assert!(r.begin_ssh().is_some());
+    }
+
+    #[test]
+    fn client179_local_refusal_retains_result_but_revokes_ssh_publication() {
+        let r = Recovery::new(EPOCH, 1);
+        let revision = r.revision();
+        r.begin_sweep(SweepId(1));
+        r.finish(
+            revision,
+            EPOCH,
+            SweepId(1),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        let ssh = r
+            .begin_ssh()
+            .expect("ordinary remote failure still admits SSH");
+        r.begin_sweep(SweepId(2));
+        assert!(r.local_send_failed(revision));
+        assert!(ssh.cancel.is_cancelled());
+        assert!(!r.publish_ready(&ssh, 0, 60002));
+        assert!(
+            !r.interrupted(revision),
+            "terminal result remains publishable"
+        );
+        assert_eq!(r.revision(), revision);
+        r.finish(
+            revision,
+            EPOCH,
+            SweepId(2),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        r.begin_sweep(SweepId(3));
+        r.finish(
+            revision,
+            EPOCH,
+            SweepId(3),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        assert!(!r.ssh_allowed());
+        assert!(r.begin_ssh().is_none());
+        assert!(!r.activity().ssh_allowed);
+        assert!(r.activity().qsh.is_empty());
+    }
+
+    #[test]
+    fn client179_stale_local_refusal_cannot_stop_replacement_revision() {
+        let r = Recovery::with_catalog(
+            EPOCH,
+            vec![AddressId(0)],
+            vec![(AddressId(0), "127.0.0.1:60001".parse().unwrap())],
+        );
+        let old = r.revision();
+        assert!(r.local_send_failed(old));
+        r.update_endpoints(
+            EPOCH,
+            vec![(AddressId(0), "127.0.0.2:60001".parse().unwrap())],
+        );
+        let current = r.revision();
+        r.begin_sweep(SweepId(2));
+        r.finish(
+            current,
+            EPOCH,
+            SweepId(2),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        let ssh = r.begin_ssh().unwrap();
+        assert!(!r.local_send_failed(old));
+        assert!(!ssh.cancel.is_cancelled());
+        assert!(r.publish_ready(&ssh, 0, 60002));
+        assert_eq!(r.port(0), Some(60002));
     }
 
     #[test]

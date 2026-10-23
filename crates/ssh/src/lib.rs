@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! SSH for the core: one connection, logged in, carrying channels for the
 //! session above it. Port knocking and the socket come from the core too,
 //! so the address that was knocked is the address connected to.

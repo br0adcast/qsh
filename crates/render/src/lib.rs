@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Turning a terminal frame into bytes for someone else's terminal.
 
 pub mod caps;

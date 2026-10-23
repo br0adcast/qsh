@@ -34,7 +34,7 @@ use crate::{keys, log, report, status, trust};
 mod shared_recovery;
 
 /// Where the substrate sends its bytes: the connection's `send_bytes`.
-pub type Sink = Box<dyn FnMut(u8, Vec<u8>) + Send>;
+pub type Sink = Box<dyn FnMut(u8, Vec<u8>) -> Result<(), client::channel::ChannelSendError> + Send>;
 
 /// What the connection trial hands `interactive`: the channel session it
 /// already built (and already used to open the shell channel -- see
@@ -116,6 +116,7 @@ pub struct Setup {
     ssh_dir: Option<PathBuf>,
     /// Which session on the server this run is coming back to.
     token: [u8; 16],
+    input_budget: transport::client_input_budget::ClientInputBudget,
     /// Loaded once per process, at the first step 1 whose server key is
     /// known -- discovered from an answer, or pinned from an earlier run --
     /// before its handshake: an address with no key to show must not make
@@ -161,6 +162,7 @@ impl Setup {
             agent,
             ssh_dir,
             token,
+            input_budget: transport::client_input_budget::ClientInputBudget::default(),
             candidates: Mutex::new(None),
             session_key: Mutex::new(None),
             weighed: Mutex::new(HashSet::new()),
@@ -185,6 +187,7 @@ impl Setup {
             agent: self.agent.clone(),
             ssh_dir: self.ssh_dir.clone(),
             token,
+            input_budget: self.input_budget.clone(),
             candidates: Mutex::new(self.cached_candidates()),
             session_key: Mutex::new(self.server_identity().map(|s| s.qsh_key)),
             weighed: Mutex::new(
@@ -198,6 +201,13 @@ impl Setup {
             // Only fresh SSH enrollment can restore this authentication path.
             allowlisted: Mutex::new(HashSet::new()),
             trust_write: Mutex::new(None),
+        }
+    }
+
+    fn attempt_scope(&self) -> attempt::AttemptScope {
+        attempt::AttemptScope {
+            token: self.token,
+            input_budget: self.input_budget.clone(),
         }
     }
 
@@ -754,6 +764,7 @@ impl<'a> Climb<'a> {
         use ::connect::reconnect::RoundEnd;
         if !self.background() {
             return match give_up {
+                GiveUp::LocalSendFailure { .. } => Climbed::Exit(1),
                 GiveUp::SessionAborted { reason, .. } => {
                     let line = attempt::abort_line_code(reason);
                     eprintln!("{line}");
@@ -781,6 +792,10 @@ impl<'a> Climb<'a> {
             };
         }
         match give_up {
+            GiveUp::LocalSendFailure { addr } => Climbed::Failed {
+                end: RoundEnd::LocalSendFailure { addr },
+                line: self.loud.take(),
+            },
             GiveUp::SessionAborted { addr, reason } => Climbed::Failed {
                 end: RoundEnd::SessionAborted { addr, reason },
                 line: Some(attempt::abort_line_code(reason)),
@@ -877,17 +892,27 @@ impl<'a> Climb<'a> {
         stage: Stage,
         cancel: &knock::Cancel,
     ) -> Result<(DirectOutcome, Option<String>), i32> {
-        use ::connect::recovery_gate::{AddressId, AddressOutcome};
+        use ::connect::recovery_gate::AddressId;
         if let (Some(recovery), Some((_, sweep))) = (self.recovery, self.recovery_attempt) {
             recovery.observe_qsh(self.revision, sweep, AddressId(i), None);
         }
         let result = self.direct_attempt(i, port, stage, cancel);
-        // Cancellation or a new SSH endpoint can interrupt a handshake. That
-        // is not a completed failed address in the sweep that started it.
+        if let Ok((outcome, _)) = &result {
+            self.account_direct(i, outcome.clone());
+        }
+        result
+    }
+
+    // Cancellation/new endpoints never count as a completed old failure. Local
+    // admission refusal terminates this revision without granting SSH credit.
+    fn account_direct(&self, i: usize, outcome: DirectOutcome) {
+        use ::connect::recovery_gate::{AddressId, AddressOutcome};
         if !self.interrupted() {
-            if let (Some(recovery), Some((epoch, sweep)), Ok((outcome, _))) =
-                (self.recovery, self.recovery_attempt, &result)
-            {
+            if let (Some(recovery), Some((epoch, sweep))) = (self.recovery, self.recovery_attempt) {
+                if outcome == DirectOutcome::LocalSendFailure {
+                    recovery.local_send_failed(self.revision);
+                    return;
+                }
                 let outcome = match outcome {
                     DirectOutcome::Connected | DirectOutcome::SessionGone => {
                         AddressOutcome::Recovered
@@ -901,7 +926,6 @@ impl<'a> Climb<'a> {
                 recovery.finish(self.revision, epoch, sweep, AddressId(i), outcome);
             }
         }
-        result
     }
 
     fn direct_attempt(
@@ -1149,6 +1173,16 @@ impl<'a> Climb<'a> {
                 self.proved(host, port, &server);
             }
             match verdict {
+                Verdict::LocalSendFailure(error) => {
+                    if let Some(recovery) = self.recovery {
+                        recovery.local_send_failed(self.revision);
+                    }
+                    self.forget(&att);
+                    self.say_loud(format!(
+                        "qsh: local startup write was not accepted ({error:?})"
+                    ));
+                    return Ok((DirectOutcome::LocalSendFailure, None));
+                }
                 Verdict::SessionAborted(reason) => {
                     self.forget(&att);
                     return Ok((
@@ -1215,6 +1249,16 @@ impl<'a> Climb<'a> {
             self.proved(host, port, &server);
         }
         match verdict {
+            Verdict::LocalSendFailure(error) => {
+                if let Some(recovery) = self.recovery {
+                    recovery.local_send_failed(self.revision);
+                }
+                self.forget(&att);
+                self.say_loud(format!(
+                    "qsh: local startup write was not accepted ({error:?})"
+                ));
+                (DirectOutcome::LocalSendFailure, None)
+            }
             Verdict::SessionAborted(reason) => {
                 self.forget(&att);
                 (
@@ -1456,7 +1500,7 @@ impl<'a> Climb<'a> {
             self.setup.keypair.private,
             login,
             self.tx.clone(),
-            self.setup.token,
+            self.setup.attempt_scope(),
         );
         if let Some((epoch, sweep)) = self.recovery_attempt {
             att.probe_port_refusal_stamped(sockaddr, epoch, sweep.0);
@@ -1482,7 +1526,21 @@ impl<'a> Climb<'a> {
         // attempt's queued events are drained (`forget`) rather than read.
         let sink: Sink = Box::new({
             let client = Arc::clone(&att.client);
-            move |stream, data| client.send_bytes(stream, data)
+            move |stream, data| {
+                client
+                    .send_bytes(stream, data)
+                    .map_err(|rejected| match rejected.reason {
+                        transport::driver_std::SendBlocked::Full => {
+                            client::channel::ChannelSendError::Full
+                        }
+                        transport::driver_std::SendBlocked::Gone => {
+                            client::channel::ChannelSendError::Gone
+                        }
+                        transport::driver_std::SendBlocked::OnDriverThread => {
+                            client::channel::ChannelSendError::OnDriverThread
+                        }
+                    })
+            }
         });
         let mut channel_session =
             ChannelSession::new(QshSubstrate::new(sink).on_malformed_control(log::warn));
@@ -1492,12 +1550,11 @@ impl<'a> Climb<'a> {
         // client, and keys this terminal encodes differently -- Home
         // and End first of all -- arrive as sequences the remote does not
         // recognize.
-        if let Ok(term) = std::env::var("TERM") {
-            channel_session.announce_term(&term);
-        }
+        let term = std::env::var("TERM").ok();
         let (verdict, opened_ch) = settle_opening(
             &att,
             &mut channel_session,
+            term.as_deref(),
             self.cols,
             self.rows,
             !self.background() || self.fresh_session,
@@ -1705,12 +1762,19 @@ fn let_go(resumed: bool) -> LetGo {
 fn settle_opening(
     att: &attempt::Attempt,
     channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
+    term: Option<&str>,
     cols: u16,
     rows: u16,
     open_fresh: bool,
     interrupted: impl Fn() -> bool,
 ) -> (Verdict, Option<ChannelId>) {
+    if let Some(term) = term {
+        if let Err(error) = channel_session.announce_term(term) {
+            return (Verdict::LocalSendFailure(error), None);
+        }
+    }
     let mut opened_ch = None;
+    let mut send_error = None;
     let verdict = att.settle_until(
         || {
             if open_fresh
@@ -1718,17 +1782,25 @@ fn settle_opening(
                     accepted.disposition == transport::SessionDisposition::Fresh
                 })
             {
-                opened_ch = channel_session.open_shell(cols, rows);
+                match channel_session.open_shell(cols, rows) {
+                    Ok(ch) => opened_ch = Some(ch),
+                    Err(error) => send_error = Some(error),
+                }
             }
         },
         interrupted,
     );
-    (verdict, opened_ch)
+    (
+        send_error.map_or(verdict, Verdict::LocalSendFailure),
+        opened_ch,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("startup_admission_tests.rs");
+    include!("invocation_budget_tests.rs");
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;

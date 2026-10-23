@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Client-side glue of a shell session: the core terminal, the prediction
 //! engine and the stream-0 record deframer under one roof.
 //!

@@ -105,8 +105,10 @@ fn a_shell_channel_has_a_pty_of_the_requested_size_and_follows_a_resize() {
         return;
     };
     assert_eq!(sub.resize_semantics(), ResizeSemantics::Unconfirmed);
-    sub.announce_term("xterm-256color");
-    sub.open(&shell(16, 90, 30));
+    sub.announce_term("xterm-256color")
+        .expect("fixture channel operation admitted");
+    sub.open(&shell(16, 90, 30))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(
         |r| r
             .events
@@ -115,7 +117,8 @@ fn a_shell_channel_has_a_pty_of_the_requested_size_and_follows_a_resize() {
             .contains(&SubstrateEvent::Opened(16)),
         Duration::from_secs(5)
     ));
-    sub.send(16, b"stty size; echo T=$TERM; echo DO'NE'1\n");
+    sub.send(16, b"stty size; echo T=$TERM; echo DO'NE'1\n")
+        .expect("fixture channel operation admitted");
     assert!(
         rec.wait_for(|r| r.output(16).contains("DONE1"), Duration::from_secs(5)),
         "{}",
@@ -123,8 +126,10 @@ fn a_shell_channel_has_a_pty_of_the_requested_size_and_follows_a_resize() {
     );
     assert!(rec.output(16).contains("30 90"));
     assert!(rec.output(16).contains("T=xterm-256color"));
-    sub.resize(16, 120, 40);
-    sub.send(16, b"stty size; echo DO'NE'2\n");
+    sub.resize(16, 120, 40)
+        .expect("fixture channel operation admitted");
+    sub.send(16, b"stty size; echo DO'NE'2\n")
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.output(16).contains("DONE2"), Duration::from_secs(5)));
     assert!(rec.output(16).contains("40 120"));
     assert!(
@@ -142,7 +147,8 @@ fn an_exec_channel_reports_its_output_and_exit_code() {
     let Some((_sshd, _conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&command(16, "echo out; exit 3"));
+    sub.open(&command(16, "echo out; exit 3"))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.exit_of(16).is_some(), Duration::from_secs(5)));
     assert_eq!(rec.exit_of(16), Some(3));
     assert!(rec.output(16).contains("out"));
@@ -159,9 +165,10 @@ fn a_command_pty_does_not_echo_input_into_its_output() {
     );
     req.cols = 80;
     req.rows = 24;
-    sub.open(&req);
+    sub.open(&req).expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.output(16).contains("READY"), Duration::from_secs(5)));
-    sub.send(16, b"input-marker\n");
+    sub.send(16, b"input-marker\n")
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.exit_of(16).is_some(), Duration::from_secs(5)));
     assert_eq!(rec.exit_of(16), Some(0));
     assert_eq!(
@@ -179,7 +186,8 @@ fn exec_stderr_is_not_stdout() {
     sub.open(&command(
         16,
         "printf stdout; printf stderr >&2; printf tail; exit 3",
-    ));
+    ))
+    .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.exit_of(16).is_some(), Duration::from_secs(5)));
     assert_eq!(rec.output(16), "stdouttail");
     let stderr: Vec<u8> = rec
@@ -207,11 +215,14 @@ fn two_channels_share_one_connection() {
     let Some((_sshd, _conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&shell(16, 80, 24));
-    sub.open(&command(17, "echo second"));
+    sub.open(&shell(16, 80, 24))
+        .expect("fixture channel operation admitted");
+    sub.open(&command(17, "echo second"))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.exit_of(17).is_some(), Duration::from_secs(5)));
     assert!(rec.output(17).contains("second"));
-    sub.send(16, b"echo fi'rst'\n");
+    sub.send(16, b"echo fi'rst'\n")
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.output(16).contains("first"), Duration::from_secs(5)));
 }
 
@@ -220,7 +231,8 @@ fn each_channel_exits_exactly_once() {
     let Some((_sshd, _conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&command(16, "true"));
+    sub.open(&command(16, "true"))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(|r| r.exit_of(16).is_some(), Duration::from_secs(5)));
     std::thread::sleep(Duration::from_millis(300));
     let exits = rec
@@ -252,7 +264,8 @@ fn cutting_the_connection_reports_closed() {
         &knock::Cancel::new(),
     )
     .expect("connect");
-    sub.open(&shell(16, 80, 24));
+    sub.open(&shell(16, 80, 24))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(
         |r| r
             .events
@@ -298,7 +311,8 @@ fn a_full_window_on_one_channel_stalls_neither_the_others_nor_close() {
     let Some((_sshd, conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&command(16, "sleep 60"));
+    sub.open(&command(16, "sleep 60"))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(
         |r| r
             .events
@@ -307,7 +321,8 @@ fn a_full_window_on_one_channel_stalls_neither_the_others_nor_close() {
             .contains(&SubstrateEvent::Opened(16)),
         Duration::from_secs(5)
     ));
-    sub.open(&shell(17, 80, 24));
+    sub.open(&shell(17, 80, 24))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(
         |r| r
             .events
@@ -318,10 +333,12 @@ fn a_full_window_on_one_channel_stalls_neither_the_others_nor_close() {
     ));
     let chunk = vec![b'x'; 64 * 1024];
     for step in 0..40 {
-        sub.send(16, &chunk);
+        sub.send(16, &chunk)
+            .expect("fixture channel operation admitted");
         // A round trip lets the connection process each chunk before the
         // next one is queued. The blocked tail stays below the 1 MiB cap.
-        sub.send(17, format!("echo pro'gress{step}'\n").as_bytes());
+        sub.send(17, format!("echo pro'gress{step}'\n").as_bytes())
+            .expect("fixture channel operation admitted");
         assert!(
             rec.wait_for(
                 |r| r.output(17).contains(&format!("progress{step}")),
@@ -346,7 +363,8 @@ fn close_bypasses_a_full_write_queue() {
     let Some((_sshd, conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.open(&command(16, "sleep 60"));
+    sub.open(&command(16, "sleep 60"))
+        .expect("fixture channel operation admitted");
     assert!(rec.wait_for(
         |r| r
             .events
@@ -356,7 +374,13 @@ fn close_bypasses_a_full_write_queue() {
         Duration::from_secs(5)
     ));
     for _ in 0..512 {
-        sub.send(16, &[b'x'; 4096]);
+        match sub.send(16, &[b'x'; 4096]) {
+            Ok(()) => {}
+            Err(error) => assert!(matches!(
+                error,
+                client::channel::ChannelSendError::Full | client::channel::ChannelSendError::Gone
+            )),
+        }
     }
     let closed = Instant::now();
     conn.close();
@@ -372,7 +396,10 @@ fn an_oversized_packet_closes_with_a_resource_limit_reason() {
     let Some((_sshd, conn, mut sub, rec)) = up() else {
         return;
     };
-    sub.send(16, &vec![b'x'; 1024 * 1024 + 1]);
+    assert_eq!(
+        sub.send(16, &vec![b'x'; 1024 * 1024 + 1]),
+        Err(client::channel::ChannelSendError::Full)
+    );
     assert!(
         rec.wait_for(
             |r| !r.closed.lock().unwrap().is_empty(),

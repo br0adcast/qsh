@@ -70,6 +70,9 @@ impl Default for Events {
     }
 }
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream: u8, data: Vec<u8>) {
         if stream == CONTROL_STREAM {
             for raw in self.records.lock().unwrap().push(&data) {
@@ -630,17 +633,19 @@ fn stop_with_silent_channel(keep_descendant: bool) {
         events.clone(),
         None,
     );
-    client.send_bytes(
-        CONTROL_STREAM,
-        encode_client(&ClientRecord::Open(OpenRequest {
-            stream: FIRST_CHANNEL_STREAM,
-            kind: ChannelKind::Shell,
-            cols: 80,
-            rows: 24,
-            screen: false,
-            command: Vec::new(),
-        })),
-    );
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture Open must be admitted");
     let open_deadline = Instant::now() + Duration::from_secs(15);
     while !events.opened.load(Ordering::Acquire) {
         assert!(
@@ -665,7 +670,9 @@ fn stop_with_silent_channel(keep_descendant: bool) {
             marker.display()
         )
     };
-    client.send_bytes(FIRST_CHANNEL_STREAM, command.into_bytes());
+    client
+        .send_bytes(FIRST_CHANNEL_STREAM, command.into_bytes())
+        .expect("fixture shell input must be admitted");
     let ready_deadline = Instant::now() + Duration::from_secs(15);
     let child_pids: Vec<u32> = loop {
         if let Ok(text) = std::fs::read_to_string(&marker) {

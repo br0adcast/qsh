@@ -84,25 +84,34 @@ fn commands() -> (Commands, mpsc::Receiver<Command>) {
 }
 
 impl Commands {
-    fn reserve(&self, count: usize) -> Option<OwnedSemaphorePermit> {
+    fn reserve(
+        &self,
+        count: usize,
+    ) -> Result<OwnedSemaphorePermit, client::channel::ChannelSendError> {
         if self.stop.reason.lock().unwrap().is_some() {
-            return None;
+            return Err(client::channel::ChannelSendError::Gone);
         }
         if count <= MAX_QUEUED_BYTES {
             if let Ok(permit) = Arc::clone(&self.bytes).try_acquire_many_owned(count as u32) {
-                return Some(permit);
+                return Ok(permit);
             }
         }
         self.stop.resource_limit("queued SSH data exceeds 1 MiB");
-        None
+        Err(client::channel::ChannelSendError::Full)
     }
 
-    fn send(&self, command: Command) {
+    fn send(&self, command: Command) -> Result<(), client::channel::ChannelSendError> {
+        use client::channel::ChannelSendError;
         if self.stop.reason.lock().unwrap().is_some() {
-            return;
+            return Err(ChannelSendError::Gone);
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(command) {
-            self.stop.resource_limit("the SSH command queue is full");
+        match self.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stop.resource_limit("the SSH command queue is full");
+                Err(ChannelSendError::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ChannelSendError::Gone),
         }
     }
 }
@@ -134,37 +143,42 @@ impl ChannelSubstrate for SshSubstrate {
     fn resize_semantics(&self) -> ResizeSemantics {
         ResizeSemantics::Unconfirmed
     }
-    fn open(&mut self, req: &OpenRequest) {
-        if let Some(permit) = self.commands.reserve(req.command.len()) {
-            self.commands
-                .send(Command::Open(req.clone(), permit, self.cancel.clone()));
-        }
+    fn open(&mut self, req: &OpenRequest) -> Result<(), client::channel::ChannelSendError> {
+        let permit = self.commands.reserve(req.command.len())?;
+        self.commands
+            .send(Command::Open(req.clone(), permit, self.cancel.clone()))
     }
-    fn announce_term(&mut self, term: &str) {
-        if let Some(permit) = self.commands.reserve(term.len()) {
-            self.commands.send(Command::Term(Arc::new(QueuedTerm {
-                value: term.to_string(),
-                _permit: Some(permit),
-            })));
-        }
+    fn announce_term(&mut self, term: &str) -> Result<(), client::channel::ChannelSendError> {
+        let permit = self.commands.reserve(term.len())?;
+        self.commands.send(Command::Term(Arc::new(QueuedTerm {
+            value: term.to_string(),
+            _permit: Some(permit),
+        })))
     }
-    fn send(&mut self, ch: ChannelId, data: &[u8]) {
-        let Some(permit) = self.commands.reserve(data.len()) else {
-            return;
-        };
+    fn send(
+        &mut self,
+        ch: ChannelId,
+        data: &[u8],
+    ) -> Result<(), client::channel::ChannelSendError> {
+        let permit = self.commands.reserve(data.len())?;
         self.commands.send(Command::Send(
             ch,
             QueuedData {
                 bytes: data.to_vec(),
                 _permit: permit,
             },
-        ));
+        ))
     }
-    fn resize(&mut self, ch: ChannelId, cols: u16, rows: u16) {
-        self.commands.send(Command::Resize(ch, cols, rows));
+    fn resize(
+        &mut self,
+        ch: ChannelId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), client::channel::ChannelSendError> {
+        self.commands.send(Command::Resize(ch, cols, rows))
     }
-    fn close(&mut self, ch: ChannelId) {
-        self.commands.send(Command::Close(ch));
+    fn close(&mut self, ch: ChannelId) -> Result<(), client::channel::ChannelSendError> {
+        self.commands.send(Command::Close(ch))
     }
     /// SSH delivers channel events through `SshEvents`, never as raw
     /// stream bytes -- there is no framing to decode.
@@ -978,7 +992,7 @@ mod tests {
             };
             gate.blocked.store(true, Ordering::SeqCst);
             for (index, channel) in [16, 17, 16, 17].into_iter().enumerate() {
-                sub.send(channel, &vec![b'x'; 256 * 1024]);
+                sub.send(channel, &vec![b'x'; 256 * 1024]).unwrap();
                 let Command::Send(ch, data) = incoming.try_recv().unwrap() else {
                     panic!("expected data")
                 };
@@ -1223,7 +1237,7 @@ mod tests {
             commands,
             cancel: knock::Cancel::new(),
         };
-        sub.send(16, &vec![b'x'; 1024 * 1024]);
+        sub.send(16, &vec![b'x'; 1024 * 1024]).unwrap();
         let Command::Send(ch, data) = pending.try_recv().unwrap() else {
             panic!("expected data")
         };
@@ -1233,7 +1247,10 @@ mod tests {
         assert_eq!(budget.available_permits(), 0);
         let in_flight = writes.try_recv().unwrap();
         assert_eq!(budget.available_permits(), 0);
-        sub.send(16, b"overflow");
+        assert_eq!(
+            sub.send(16, b"overflow"),
+            Err(client::channel::ChannelSendError::Full)
+        );
         assert!(stop
             .reason
             .lock()
@@ -1253,8 +1270,15 @@ mod tests {
             commands,
             cancel: knock::Cancel::new(),
         };
-        for _ in 0..257 {
-            sub.resize(16, 80, 24);
+        for index in 0..257 {
+            assert_eq!(
+                sub.resize(16, 80, 24),
+                if index < 256 {
+                    Ok(())
+                } else {
+                    Err(client::channel::ChannelSendError::Full)
+                }
+            );
         }
         assert_eq!(pending.len(), 256);
         assert!(stop
@@ -1282,7 +1306,7 @@ mod tests {
             cancel: knock::Cancel::new(),
         };
         for _ in 0..256 {
-            sub.resize(16, 80, 24);
+            sub.resize(16, 80, 24).unwrap();
         }
         connection.close();
         runtime().block_on(async {
@@ -1308,14 +1332,17 @@ mod tests {
             commands,
             cancel: knock::Cancel::new(),
         };
-        sub.open(&OpenRequest {
-            stream: 16,
-            kind: ChannelKind::Command,
-            cols: 0,
-            rows: 0,
-            screen: false,
-            command: vec![b'x'; 1024 * 1024 + 1],
-        });
+        assert_eq!(
+            sub.open(&OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Command,
+                cols: 0,
+                rows: 0,
+                screen: false,
+                command: vec![b'x'; 1024 * 1024 + 1],
+            }),
+            Err(client::channel::ChannelSendError::Full)
+        );
         assert_eq!(pending.len(), 0, "an oversized exec payload was queued");
         assert!(stop
             .reason
@@ -1334,8 +1361,15 @@ mod tests {
             cancel: knock::Cancel::new(),
         };
         let chunk = vec![b'x'; 64 * 1024];
-        for _ in 0..80 {
-            sub.send(16, &chunk);
+        for index in 0..80 {
+            assert_eq!(
+                sub.send(16, &chunk),
+                match index {
+                    0..16 => Ok(()),
+                    16 => Err(client::channel::ChannelSendError::Full),
+                    _ => Err(client::channel::ChannelSendError::Gone),
+                }
+            );
         }
         let mut max_queued_bytes = 0;
         while let Ok(command) = rx.try_recv() {
@@ -1347,5 +1381,38 @@ mod tests {
             max_queued_bytes <= 1024 * 1024,
             "held {max_queued_bytes} bytes"
         );
+    }
+    #[test]
+    fn client179_ssh_rejected_command_returns_reason_and_refunds_bytes() {
+        use client::channel::ChannelSendError;
+        for closed in [false, true] {
+            let (commands, pending) = commands();
+            let budget = commands.bytes.clone();
+            let mut sub = SshSubstrate {
+                commands,
+                cancel: knock::Cancel::new(),
+            };
+            if closed {
+                drop(pending);
+            } else {
+                for _ in 0..MAX_QUEUED_COMMANDS {
+                    sub.resize(16, 80, 24).unwrap();
+                }
+                assert_eq!(pending.len(), MAX_QUEUED_COMMANDS);
+                // Keep this finite receiver held until the candidate is refused.
+                assert_eq!(
+                    sub.send(16, b"whole rejected input"),
+                    Err(ChannelSendError::Full)
+                );
+                assert_eq!(budget.available_permits(), MAX_QUEUED_BYTES);
+                drop(pending);
+                continue;
+            }
+            assert_eq!(
+                sub.send(16, b"whole rejected input"),
+                Err(ChannelSendError::Gone)
+            );
+            assert_eq!(budget.available_permits(), MAX_QUEUED_BYTES);
+        }
     }
 }

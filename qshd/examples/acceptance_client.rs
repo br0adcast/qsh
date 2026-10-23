@@ -260,6 +260,9 @@ impl Default for Events {
 }
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == CONTROL_STREAM {
             let raws = self.control_deframer.lock().expect("lock").push(&data);
@@ -399,17 +402,19 @@ fn cmd_probe(args: Vec<String>) -> ExitCode {
             None => (ChannelKind::Shell, Vec::new()),
             Some(c) => (ChannelKind::Command, c.as_bytes().to_vec()),
         };
-        client.send_bytes(
-            CONTROL_STREAM,
-            encode_client(&ClientRecord::Open(OpenRequest {
-                stream: FIRST_CHANNEL_STREAM,
-                kind,
-                cols: 80,
-                rows: 24,
-                screen: false,
-                command: command_bytes,
-            })),
-        );
+        client
+            .send_bytes(
+                CONTROL_STREAM,
+                encode_client(&ClientRecord::Open(OpenRequest {
+                    stream: FIRST_CHANNEL_STREAM,
+                    kind,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: command_bytes,
+                })),
+            )
+            .expect("fixture input admitted");
 
         let verdict = |records: &[ServerRecord]| -> Option<Result<Option<i32>, String>> {
             let refused = records.iter().find_map(|r| match r {

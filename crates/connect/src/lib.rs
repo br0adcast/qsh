@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! How a client gets to a qsh daemon: the address ladder (qsh directly, then
 //! SSH to bring the daemon up, then qsh again), as a state machine with no
 //! I/O. Shared by every client -- the console now, the app later -- so it

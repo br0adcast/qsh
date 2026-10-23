@@ -78,7 +78,7 @@ fn require_refusal(session: &Session) {
     assert!(!pam_refusal(), "this token must have no prior refusal");
     session.request_channel(Some("printf 'should-not-%s' execute"));
     assert!(
-        common::wait_until(|| session.saw_opened() || refusal().is_some() || pam_refusal()),
+        common::wait_until(|| session.saw_opened() || refusal().is_some()),
         "no verdict for this session's Open: {:?}; supplemental PAM log: {:?}",
         session.control_records(),
         std::fs::read_to_string(&log)
@@ -88,14 +88,13 @@ fn require_refusal(session: &Session) {
         "new PAM session bypassed policy: {:?}",
         session.control_records()
     );
-    if let Some(reason) = refusal() {
-        assert!(
-            !reason.is_empty() && reason.len() <= 1024,
-            "bounded refusal reason: {reason:?}"
-        );
-    }
-    // LoginEnded can retire the transport route before Refused is delivered.
-    // This alternate proves this login's PAM verdict, not client-visible delivery.
+    let reason = refusal().expect("this Open must receive its client-visible refusal");
+    assert!(
+        !reason.is_empty() && reason.len() <= 1024,
+        "bounded refusal reason: {reason:?}"
+    );
+    // The exact session's helper log supplements the client-visible record;
+    // it cannot substitute for reliable refusal delivery.
     assert!(
         common::wait_until(pam_refusal),
         "this session must have an actual PAM refusal"

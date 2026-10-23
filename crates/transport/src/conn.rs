@@ -57,7 +57,7 @@ pub const PATH_DOWN_AFTER: Duration = Duration::from_secs(3);
 /// toward this: the driver treats a thread freeze as a rebind/resume and
 /// restarts the liveness window (see `driver_std` and [`Connection::request_ping`]),
 /// so a phone that was asleep hot-migrates over UDP instead of slowly reconnecting.
-const CLIENT_DEATH_AFTER: Duration = Duration::from_secs(45);
+pub(crate) const CLIENT_DEATH_AFTER: Duration = Duration::from_secs(45);
 
 /// Server session lifetime: how long the server keeps a SILENT session alive and
 /// routable, so a returning client (a hot-roam over UDP, or a warm reattach by
@@ -598,6 +598,9 @@ pub struct Connection {
     /// `Live`.
     server_nonce: Option<[u8; AUTH_NONCE_LEN]>,
     peer: Option<SocketAddr>,
+    /// Daemon probation accepts transport only from its handshake's source.
+    /// Noise possession alone must not redirect replies before admission.
+    probation_source: Option<SocketAddr>,
     /// The authenticated remote static key, recorded once the handshake
     /// completes (server: the client's key from msg1; unset on the client
     /// path today).
@@ -925,6 +928,7 @@ impl Connection {
             resumed: false,
             server_nonce: None,
             peer: None,
+            probation_source: None,
             peer_static: None,
             paths: PathTable::new(),
             handshake_hash: [0u8; 32],
@@ -1209,6 +1213,9 @@ impl Connection {
     }
 
     /// Start one recovery handshake over the complete eligible catalog.
+    /// Requires negotiated `AUTH_ACCEPTED` in addition to the configured
+    /// minimum, before Live or queued output. The offered bits are unchanged.
+    /// Ordinary single-endpoint starts retain the configured feature minimum.
     pub fn start_recovery(
         &mut self,
         now: Instant,
@@ -1883,6 +1890,20 @@ impl Connection {
     /// The current peer address, if already known.
     pub fn peer(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// Called only after the daemon accepted a server handshake. Repeated
+    /// probation setup preserves the original source; it never retargets it.
+    #[cfg(feature = "tokio-driver")]
+    pub(crate) fn restrict_to_handshake_source(&mut self) {
+        self.probation_source
+            .get_or_insert(self.peer.expect("probation follows an accepted handshake"));
+    }
+
+    /// Only committed bridge adoption restores ordinary server roaming.
+    #[cfg(feature = "tokio-driver")]
+    pub(crate) fn admit_source_migration(&mut self) {
+        self.probation_source = None;
     }
 
     /// Tell the connection which roads lead to the same peer. Only a client
@@ -2591,10 +2612,18 @@ impl Connection {
             self.set_state(LinkState::Closed);
             return out;
         }
-        if !msg2.enabled.contains(self.required_features) {
+        // Shared recovery has no trustworthy completion boundary without the
+        // explicit admission record. Keep this attempt-local: a later ordinary
+        // transport-only start still uses the caller's configured minimum.
+        let required = if self.recovery_handshake.is_some() {
+            self.required_features | Features::AUTH_ACCEPTED
+        } else {
+            self.required_features
+        };
+        if !msg2.enabled.contains(required) {
             self.handshake = None;
             self.events.push(Event::MissingRequiredFeatures {
-                required: self.required_features,
+                required,
                 enabled: msg2.enabled,
             });
             self.set_state(LinkState::Closed);
@@ -2704,6 +2733,12 @@ impl Connection {
         aead: &[u8],
     ) -> Vec<Datagram> {
         let mut out = Vec::new();
+        // Reject the whole other-source packet before AEAD, replay/liveness,
+        // key confirmation or frame routing (including direct probe answers).
+        // A source change before admission requires a fresh handshake there.
+        if self.probation_source.is_some_and(|source| source != src) {
+            return out;
+        }
         if self.keys.is_none() || session_id != self.session_id {
             return out;
         }
@@ -3912,6 +3947,7 @@ mod recovery_tests;
 pub(crate) mod tests {
     use super::*;
     include!("conn_capacity_tests.rs");
+    include!("client_input_queue_tests.rs");
     use crate::handshake::generate_keypair;
     use crate::handshake_payload::{encode_msg1_without_tail, StartKind};
     use crate::reliability::MAX_IN_FLIGHT;

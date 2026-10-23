@@ -65,6 +65,9 @@ struct Collected {
 struct Events(Mutex<Collected>);
 
 impl ClientEvents for Events {
+    fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
+        panic!("unexpected accepted-input failure: {failure:?}");
+    }
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
         if stream_id == 0 {
             self.0.lock().expect("collected").stream0.extend(data);
@@ -177,7 +180,9 @@ async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
                 .with_login("listed".to_string()),
         )),
     );
-    client.send_bytes(0, b"hello".to_vec());
+    client
+        .send_bytes(0, b"hello".to_vec())
+        .expect("fixture input admitted");
     let echoed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if events.0.lock().expect("collected").stream0 == b"hello" {
@@ -217,7 +222,11 @@ async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
                 .with_login("stranger".to_string()),
         )),
     );
-    stranger_client.send_bytes(0, b"hello".to_vec());
+    stranger_client
+        .send_bytes(0, b"hello".to_vec())
+        .unwrap_or_else(|rejected| {
+            assert_eq!(rejected.reason, transport::driver_std::SendBlocked::Gone)
+        });
 
     // PRESENCE check, polled with a generous ceiling (like the acceptance
     // wait above) rather than assumed within a fixed window: the stranger's

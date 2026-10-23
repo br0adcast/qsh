@@ -188,11 +188,13 @@ pub(super) struct OrderedSession {
     entries: BTreeMap<ChannelId, Entry>,
     imported: BTreeMap<ChannelId, Intent>,
     failure: Option<ChannelProtocolError>,
+    send_failure: Option<ChannelSendError>,
 }
 impl OrderedSession {
     pub(super) fn ignore_input(&self, ch: ChannelId) -> bool {
         ch >= FIRST_CHANNEL_STREAM
-            && (self.failure.is_some() || self.entries.get(&ch).is_some_and(|e| e.gone))
+            && ((self.failure.is_some() || self.send_failure.is_some())
+                || self.entries.get(&ch).is_some_and(|e| e.gone))
     }
     pub(super) fn input_limits<S: ChannelSubstrate>(
         &self,
@@ -238,7 +240,7 @@ impl OrderedSession {
         limits
     }
     pub(super) fn free_stream(&self) -> Option<ChannelId> {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.send_failure.is_some() {
             return None;
         }
         (FIRST_CHANNEL_STREAM..=255)
@@ -257,7 +259,9 @@ impl OrderedSession {
         self.entries.insert(ch, entry);
     }
     pub(super) fn is_ready(&self, ch: ChannelId) -> bool {
-        self.failure.is_none() && self.entries.get(&ch).is_some_and(Entry::writable)
+        self.failure.is_none()
+            && self.send_failure.is_none()
+            && self.entries.get(&ch).is_some_and(Entry::writable)
     }
     pub(super) fn continuity_lost(&self, ch: ChannelId) -> bool {
         self.entries
@@ -267,12 +271,18 @@ impl OrderedSession {
     pub(super) fn committed(&self, ch: ChannelId) -> Option<GeometryRecord> {
         self.entries.get(&ch).and_then(|entry| entry.committed)
     }
-    pub(super) fn close<S: ChannelSubstrate>(&mut self, substrate: &mut S, ch: ChannelId) {
+    pub(super) fn close<S: ChannelSubstrate>(
+        &mut self,
+        substrate: &mut S,
+        ch: ChannelId,
+    ) -> Result<(), ChannelSendError> {
         if self.is_ready(ch) || self.entries.get(&ch).is_some_and(|e| e.draining && !e.gone) {
-            substrate.close(ch);
+            substrate.close(ch)?;
             substrate.retire_channel(ch);
             self.entries.get_mut(&ch).expect("known channel").retire();
+            return Ok(());
         }
+        Err(ChannelSendError::NotReady)
     }
     pub(super) fn into_intent(mut self) -> AttachmentIntent {
         for (ch, entry) in self.entries {
@@ -314,7 +324,7 @@ impl OrderedSession {
         substrate: &mut S,
         error: ChannelProtocolError,
     ) -> Vec<SessionEvent> {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.send_failure.is_some() {
             return Vec::new();
         }
         self.failure = Some(error);
@@ -333,30 +343,30 @@ impl OrderedSession {
         ch: ChannelId,
         cols: u16,
         rows: u16,
-    ) -> ResizeDisposition {
-        if self.failure.is_some() {
-            return ResizeDisposition::Rejected(ResizeRejection::Failed);
+    ) -> Result<ResizeDisposition, ChannelSendError> {
+        if self.failure.is_some() || self.send_failure.is_some() {
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::Failed));
         }
         if cols == 0 || rows == 0 {
-            return ResizeDisposition::Rejected(ResizeRejection::ZeroViewport);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::ZeroViewport));
         }
         let Some(entry) = self.entries.get_mut(&ch) else {
-            return ResizeDisposition::Rejected(ResizeRejection::NotReady);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::NotReady));
         };
         if entry.gone || entry.draining {
-            return ResizeDisposition::Rejected(ResizeRejection::Ended);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::Ended));
         }
         if entry
             .classification
             .is_some_and(|c| c.cols == 0 || c.rows == 0)
         {
-            return ResizeDisposition::Rejected(ResizeRejection::NoPty);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::NoPty));
         }
         if !entry.writable() && entry.pending.is_none() {
-            return ResizeDisposition::Rejected(ResizeRejection::NotReady);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::NotReady));
         }
         if let Err(reason) = Self::update_desired(&mut entry.desired, cols, rows, true) {
-            return ResizeDisposition::Rejected(reason);
+            return Ok(ResizeDisposition::Rejected(reason));
         }
         Self::send_desired(substrate, ch, entry)
     }
@@ -394,7 +404,7 @@ impl OrderedSession {
         cols: u16,
         rows: u16,
     ) -> ResizeDisposition {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.send_failure.is_some() {
             return ResizeDisposition::Rejected(ResizeRejection::Failed);
         }
         let desired = if let Some(entry) = self.entries.get_mut(&ch) {
@@ -433,18 +443,18 @@ impl OrderedSession {
         substrate: &mut S,
         ch: ChannelId,
         entry: &mut Entry,
-    ) -> ResizeDisposition {
+    ) -> Result<ResizeDisposition, ChannelSendError> {
         if entry.pending.is_some() {
-            return ResizeDisposition::Coalesced;
+            return Ok(ResizeDisposition::Coalesced);
         }
         if !entry.writable() {
-            return ResizeDisposition::Rejected(ResizeRejection::NotReady);
+            return Ok(ResizeDisposition::Rejected(ResizeRejection::NotReady));
         }
         let Some(desired) = entry.desired else {
-            return ResizeDisposition::Unchanged;
+            return Ok(ResizeDisposition::Unchanged);
         };
         if !desired.eligible {
-            return ResizeDisposition::Coalesced;
+            return Ok(ResizeDisposition::Coalesced);
         }
         let committed = entry.committed.expect("ready has geometry");
         if (committed.cols, committed.rows) == (desired.size.cols(), desired.size.rows())
@@ -452,29 +462,26 @@ impl OrderedSession {
                 .refused
                 .is_some_and(|old| old.revision == desired.revision && old.size == desired.size)
         {
-            return ResizeDisposition::Unchanged;
+            return Ok(ResizeDisposition::Unchanged);
         }
         let Some(id) = entry.next_id else {
-            return ResizeDisposition::Rejected(ResizeRejection::RequestIdExhausted);
+            return Ok(ResizeDisposition::Rejected(
+                ResizeRejection::RequestIdExhausted,
+            ));
         };
-        if substrate
-            .resize_correlated(
-                ch,
-                committed.instance,
-                id,
-                desired.size.cols(),
-                desired.size.rows(),
-            )
-            .is_err()
-        {
-            return ResizeDisposition::Rejected(ResizeRejection::Failed);
-        }
+        substrate.resize_correlated(
+            ch,
+            committed.instance,
+            id,
+            desired.size.cols(),
+            desired.size.rows(),
+        )?;
         entry.pending = Some(Pending {
             id,
             intent: desired,
         });
         entry.next_id = id.checked_next();
-        ResizeDisposition::Sent
+        Ok(ResizeDisposition::Sent)
     }
     fn inherit_intent(&mut self, ch: ChannelId, entry: &mut Entry, instance: ChannelInstance) {
         if let Some(intent) = self
@@ -532,6 +539,7 @@ impl OrderedSession {
                 return Err(ChannelProtocolError::Correlation);
             }
         }
+        let geometry_start = out.len();
         entry.committed = Some(record);
         if entry.desired.is_none() {
             entry.desired = TerminalSize::new(record.cols, record.rows)
@@ -560,7 +568,13 @@ impl OrderedSession {
                 reason,
             });
         }
-        Self::send_desired(substrate, ch, entry);
+        if let Err(error) = Self::send_desired(substrate, ch, entry) {
+            self.send_failure = Some(error);
+            // No Ready or queued data may escape after known local refusal.
+            // Earlier records already returned to the owner keep their order.
+            out.truncate(geometry_start);
+            out.push(SessionEvent::SendFailure { ch, error });
+        }
         Ok(())
     }
     fn event_cost(event: &SubstrateEvent) -> (usize, usize) {
@@ -663,6 +677,9 @@ impl OrderedSession {
                     });
                 }
                 _ => return Err(ChannelProtocolError::Metadata),
+            }
+            if self.send_failure.is_some() {
+                break;
             }
         }
         Ok(())
@@ -779,7 +796,7 @@ impl OrderedSession {
         substrate: &mut S,
         event: SubstrateEvent,
     ) -> Vec<SessionEvent> {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.send_failure.is_some() {
             return Vec::new();
         }
         match event {
@@ -873,7 +890,7 @@ impl OrderedSession {
         &mut self,
         substrate: &mut S,
     ) -> Vec<SessionEvent> {
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.send_failure.is_some() {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -901,7 +918,7 @@ mod exhaustion_tests {
     fn retirement_frontier_keeps_one_entry_across_many_instances() {
         use transport::channel::{encode_server, DrainingChannel, ServerRecord, CONTROL_STREAM};
         use transport::shell_frame::{encode_shell, ShellRecord};
-        let mut s = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let mut s = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| Ok(())));
         for id in 1..=1024 {
             let instance = ChannelInstance::new(id).unwrap();
             let snapshot = ChannelSnapshot::new(
@@ -951,7 +968,7 @@ mod exhaustion_tests {
     }
     #[test]
     fn last_request_id_is_used_once_and_never_wraps() {
-        let mut s = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| {}));
+        let mut s = ChannelSession::new(crate::qsh::QshSubstrate::new(|_, _| Ok(())));
         let ch = s.open_shell(80, 24).unwrap();
         s.on_event(SubstrateEvent::Opened(ch));
         let record = GeometryRecord {
@@ -969,7 +986,7 @@ mod exhaustion_tests {
             .get_mut(&ch)
             .unwrap()
             .next_id = ResizeRequestId::new(u64::MAX);
-        assert_eq!(s.resize(ch, 100, 30), ResizeDisposition::Sent);
+        assert_eq!(s.resize(ch, 100, 30).unwrap(), ResizeDisposition::Sent);
         let record = GeometryRecord {
             request_id: u64::MAX,
             outcome: GeometryOutcome::Applied,
@@ -979,7 +996,7 @@ mod exhaustion_tests {
         };
         s.on_event(SubstrateEvent::Geometry { ch, record });
         assert_eq!(
-            s.resize(ch, 120, 40),
+            s.resize(ch, 120, 40).unwrap(),
             ResizeDisposition::Rejected(ResizeRejection::RequestIdExhausted)
         );
         assert_eq!(s.committed_geometry(ch), Some(record));
