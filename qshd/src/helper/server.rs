@@ -15045,18 +15045,36 @@ pub(crate) mod tests {
         );
     }
 
-    /// Waits for `path` to exist, bounded -- a marker that never appears
-    /// must fail the test that wanted it, not hang the run.
-    fn wait_until_exists(path: &Path, within: Duration) {
+    /// Reads an atomically published marker. Only absence is retried; a
+    /// present but incomplete record is returned for the caller to reject.
+    fn read_marker_after_absence(
+        path: &Path,
+        within: Duration,
+        first_absence: impl FnOnce(),
+    ) -> String {
         let deadline = Instant::now() + within;
-        while !path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "{} never appeared within {within:?}",
-                path.display()
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        let mut first_absence = Some(first_absence);
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(record) => return record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(observe) = first_absence.take() {
+                        observe();
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} never appeared within {within:?}",
+                        path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("read {}: {error}", path.display()),
+            }
         }
+    }
+
+    fn wait_until_exists(path: &Path, within: Duration) {
+        let _ = read_marker_after_absence(path, within, || {});
     }
 
     /// The lines of `path`, trimmed -- what an appending `pam_exec` script
@@ -15684,19 +15702,39 @@ pub(crate) mod tests {
     /// that the same process did both.
     #[test]
     fn the_session_is_opened_and_closed_by_the_monitor() {
+        #[cfg(target_os = "linux")]
+        crate::test_borrowed_scope::run_exact(
+            "helper::server::tests::the_session_is_opened_and_closed_by_the_monitor",
+            0,
+            session_publication_body,
+        )
+        .assert_clean(0);
+        #[cfg(not(target_os = "linux"))]
+        session_publication_body();
+    }
+
+    fn session_publication_body() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("session-open");
         let closed_marker = dir.path().join("session-open.closed");
-        // `pam_exec.so` runs once for each half of the session stack.
-        // Nothing here needs privileges: the stack is `pam_permit` plus
-        // `pam_exec`, and the config directory is the test's own.
-        // The script records WHICH process called pam_open_session, and the
-        // close half must be the same one: `pam_close_session` from any
-        // other process is what the monitor exists to prevent (spec 3.3).
-        // pam_exec forks and execs the script from the process that called
-        // into PAM, so the script's $PPID is that process.
-        // Publish each complete PID atomically: existence is what the close
-        // wait observes, and shell redirection creates a file before writing.
+        let ready = dir.path().join("close-ready");
+        let gate_path = dir.path().join("publish-gate");
+        nix::unistd::mkfifo(
+            &gate_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create owned publication gate");
+        // Holding both ends makes unwind release nonblocking even if the hook
+        // has not opened its read end. Monitor FD sweeps prevent inheritance.
+        let mut gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(&gate_path)
+            .expect("own publication gate");
         let script = dir.path().join("record-session.sh");
         write_script(
             &script,
@@ -15704,8 +15742,15 @@ pub(crate) mod tests {
                 "if [ \"$PAM_TYPE\" = open_session ]; then marker={m}; \
                  else marker={m}.closed; fi\n\
                  pending=$(mktemp \"$marker.XXXXXX\") || exit $?\n\
-                 printf '%s\\n' \"$PPID\" > \"$pending\" && mv \"$pending\" \"$marker\"",
-                m = marker.display()
+                 printf '%s\\n' \"$PPID\" > \"$pending\" || exit $?\n\
+                 if [ \"$PAM_TYPE\" = close_session ]; then\n\
+                   printf '%s\\n' \"$pending\" > {r}.pending && mv {r}.pending {r} || exit $?\n\
+                   IFS= read -r release < {g} || exit $?\n\
+                 fi\n\
+                 mv \"$pending\" \"$marker\"",
+                m = marker.display(),
+                r = ready.display(),
+                g = gate_path.display(),
             ),
         );
         write_stack(
@@ -15720,33 +15765,69 @@ pub(crate) mod tests {
             ),
         );
 
+        enum ReadEvent {
+            Missing,
+            Complete(String),
+        }
         let h = helper_with_pam_confdir(dir.path(), "qshd-test-session");
-        let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), h.login);
-        assert!(
-            marker.exists(),
-            "pam_open_session must run before the first channel is answered"
-        );
-
-        let opened_by = std::fs::read_to_string(&marker)
-            .expect("open marker")
-            .trim()
-            .to_string();
-        assert_eq!(
-            opened_by,
-            monitor.to_string(),
-            "pam_open_session must be called by the monitor itself, not by the helper"
-        );
-
-        tell_login_ended(&h.auth, h.login);
-        wait_until_exists(&closed_marker, TEST_RECV_TIMEOUT);
-        assert_eq!(
-            std::fs::read_to_string(&closed_marker)
-                .expect("close marker")
-                .trim(),
-            opened_by,
-            "pam_close_session must be called by the SAME process that opened the session"
-        );
+        let mut reader = None;
+        let (send, receive) = std::sync::mpsc::channel();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), h.login);
+            let opened_by = std::fs::read_to_string(&marker).expect("open marker");
+            assert_eq!(opened_by, format!("{monitor}\n"), "monitor opened PAM");
+            tell_login_ended(&h.auth, h.login);
+            let pending = read_marker_after_absence(&ready, TEST_RECV_TIMEOUT, || {});
+            assert_eq!(
+                std::fs::read_to_string(pending.trim()).expect("complete pending PID"),
+                opened_by,
+                "held hook prepared the same monitor's complete record"
+            );
+            let path = closed_marker.clone();
+            reader = Some(std::thread::spawn(move || {
+                let record = read_marker_after_absence(&path, TEST_RECV_TIMEOUT, || {
+                    send.send(ReadEvent::Missing)
+                        .expect("observe actual absent read");
+                });
+                send.send(ReadEvent::Complete(record.clone()))
+                    .expect("observe completed read");
+                record
+            }));
+            match receive
+                .recv_timeout(TEST_RECV_TIMEOUT)
+                .expect("reader reached publication boundary")
+            {
+                ReadEvent::Missing => {}
+                ReadEvent::Complete(record) => {
+                    panic!("publication contract: reader returned before gate release: {record:?}")
+                }
+            }
+            assert!(
+                matches!(
+                    receive.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "reader must not succeed while the complete record is unpublished"
+            );
+            assert!(!closed_marker.exists(), "final path remains unpublished");
+        }));
+        // Always release before joining the reader and stopping the real helper.
+        // One small nonblocking write cannot wait on a hook that never started.
+        let released = gate.write_all(b"publish\n");
+        let read_result = reader.map(|reader| reader.join());
         h.stop();
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+        released.expect("release owned publication gate");
+        let record = read_result
+            .expect("reader started")
+            .expect("marker reader completed");
+        assert_eq!(
+            record,
+            std::fs::read_to_string(&marker).expect("open marker"),
+            "PAM close publishes the complete PID of the monitor that opened it"
+        );
     }
 
     /// And the session is closed when the HELPER stops, not only when the
