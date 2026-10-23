@@ -1,6 +1,6 @@
 //! Exclusive wait ownership of the direct child returned by fork.
 
-use super::Failure;
+use super::{scope::ChildCustody, Failure};
 use nix::libc;
 use std::num::NonZeroU32;
 
@@ -74,6 +74,18 @@ impl ForkChild {
             }
             return Err(Failure::Malformed);
         }
+    }
+}
+
+impl ChildCustody for ForkChild {
+    fn leader_id(&self) -> NonZeroU32 {
+        self.pid()
+    }
+    fn observe(&mut self) -> Result<Option<i32>, crate::process_scope::Failure> {
+        self.observe()
+    }
+    fn reap(&mut self) -> Result<i32, crate::process_scope::Failure> {
+        self.reap()
     }
 }
 

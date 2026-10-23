@@ -5,22 +5,10 @@ use super::startup::SessionEstablished;
 use crate::process_scope::{
     fork::ChildOnly,
     fork_child::ForkChild,
-    scope::{ChildCustody, LeaderStatus, Progress, Scope},
+    scope::{LeaderStatus, Progress, Scope},
     QualifiedProc,
 };
 use std::num::NonZeroU32;
-
-impl ChildCustody for ForkChild {
-    fn leader_id(&self) -> NonZeroU32 {
-        self.pid()
-    }
-    fn observe(&mut self) -> Result<Option<i32>, crate::process_scope::Failure> {
-        self.observe()
-    }
-    fn reap(&mut self) -> Result<i32, crate::process_scope::Failure> {
-        self.reap()
-    }
-}
 
 enum State {
     ChildOnly(ChildOnly<ForkChild>),
