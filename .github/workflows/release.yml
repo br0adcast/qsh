@@ -125,7 +125,8 @@ jobs:
             # Probes both actual stripped inputs, then checks archived bytes.
             python3 scripts/check-release-output.py archive --version "$VERSION" \
               --target "$target" --inputs "$stage" "dist/$stage.tar.gz"
-            cargo deb -p qsh --target "$target" --no-build
+            # Archive inputs are already stripped; preserve their exact bytes.
+            cargo deb -p qsh --target "$target" --no-build --no-strip
             cargo generate-rpm -p cli --target "$target"
           done
           cp target/*/debian/*.deb dist/
@@ -143,6 +144,25 @@ jobs:
             python3 scripts/check-release-output.py package --format rpm --program qsh \
               --version "$VERSION" --arch "$rpm_arch" --probe "$package"
           done
+
+      - name: Exercise shipped Linux clients before upload
+        shell: bash
+        run: |
+          case "$NATIVE_TARGET" in
+            x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
+            aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
+            *) echo 'unsupported client runtime architecture' >&2; exit 1 ;;
+          esac
+          deb_version=$(python3 -c 'import runpy,sys; print(runpy.run_path("scripts/check-release-output.py")["debian_version"](sys.argv[1]))' "$RELEASE_VERSION")
+          archive="dist/qsh-$RELEASE_VERSION-$NATIVE_TARGET.tar.gz"
+          python3 packaging/client-acceptance.py --archive "$archive" \
+            --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
+          python3 packaging/client-acceptance.py --archive "$archive" \
+            --package "dist/qsh_${deb_version}_${deb_arch}.deb" \
+            --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
+          python3 packaging/client-acceptance.py --archive "$archive" \
+            --package "dist/qsh-$RELEASE_VERSION-1.$rpm_arch.rpm" \
+            --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
