@@ -6,6 +6,7 @@ enum ParentFailure {
     Auth,
     RequiredCleanupLost,
     RequiredExitLost,
+    RequiredPublication(RequiredPublicationFailure),
     Setup(i32),
     Poll(i32),
     Worker(super::worker_owner::WorkerFailure),
@@ -64,12 +65,19 @@ impl WorkerDomain {
                 ParentFailure::Auth => "authentication seam closed or failed".to_string(),
                 ParentFailure::RequiredExitLost => "native monitor ended after cleanup but without required exit/forwarded outcome".to_string(),
                 ParentFailure::RequiredCleanupLost => "native monitor ended without required shell cleanup; worker drain cannot complete".to_string(),
+                ParentFailure::RequiredPublication(failure) => format!("required helper publication failed: {failure:?}"),
                 ParentFailure::Setup(errno) => format!("seam setup failed ({errno})"),
                 ParentFailure::Poll(errno) => format!("poll failed ({errno})"),
                 ParentFailure::Worker(failure) => format!("worker cleanup: {failure:?}"),
                 ParentFailure::Send(failure) => format!("private Stop publication: {failure:?}"),
             };
             crate::log::error("helper", &format!("owned shutdown: {detail}"));
+        }
+    }
+    fn observe_required_publication(&mut self, state: &LoopState) {
+        if let Some(failure) = state.required_publication {
+            self.record(ParentFailure::RequiredPublication(failure));
+            self.stopping = true;
         }
     }
     fn record_seam_end(&mut self, end: Next, failure: ParentFailure) {

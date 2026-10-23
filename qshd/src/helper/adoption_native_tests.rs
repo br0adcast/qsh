@@ -222,7 +222,9 @@ mod adoption_native {
                 drop(control);
                 let result = std::panic::catch_unwind(|| {
                     if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
-                        if mode.starts_with("legacy_") {
+                        if mode == "required_reply_cleanup" {
+                            super::required_reply::helper_body(dir.path(), child_control);
+                        } else if mode.starts_with("legacy_") {
                             super::adoption_legacy::helper_body(dir.path(), child_control, &mode);
                         } else {
                             super::adoption_pump::helper_body(dir.path(), child_control, &mode);
@@ -256,7 +258,9 @@ mod adoption_native {
         let deadline = Instant::now() + Duration::from_secs(10);
         let driven = if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if mode.starts_with("legacy_") {
+                if mode == "required_reply_cleanup" {
+                    super::required_reply::drive(&control)
+                } else if mode.starts_with("legacy_") {
                     super::adoption_legacy::drive(&control, dir.path(), &helper, pid, &mode)
                 } else {
                     super::adoption_pump::drive(&control, dir.path(), &helper, pid, &mode)

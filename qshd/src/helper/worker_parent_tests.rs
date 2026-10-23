@@ -239,20 +239,29 @@ mod worker_parent {
 
     #[test]
     fn worker40_drained_nonzero_native_exit_remains_failed() {
-        drained_native_exit(23, 23);
+        drained_native_exit(23, 23, None);
     }
 
     #[test]
     fn worker40_drained_signal_native_exit_remains_failed() {
-        drained_native_exit(-nix::libc::SIGTERM, 128 + nix::libc::SIGTERM);
+        drained_native_exit(-nix::libc::SIGTERM, 128 + nix::libc::SIGTERM, None);
     }
 
     #[test]
     fn worker40_drained_zero_native_exit_remains_successful() {
-        drained_native_exit(0, 0);
+        drained_native_exit(0, 0, None);
     }
 
-    fn drained_native_exit(code: i32, expected: i32) {
+    #[test]
+    fn required40_actual_zero_exit_and_drained_cannot_erase_publication_failure() {
+        drained_native_exit(0, 0, Some(super::required_reply::exited_failure()));
+    }
+
+    fn drained_native_exit(
+        code: i32,
+        expected: i32,
+        publication: Option<RequiredPublicationFailure>,
+    ) {
         let (_dir, owner, mut child) = child_fixture_exit(true, Some(code));
         let mut worker = WorkerDomain::new(owner);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -273,6 +282,7 @@ mod worker_parent {
             monitor_failure: None,
             adoption_failed: false,
             forced_worker: false,
+            required_publication: publication,
         };
         assert!(outcome.worker.terminal_received);
         assert!(outcome.worker.first_failure.is_none());
@@ -280,7 +290,7 @@ mod worker_parent {
         assert_eq!(outcome.worker.native_exit, expected);
         assert_eq!(
             outcome.failed(),
-            expected != 0,
+            expected != 0 || publication.is_some(),
             "successful Drained cannot erase actual nonzero native exit"
         );
     }

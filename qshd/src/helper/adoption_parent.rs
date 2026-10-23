@@ -125,6 +125,7 @@ struct HelperPhysicalOutcome {
     monitor_failure: Option<MonitorShutdownFailure>,
     adoption_failed: bool,
     forced_worker: bool,
+    required_publication: Option<RequiredPublicationFailure>,
 }
 #[cfg(target_os = "linux")]
 impl HelperPhysicalOutcome {
@@ -140,6 +141,7 @@ impl HelperPhysicalOutcome {
             || self.monitor_failure.is_some()
             || self.adoption_failed
             || self.forced_worker
+            || self.required_publication.is_some()
     }
 }
 
@@ -159,15 +161,20 @@ impl HelperShutdown {
         // A retained live slot needs a receipt from its now-dead native monitor.
         // The authenticated post-exit-empty fence makes that loss irrevocable.
         // PAM absence alone does not prevent a worker's cooperative join.
+        // A failed required publication independently makes a cooperative
+        // result unusable; a lost cleanup packet can otherwise strand the
+        // worker after local physical slots were correctly retired.
         let debt = ChannelReceiptDebt::from_state(&self.state);
         if !self.forced_worker
-            && debt.any()
+            && (debt.any() || self.state.required_publication.is_some())
             && worker.stop_attempted
             && matches!(root, crate::process_scope::scope::ReservedRoot::Owned(_))
         {
             // The ordinary pump already made its bounded cooperative Stop
             // attempt in this pass. Do not send a second frame here.
-            worker.record(if debt.cleanup != 0 {
+            worker.record(if let Some(failure) = self.state.required_publication {
+                ParentFailure::RequiredPublication(failure)
+            } else if debt.cleanup != 0 {
                 ParentFailure::RequiredCleanupLost
             } else {
                 ParentFailure::RequiredExitLost
@@ -210,6 +217,7 @@ impl HelperShutdown {
             monitor_failure: self.first_monitor_failure,
             adoption_failed: adoption.owner.failed(),
             forced_worker: self.forced_worker,
+            required_publication: self.state.required_publication,
         })
     }
 }

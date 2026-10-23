@@ -349,14 +349,12 @@ const REFUSED_REASON: &str = "authentication failed";
 /// long means that reader is stuck, and waiting on it longer would only
 /// stop the helper for longer.
 ///
-/// A dropped answer is never mistaken for another -- the worker matches
-/// answers to questions by number on the authentication seam and by channel
-/// id on the other. Its cost falls on its own call: a channel whose `Opened`
-/// could not be handed over is closed by the worker's own
-/// `OPEN_REPLY_TIMEOUT` path a few seconds later, and a verdict that could
-/// not be handed over leaves its call to run out its time and refuse, while
-/// the login entry an admission opened here can stay for up to
-/// `LOGIN_GRACE`.
+/// Answers are matched by authentication request number or channel id.
+/// Optional nonce and verification answers retain their request-level timeout
+/// and refusal behavior; an admitted login can remain until LOGIN_GRACE.
+/// Required lifecycle publications (including Opened and cleanup) instead
+/// retain a sticky failure and start owned shutdown. Their send failure never
+/// substitutes for actual process or PAM cleanup.
 const SEAM_SEND_TIMEOUT: Duration = super::spawner::HELPER_ANSWER_TIMEOUT;
 
 /// The loop, as the daemon runs it. The worker closing either of its two
@@ -540,6 +538,25 @@ const USER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// `sbin` directories, where the administration tools live.
 const ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[derive(Clone, Copy, Debug)]
+enum RequiredPublication {
+    Exited,
+    Cleanup,
+    Opened,
+    Refused,
+    LoginEnded,
+}
+#[derive(Clone, Copy, Debug)]
+enum PublicationError {
+    Encode,
+    Send(i32),
+}
+#[derive(Clone, Copy, Debug)]
+struct RequiredPublicationFailure {
+    kind: RequiredPublication,
+    error: PublicationError,
+}
+
 /// Everything the loop keeps between messages: one of each, shared by both
 /// seams. The sharing is the point -- the nonce a `Request::Nonce` issues on
 /// the authentication seam is the one a `Request::Verify` spends there, and
@@ -645,6 +662,7 @@ struct LoopState {
     next_incarnation: u64,
     /// Fixed aggregate survives retirement of physically joined monitors.
     pam_cleanup: PamCompletion,
+    required_publication: Option<RequiredPublicationFailure>,
     /// Sticky cooperative teardown policy; never renewed admission.
     stopping: bool,
 }
@@ -1105,6 +1123,7 @@ fn serve_inner(
         highest_channel_id: 0,
         next_incarnation: 1 + seeded as u64,
         pam_cleanup: PamCompletion::NotOpened,
+        required_publication: None,
         stopping: false,
     });
     #[cfg(target_os = "linux")]
@@ -1132,6 +1151,7 @@ fn serve_inner(
         let worker = &mut shutdown.worker;
         #[cfg(target_os = "linux")]
         if let Some(worker) = worker.as_mut() {
+            worker.observe_required_publication(state);
             if worker.stopping {
                 begin_owned_stop(
                     &channels,
@@ -1346,6 +1366,7 @@ fn serve_inner(
         reap(&channels, state);
         #[cfg(target_os = "linux")]
         if let Some(worker) = worker.as_mut() {
+            worker.observe_required_publication(state);
             worker.advance();
             if worker.stopping {
                 begin_owned_stop(
@@ -1605,13 +1626,13 @@ fn serve_channel_seam(
             if fresh {
                 state.highest_channel_id = id;
             }
-            if state.stopping {
-                refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
+            if state.stopping || state.required_publication.is_some() {
+                refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
                 return Next::Continue;
             }
             // A compromised worker cannot bypass geometry admission here.
             if let Err(reason) = terminal_size::TerminalSize::new(cols, rows) {
-                refuse_open(sock, id, reason.to_string(), fresh);
+                refuse_open(sock, state, id, reason.to_string(), fresh);
                 return Next::Continue;
             }
             // Only for an account this helper verified itself
@@ -1635,7 +1656,13 @@ fn serve_channel_seam(
                     "helper",
                     &format!("refusing a channel for uid {uid}, which has not authenticated"),
                 );
-                refuse_open(sock, id, UNVERIFIED_ACCOUNT_REASON.to_string(), fresh);
+                refuse_open(
+                    sock,
+                    state,
+                    id,
+                    UNVERIFIED_ACCOUNT_REASON.to_string(),
+                    fresh,
+                );
                 return Next::Continue;
             }
             // And only under a login that is already on file, bound to this
@@ -1675,7 +1702,7 @@ fn serve_channel_seam(
                 Ok(account) => account,
                 Err(why) => {
                     crate::log::warn("helper", &format!("refusing an Open for uid {uid}: {why}"));
-                    refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
+                    refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
                     return Next::Continue;
                 }
             };
@@ -1707,6 +1734,7 @@ fn serve_channel_seam(
             if !fresh || state.live.contains_key(&id) {
                 refuse_open(
                     sock,
+                    state,
                     id,
                     "a channel with this id is already open".to_string(),
                     false,
@@ -1762,7 +1790,7 @@ fn serve_channel_seam(
                         login[0], login[1]
                     ),
                 );
-                refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
+                refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
                 return Next::Continue;
             }
             let owner = owner_for(state, login);
@@ -1799,8 +1827,10 @@ fn serve_channel_seam(
                     // Only audited preparation failures prove NoChild.
                     // Once a send was attempted, preserve the exact charge
                     // until the monitor supplies a terminal cleanup receipt.
-                    reply(
+                    required_reply(
                         sock,
+                        state,
+                        RequiredPublication::Refused,
                         &Response::Failed {
                             id,
                             reason: format!("{e:#}"),
@@ -1951,7 +1981,7 @@ fn serve_auth_seam(
     };
     match body {
         Request::Nonce => {
-            let answer = match (!state.stopping)
+            let answer = match (!state.stopping && state.required_publication.is_none())
                 .then(|| issue_nonce(&mut state.nonces))
                 .flatten()
             {
@@ -1998,7 +2028,10 @@ fn serve_auth_seam(
             // expires at `NONCE_LIFETIME`. The wire answer is the shared
             // `REFUSED_REASON`, so nothing out there can tell which limit
             // was reached -- or that one was.
-            if state.stopping || state.pending.verifying() >= MAX_VERIFYING {
+            if state.stopping
+                || state.required_publication.is_some()
+                || state.pending.verifying() >= MAX_VERIFYING
+            {
                 crate::log::warn(
                     "helper",
                     &format!(
@@ -2336,8 +2369,10 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
         {
             state.verified.remove(&ended.account.uid);
         }
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::LoginEnded,
             &Response::LoginEnded {
                 login: owner.login,
                 incarnation: owner.incarnation,
@@ -3585,17 +3620,35 @@ fn report_exit(sock: &UnixStream, state: &mut LoopState, id: ChannelId, code: i3
             login.channels.remove(&id);
         }
     }
-    reply(sock, &Response::Exited { id, code });
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Exited,
+        &Response::Exited { id, code },
+    );
     if matches!(slot, ChannelSlot::ReapedRunning(_)) {
         complete_cleanup(sock, state, owner, id, super::protocol::CleanupKind::Reaped);
     }
 }
 
-fn refuse_open(sock: &UnixStream, id: ChannelId, reason: String, fresh: bool) {
-    reply(sock, &Response::Failed { id, reason });
+fn refuse_open(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    id: ChannelId,
+    reason: String,
+    fresh: bool,
+) {
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Refused,
+        &Response::Failed { id, reason },
+    );
     if fresh {
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::Cleanup,
             &Response::CleanupComplete {
                 id,
                 kind: super::protocol::CleanupKind::NoChild,
@@ -3630,8 +3683,10 @@ fn complete_cleanup(
     }
     if let Some(pending) = state.pending.take_channel(id) {
         drop(pending); // retire startup callback and its descriptor before proof
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::Refused,
             &Response::Failed {
                 id,
                 reason: "the channel ended before startup completed".into(),
@@ -3640,30 +3695,76 @@ fn complete_cleanup(
     }
     state.live.remove(&id);
     state.closing.remove(&id);
-    reply(sock, &Response::CleanupComplete { id, kind });
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Cleanup,
+        &Response::CleanupComplete { id, kind },
+    );
     finish_retired(state, owner);
 }
 
+fn reply_result<T: serde::Serialize>(
+    sock: &UnixStream,
+    msg: &T,
+    fd: Option<BorrowedFd<'_>>,
+) -> Result<(), PublicationError> {
+    let bytes = encode(msg).map_err(|e| {
+        crate::log::warn("helper", &format!("could not encode a reply: {e}"));
+        PublicationError::Encode
+    })?;
+    channel::send(sock, &bytes, fd).map_err(|e| {
+        crate::log::warn("helper", &format!("reply failed: {e}"));
+        PublicationError::Send(e.raw_os_error().unwrap_or(nix::libc::EIO))
+    })
+}
+
 fn reply<T: serde::Serialize>(sock: &UnixStream, msg: &T) {
-    match encode(msg) {
-        Ok(bytes) => {
-            if let Err(e) = channel::send(sock, &bytes, None) {
-                crate::log::warn("helper", &format!("reply failed: {e}"));
-            }
+    // Nonce and authentication answers keep their request-level semantics.
+    let _ = reply_result(sock, msg, None);
+}
+
+fn retain_required_result(
+    state: &mut LoopState,
+    kind: RequiredPublication,
+    result: Result<(), PublicationError>,
+) {
+    if let Err(error) = result {
+        let failure = RequiredPublicationFailure { kind, error };
+        if state.required_publication.is_none() {
+            state.required_publication = Some(failure);
+            let detail = match failure.error {
+                PublicationError::Encode => "encoding failed".to_string(),
+                PublicationError::Send(errno) => format!("send failed ({errno})"),
+            };
+            crate::log::error(
+                "helper",
+                &format!("required {:?} publication: {detail}", failure.kind),
+            );
         }
-        Err(e) => crate::log::warn("helper", &format!("could not encode a reply: {e}")),
     }
 }
 
-fn reply_with_fd(sock: &UnixStream, msg: &Response, fd: BorrowedFd<'_>) {
-    match encode(msg) {
-        Ok(bytes) => {
-            if let Err(e) = channel::send(sock, &bytes, Some(fd)) {
-                crate::log::warn("helper", &format!("reply failed: {e}"));
-            }
-        }
-        Err(e) => crate::log::warn("helper", &format!("could not encode a reply: {e}")),
-    }
+fn required_reply<T: serde::Serialize>(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    kind: RequiredPublication,
+    msg: &T,
+) {
+    retain_required_result(state, kind, reply_result(sock, msg, None));
+}
+
+fn required_reply_with_fd(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    msg: &Response,
+    fd: BorrowedFd<'_>,
+) {
+    retain_required_result(
+        state,
+        RequiredPublication::Opened,
+        reply_result(sock, msg, Some(fd)),
+    );
 }
 
 /// How long a channel's child gets to report its own startup before the
@@ -4294,7 +4395,11 @@ fn publish_verification(
         rhost,
     } = request;
     // A late completed proof cannot recreate admission after sticky stop.
-    let verdict = if state.stopping { None } else { verdict };
+    let verdict = if state.stopping || state.required_publication.is_some() {
+        None
+    } else {
+        verdict
+    };
     let answer = match verdict {
         Some(Verdict::Admitted {
             account,
@@ -4570,7 +4675,7 @@ fn apply_channel_verdict(
                     ),
                 ),
             }
-            reply_with_fd(channels, &Response::Opened { id }, master.as_fd());
+            required_reply_with_fd(channels, state, &Response::Opened { id }, master.as_fd());
         }
         StartupReport::Failed(errno) => {
             drop(master);
@@ -4631,7 +4736,12 @@ fn refuse_starting_channel(
     if let Some(slot) = state.live.get_mut(&id) {
         *slot = ChannelSlot::Cleaning(slot.owner());
     }
-    reply(channels, &Response::Failed { id, reason });
+    required_reply(
+        channels,
+        state,
+        RequiredPublication::Refused,
+        &Response::Failed { id, reason },
+    );
 }
 
 /// What a `Request::Open` asks [`open_channel`] to start, besides whose
@@ -5083,6 +5193,7 @@ pub(crate) mod tests {
     include!("monitor_shutdown_tests.rs");
     include!("verification_lifecycle_tests.rs");
     include!("worker_parent_tests.rs");
+    include!("required_reply_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -7228,6 +7339,7 @@ pub(crate) mod tests {
             highest_channel_id: 0,
             next_incarnation: 1,
             pam_cleanup: PamCompletion::NotOpened,
+            required_publication: None,
             stopping: false,
         }
     }
@@ -7293,6 +7405,7 @@ pub(crate) mod tests {
             highest_channel_id: 0,
             next_incarnation: 1,
             pam_cleanup: PamCompletion::NotOpened,
+            required_publication: None,
             stopping: false,
         }
     }
