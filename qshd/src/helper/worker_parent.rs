@@ -20,6 +20,7 @@ struct WorkerPhysicalOutcome {
     first_failure: Option<ParentFailure>,
     signal_failure: Option<(i32, i32)>,
     terminal_received: bool,
+    native_exit: i32,
 }
 
 #[cfg(target_os = "linux")]
@@ -28,8 +29,10 @@ struct WorkerDomain {
     pending: Option<super::worker_control::PendingFrame>,
     stopping: bool,
     stop_queued: bool,
+    stop_reason: Option<super::worker_protocol::StopReason>,
     stop_attempted: bool,
     native_complete: bool,
+    native_exit: Option<i32>,
     first_failure: Option<ParentFailure>,
     signal_failure: Option<(i32, i32)>,
     setup_failed: bool,
@@ -43,8 +46,10 @@ impl WorkerDomain {
             pending: None,
             stopping: false,
             stop_queued: false,
+            stop_reason: None,
             stop_attempted: false,
             native_complete: false,
+            native_exit: None,
             first_failure: None,
             signal_failure: None,
             setup_failed: false,
@@ -67,8 +72,17 @@ impl WorkerDomain {
             crate::log::error("helper", &format!("owned shutdown: {detail}"));
         }
     }
+    fn record_seam_end(&mut self, end: Next, failure: ParentFailure) {
+        match end {
+            Next::Eof
+                if self.stop_reason == Some(super::worker_protocol::StopReason::Requested) => {}
+            Next::Eof | Next::Failed => self.record(failure),
+            Next::Continue => unreachable!("live seam is not an end event"),
+        }
+    }
     fn request_stop(&mut self, reason: super::worker_protocol::StopReason) {
         use super::worker_protocol::StopReason;
+        self.stop_reason.get_or_insert(reason);
         self.stopping = true;
         if self.native_complete || self.owner.terminal_received() {
             // Exact physical completion independently forbids more Stop sends;
@@ -131,7 +145,10 @@ impl WorkerDomain {
         if progress.receipt.is_some() || matches!(progress.native, Progress::Complete(_)) {
             self.stopping = true;
         }
-        self.native_complete = matches!(progress.native, Progress::Complete(_));
+        if let Progress::Complete(code) = progress.native {
+            self.native_exit = Some(code);
+            self.native_complete = true;
+        }
         if self.native_complete {
             self.pending = None;
         }
@@ -147,6 +164,9 @@ impl WorkerDomain {
             first_failure: self.first_failure,
             signal_failure: self.signal_failure,
             terminal_received: self.owner.terminal_received(),
+            native_exit: self
+                .native_exit
+                .expect("settled worker retains exact native exit"),
         }
     }
 }

@@ -64,6 +64,15 @@ mod worker_parent {
         // ChannelLost is a retained fault even though actual joins completed.
         let _ = publisher.finish(outcome);
         std::fs::write(dir.join("finished"), b"finished").unwrap();
+        if let Ok(code) = std::env::var("QSH_TEST_PARENT_EXIT") {
+            let code: i32 = code.parse().unwrap();
+            if code < 0 {
+                // This exact disposable child terminates only itself after Drained.
+                unsafe { nix::libc::raise(-code) };
+                panic!("fixture terminating signal unexpectedly returned");
+            }
+            std::process::exit(code);
+        }
     }
 
     struct ChildOwner(std::process::Child);
@@ -81,6 +90,13 @@ mod worker_parent {
     }
 
     fn child_fixture(natural: bool) -> (tempfile::TempDir, WorkerOwner, ChildOwner) {
+        child_fixture_exit(natural, None)
+    }
+
+    fn child_fixture_exit(
+        natural: bool,
+        exit: Option<i32>,
+    ) -> (tempfile::TempDir, WorkerOwner, ChildOwner) {
         use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let view = crate::process_scope::prepare().unwrap();
@@ -99,6 +115,12 @@ mod worker_parent {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        command
+            .env_remove("QSH_TEST_PARENT_EXIT")
+            .env_remove("QSH_TEST_PARENT_NATURAL");
+        if let Some(code) = exit {
+            command.env("QSH_TEST_PARENT_EXIT", code.to_string());
+        }
         if natural {
             command.env("QSH_TEST_PARENT_NATURAL", "1");
         }
@@ -213,6 +235,95 @@ mod worker_parent {
             no_late_send,
             "already final receipt must not acquire a new Stop send failure"
         );
+    }
+
+    #[test]
+    fn worker40_drained_nonzero_native_exit_remains_failed() {
+        drained_native_exit(23, 23);
+    }
+
+    #[test]
+    fn worker40_drained_signal_native_exit_remains_failed() {
+        drained_native_exit(-nix::libc::SIGTERM, 128 + nix::libc::SIGTERM);
+    }
+
+    #[test]
+    fn worker40_drained_zero_native_exit_remains_successful() {
+        drained_native_exit(0, 0);
+    }
+
+    fn drained_native_exit(code: i32, expected: i32) {
+        let (_dir, owner, mut child) = child_fixture_exit(true, Some(code));
+        let mut worker = WorkerDomain::new(owner);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.settled() && Instant::now() < deadline {
+            worker.advance();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let reaped =
+            matches!(child.0.try_wait(), Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD));
+        drop(child);
+        assert!(reaped && worker.settled());
+        let outcome = HelperPhysicalOutcome {
+            worker: worker.physical_outcome(),
+            pam_received: PamCompletion::NotOpened,
+            missing_pam: 0,
+            channel_receipts: ChannelReceiptDebt::default(),
+            pending_requests: false,
+            monitor_failure: None,
+            adoption_failed: false,
+            forced_worker: false,
+        };
+        assert!(outcome.worker.terminal_received);
+        assert!(outcome.worker.first_failure.is_none());
+        assert!(outcome.worker.signal_failure.is_none());
+        assert_eq!(outcome.worker.native_exit, expected);
+        assert_eq!(
+            outcome.failed(),
+            expected != 0,
+            "successful Drained cannot erase actual nonzero native exit"
+        );
+    }
+
+    #[test]
+    fn worker40_only_requested_stop_accepts_clean_eof_and_never_receive_failure() {
+        use crate::helper::worker_protocol::StopReason;
+        for reason in [
+            None,
+            Some(StopReason::Requested),
+            Some(StopReason::Protocol),
+        ] {
+            for failed in [false, true] {
+                let (dir, owner, child) = child_fixture(false);
+                let mut worker = WorkerDomain::new(owner);
+                // stopping alone can come from a receipt or unrelated failure.
+                worker.stopping = true;
+                if let Some(reason) = reason {
+                    worker.request_stop(reason);
+                    // A fallback or later request cannot change the first cause.
+                    worker.request_stop(StopReason::Protocol);
+                    worker.request_stop(StopReason::Requested);
+                }
+                worker.record_seam_end(
+                    if failed { Next::Failed } else { Next::Eof },
+                    ParentFailure::Channel,
+                );
+                let recorded = worker.first_failure.is_some();
+                std::fs::write(dir.path().join("release"), b"release").unwrap();
+                worker.request_stop(StopReason::Requested);
+                worker.send_stop();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !worker.settled() && Instant::now() < deadline {
+                    worker.advance();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let settled = worker.settled();
+                drop(worker);
+                drop(child);
+                assert!(settled, "fixture must actually settle before assertions");
+                assert_eq!(recorded, failed || reason != Some(StopReason::Requested));
+            }
+        }
     }
 
     #[test]

@@ -962,9 +962,10 @@ enum WhyFinished {
 /// What a seam's handler tells the loop to do next.
 enum Next {
     Continue,
-    /// The worker is gone, or sent something that says it is not the
-    /// process this helper thinks it is: end the loop.
-    Stop,
+    /// Clean producer EOF; only an explicit requested stop expects this.
+    Eof,
+    /// Receive or protocol failure, including while stopping.
+    Failed,
 }
 
 /// Why an `Open` for an account nobody verified is refused. Shown to the
@@ -1300,11 +1301,12 @@ fn serve_inner(
         // about to be free.
         serve_ready_monitors(seams, state, &ready_monitors);
         if channel_ready {
-            if let Next::Stop = serve_channel_seam(&channels, state, &config, switches) {
+            let next = serve_channel_seam(&channels, state, &config, switches);
+            if !matches!(next, Next::Continue) {
                 #[cfg(target_os = "linux")]
                 if let Some(worker) = worker.as_mut() {
                     *channels_open = false;
-                    worker.record(ParentFailure::Channel);
+                    worker.record_seam_end(next, ParentFailure::Channel);
                     begin_owned_stop(
                         &channels,
                         state,
@@ -1319,11 +1321,12 @@ fn serve_inner(
             }
         }
         if auth_ready {
-            if let Next::Stop = serve_auth_seam(seams, state, &config, switches) {
+            let next = serve_auth_seam(seams, state, &config, switches);
+            if !matches!(next, Next::Continue) {
                 #[cfg(target_os = "linux")]
                 if let Some(worker) = worker.as_mut() {
                     *auth_open = false;
-                    worker.record(ParentFailure::Auth);
+                    worker.record_seam_end(next, ParentFailure::Auth);
                     begin_owned_stop(
                         &channels,
                         state,
@@ -1576,13 +1579,13 @@ fn serve_channel_seam(
             return Next::Continue
         }
         // The worker closed its end: it is gone.
-        Ok(None) => return Next::Stop,
+        Ok(None) => return Next::Eof,
         Err(e) => {
             crate::log::warn(
                 "helper",
                 &format!("receive on the channel seam failed: {e}"),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     match decode::<Request>(&message) {
@@ -1868,7 +1871,7 @@ fn serve_channel_seam(
             // think it is. Say so and stop rather than guess -- in words
             // of this helper's own: see `malformed_request_line`.
             crate::log::error("helper", &malformed_request_line("channel", &message));
-            return Next::Stop;
+            return Next::Failed;
         }
     }
     Next::Continue
@@ -1925,13 +1928,13 @@ fn serve_auth_seam(
             return Next::Continue
         }
         // The worker closed its end: it is gone.
-        Ok(None) => return Next::Stop,
+        Ok(None) => return Next::Eof,
         Err(e) => {
             crate::log::warn(
                 "helper",
                 &format!("receive on the authentication seam failed: {e}"),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     let AuthRequest { id, body } = match decode::<AuthRequest>(&message) {
@@ -1943,7 +1946,7 @@ fn serve_auth_seam(
                 "helper",
                 &malformed_request_line("authentication", &message),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     match body {
@@ -8280,7 +8283,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED),
-                Next::Stop
+                Next::Failed
             ),
             "a malformed request still stops the helper"
         );
@@ -8294,11 +8297,69 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED),
-                Next::Stop
+                Next::Failed
             ),
             "a malformed request still stops the helper"
         );
         assert_one_unforgeable_line(&read());
+    }
+
+    #[test]
+    fn seam_clean_eof_is_distinct_from_malformed_request() {
+        let config = test_config();
+        for authentication in [false, true] {
+            let mut state = empty_state();
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            let eof = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            super::channel::send(peer, b"invalid-json", None).unwrap();
+            let malformed = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            super::channel::send(
+                peer,
+                &vec![b'x'; crate::helper::protocol::MAX_MESSAGE_LEN + 1],
+                None,
+            )
+            .unwrap();
+            let truncated = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            assert_eq!(
+                std::mem::discriminant(&truncated),
+                std::mem::discriminant(&malformed)
+            );
+            assert_ne!(
+                std::mem::discriminant(&eof),
+                std::mem::discriminant(&malformed),
+                "clean producer EOF must not erase protocol failure (auth={authentication})"
+            );
+        }
     }
 
     // -- §10's accept and refuse lines --------------------------------

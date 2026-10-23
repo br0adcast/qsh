@@ -129,7 +129,8 @@ struct HelperPhysicalOutcome {
 #[cfg(target_os = "linux")]
 impl HelperPhysicalOutcome {
     fn failed(&self) -> bool {
-        self.worker.first_failure.is_some()
+        self.worker.native_exit != 0
+            || self.worker.first_failure.is_some()
             || !self.worker.terminal_received
             || self.worker.signal_failure.is_some()
             || !self.pam_received.succeeded()
