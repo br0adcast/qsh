@@ -799,3 +799,13 @@ fn a_resume_without_a_handover_is_refused() {
         daemon_log(home.path())
     );
 }
+
+#[cfg(target_os = "linux")]
+mod personal_signals;
+#[cfg(target_os = "linux")]
+#[path = "../src/test_borrowed_scope.rs"]
+mod test_borrowed_scope;
+#[cfg(target_os = "linux")]
+fn qualify_borrowed_fixture() {
+    personal_signals::qualify_borrowed_fixture();
+}

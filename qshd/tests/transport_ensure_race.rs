@@ -579,15 +579,20 @@ fn socket(home: &Path) -> PathBuf {
 
 #[test]
 fn stop_joins_a_silent_authenticated_channel_before_daemon_exit() {
-    stop_with_silent_channel(false);
+    stop_with_silent_channel(false, false);
 }
 
 #[test]
 fn stop_joins_a_silent_channel_with_a_hup_ignoring_descendant() {
-    stop_with_silent_channel(true);
+    stop_with_silent_channel(true, false);
 }
 
-fn stop_with_silent_channel(keep_descendant: bool) {
+#[test]
+fn stop_then_ensure_reuses_the_port_after_owned_channel_cleanup() {
+    stop_with_silent_channel(true, true);
+}
+
+fn stop_with_silent_channel(keep_descendant: bool, ensure_again: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     // This dedicated, serialized binary owns every descendant it creates.
@@ -757,7 +762,238 @@ fn stop_with_silent_channel(keep_descendant: bool) {
     let socket_removed = !sock.exists();
     assert!(daemon_exited && child_exited.iter().all(|&done| done) && rebound.is_ok() && socket_removed,
         "STOP obligations: daemon_exited={daemon_exited}, child_exited={child_exited:?}, udp_rebound={}, socket_removed={socket_removed}", rebound.is_ok());
-    client.close();
+    if ensure_again {
+        // Pin readability alone is not the native daemon wait receipt. Settle
+        // it and any already-exited adopted actors without invoking rescue.
+        wait_owned_daemon(daemon_pid);
+        reap_without_rescue();
+        drop(rebound);
+        // Initial port=0 selected this concrete endpoint; the next ensure
+        // explicitly requests that same actual port after independent rebind.
+        ensure_after_completed_stop(home.path(), port, &sock, &daemon_fd, client);
+        reap_without_rescue();
+    } else {
+        client.close();
+    }
+}
+
+fn wait_owned_daemon(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            assert!(
+                Instant::now() < deadline,
+                "owned daemon wait interrupted past deadline"
+            );
+            continue;
+        }
+        if waited == pid as i32 {
+            assert!(
+                libc::WIFEXITED(status),
+                "daemon did not exit normally: {status}"
+            );
+            assert_eq!(libc::WEXITSTATUS(status), 0, "daemon shutdown failed");
+            return;
+        }
+        assert!(
+            waited >= 0,
+            "owned daemon wait lost: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "owned daemon native wait timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn reap_without_rescue() {
+    // This serialized binary is the subreaper for only its own fixture. Consume
+    // actual exited children; never signal an actor to make success possible.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            assert!(
+                Instant::now() < deadline,
+                "owned child wait interrupted past deadline"
+            );
+            continue;
+        }
+        if waited > 0 {
+            assert!(libc::WIFEXITED(status) || libc::WIFSIGNALED(status));
+            continue;
+        }
+        if waited < 0 {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned children remain live before rescue"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn ensure_after_completed_stop(
+    home: &Path,
+    port: u16,
+    sock: &Path,
+    old_pin: &OwnedFd,
+    old_client: StdClient,
+) {
+    let run = Ensure::start(home, port).finish();
+    let key_line = run.1.lines().next().unwrap().to_owned();
+    assert_eq!(
+        ready(run),
+        port,
+        "new instance must use the original UDP port"
+    );
+    let server_pub: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(key_line.strip_prefix("server-pubkey: ").unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let fresh_pid = status(sock).pid;
+    let fresh_pin = pidfd(fresh_pid);
+    assert!(
+        exited(old_pin) && !exited(&fresh_pin),
+        "distinct retained daemon lifetimes"
+    );
+    assert_eq!(
+        status(sock).pid,
+        fresh_pid,
+        "pin the newly answering daemon"
+    );
+    assert!(
+        UdpSocket::bind(("127.0.0.1", port)).is_err(),
+        "ready instance owns the original port"
+    );
+    let key = generate_keypair();
+    assert!(matches!(
+        client_request_with_timeout(
+            sock,
+            &ControlRequest::AddClient(key.public),
+            Duration::from_secs(2)
+        )
+        .unwrap(),
+        ControlReply::Answered(_)
+    ));
+    let events = Arc::new(Events::default());
+    let fresh = StdClient::connect(
+        ([127, 0, 0, 1], port).into(),
+        ConnectionConfig {
+            required_features: transport::Features::NONE,
+            features: transport::Features::SUPPORTED,
+            role: Role::Client,
+            local_static_priv: key.private,
+            remote_static_pub: Some(server_pub),
+            auth: AuthPolicy::Allowlist(Vec::new()),
+        },
+        [40; 16],
+        StartKind::Cold,
+        Arc::new(NoopBinder),
+        events.clone(),
+        None,
+    );
+    let marker = home.join("replacement-operation");
+    let quoted = format!("'{}'", marker.to_str().unwrap().replace('\'', "'\"'\"'"));
+    let shell_marker = home.join("replacement-shell.pid");
+    let shell_quoted = format!(
+        "'{}'",
+        shell_marker.to_str().unwrap().replace('\'', "'\"'\"'")
+    );
+    // Personal command channels parse argv, not shell syntax. Keep the
+    // marker script intact in a private file instead of nesting shell quoting
+    // inside that parser's single-quote-only command argument syntax.
+    let script_dir = tempfile::Builder::new()
+        .prefix("qsh-stop-ensure-command-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let script_path = script_dir.path().join("operation.sh");
+    std::fs::write(&script_path, format!(
+        "printf '%s\\n' \"$$\" > {shell_quoted}; while IFS= read -r line; do printf '%s\\n' \"$line\" > {quoted}; done"
+    )).unwrap();
+    let script_arg = script_path.to_str().unwrap();
+    assert!(
+        script_arg
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/._-".contains(&c)),
+        "controlled fixture command path"
+    );
+    fresh
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: format!("/bin/sh '{script_arg}'").into_bytes(),
+            })),
+        )
+        .expect("fresh authenticated command admission");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !events.opened.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "new authenticated command did not open"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let operate = |nonce: &str| {
+        fresh
+            .send_bytes(FIRST_CHANNEL_STREAM, format!("{nonce}\n").into_bytes())
+            .expect("new input admission");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&marker).ok().as_deref() != Some(&format!("{nonce}\n")) {
+            assert!(Instant::now() < deadline, "fresh command failed to operate");
+            assert!(!exited(&fresh_pin), "new daemon died before operation");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    operate("before-old-release");
+    // The operation proves the preceding PID publication finished. Keep this
+    // exact still-running shell identity through the second STOP.
+    let shell_pid = std::fs::read_to_string(shell_marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let shell_pin = pidfd(shell_pid);
+    assert!(
+        !exited(&shell_pin),
+        "new shell live before old resources release"
+    );
+    old_client.close();
+    assert_eq!(
+        status(sock).pid,
+        fresh_pid,
+        "old resources cannot remove new endpoint"
+    );
+    operate("after-old-release");
+    assert!(
+        matches!(client_request_with_timeout(sock, &ControlRequest::Stop, Duration::from_secs(2)).unwrap(), ControlReply::Answered(line) if line.contains("stopping"))
+    );
+    wait_owned_daemon(fresh_pid);
+    let daemon_exited = exited(&fresh_pin);
+    let shell_exited = exited(&shell_pin);
+    let socket_removed = !sock.exists();
+    let rebound = UdpSocket::bind(("127.0.0.1", port));
+    assert!(
+        daemon_exited && shell_exited && socket_removed && rebound.is_ok(),
+        "second STOP must settle before fixture cleanup"
+    );
+    fresh.close();
 }
 
 #[test]
