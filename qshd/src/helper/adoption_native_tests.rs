@@ -294,12 +294,9 @@ mod adoption_native {
         };
         let setup_elapsed = setup_started.elapsed();
         let drain_started = Instant::now();
-        let deadline = if pam_only {
-            // Existing 8s maximum PAM close plus a finite 2s fixture allowance.
-            (drain_started + Duration::from_secs(10)).min(hard_deadline)
-        } else {
-            hard_deadline
-        };
+        // Keep the absolute fence established before setup; PAM-only already
+        // reserves time there for PAM escalation and final physical drainage.
+        let deadline = hard_deadline;
         drop(control);
         while driver_failure.is_none() && !helper.exited() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));

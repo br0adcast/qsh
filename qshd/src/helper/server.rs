@@ -2464,6 +2464,19 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
                 }
             }
             ChannelSlot::Starting(_) => {
+                // Native exit revokes admission immediately, but its original
+                // producer may still have queued the startup outcome. Keep the
+                // pending terminal until that bounded receive path proves the
+                // original queue empty (or fails). A later Started is retired.
+                #[cfg(target_os = "linux")]
+                if state.monitors.get(&owner).is_some_and(|monitor| {
+                    matches!(&monitor.process, MonitorProcess::Native(native)
+                        if native.leader_exited() && !native.producer_drained())
+                        && !monitor.wait_lost
+                        && monitor.failure.is_none()
+                }) {
+                    continue;
+                }
                 if let Some(pending) = state.pending.take_channel(id) {
                     drop(pending);
                     refuse_starting_channel(
@@ -5257,6 +5270,7 @@ pub(crate) mod tests {
     include!("verification_lifecycle_tests.rs");
     include!("worker_parent_tests.rs");
     include!("required_reply_tests.rs");
+    include!("monitor_refusal_tests.rs");
     include!("stop_signal_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
