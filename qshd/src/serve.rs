@@ -632,18 +632,25 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         .enable_all()
         .build()
         .context("creating the tokio runtime")?;
-    runtime.block_on(transport_daemon::run_serve_loop(
-        socket,
-        keypair.private,
-        auth,
-        Arc::new(managed(ChannelSessionBackend::new(Arc::new(
-            crate::screen_budget::ScreenBudget::new(crate::screen_budget::BudgetLimits::default()),
-        )))),
-        // No helper, so nobody can report a login ended from outside: in
-        // the personal mode the router is the only authority on whether a
-        // login lives.
-        LoginEndedReports::none(),
-    ))
+    runtime.block_on(async {
+        let mut signals = transport_daemon::PersonalSignals::register()?;
+        transport_daemon::run_serve_loop_until_stop(
+            socket,
+            keypair.private,
+            auth,
+            Arc::new(managed(ChannelSessionBackend::new(Arc::new(
+                crate::screen_budget::ScreenBudget::new(
+                    crate::screen_budget::BudgetLimits::default(),
+                ),
+            )))),
+            // No helper, so nobody can report a login ended from outside: in
+            // the personal mode the router is the only authority on whether a
+            // login lives.
+            LoginEndedReports::none(),
+            signals.requested(),
+        )
+        .await
+    })
 }
 
 /// A `serve` daemon describes itself but never replaces itself: a service
