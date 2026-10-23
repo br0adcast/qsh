@@ -21,6 +21,9 @@ mod adoption_native {
             assert!(fd >= 0, "owned runtime fixture requires pidfd_open");
             Self(unsafe { OwnedFd::from_raw_fd(fd as i32) })
         }
+        pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
         pub(super) fn exited(&self) -> bool {
             let mut poll = nix::libc::pollfd {
                 fd: self.0.as_raw_fd(),
@@ -178,7 +181,10 @@ mod adoption_native {
             evidence.contains("case_success=true") && evidence.contains("no_children=true"),
             "{evidence:?}"
         );
-        if scenario == Some("legacy_helper_death") {
+        if scenario == Some("legacy_helper_death")
+            || scenario
+                .is_some_and(|mode| mode.starts_with("verifier_") && mode.ends_with("_death"))
+        {
             assert!(
                 evidence.contains("helper_success=false")
                     && evidence.contains("helper_killed=true"),
@@ -203,7 +209,22 @@ mod adoption_native {
             unsafe { nix::libc::prctl(nix::libc::PR_SET_CHILD_SUBREAPER, 1) },
             0
         );
-        let dir = tempfile::tempdir().unwrap();
+        let dir = if std::env::var("QSH_TEST_ADOPTION_SCENARIO")
+            .is_ok_and(|mode| mode.starts_with("verifier_credential"))
+        {
+            assert!(running_as_root());
+            assert_eq!(
+                std::env::var("QSHD_TEST_DISPOSABLE_HOST").as_deref(),
+                Ok("1")
+            );
+            // Protected authorized_keys traversal must not pass through /tmp.
+            tempfile::Builder::new()
+                .prefix("qshd-test-verifier-")
+                .tempdir_in("/run")
+                .unwrap()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
         // This guard precedes all child creation and outlives their resources.
         let _cleanup = OwnedCleanup;
         // Sibling is owned by this supervisor, outside the helper's child domain.
@@ -222,7 +243,9 @@ mod adoption_native {
                 drop(control);
                 let result = std::panic::catch_unwind(|| {
                     if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
-                        if mode.starts_with("signal_") {
+                        if mode.starts_with("verifier_") {
+                            super::verifier_parent::helper_body(dir.path(), child_control, &mode);
+                        } else if mode.starts_with("signal_") {
                             super::owned_signal::helper_body(dir.path(), child_control, &mode);
                         } else if mode == "required_reply_cleanup" {
                             super::required_reply::helper_body(dir.path(), child_control);
@@ -265,7 +288,9 @@ mod adoption_native {
         let hard_deadline = setup_started + Duration::from_secs(if pam_only { 20 } else { 10 });
         let driven = if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if mode.starts_with("signal_") {
+                if mode.starts_with("verifier_") {
+                    super::verifier_parent::drive(&control, dir.path(), &helper, pid, &mode)
+                } else if mode.starts_with("signal_") {
                     super::owned_signal::drive(&control, &helper, &mode)
                 } else if mode == "required_reply_cleanup" {
                     super::required_reply::drive(&control)
@@ -294,12 +319,9 @@ mod adoption_native {
         };
         let setup_elapsed = setup_started.elapsed();
         let drain_started = Instant::now();
-        let deadline = if pam_only {
-            // Existing 8s maximum PAM close plus a finite 2s fixture allowance.
-            (drain_started + Duration::from_secs(10)).min(hard_deadline)
-        } else {
-            hard_deadline
-        };
+        // Keep the absolute fence established before setup; PAM-only already
+        // reserves time there for PAM escalation and final physical drainage.
+        let deadline = hard_deadline;
         drop(control);
         while driver_failure.is_none() && !helper.exited() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
@@ -326,8 +348,10 @@ mod adoption_native {
         let helper_killed = result == 0
             && info.si_code == nix::libc::CLD_KILLED
             && unsafe { info.si_status() } == nix::libc::SIGKILL;
-        let expected_helper_death =
-            std::env::var("QSH_TEST_ADOPTION_SCENARIO").as_deref() == Ok("legacy_helper_death");
+        let expected_helper_death = std::env::var("QSH_TEST_ADOPTION_SCENARIO").is_ok_and(|mode| {
+            mode == "legacy_helper_death"
+                || (mode.starts_with("verifier_") && mode.ends_with("_death"))
+        });
         let outsider_untouched = !outsider_pin.exited();
         let observed_exited = observed.iter().all(Pin::exited);
         let case_success = driver_failure.is_none()
