@@ -71,6 +71,34 @@ fn monitor40_private_producer_body() {
     }
     let rights = (mode == "rights").then(|| std::fs::File::open("/dev/null").unwrap());
     channel::send(&seam, &stage, rights.as_ref().map(AsFd::as_fd)).unwrap();
+    if matches!(mode.as_str(), "refused" | "started") {
+        let outcome = if mode == "refused" {
+            MonitorEvent::Refused {
+                id: 209,
+                why: "fixture account denied".into(),
+            }
+        } else {
+            MonitorEvent::Started { id: 209 }
+        };
+        channel::send(&seam, &encode(&outcome).unwrap(), None).unwrap();
+        channel::send(
+            &seam,
+            &encode(&MonitorEvent::CleanupComplete {
+                id: 209,
+                kind: if mode == "refused" {
+                    super::super::protocol::CleanupKind::NoChild
+                } else {
+                    super::super::protocol::CleanupKind::Reaped
+                },
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    }
+    if mode == "malformed-outcome" {
+        channel::send(&seam, b"not a monitor record", None).unwrap();
+    }
     channel::send(
         &seam,
         &encode(&MonitorEvent::SessionClosed {

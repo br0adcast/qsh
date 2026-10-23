@@ -511,7 +511,10 @@ struct AccountSwitches {
     /// How [`verify_proof_after_nonce`]'s step 4 reads an account's
     /// `authorized_keys`. Called in the verifying child too, for the same
     /// reason: the file may live on a home directory that never answers.
-    read_keys: fn(&Account, &str) -> Result<String, AuthorizedError>,
+    read_keys:
+        fn(&Account, &str, Option<authorized::VerifierParent>) -> Result<String, AuthorizedError>,
+    #[cfg(test)]
+    verifier_observer: fn(authorized::VerifierBoundary),
     /// How a channel's child becomes the account it runs as: called between
     /// `fork` and `exec`, so it must not allocate -- see the module's docs.
     become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
@@ -525,7 +528,9 @@ impl AccountSwitches {
     /// it.
     const REAL: AccountSwitches = AccountSwitches {
         lookup: account::lookup,
-        read_keys: authorized::read_for,
+        read_keys: authorized::read_for_verifier,
+        #[cfg(test)]
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -2464,6 +2469,19 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
                 }
             }
             ChannelSlot::Starting(_) => {
+                // Native exit revokes admission immediately, but its original
+                // producer may still have queued the startup outcome. Keep the
+                // pending terminal until that bounded receive path proves the
+                // original queue empty (or fails). A later Started is retired.
+                #[cfg(target_os = "linux")]
+                if state.monitors.get(&owner).is_some_and(|monitor| {
+                    matches!(&monitor.process, MonitorProcess::Native(native)
+                        if native.leader_exited() && !native.producer_drained())
+                        && !monitor.wait_lost
+                        && monitor.failure.is_none()
+                }) {
+                    continue;
+                }
                 if let Some(pending) = state.pending.take_channel(id) {
                     drop(pending);
                     refuse_starting_channel(
@@ -3079,6 +3097,7 @@ fn verify_proof_after_nonce(
     nonce: &Nonce,
     config: &HelperConfig,
     switches: AccountSwitches,
+    verifier_parent: Option<authorized::VerifierParent>,
 ) -> Result<(Account, String, String), VerifyRefusal> {
     // 2.
     let account = (switches.lookup)(login).map_err(|e| VerifyRefusal {
@@ -3112,7 +3131,7 @@ fn verify_proof_after_nonce(
     // `authorized::read_for`); `key_is_listed` is the SAME parsing and
     // matching the personal mode's verifier uses -- never a second parser,
     // see that function's docs.
-    let text = (switches.read_keys)(&account, &config.authorized_keys_template)
+    let text = (switches.read_keys)(&account, &config.authorized_keys_template, verifier_parent)
         .map_err(|e| VerifyRefusal::other(format!("reading authorized_keys: {e}")))?;
     if !sshauth::verify::key_is_listed(&text, &key)
         .map_err(|e| VerifyRefusal::other(format!("matching authorized_keys: {e}")))?
@@ -3509,6 +3528,14 @@ fn fork_verification(
     // here: `getrlimit` is a libc call, and the child has closing to do
     // before it may make any.
     let fd_limit = max_open_descriptors();
+    #[cfg(target_os = "linux")]
+    let verifier_parent = Some(authorized::VerifierParent::new(
+        Pid::this(),
+        #[cfg(test)]
+        switches.verifier_observer,
+    ));
+    #[cfg(not(target_os = "linux"))]
+    let verifier_parent = None;
 
     // SAFETY: the helper is single-threaded by construction (it forked
     // before the tokio runtime existed and never starts a thread), so no
@@ -3559,6 +3586,9 @@ fn fork_verification(
                 // this child's own copy -- goes with the rest; nothing here
                 // reads the pipe.
                 close_other_descriptors(report_write.as_raw_fd(), fd_limit);
+                if let Some(parent) = verifier_parent {
+                    parent.arm_initial();
+                }
                 #[cfg(target_os = "linux")]
                 {
                     let (tag, value) = match nix::unistd::setsid() {
@@ -3593,6 +3623,7 @@ fn fork_verification(
                     nonce,
                     config,
                     switches,
+                    verifier_parent,
                 ) {
                     Ok((account, identity, algorithm)) => Verdict::Admitted {
                         account,
@@ -5255,8 +5286,10 @@ pub(crate) mod tests {
     include!("shutdown_owner_tests.rs");
     include!("monitor_shutdown_tests.rs");
     include!("verification_lifecycle_tests.rs");
+    include!("verifier_parent_death_tests.rs");
     include!("worker_parent_tests.rs");
     include!("required_reply_tests.rs");
+    include!("monitor_refusal_tests.rs");
     include!("stop_signal_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
@@ -6467,7 +6500,11 @@ pub(crate) mod tests {
     /// so it cannot run unprivileged. The switch itself is proven under
     /// root in `qshd/tests/authorized_keys_privilege.rs`; real daemon attack
     /// rejection is exercised in `system_mode_accounts.rs`.
-    fn read_keys_plainly(account: &Account, template: &str) -> Result<String, AuthorizedError> {
+    fn read_keys_plainly(
+        account: &Account,
+        template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
+    ) -> Result<String, AuthorizedError> {
         let path = super::account::expand_template(template, account);
         super::authorized::to_key_text(super::authorized::read_regular_file_bounded(&path), &path)
     }
@@ -6554,6 +6591,7 @@ pub(crate) mod tests {
     fn read_keys_from_the_fifo(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         let path = HUNG_KEYS_FIFO
             .get()
@@ -6611,6 +6649,7 @@ pub(crate) mod tests {
     fn read_keys_that_never_finishes(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         loop {
             // SAFETY: `pause` takes no arguments and touches nothing this
@@ -6630,6 +6669,7 @@ pub(crate) mod tests {
     fn read_keys_killing_this_process(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGKILL);
         // Not reached: `SIGKILL` cannot be caught, blocked or ignored.
@@ -6651,6 +6691,7 @@ pub(crate) mod tests {
     fn read_keys_recording_descriptors(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         // Built BEFORE anything below opens a file of its own, so the
         // listing describes what was inherited rather than what this
@@ -6704,6 +6745,7 @@ pub(crate) mod tests {
     const UNPRIVILEGED: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: keep_identity,
         session_group_ops: monitor::SessionGroupOps {
             install: |_| Ok(()),
@@ -14580,6 +14622,7 @@ pub(crate) mod tests {
     const WRONG_GID_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_wrong_gid,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -14601,6 +14644,7 @@ pub(crate) mod tests {
     const KEEP_CAPS_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_keeping_caps,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -14615,6 +14659,7 @@ pub(crate) mod tests {
     const EMPTY_GROUPS_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_empty_groups,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -15000,18 +15045,36 @@ pub(crate) mod tests {
         );
     }
 
-    /// Waits for `path` to exist, bounded -- a marker that never appears
-    /// must fail the test that wanted it, not hang the run.
-    fn wait_until_exists(path: &Path, within: Duration) {
+    /// Reads an atomically published marker. Only absence is retried; a
+    /// present but incomplete record is returned for the caller to reject.
+    fn read_marker_after_absence(
+        path: &Path,
+        within: Duration,
+        first_absence: impl FnOnce(),
+    ) -> String {
         let deadline = Instant::now() + within;
-        while !path.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "{} never appeared within {within:?}",
-                path.display()
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        let mut first_absence = Some(first_absence);
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(record) => return record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(observe) = first_absence.take() {
+                        observe();
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} never appeared within {within:?}",
+                        path.display()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("read {}: {error}", path.display()),
+            }
         }
+    }
+
+    fn wait_until_exists(path: &Path, within: Duration) {
+        let _ = read_marker_after_absence(path, within, || {});
     }
 
     /// The lines of `path`, trimmed -- what an appending `pam_exec` script
@@ -15639,19 +15702,39 @@ pub(crate) mod tests {
     /// that the same process did both.
     #[test]
     fn the_session_is_opened_and_closed_by_the_monitor() {
+        #[cfg(target_os = "linux")]
+        crate::test_borrowed_scope::run_exact(
+            "helper::server::tests::the_session_is_opened_and_closed_by_the_monitor",
+            0,
+            session_publication_body,
+        )
+        .assert_clean(0);
+        #[cfg(not(target_os = "linux"))]
+        session_publication_body();
+    }
+
+    fn session_publication_body() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let marker = dir.path().join("session-open");
         let closed_marker = dir.path().join("session-open.closed");
-        // `pam_exec.so` runs once for each half of the session stack.
-        // Nothing here needs privileges: the stack is `pam_permit` plus
-        // `pam_exec`, and the config directory is the test's own.
-        // The script records WHICH process called pam_open_session, and the
-        // close half must be the same one: `pam_close_session` from any
-        // other process is what the monitor exists to prevent (spec 3.3).
-        // pam_exec forks and execs the script from the process that called
-        // into PAM, so the script's $PPID is that process.
-        // Publish each complete PID atomically: existence is what the close
-        // wait observes, and shell redirection creates a file before writing.
+        let ready = dir.path().join("close-ready");
+        let gate_path = dir.path().join("publish-gate");
+        nix::unistd::mkfifo(
+            &gate_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create owned publication gate");
+        // Holding both ends makes unwind release nonblocking even if the hook
+        // has not opened its read end. Monitor FD sweeps prevent inheritance.
+        let mut gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(&gate_path)
+            .expect("own publication gate");
         let script = dir.path().join("record-session.sh");
         write_script(
             &script,
@@ -15659,8 +15742,15 @@ pub(crate) mod tests {
                 "if [ \"$PAM_TYPE\" = open_session ]; then marker={m}; \
                  else marker={m}.closed; fi\n\
                  pending=$(mktemp \"$marker.XXXXXX\") || exit $?\n\
-                 printf '%s\\n' \"$PPID\" > \"$pending\" && mv \"$pending\" \"$marker\"",
-                m = marker.display()
+                 printf '%s\\n' \"$PPID\" > \"$pending\" || exit $?\n\
+                 if [ \"$PAM_TYPE\" = close_session ]; then\n\
+                   printf '%s\\n' \"$pending\" > {r}.pending && mv {r}.pending {r} || exit $?\n\
+                   IFS= read -r release < {g} || exit $?\n\
+                 fi\n\
+                 mv \"$pending\" \"$marker\"",
+                m = marker.display(),
+                r = ready.display(),
+                g = gate_path.display(),
             ),
         );
         write_stack(
@@ -15675,33 +15765,69 @@ pub(crate) mod tests {
             ),
         );
 
+        enum ReadEvent {
+            Missing,
+            Complete(String),
+        }
         let h = helper_with_pam_confdir(dir.path(), "qshd-test-session");
-        let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), h.login);
-        assert!(
-            marker.exists(),
-            "pam_open_session must run before the first channel is answered"
-        );
-
-        let opened_by = std::fs::read_to_string(&marker)
-            .expect("open marker")
-            .trim()
-            .to_string();
-        assert_eq!(
-            opened_by,
-            monitor.to_string(),
-            "pam_open_session must be called by the monitor itself, not by the helper"
-        );
-
-        tell_login_ended(&h.auth, h.login);
-        wait_until_exists(&closed_marker, TEST_RECV_TIMEOUT);
-        assert_eq!(
-            std::fs::read_to_string(&closed_marker)
-                .expect("close marker")
-                .trim(),
-            opened_by,
-            "pam_close_session must be called by the SAME process that opened the session"
-        );
+        let mut reader = None;
+        let (send, receive) = std::sync::mpsc::channel();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), h.login);
+            let opened_by = std::fs::read_to_string(&marker).expect("open marker");
+            assert_eq!(opened_by, format!("{monitor}\n"), "monitor opened PAM");
+            tell_login_ended(&h.auth, h.login);
+            let pending = read_marker_after_absence(&ready, TEST_RECV_TIMEOUT, || {});
+            assert_eq!(
+                std::fs::read_to_string(pending.trim()).expect("complete pending PID"),
+                opened_by,
+                "held hook prepared the same monitor's complete record"
+            );
+            let path = closed_marker.clone();
+            reader = Some(std::thread::spawn(move || {
+                let record = read_marker_after_absence(&path, TEST_RECV_TIMEOUT, || {
+                    send.send(ReadEvent::Missing)
+                        .expect("observe actual absent read");
+                });
+                send.send(ReadEvent::Complete(record.clone()))
+                    .expect("observe completed read");
+                record
+            }));
+            match receive
+                .recv_timeout(TEST_RECV_TIMEOUT)
+                .expect("reader reached publication boundary")
+            {
+                ReadEvent::Missing => {}
+                ReadEvent::Complete(record) => {
+                    panic!("publication contract: reader returned before gate release: {record:?}")
+                }
+            }
+            assert!(
+                matches!(
+                    receive.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "reader must not succeed while the complete record is unpublished"
+            );
+            assert!(!closed_marker.exists(), "final path remains unpublished");
+        }));
+        // Always release before joining the reader and stopping the real helper.
+        // One small nonblocking write cannot wait on a hook that never started.
+        let released = gate.write_all(b"publish\n");
+        let read_result = reader.map(|reader| reader.join());
         h.stop();
+        if let Err(failure) = result {
+            std::panic::resume_unwind(failure);
+        }
+        released.expect("release owned publication gate");
+        let record = read_result
+            .expect("reader started")
+            .expect("marker reader completed");
+        assert_eq!(
+            record,
+            std::fs::read_to_string(&marker).expect("open marker"),
+            "PAM close publishes the complete PID of the monitor that opened it"
+        );
     }
 
     /// And the session is closed when the HELPER stops, not only when the

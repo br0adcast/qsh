@@ -40,6 +40,7 @@ pub(super) struct NativeMonitor {
     stop_at: Option<Instant>,
     completed: Option<i32>,
     leader_exited: bool,
+    producer_drained: bool,
 }
 impl NativeMonitor {
     /// Infallible first successful-fork parent action. Qualified proc and the
@@ -57,6 +58,7 @@ impl NativeMonitor {
             stop_at: None,
             completed: None,
             leader_exited: false,
+            producer_drained: false,
         }
     }
     pub(super) fn seam(&self) -> &UnixStream {
@@ -64,6 +66,11 @@ impl NativeMonitor {
     }
     pub(super) fn closed(&self) -> bool {
         self.closed
+    }
+    /// An empty receive begun after original-producer exit. Inherited socket
+    /// writers need not reach EOF before its queued outcomes are exhausted.
+    pub(super) fn producer_drained(&self) -> bool {
+        self.producer_drained
     }
     pub(super) fn leader(&mut self) -> LeaderStatus {
         let status = self.child.leader();
@@ -160,6 +167,7 @@ impl NativeMonitor {
         }
         // Only a receive begun after nonreaping exit observation can discharge
         // the queue fence. An event, error, or EINTR is never an empty proof.
+        self.producer_drained |= matches!(leader, LeaderStatus::Exited(_)) && empty;
         let native = if matches!(leader, LeaderStatus::Exited(_)) && empty {
             self.child.progress(self.closed && !self.ambiguous)
         } else {
