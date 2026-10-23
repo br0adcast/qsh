@@ -46,6 +46,8 @@ jobs:
           actual=$(git rev-parse HEAD)
           echo "Source commit: $actual (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
           test "$actual" = "$GITHUB_SHA"
+      - name: Inspect Darwin custody API availability
+        run: bash scripts/inspect-darwin-custody.sh
       - name: Install the toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - name: Verify qualified compiler
