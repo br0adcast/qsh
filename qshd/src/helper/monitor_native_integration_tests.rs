@@ -110,6 +110,7 @@ mod monitor_native_integration {
     fn empty_monitor_plan() -> MonitorPlan {
         let config = test_config();
         MonitorPlan {
+            child_mask: None,
             account: my_account(),
             login: [40; 16],
             tty: "/dev/pts/0".into(),
@@ -169,7 +170,13 @@ mod monitor_native_integration {
     fn force_command(mode: &str) -> std::process::Command {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", FORCE_TEST, "--ignored", "--test-threads=1"])
+            .args([
+                "--exact",
+                FORCE_TEST,
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
             .env(FORCE_MODE, mode)
             .env(FORCE_PARENT, std::process::id().to_string())
             .stdin(std::process::Stdio::null())
@@ -196,6 +203,36 @@ mod monitor_native_integration {
     }
 
     #[test]
+    fn monitor40_bad_explicit_owned_module_fails_clearly_after_exact_cleanup() {
+        qualify_fixture_pidfds();
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = dir.path().join("invalid-module");
+        std::fs::write(&invalid, b"not an ELF module").unwrap();
+        for (index, module) in [dir.path().join("missing-module"), invalid]
+            .into_iter()
+            .enumerate()
+        {
+            let report = dir.path().join(format!("bad-module-{index}"));
+            let status = force_command("supervisor")
+                .env(FORCE_REPORT, &report)
+                .env("QSHD_TEST_PAM_OWNED_MODULE", module)
+                .status()
+                .unwrap();
+            let report = std::fs::read_to_string(report).unwrap();
+            assert!(
+                !status.success(),
+                "broken explicit module cannot fall back: {report}"
+            );
+            assert!(
+                report.contains("body_success=false")
+                    && report.contains("no_children=true")
+                    && report.contains("configured QSHD_TEST_PAM_OWNED_MODULE"),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "runs only in the exact owned monitor-force subprocess"]
     fn monitor40_force_owned_body() {
         use std::process::{Command, Stdio};
@@ -208,7 +245,11 @@ mod monitor_native_integration {
             0
         );
         if std::env::var(FORCE_MODE).unwrap() == "supervisor" {
-            let mut body = force_command("body").spawn().unwrap();
+            let mut body_stderr = tempfile::tempfile().unwrap();
+            let mut body = force_command("body")
+                .stderr(Stdio::from(body_stderr.try_clone().unwrap()))
+                .spawn()
+                .unwrap();
             let mut pin = Pin::new(Pid::from_raw(body.id() as i32));
             let deadline = Instant::now() + Duration::from_secs(10);
             while !pin.exited() && Instant::now() < deadline {
@@ -254,7 +295,16 @@ mod monitor_native_integration {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(nix::libc::ECHILD)
             );
-            let report = format!("timed_out={timed_out}, body_success={body_success}, adopted_reaped={adopted}, no_children=true");
+            // Read diagnostic bytes only after exact child/adopted cleanup.
+            // A file avoids pipe inheritance or output backpressure blocking waits.
+            use std::io::{Read, Seek};
+            body_stderr.rewind().unwrap();
+            let mut diagnostic = Vec::new();
+            body_stderr.take(4097).read_to_end(&mut diagnostic).unwrap();
+            let truncated = diagnostic.len() > 4096;
+            diagnostic.truncate(4096);
+            let diagnostic = String::from_utf8_lossy(&diagnostic);
+            let report = format!("timed_out={timed_out}, body_success={body_success}, adopted_reaped={adopted}, no_children=true, body_stderr_truncated={truncated}, body_stderr={diagnostic:?}");
             std::fs::write(std::env::var_os(FORCE_REPORT).unwrap(), &report).unwrap();
             assert!(body_success && !timed_out, "{report}");
             return;
@@ -275,46 +325,47 @@ mod monitor_native_integration {
         // pam_exec deliberately calls setsid. This owned module instead keeps
         // its finite helper in the monitor session; it is a same-SID contract
         // control, not evidence for descendants that start separate sessions.
-        let module_source = dir.path().join("pam_owned.c");
-        let module = dir.path().join("pam_owned.so");
-        std::fs::write(
-            &module_source,
-            r#"
-#include <security/pam_modules.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <errno.h>
-PAM_EXTERN int pam_sm_open_session(pam_handle_t *p, int flags, int argc, const char **argv) {
-    (void)p; (void)flags;
-    if (argc != 1) return PAM_SESSION_ERR;
-    pid_t child = fork();
-    if (child < 0) return PAM_SESSION_ERR;
-    if (child == 0) { execl(argv[0], argv[0], (char *)0); _exit(127); }
-    int status;
-    while (waitpid(child, &status, 0) < 0) {
-        if (errno != EINTR) return PAM_SESSION_ERR;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? PAM_SUCCESS : PAM_SESSION_ERR;
-}
-PAM_EXTERN int pam_sm_close_session(pam_handle_t *p, int flags, int argc, const char **argv) {
-    (void)p; (void)flags; (void)argc; (void)argv;
-    return PAM_SUCCESS;
-}
-"#,
-        )
-        .unwrap();
-        let built = Command::new("cc")
-            .args(["-shared", "-fPIC", "-Werror", "-Wall", "-Wextra"])
-            .arg(&module_source)
-            .arg("-o")
-            .arg(&module)
-            .output()
+        let module = if let Some(configured) = std::env::var_os("QSHD_TEST_PAM_OWNED_MODULE") {
+            use std::io::Read;
+            let path = std::path::PathBuf::from(configured);
+            let mut file = std::fs::File::open(&path).unwrap_or_else(|error| {
+                panic!("configured QSHD_TEST_PAM_OWNED_MODULE is unavailable at {path:?}: {error}")
+            });
+            assert!(
+                file.metadata().unwrap().is_file(),
+                "configured QSHD_TEST_PAM_OWNED_MODULE must be a regular file: {path:?}"
+            );
+            let mut magic = [0; 4];
+            file.read_exact(&mut magic).unwrap_or_else(|error| {
+                panic!(
+                    "configured QSHD_TEST_PAM_OWNED_MODULE has no ELF header at {path:?}: {error}"
+                )
+            });
+            assert_eq!(
+                &magic, b"\x7fELF",
+                "configured QSHD_TEST_PAM_OWNED_MODULE is not an ELF shared module: {path:?}"
+            );
+            path.canonicalize()
+                .expect("configured owned PAM module path")
+        } else {
+            let module_source = dir.path().join("owned_session.c");
+            let module = dir.path().join("owned_session.so");
+            std::fs::write(
+                &module_source,
+                include_str!("../../tests/fixtures/pam/owned_session.c"),
+            )
             .unwrap();
-        assert!(
-            built.status.success(),
-            "owned PAM module build failed: {:?}",
-            String::from_utf8_lossy(&built.stderr)
-        );
+            let built = Command::new("cc")
+                .args(["-shared", "-fPIC", "-Werror", "-Wall", "-Wextra"])
+                .arg(&module_source).arg("-o").arg(&module)
+                .output().expect("local owned PAM fallback requires cc and PAM development headers; CI should set QSHD_TEST_PAM_OWNED_MODULE");
+            assert!(
+                built.status.success(),
+                "owned PAM module build failed: {:?}",
+                String::from_utf8_lossy(&built.stderr)
+            );
+            module
+        };
         write_stack(dir.path(), "qshd-monitor-force", &format!("auth required pam_permit.so\naccount required pam_permit.so\nsession required {} {}\nsession required pam_permit.so\n", module.display(), script.display()));
         let mut plan = empty_monitor_plan();
         plan.pam_service = "qshd-monitor-force".into();

@@ -54,6 +54,7 @@ mod adoption_legacy {
             Some(OwnedParent {
                 worker,
                 adoption: Some(adoption),
+                stop: None,
             }),
         );
         assert_ne!(

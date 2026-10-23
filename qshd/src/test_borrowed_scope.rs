@@ -1,0 +1,419 @@
+//! Private exact-test self-reexec for fixtures that deliberately orphan jobs.
+//! Neither subreaping nor descendant collection runs in ordinary shared libtest.
+use nix::libc;
+use std::{
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    process::{Child, Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
+};
+
+const MODE: &str = "QSH_TEST_BORROWED_SCOPE_MODE";
+const TEST: &str = "QSH_TEST_BORROWED_SCOPE_TEST";
+const PARENT: &str = "QSH_TEST_BORROWED_SCOPE_PARENT";
+const REPORT: &str = "QSH_TEST_BORROWED_SCOPE_REPORT";
+// Observation deadline only. These fixed fixtures create finite killable jobs;
+// consuming waits retain custody even if an OS wait cannot finish promptly.
+// This helper does not promise a universal wall bound for uninterruptible exit.
+const BODY_LIMIT: Duration = Duration::from_secs(30);
+static EXPECTED_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct Outcome {
+    pub(crate) body_success: bool,
+    pub(crate) timed_out: bool,
+    pub(crate) expected_waits: usize,
+    pub(crate) body_adopted: usize,
+    pub(crate) body_rescues: usize,
+    pub(crate) supervisor_adopted: usize,
+    pub(crate) supervisor_rescues: usize,
+    pub(crate) no_children: bool,
+    pub(crate) supervisor_success: bool,
+}
+impl Outcome {
+    pub(crate) fn assert_clean(&self, expected_waits: usize) {
+        assert!(
+            self.supervisor_success
+                && self.body_success
+                && !self.timed_out
+                && self.expected_waits == expected_waits
+                && self.body_adopted == 0
+                && self.body_rescues == 0
+                && self.supervisor_adopted == 0
+                && self.supervisor_rescues == 0
+                && self.no_children,
+            "borrowed fixture did not finish unaided: {self:?}"
+        );
+    }
+}
+
+fn pin(pid: u32) -> OwnedFd {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(raw >= 0, "private fixture pidfd_open unavailable");
+    unsafe { OwnedFd::from_raw_fd(raw as i32) }
+}
+fn exited(fd: BorrowedFd<'_>) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result >= 0 {
+            return descriptor.revents & libc::POLLIN != 0;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+}
+fn signal_kill(fd: BorrowedFd<'_>) {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    assert!(result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+}
+fn wait_exact(fd: BorrowedFd<'_>) {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::__WALL,
+            )
+        };
+        if result == 0 {
+            assert!(
+                unsafe { info.si_pid() } > 0,
+                "actual consuming wait required"
+            );
+            return;
+        }
+        // ECHILD is a lost/not-owned wait, never a successful fixture receipt.
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+}
+/// Called only for a positively identified fixture member, after its parent
+/// has ended and this dedicated body has adopted it. No ECHILD shortcut.
+pub(crate) fn wait_expected(fd: BorrowedFd<'_>) {
+    assert_eq!(std::env::var(MODE).as_deref(), Ok("body"));
+    wait_exact(fd);
+    EXPECTED_WAITS.fetch_add(1, Ordering::SeqCst);
+}
+
+fn qualify_private_child() {
+    super::qualify_borrowed_fixture();
+    assert_eq!(
+        std::env::var(PARENT).unwrap().parse::<u32>().unwrap(),
+        unsafe { libc::getppid() } as u32
+    );
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) },
+        0
+    );
+    assert_eq!(
+        action.sa_sigaction,
+        libc::SIG_DFL,
+        "private fixture needs exclusive waits"
+    );
+    assert_eq!(action.sa_flags & libc::SA_NOCLDWAIT, 0);
+    let own = pin(std::process::id());
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            own.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    assert_eq!(result, 0);
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    let mut enabled = 0i32;
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled, 0, 0, 0) },
+        0
+    );
+    assert_eq!(enabled, 1);
+}
+
+#[derive(Default)]
+struct Drain {
+    adopted: usize,
+    rescues: usize,
+}
+fn drain_owned_children() -> Drain {
+    // As in the qualified adoption fixtures: include the libtest body's task,
+    // not just /proc/self/task/<main>/children. Every child belongs to this case.
+    use std::os::fd::AsFd;
+    let mut drain = Drain::default();
+    loop {
+        let mut children = std::collections::BTreeSet::new();
+        for task in std::fs::read_dir("/proc/self/task").unwrap() {
+            let path = task.unwrap().path().join("children");
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    children.extend(text.split_whitespace().map(|p| p.parse::<u32>().unwrap()))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("owned fixture child census: {error}"),
+            }
+        }
+        if children.is_empty() {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_ALL,
+                    0,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+                )
+            };
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            assert_eq!(result, -1, "empty census alone is not no-child proof");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+            return drain;
+        }
+        for child in children {
+            // These are our exclusively waitable direct children. Their PIDs
+            // stay reserved until this exact wait; only the pidfd is signaled.
+            let fd = pin(child);
+            if !exited(fd.as_fd()) {
+                signal_kill(fd.as_fd());
+                drain.rescues += 1;
+            }
+            wait_exact(fd.as_fd());
+            drain.adopted += 1;
+        }
+    }
+}
+struct DrainOnDrop(bool);
+impl DrainOnDrop {
+    fn finish(&mut self) -> Drain {
+        let result = drain_owned_children();
+        self.0 = true;
+        result
+    }
+}
+impl Drop for DrainOnDrop {
+    fn drop(&mut self) {
+        if !self.0 {
+            // Declared before the root owner: unwind kills/waits that root
+            // first, then retains all of its adopted descendants here.
+            let _ = self.finish();
+        }
+    }
+}
+struct ChildOwner {
+    child: Child,
+    reaped: bool,
+    authority: bool,
+}
+impl ChildOwner {
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            match self.child.wait() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => {
+                    self.reaped = result.is_ok();
+                    if result.is_err() {
+                        self.authority = false;
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+}
+impl Drop for ChildOwner {
+    fn drop(&mut self) {
+        if !self.reaped && self.authority {
+            // This root is still an exclusively owned, unreaped direct child.
+            let _ = self.child.kill();
+            let _ = self.wait();
+        }
+    }
+}
+fn command(test: &str, mode: &str, report: &std::path::Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test, "--test-threads=1"])
+        .env(MODE, mode)
+        .env(TEST, test)
+        .env(PARENT, std::process::id().to_string())
+        .env(REPORT, report)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // No inherited output pipe can be held by a borrowed job. The bounded
+    // private report supplies status; there are no detached pipe collectors.
+    command
+}
+fn read_fields(path: &std::path::Path) -> std::collections::BTreeMap<String, usize> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .unwrap()
+        .take(1025)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(bytes.len() <= 1024, "bounded fixture report");
+    String::from_utf8(bytes)
+        .unwrap()
+        .split_whitespace()
+        .map(|field| {
+            let (key, value) = field.split_once('=').unwrap();
+            (key.to_string(), value.parse::<usize>().unwrap())
+        })
+        .collect()
+}
+
+/// One fixed exact test, two private stages. A body panic/crash/timeout remains
+/// failed after the supervisor has actually waited its root and all adoptees.
+pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) -> Outcome {
+    match std::env::var(MODE).ok().as_deref() {
+        Some("body") => {
+            qualify_private_child();
+            assert_eq!(std::env::var(TEST).unwrap(), test);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            let drain = drain_owned_children();
+            let waits = EXPECTED_WAITS.load(Ordering::SeqCst);
+            let success = result.is_ok() && waits == expected_waits && drain.adopted == 0;
+            std::fs::write(std::env::var_os(REPORT).unwrap(), format!(
+                "body_success={} expected_waits={waits} body_adopted={} body_rescues={} no_children=1",
+                usize::from(success), drain.adopted, drain.rescues)).unwrap();
+            std::process::exit(if success { 0 } else { 101 });
+        }
+        Some("supervisor") => {
+            qualify_private_child();
+            assert_eq!(std::env::var(TEST).unwrap(), test);
+            let report = std::path::PathBuf::from(std::env::var_os(REPORT).unwrap());
+            let body_report = report.with_extension("body");
+            let mut cleanup = DrainOnDrop(false);
+            let mut root = ChildOwner {
+                child: command(test, "body", &body_report).spawn().unwrap(),
+                reaped: false,
+                authority: true,
+            };
+            let until = Instant::now() + BODY_LIMIT;
+            let status = loop {
+                match root.child.try_wait() {
+                    Ok(Some(status)) => {
+                        root.reaped = true;
+                        break Some(status);
+                    }
+                    Ok(None) if Instant::now() < until => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Ok(None) => break None,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        root.authority = false;
+                        panic!("private fixture root observation: {error}");
+                    }
+                }
+            };
+            // Root kill/wait precedes adopted-child draining, never substitutes
+            // for it. A failed body cannot leave a grandchild outside this fence.
+            drop(root);
+            let drain = cleanup.finish();
+            let fields = if body_report.exists() {
+                read_fields(&body_report)
+            } else {
+                Default::default()
+            };
+            let body_ok =
+                status.is_some_and(|s| s.success()) && fields.get("body_success") == Some(&1);
+            let success = body_ok && drain.adopted == 0;
+            std::fs::write(report, format!(
+                "body_success={} timed_out={} expected_waits={} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1",
+                usize::from(body_ok), usize::from(status.is_none()), fields.get("expected_waits").copied().unwrap_or(0),
+                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues)).unwrap();
+            std::process::exit(if success { 0 } else { 101 });
+        }
+        Some(_) => panic!("unknown private borrowed fixture stage"),
+        None => {
+            let dir = tempfile::tempdir().unwrap();
+            let report = dir.path().join("result");
+            let mut root = ChildOwner {
+                child: command(test, "supervisor", &report).spawn().unwrap(),
+                reaped: false,
+                authority: true,
+            };
+            let status = root.wait().unwrap();
+            let fields = read_fields(&report);
+            Outcome {
+                body_success: fields["body_success"] == 1,
+                timed_out: fields["timed_out"] == 1,
+                expected_waits: fields["expected_waits"],
+                body_adopted: fields["body_adopted"],
+                body_rescues: fields["body_rescues"],
+                supervisor_adopted: fields["supervisor_adopted"],
+                supervisor_rescues: fields["supervisor_rescues"],
+                no_children: fields["no_children"] == 1,
+                supervisor_success: status.success(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assertion_failure_stays_failed_after_borrowed_child_cleanup() {
+        const NAME: &str = "test_borrowed_scope::tests::assertion_failure_stays_failed_after_borrowed_child_cleanup";
+        let result = run_exact(NAME, 0, || {
+            let status = Command::new("/bin/sh")
+                .args(["-c", "sleep 60 & exit 0"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            panic!("deliberate original assertion failure");
+        });
+        assert!(!result.supervisor_success && !result.body_success && !result.timed_out);
+        assert_eq!(result.body_adopted, 1);
+        assert_eq!(result.body_rescues, 1);
+        assert_eq!(result.supervisor_adopted, 0);
+        assert!(result.no_children);
+    }
+
+    #[test]
+    // Deliberate crash leaves this child to the supervisor's consuming wait.
+    #[allow(clippy::zombie_processes)]
+    fn body_crash_stays_failed_after_supervisor_adopted_wait() {
+        const NAME: &str =
+            "test_borrowed_scope::tests::body_crash_stays_failed_after_supervisor_adopted_wait";
+        let result = run_exact(NAME, 0, || {
+            let _child = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            unsafe { libc::_exit(73) }
+        });
+        assert!(!result.supervisor_success && !result.body_success && !result.timed_out);
+        assert_eq!(result.supervisor_adopted, 1);
+        assert_eq!(result.supervisor_rescues, 1);
+        assert!(result.no_children);
+    }
+}

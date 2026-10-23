@@ -27,6 +27,8 @@ fn pam40_session_cleanup_retains_delete_failure_and_partial_open_obligations_bod
         std::fs::write(dir.path().join(service), format!("auth required pam_permit.so\naccount required pam_permit.so\nsession required {session_module}\n")).unwrap();
     }
     let plan = |service: &str| MonitorPlan {
+        #[cfg(target_os = "linux")]
+        child_mask: None,
         account: account.clone(),
         login: [40; 16],
         tty: "/dev/pts/0".into(),

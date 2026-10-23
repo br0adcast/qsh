@@ -189,6 +189,8 @@ const PREPARATION_REFUSED: nix::Error = nix::Error::EINVAL;
 /// itself -- never over the seam, which carries only what changes from
 /// channel to channel.
 pub(super) struct MonitorPlan {
+    #[cfg(target_os = "linux")]
+    pub(super) child_mask: Option<super::stop_signal::ChildMask>,
     /// The account every shell of this login runs as, exactly as the
     /// verification that admitted the login resolved it.
     pub(super) account: Account,
@@ -1107,6 +1109,10 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     }
     // The one way a test can reach [`run_monitor`]'s panic guard; see the
     // flag's own docs for why nothing else can.
+    #[cfg(target_os = "linux")]
+    if plan.child_mask.is_some_and(|mask| mask.restore().is_err()) {
+        unsafe { nix::libc::_exit(SESSION_ESTABLISH_FAILED_EXIT) }
+    }
     #[cfg(test)]
     if PANIC_WHEN_A_MONITOR_STARTS.load(std::sync::atomic::Ordering::SeqCst) {
         panic!("a deliberate panic in a monitor's own body");
@@ -2052,6 +2058,8 @@ mod tests {
     ) -> Result<Pam, PamError> {
         let account = super::super::account::lookup(user).expect("existing test account");
         start_transaction(&MonitorPlan {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             account,
             login: [7; 16],
             tty: tty.into(),

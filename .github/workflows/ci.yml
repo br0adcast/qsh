@@ -329,8 +329,8 @@ jobs:
           # run_suite <kind> <target name> [--require NAME ...] [name of a test that may skip ...]
           #
           # Every suite runs even if an earlier one failed, and the step
-          # fails at the end: which of six binaries broke is the useful
-          # answer, and stopping at the first hides the other five. The
+          # fails at the end: identifying every broken binary is useful;
+          # stopping at the first hides the remaining results. The
           # `if` around the pipeline is what suspends `-e` for it (GitHub
           # runs this script under `bash -e`), so a failing suite is
           # counted rather than fatal on the spot.
@@ -339,7 +339,7 @@ jobs:
           # failed AND whose log then failed the skip check is ONE broken
           # binary, and adding to the total twice for it made the closing
           # line say two binaries had broken when one had -- a number
-          # nobody could reconcile with the six groups above it.
+          # nobody could reconcile with the individual groups above it.
           run_suite() {
             kind=$1; name=$2; shift 2
             bin=$(binary "$kind" "$name")
@@ -354,6 +354,10 @@ jobs:
             fixture_env=()
             if [ "$kind" = lib ] || [ "$name" = system_mode_pam ]; then
               fixture_env=(-e "QSHD_TEST_PAM_GROUP_MODULE=$GITHUB_WORKSPACE/target/test-fixtures/pam/session_groups.so")
+            fi
+            # The native monitor fixture runs without a compiler or PAM headers.
+            if [ "$kind" = lib ]; then
+              fixture_env+=(-e "QSHD_TEST_PAM_OWNED_MODULE=$GITHUB_WORKSPACE/target/test-fixtures/pam/owned_session.so")
             fi
             if [ "$name" = system_mode_policies ]; then
               fixture_env+=(-e QSHD_TEST_PAM_FAMILY=debian)
@@ -381,7 +385,7 @@ jobs:
             echo "::endgroup::"
           }
 
-          # The six suites that are `#[cfg(feature = "system")]` at file
+          # The integration suites gated by `feature = "system"` at file
           # scope. NOTHING in them may skip: they are the reason this job
           # exists.
           #
@@ -418,6 +422,10 @@ jobs:
             --require retained_login_keeps_policy_until_a_new_incarnation \
             --require required_audit_failure_refuses_before_exec \
             --require required_limits_failure_refuses_before_exec
+          run_suite test system_mode_stop \
+            --require term_retains_helper_until_successful_pam_close \
+            --require int_retains_helper_until_successful_pam_close \
+            --require failed_pam_close_keeps_service_exit_nonzero
           run_suite test system_mode_shell \
             --require the_system_mode_serves_a_shell_over_the_seam
           run_suite test authorized_keys_privilege \
@@ -430,23 +438,22 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 51` is the one declared count in this job. Every one
-          # of the 51 is a body a parent test re-invokes in a process of its
-          # own (each says "runs only via ..." in its own reason), so they
-          # are run, through another door. The number is exact so that a
-          # 52nd is somebody's decision rather than nobody's.
+          # `--ignored 70` is the exact compiled system-library body count.
+          # These bodies are re-invoked by maintained owning subprocess fixtures;
+          # the 19 additions to public main have an explicit wrapper mapping.
+          # Keep the strict count: a new isolated body requires deliberate review.
           #
           # One --require for this binary too, not the zero an earlier
           # version of this comment said was enough. `qshd/src/serve.rs`
           # carries about a dozen `#[test]` functions gated on `#[cfg(feature
           # = "system")]` -- `the_system_flag_is_accepted_and_moves_the_host_key`
           # and its neighbours, plus two more nested under `mod
-          # silent_helper` -- the same risk this task closes for the five
+          # silent_helper` -- the same risk this task closes for the seven
           # suites above, just diluted among ~399 tests instead of living in
           # a binary of its own. Renaming or deleting any one of them still
           # moves `399 passed` to `398 passed`, unnoticed by anything else in
           # this file: the binary AS A WHOLE is never at risk of the
-          # "compiles to nothing" failure the five suites were, since it
+          # "compiles to nothing" failure the seven suites were, since it
           # always carries the crate's few hundred ordinary unit tests
           # regardless of this feature -- but that is a claim about the
           # whole binary, not about every test inside it, and saying only
@@ -464,12 +471,12 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 40 named below are a separate matter and still get no
+          # The 70 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 51 \
+          run_suite lib qshd --ignored 70 \
             --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
             --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \
             --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \
@@ -479,6 +486,6 @@ jobs:
             a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth
 
           [ "$failures" -eq 0 ] || {
-            echo "::error::$failures of 6 test binaries failed, skipped a test or left one out"
+            echo "::error::$failures of 8 test binaries failed, skipped a test or left one out"
             exit 1
           }

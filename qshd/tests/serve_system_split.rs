@@ -175,48 +175,31 @@ fn probe_children(helper_pid: u32) -> ChildrenProbe {
 /// signal specifically (see the death test below).
 const WORKER_WAIT: Duration = Duration::from_secs(10);
 
-/// Waits, bounded by [`WORKER_WAIT`], for the helper to have exactly one
-/// child and to still have it a poll later -- which, before any login, is
-/// the worker and can be nothing else. `None` means the kernel does not
-/// expose `/proc/<pid>/task/<pid>/children` (needs `CONFIG_PROC_CHILDREN`)
-/// -- the ONLY case worth a skip, since nothing below can check anything
-/// without it. Anything else that never produces such a child is a
-/// genuine failure, reported with a panic naming what was actually seen:
-/// the daemon already proved it is alive (its startup banner is what got a
-/// caller here at all), so a helper that never forks is a real bug, not an
-/// unsupported kernel -- a silent skip here would be exactly the "passes
-/// for the wrong reason" fix round 2 was written to close.
-///
-/// `helper::split_and_run` forks exactly once for the helper/worker split
-/// itself. Every OTHER fork the helper makes belongs to a login -- the
-/// process that reads an account's `authorized_keys` as that account
-/// (`helper::authorized`), the one that verifies a proof
-/// (`helper/server.rs`), and the login's monitor -- and the first two of
-/// those are short-lived. A caller here has not logged in yet, so the
-/// worker is the only child there SHOULD be; taking "the first pid in the
-/// file" regardless was measured returning a pid that was gone moments
-/// later, and every caller below then either read `/proc` for a process
-/// that no longer existed or compared a stale number against a live child
-/// list (which is how `a_monitor_holds_no_seam_and_the_worker_still_sees_the_end`
-/// came to report "2 children besides its worker" -- its filter matched
-/// none of them). So this insists on exactly one child and on that child
-/// still being there, and waits rather than settling for whatever it saw
-/// first.
-fn wait_for_worker_pid(helper_pid: u32) -> Option<u32> {
+/// Wait for the privately established, unprivileged direct worker child.
+/// The startup banner precedes locale warmup, so child count or a fixed delay
+/// cannot establish this role. Preserve the unsupported proc-children skip.
+fn wait_for_worker_pid(helper_pid: u32) -> Option<(u32, OwnedFd)> {
+    let worker_uid = nix::unistd::User::from_name("nobody")
+        .unwrap()
+        .unwrap()
+        .uid
+        .as_raw();
     let deadline = Instant::now() + WORKER_WAIT;
     let mut last_seen = Vec::new();
     loop {
         match probe_children(helper_pid) {
             ChildrenProbe::Unsupported => return None,
             ChildrenProbe::Children(pids) => {
-                // Exactly one, and still there on a second look: a pid that
-                // survives a poll interval while no login is in flight is
-                // the worker, not a fork on its way out.
-                if let [only] = pids[..] {
-                    std::thread::sleep(Duration::from_millis(20));
-                    if probe_children(helper_pid).names(only) {
-                        return Some(only);
-                    }
+                let mut qualified: Vec<_> = pids
+                    .iter()
+                    .filter_map(|pid| {
+                        common::qualified_system_worker(*pid, helper_pid, worker_uid)
+                            .map(|pin| (*pid, pin))
+                    })
+                    .collect();
+                assert!(qualified.len() <= 1, "multiple qualified worker children");
+                if let Some(worker) = qualified.pop() {
+                    return Some(worker);
                 }
                 last_seen = pids;
             }
@@ -224,20 +207,11 @@ fn wait_for_worker_pid(helper_pid: u32) -> Option<u32> {
         }
         assert!(
             Instant::now() < deadline,
-            "the helper (pid {helper_pid}) never settled on a single, lasting child within \
+            "the helper (pid {helper_pid}) never established a qualified worker child within \
              {WORKER_WAIT:?} -- the split does not seem to have happened at all (last children \
              seen: {last_seen:?})"
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-impl ChildrenProbe {
-    /// Whether this probe names `pid` as a child. An unreadable or empty
-    /// file names nothing, which is the answer a caller wants when it is
-    /// asking "is the process I am watching still the helper's child?"
-    fn names(&self, pid: u32) -> bool {
-        matches!(self, ChildrenProbe::Children(pids) if pids.contains(&pid))
     }
 }
 
@@ -429,12 +403,22 @@ fn is_enosys(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENOSYS)
 }
 
-/// Finds exactly the helper's channel, authentication and diagnostic sockets.
-/// Pair creation order identifies auth as the middle descriptor; the auth-loss
-/// test independently proves that identity through the named reader's stderr.
-/// An unexpected extra socket is a failure, never an arbitrary candidate choice.
-fn seam_fd_numbers(pid: u32) -> [i32; 3] {
-    let candidates: Vec<i32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+/// The four pre-fork Unix socket roles, ordered by pair creation. The private
+/// control pair is prepared before channel, auth and diagnostics. Auth-only
+/// shutdown also proves its identity through the actual named reader's stderr.
+struct SeamFds {
+    control: i32,
+    channel: i32,
+    auth: i32,
+    diagnostics: i32,
+}
+impl SeamFds {
+    fn all(self) -> [i32; 4] {
+        [self.control, self.channel, self.auth, self.diagnostics]
+    }
+}
+fn seam_fd_numbers(pid: u32) -> SeamFds {
+    let mut candidates: Vec<i32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
         .unwrap_or_else(|e| panic!("read /proc/{pid}/fd: {e}"))
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -444,10 +428,11 @@ fn seam_fd_numbers(pid: u32) -> [i32; 3] {
         })
         .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
         .collect();
+    candidates.sort_unstable();
     match candidates[..] {
-        [first, second, third] => [first, second, third],
+        [control, channel, auth, diagnostics] => SeamFds { control, channel, auth, diagnostics },
         ref other => panic!(
-            "the helper (pid {pid}) must hold exactly three AF_UNIX socket fds (channel, authentication and diagnostic seams) to duplicate unambiguously, found {}: {other:?}",
+            "the helper (pid {pid}) must hold exactly four AF_UNIX socket fds (private control, channel, authentication, diagnostics), found {}: {other:?}",
             other.len()
         ),
     }
@@ -598,7 +583,7 @@ fn the_worker_holds_no_privileged_log_descriptor_after_the_split() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (daemon, _, _) = common::start_daemon(dir.path());
         let helper_pid = daemon.child.id();
-        let worker_pid = wait_for_worker_pid(helper_pid)
+        let (worker_pid, _worker_role) = wait_for_worker_pid(helper_pid)
             .expect("the disposable Linux fixture exposes the helper's children");
         let nobody = nix::unistd::User::from_name("nobody")
             .unwrap()
@@ -644,7 +629,7 @@ fn the_worker_runs_as_its_configured_account() {
             let (mut daemon, _server_pub, _port) = common::start_daemon(dir.path());
             let helper_pid = daemon.child.id();
 
-            let Some(worker_pid) = wait_for_worker_pid(helper_pid) else {
+            let Some((worker_pid, _worker_role)) = wait_for_worker_pid(helper_pid) else {
                 eprintln!(
                     "SKIPPED the_worker_runs_as_its_configured_account: this kernel does not \
                      expose /proc/<pid>/task/<pid>/children (needs CONFIG_PROC_CHILDREN), so \
@@ -747,7 +732,7 @@ fn the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open() {
                      it",
                 );
 
-            let Some(worker_pid) = wait_for_worker_pid(helper_pid) else {
+            let Some((worker_pid, _worker_role)) = wait_for_worker_pid(helper_pid) else {
                 eprintln!(
                     "SKIPPED the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open: \
                      this kernel does not expose /proc/<pid>/task/<pid>/children (needs \
@@ -817,7 +802,7 @@ fn the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open() {
                 Err(e) => panic!("pidfd_open({helper_pid}) (the helper) failed: {e}"),
             };
             let mut held_open = Vec::new();
-            for seam_fd in seam_fds {
+            for seam_fd in seam_fds.all() {
                 match pidfd_getfd(helper_pidfd.as_fd(), seam_fd) {
                     Ok(fd) => held_open.push(fd),
                     Err(e) if is_enosys(&e) => {
@@ -843,7 +828,7 @@ fn the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open() {
 
             // The duplicates must be the seams themselves, not merely SOME
             // sockets that happened to be the only ones found:
-            // `seam_fd_numbers` already narrows to exactly three AF_UNIX
+            // `seam_fd_numbers` already identifies exactly four AF_UNIX
             // candidates, and this confirms each one's type matches
             // `helper::channel::pair`'s `SOCK_SEQPACKET` exactly.
             for fd in &held_open {
@@ -973,7 +958,7 @@ fn a_monitor_holds_no_seam_and_the_worker_still_sees_the_end() {
         let (mut daemon, server_pub, port) = common::start_daemon(dir.path());
         let helper_pid = daemon.child.id();
 
-        let Some(worker_pid) = wait_for_worker_pid(helper_pid) else {
+        let Some((worker_pid, _worker_role)) = wait_for_worker_pid(helper_pid) else {
             eprintln!(
                 "SKIPPED {NAME}: this kernel does not expose /proc/<pid>/task/<pid>/children \
                  (needs CONFIG_PROC_CHILDREN), so the worker's pid cannot be found from here."
@@ -1152,14 +1137,12 @@ fn proc_stat_field(pid: u32, field: usize) -> Option<String> {
 /// alive -- no parent-death signal -- and its end of the channel seam stays
 /// open, and only the authentication seam is shut down, through a
 /// duplicate of the helper's end taken with `pidfd_getfd`. The worker must
-/// then exit with status 1 (`end_the_worker`), not be killed.
+/// then exit with status 1 from its failed owned outcome, not be killed.
 ///
-/// Which of the helper's two seam descriptors is the authentication one:
-/// `split_and_run` makes the channel pair first and the authentication pair
-/// right after it, with nothing closed in between, and a new descriptor
-/// always takes the lowest free number -- so both of the authentication
-/// pair's descriptors are numbered above both of the channel pair's, and the
-/// helper's authentication end is the middle of its three (diagnostics is last). Socket inode
+/// Which descriptor is auth: owned preparation creates private control first,
+/// then channel, authentication and diagnostics, without closing any pair in
+/// between. Sorted descriptor numbers therefore name those four roles in that
+/// order; auth is third. Socket inode
 /// numbers are no second witness: the kernel hands them out from per-CPU
 /// batches, so a process that moves to another CPU between the two
 /// `socketpair` calls can get the later pair a LOWER inode. What does
@@ -1181,7 +1164,7 @@ fn the_worker_ends_itself_when_only_its_authentication_seam_is_lost() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut daemon, _server_pub, _port) = common::start_daemon(dir.path());
         let helper_pid = daemon.child.id();
-        let Some(worker_pid) = wait_for_worker_pid(helper_pid) else {
+        let Some((worker_pid, _worker_role)) = wait_for_worker_pid(helper_pid) else {
             eprintln!("SKIPPED {NAME}: no /proc/<pid>/task/<pid>/children on this kernel.");
             return;
         };
@@ -1216,12 +1199,9 @@ fn the_worker_ends_itself_when_only_its_authentication_seam_is_lost() {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // The second of three ordered descriptors: channel, authentication,
-        // test's docs for why that is the authentication seam, and for
-        // what confirms it once the worker has ended.
-        let mut seams = seam_fd_numbers(helper_pid);
-        seams.sort_unstable();
-        let auth_fd = seams[1];
+        // The explicit role follows creation order; the named reader's log
+        // independently confirms only this authentication seam was lost.
+        let auth_fd = seam_fd_numbers(helper_pid).auth;
         let helper_pidfd = match pidfd_open(helper_pid) {
             Ok(fd) => fd,
             Err(e) if is_enosys(&e) => {
@@ -1284,7 +1264,7 @@ fn the_worker_ends_itself_when_only_its_authentication_seam_is_lost() {
         assert_eq!(
             (worker_state.as_deref(), exit_code.as_deref()),
             (Some("Z"), Some("256")),
-            "the worker must have exited with status 1 (end_the_worker), not been killed"
+            "the worker must have exited with status 1 from its failed owned outcome, not been killed"
         );
         // The seam that was shut down was the authentication one, and its
         // reader is what noticed: had the channel seam been taken for it,

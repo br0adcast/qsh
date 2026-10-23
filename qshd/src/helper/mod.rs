@@ -50,6 +50,8 @@ pub mod spawner;
 #[cfg(target_os = "linux")]
 mod startup;
 #[cfg(target_os = "linux")]
+mod stop_signal;
+#[cfg(target_os = "linux")]
 mod verification;
 pub(crate) mod worker_threads;
 // Staged private coordination foundation; not a worker/global drain receipt.
@@ -544,6 +546,7 @@ fn split_with_clients<T>(
     struct PreparedOwned {
         worker: worker_bootstrap::Prepared,
         adoption: server::AdoptionRuntime,
+        stop: stop_signal::StopOwner,
     }
     #[cfg(target_os = "linux")]
     let prepared = if owned {
@@ -553,7 +556,7 @@ fn split_with_clients<T>(
             .context("qualifying helper adopted-child custody before fork")?;
         let worker = worker_bootstrap::Prepared::new(config.startup_timeout)
             .context("qualifying owned worker split before fork")?;
-        Some(PreparedOwned { worker, adoption })
+        Some((worker, adoption))
     } else {
         None
     };
@@ -574,6 +577,19 @@ fn split_with_clients<T>(
     let (worker_log, mut helper_log) =
         crate::log::relay::pair().context("creating the diagnostic socket pair")?;
 
+    // All ordinary fallible preparation is complete. Only fork can now fail;
+    // its error path explicitly restores the complete original signal mask.
+    #[cfg(target_os = "linux")]
+    let prepared = match prepared {
+        Some((worker, adoption)) => Some(PreparedOwned {
+            worker,
+            adoption,
+            stop: stop_signal::StopOwner::prepare()
+                .context("preparing owned service stop signals")?,
+        }),
+        None => None,
+    };
+
     // The pid that becomes the child's parent, captured before the fork so
     // the child can tell a helper that died in the narrow window between
     // the fork and its own first `arm_and_verify_pdeathsig` call (below)
@@ -585,7 +601,19 @@ fn split_with_clients<T>(
     // the check, and nothing between there and here starts another thread
     // -- so the fork happens single-threaded, and the child inherits no
     // lock held by a thread that does not exist in it.
-    match unsafe { nix::unistd::fork() }.context("splitting into helper and worker")? {
+    let forked = match unsafe { nix::unistd::fork() } {
+        Ok(forked) => forked,
+        Err(error) => {
+            #[cfg(target_os = "linux")]
+            if let Some(prepared) = prepared {
+                prepared.stop.rollback().with_context(|| {
+                    format!("restoring signal mask after fork failed ({error})")
+                })?;
+            }
+            return Err(error).context("splitting into helper and worker");
+        }
+    };
+    match forked {
         nix::unistd::ForkResult::Parent { child } => {
             // FIRST parent action: reserve exact child custody before even
             // closing inherited endpoints or dropping fallible client captures.
@@ -595,7 +623,7 @@ fn split_with_clients<T>(
                     std::num::NonZeroU32::new(child.as_raw() as u32)
                         .expect("fork returned a positive child PID"),
                 );
-                (worker, prepared.adoption)
+                (worker, prepared.adoption, prepared.stop)
             });
             // The helper has no business with the network: drop the worker's
             // ends of both pairs here and let the worker own them alone.
@@ -615,7 +643,7 @@ fn split_with_clients<T>(
             drop(run_worker);
             drop(make_clients);
             #[cfg(target_os = "linux")]
-            if let Some((worker, adoption)) = worker {
+            if let Some((worker, adoption, stop)) = worker {
                 server::run_with_owned_worker(
                     helper_channels,
                     helper_auth,
@@ -623,19 +651,24 @@ fn split_with_clients<T>(
                     helper_log,
                     worker,
                     adoption,
+                    stop,
                 )
             }
             server::run_with_diagnostics(helper_channels, helper_auth, config, helper_log)
         }
         nix::unistd::ForkResult::Child => {
             #[cfg(target_os = "linux")]
-            let mut publisher = prepared.map(|prepared| {
+            let (mut publisher, child_mask) = match prepared.map(|prepared| {
                 // No helper adoption state belongs to the worker. Close its
                 // inherited owned proc handles before the mandatory FD sweep;
                 // leaving them to later Drop could close a reused descriptor.
                 drop(prepared.adoption);
-                prepared.worker.child()
-            });
+                let mask = prepared.stop.into_child_mask_close_fd();
+                (prepared.worker.child(), mask)
+            }) {
+                Some((publisher, mask)) => (Some(publisher), Some(mask)),
+                None => (None, None),
+            };
             // Retain private publication outside all fallible initialization.
             let initialized = (|| {
                 drop(helper_channels);
@@ -648,6 +681,10 @@ fn split_with_clients<T>(
                         // Full private stage precedes log setup, privilege-drop/
                         // NSS and every descendant-producing action.
                         publisher.establish()?;
+                        if let Some(mask) = child_mask {
+                            mask.restore()
+                                .context("restoring worker signal mask before initialization")?;
+                        }
                         Some((publisher.reader()?, helper_pid.as_raw() as u32))
                     }
                     None => None,

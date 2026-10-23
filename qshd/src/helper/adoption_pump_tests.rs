@@ -135,6 +135,7 @@ mod adoption_pump {
             Some(OwnedParent {
                 worker,
                 adoption: Some(adoption),
+                stop: None,
             }),
         );
         let outcome = match exit {

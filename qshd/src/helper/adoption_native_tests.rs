@@ -222,7 +222,9 @@ mod adoption_native {
                 drop(control);
                 let result = std::panic::catch_unwind(|| {
                     if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
-                        if mode == "required_reply_cleanup" {
+                        if mode.starts_with("signal_") {
+                            super::owned_signal::helper_body(dir.path(), child_control, &mode);
+                        } else if mode == "required_reply_cleanup" {
                             super::required_reply::helper_body(dir.path(), child_control);
                         } else if mode.starts_with("legacy_") {
                             super::adoption_legacy::helper_body(dir.path(), child_control, &mode);
@@ -255,10 +257,17 @@ mod adoption_native {
         };
         drop(child_control);
         let helper = Pin::new(pid);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let setup_started = Instant::now();
+        let pam_only = std::env::var("QSH_TEST_ADOPTION_SCENARIO").as_deref() == Ok("pam_only");
+        // PAM-only close legitimately permits 4s x two deadline firings. Its
+        // setup and final physical drainage cannot share the old 10s budget.
+        // Keep a finite owned outer fence, independent of all success evidence.
+        let hard_deadline = setup_started + Duration::from_secs(if pam_only { 20 } else { 10 });
         let driven = if let Ok(mode) = std::env::var("QSH_TEST_ADOPTION_SCENARIO") {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if mode == "required_reply_cleanup" {
+                if mode.starts_with("signal_") {
+                    super::owned_signal::drive(&control, &helper, &mode)
+                } else if mode == "required_reply_cleanup" {
                     super::required_reply::drive(&control)
                 } else if mode.starts_with("legacy_") {
                     super::adoption_legacy::drive(&control, dir.path(), &helper, pid, &mode)
@@ -282,6 +291,14 @@ mod adoption_native {
                     Some(message.chars().take(512).collect::<String>()),
                 )
             }
+        };
+        let setup_elapsed = setup_started.elapsed();
+        let drain_started = Instant::now();
+        let deadline = if pam_only {
+            // Existing 8s maximum PAM close plus a finite 2s fixture allowance.
+            (drain_started + Duration::from_secs(10)).min(hard_deadline)
+        } else {
+            hard_deadline
         };
         drop(control);
         while driver_failure.is_none() && !helper.exited() && Instant::now() < deadline {
@@ -347,7 +364,7 @@ mod adoption_native {
         );
         let details = std::fs::read_to_string(dir.path().join("helper-result"))
             .unwrap_or_else(|_| "helper produced no success receipt".into());
-        let evidence = format!("case_success={case_success}, timed_out={timed_out}, helper_success={helper_success}, helper_killed={helper_killed}, outsider_untouched={outsider_untouched}, observed_exited={observed_exited}, adopted_reaped={adopted}, no_children=true, driver_failure={driver_failure:?}, details={details:?}");
+        let evidence = format!("case_success={case_success}, timed_out={timed_out}, helper_success={helper_success}, helper_killed={helper_killed}, outsider_untouched={outsider_untouched}, observed_exited={observed_exited}, adopted_reaped={adopted}, no_children=true, driver_failure={driver_failure:?}, setup_elapsed={setup_elapsed:?}, drain_elapsed={:?}, phase=post_driver_drain, details={details:?}", drain_started.elapsed());
         std::fs::write(std::env::var_os(REPORT).unwrap(), &evidence).unwrap();
         assert!(case_success, "{evidence}");
     }
@@ -389,6 +406,8 @@ mod adoption_native {
         write_script(&script, &format!("exec /bin/bash -c 'trap \"\" HUP; /usr/bin/setsid /bin/sleep 60 & member=$!; printf \"%s %s %s adoption-native-40\\n\" \"$$\" \"$member\" \"$PPID\" > \"{}\"; IFS= read -r unused < \"{}\"'", marker.display(), fifo.display()));
         write_stack(dir, "qshd-adoption", &format!("auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_exec.so {}\nsession required pam_permit.so\n", script.display()));
         let plan = MonitorPlan {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             account: my_account(),
             login: [40; 16],
             tty: "/dev/pts/0".into(),

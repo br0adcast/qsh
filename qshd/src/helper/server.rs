@@ -396,6 +396,7 @@ pub(super) fn run_with_owned_worker(
     diagnostics: crate::log::relay::Receiver,
     worker: super::worker_owner::WorkerOwner,
     adoption: AdoptionRuntime,
+    stop: super::stop_signal::StopOwner,
 ) -> ! {
     let outcome = match serve_inner(
         channels,
@@ -407,6 +408,7 @@ pub(super) fn run_with_owned_worker(
         Some(OwnedParent {
             worker,
             adoption: Some(adoption),
+            stop: Some(stop),
         }),
     ) {
         HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
@@ -419,8 +421,7 @@ pub(super) fn run_with_owned_worker(
             outcome.failed()
         ),
     );
-    // Service-signal/success policy remains a separate integration stage.
-    std::process::exit(1);
+    std::process::exit(outcome.service_exit_code());
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -444,6 +445,7 @@ fn serve_owned(
             worker,
             // Component-only worker proof, not qualified helper completion.
             adoption: None,
+            stop: None,
         }),
     ) {
         HelperLoopExit::WorkerPhysicallyExited(outcome) => outcome,
@@ -566,6 +568,8 @@ struct RequiredPublicationFailure {
 /// [`serve_auth_seam`]): a request honoured on the wrong seam would reach
 /// this state by a door that seam's own rules were never written for.
 struct LoopState {
+    #[cfg(target_os = "linux")]
+    child_mask: Option<super::stop_signal::ChildMask>,
     /// Every channel id that is TAKEN, by id -- one whose process is still
     /// starting as much as one already running; see [`ChannelSlot`] for why
     /// those are one table and not two.
@@ -1047,6 +1051,7 @@ enum HelperLoopExit {
 struct OwnedParent {
     worker: super::worker_owner::WorkerOwner,
     adoption: Option<AdoptionRuntime>,
+    stop: Option<super::stop_signal::StopOwner>,
 }
 
 fn serve_inner(
@@ -1059,9 +1064,13 @@ fn serve_inner(
     #[cfg(target_os = "linux")] owned: Option<OwnedParent>,
 ) -> HelperLoopExit {
     #[cfg(target_os = "linux")]
-    let (mut worker, adoption) = match owned {
-        Some(owned) => (Some(WorkerDomain::new(owned.worker)), owned.adoption),
-        None => (None, None),
+    let (mut worker, adoption, stop) = match owned {
+        Some(owned) => (
+            Some(WorkerDomain::new(owned.worker)),
+            owned.adoption,
+            owned.stop,
+        ),
+        None => (None, None, None),
     };
     // Neither seam may be able to park this loop for good -- see
     // `SEAM_SEND_TIMEOUT`. Owned setup failure enters retained cooperative
@@ -1090,6 +1099,8 @@ fn serve_inner(
     // past every login seeded out of it.
     let seeded = admitted.len();
     let mut shutdown = HelperShutdown::new(LoopState {
+        #[cfg(target_os = "linux")]
+        child_mask: stop.as_ref().map(super::stop_signal::StopOwner::child_mask),
         live: HashMap::new(),
         pending: PendingTable::default(),
         orphans: Vec::new(),
@@ -1136,6 +1147,7 @@ fn serve_inner(
         }
         shutdown.worker = worker;
         shutdown.adoption = adoption;
+        shutdown.stop = stop;
     }
     // Borrowed once, for the whole loop: both are owned locals that outlive
     // it, and everything below takes them immutably.
@@ -1238,6 +1250,12 @@ fn serve_inner(
             // SAFETY: single live owner remains retained through this poll pass.
             fds.push(PollFd::new(unsafe { BorrowedFd::borrow_raw(raw) }, flags));
         }
+        #[cfg(target_os = "linux")]
+        let stop_index = shutdown.stop.as_ref().map(|stop| {
+            let index = fds.len();
+            fds.push(PollFd::new(stop.fd(), PollFlags::POLLIN));
+            index
+        });
         // Never longer than REAP_INTERVAL, so a child that exits while the
         // worker is silent is still noticed -- and never past the nearest
         // startup deadline either, so a child that says nothing at all is
@@ -1297,7 +1315,37 @@ fn serve_inner(
 
         let diagnostic_ready =
             poll_ok && diagnostics.is_some() && fds[diagnostic_index].any().unwrap_or(true);
+        #[cfg(target_os = "linux")]
+        let stop_ready = poll_ok && stop_index.is_some_and(|i| fds[i].any().unwrap_or(true));
         drop(fds);
+        #[cfg(target_os = "linux")]
+        if stop_ready {
+            if let (Some(stop), Some(worker)) = (shutdown.stop.as_ref(), worker.as_mut()) {
+                match stop.receive_requested() {
+                    Ok(true) => begin_owned_stop(
+                        &channels,
+                        state,
+                        worker,
+                        super::worker_protocol::StopReason::Requested,
+                    ),
+                    Ok(false) => {}
+                    Err(error) => {
+                        worker.record(ParentFailure::StopSignal(
+                            error.raw_os_error().unwrap_or(nix::libc::EIO),
+                        ));
+                        begin_owned_stop(
+                            &channels,
+                            state,
+                            worker,
+                            super::worker_protocol::StopReason::Protocol,
+                        );
+                    }
+                }
+            }
+        }
+        // Stop retirement may cancel a pending entry, but does not fork or open
+        // descriptors. The ready-report lookup below skips canceled entries; no
+        // new admission can reuse a canceled report number before that lookup.
         if diagnostic_ready {
             if let Some(receiver) = diagnostics.as_ref() {
                 if !receiver.drain(crate::log::record_worker) {
@@ -1417,6 +1465,8 @@ struct HelperShutdown {
     adoption: Option<AdoptionRuntime>,
     #[cfg(target_os = "linux")]
     forced_worker: bool,
+    #[cfg(target_os = "linux")]
+    stop: Option<super::stop_signal::StopOwner>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1439,6 +1489,8 @@ impl HelperShutdown {
             adoption: None,
             #[cfg(target_os = "linux")]
             forced_worker: false,
+            #[cfg(target_os = "linux")]
+            stop: None,
         }
     }
 
@@ -2076,6 +2128,8 @@ fn serve_auth_seam(
                 &nonce,
                 config,
                 switches,
+                #[cfg(target_os = "linux")]
+                state.child_mask,
             ) {
                 Ok(start) => {
                     let VerificationStart {
@@ -3422,6 +3476,8 @@ struct VerificationStart {
     custody: super::verification::VerificationChild,
 }
 
+// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
+#[allow(clippy::too_many_arguments)]
 fn fork_verification(
     login: &str,
     public_key: &[u8],
@@ -3430,6 +3486,7 @@ fn fork_verification(
     nonce: &Nonce,
     config: &HelperConfig,
     switches: AccountSwitches,
+    #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
 ) -> anyhow::Result<VerificationStart> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
@@ -3523,6 +3580,10 @@ fn fork_verification(
                     if tag != 1 {
                         unsafe { nix::libc::_exit(127) };
                     }
+                }
+                #[cfg(target_os = "linux")]
+                if child_mask.is_some_and(|mask| mask.restore().is_err()) {
+                    unsafe { nix::libc::_exit(127) };
                 }
                 let verdict = match verify_proof_after_nonce(
                     login,
@@ -3906,6 +3967,8 @@ fn open_channel(
              would read the machine's /etc/pam.d and pass or fail by the host's policy"
         );
             let plan = MonitorPlan {
+                #[cfg(target_os = "linux")]
+                child_mask: state.child_mask,
                 account: account.clone(),
                 login,
                 tty: tty
@@ -5194,6 +5257,7 @@ pub(crate) mod tests {
     include!("verification_lifecycle_tests.rs");
     include!("worker_parent_tests.rs");
     include!("required_reply_tests.rs");
+    include!("stop_signal_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -7327,6 +7391,8 @@ pub(crate) mod tests {
             })
             .collect();
         LoopState {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             live: HashMap::new(),
             pending: PendingTable::default(),
             orphans: Vec::new(),
@@ -7393,6 +7459,8 @@ pub(crate) mod tests {
     /// is already verified) cannot express.
     fn empty_state() -> LoopState {
         LoopState {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             live: HashMap::new(),
             pending: PendingTable::default(),
             orphans: Vec::new(),
@@ -13607,7 +13675,7 @@ pub(crate) mod tests {
     /// the first reply the helper tries has nowhere to go and nothing is
     /// ever going to make room (this test never reads that seam). The proof
     /// that the helper came back out of it is taken on the OTHER seam: a
-    /// `Nonce` asked afterwards must still be answered. Control: set the
+    /// `Nonce` asked afterwards must still be answered with admission closed. Control: set the
     /// helper's write timeout to `None` in `serve` -- the send then never
     /// returns and no answer ever comes.
     #[test]
@@ -13675,8 +13743,8 @@ pub(crate) mod tests {
         };
         assert_eq!(answer.id, id, "the answer must carry this request's number");
         assert!(
-            matches!(answer.body, Response::Nonce { .. }),
-            "the helper must answer the other seam, got {:?}",
+            matches!(answer.body, Response::NonceUnavailable),
+            "the helper must answer the other seam while refusing new admission after required send loss, got {:?}",
             answer.body
         );
 

@@ -129,6 +129,10 @@ struct HelperPhysicalOutcome {
 }
 #[cfg(target_os = "linux")]
 impl HelperPhysicalOutcome {
+    fn service_exit_code(&self) -> i32 {
+        i32::from(!self.worker.requested || self.failed())
+    }
+
     fn failed(&self) -> bool {
         self.worker.native_exit != 0
             || self.worker.first_failure.is_some()

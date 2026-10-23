@@ -278,15 +278,18 @@ connection (see "Returning to your session" above) — the daemon's own
 session retention doesn't help here, because there's no session left to
 return to.
 
-**`Restart=on-failure`, the policy in the shipped unit, does *not*
-restart the service after the process exits because of `SIGTERM`,
-`SIGINT`, `SIGHUP` or `SIGPIPE`** — systemd counts all four as a clean
-exit, not a failure. That's deliberate, not an oversight: since a restart
-can't save any session anyway, there's nothing to gain from racing back
-up after an administrator's own `systemctl stop` (which sends `SIGTERM`)
-or a plain `kill`, and it means a stop is never silently undone a moment
-later. Seeing "the service didn't come back after `kill`" should send an
-administrator to this paragraph, not to a bug report.
+On Linux, the system helper receives `SIGTERM` and `SIGINT` as requests to
+stop admitting work and drain its owned worker, shells, and PAM sessions.
+The shipped system unit uses `KillMode=mixed`: systemd sends the initial
+stop signal to the helper and retains its final cgroup kill policy if the
+stop cannot finish. The helper exits successfully only after its worker
+and shell processes have ended and PAM cleanup has succeeded. Failed or
+unconfirmed cleanup causes a nonzero exit.
+
+`Restart=on-failure` restarts an unexpected failed shutdown. An explicit
+`systemctl stop qshd` suppresses restart regardless of the exit status.
+A successful TERM/INT drain exits zero and is not restarted. Personal mode
+and the other signal dispositions retain their existing behavior.
 
 ## Path probing (multipath qsh)
 
@@ -693,8 +696,9 @@ for those versions needs that one edit.
   own `authorized_keys` can log in;
 - restarting `qshd` in system mode drops every session on the machine at
   once, not just one person's — and stopping it with a plain `kill` or
-  `systemctl stop` does **not** bring it back up automatically, by
-  design; see "A restart kills every session on the machine" under
+  `systemctl stop` does **not** bring it back up automatically after a
+  successful drain (an explicit service stop suppresses restart); see
+  "A restart kills every session on the machine" under
   "System mode" above;
 - system mode never calls `pam_authenticate` — the SSH-key signature
   already proved identity — but it does run the rest of the PAM stack

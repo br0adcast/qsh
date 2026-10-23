@@ -9,6 +9,7 @@ enum ParentFailure {
     RequiredPublication(RequiredPublicationFailure),
     Setup(i32),
     Poll(i32),
+    StopSignal(i32),
     Worker(super::worker_owner::WorkerFailure),
     Send(super::worker_protocol::Fault),
 }
@@ -22,6 +23,7 @@ struct WorkerPhysicalOutcome {
     signal_failure: Option<(i32, i32)>,
     terminal_received: bool,
     native_exit: i32,
+    requested: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -67,6 +69,7 @@ impl WorkerDomain {
                 ParentFailure::RequiredCleanupLost => "native monitor ended without required shell cleanup; worker drain cannot complete".to_string(),
                 ParentFailure::RequiredPublication(failure) => format!("required helper publication failed: {failure:?}"),
                 ParentFailure::Setup(errno) => format!("seam setup failed ({errno})"),
+                ParentFailure::StopSignal(errno) => format!("service stop notification failed ({errno})"),
                 ParentFailure::Poll(errno) => format!("poll failed ({errno})"),
                 ParentFailure::Worker(failure) => format!("worker cleanup: {failure:?}"),
                 ParentFailure::Send(failure) => format!("private Stop publication: {failure:?}"),
@@ -169,6 +172,7 @@ impl WorkerDomain {
     fn physical_outcome(&self) -> WorkerPhysicalOutcome {
         assert!(self.settled());
         WorkerPhysicalOutcome {
+            requested: self.stop_reason == Some(super::worker_protocol::StopReason::Requested),
             first_failure: self.first_failure,
             signal_failure: self.signal_failure,
             terminal_received: self.owner.terminal_received(),

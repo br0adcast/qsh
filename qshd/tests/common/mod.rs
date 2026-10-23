@@ -1306,3 +1306,72 @@ pub(crate) fn start_daemon_expecting_refusal(dir: &Path) -> String {
     );
     stderr
 }
+
+/// Strict Linux fixture role proof; startup utilities are not worker identities.
+/// The returned exact descriptor stays with the caller. These fixture pidfd
+/// requirements do not change the daemon's proc-dirfd capability policy.
+#[cfg(target_os = "linux")]
+pub(crate) fn qualified_system_worker(
+    pid: u32,
+    helper: u32,
+    worker_uid: u32,
+) -> Option<std::os::fd::OwnedFd> {
+    use nix::libc;
+    use std::os::fd::{AsFd, FromRawFd};
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return None;
+        }
+        panic!("cannot pin candidate worker: {error}");
+    }
+    let pin = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw as i32) };
+    let live = || {
+        use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+        let mut descriptor = [PollFd::new(pin.as_fd(), PollFlags::POLLIN)];
+        loop {
+            match poll(&mut descriptor, PollTimeout::ZERO) {
+                Ok(_) => {
+                    let flags = descriptor[0].revents().expect("known pidfd poll flags");
+                    assert!(!flags.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL));
+                    return !flags.contains(PollFlags::POLLIN);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(error) => panic!("candidate worker poll: {error}"),
+            }
+        }
+    };
+    if !live() {
+        return None;
+    }
+    let read = |part: &str| match std::fs::read_to_string(format!("/proc/{pid}/{part}")) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !live() => None,
+        Err(error) => panic!("candidate worker {part}: {error}"),
+    };
+    let status = read("status")?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap()
+    };
+    let parent = field("PPid:").trim().parse::<u32>().unwrap();
+    let uids: Vec<u32> = field("Uid:")
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    assert_eq!(uids.len(), 4);
+    if parent != helper || uids.iter().any(|uid| *uid != worker_uid) {
+        return None;
+    }
+    let stat = read("stat")?;
+    let fields: Vec<_> = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .collect();
+    if fields[3].parse::<u32>().unwrap() != pid || !live() {
+        return None;
+    }
+    Some(pin)
+}

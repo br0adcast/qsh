@@ -3,10 +3,20 @@
 #[cfg(target_os = "linux")]
 #[test]
 fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
+    crate::test_support::borrowed_scope::run_exact(
+        "helper::server::tests::helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close",
+        3,
+        monitor_sibling_jobs_body,
+    )
+    .assert_clean(3);
+}
+
+#[cfg(target_os = "linux")]
+fn monitor_sibling_jobs_body() {
     use super::super::protocol::CleanupKind;
     use nix::libc;
     use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 
     struct Pin(OwnedFd);
     impl Pin {
@@ -49,6 +59,11 @@ fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
             while !self.exited() {
                 std::thread::sleep(Duration::from_millis(1));
             }
+        }
+        fn reap_adopted_member(&self) {
+            // This deliberately borrowed member belongs to the private
+            // subreaper body now. ECHILD cannot stand in for its actual wait.
+            crate::test_support::borrowed_scope::wait_expected(self.0.as_fd());
         }
         fn reap_if_child(&self) {
             loop {
@@ -117,7 +132,7 @@ fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
                 // waiter can lose numeric-PID authority to fixture cleanup.
                 jobs.monitor.reap_if_child();
                 jobs.leader.reap_if_child();
-                jobs.member.reap_if_child();
+                jobs.member.reap_adopted_member();
             }
             self.master = None;
             self.joined
