@@ -511,7 +511,10 @@ struct AccountSwitches {
     /// How [`verify_proof_after_nonce`]'s step 4 reads an account's
     /// `authorized_keys`. Called in the verifying child too, for the same
     /// reason: the file may live on a home directory that never answers.
-    read_keys: fn(&Account, &str) -> Result<String, AuthorizedError>,
+    read_keys:
+        fn(&Account, &str, Option<authorized::VerifierParent>) -> Result<String, AuthorizedError>,
+    #[cfg(test)]
+    verifier_observer: fn(authorized::VerifierBoundary),
     /// How a channel's child becomes the account it runs as: called between
     /// `fork` and `exec`, so it must not allocate -- see the module's docs.
     become_account: fn(Uid, Gid, &[Gid]) -> nix::Result<()>,
@@ -525,7 +528,9 @@ impl AccountSwitches {
     /// it.
     const REAL: AccountSwitches = AccountSwitches {
         lookup: account::lookup,
-        read_keys: authorized::read_for,
+        read_keys: authorized::read_for_verifier,
+        #[cfg(test)]
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -3092,6 +3097,7 @@ fn verify_proof_after_nonce(
     nonce: &Nonce,
     config: &HelperConfig,
     switches: AccountSwitches,
+    verifier_parent: Option<authorized::VerifierParent>,
 ) -> Result<(Account, String, String), VerifyRefusal> {
     // 2.
     let account = (switches.lookup)(login).map_err(|e| VerifyRefusal {
@@ -3125,7 +3131,7 @@ fn verify_proof_after_nonce(
     // `authorized::read_for`); `key_is_listed` is the SAME parsing and
     // matching the personal mode's verifier uses -- never a second parser,
     // see that function's docs.
-    let text = (switches.read_keys)(&account, &config.authorized_keys_template)
+    let text = (switches.read_keys)(&account, &config.authorized_keys_template, verifier_parent)
         .map_err(|e| VerifyRefusal::other(format!("reading authorized_keys: {e}")))?;
     if !sshauth::verify::key_is_listed(&text, &key)
         .map_err(|e| VerifyRefusal::other(format!("matching authorized_keys: {e}")))?
@@ -3522,6 +3528,14 @@ fn fork_verification(
     // here: `getrlimit` is a libc call, and the child has closing to do
     // before it may make any.
     let fd_limit = max_open_descriptors();
+    #[cfg(target_os = "linux")]
+    let verifier_parent = Some(authorized::VerifierParent::new(
+        Pid::this(),
+        #[cfg(test)]
+        switches.verifier_observer,
+    ));
+    #[cfg(not(target_os = "linux"))]
+    let verifier_parent = None;
 
     // SAFETY: the helper is single-threaded by construction (it forked
     // before the tokio runtime existed and never starts a thread), so no
@@ -3572,6 +3586,9 @@ fn fork_verification(
                 // this child's own copy -- goes with the rest; nothing here
                 // reads the pipe.
                 close_other_descriptors(report_write.as_raw_fd(), fd_limit);
+                if let Some(parent) = verifier_parent {
+                    parent.arm_initial();
+                }
                 #[cfg(target_os = "linux")]
                 {
                     let (tag, value) = match nix::unistd::setsid() {
@@ -3606,6 +3623,7 @@ fn fork_verification(
                     nonce,
                     config,
                     switches,
+                    verifier_parent,
                 ) {
                     Ok((account, identity, algorithm)) => Verdict::Admitted {
                         account,
@@ -5268,6 +5286,7 @@ pub(crate) mod tests {
     include!("shutdown_owner_tests.rs");
     include!("monitor_shutdown_tests.rs");
     include!("verification_lifecycle_tests.rs");
+    include!("verifier_parent_death_tests.rs");
     include!("worker_parent_tests.rs");
     include!("required_reply_tests.rs");
     include!("monitor_refusal_tests.rs");
@@ -6481,7 +6500,11 @@ pub(crate) mod tests {
     /// so it cannot run unprivileged. The switch itself is proven under
     /// root in `qshd/tests/authorized_keys_privilege.rs`; real daemon attack
     /// rejection is exercised in `system_mode_accounts.rs`.
-    fn read_keys_plainly(account: &Account, template: &str) -> Result<String, AuthorizedError> {
+    fn read_keys_plainly(
+        account: &Account,
+        template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
+    ) -> Result<String, AuthorizedError> {
         let path = super::account::expand_template(template, account);
         super::authorized::to_key_text(super::authorized::read_regular_file_bounded(&path), &path)
     }
@@ -6568,6 +6591,7 @@ pub(crate) mod tests {
     fn read_keys_from_the_fifo(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         let path = HUNG_KEYS_FIFO
             .get()
@@ -6625,6 +6649,7 @@ pub(crate) mod tests {
     fn read_keys_that_never_finishes(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         loop {
             // SAFETY: `pause` takes no arguments and touches nothing this
@@ -6644,6 +6669,7 @@ pub(crate) mod tests {
     fn read_keys_killing_this_process(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGKILL);
         // Not reached: `SIGKILL` cannot be caught, blocked or ignored.
@@ -6665,6 +6691,7 @@ pub(crate) mod tests {
     fn read_keys_recording_descriptors(
         _account: &Account,
         _template: &str,
+        _verifier_parent: Option<authorized::VerifierParent>,
     ) -> Result<String, AuthorizedError> {
         // Built BEFORE anything below opens a file of its own, so the
         // listing describes what was inherited rather than what this
@@ -6718,6 +6745,7 @@ pub(crate) mod tests {
     const UNPRIVILEGED: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: keep_identity,
         session_group_ops: monitor::SessionGroupOps {
             install: |_| Ok(()),
@@ -14594,6 +14622,7 @@ pub(crate) mod tests {
     const WRONG_GID_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_wrong_gid,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -14615,6 +14644,7 @@ pub(crate) mod tests {
     const KEEP_CAPS_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_keeping_caps,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };
@@ -14629,6 +14659,7 @@ pub(crate) mod tests {
     const EMPTY_GROUPS_DROP: AccountSwitches = AccountSwitches {
         lookup: super::account::lookup,
         read_keys: read_keys_plainly,
+        verifier_observer: authorized::ignore_verifier_boundary,
         become_account: become_account_empty_groups,
         session_group_ops: monitor::SessionGroupOps::REAL,
     };

@@ -132,6 +132,84 @@ impl fmt::Display for AuthorizedError {
 
 impl std::error::Error for AuthorizedError {}
 
+/// Captured by the helper before fork; never reconstructed from a possibly
+/// reparented verifier. Unrelated readers pass no verifier context.
+#[derive(Clone, Copy)]
+pub(super) struct VerifierParent {
+    #[cfg(target_os = "linux")]
+    helper_pid: nix::unistd::Pid,
+    #[cfg(test)]
+    observer: fn(VerifierBoundary),
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VerifierBoundary {
+    BeforeInitialArm,
+    Armed,
+    GroupsInstalled,
+    BeforeRearm(IdentityTransition),
+    AfterRearm(IdentityTransition),
+    BeforeRead,
+    BeforeRestore,
+    Restored,
+}
+
+#[cfg(test)]
+pub(super) fn ignore_verifier_boundary(_: VerifierBoundary) {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IdentityTransition {
+    EntryGroup,
+    EntryUser,
+    RestoreUser,
+    RestoreGroup,
+}
+
+impl VerifierParent {
+    #[cfg(target_os = "linux")]
+    pub(super) fn new(
+        helper_pid: nix::unistd::Pid,
+        #[cfg(test)] observer: fn(VerifierBoundary),
+    ) -> Self {
+        Self {
+            helper_pid,
+            #[cfg(test)]
+            observer,
+        }
+    }
+
+    fn check_or_exit(self) {
+        #[cfg(target_os = "linux")]
+        if super::arm_and_verify_pdeathsig(self.helper_pid).is_err() {
+            // A verifier must not turn lost parent protection into an ordinary
+            // authentication error and resume potentially blocking work.
+            unsafe { nix::libc::_exit(127) };
+        }
+    }
+
+    pub(super) fn arm_initial(self) {
+        #[cfg(test)]
+        self.observe(VerifierBoundary::BeforeInitialArm);
+        self.check_or_exit();
+        #[cfg(test)]
+        self.observe(VerifierBoundary::Armed);
+    }
+
+    fn rearm(self, _transition: IdentityTransition) {
+        #[cfg(test)]
+        self.observe(VerifierBoundary::BeforeRearm(_transition));
+        self.check_or_exit();
+        #[cfg(test)]
+        self.observe(VerifierBoundary::AfterRearm(_transition));
+    }
+
+    #[cfg(test)]
+    fn observe(self, boundary: VerifierBoundary) {
+        (self.observer)(boundary);
+    }
+}
+
 /// A guard that puts the effective identity -- user, group, and
 /// supplementary groups, in that order -- back. Being a guard rather than
 /// a sequence of calls is the point: an early return, an error, or a panic
@@ -142,6 +220,7 @@ struct EffectiveIdentity {
     previous_uid: Uid,
     previous_gid: Gid,
     previous_groups: Vec<Gid>,
+    verifier_parent: Option<VerifierParent>,
 }
 
 impl EffectiveIdentity {
@@ -151,8 +230,12 @@ impl EffectiveIdentity {
     /// call, not after the last one, so a failure partway through the
     /// switch still has something to roll back to when this returns `Err`
     /// and the partially-built guard drops.
-    fn become_account(account: &Account) -> Result<EffectiveIdentity, AuthorizedError> {
+    fn become_account(
+        account: &Account,
+        verifier_parent: Option<VerifierParent>,
+    ) -> Result<EffectiveIdentity, AuthorizedError> {
         let guard = EffectiveIdentity {
+            verifier_parent,
             previous_uid: Uid::effective(),
             previous_gid: Gid::effective(),
             previous_groups: nix::unistd::getgroups()
@@ -160,8 +243,20 @@ impl EffectiveIdentity {
         };
         nix::unistd::setgroups(&account.groups)
             .map_err(|e| AuthorizedError::Switch(e.to_string()))?;
+        // Supplementary-group changes do not clear PDEATHSIG. Effective gid
+        // and uid transitions do, including the reverse transitions in Drop.
+        #[cfg(test)]
+        if let Some(parent) = verifier_parent {
+            parent.observe(VerifierBoundary::GroupsInstalled);
+        }
         nix::unistd::setegid(account.gid).map_err(|e| AuthorizedError::Switch(e.to_string()))?;
+        if let Some(parent) = verifier_parent {
+            parent.rearm(IdentityTransition::EntryGroup);
+        }
         nix::unistd::seteuid(account.uid).map_err(|e| AuthorizedError::Switch(e.to_string()))?;
+        if let Some(parent) = verifier_parent {
+            parent.rearm(IdentityTransition::EntryUser);
+        }
         Ok(guard)
     }
 }
@@ -172,9 +267,23 @@ impl Drop for EffectiveIdentity {
         // choice: `setgroups` needs `CAP_SETGID`, which is only present
         // again once the effective user id is back to root -- see this
         // module's docs.
-        let restored = nix::unistd::seteuid(self.previous_uid).is_ok()
-            && nix::unistd::setegid(self.previous_gid).is_ok()
-            && nix::unistd::setgroups(&self.previous_groups).is_ok();
+        #[cfg(test)]
+        if let Some(parent) = self.verifier_parent {
+            parent.observe(VerifierBoundary::BeforeRestore);
+        }
+        let restored = (|| -> nix::Result<()> {
+            nix::unistd::seteuid(self.previous_uid)?;
+            if let Some(parent) = self.verifier_parent {
+                parent.rearm(IdentityTransition::RestoreUser);
+            }
+            nix::unistd::setegid(self.previous_gid)?;
+            if let Some(parent) = self.verifier_parent {
+                parent.rearm(IdentityTransition::RestoreGroup);
+            }
+            nix::unistd::setgroups(&self.previous_groups)?;
+            Ok(())
+        })()
+        .is_ok();
         if !restored {
             // There is no recovering from this and no safe way to
             // continue: the helper would go on believing it is root while
@@ -186,6 +295,10 @@ impl Drop for EffectiveIdentity {
                  authorized_keys -- aborting",
             );
             std::process::abort();
+        }
+        #[cfg(test)]
+        if let Some(parent) = self.verifier_parent {
+            parent.observe(VerifierBoundary::Restored);
         }
     }
 }
@@ -425,8 +538,20 @@ pub(super) fn to_key_text(
 /// account that has added no key admits nobody, which is a policy, not a
 /// failure.
 pub fn read_for(account: &Account, template: &str) -> Result<String, AuthorizedError> {
+    read_for_verifier(account, template, None)
+}
+
+pub(super) fn read_for_verifier(
+    account: &Account,
+    template: &str,
+    verifier_parent: Option<VerifierParent>,
+) -> Result<String, AuthorizedError> {
     let path = super::account::expand_template(template, account);
-    let _as_them = EffectiveIdentity::become_account(account)?;
+    let _as_them = EffectiveIdentity::become_account(account, verifier_parent)?;
+    #[cfg(test)]
+    if let Some(parent) = verifier_parent {
+        parent.observe(VerifierBoundary::BeforeRead);
+    }
     to_key_text(read_trusted_file(&path, account.uid), &path)
 }
 
