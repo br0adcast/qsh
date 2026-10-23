@@ -54,8 +54,8 @@ use crate::control::{self, ControlRequest, PortStatus, StatusResponse};
 use crate::version::ReconcileAction;
 use crate::{log, state};
 
-/// How long a control-socket client has to send its one request line
-/// before the connection is dropped.
+/// The original deadline for an accepted control connection: request read,
+/// control gate, command delivery, and response write all share this budget.
 pub const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared in-memory set of trusted client Noise keys for the transport
@@ -182,6 +182,35 @@ pub async fn run_transport_daemon(
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
 ) -> Result<()> {
+    run_transport_daemon_until_stop(
+        socket,
+        server_priv,
+        auth,
+        backend,
+        listener,
+        _cleanup,
+        ports,
+        active_count,
+        control_gate,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// The executable owns its signal streams until this joined boundary returns.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_daemon_until_stop(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    listener: std::os::unix::net::UnixListener,
+    _cleanup: control::SocketCleanup,
+    ports: Vec<u16>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
     // Sized here, where every socket the daemon serves passes -- one it
     // bound, and one an older binary handed over on an update (spec §4.12).
     transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
@@ -212,14 +241,8 @@ pub async fn run_transport_daemon(
     // updated incrementally by each session bridge in the manager, read by
     // the control server's STATUS/ADD-CLIENT/ADD-PORT replies
     // (`total_connections`) and by the update service.
-    let control_loop = serve_transport_control(
-        listener,
-        auth.allowlist.clone(),
-        ports,
-        stop_tx.clone(),
-        active_count.clone(),
-        control_gate,
-    );
+    let shared_allowlist = auth.allowlist.clone();
+    let mut handlers = tokio::task::JoinSet::new();
     // The multi-session router: one UDP socket, per-token sessions, the
     // per-session channel backend. It snapshots the allowlist fresh at every
     // handshake and scrubs an ended session's key off it.
@@ -229,25 +252,60 @@ pub async fn run_transport_daemon(
         server_priv,
         auth,
         BackendFactory(backend),
-        active_count,
+        active_count.clone(),
         LoginEndedReports::none(),
         shutdown.clone(),
     );
     tokio::pin!(manager_loop);
 
-    let completed = tokio::select! {
-        _ = control_loop => None,
-        result = &mut manager_loop => Some(result),
-        _ = stop_rx.recv() => None,
-    };
-    let result = match completed {
-        Some(result) => result,
-        None => {
-            shutdown.request();
-            manager_loop.await
+    tokio::pin!(stop);
+    let mut trigger_error = None;
+    let completed = loop {
+        tokio::select! {
+            biased;
+            result = &mut stop => {
+                trigger_error = result.err();
+                break None;
+            }
+            _ = stop_rx.recv() => break None,
+            result = &mut manager_loop => break Some(result),
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(error)) = result {
+                    trigger_error = Some(anyhow::Error::new(error).context("joining transport control task"));
+                    break None;
+                }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
+                    shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
+                    active_count.clone(), control_gate.clone()),
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
+                Err(error) => {
+                    trigger_error = Some(anyhow::Error::new(error).context("accepting transport control connection"));
+                    break None;
+                }
+            }
         }
     };
-    result.context("joining transport session shutdown")?;
+    // Close admission before requesting drain. Accepted STOP acknowledgments
+    // retain their tasks and original deadlines while the manager joins.
+    drop(listener);
+    shutdown.request();
+    let (manager_result, control_result) = match completed {
+        Some(result) => (
+            result,
+            join_control_handlers(&mut handlers, &mut stop_rx).await,
+        ),
+        None => tokio::join!(
+            &mut manager_loop,
+            join_control_handlers(&mut handlers, &mut stop_rx)
+        ),
+    };
+    manager_result.context("joining transport session shutdown")?;
+    control_result?;
+    if let Some(error) = trigger_error {
+        return Err(error);
+    }
 
     log::info("qshd", "transport daemon stopped");
     Ok(())
@@ -268,30 +326,81 @@ pub async fn run_serve_loop(
     backend: Arc<dyn SessionBackend>,
     login_ends: LoginEndedReports,
 ) -> Result<()> {
-    // Sized here, where every socket the daemon serves passes -- one it
-    // bound, and one an older binary handed over on an update (spec §4.12).
-    transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
-    socket
-        .set_nonblocking(true)
-        .context("switching the UDP socket to non-blocking mode")?;
-    let socket = Arc::new(
-        tokio::net::UdpSocket::from_std(socket).context("adopting the UDP socket into tokio")?,
-    );
-    let active_count = Arc::new(AtomicUsize::new(0));
-    SessionManager::serve(
+    run_serve_loop_until_stop(
         socket,
         server_priv,
         auth,
-        BackendFactory(backend),
-        active_count,
+        backend,
         login_ends,
+        std::future::pending(),
     )
-    .await;
+    .await
+}
+
+pub(crate) async fn run_serve_loop_until_stop(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    login_ends: LoginEndedReports,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let shutdown = transport::Shutdown::default();
+    let manager = run_serve_loop_until_shutdown(
+        socket,
+        server_priv,
+        auth,
+        backend,
+        login_ends,
+        shutdown.clone(),
+    );
+    tokio::pin!(manager);
+    tokio::pin!(stop);
+    let (result, stop_error) = tokio::select! {
+        biased;
+        stopped = &mut stop => {
+            shutdown.request();
+            (manager.await, stopped.err())
+        }
+        result = &mut manager => (result, None),
+    };
+    result.map_err(|error| match error {
+        ServeLoopError::Initialize(error) => error,
+        ServeLoopError::Shutdown(error) => anyhow::Error::new(error),
+    })?;
+    if let Some(error) = stop_error {
+        return Err(error);
+    }
     Ok(())
 }
 
+/// Unix handlers are installed only at executable entry, after daemonization.
+/// Keep this owner alive through the complete manager and control-task drain.
+pub struct PersonalSignals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl PersonalSignals {
+    pub fn register() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Self {
+            term: signal(SignalKind::terminate()).context("registering personal daemon SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt())
+                .context("registering personal daemon SIGINT")?,
+        })
+    }
+
+    pub async fn requested(&mut self) -> Result<()> {
+        let received = tokio::select! {
+            received = self.term.recv() => received,
+            received = self.interrupt.recv() => received,
+        };
+        received.context("personal daemon signal stream closed")
+    }
+}
+
 /// Initialization failure is not a joined manager receipt.
-#[cfg(feature = "system")]
 #[derive(Debug)]
 pub(crate) enum ServeLoopError {
     Initialize(anyhow::Error),
@@ -299,7 +408,6 @@ pub(crate) enum ServeLoopError {
 }
 
 /// The system worker's owned manager boundary; cancellation is not completion.
-#[cfg(feature = "system")]
 pub(crate) async fn run_serve_loop_until_shutdown(
     socket: std::net::UdpSocket,
     server_priv: [u8; 32],
@@ -349,41 +457,80 @@ pub async fn serve_transport_control(
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
 ) {
+    let mut handlers = tokio::task::JoinSet::new();
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _addr)) => stream,
-            Err(e) => {
-                log::warn(
-                    "qshd",
-                    &format!("error accepting a connection to the transport control socket: {e}"),
-                );
-                continue;
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
+                    shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
+                    active_count.clone(), control_gate.clone()),
+                Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
+            },
+            result = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(error)) = result {
+                    log::warn("qshd", &format!("error joining transport control task: {error}"));
+                }
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_control_handler(
+    handlers: &mut tokio::task::JoinSet<()>,
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+) {
+    let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT;
+    handlers.spawn(async move {
+        if let Err(error) = handle_transport_control_connection(
+            stream,
+            shared_allowlist,
+            ports,
+            stop_tx,
+            active_count,
+            control_gate,
+            deadline,
+        )
+        .await
+        {
+            log::warn(
+                "qshd",
+                &format!("error handling transport control connection: {error}"),
+            );
+        }
+    });
+}
+
+async fn join_control_handlers(
+    handlers: &mut tokio::task::JoinSet<()>,
+    stop_rx: &mut mpsc::Receiver<()>,
+) -> Result<()> {
+    let mut failure = None;
+    while !handlers.is_empty() {
+        // A STOP admitted before listener closure still has a live delivery
+        // endpoint. Drain its request while its task retains the ACK write.
+        let result = tokio::select! {
+            result = handlers.join_next() => result.expect("retained control task"),
+            _ = stop_rx.recv() => continue,
         };
-
-        let shared_allowlist = shared_allowlist.clone();
-        let ports = ports.clone();
-        let stop_tx = stop_tx.clone();
-        let active_count = active_count.clone();
-        let control_gate = control_gate.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_transport_control_connection(
-                stream,
-                shared_allowlist,
-                ports,
-                stop_tx,
-                active_count,
-                control_gate,
-            )
-            .await
-            {
-                log::warn(
-                    "qshd",
-                    &format!("error handling a connection to the transport control socket: {e}"),
-                );
+        if let Err(error) = result {
+            log::warn(
+                "qshd",
+                &format!("error joining transport control task: {error}"),
+            );
+            if failure.is_none() {
+                failure = Some(error);
             }
-        });
+        }
+    }
+    match failure {
+        Some(error) => Err(anyhow::Error::new(error).context("joining transport control tasks")),
+        None => Ok(()),
     }
 }
 
@@ -394,10 +541,11 @@ pub async fn serve_transport_control(
 /// transport (native roaming on a single port) -- we silently reply with
 /// status, without binding anything.
 ///
-/// The request is read first, within [`CONTROL_REQUEST_TIMEOUT`], and only
-/// then is `control_gate` taken for reading, held until the answer is
+/// The line is read before taking `control_gate` for reading, held until
+/// the answer is
 /// written: a client that connects and says nothing never holds the gate a
-/// replacement waits for.
+/// replacement waits for. Read, gate, delivery and reply share the original
+/// accepted deadline.
 async fn handle_transport_control_connection(
     stream: tokio::net::UnixStream,
     shared_allowlist: SharedAllowlist,
@@ -405,57 +553,62 @@ async fn handle_transport_control_connection(
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
+    deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = tokio::io::BufReader::new(read_half);
-    let mut line = String::new();
-    tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, reader.read_line(&mut line))
-        .await
-        .context("the transport control socket's client sent no request in time")?
-        .context("reading the request from the transport control socket")?;
-    let line = line.trim_end_matches('\n');
+    tokio::time::timeout_at(deadline, async {
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .context("reading the request from the transport control socket")?;
+        let line = line.trim_end_matches('\n');
 
-    // Held for the rest of the request: a replacement takes this for writing
-    // before it snapshots the allowlist, so an `ADD-CLIENT` either lands
-    // before the snapshot or waits -- and then meets the new process.
-    let _gate = control_gate.read().await;
+        // Held for the rest of the request: a replacement takes this for writing
+        // before it snapshots the allowlist, so an `ADD-CLIENT` either lands
+        // before the snapshot or waits -- and then meets the new process.
+        let _gate = control_gate.read().await;
 
-    let Some(request) = control::parse_request(line) else {
-        // Unparseable request -- silently close the connection: the only
-        // client is `transport-ensure` itself, not external input.
-        return Ok(());
-    };
+        let Some(request) = control::parse_request(line) else {
+            // Unparseable request -- silently close the connection: the only
+            // client is `transport-ensure` itself, not external input.
+            return Ok(());
+        };
 
-    match request {
-        ControlRequest::Status => {
-            let response =
-                transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
-            write_half.write_all(response.to_line()?.as_bytes()).await?;
+        match request {
+            ControlRequest::Status => {
+                let response =
+                    transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
+                write_half.write_all(response.to_line()?.as_bytes()).await?;
+            }
+            ControlRequest::AddClient(pubkey) => {
+                apply_add_client(&shared_allowlist, pubkey);
+                let response =
+                    transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
+                write_half.write_all(response.to_line()?.as_bytes()).await?;
+            }
+            ControlRequest::AddPort(_) => {
+                // The transport has no live port addition -- reply with status.
+                let response =
+                    transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
+                write_half.write_all(response.to_line()?.as_bytes()).await?;
+            }
+            ControlRequest::Stop => {
+                stop_tx
+                    .send(())
+                    .await
+                    .context("requesting transport shutdown")?;
+                // This acknowledges accepted work. Joined daemon completion is
+                // observed independently; owned cleanup may still be pending.
+                write_half.write_all(b"{\"stopping\":true}\n").await?;
+            }
         }
-        ControlRequest::AddClient(pubkey) => {
-            apply_add_client(&shared_allowlist, pubkey);
-            let response =
-                transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
-            write_half.write_all(response.to_line()?.as_bytes()).await?;
-        }
-        ControlRequest::AddPort(_) => {
-            // The transport has no live port addition -- reply with status.
-            let response =
-                transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64)?;
-            write_half.write_all(response.to_line()?.as_bytes()).await?;
-        }
-        ControlRequest::Stop => {
-            stop_tx
-                .send(())
-                .await
-                .context("requesting transport shutdown")?;
-            // This acknowledges accepted work. Joined daemon completion is
-            // observed independently; owned cleanup may still be pending.
-            write_half.write_all(b"{\"stopping\":true}\n").await?;
-        }
-    }
 
-    Ok(())
+        Ok(())
+    })
+    .await
+    .context("transport control request exceeded its accepted deadline")?
 }
 
 #[cfg(test)]

@@ -997,17 +997,22 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
 
     let runtime =
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
-    runtime.block_on(transport_daemon::run_transport_daemon(
-        start.socket,
-        start.keypair.private,
-        personal_server_auth(shared_allowlist, start.keypair.public, admission),
-        Arc::new(backend),
-        start.listener,
-        start.cleanup,
-        vec![start.port],
-        active_count,
-        control_gate,
-    ))
+    runtime.block_on(async {
+        let mut signals = transport_daemon::PersonalSignals::register()?;
+        transport_daemon::run_transport_daemon_until_stop(
+            start.socket,
+            start.keypair.private,
+            personal_server_auth(shared_allowlist, start.keypair.public, admission),
+            Arc::new(backend),
+            start.listener,
+            start.cleanup,
+            vec![start.port],
+            active_count,
+            control_gate,
+            signals.requested(),
+        )
+        .await
+    })
 }
 
 /// The authentication of a `transport-ensure` daemon: two gates, because
