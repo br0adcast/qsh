@@ -185,9 +185,20 @@ mod tests {
         let view = crate::process_scope::prepare().unwrap();
         let (input, output) = UnixStream::pair().unwrap();
         input.set_nonblocking(true).unwrap();
+        let isolated = tempfile::tempdir().unwrap();
+        for directory in ["home", "cache", "config"] {
+            std::fs::create_dir(isolated.path().join(directory)).unwrap();
+        }
         let mut fixture = Fixture {
             child: Command::new("/bin/sh")
                 .args(["-c", "read release"])
+                .env_clear()
+                .env("HOME", isolated.path().join("home"))
+                .env("XDG_CACHE_HOME", isolated.path().join("cache"))
+                .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+                .env("HISTFILE", "/dev/null")
+                .env("PATH", "/usr/bin:/bin")
+                .current_dir(isolated.path())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -202,19 +213,22 @@ mod tests {
             input.into(),
             now + Duration::from_secs(1),
         );
-        // Controlled parent-created EOF associated with the owned child. It is
-        // not represented as a report actually emitted by fork_shell's child.
-        drop(output);
+        // Holding this parent-owned writer makes the first advance pending.
+        // The later controlled EOF is associated with the owned child; it is
+        // not a report actually emitted by fork_shell's child.
         assert!(native.report_fd().is_some());
         let first = native.advance(now);
-        let startup = first.startup;
-        let leader = first.leader;
+        let first_report_retained = native.report_fd().is_some();
+        let first_complete = matches!(&first.progress, Progress::Complete(_));
+        let mut outcomes: Vec<_> = first.startup.into_iter().collect();
+        let mut leaders: Vec<_> = first.leader.into_iter().collect();
         let mut progress = first.progress;
+        drop(output);
         let deadline = now + Duration::from_secs(2);
-        let mut extra_outcomes = Vec::new();
         while !matches!(progress, Progress::Complete(_)) && Instant::now() < deadline {
             let update = native.advance(Instant::now());
-            extra_outcomes.extend(update.startup);
+            outcomes.extend(update.startup);
+            leaders.extend(update.leader);
             progress = update.progress;
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -224,12 +238,15 @@ mod tests {
             matches!(progress, Progress::Complete(_)),
             "timeout is failure, never receipt"
         );
-        assert_eq!(startup, Some(Outcome::Failed(Failure::Protocol)));
-        assert_eq!(
-            leader, None,
+        assert!(first_report_retained, "pending report remains owned");
+        assert_eq!(first.startup, None, "held writer has not published EOF");
+        assert_eq!(first.leader, None);
+        assert!(!first_complete, "pending startup cannot complete custody");
+        assert_eq!(outcomes, vec![Outcome::Failed(Failure::Protocol)]);
+        assert!(
+            leaders.is_empty(),
             "failed startup never publishes installed Exited"
         );
-        assert!(extra_outcomes.is_empty(), "startup outcome is exactly once");
         assert!(native.report_fd().is_none());
         let last = native.advance(Instant::now());
         assert_eq!(last.startup, None);

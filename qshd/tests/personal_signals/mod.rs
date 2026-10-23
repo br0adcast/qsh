@@ -631,18 +631,25 @@ fn personal_exec_probe_observes_a_real_inherited_mask_and_ignored_signal() {
     let probe = generated_probe(dir.path());
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
+    let sentinel = home.join("owned-descriptor");
+    std::fs::write(&sentinel, b"owned inherited descriptor fixture\n").unwrap();
     let mut command = Command::new(&probe);
     isolated(&mut command, &home, &probe);
     command
         .arg("--inherited-control")
-        .env("QSH_TEST_PERSONAL_PROBE_ONLY", "1");
+        .env("QSH_TEST_PERSONAL_PROBE_ONLY", "1")
+        .env("QSH_TEST_PERSONAL_SENTINEL", sentinel);
     assert!(command.status().unwrap().success());
     let actual = read_probe(&home);
     assert_eq!(actual["term_blocked"], 1);
     assert_eq!(actual["int_blocked"], 0);
     assert_eq!(actual["term_default"], 1);
     assert_eq!(actual["int_default"], 0);
-    assert_eq!(actual["inherited_fds"], 0);
+    // This direct control bypasses the daemon's PTY descriptor closure. Its
+    // setup child deliberately inherits one exact file alongside harness fds.
+    assert_eq!(actual["sentinel_inherited"], 1);
+    assert!(actual["inherited_fds"] >= 1);
+    eprintln!("inherited signal/owned-descriptor control: {actual:?}");
 }
 
 #[test]

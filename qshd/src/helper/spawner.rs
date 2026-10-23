@@ -2508,6 +2508,7 @@ impl LoginSink for HelperAuth {
 #[cfg(test)]
 pub(crate) mod tests {
     include!("spawner_auxiliary_tests.rs");
+    include!("spawner_login_retry_tests.rs");
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
