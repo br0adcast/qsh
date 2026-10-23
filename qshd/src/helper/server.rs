@@ -11812,6 +11812,63 @@ pub(crate) mod tests {
         helper_trusting_with(key, permit_root, UNPRIVILEGED)
     }
 
+    // Only this isolated reexec fixture uses this lookup. Other tests continue
+    // using UNPRIVILEGED's real account unchanged.
+    static RETRY_FIXTURE_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    fn retry_fixture_account(login: &str) -> Result<Account, AccountError> {
+        let mut account = super::account::lookup(login)?;
+        account.home = RETRY_FIXTURE_HOME
+            .get()
+            .expect("fixture home installed")
+            .clone();
+        account.shell = PathBuf::from("/bin/sh");
+        Ok(account)
+    }
+
+    /// Real proof verification and monitor lifecycle against a private PAM stack.
+    /// The returned key-directory owner also retains the isolated shell home
+    /// until after the caller joins the helper.
+    pub(crate) fn helper_trusting_pam(
+        key: &PrivateKey,
+        permit_root: bool,
+        confdir: &Path,
+        service: &str,
+    ) -> TestHelper {
+        let keys = tempfile::tempdir().expect("temporary authorized keys");
+        let home = keys.path().join("home");
+        std::fs::create_dir(&home).expect("isolated account home");
+        RETRY_FIXTURE_HOME
+            .set(home)
+            .expect("one fixture per exact reexec");
+        let authorized_keys = keys.path().join("authorized_keys");
+        std::fs::write(
+            &authorized_keys,
+            format!("{}\n", key.public_key().to_openssh().expect("openssh")),
+        )
+        .expect("fixture authorized keys");
+        let config = HelperConfig {
+            permit_root,
+            pam_service: service.into(),
+            pam_confdir: Some(confdir.into()),
+            authorized_keys_template: authorized_keys.display().to_string(),
+            tty_gid: None,
+            worker_user: "qshd".into(),
+            startup_timeout: STARTUP_REPORT_TIMEOUT,
+            verify_timeout: VERIFY_TIMEOUT,
+        };
+        helper_running(
+            config,
+            HashMap::new(),
+            AccountSwitches {
+                lookup: retry_fixture_account,
+                ..UNPRIVILEGED
+            },
+            keys,
+            PROOF_LOGIN,
+        )
+    }
+
     /// [`helper_trusting`], with the switches spelled out -- for the tests
     /// about what the VERIFYING CHILD does, which need to stand something
     /// of their own in for the account lookup or the key read that child
