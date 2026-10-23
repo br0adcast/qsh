@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <signal.h>
@@ -16,6 +17,14 @@
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--inherited-control") == 0) {
+        /* Only this owned setup child creates a deliberately inherited fd. */
+        const char *path = getenv("QSH_TEST_PERSONAL_SENTINEL");
+        if (!path) return 98;
+        int sentinel = open(path, O_RDONLY); /* intentionally without CLOEXEC */
+        if (sentinel < 3) return 98;
+        char number[32];
+        snprintf(number, sizeof(number), "%d", sentinel);
+        if (setenv("QSH_TEST_PERSONAL_SENTINEL_FD", number, 1)) return 98;
         sigset_t blocked;
         sigemptyset(&blocked);
         sigaddset(&blocked, SIGTERM);
@@ -54,15 +63,27 @@ int main(int argc, char **argv) {
         if (*end == '\0' && fd > 2 && fd != dirfd(fds)) inherited++;
     }
     closedir(fds);
+    int sentinel_inherited = 0;
+    const char *sentinel_number = getenv("QSH_TEST_PERSONAL_SENTINEL_FD");
+    if (sentinel_number) {
+        const char *path = getenv("QSH_TEST_PERSONAL_SENTINEL");
+        struct stat actual, expected;
+        int fd = atoi(sentinel_number);
+        int flags = fcntl(fd, F_GETFD);
+        if (path && fd > 2 && flags >= 0 && !(flags & FD_CLOEXEC) &&
+            !fstat(fd, &actual) && !stat(path, &expected) && S_ISREG(actual.st_mode) &&
+            actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino)
+            sentinel_inherited = 1;
+    }
     const char *home = getenv("HOME"), *expected = getenv("QSH_TEST_PERSONAL_HOME");
     struct stat info;
     if (!home || !expected || strcmp(home, expected) || stat(home, &info) ||
         info.st_uid != getuid() || !S_ISDIR(info.st_mode)) return 94;
     FILE *report = fopen(getenv("QSH_TEST_PERSONAL_PROBE"), "w");
     if (!report) return 95;
-    fprintf(report, "pid=%ld term_blocked=%d int_blocked=%d term_default=%d int_default=%d inherited_fds=%d home_owned=1\n",
+    fprintf(report, "pid=%ld term_blocked=%d int_blocked=%d term_default=%d int_default=%d inherited_fds=%d home_owned=1 sentinel_inherited=%d\n",
         (long)getpid(), sigismember(&mask, SIGTERM), sigismember(&mask, SIGINT),
-        term.sa_handler == SIG_DFL, interrupt.sa_handler == SIG_DFL, inherited);
+        term.sa_handler == SIG_DFL, interrupt.sa_handler == SIG_DFL, inherited, sentinel_inherited);
     if (fclose(report)) return 96;
     if (getenv("QSH_TEST_PERSONAL_PROBE_ONLY")) return 0;
     if (chdir(home)) return 96;
