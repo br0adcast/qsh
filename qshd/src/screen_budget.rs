@@ -663,6 +663,9 @@ mod lifecycle_tests {
     struct Wait(Feed);
     impl ChannelWait for Wait {
         fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+            // This fake declares its process scope gone: release its output
+            // source before the real reader worker can supply its join receipt.
+            self.0.lock().unwrap().take();
             transport::channel_server::ChildStatus::Reaped { code: Some(0) }
         }
         fn cleanup_uninstalled(

@@ -18,7 +18,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use portable_pty::{Child, CommandBuilder, PtySize};
+#[cfg(not(target_os = "linux"))]
+use portable_pty::Child;
+use portable_pty::{CommandBuilder, PtySize};
 
 use transport::auth::Principal;
 use transport::channel::{ChannelKind, OpenRequest};
@@ -77,6 +79,9 @@ impl ChannelSpawner for PtyChannelSpawner {
         }
         TerminalSize::new(req.cols, req.rows)
             .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let process_view = crate::process_scope::prepare()
+            .map_err(|error| custody.refuse_before_creation(error))?;
         let screen = make_screen(req, owner, Arc::clone(&self.budget))
             .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
@@ -106,19 +111,25 @@ impl ChannelSpawner for PtyChannelSpawner {
             ),
         }
         .map_err(|e| custody.refuse_before_creation(format!("could not open channel: {e:#}")))?;
+        // portable-pty has completed its owned setsid/exec handshake. Retain
+        // the unreaped leader before any fallible descriptor preparation.
+        #[cfg(target_os = "linux")]
+        let wait = crate::process_scope::own_child(child, process_view);
+        #[cfg(not(target_os = "linux"))]
+        let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
         drop(permit);
-        finish_personal_spawn(master, child, screen, custody)
+        finish_personal_spawn(master, wait, screen, custody)
     }
 }
 
 /// Assemble the spawned PTY at the descriptor-preparation boundary.
 fn finish_personal_spawn(
     master: Box<dyn portable_pty::MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    wait: Box<dyn ChannelWait>,
     screen: Box<dyn SessionScreen>,
     custody: &OpenCustody,
 ) -> Result<UninstalledChannel, SpawnFailure> {
-    let construction = custody.protect(Box::new(ChildWait(child)), screen);
+    let construction = custody.protect(wait, screen);
     let reader = master
         .try_clone_reader()
         .map_err(|e| custody.failure(format!("reading from the channel is unavailable: {e:#}")))?;
@@ -248,8 +259,10 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 
 /// Waits for the channel's child and reports its code. Blocking, which is
 /// why `run_channel_session` calls it on a blocking task.
+#[cfg(not(target_os = "linux"))]
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
+#[cfg(not(target_os = "linux"))]
 impl ChannelWait for ChildWait {
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
         use transport::channel_server::ChildStatus;
@@ -396,20 +409,97 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::Duration;
 
+    #[derive(Default)]
+    struct CleanupCounts {
+        waits: std::sync::atomic::AtomicUsize,
+        reader_joins: std::sync::atomic::AtomicUsize,
+    }
+    struct TestChannel {
+        channel: Option<SpawnedChannel>,
+        reader: Option<std::thread::JoinHandle<()>>,
+        counts: Arc<CleanupCounts>,
+    }
+    impl TestChannel {
+        fn new(channel: SpawnedChannel) -> Self {
+            Self {
+                channel: Some(channel),
+                reader: None,
+                counts: Arc::default(),
+            }
+        }
+        fn join_reader(&mut self) -> bool {
+            if let Some(reader) = self.reader.take() {
+                let success = reader.join().is_ok();
+                if success {
+                    self.counts
+                        .reader_joins
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                success
+            } else {
+                true
+            }
+        }
+        fn finish(&mut self, stop: bool) -> bool {
+            let waited = if let Some(mut channel) = self.channel.take() {
+                if stop {
+                    channel.wait.kill();
+                }
+                let status = channel.wait.wait();
+                if status >= 0 {
+                    self.counts
+                        .waits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                status >= 0
+            } else {
+                true
+            };
+            // The channel is actually settled before a possibly blocked PTY
+            // reader is joined, on success and assertion-unwind paths alike.
+            self.join_reader() && waited
+        }
+    }
+    impl std::ops::Deref for TestChannel {
+        type Target = SpawnedChannel;
+        fn deref(&self) -> &Self::Target {
+            self.channel.as_ref().unwrap()
+        }
+    }
+    impl std::ops::DerefMut for TestChannel {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.channel.as_mut().unwrap()
+        }
+    }
+    impl Drop for TestChannel {
+        fn drop(&mut self) {
+            let _ = self.finish(true);
+        }
+    }
+
+    struct WindowSpawn {
+        window: Option<std::sync::RwLockWriteGuard<'static, ()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl WindowSpawn {
+        fn release_and_join(&mut self) -> bool {
+            self.window.take();
+            self.thread
+                .take()
+                .is_none_or(|thread| thread.join().is_ok())
+        }
+    }
+    impl Drop for WindowSpawn {
+        fn drop(&mut self) {
+            let _ = self.release_and_join();
+        }
+    }
+
     #[test]
     fn personal_child_poll_distinguishes_running_from_exact_reaped_status() {
         use transport::channel_server::ChildStatus;
         suppress_shell_history();
-        struct Cleanup(Option<SpawnedChannel>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                if let Some(mut channel) = self.0.take() {
-                    channel.wait.kill();
-                    channel.wait.wait();
-                }
-            }
-        }
-        let mut cleanup = Cleanup(Some(
+        let mut cleanup = TestChannel::new(
             spawner()
                 .spawn(
                     &owner(),
@@ -423,23 +513,23 @@ mod tests {
                     None,
                 )
                 .unwrap(),
-        ));
+        );
         // Own cleanup before any fallible PTY read or assertion.
-        let output = read_until(cleanup.0.as_mut().unwrap(), "POLL_READY");
+        let output = read_until(&mut cleanup, "POLL_READY");
         assert!(output.contains("POLL_READY"));
-        let channel = cleanup.0.as_mut().unwrap();
+        let channel = cleanup.channel.as_mut().unwrap();
         assert!(matches!(channel.wait.poll_exit(), ChildStatus::Running));
         channel.writer.write_all(b"finish\n").unwrap();
         channel.writer.flush().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match cleanup.0.as_mut().unwrap().wait.poll_exit() {
+            match cleanup.channel.as_mut().unwrap().wait.poll_exit() {
                 ChildStatus::Reaped { code } => {
-                    cleanup.0.take(); // Reaped: never signal this PID again, even on failure.
+                    cleanup.channel.take(); // Reaped: never signal this PID again, even on failure.
                     assert_eq!(code, Some(7));
                     break;
                 }
-                ChildStatus::Running => {
+                ChildStatus::Running | ChildStatus::WaitingForWorkers => {
                     assert!(
                         std::time::Instant::now() < deadline,
                         "owned shell did not finish"
@@ -447,7 +537,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 ChildStatus::Unknown(error) => {
-                    cleanup.0.take(); // Lost identity is not permission for blind PID signaling.
+                    cleanup.channel.take(); // Lost identity is not permission for blind PID signaling.
                     panic!("owned shell status became unknown: {error}");
                 }
             }
@@ -458,33 +548,18 @@ mod tests {
     /// stuck rather than merely slow.
     const READ_UNTIL_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Reads from a channel until `needle` shows up, or gives up. Reading
-    /// "until a marker" rather than "one chunk" is what makes the test
-    /// independent of how a pseudo-terminal splits its output.
-    ///
-    /// The actual reading happens on a DEDICATED THREAD, and the caller waits
-    /// on it with [`READ_UNTIL_TIMEOUT`] via `recv_timeout`: `Read::read` on a
-    /// pseudo-terminal has no deadline of its own, so waiting on it directly
-    /// here would have no way to fail fast if the marker never shows up and
-    /// no EOF ever arrives either. Proven by mutation: swap the requested
-    /// geometry back for the pseudo-terminal default -- the very regression
-    /// this test exists to catch -- and without the thread-plus-timeout, the
-    /// read blocks forever instead of the test failing. A thread still
-    /// blocked past the deadline is leaked, which is fine for a test that is
-    /// about to panic anyway.
-    fn read_until(ch: &mut SpawnedChannel, needle: &str) -> String {
-        let needle = needle.to_string();
-        // A separate clone travels into the thread: the panics below still
-        // need `needle` on THIS thread after the `recv_timeout`, including
-        // in the timeout arm, which never gets anything back from the
-        // (possibly still-running) thread at all.
-        let needle_for_thread = needle.clone();
-        // Move the real reader out of `ch` for the thread; every caller below
-        // is done with `ch` once `read_until` returns, so the placeholder
-        // (immediate EOF) left in its place is never observed.
-        let mut reader = std::mem::replace(&mut ch.reader, Box::new(std::io::empty()));
+    /// Reads a computed marker while retaining and joining the actual reader.
+    fn read_until(ch: &mut TestChannel, needle: &str) -> String {
+        read_until_with_timeout(ch, needle, READ_UNTIL_TIMEOUT)
+    }
+    fn read_until_with_timeout(ch: &mut TestChannel, needle: &str, timeout: Duration) -> String {
+        let needle_for_thread = needle.to_string();
+        let mut reader = std::mem::replace(
+            &mut ch.channel.as_mut().unwrap().reader,
+            Box::new(std::io::empty()),
+        );
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        ch.reader = Some(std::thread::spawn(move || {
             let mut seen = String::new();
             let mut buf = [0u8; 4096];
             for _ in 0..200 {
@@ -501,17 +576,54 @@ mod tests {
                 }
             }
             let _ = tx.send(Err(seen));
-        });
-
-        match rx.recv_timeout(READ_UNTIL_TIMEOUT) {
-            Ok(Ok(seen)) => seen,
-            Ok(Err(seen)) => panic!("never saw {needle:?}; what arrived was: {seen:?}"),
-            Err(_) => panic!(
-                "never saw {needle:?} within {READ_UNTIL_TIMEOUT:?}: the reading thread is \
-                 still blocked rather than having given up -- exactly what a regression back to \
-                 a fixed pseudo-terminal size looks like"
-            ),
+        }));
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(seen)) => {
+                assert!(ch.join_reader(), "terminal reader panicked");
+                seen
+            }
+            original => {
+                let settled = ch.finish(true);
+                panic!("never saw {needle:?} within {timeout:?}: {original:?}; actual cleanup={settled}");
+            }
         }
+    }
+
+    #[test]
+    fn missing_marker_stays_failed_after_channel_and_reader_join() {
+        suppress_shell_history();
+        let mut ch = TestChannel::new(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(
+                        ChannelKind::Command,
+                        80,
+                        24,
+                        b"/bin/sh -c 'printf READY; read line'",
+                    ),
+                    None,
+                )
+                .unwrap(),
+        );
+        let counts = ch.counts.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            read_until_with_timeout(
+                &mut ch,
+                "MARKER_THAT_IS_NOT_SENT",
+                Duration::from_millis(100),
+            );
+        }));
+        drop(ch);
+        assert!(result.is_err(), "missing marker must remain a failed read");
+        assert_eq!(counts.waits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            counts
+                .reader_joins
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     /// Whose session asks: its uid owns the screen reservation.
@@ -596,14 +708,16 @@ mod tests {
     #[test]
     fn a_shell_channel_opens_at_the_size_requested() {
         suppress_shell_history();
-        let mut ch = spawner()
-            .spawn(
-                &owner(),
-                login(),
-                &request(ChannelKind::Shell, 100, 30, b""),
-                None,
-            )
-            .expect("a shell channel must open");
+        let mut ch = TestChannel::new(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(ChannelKind::Shell, 100, 30, b""),
+                    None,
+                )
+                .expect("a shell channel must open"),
+        );
 
         // `stty size` prints "rows cols" -- the shell's own view of its
         // terminal, which is the thing under test. The marker around it
@@ -618,6 +732,9 @@ mod tests {
             seen.contains("MARK-30x100-MARK"),
             "the shell must see the requested geometry, got: {seen:?}"
         );
+        ch.writer.write_all(b"exit\n").unwrap();
+        ch.writer.flush().unwrap();
+        assert!(ch.finish(false), "actual channel wait and reader join");
     }
 
     /// A command channel runs the command, not the shell. The marker is
@@ -626,17 +743,20 @@ mod tests {
     #[test]
     fn a_command_channel_runs_the_command() {
         suppress_shell_history();
-        let mut ch = spawner()
-            .spawn(
-                &owner(),
-                login(),
-                &request(ChannelKind::Command, 80, 24, b"sh -c 'echo ready-$((6*7))'"),
-                None,
-            )
-            .expect("a command channel must open");
+        let mut ch = TestChannel::new(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(ChannelKind::Command, 80, 24, b"sh -c 'echo ready-$((6*7))'"),
+                    None,
+                )
+                .expect("a command channel must open"),
+        );
 
         let seen = read_until(&mut ch, "ready-42");
         assert!(seen.contains("ready-42"), "the command ran, got: {seen:?}");
+        assert!(ch.finish(false), "actual channel wait and reader join");
     }
 
     /// A channel is not opened while a replacement's exec window is open:
@@ -649,26 +769,32 @@ mod tests {
         suppress_shell_history();
         let window = crate::update::exec_window_for_test();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let ch = spawner().spawn(
                 &owner(),
                 login(),
                 &request(ChannelKind::Command, 80, 24, b"sh -c 'echo ready-$((6*7))'"),
                 None,
             );
-            let _ = tx.send(ch);
+            let _ = tx.send(ch.map(TestChannel::new));
         });
+        let mut spawning = WindowSpawn {
+            window: Some(window),
+            thread: Some(thread),
+        };
         assert!(
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "held off while the window is open"
         );
-        drop(window);
+        spawning.window.take();
         let mut ch = rx
             .recv_timeout(READ_UNTIL_TIMEOUT)
             .expect("opened once the window closed")
             .expect("a command channel must open");
+        assert!(spawning.release_and_join(), "actual spawning thread join");
         let seen = read_until(&mut ch, "ready-42");
         assert!(seen.contains("ready-42"), "the command ran, got: {seen:?}");
+        assert!(ch.finish(false), "actual channel wait and reader join");
     }
 
     /// The terminal type the client announced becomes the child's `TERM`.
@@ -679,20 +805,23 @@ mod tests {
     #[test]
     fn the_announced_terminal_type_becomes_the_childs_term() {
         suppress_shell_history();
-        let mut ch = spawner()
-            .spawn(
-                &owner(),
-                login(),
-                &request(ChannelKind::Command, 80, 24, b"sh -c 'echo T=$TERM'"),
-                Some("rxvt-unicode-256color"),
-            )
-            .expect("a command channel must open");
+        let mut ch = TestChannel::new(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(ChannelKind::Command, 80, 24, b"sh -c 'echo T=$TERM'"),
+                    Some("rxvt-unicode-256color"),
+                )
+                .expect("a command channel must open"),
+        );
 
         let seen = read_until(&mut ch, "T=");
         assert!(
             seen.contains("T=rxvt-unicode-256color"),
             "the child must see the announced terminal type, got: {seen:?}"
         );
+        assert!(ch.finish(false), "actual channel wait and reader join");
     }
 
     /// A client that announced nothing still gets a terminal type: the
@@ -701,20 +830,23 @@ mod tests {
     #[test]
     fn a_client_that_announced_nothing_gets_the_default_term() {
         suppress_shell_history();
-        let mut ch = spawner()
-            .spawn(
-                &owner(),
-                login(),
-                &request(ChannelKind::Command, 80, 24, b"sh -c 'echo T=$TERM'"),
-                None,
-            )
-            .expect("a command channel must open");
+        let mut ch = TestChannel::new(
+            spawner()
+                .spawn(
+                    &owner(),
+                    login(),
+                    &request(ChannelKind::Command, 80, 24, b"sh -c 'echo T=$TERM'"),
+                    None,
+                )
+                .expect("a command channel must open"),
+        );
 
         let seen = read_until(&mut ch, "T=");
         assert!(
             seen.contains("T=xterm-256color"),
             "the default terminal type must still be set, got: {seen:?}"
         );
+        assert!(ch.finish(false), "actual channel wait and reader join");
     }
 
     /// A request with no terminal is refused with a reason rather than

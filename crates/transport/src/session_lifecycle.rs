@@ -88,6 +88,37 @@ impl fmt::Display for ShutdownError {
 }
 impl std::error::Error for ShutdownError {}
 
+/// Completion is published only after joining the blocking worker itself.
+#[derive(Clone, Default)]
+pub(crate) struct WorkerReceipt(Arc<Mutex<WorkerState>>);
+#[derive(Default)]
+struct WorkerState {
+    joined: Option<Result<(), String>>,
+    notifier: Option<crate::channel_server::ReapNotifier>,
+}
+impl WorkerReceipt {
+    pub(crate) fn joined(&self) -> Option<Result<(), String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .joined
+            .clone()
+    }
+    pub(crate) fn set_notifier(&self, notifier: crate::channel_server::ReapNotifier) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).notifier = Some(notifier);
+    }
+    fn finish(&self, result: Result<(), String>) {
+        let notifier = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.joined = Some(result);
+            state.notifier.clone()
+        };
+        if let Some(notifier) = notifier {
+            notifier.notify();
+        }
+    }
+}
+
 #[derive(Default)]
 struct TaskOwner {
     tasks: Mutex<JoinSet<Option<CallbackCompletion>>>,
@@ -159,6 +190,22 @@ impl Lifecycle {
             });
         receiver
     }
+    pub(super) fn spawn_blocking(&self, work: impl FnOnce() + Send + 'static) -> WorkerReceipt {
+        let receipt = WorkerReceipt::default();
+        let completed = receipt.clone();
+        // Register the supervisor before it can launch the blocking work. Its
+        // handle remains owned even if the backend runner is cancelled.
+        self.spawn(async move {
+            let result = tokio::task::spawn_blocking(work)
+                .await
+                .map_err(|e| e.to_string());
+            completed.finish(result.clone());
+            if let Err(error) = result {
+                panic!("owned blocking worker failed: {error}");
+            }
+        });
+        receipt
+    }
     pub(super) fn is_empty(&self) -> bool {
         self.owner
             .tasks
@@ -220,6 +267,45 @@ mod tests {
     include!("session_lifecycle_callback_tests.rs");
     use std::task::Poll;
     use tokio::sync::{oneshot, Notify};
+
+    #[tokio::test]
+    async fn failed_blocking_worker_still_joins_an_independently_held_worker() {
+        let lifecycle = Lifecycle::default();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (started, entered) = oneshot::channel();
+        let held_receipt = lifecycle.spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = held.recv();
+        });
+        let failed_receipt =
+            lifecycle.spawn_blocking(|| panic!("controlled blocking worker failure"));
+        assert!(
+            !lifecycle.is_empty(),
+            "register before blocking work is published"
+        );
+        entered.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while failed_receipt.joined().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(failed_receipt.joined().unwrap().is_err());
+        assert!(
+            held_receipt.joined().is_none(),
+            "held syscall is not a join receipt"
+        );
+        let mut drain = Box::pin(lifecycle.drain());
+        assert!(poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await);
+        drop(release);
+        assert!(
+            drain.await.is_err(),
+            "report failure after all other workers join"
+        );
+        assert_eq!(held_receipt.joined(), Some(Ok(())));
+        assert!(lifecycle.is_empty());
+    }
 
     #[tokio::test]
     async fn shutdown_is_sticky_for_late_observers() {

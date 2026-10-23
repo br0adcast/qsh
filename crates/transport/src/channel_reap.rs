@@ -1,6 +1,6 @@
 //! Exact-instance child waits with factory-owned custody while proof is absent.
 
-use super::{ChannelWait, ChildStatus};
+use super::{ChannelWait, ChildStatus, LeaderStatus};
 use crate::channel_open::{ChannelOpenRegistry, InstalledSlot};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -24,7 +24,7 @@ impl ReapNotifier {
 }
 
 struct Resources {
-    child: Box<dyn ChannelWait>,
+    child: Option<Box<dyn ChannelWait>>,
     _slot: Option<InstalledSlot>,
     notifier_installed: bool,
 }
@@ -37,6 +37,10 @@ struct State {
     signal_allowed: bool,
     terminal: Option<Option<i32>>,
     published: bool,
+    retiring: bool,
+    registering: bool,
+    leader_status: Option<Option<i32>>,
+    leader_published: bool,
 }
 
 /// Registry-owned before any callback or worker can run. A task owns only an
@@ -44,6 +48,7 @@ struct State {
 pub(crate) struct Capsule {
     stream: u8,
     instance: u64,
+    uid: u32,
     state: Mutex<State>,
     changed: Condvar,
     ready: Arc<Notify>,
@@ -64,25 +69,68 @@ impl Capsule {
     }
 
     pub(crate) fn stop(self: &Arc<Self>) {
-        let schedule = {
+        self.retire(true);
+    }
+
+    fn retire(self: &Arc<Self>, stop_now: bool) {
+        let register = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.terminal.is_some() {
                 return;
             }
-            state.stop = true;
+            state.stop |= stop_now;
             self.changed.notify_all();
-            // Unknown can mean lost PID authority. Only backend evidence may
-            // retry that observation; another Close cannot authorize a signal.
-            state.signal_allowed && !state.stop_seen
+            if state.retiring {
+                false
+            } else if state.registering {
+                return;
+            } else {
+                state.registering = true;
+                true
+            }
+        };
+        if register {
+            // No backend lease can start final cleanup until the factory owns
+            // retirement. register_reap may synchronously request stop at a
+            // restart fence, so no capsule mutex is held across registration.
+            let registry = self
+                .registry
+                .upgrade()
+                .expect("factory outlives its session owner");
+            registry.register_reap(self.clone(), self.uid);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.retiring = true;
+            state.registering = false;
+            state.retry = true;
+            self.changed.notify_all();
+        }
+        let schedule = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            register || state.retry || (state.signal_allowed && !state.stop_seen)
         };
         if schedule {
             self.dispatch();
         }
     }
 
+    fn observe_active(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.retiring
+                || state.registering
+                || state.terminal.is_some()
+                || !state.signal_allowed
+            {
+                return;
+            }
+            state.retry = true;
+        }
+        self.dispatch();
+    }
+
     fn take_lease(self: &Arc<Self>) -> Option<Lease> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.leased || state.terminal.is_some() {
+        if state.leased || state.registering || state.terminal.is_some() {
             return None;
         }
         let resources = state.resources.take()?;
@@ -108,6 +156,16 @@ impl Capsule {
         {
             log::warn!("channel wait scheduling failed; custody remains retained");
         }
+    }
+
+    fn take_leader_status(&self) -> Option<Option<i32>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.leader_published {
+            return None;
+        }
+        let code = state.leader_status?;
+        state.leader_published = true;
+        Some(code)
     }
 
     fn terminal(&self) -> Option<Option<i32>> {
@@ -176,16 +234,54 @@ impl Lease {
         if !resources.notifier_installed {
             resources
                 .child
+                .as_mut()
+                .expect("owned child")
                 .set_reap_notifier(ReapNotifier(Arc::downgrade(&self.owner)));
             resources.notifier_installed = true;
         }
         loop {
-            match resources.child.poll_exit() {
+            if let Some(status) = resources
+                .child
+                .as_mut()
+                .expect("owned child")
+                .poll_leader_status()
+            {
+                match status {
+                    LeaderStatus::Running => {}
+                    LeaderStatus::Exited { code } => {
+                        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.leader_status.is_none() {
+                            state.leader_status = Some(code);
+                            self.owner.ready.notify_one();
+                        }
+                    }
+                    LeaderStatus::Unknown(detail) => {
+                        self.unknown(&detail);
+                        return None;
+                    }
+                }
+            }
+            if !self
+                .owner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retiring
+            {
+                // Live observation is one shot. The runner's existing timer
+                // schedules its next observation without parking an OS thread.
+                return None;
+            }
+            match resources.child.as_mut().expect("owned child").poll_exit() {
                 ChildStatus::Reaped { code } => return Some(code),
                 ChildStatus::Unknown(detail) => {
                     self.unknown(&detail);
                     return None;
                 }
+                // The child receipt is latched by IoOwnedWait. Its workers
+                // notify this exact capsule after actual joins; a notification
+                // before lease return remains sticky in state.retry.
+                ChildStatus::WaitingForWorkers => return None,
                 ChildStatus::Running => {}
             }
             let stop = {
@@ -198,7 +294,7 @@ impl Lease {
                 }
             };
             if stop {
-                resources.child.kill();
+                resources.child.as_mut().expect("owned child").kill();
                 // kill can itself observe/reap the child. Poll the same owned
                 // handle again; no independent killer exists in this design.
                 continue;
@@ -235,6 +331,11 @@ pub(super) struct Completion {
     pub code: Option<i32>,
 }
 
+pub(super) enum ReapEvent {
+    LeaderExited(Completion),
+    Complete(Completion),
+}
+
 pub(super) struct ReapSet {
     registry: Arc<ChannelOpenRegistry>,
     owners: HashMap<u64, Arc<Capsule>>,
@@ -265,6 +366,53 @@ impl ReapSet {
         slot: Option<InstalledSlot>,
         stop_now: bool,
     ) {
+        self.insert_owner(stream, instance, child, slot, stop_now, false);
+    }
+    pub fn start_active(
+        &mut self,
+        stream: u8,
+        instance: u64,
+        child: Box<dyn ChannelWait>,
+        slot: Option<InstalledSlot>,
+    ) {
+        self.insert_owner(stream, instance, child, slot, false, true);
+    }
+    pub fn attach_workers(
+        &self,
+        instance: u64,
+        workers: [crate::session_manager::WorkerReceipt; 2],
+    ) {
+        let owner = self.owners.get(&instance).expect("registered active owner");
+        // Installation is synchronous and has not published/scheduled this
+        // capsule yet. Never hold its mutex across worker/backend callbacks.
+        let mut lease = owner.take_lease().expect("unpublished active custody");
+        let resources = lease.resources.as_mut().expect("exclusive child lease");
+        let child = resources.child.take().expect("owned child");
+        resources.child = Some(Box::new(super::IoOwnedWait {
+            child,
+            reaped: None,
+            workers,
+        }));
+    }
+    pub fn retire(&self, instance: u64) {
+        if let Some(owner) = self.owners.get(&instance) {
+            owner.retire(false);
+        }
+    }
+    pub fn observe_active(&self) {
+        for owner in self.owners.values() {
+            owner.observe_active();
+        }
+    }
+    fn insert_owner(
+        &mut self,
+        stream: u8,
+        instance: u64,
+        child: Box<dyn ChannelWait>,
+        slot: Option<InstalledSlot>,
+        stop_now: bool,
+        active: bool,
+    ) {
         if let Some(slot) = &slot {
             assert!(
                 slot.belongs_to(&self.registry),
@@ -279,13 +427,14 @@ impl ReapSet {
         let owner = Arc::new(Capsule {
             stream,
             instance,
+            uid,
             ready: self.ready.clone(),
             runtime: Handle::current(),
             registry: Arc::downgrade(&self.registry),
             changed: Condvar::new(),
             state: Mutex::new(State {
                 resources: Some(Resources {
-                    child,
+                    child: Some(child),
                     _slot: slot,
                     notifier_installed: false,
                 }),
@@ -296,15 +445,20 @@ impl ReapSet {
                 signal_allowed: true,
                 terminal: None,
                 published: false,
+                retiring: false,
+                registering: false,
+                leader_status: None,
+                leader_published: false,
             }),
         });
         assert!(
             !self.owners.contains_key(&instance),
             "one retirement per exact instance"
         );
-        self.registry.register_reap(owner.clone(), uid);
         self.owners.insert(instance, owner.clone());
-        owner.dispatch();
+        if !active {
+            owner.retire(stop_now);
+        }
     }
     pub fn stop(&self, instance: u64) {
         if let Some(owner) = self.owners.get(&instance) {
@@ -318,17 +472,35 @@ impl ReapSet {
     }
     pub async fn next(&mut self) -> Completion {
         loop {
+            if let ReapEvent::Complete(done) = self.next_event().await {
+                return done;
+            }
+        }
+    }
+    pub async fn next_event(&mut self) -> ReapEvent {
+        loop {
             let ready = self.ready.notified();
+            // Publish independent status without removing the exact owner or
+            // refunding its slot. Full cleanup may still own descendants/I/O.
+            if let Some(status) = self.owners.values().find_map(|owner| {
+                owner.take_leader_status().map(|code| Completion {
+                    stream: owner.stream,
+                    instance: owner.instance,
+                    code,
+                })
+            }) {
+                return ReapEvent::LeaderExited(status);
+            }
             let done = self.owners.iter().find_map(|(&instance, owner)| {
                 owner.terminal().map(|code| (instance, owner.stream, code))
             });
             if let Some((instance, stream, code)) = done {
                 self.owners.remove(&instance);
-                return Completion {
+                return ReapEvent::Complete(Completion {
                     stream,
                     instance,
                     code,
-                };
+                });
             }
             ready.await;
         }
@@ -805,3 +977,7 @@ mod tests {
         assert_eq!(control.drops.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "channel_reap_active_tests.rs"]
+mod active_tests;

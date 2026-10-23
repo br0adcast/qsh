@@ -290,6 +290,51 @@ pub async fn run_serve_loop(
     Ok(())
 }
 
+/// Initialization failure is not a joined manager receipt.
+#[cfg(feature = "system")]
+#[derive(Debug)]
+pub(crate) enum ServeLoopError {
+    Initialize(anyhow::Error),
+    Shutdown(transport::ShutdownError),
+}
+
+/// The system worker's owned manager boundary; cancellation is not completion.
+#[cfg(feature = "system")]
+pub(crate) async fn run_serve_loop_until_shutdown(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    login_ends: LoginEndedReports,
+    shutdown: transport::Shutdown,
+) -> std::result::Result<(), ServeLoopError> {
+    transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
+    socket.set_nonblocking(true).map_err(|error| {
+        ServeLoopError::Initialize(
+            anyhow::Error::new(error)
+                .context("switching the worker UDP socket to non-blocking mode"),
+        )
+    })?;
+    let socket = tokio::net::UdpSocket::from_std(socket).map_err(|error| {
+        ServeLoopError::Initialize(
+            anyhow::Error::new(error).context("adopting the worker UDP socket into tokio"),
+        )
+    })?;
+    // Retained by the caller until this real lifecycle drain returns. An error
+    // is not a producer-fence receipt, even though sibling tasks were joined.
+    SessionManager::serve_until_shutdown(
+        Arc::new(socket),
+        server_priv,
+        auth,
+        BackendFactory(backend),
+        Arc::new(AtomicUsize::new(0)),
+        login_ends,
+        shutdown,
+    )
+    .await
+    .map_err(ServeLoopError::Shutdown)
+}
+
 /// The transport daemon's control server: an `accept()` loop, a separate
 /// task per connection (one request line, one response, close). Shaped
 /// like the qsh path's `control::serve_control`, but with transport verbs
@@ -400,11 +445,13 @@ async fn handle_transport_control_connection(
             write_half.write_all(response.to_line()?.as_bytes()).await?;
         }
         ControlRequest::Stop => {
-            write_half.write_all(b"{\"stopped\":true}\n").await?;
-            // Ignore the send error: the receiver may have already closed
-            // (the daemon is shutting down via another signal) -- that's
-            // not a connection failure.
-            let _ = stop_tx.send(()).await;
+            stop_tx
+                .send(())
+                .await
+                .context("requesting transport shutdown")?;
+            // This acknowledges accepted work. Joined daemon completion is
+            // observed independently; owned cleanup may still be pending.
+            write_half.write_all(b"{\"stopping\":true}\n").await?;
         }
     }
 
@@ -497,16 +544,20 @@ mod tests {
     ) -> std::path::PathBuf {
         let path = dir.join("control.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        // No receiver: a `STOP` is answered, and its send ignored.
-        let (stop_tx, _) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(super::serve_transport_control(
-            listener,
-            Arc::new(Mutex::new(Vec::new())),
-            vec![1],
-            stop_tx,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            gate,
-        ));
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            // This fixture accepts one STOP without ending its control loop.
+            let _receiver = stop_rx;
+            super::serve_transport_control(
+                listener,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![1],
+                stop_tx,
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                gate,
+            )
+            .await;
+        });
         path
     }
 
@@ -550,7 +601,7 @@ mod tests {
         drop(held);
         let reply = ask.await.unwrap();
         assert!(
-            matches!(reply, crate::control::ControlReply::Answered(ref line) if line.contains("stopped")),
+            matches!(reply, crate::control::ControlReply::Answered(ref line) if line.contains("stopping")),
             "{reply:?}"
         );
     }

@@ -119,9 +119,14 @@ pub(super) enum PendingWhat {
         /// to anything else while the entry is on file, and is closed
         /// exactly when the entry leaves the table.
         report: OwnedFd,
-        /// The child the loop is waiting on -- what a timeout kills and
-        /// what either failure hands to `LoopState::orphans` to be reaped.
+        /// Diagnostic child identity; Linux process authority belongs only to
+        /// `custody`, retained through native completion and actual final wait.
         child: Pid,
+        /// Answer publication never releases native cleanup/admission custody.
+        answered: bool,
+        /// Missing custody is retained Unknown, never a numeric-PID fallback.
+        #[cfg(target_os = "linux")]
+        custody: Option<Box<super::verification::VerificationChild>>,
         /// The number the answer must carry back on the AUTHENTICATION
         /// seam. Every answer there is matched to its question by this
         /// number (see `protocol::AuthRequest`), so a verdict that lost it
@@ -189,7 +194,45 @@ impl PendingTable {
     /// point rather than a shortcut. A channel start contributes none: what
     /// the loop polls for it is its login's monitor seam, which the loop
     /// holds itself.
+    #[cfg(target_os = "linux")]
     pub(super) fn poll_fds(&self) -> Vec<RawFd> {
+        self.entries
+            .iter()
+            .filter_map(|(key, pending)| match (key, &pending.what) {
+                (
+                    PendingKey::Report(fd),
+                    PendingWhat::Verify {
+                        custody: Some(custody),
+                        ..
+                    },
+                ) if custody.readable() => Some(*fd),
+                (
+                    PendingKey::Report(fd),
+                    PendingWhat::Verify {
+                        custody: None,
+                        answered: false,
+                        ..
+                    },
+                ) => Some(*fd),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn poll_fds(&self) -> Vec<RawFd> {
+        self.entries
+            .keys()
+            .filter_map(|key| match key {
+                PendingKey::Report(fd) => Some(*fd),
+                PendingKey::Channel(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every retained verification, including answered/Unknown owners.
+    #[cfg(target_os = "linux")]
+    pub(super) fn verification_fds(&self) -> Vec<RawFd> {
         self.entries
             .keys()
             .filter_map(|key| match key {
@@ -222,7 +265,10 @@ impl PendingTable {
         let expired: Vec<PendingKey> = self
             .entries
             .iter()
-            .filter(|(_, pending)| pending.deadline <= now)
+            .filter(|(_, pending)| {
+                !matches!(pending.what, PendingWhat::Verify { answered: true, .. })
+                    && pending.deadline <= now
+            })
             .map(|(key, _)| *key)
             .collect();
         expired
@@ -321,8 +367,8 @@ impl PendingTable {
         cancelled_now
     }
 
-    /// How many proofs are being checked right now -- what
-    /// `server::MAX_VERIFYING` bounds.
+    /// All retained verification obligations, including answered and Unknown
+    /// cleanup. Every one remains charged against `server::MAX_VERIFYING`.
     ///
     /// Counted on demand rather than kept in a counter beside the table: a
     /// second piece of state would have to be held in step with every
@@ -336,11 +382,11 @@ impl PendingTable {
             .count()
     }
 
-    /// Whether the helper is waiting on anything at all -- what a test
-    /// that settles "everything pending" asks, now that a channel start
-    /// contributes no descriptor to [`PendingTable::poll_fds`] and an empty
-    /// poll set no longer means an empty table.
-    #[cfg(test)]
+    /// Whether any response obligation remains. The final physical report
+    /// preserves this independently of verification native custody: a channel
+    /// start contributes no descriptor to [`PendingTable::poll_fds`], so an
+    /// empty poll set does not mean an empty table.
+    #[cfg(any(test, target_os = "linux"))]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -352,6 +398,7 @@ impl PendingTable {
     pub(super) fn nearest_deadline(&self, now: Instant) -> Option<Duration> {
         self.entries
             .values()
+            .filter(|pending| !matches!(pending.what, PendingWhat::Verify { answered: true, .. }))
             .map(|pending| pending.deadline.saturating_duration_since(now))
             .min()
     }
@@ -447,6 +494,9 @@ mod tests {
             what: PendingWhat::Verify {
                 report,
                 child: Pid::from_raw(999_999),
+                answered: false,
+                #[cfg(target_os = "linux")]
+                custody: None,
                 id: 1,
                 login: "alice".to_string(),
                 login_id: login,

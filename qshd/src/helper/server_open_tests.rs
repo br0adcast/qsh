@@ -25,6 +25,41 @@ mod open24_receipts {
         sock.set_nonblocking(false).unwrap();
     }
 
+    // Socket-only model: no PAM transaction or OS child was created. The
+    // completed wait fact is modeled independently from the required receipt.
+    fn completed_monitor_model(state: &mut LoopState, owner: MonitorOwner) -> UnixStream {
+        let (seam, peer) = channel::pair().unwrap();
+        state.monitors.insert(
+            owner,
+            Monitor {
+                process: MonitorProcess::Controlled(seam),
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
+                pid: Pid::this(),
+                reaped: true,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
+            },
+        );
+        peer
+    }
+
+    fn never_opened_receipt(peer: &UnixStream) {
+        channel::send(
+            peer,
+            &encode(&MonitorEvent::SessionClosed {
+                result: PamCompletion::NotOpened,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn open24_receipt_retires_startup_before_a_late_started_event() {
         let login = [92; 16];
@@ -58,6 +93,7 @@ mod open24_receipts {
         let old = owner_for(&state, login);
         state.next_incarnation = old.incarnation + 1;
         pending_channel(&mut state, old, 101);
+        let monitor = completed_monitor_model(&mut state, old);
         let seam = DirectSeam::new();
         forget_login(&seam.helper, &mut state, login);
         // Existing outcome order is separate from receipt proof.
@@ -87,6 +123,9 @@ mod open24_receipts {
                 kind: CleanupKind::NoChild
             }
         );
+        assert!(state.retired.contains(&old), "shell proof is not PAM proof");
+        never_opened_receipt(&monitor);
+        serve_ready_monitors(seam.seams(), &mut state, &[old]);
         assert!(!state.retired.contains(&old));
         assert!(state.live.contains_key(&102));
         seam.serve(
@@ -101,6 +140,38 @@ mod open24_receipts {
         ));
         assert_quiet(&seam.worker); // refusing reuse cannot produce another proof
         assert!(!state.live.contains_key(&101));
+    }
+
+    #[test]
+    fn open24_shell_receipt_cannot_refund_a_missing_monitor_owner() {
+        let login = [100; 16];
+        let mut state = state_with_login(&my_account(), login);
+        let owner = owner_for(&state, login);
+        pending_channel(&mut state, owner, 101);
+        let seam = DirectSeam::new();
+        forget_login(&seam.helper, &mut state, login);
+        assert!(matches!(
+            next_response(&seam.worker).0,
+            Response::LoginEnded { .. }
+        ));
+        assert!(matches!(
+            next_response(&seam.worker).0,
+            Response::Failed { id: 101, .. }
+        ));
+        complete_cleanup(&seam.helper, &mut state, owner, 101, CleanupKind::NoChild);
+        assert!(matches!(
+            next_response(&seam.worker).0,
+            Response::CleanupComplete {
+                id: 101,
+                kind: CleanupKind::NoChild
+            }
+        ));
+        assert!(!state.live.contains_key(&101));
+        assert!(
+            state.retired.contains(&owner),
+            "missing owner cannot be retrospectively declared NotOpened"
+        );
+        assert!(!state.monitors.contains_key(&owner));
     }
 
     #[test]
@@ -152,12 +223,19 @@ mod open24_receipts {
         let account = my_account();
         let mut state = empty_state();
         let (helper, worker) = quiet_seam();
+        let (auth, _auth_peer) = channel::pair().unwrap();
+        let mut completed_owner = None;
         // Drain notices synchronously; the fixed socket buffer is not the bound.
         worker.set_read_timeout(Some(TEST_RECV_TIMEOUT)).unwrap();
         for n in 0..MAX_LOGINS {
             let login = login_token(n);
             ensure_login(&mut state, login, &account, String::new()).unwrap();
             let owner = owner_for(&state, login);
+            // Only this owner is intended to refund. All other synthetic
+            // obligations deliberately stay unproved and charged.
+            if n == 0 {
+                completed_owner = Some((owner, completed_monitor_model(&mut state, owner)));
+            }
             for slot in 0..MAX_CHANNELS_PER_LOGIN {
                 let id = (n * MAX_CHANNELS_PER_LOGIN + slot + 1) as u64;
                 state.live.insert(id, ChannelSlot::Cleaning(owner));
@@ -173,6 +251,8 @@ mod open24_receipts {
         assert_eq!(state.live.len(), 4096);
         assert!(ensure_login(&mut state, [255; 16], &account, String::new()).is_err());
         let owner = state.live[&1].owner();
+        let (completed, monitor) = completed_owner.unwrap();
+        assert_eq!(owner, completed);
         for id in 1..=16 {
             complete_cleanup(&helper, &mut state, owner, id, CleanupKind::Reaped);
             assert!(matches!(
@@ -180,6 +260,21 @@ mod open24_receipts {
                 Response::CleanupComplete { .. }
             ));
         }
+        assert_eq!(
+            state.retired.len(),
+            256,
+            "shell cleanup alone cannot refund PAM debt"
+        );
+        assert!(ensure_login(&mut state, [255; 16], &account, String::new()).is_err());
+        never_opened_receipt(&monitor);
+        serve_ready_monitors(
+            Seams {
+                channels: &helper,
+                auth: &auth,
+            },
+            &mut state,
+            &[owner],
+        );
         assert_eq!(state.retired.len(), 255);
         ensure_login(&mut state, [255; 16], &account, String::new()).unwrap();
         assert_eq!(state.logins.len() + state.retired.len(), 256);
@@ -221,9 +316,17 @@ mod open24_receipts {
         state.monitors.insert(
             owner,
             Monitor {
-                seam: parent,
+                process: MonitorProcess::Controlled(parent),
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
                 pid,
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [
@@ -232,24 +335,21 @@ mod open24_receipts {
                 id: 101,
                 kind: CleanupKind::Reaped,
             },
+            // /bin/true never acquired a PAM transaction.
+            MonitorEvent::SessionClosed {
+                result: PamCompletion::NotOpened,
+            },
         ] {
             channel::send(&monitor, &encode(&event).unwrap(), None).unwrap();
         }
         drop(monitor);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !state
-            .monitors
-            .get(&owner)
-            .is_some_and(|monitor| monitor.reaped)
-        {
-            reap(&seam.helper, &mut state);
-            assert!(Instant::now() < deadline, "owned monitor did not exit");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(child.wait().unwrap().success());
+        state.monitors.get_mut(&owner).unwrap().reaped = true;
+        reap(&seam.helper, &mut state);
         assert_eq!(
-            child.wait().unwrap_err().raw_os_error(),
-            Some(nix::libc::ECHILD),
-            "the helper already reaped the exact monitor"
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::Error::ECHILD),
+            "the fixture actually reaped its stand-in before marking the controlled wait"
         );
         assert!(matches!(
             next_response(&seam.worker).0,
@@ -270,7 +370,13 @@ mod open24_receipts {
                 kind: CleanupKind::Reaped
             }
         );
-        assert!(state.live.is_empty() && state.retired.is_empty());
+        assert!(state.live.is_empty());
+        assert!(
+            state.retired.contains(&owner),
+            "the final PAM receipt is still queued"
+        );
+        serve_ready_monitors(seam.seams(), &mut state, &[owner]);
+        assert!(state.retired.is_empty());
         assert!(state.monitors.is_empty());
     }
 
@@ -328,9 +434,17 @@ mod open24_receipts {
         state.monitors.insert(
             stale,
             Monitor {
-                seam: parent,
+                process: MonitorProcess::Controlled(parent),
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
                 pid: Pid::from_raw(1),
                 reaped: true,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [
@@ -362,9 +476,17 @@ mod open24_receipts {
         state.monitors.insert(
             owner,
             Monitor {
-                seam: parent,
+                process: MonitorProcess::Controlled(parent),
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
                 pid,
                 reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
             },
         );
         for event in [
@@ -376,6 +498,10 @@ mod open24_receipts {
                 id: 101,
                 kind: CleanupKind::NoChild,
             },
+            // /bin/true never acquired a PAM transaction.
+            MonitorEvent::SessionClosed {
+                result: PamCompletion::NotOpened,
+            },
         ] {
             channel::send(&monitor, &encode(&event).unwrap(), None).unwrap();
         }
@@ -385,24 +511,17 @@ mod open24_receipts {
             next_response(&seam.worker).0,
             Response::Failed { id: 101, .. }
         ));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !state
-            .monitors
-            .get(&owner)
-            .is_some_and(|monitor| monitor.reaped)
-        {
-            reap(&seam.helper, &mut state);
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(child.wait().unwrap().success());
+        state.monitors.get_mut(&owner).unwrap().reaped = true;
+        reap(&seam.helper, &mut state);
         assert!(matches!(
             next_response(&seam.worker).0,
             Response::LoginEnded { .. }
         ));
         assert_eq!(
-            child.wait().unwrap_err().raw_os_error(),
-            Some(nix::libc::ECHILD),
-            "the helper already reaped the exact monitor"
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::Error::ECHILD),
+            "the fixture actually reaped its stand-in before marking the controlled wait"
         );
         assert!(matches!(
             state.live.get(&101),
@@ -416,6 +535,12 @@ mod open24_receipts {
                 kind: CleanupKind::NoChild
             }
         );
-        assert!(state.live.is_empty() && state.retired.is_empty() && state.monitors.is_empty());
+        assert!(state.live.is_empty());
+        assert!(
+            state.retired.contains(&owner),
+            "the final PAM receipt is still queued"
+        );
+        serve_ready_monitors(seam.seams(), &mut state, &[owner]);
+        assert!(state.retired.is_empty() && state.monitors.is_empty());
     }
 }

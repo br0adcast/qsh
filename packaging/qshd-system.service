@@ -13,6 +13,9 @@ After=network.target
 ExecStart=/usr/bin/qshd serve --system --port 60022
 Restart=on-failure
 RestartSec=2
+# Deliver the initial stop to the privileged helper; it retains child custody
+# through worker, shell and PAM cleanup. The manager retains final cgroup KILL.
+KillMode=mixed
 
 # Do NOT switch the following on, however much they look like free hardening.
 # This daemon starts login shells for other people, so whatever sandbox it
@@ -26,12 +29,9 @@ RestartSec=2
 #                             su, passwd and mount inside a session would be
 #                             left without their privileges
 #
-# The fifth trap is in the restart policy above, and it is not a negation:
-# Restart=on-failure does NOT restart the service after the process dies of
-# SIGTERM, SIGINT, SIGHUP or SIGPIPE, because systemd counts those as a clean
-# exit. The policy is deliberate -- sessions do not survive a restart anyway --
-# but an administrator who sees "the service did not come back after kill"
-# should find the reason written here rather than have to derive it.
+# TERM/INT request owned cooperative shutdown on Linux. Exit zero requires the
+# actual successful worker/PAM/child receipts and waits. Failed cleanup remains
+# a failure for Restart=on-failure; systemctl stop itself suppresses restart.
 
 [Install]
 WantedBy=multi-user.target

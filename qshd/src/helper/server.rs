@@ -92,6 +92,7 @@ use super::config::HelperConfig;
 #[cfg(test)]
 use super::config::PAM_SERVICE;
 use super::monitor::{self, run_monitor, MonitorPlan};
+use super::pam_completion::PamCompletion;
 use super::pending::{Pending, PendingTable, PendingWhat};
 use super::protocol::{
     decode, encode, AuthRequest, AuthResponse, ChannelId, MonitorEvent, MonitorRequest, Nonce,
@@ -348,14 +349,12 @@ const REFUSED_REASON: &str = "authentication failed";
 /// long means that reader is stuck, and waiting on it longer would only
 /// stop the helper for longer.
 ///
-/// A dropped answer is never mistaken for another -- the worker matches
-/// answers to questions by number on the authentication seam and by channel
-/// id on the other. Its cost falls on its own call: a channel whose `Opened`
-/// could not be handed over is closed by the worker's own
-/// `OPEN_REPLY_TIMEOUT` path a few seconds later, and a verdict that could
-/// not be handed over leaves its call to run out its time and refuse, while
-/// the login entry an admission opened here can stay for up to
-/// `LOGIN_GRACE`.
+/// Answers are matched by authentication request number or channel id.
+/// Optional nonce and verification answers retain their request-level timeout
+/// and refusal behavior; an admitted login can remain until LOGIN_GRACE.
+/// Required lifecycle publications (including Opened and cleanup) instead
+/// retain a sticky failure and start owned shutdown. Their send failure never
+/// substitutes for actual process or PAM cleanup.
 const SEAM_SEND_TIMEOUT: Duration = super::spawner::HELPER_ANSWER_TIMEOUT;
 
 /// The loop, as the daemon runs it. The worker closing either of its two
@@ -384,6 +383,74 @@ pub(crate) fn run_with_diagnostics(
     );
     crate::log::error("helper", "the worker is gone, stopping");
     std::process::exit(1);
+}
+
+/// Owned Linux worker and live helper pump. Private completion, exact native
+/// wait and PAM monitor receipts remain separate; this is not service-signal or
+/// monitor-descendant qualification.
+#[cfg(target_os = "linux")]
+pub(super) fn run_with_owned_worker(
+    channels: UnixStream,
+    auth: UnixStream,
+    config: HelperConfig,
+    diagnostics: crate::log::relay::Receiver,
+    worker: super::worker_owner::WorkerOwner,
+    adoption: AdoptionRuntime,
+    stop: super::stop_signal::StopOwner,
+) -> ! {
+    let outcome = match serve_inner(
+        channels,
+        auth,
+        config,
+        HashMap::new(),
+        AccountSwitches::REAL,
+        Some(diagnostics),
+        Some(OwnedParent {
+            worker,
+            adoption: Some(adoption),
+            stop: Some(stop),
+        }),
+    ) {
+        HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
+        _ => unreachable!("qualified helper cannot take an unqualified tail"),
+    };
+    crate::log::error(
+        "helper",
+        &format!(
+            "owned helper physically settled; logical_failed={}; outcome={outcome:?}",
+            outcome.failed()
+        ),
+    );
+    std::process::exit(outcome.service_exit_code());
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn serve_owned(
+    channels: UnixStream,
+    auth: UnixStream,
+    config: HelperConfig,
+    admitted: HashMap<LoginId, Account>,
+    switches: AccountSwitches,
+    diagnostics: Option<crate::log::relay::Receiver>,
+    worker: super::worker_owner::WorkerOwner,
+) -> WorkerPhysicalOutcome {
+    match serve_inner(
+        channels,
+        auth,
+        config,
+        admitted,
+        switches,
+        diagnostics,
+        Some(OwnedParent {
+            worker,
+            // Component-only worker proof, not qualified helper completion.
+            adoption: None,
+            stop: None,
+        }),
+    ) {
+        HelperLoopExit::WorkerPhysicallyExited(outcome) => outcome,
+        _ => unreachable!("component worker pump cannot take a different tail"),
+    }
 }
 
 /// The loop, as the tests drive it: returns when the peer closes either end
@@ -473,6 +540,25 @@ const USER_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 /// `sbin` directories, where the administration tools live.
 const ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[derive(Clone, Copy, Debug)]
+enum RequiredPublication {
+    Exited,
+    Cleanup,
+    Opened,
+    Refused,
+    LoginEnded,
+}
+#[derive(Clone, Copy, Debug)]
+enum PublicationError {
+    Encode,
+    Send(i32),
+}
+#[derive(Clone, Copy, Debug)]
+struct RequiredPublicationFailure {
+    kind: RequiredPublication,
+    error: PublicationError,
+}
+
 /// Everything the loop keeps between messages: one of each, shared by both
 /// seams. The sharing is the point -- the nonce a `Request::Nonce` issues on
 /// the authentication seam is the one a `Request::Verify` spends there, and
@@ -482,6 +568,8 @@ const ROOT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 /// [`serve_auth_seam`]): a request honoured on the wrong seam would reach
 /// this state by a door that seam's own rules were never written for.
 struct LoopState {
+    #[cfg(target_os = "linux")]
+    child_mask: Option<super::stop_signal::ChildMask>,
     /// Every channel id that is TAKEN, by id -- one whose process is still
     /// starting as much as one already running; see [`ChannelSlot`] for why
     /// those are one table and not two.
@@ -491,10 +579,8 @@ struct LoopState {
     /// seams in the loop's one `poll`, which is what keeps a slow channel
     /// from stopping every other session on the machine.
     pending: PendingTable,
-    /// Pids the helper has already given up on -- a verifying child whose
-    /// verdict it will not use, and every monitor it has stopped talking to
-    /// -- see `reap`'s docs for why they still need a place to be reaped
-    /// from.
+    /// Legacy unsupported-platform child retirement. Qualified Linux
+    /// verification never moves exact custody out of the bounded pending table.
     orphans: Vec<Pid>,
     /// Channels `Request::Close` has been forwarded to a monitor for, keyed
     /// to the deadline by which that monitor must have reported the exit --
@@ -578,18 +664,72 @@ struct LoopState {
     /// "no incarnation" everywhere it travels (`transport::Principal`'s own
     /// field, for a verifier that keeps nothing per login).
     next_incarnation: u64,
+    /// Fixed aggregate survives retirement of physically joined monitors.
+    pam_cleanup: PamCompletion,
+    required_publication: Option<RequiredPublicationFailure>,
+    /// Sticky cooperative teardown policy; never renewed admission.
+    stopping: bool,
 }
 
 /// One login's monitor, as the helper holds it.
+enum MonitorProcess {
+    #[cfg(target_os = "linux")]
+    Native(super::monitor_owner::NativeMonitor),
+    #[cfg(not(target_os = "linux"))]
+    Legacy(UnixStream),
+    /// Socket-state models carry no operating-system process authority.
+    #[cfg(test)]
+    Controlled(UnixStream),
+}
 struct Monitor {
-    /// The helper's end of the seam to it. Dropping this is what tells a
-    /// monitor its login is over: its own end then reaches end-of-file, it
-    /// takes its shells down and exits.
-    seam: UnixStream,
-    /// The monitor's process, so the helper can reap it -- and, past
-    /// [`MONITOR_GRACE_PERIOD`], kill it.
+    process: MonitorProcess,
+    /// Diagnostic identity; Linux wait/signalling authority lives only in
+    /// NativeMonitor. Legacy platforms retain their original direct-child path.
     pid: Pid,
     reaped: bool,
+    /// End requested; the read half and admission remain owned through PAM completion.
+    write_closed: bool,
+    stop_attempted: bool,
+    completion: Option<PamCompletion>,
+    seam_closed: bool,
+    wait_lost: bool,
+    failure: Option<MonitorFailure>,
+    #[cfg(target_os = "linux")]
+    signal_failure: Option<(i32, i32)>,
+}
+impl Monitor {
+    fn seam(&self) -> &UnixStream {
+        match &self.process {
+            #[cfg(target_os = "linux")]
+            MonitorProcess::Native(native) => native.seam(),
+            #[cfg(not(target_os = "linux"))]
+            MonitorProcess::Legacy(seam) => seam,
+            #[cfg(test)]
+            MonitorProcess::Controlled(seam) => seam,
+        }
+    }
+    fn leader_exited(&self) -> bool {
+        match &self.process {
+            #[cfg(target_os = "linux")]
+            MonitorProcess::Native(native) => native.leader_exited(),
+            #[cfg(not(target_os = "linux"))]
+            MonitorProcess::Legacy(_) => self.reaped,
+            #[cfg(test)]
+            MonitorProcess::Controlled(_) => self.reaped,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorFailure {
+    Shutdown(i32),
+    Send(i32),
+    Stream,
+    #[cfg(any(test, not(target_os = "linux")))]
+    Wait(i32),
+    #[cfg(target_os = "linux")]
+    Native(super::monitor_owner::Failure),
+    DuplicateCompletion,
 }
 
 /// One login's own bookkeeping: which account it belongs to (fixed for the
@@ -837,14 +977,17 @@ enum WhyFinished {
     /// The entry's own deadline passed with nothing said. Nothing is read:
     /// the child is killed and whoever is waiting for it is refused.
     Expired,
+    #[cfg(target_os = "linux")]
+    Progress,
 }
 
 /// What a seam's handler tells the loop to do next.
 enum Next {
     Continue,
-    /// The worker is gone, or sent something that says it is not the
-    /// process this helper thinks it is: end the loop.
-    Stop,
+    /// Clean producer EOF; only an explicit requested stop expects this.
+    Eof,
+    /// Receive or protocol failure, including while stopping.
+    Failed,
 }
 
 /// Why an `Open` for an account nobody verified is refused. Shown to the
@@ -882,14 +1025,66 @@ fn serve(
     config: HelperConfig,
     admitted: HashMap<LoginId, Account>,
     switches: AccountSwitches,
-    mut diagnostics: Option<crate::log::relay::Receiver>,
+    diagnostics: Option<crate::log::relay::Receiver>,
 ) {
+    serve_inner(
+        channels,
+        auth,
+        config,
+        admitted,
+        switches,
+        diagnostics,
+        #[cfg(target_os = "linux")]
+        None,
+    );
+}
+
+enum HelperLoopExit {
+    Legacy,
+    #[cfg(all(test, target_os = "linux"))]
+    WorkerPhysicallyExited(WorkerPhysicalOutcome),
+    #[cfg(target_os = "linux")]
+    HelperPhysicallyExited(HelperPhysicalOutcome),
+}
+
+#[cfg(target_os = "linux")]
+struct OwnedParent {
+    worker: super::worker_owner::WorkerOwner,
+    adoption: Option<AdoptionRuntime>,
+    stop: Option<super::stop_signal::StopOwner>,
+}
+
+fn serve_inner(
+    channels: UnixStream,
+    auth: UnixStream,
+    config: HelperConfig,
+    admitted: HashMap<LoginId, Account>,
+    switches: AccountSwitches,
+    mut diagnostics: Option<crate::log::relay::Receiver>,
+    #[cfg(target_os = "linux")] owned: Option<OwnedParent>,
+) -> HelperLoopExit {
+    #[cfg(target_os = "linux")]
+    let (mut worker, adoption, stop) = match owned {
+        Some(owned) => (
+            Some(WorkerDomain::new(owned.worker)),
+            owned.adoption,
+            owned.stop,
+        ),
+        None => (None, None, None),
+    };
     // Neither seam may be able to park this loop for good -- see
-    // `SEAM_SEND_TIMEOUT`. Reported rather than fatal: a helper that could
-    // not set the option is still a working helper, and saying so beats
-    // refusing to serve anyone.
+    // `SEAM_SEND_TIMEOUT`. Owned setup failure enters retained cooperative
+    // stopping before serving any request. Legacy fixture behavior stays separate.
     for (seam, which) in [(&channels, "channel"), (&auth, "authentication")] {
         if let Err(e) = seam.set_write_timeout(Some(SEAM_SEND_TIMEOUT)) {
+            #[cfg(target_os = "linux")]
+            if let Some(worker) = worker.as_mut() {
+                worker.setup_failed = true;
+                worker.record(ParentFailure::Setup(
+                    e.raw_os_error().unwrap_or(nix::libc::EIO),
+                ));
+                worker.request_stop(super::worker_protocol::StopReason::Protocol);
+            }
             crate::log::warn(
                 "helper",
                 &format!(
@@ -903,7 +1098,9 @@ fn serve(
     // Read before `admitted` is consumed below, so the counter can start
     // past every login seeded out of it.
     let seeded = admitted.len();
-    let mut state = LoopState {
+    let mut shutdown = HelperShutdown::new(LoopState {
+        #[cfg(target_os = "linux")]
+        child_mask: stop.as_ref().map(super::stop_signal::StopOwner::child_mask),
         live: HashMap::new(),
         pending: PendingTable::default(),
         orphans: Vec::new(),
@@ -936,7 +1133,22 @@ fn serve(
         retired: HashSet::new(),
         highest_channel_id: 0,
         next_incarnation: 1 + seeded as u64,
-    };
+        pam_cleanup: PamCompletion::NotOpened,
+        required_publication: None,
+        stopping: false,
+    });
+    #[cfg(target_os = "linux")]
+    {
+        if worker.as_ref().is_some_and(|worker| worker.setup_failed) {
+            // Setup is before the first request/admission. Preserve child/control
+            // custody but never enter a seam path whose writes lack their bound.
+            shutdown.channels_open = false;
+            shutdown.auth_open = false;
+        }
+        shutdown.worker = worker;
+        shutdown.adoption = adoption;
+        shutdown.stop = stop;
+    }
     // Borrowed once, for the whole loop: both are owned locals that outlive
     // it, and everything below takes them immutably.
     let seams = Seams {
@@ -944,6 +1156,23 @@ fn serve(
         auth: &auth,
     };
     loop {
+        let state = &mut shutdown.state;
+        let channels_open = &mut shutdown.channels_open;
+        let auth_open = &mut shutdown.auth_open;
+        #[cfg(target_os = "linux")]
+        let worker = &mut shutdown.worker;
+        #[cfg(target_os = "linux")]
+        if let Some(worker) = worker.as_mut() {
+            worker.observe_required_publication(state);
+            if worker.stopping {
+                begin_owned_stop(
+                    &channels,
+                    state,
+                    worker,
+                    super::worker_protocol::StopReason::Protocol,
+                );
+            }
+        }
         // Everything the helper is waiting on goes into ONE `poll`: both
         // seams, and the report pipe of every child a request is still
         // pending on. The numbers come out of the table first and the array
@@ -957,10 +1186,28 @@ fn serve(
         // against it -- the same shape the report pipes use, and for the
         // same reason (the array must not borrow the table it was built
         // from).
-        let monitor_logins: Vec<MonitorOwner> = state.monitors.keys().copied().collect();
+        let monitor_logins: Vec<MonitorOwner> = state
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| !monitor.seam_closed)
+            .map(|(owner, _)| *owner)
+            .collect();
         let mut fds: Vec<PollFd> = Vec::with_capacity(2 + report_fds.len() + monitor_logins.len());
-        fds.push(PollFd::new(channels.as_fd(), PollFlags::POLLIN));
-        fds.push(PollFd::new(auth.as_fd(), PollFlags::POLLIN));
+        let channel_index = if *channels_open {
+            let i = fds.len();
+            fds.push(PollFd::new(channels.as_fd(), PollFlags::POLLIN));
+            Some(i)
+        } else {
+            None
+        };
+        let auth_index = if *auth_open {
+            let i = fds.len();
+            fds.push(PollFd::new(auth.as_fd(), PollFlags::POLLIN));
+            Some(i)
+        } else {
+            None
+        };
+        let reports_start = fds.len();
         for fd in &report_fds {
             // SAFETY: every number here came out of `poll_fds` a line ago,
             // and the pending table owns each of those descriptors
@@ -972,6 +1219,7 @@ fn serve(
                 PollFlags::POLLIN,
             ));
         }
+        let monitors_start = fds.len();
         for login in &monitor_logins {
             // SAFETY: every login here came out of `state.monitors` a line
             // ago, and the `Monitor` it names owns its seam socket
@@ -979,7 +1227,7 @@ fn serve(
             // table -- which nothing between there and the `poll` below
             // does. The borrow is used for this one call and never outlives
             // the pass.
-            let raw = state.monitors[login].seam.as_raw_fd();
+            let raw = state.monitors[login].seam().as_raw_fd();
             fds.push(PollFd::new(
                 unsafe { BorrowedFd::borrow_raw(raw) },
                 PollFlags::POLLIN,
@@ -989,44 +1237,115 @@ fn serve(
         if let Some(receiver) = diagnostics.as_ref() {
             fds.push(PollFd::new(receiver.as_fd(), PollFlags::POLLIN));
         }
+        #[cfg(target_os = "linux")]
+        if let Some(worker) = worker
+            .as_ref()
+            .filter(|worker| !worker.owner.control_closed() && !worker.native_complete)
+        {
+            let mut flags = PollFlags::POLLIN;
+            if worker.pending.is_some() {
+                flags |= PollFlags::POLLOUT;
+            }
+            let raw = worker.owner.control_fd().as_raw_fd();
+            // SAFETY: single live owner remains retained through this poll pass.
+            fds.push(PollFd::new(unsafe { BorrowedFd::borrow_raw(raw) }, flags));
+        }
+        #[cfg(target_os = "linux")]
+        let stop_index = shutdown.stop.as_ref().map(|stop| {
+            let index = fds.len();
+            fds.push(PollFd::new(stop.fd(), PollFlags::POLLIN));
+            index
+        });
         // Never longer than REAP_INTERVAL, so a child that exits while the
         // worker is silent is still noticed -- and never past the nearest
         // startup deadline either, so a child that says nothing at all is
         // given up on when its own budget runs out rather than up to a reap
         // pass later.
+        let mut poll_ok = true;
         match poll(&mut fds, poll_timeout(&state.pending, Instant::now())) {
             // `Ok(0)` -- nothing spoke -- needs no arm of its own: every
             // `revents` is then empty, nothing below is served, and the
             // pass falls straight through to the deadline and reap sweeps,
             // which is the whole point of the timeout.
             Ok(_) => {}
-            Err(nix::Error::EINTR) => continue,
+            Err(nix::Error::EINTR) => {
+                poll_ok = false;
+            }
             Err(e) => {
-                crate::log::error("helper", &format!("poll failed: {e}"));
-                break;
+                #[cfg(target_os = "linux")]
+                if let Some(worker) = worker.as_mut() {
+                    poll_ok = false;
+                    worker.record(ParentFailure::Poll(e as i32));
+                    begin_owned_stop(
+                        &channels,
+                        state,
+                        worker,
+                        super::worker_protocol::StopReason::Protocol,
+                    );
+                    std::thread::sleep(REAP_INTERVAL);
+                } else {
+                    crate::log::error("helper", &format!("poll failed: {e}"));
+                    break;
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    crate::log::error("helper", &format!("poll failed: {e}"));
+                    break;
+                }
             }
         }
         // Anything at all in `revents` -- data, a hang-up, an error -- is
         // for `recv` (or the report read) to interpret, which is why this
         // does not look at WHICH flags came back; flags `nix` does not know
         // count as ready for the same reason.
-        let channel_ready = fds[0].any().unwrap_or(true);
-        let auth_ready = fds[1].any().unwrap_or(true);
+        let channel_ready = poll_ok && channel_index.is_some_and(|i| fds[i].any().unwrap_or(true));
+        let auth_ready = poll_ok && auth_index.is_some_and(|i| fds[i].any().unwrap_or(true));
         let ready_reports: Vec<RawFd> = report_fds
             .iter()
-            .zip(&fds[2..])
-            .filter(|(_, polled)| polled.any().unwrap_or(true))
+            .zip(&fds[reports_start..])
+            .filter(|(_, polled)| poll_ok && polled.any().unwrap_or(true))
             .map(|(fd, _)| *fd)
             .collect();
         let ready_monitors: Vec<MonitorOwner> = monitor_logins
             .iter()
-            .zip(&fds[2 + report_fds.len()..])
-            .filter(|(_, polled)| polled.any().unwrap_or(true))
+            .zip(&fds[monitors_start..])
+            .filter(|(_, polled)| poll_ok && polled.any().unwrap_or(true))
             .map(|(login, _)| *login)
             .collect();
 
-        let diagnostic_ready = diagnostics.is_some() && fds[diagnostic_index].any().unwrap_or(true);
+        let diagnostic_ready =
+            poll_ok && diagnostics.is_some() && fds[diagnostic_index].any().unwrap_or(true);
+        #[cfg(target_os = "linux")]
+        let stop_ready = poll_ok && stop_index.is_some_and(|i| fds[i].any().unwrap_or(true));
         drop(fds);
+        #[cfg(target_os = "linux")]
+        if stop_ready {
+            if let (Some(stop), Some(worker)) = (shutdown.stop.as_ref(), worker.as_mut()) {
+                match stop.receive_requested() {
+                    Ok(true) => begin_owned_stop(
+                        &channels,
+                        state,
+                        worker,
+                        super::worker_protocol::StopReason::Requested,
+                    ),
+                    Ok(false) => {}
+                    Err(error) => {
+                        worker.record(ParentFailure::StopSignal(
+                            error.raw_os_error().unwrap_or(nix::libc::EIO),
+                        ));
+                        begin_owned_stop(
+                            &channels,
+                            state,
+                            worker,
+                            super::worker_protocol::StopReason::Protocol,
+                        );
+                    }
+                }
+            }
+        }
+        // Stop retirement may cancel a pending entry, but does not fork or open
+        // descriptors. The ready-report lookup below skips canceled entries; no
+        // new admission can reuse a canceled report number before that lookup.
         if diagnostic_ready {
             if let Some(receiver) = diagnostics.as_ref() {
                 if !receiver.drain(crate::log::record_worker) {
@@ -1043,102 +1362,266 @@ fn serve(
         // seams leaves the suite green, and a descriptor-number race is not
         // reachable on demand -- so this is reasoning, not coverage: treat
         // it as load-bearing when you edit it.
-        settle_ready_pending(seams, &mut state, &config, &ready_reports);
+        settle_ready_pending(seams, state, &config, &ready_reports);
         // And the monitors, before the seams too, for the same reason: a
         // channel whose start this pass finishes frees its id, and an
         // `Open` served first could otherwise be refused for an id that is
         // about to be free.
-        serve_ready_monitors(seams, &mut state, &ready_monitors);
+        serve_ready_monitors(seams, state, &ready_monitors);
         if channel_ready {
-            if let Next::Stop = serve_channel_seam(&channels, &mut state, &config, switches) {
+            let next = serve_channel_seam(&channels, state, &config, switches);
+            if !matches!(next, Next::Continue) {
+                #[cfg(target_os = "linux")]
+                if let Some(worker) = worker.as_mut() {
+                    *channels_open = false;
+                    worker.record_seam_end(next, ParentFailure::Channel);
+                    begin_owned_stop(
+                        &channels,
+                        state,
+                        worker,
+                        super::worker_protocol::StopReason::ChannelLost,
+                    );
+                } else {
+                    break;
+                }
+                #[cfg(not(target_os = "linux"))]
                 break;
             }
         }
         if auth_ready {
-            if let Next::Stop = serve_auth_seam(seams, &mut state, &config, switches) {
+            let next = serve_auth_seam(seams, state, &config, switches);
+            if !matches!(next, Next::Continue) {
+                #[cfg(target_os = "linux")]
+                if let Some(worker) = worker.as_mut() {
+                    *auth_open = false;
+                    worker.record_seam_end(next, ParentFailure::Auth);
+                    begin_owned_stop(
+                        &channels,
+                        state,
+                        worker,
+                        super::worker_protocol::StopReason::AuthLost,
+                    );
+                } else {
+                    break;
+                }
+                #[cfg(not(target_os = "linux"))]
                 break;
             }
         }
-        expire_pending(seams, &mut state, &config, Instant::now());
-        reap(&channels, &mut state);
+        expire_pending(seams, state, &config, Instant::now());
+        #[cfg(target_os = "linux")]
+        progress_verifications(seams, state, &config);
+        reap(&channels, state);
+        #[cfg(target_os = "linux")]
+        if let Some(worker) = worker.as_mut() {
+            worker.observe_required_publication(state);
+            worker.advance();
+            if worker.stopping {
+                begin_owned_stop(
+                    &channels,
+                    state,
+                    worker,
+                    super::worker_protocol::StopReason::Protocol,
+                );
+            }
+            worker.send_stop();
+        }
+        #[cfg(target_os = "linux")]
+        if shutdown.worker.is_some() {
+            shutdown.observe_monitor_failures();
+            shutdown.progress_adopted_children();
+            if let Some(outcome) = shutdown.physical_helper_outcome(diagnostics.is_none()) {
+                return HelperLoopExit::HelperPhysicallyExited(outcome);
+            }
+            #[cfg(test)]
+            if let Some(outcome) = shutdown.component_worker_outcome(diagnostics.is_none()) {
+                return HelperLoopExit::WorkerPhysicallyExited(outcome);
+            }
+        }
     }
 
     // `break`, not `return`, at each of the three ways out above: this
     // helper is LEAVING, and every live login's PAM session still has to be
     // closed by the process that opened it.
-    end_the_monitors(&mut state);
+    shutdown.end_the_monitors(seams, &config);
+    HelperLoopExit::Legacy
 }
 
-/// The helper is stopping: let every live monitor close its login's PAM
-/// session before this process goes.
-///
-/// # Why this exists at all
-///
-/// Dropping a monitor's seam is how a login is ended everywhere else
-/// ([`forget_login`]), and it works because the monitor is still there to
-/// read the end-of-file and run `monitor::Session::close`. Letting `serve`
-/// simply return would drop the same seams -- `LoopState` owns them -- and
-/// then immediately race them: `run` exits the process, the monitors'
-/// parent-death signal fires, and each gets a `SIGKILL` somewhere in the
-/// middle of the close it had just started. Measured, on the branch that
-/// added that signal: a login ended by `Request::LoginEnded` closed its
-/// session (`Exited(0)`, `closed=true`), the same login with the helper
-/// stopping did not (`Signaled(SIGKILL)`, `closed=false`) -- where the
-/// revision before the signal closed it.
-///
-/// So the seams go FIRST, on their own, and the monitors get their moment
-/// before this process leaves.
-///
-/// # What it does not cover
-///
-/// A helper that DIES -- killed, crashed -- never reaches this line, and
-/// then the parent-death signal is exactly right: a root process with an
-/// open session, reparented to init and surviving a restart of the service,
-/// is worse than an unclosed session. This function is about the other
-/// case, the one the signal made worse: a helper that leaves on purpose,
-/// which is the ordinary end of a daemon whose worker has gone.
-///
-/// [`MONITOR_GRACE_PERIOD`] is the budget, the same number the helper
-/// already gives a monitor to finish something it was asked to do. A close
-/// that needs longer than this loses the rest of it to the parent-death
-/// signal when the process exits -- the same trade-off as everywhere else
-/// here, one level up, and the reason a monitor bounds its own close
-/// (`monitor::MonitorPlan::session_close_budget`) rather than trusting this
-/// budget to be generous.
-fn end_the_monitors(state: &mut LoopState) {
-    // The seam of each goes with the entry, which is what each monitor is
-    // waiting to see close.
-    let mut leaving: Vec<Pid> = state
-        .monitors
-        .drain()
-        .filter_map(|(_, monitor)| (!monitor.reaped).then_some(monitor.pid))
-        .collect();
-    if leaving.is_empty() {
-        return;
+include!("worker_parent.rs");
+include!("adoption_parent.rs");
+
+/// Owns the existing serve state through monitor receipt/wait drainage.
+/// Linux verification owners remain retained through native cleanup and wait.
+/// Worker physical settlement and cooperative receipt outcome remain separate.
+/// Monitor-descendant custody and service signal delivery remain unqualified.
+struct HelperShutdown {
+    state: LoopState,
+    first_monitor_failure: Option<MonitorShutdownFailure>,
+    channels_open: bool,
+    auth_open: bool,
+    #[cfg(target_os = "linux")]
+    worker: Option<WorkerDomain>,
+    #[cfg(target_os = "linux")]
+    adoption: Option<AdoptionRuntime>,
+    #[cfg(target_os = "linux")]
+    forced_worker: bool,
+    #[cfg(target_os = "linux")]
+    stop: Option<super::stop_signal::StopOwner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorShutdownFailure {
+    Monitor(MonitorFailure),
+    MissingOwner,
+    Poll(i32),
+}
+
+impl HelperShutdown {
+    fn new(state: LoopState) -> Self {
+        Self {
+            state,
+            first_monitor_failure: None,
+            channels_open: true,
+            auth_open: true,
+            #[cfg(target_os = "linux")]
+            worker: None,
+            #[cfg(target_os = "linux")]
+            adoption: None,
+            #[cfg(target_os = "linux")]
+            forced_worker: false,
+            #[cfg(target_os = "linux")]
+            stop: None,
+        }
     }
-    let give_up_at = Instant::now() + MONITOR_GRACE_PERIOD;
-    loop {
-        // `reap_orphan` answers "gone", by the same `WNOHANG` pass the loop
-        // uses: a monitor that has finished is reaped here rather than left
-        // for an init this process is about to hand it to.
-        leaving.retain(|pid| !reap_orphan(*pid));
-        if leaving.is_empty() {
+
+    fn observe_monitor_failures(&mut self) {
+        // Once observed, a fault cannot change or disappear on a later report.
+        if self.first_monitor_failure.is_some() {
             return;
         }
-        if Instant::now() >= give_up_at {
-            break;
+        self.first_monitor_failure = self
+            .state
+            .monitors
+            .values()
+            .find_map(|monitor| monitor.failure.map(MonitorShutdownFailure::Monitor));
+        if self.first_monitor_failure.is_none()
+            && self
+                .state
+                .retired
+                .iter()
+                .any(|owner| !self.state.monitors.contains_key(owner))
+        {
+            self.first_monitor_failure = Some(MonitorShutdownFailure::MissingOwner);
         }
-        std::thread::sleep(REAP_INTERVAL);
+        if let Some(failure) = self.first_monitor_failure {
+            crate::log::error(
+                "helper",
+                &format!("monitor cleanup remains unresolved: {failure:?}"),
+            );
+        }
     }
-    crate::log::warn(
-        "helper",
-        &format!(
-            "{} monitor(s) had not finished closing their logins' sessions within \
-         {MONITOR_GRACE_PERIOD:?} of this helper stopping; what is left of those sessions goes \
-         unclosed",
-            leaving.len()
-        ),
-    );
+
+    fn begin_monitor_stop(&mut self, seams: Seams<'_>) {
+        self.state.stopping = true;
+        // Both active and already retiring incarnations keep their readable
+        // seams. The ordinary retirement route closes input after shell receipts.
+        let owners: Vec<_> = self.state.monitors.keys().copied().collect();
+        for owner in owners {
+            retire_login(seams.channels, &mut self.state, owner);
+        }
+    }
+
+    fn end_the_monitors(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        self.begin_monitor_stop(seams);
+        loop {
+            self.observe_monitor_failures();
+            if self.state.monitors.is_empty()
+                && self.state.retired.is_empty()
+                && self.state.live.is_empty()
+                && self.verifications_settled()
+            {
+                return;
+            }
+            self.monitor_pass(seams, config);
+        }
+    }
+
+    fn verifications_settled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.state.pending.verifying() == 0 && self.state.orphans.is_empty()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        } // unsupported-platform custody remains separately unqualified
+    }
+
+    fn monitor_pass(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        #[cfg(target_os = "linux")]
+        let reports = self.state.pending.poll_fds();
+        #[cfg(not(target_os = "linux"))]
+        let reports: Vec<RawFd> = Vec::new();
+        let owners: Vec<_> = self
+            .state
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| !monitor.seam_closed)
+            .map(|(owner, _)| *owner)
+            .collect();
+        let mut fds = Vec::with_capacity(reports.len() + owners.len());
+        for fd in &reports {
+            // SAFETY: PendingTable retains this exact report descriptor through
+            // the poll, including answered entries; no mutation occurs here.
+            fds.push(PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(*fd) },
+                PollFlags::POLLIN,
+            ));
+        }
+        fds.extend(owners.iter().map(|owner| {
+            PollFd::new(self.state.monitors[owner].seam().as_fd(), PollFlags::POLLIN)
+        }));
+        let (ready_reports, ready) =
+            match poll(&mut fds, PollTimeout::try_from(REAP_INTERVAL).unwrap()) {
+                Ok(_) => (
+                    reports
+                        .iter()
+                        .zip(&fds[..reports.len()])
+                        .filter(|(_, fd)| fd.any().unwrap_or(true))
+                        .map(|(fd, _)| *fd)
+                        .collect::<Vec<_>>(),
+                    owners
+                        .iter()
+                        .zip(&fds[reports.len()..])
+                        .filter(|(_, fd)| fd.any().unwrap_or(true))
+                        .map(|(owner, _)| *owner)
+                        .collect::<Vec<_>>(),
+                ),
+                Err(nix::Error::EINTR) => (Vec::new(), Vec::new()),
+                Err(error) => {
+                    self.first_monitor_failure
+                        .get_or_insert(MonitorShutdownFailure::Poll(error as i32));
+                    // A hard poll error is unresolved ownership, not an empty drain.
+                    // Bound retry work while retaining every descriptor and charge.
+                    std::thread::sleep(REAP_INTERVAL);
+                    (Vec::new(), Vec::new())
+                }
+            };
+        drop(fds);
+        settle_ready_pending(seams, &mut self.state, config, &ready_reports);
+        serve_ready_monitors(seams, &mut self.state, &ready);
+        #[cfg(target_os = "linux")]
+        {
+            expire_pending(seams, &mut self.state, config, Instant::now());
+            progress_verifications(seams, &mut self.state, config);
+        }
+        reap_owned_monitors(seams.channels, &mut self.state);
+        let retired: Vec<_> = self.state.retired.iter().copied().collect();
+        for owner in retired {
+            finish_retired(&mut self.state, owner);
+        }
+        self.observe_monitor_failures();
+    }
 }
 
 /// Read one message from the channel seam and act on it.
@@ -1158,16 +1641,24 @@ fn serve_channel_seam(
     config: &HelperConfig,
     switches: AccountSwitches,
 ) -> Next {
-    let message = match channel::recv(sock) {
+    let message = match channel::recv_once(sock) {
         Ok(Some((bytes, _fd))) => bytes,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Next::Continue
+        }
         // The worker closed its end: it is gone.
-        Ok(None) => return Next::Stop,
+        Ok(None) => return Next::Eof,
         Err(e) => {
             crate::log::warn(
                 "helper",
                 &format!("receive on the channel seam failed: {e}"),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     match decode::<Request>(&message) {
@@ -1187,9 +1678,13 @@ fn serve_channel_seam(
             if fresh {
                 state.highest_channel_id = id;
             }
+            if state.stopping || state.required_publication.is_some() {
+                refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
+                return Next::Continue;
+            }
             // A compromised worker cannot bypass geometry admission here.
             if let Err(reason) = terminal_size::TerminalSize::new(cols, rows) {
-                refuse_open(sock, id, reason.to_string(), fresh);
+                refuse_open(sock, state, id, reason.to_string(), fresh);
                 return Next::Continue;
             }
             // Only for an account this helper verified itself
@@ -1213,7 +1708,13 @@ fn serve_channel_seam(
                     "helper",
                     &format!("refusing a channel for uid {uid}, which has not authenticated"),
                 );
-                refuse_open(sock, id, UNVERIFIED_ACCOUNT_REASON.to_string(), fresh);
+                refuse_open(
+                    sock,
+                    state,
+                    id,
+                    UNVERIFIED_ACCOUNT_REASON.to_string(),
+                    fresh,
+                );
                 return Next::Continue;
             }
             // And only under a login that is already on file, bound to this
@@ -1253,7 +1754,7 @@ fn serve_channel_seam(
                 Ok(account) => account,
                 Err(why) => {
                     crate::log::warn("helper", &format!("refusing an Open for uid {uid}: {why}"));
-                    refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
+                    refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
                     return Next::Continue;
                 }
             };
@@ -1285,6 +1786,7 @@ fn serve_channel_seam(
             if !fresh || state.live.contains_key(&id) {
                 refuse_open(
                     sock,
+                    state,
                     id,
                     "a channel with this id is already open".to_string(),
                     false,
@@ -1340,7 +1842,7 @@ fn serve_channel_seam(
                         login[0], login[1]
                     ),
                 );
-                refuse_open(sock, id, REFUSED_REASON.to_string(), fresh);
+                refuse_open(sock, state, id, REFUSED_REASON.to_string(), fresh);
                 return Next::Continue;
             }
             let owner = owner_for(state, login);
@@ -1377,8 +1879,10 @@ fn serve_channel_seam(
                     // Only audited preparation failures prove NoChild.
                     // Once a send was attempted, preserve the exact charge
                     // until the monitor supplies a terminal cleanup receipt.
-                    reply(
+                    required_reply(
                         sock,
+                        state,
+                        RequiredPublication::Refused,
                         &Response::Failed {
                             id,
                             reason: format!("{e:#}"),
@@ -1449,7 +1953,7 @@ fn serve_channel_seam(
             // think it is. Say so and stop rather than guess -- in words
             // of this helper's own: see `malformed_request_line`.
             crate::log::error("helper", &malformed_request_line("channel", &message));
-            return Next::Stop;
+            return Next::Failed;
         }
     }
     Next::Continue
@@ -1495,16 +1999,24 @@ fn serve_auth_seam(
     // login's monitor and so its channels, and a channel's end is the
     // CHANNEL seam's news.
     let sock = seams.auth;
-    let message = match channel::recv(sock) {
+    let message = match channel::recv_once(sock) {
         Ok(Some((bytes, _fd))) => bytes,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Next::Continue
+        }
         // The worker closed its end: it is gone.
-        Ok(None) => return Next::Stop,
+        Ok(None) => return Next::Eof,
         Err(e) => {
             crate::log::warn(
                 "helper",
                 &format!("receive on the authentication seam failed: {e}"),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     let AuthRequest { id, body } = match decode::<AuthRequest>(&message) {
@@ -1516,12 +2028,15 @@ fn serve_auth_seam(
                 "helper",
                 &malformed_request_line("authentication", &message),
             );
-            return Next::Stop;
+            return Next::Failed;
         }
     };
     match body {
         Request::Nonce => {
-            let answer = match issue_nonce(&mut state.nonces) {
+            let answer = match (!state.stopping && state.required_publication.is_none())
+                .then(|| issue_nonce(&mut state.nonces))
+                .flatten()
+            {
                 Some(nonce) => Response::Nonce { nonce },
                 None => Response::NonceUnavailable,
             };
@@ -1565,12 +2080,15 @@ fn serve_auth_seam(
             // expires at `NONCE_LIFETIME`. The wire answer is the shared
             // `REFUSED_REASON`, so nothing out there can tell which limit
             // was reached -- or that one was.
-            if state.pending.verifying() >= MAX_VERIFYING {
+            if state.stopping
+                || state.required_publication.is_some()
+                || state.pending.verifying() >= MAX_VERIFYING
+            {
                 crate::log::warn(
                     "helper",
                     &format!(
-                        "refusing a Verify request: already checking {MAX_VERIFYING} \
-                     proofs at once"
+                        "refusing a Verify request: already holding {MAX_VERIFYING} \
+                     live or unresolved verifications"
                     ),
                 );
                 reply(
@@ -1610,8 +2128,17 @@ fn serve_auth_seam(
                 &nonce,
                 config,
                 switches,
+                #[cfg(target_os = "linux")]
+                state.child_mask,
             ) {
-                Ok((report, child)) => {
+                Ok(start) => {
+                    let VerificationStart {
+                        report,
+                        child,
+                        deadline,
+                        #[cfg(target_os = "linux")]
+                        custody,
+                    } = start;
                     // And this request now leaves the handler unanswered:
                     // `Verified` or `Refused` goes out from the loop once
                     // this child has spoken, or once its deadline has
@@ -1620,10 +2147,13 @@ fn serve_auth_seam(
                     // machine, for as long as one account's home directory
                     // felt like taking.
                     state.pending.insert(Pending {
-                        deadline: Instant::now() + config.verify_timeout,
+                        deadline,
                         what: PendingWhat::Verify {
                             report,
                             child,
+                            answered: false,
+                            #[cfg(target_os = "linux")]
+                            custody: Some(Box::new(custody)),
                             id,
                             // Bounded HERE too, and for the same reason the
                             // address below is. The name the CHILD was
@@ -1791,14 +2321,92 @@ fn forget_login(sock: &UnixStream, state: &mut LoopState, login: LoginId) {
 }
 
 fn finish_retired(state: &mut LoopState, owner: MonitorOwner) {
-    if state.retired.contains(&owner) && !state.live.values().any(|slot| slot.owner() == owner) {
-        state.retired.remove(&owner);
-        if let Some(monitor) = state.monitors.remove(&owner) {
-            if !monitor.reaped {
-                state.orphans.push(monitor.pid);
-            }
+    finish_retired_using(state, owner, |seam| {
+        seam.shutdown(std::net::Shutdown::Write)
+    });
+}
+
+fn finish_retired_using(
+    state: &mut LoopState,
+    owner: MonitorOwner,
+    shutdown: impl FnOnce(&UnixStream) -> std::io::Result<()>,
+) {
+    if !state.retired.contains(&owner) || state.live.values().any(|slot| slot.owner() == owner) {
+        return;
+    }
+    let Some(monitor) = state.monitors.get_mut(&owner) else {
+        return;
+    };
+    if monitor.reaped && !monitor.wait_lost && monitor.failure.is_none() {
+        if let Some(result) = monitor.completion {
+            state.pam_cleanup.merge(result);
+            state.monitors.remove(&owner);
+            state.retired.remove(&owner);
+            return;
         }
     }
+    // A final receipt already reports completed PAM work. Retain only the
+    // remaining wait obligation rather than issuing a new shutdown request.
+    if monitor.completion.is_none() {
+        request_monitor_end_using(monitor, shutdown);
+    }
+}
+
+fn request_monitor_end_using(
+    monitor: &mut Monitor,
+    shutdown: impl FnOnce(&UnixStream) -> std::io::Result<()>,
+) {
+    if monitor.stop_attempted {
+        return;
+    }
+    monitor.stop_attempted = true;
+    match shutdown(monitor.seam()) {
+        Ok(()) => monitor.write_closed = true,
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            // Retry on a later bounded pass, never an unbounded syscall loop.
+            monitor.stop_attempted = false;
+        }
+        Err(error) => {
+            monitor.failure.get_or_insert(MonitorFailure::Shutdown(
+                error.raw_os_error().unwrap_or(nix::libc::EIO),
+            ));
+        }
+    }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn record_monitor_wait_failure(monitor: &mut Monitor, error: i32) {
+    monitor.wait_lost = true;
+    monitor.failure.get_or_insert(MonitorFailure::Wait(error));
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn poll_monitor_wait_using(
+    monitor: &mut Monitor,
+    mut wait: impl FnMut() -> nix::Result<nix::sys::wait::WaitStatus>,
+) -> bool {
+    use nix::sys::wait::WaitStatus;
+    #[cfg(target_os = "linux")]
+    if matches!(monitor.process, MonitorProcess::Native(_)) {
+        return false; // Injected/model waits can never consume a native owner.
+    }
+    if !monitor_signal_authority(monitor) {
+        return false;
+    }
+    match wait() {
+        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => true,
+        Err(nix::Error::EINTR) => false,
+        Err(error) => {
+            record_monitor_wait_failure(monitor, error as i32);
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn monitor_signal_authority(monitor: &Monitor) -> bool {
+    !monitor.reaped && !monitor.wait_lost
 }
 
 fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
@@ -1815,13 +2423,24 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
         {
             state.verified.remove(&ended.account.uid);
         }
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::LoginEnded,
             &Response::LoginEnded {
                 login: owner.login,
                 incarnation: owner.incarnation,
             },
         );
+    }
+    // Monitor fork publication is synchronous before Open is sent. A login
+    // without a monitor or live slot acquired no PAM/process obligation. An
+    // already retained owner is never repaired by this absence check.
+    if !state.retired.contains(&owner)
+        && !state.monitors.contains_key(&owner)
+        && !state.live.values().any(|slot| slot.owner() == owner)
+    {
+        return;
     }
     state.retired.insert(owner);
     let ids: Vec<_> = state
@@ -1839,7 +2458,7 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
                 if !state
                     .monitors
                     .get(&owner)
-                    .is_some_and(|monitor| monitor.reaped)
+                    .is_some_and(Monitor::leader_exited)
                 {
                     report_exit(sock, state, id, 128 + nix::libc::SIGKILL);
                 }
@@ -1857,7 +2476,12 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
             }
             ChannelSlot::Cleaning(_) => {}
         }
-        if state.live.contains_key(&id) && state.monitors.get(&owner).is_some_and(|m| !m.reaped) {
+        if state.live.contains_key(&id)
+            && state
+                .monitors
+                .get(&owner)
+                .is_some_and(|m| !m.leader_exited())
+        {
             tell_monitor(sock, state, owner, &MonitorRequest::Close { id });
             state
                 .closing
@@ -1869,10 +2493,9 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
 }
 
 fn detach_monitor(state: &mut LoopState, owner: MonitorOwner) {
-    if let Some(monitor) = state.monitors.remove(&owner) {
-        if !monitor.reaped {
-            state.orphans.push(monitor.pid);
-        }
+    if let Some(monitor) = state.monitors.get_mut(&owner) {
+        monitor.seam_closed = true;
+        monitor.failure.get_or_insert(MonitorFailure::Stream);
     }
 }
 
@@ -1885,14 +2508,23 @@ fn detach_monitor(state: &mut LoopState, owner: MonitorOwner) {
 /// never allow. The client is not stranded by this: a fresh proof admits
 /// the device again, under a login of its own.
 fn lose_monitor(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner, why: &str) {
-    if let Some(monitor) = state.monitors.get(&owner) {
-        if !monitor.reaped {
-            crate::log::warn("helper", &format!("login monitor cannot serve: {why}"));
-            log_failed_kill(
-                nix::sys::signal::kill(monitor.pid, nix::sys::signal::Signal::SIGKILL),
-                monitor.pid,
-                "SIGKILL to a monitor that cannot serve",
-            );
+    if let Some(monitor) = state.monitors.get_mut(&owner) {
+        crate::log::warn("helper", &format!("login monitor cannot serve: {why}"));
+        match &mut monitor.process {
+            #[cfg(target_os = "linux")]
+            MonitorProcess::Native(native) => native.force(Instant::now()),
+            #[cfg(not(target_os = "linux"))]
+            MonitorProcess::Legacy(_) if !monitor.reaped && !monitor.wait_lost => {
+                log_failed_kill(
+                    nix::sys::signal::kill(monitor.pid, nix::sys::signal::Signal::SIGKILL),
+                    monitor.pid,
+                    "SIGKILL to a monitor that cannot serve",
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            MonitorProcess::Legacy(_) => {}
+            #[cfg(test)]
+            MonitorProcess::Controlled(_) => {}
         }
     }
     detach_monitor(state, owner);
@@ -1918,13 +2550,24 @@ fn tell_monitor(
     let Some(monitor) = state.monitors.get(&owner) else {
         return;
     };
+    if monitor.seam_closed {
+        return;
+    }
     let failed = match encode(request) {
-        Ok(bytes) => channel::send(&monitor.seam, &bytes, None)
+        Ok(bytes) => channel::send(monitor.seam(), &bytes, None)
             .err()
-            .map(|e| e.to_string()),
-        Err(e) => Some(e.to_string()),
+            .map(|e| (e.to_string(), e.raw_os_error().unwrap_or(nix::libc::EIO))),
+        Err(e) => Some((e.to_string(), nix::libc::EINVAL)),
     };
-    if let Some(why) = failed {
+    if let Some((why, errno)) = failed {
+        if state.stopping {
+            // A cooperative-stop send failure is not authority to guess a
+            // monitor PID signal. Keep its read route and all cleanup debt.
+            if let Some(monitor) = state.monitors.get_mut(&owner) {
+                monitor.failure.get_or_insert(MonitorFailure::Send(errno));
+            }
+            return;
+        }
         lose_monitor(sock, state, owner, &format!("could not be reached ({why})"));
     }
 }
@@ -1937,42 +2580,152 @@ fn tell_monitor(
 /// comes straight back for the rest (`poll` returns at once while anything
 /// is still readable).
 fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[MonitorOwner]) {
+    #[cfg(target_os = "linux")]
+    let native: Vec<_> = state
+        .monitors
+        .iter()
+        .filter_map(|(owner, monitor)| {
+            matches!(monitor.process, MonitorProcess::Native(_)).then_some(*owner)
+        })
+        .collect();
+    #[cfg(target_os = "linux")]
+    for owner in native {
+        let monitor = state.monitors.get_mut(&owner).unwrap();
+        #[cfg(not(test))]
+        let MonitorProcess::Native(native) = &mut monitor.process;
+        #[cfg(test)]
+        let MonitorProcess::Native(native) = &mut monitor.process
+        else {
+            continue;
+        };
+        let update = native.advance(Instant::now());
+        monitor.reaped = matches!(
+            update.native,
+            crate::process_scope::scope::Progress::Complete(_)
+        );
+        monitor.wait_lost |= update.leader == crate::process_scope::scope::LeaderStatus::Unknown;
+        monitor.seam_closed |= native.closed();
+        if monitor.seam_closed && monitor.completion.is_none() {
+            monitor.failure.get_or_insert(MonitorFailure::Stream);
+        }
+        if let Some(failure) = update.failure {
+            native.force(Instant::now());
+            monitor
+                .failure
+                .get_or_insert(MonitorFailure::Native(failure));
+            monitor.wait_lost |= failure == super::monitor_owner::Failure::LostAuthority;
+        }
+        if let Some((signal, errno)) = update.signal_failure {
+            if monitor.signal_failure.is_none() {
+                monitor.signal_failure = Some((signal, errno));
+                crate::log::error(
+                    "helper",
+                    &format!(
+                        "owned monitor {} signal failed: {signal}, {errno}",
+                        monitor.pid
+                    ),
+                );
+            }
+        }
+        if let Some(event) = update.event {
+            dispatch_monitor_event(seams, state, owner, event);
+        }
+        let should_retire = state.monitors.get(&owner).is_some_and(|monitor| {
+            monitor.seam_closed
+                || monitor.wait_lost
+                || monitor.leader_exited()
+                || monitor.failure.is_some()
+        });
+        if should_retire {
+            retire_login(seams.channels, state, owner);
+        }
+    }
     for &owner in ready {
         let Some(monitor) = state.monitors.get(&owner) else {
             continue;
         };
-        let message = match channel::recv(&monitor.seam) {
+        #[cfg(target_os = "linux")]
+        if matches!(monitor.process, MonitorProcess::Native(_)) {
+            continue;
+        }
+        let message = match channel::recv_once(monitor.seam()) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
             Ok(Some((bytes, fd))) if fd.is_none() => bytes,
+            Ok(None) => {
+                if let Some(monitor) = state.monitors.get_mut(&owner) {
+                    monitor.seam_closed = true;
+                    if monitor.completion.is_none() {
+                        monitor.failure.get_or_insert(MonitorFailure::Stream);
+                    }
+                }
+                retire_login(seams.channels, state, owner);
+                continue;
+            }
             _ => {
                 detach_monitor(state, owner);
                 retire_login(seams.channels, state, owner);
                 continue;
             }
         };
-        let event = match decode::<MonitorEvent>(&message) {
-            Ok(event) => event,
-            Err(_) => {
-                lose_monitor(seams.channels, state, owner, "invalid event");
-                continue;
-            }
-        };
-        let id = match &event {
-            MonitorEvent::Started { id }
-            | MonitorEvent::Failed { id, .. }
-            | MonitorEvent::Exited { id, .. }
-            | MonitorEvent::CleanupComplete { id, .. }
-            | MonitorEvent::Refused { id, .. }
-            | MonitorEvent::Noted { id, .. }
-            | MonitorEvent::SignalFailed { id, .. } => *id,
-        };
-        if !state
-            .live
-            .get(&id)
-            .is_some_and(|slot| slot.owner() == owner)
-        {
-            continue;
+        match decode::<MonitorEvent>(&message) {
+            Ok(event) => dispatch_monitor_event(seams, state, owner, event),
+            Err(_) => lose_monitor(seams.channels, state, owner, "invalid event"),
         }
-        match event {
+    }
+}
+fn dispatch_monitor_event(
+    seams: Seams<'_>,
+    state: &mut LoopState,
+    owner: MonitorOwner,
+    event: MonitorEvent,
+) {
+    if let MonitorEvent::SessionEstablished { .. } = event {
+        // Only the native private reader may establish session authority;
+        // legacy and controlled socket dispatch cannot create that proof.
+        lose_monitor(seams.channels, state, owner, "unexpected session stage");
+        return;
+    }
+    if let MonitorEvent::SessionClosed { result } = event {
+        if let Some(monitor) = state.monitors.get_mut(&owner) {
+            if monitor.completion.is_some() {
+                monitor
+                    .failure
+                    .get_or_insert(MonitorFailure::DuplicateCompletion);
+            } else {
+                monitor.completion = Some(result);
+            }
+        }
+        retire_login(seams.channels, state, owner);
+        return;
+    }
+    let id = match &event {
+        MonitorEvent::SessionEstablished { .. } | MonitorEvent::SessionClosed { .. } => {
+            unreachable!()
+        }
+        MonitorEvent::Started { id }
+        | MonitorEvent::Failed { id, .. }
+        | MonitorEvent::Exited { id, .. }
+        | MonitorEvent::CleanupComplete { id, .. }
+        | MonitorEvent::Refused { id, .. }
+        | MonitorEvent::Noted { id, .. }
+        | MonitorEvent::SignalFailed { id, .. } => *id,
+    };
+    if !state
+        .live
+        .get(&id)
+        .is_some_and(|slot| slot.owner() == owner)
+    {
+        return;
+    }
+    match event {
+            MonitorEvent::SessionEstablished { .. } | MonitorEvent::SessionClosed { .. } => unreachable!(),
             MonitorEvent::Started { id } => finish_channel(seams.channels, state, id, StartupReport::Started),
             MonitorEvent::Failed { id, errno } => finish_channel(seams.channels, state, id,
                 StartupReport::Failed(nix::Error::from_raw(errno))),
@@ -1986,6 +2739,38 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             MonitorEvent::SignalFailed { id, signal, errno } => crate::log::warn("helper",
                 &format!("signal {signal} to channel {id}'s process failed in the monitor of login {:02x}{:02x}..: {} -- the process may outlive its channel (does the service unit grant CAP_KILL?)", owner.login[0], owner.login[1], nix::Error::from_raw(errno))),
         }
+}
+
+/// Linux only mirrors the prior owned pass; legacy platforms observe their
+/// retained direct children. No Linux final wait occurs outside NativeMonitor.
+fn reap_owned_monitors(sock: &UnixStream, state: &mut LoopState) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::sys::wait::{waitpid, WaitPidFlag};
+        let monitors: Vec<_> = state
+            .monitors
+            .iter()
+            .filter(|(_, monitor)| monitor_signal_authority(monitor))
+            .map(|(owner, monitor)| (*owner, monitor.pid))
+            .collect();
+        for (owner, pid) in monitors {
+            if poll_monitor_wait_using(state.monitors.get_mut(&owner).unwrap(), || {
+                waitpid(pid, Some(WaitPidFlag::WNOHANG))
+            }) {
+                state.monitors.get_mut(&owner).unwrap().reaped = true;
+            }
+        }
+    }
+    // Linux observations and final wait already happened once in the owned
+    // monitor pass. No second receive or numeric child observation is allowed.
+    let retiring: Vec<_> = state
+        .monitors
+        .iter()
+        .filter(|(_, monitor)| monitor.leader_exited() || monitor.wait_lost)
+        .map(|(owner, _)| *owner)
+        .collect();
+    for owner in retiring {
+        retire_login(sock, state, owner);
     }
 }
 
@@ -2015,34 +2800,14 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
 /// LOGIN'S MONITOR killed -- see that constant's docs for why the helper's
 /// escalation is one level up from the monitor's own.
 fn reap(sock: &UnixStream, state: &mut LoopState) {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-
-    // Snapshot first: `forget_login` mutates `monitors`, so mutating it
-    // while iterating it directly would be a borrow conflict.
-    let monitors: Vec<_> = state
-        .monitors
-        .iter()
-        .filter(|(_, monitor)| !monitor.reaped)
-        .map(|(owner, monitor)| (*owner, monitor.pid))
-        .collect();
-    for (owner, pid) in monitors {
-        let gone = loop {
-            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => break true,
-                Err(nix::Error::EINTR) => continue,
-                _ => break false,
-            }
-        };
-        if gone {
-            if let Some(monitor) = state.monitors.get_mut(&owner) {
-                monitor.reaped = true;
-            }
-            // The socket may still hold Failed + CleanupComplete. Keep reading
-            // it until EOF rather than losing the proof after the first event.
-            retire_login(sock, state, owner);
-        }
-    }
+    reap_owned_monitors(sock, state);
     state.orphans.retain(|&pid| !reap_orphan(pid));
+    // A transient half-shutdown interruption needs another bounded attempt
+    // even if no socket event arrives. Admission bounds this owner snapshot.
+    let retired: Vec<_> = state.retired.iter().copied().collect();
+    for owner in retired {
+        finish_retired(state, owner);
+    }
 
     let now = Instant::now();
 
@@ -2104,6 +2869,7 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
 /// would leave nothing in the log to say why. `ESRCH` (the process already
 /// exited, between the caller's `live` lookup and this signal) is ordinary
 /// and not logged.
+#[cfg(not(target_os = "linux"))]
 fn log_failed_kill(result: nix::Result<()>, pid: Pid, what: &str) {
     match result {
         Ok(()) | Err(nix::Error::ESRCH) => {}
@@ -2572,6 +3338,7 @@ fn put_field(out: &mut Vec<u8>, bytes: &[u8]) {
 /// account with a few hundred groups does), so the child's one `write` is
 /// not necessarily atomic and the rest can arrive in pieces. The loop must
 /// not be parked waiting for them.
+#[cfg(any(test, not(target_os = "linux")))]
 fn verdict_from_pipe(report: &OwnedFd, deadline: Instant) -> Option<Verdict> {
     let mut record = Vec::new();
     let mut chunk = [0u8; 512];
@@ -2701,6 +3468,15 @@ impl<'a> VerdictCursor<'a> {
 /// A terminal or a seam left open in a process that goes on to read an
 /// account's own files is exactly what [`close_other_descriptors`] exists
 /// to rule out.
+struct VerificationStart {
+    report: OwnedFd,
+    child: Pid,
+    deadline: Instant,
+    #[cfg(target_os = "linux")]
+    custody: super::verification::VerificationChild,
+}
+
+// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
 #[allow(clippy::too_many_arguments)]
 fn fork_verification(
     login: &str,
@@ -2710,12 +3486,25 @@ fn fork_verification(
     nonce: &Nonce,
     config: &HelperConfig,
     switches: AccountSwitches,
-) -> anyhow::Result<(OwnedFd, Pid)> {
+    #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
+) -> anyhow::Result<VerificationStart> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
 
+    #[cfg(target_os = "linux")]
+    let deadline = Instant::now() + config.verify_timeout;
+    #[cfg(target_os = "linux")]
+    let view = crate::process_scope::prepare()
+        .map_err(anyhow::Error::msg)
+        .context("preparing exact verification-child custody before fork")?;
     let (report_read, report_write) =
         pipe2(OFlag::O_CLOEXEC).context("opening the verification report pipe")?;
+    #[cfg(target_os = "linux")]
+    nix::fcntl::fcntl(
+        report_read.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
+    )
+    .context("making verification reports nonblocking before fork")?;
     // Read here, by the parent, for the same reason a monitor reads it
     // here: `getrlimit` is a libc call, and the child has closing to do
     // before it may make any.
@@ -2734,8 +3523,22 @@ fn fork_verification(
             // Our own copy of the write end has to close before anything
             // reads the pipe, or it never reaches end-of-file even once
             // the child's copy is gone.
+            #[cfg(target_os = "linux")]
+            let custody = super::verification::VerificationChild::new(
+                std::num::NonZeroU32::new(child.as_raw() as u32).unwrap(),
+                view,
+                deadline,
+            );
             drop(report_write);
-            Ok((report_read, child))
+            #[cfg(not(target_os = "linux"))]
+            let deadline = Instant::now() + config.verify_timeout;
+            Ok(VerificationStart {
+                report: report_read,
+                child,
+                deadline,
+                #[cfg(target_os = "linux")]
+                custody,
+            })
         }
         ForkResult::Child => {
             // The whole body under a `catch_unwind`, because the `_exit`
@@ -2756,6 +3559,32 @@ fn fork_verification(
                 // this child's own copy -- goes with the rest; nothing here
                 // reads the pipe.
                 close_other_descriptors(report_write.as_raw_fd(), fd_limit);
+                #[cfg(target_os = "linux")]
+                {
+                    let (tag, value) = match nix::unistd::setsid() {
+                        Ok(sid) => (1u8, sid.as_raw()),
+                        Err(error) => (2u8, error as i32),
+                    };
+                    let mut stage = [0u8; 5];
+                    stage[0] = tag;
+                    stage[1..].copy_from_slice(&value.to_ne_bytes());
+                    let mut written = 0;
+                    while written < stage.len() {
+                        match nix::unistd::write(report_write, &stage[written..]) {
+                            Ok(0) => unsafe { nix::libc::_exit(127) },
+                            Ok(count) => written += count,
+                            Err(nix::Error::EINTR) => continue,
+                            Err(_) => unsafe { nix::libc::_exit(127) },
+                        }
+                    }
+                    if tag != 1 {
+                        unsafe { nix::libc::_exit(127) };
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                if child_mask.is_some_and(|mask| mask.restore().is_err()) {
+                    unsafe { nix::libc::_exit(127) };
+                }
                 let verdict = match verify_proof_after_nonce(
                     login,
                     public_key,
@@ -2852,17 +3681,35 @@ fn report_exit(sock: &UnixStream, state: &mut LoopState, id: ChannelId, code: i3
             login.channels.remove(&id);
         }
     }
-    reply(sock, &Response::Exited { id, code });
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Exited,
+        &Response::Exited { id, code },
+    );
     if matches!(slot, ChannelSlot::ReapedRunning(_)) {
         complete_cleanup(sock, state, owner, id, super::protocol::CleanupKind::Reaped);
     }
 }
 
-fn refuse_open(sock: &UnixStream, id: ChannelId, reason: String, fresh: bool) {
-    reply(sock, &Response::Failed { id, reason });
+fn refuse_open(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    id: ChannelId,
+    reason: String,
+    fresh: bool,
+) {
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Refused,
+        &Response::Failed { id, reason },
+    );
     if fresh {
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::Cleanup,
             &Response::CleanupComplete {
                 id,
                 kind: super::protocol::CleanupKind::NoChild,
@@ -2897,8 +3744,10 @@ fn complete_cleanup(
     }
     if let Some(pending) = state.pending.take_channel(id) {
         drop(pending); // retire startup callback and its descriptor before proof
-        reply(
+        required_reply(
             sock,
+            state,
+            RequiredPublication::Refused,
             &Response::Failed {
                 id,
                 reason: "the channel ended before startup completed".into(),
@@ -2907,30 +3756,76 @@ fn complete_cleanup(
     }
     state.live.remove(&id);
     state.closing.remove(&id);
-    reply(sock, &Response::CleanupComplete { id, kind });
+    required_reply(
+        sock,
+        state,
+        RequiredPublication::Cleanup,
+        &Response::CleanupComplete { id, kind },
+    );
     finish_retired(state, owner);
 }
 
+fn reply_result<T: serde::Serialize>(
+    sock: &UnixStream,
+    msg: &T,
+    fd: Option<BorrowedFd<'_>>,
+) -> Result<(), PublicationError> {
+    let bytes = encode(msg).map_err(|e| {
+        crate::log::warn("helper", &format!("could not encode a reply: {e}"));
+        PublicationError::Encode
+    })?;
+    channel::send(sock, &bytes, fd).map_err(|e| {
+        crate::log::warn("helper", &format!("reply failed: {e}"));
+        PublicationError::Send(e.raw_os_error().unwrap_or(nix::libc::EIO))
+    })
+}
+
 fn reply<T: serde::Serialize>(sock: &UnixStream, msg: &T) {
-    match encode(msg) {
-        Ok(bytes) => {
-            if let Err(e) = channel::send(sock, &bytes, None) {
-                crate::log::warn("helper", &format!("reply failed: {e}"));
-            }
+    // Nonce and authentication answers keep their request-level semantics.
+    let _ = reply_result(sock, msg, None);
+}
+
+fn retain_required_result(
+    state: &mut LoopState,
+    kind: RequiredPublication,
+    result: Result<(), PublicationError>,
+) {
+    if let Err(error) = result {
+        let failure = RequiredPublicationFailure { kind, error };
+        if state.required_publication.is_none() {
+            state.required_publication = Some(failure);
+            let detail = match failure.error {
+                PublicationError::Encode => "encoding failed".to_string(),
+                PublicationError::Send(errno) => format!("send failed ({errno})"),
+            };
+            crate::log::error(
+                "helper",
+                &format!("required {:?} publication: {detail}", failure.kind),
+            );
         }
-        Err(e) => crate::log::warn("helper", &format!("could not encode a reply: {e}")),
     }
 }
 
-fn reply_with_fd(sock: &UnixStream, msg: &Response, fd: BorrowedFd<'_>) {
-    match encode(msg) {
-        Ok(bytes) => {
-            if let Err(e) = channel::send(sock, &bytes, Some(fd)) {
-                crate::log::warn("helper", &format!("reply failed: {e}"));
-            }
-        }
-        Err(e) => crate::log::warn("helper", &format!("could not encode a reply: {e}")),
-    }
+fn required_reply<T: serde::Serialize>(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    kind: RequiredPublication,
+    msg: &T,
+) {
+    retain_required_result(state, kind, reply_result(sock, msg, None));
+}
+
+fn required_reply_with_fd(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    msg: &Response,
+    fd: BorrowedFd<'_>,
+) {
+    retain_required_result(
+        state,
+        RequiredPublication::Opened,
+        reply_result(sock, msg, Some(fd)),
+    );
 }
 
 /// How long a channel's child gets to report its own startup before the
@@ -3072,6 +3967,8 @@ fn open_channel(
              would read the machine's /etc/pam.d and pass or fail by the host's policy"
         );
             let plan = MonitorPlan {
+                #[cfg(target_os = "linux")]
+                child_mask: state.child_mask,
                 account: account.clone(),
                 login,
                 tty: tty
@@ -3121,7 +4018,7 @@ fn open_channel(
         .monitors
         .get(&owner)
         .expect("the monitor was just put on file");
-    if let Err(e) = channel::send(&monitor.seam, &bytes, Some(pty.slave.as_fd())) {
+    if let Err(e) = channel::send(monitor.seam(), &bytes, Some(pty.slave.as_fd())) {
         // The monitor cannot be reached, so this channel can never start --
         // and a monitor nobody can reach can only hold whatever it already
         // has open for good. It is killed and its LOGIN ends with it: the
@@ -3164,9 +4061,13 @@ fn open_channel(
 /// and its bounded sends only once it had something to send; this makes the
 /// bound unconditional instead.
 ///
-/// A bound that cannot be set is reported rather than fatal, as the two
-/// worker seams' own timeouts are.
+/// Linux rejects a timeout-setting failure before forking the monitor.
+/// The legacy non-Linux path reports that failure and retains its prior behavior.
 fn bounded_monitor_pair() -> anyhow::Result<(UnixStream, UnixStream)> {
+    #[cfg(target_os = "linux")]
+    let (helper_end, monitor_end) = super::worker_control::pair()
+        .context("creating the credential-enabled monitor socket pair")?;
+    #[cfg(not(target_os = "linux"))]
     let (helper_end, monitor_end) =
         channel::pair().context("creating the monitor seam's socket pair")?;
     for (end, whose) in [
@@ -3174,6 +4075,9 @@ fn bounded_monitor_pair() -> anyhow::Result<(UnixStream, UnixStream)> {
         (&monitor_end, "a monitor's own sends"),
     ] {
         if let Err(e) = end.set_write_timeout(Some(SEAM_SEND_TIMEOUT)) {
+            #[cfg(target_os = "linux")]
+            return Err(e).with_context(|| format!("bounding {whose} before monitor fork"));
+            #[cfg(not(target_os = "linux"))]
             crate::log::warn(
                 "helper",
                 &format!(
@@ -3200,6 +4104,10 @@ fn bounded_monitor_pair() -> anyhow::Result<(UnixStream, UnixStream)> {
 fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
     use nix::unistd::{fork, ForkResult};
 
+    #[cfg(target_os = "linux")]
+    let view = crate::process_scope::prepare()
+        .map_err(anyhow::Error::msg)
+        .context("qualifying native monitor custody before fork")?;
     let (helper_end, monitor_end) = bounded_monitor_pair()?;
 
     // Taken BEFORE the fork, so the child can tell a helper that died in
@@ -3219,10 +4127,26 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
     // nothing else will ever close what it inherited.
     match unsafe { fork() }.context("forking the login's monitor")? {
         ForkResult::Parent { child } => {
+            #[cfg(target_os = "linux")]
+            let process = MonitorProcess::Native(super::monitor_owner::NativeMonitor::new(
+                std::num::NonZeroU32::new(child.as_raw() as u32).unwrap(),
+                view,
+                helper_end,
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let process = MonitorProcess::Legacy(helper_end);
             drop(monitor_end);
             Ok(Monitor {
+                process,
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
                 reaped: false,
-                seam: helper_end,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
                 pid: child,
             })
         }
@@ -3256,6 +4180,7 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
 ///
 /// Anything short of a complete 4-byte report (or a clean end-of-file with
 /// none at all) is treated as a timeout rather than guessed at.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(super) fn read_startup_report(report_read: &OwnedFd, deadline: Instant) -> StartupReport {
     let mut buf = [0u8; 4];
     let mut filled = 0usize;
@@ -3362,183 +4287,313 @@ fn finish_pending(
             apply_channel_verdict(seams.channels, state, what, StartupReport::TimedOut)
         }
         PendingWhat::Verify {
-            report: report_pipe,
+            report,
             child,
+            answered,
+            #[cfg(target_os = "linux")]
+            mut custody,
             id,
             login,
             login_id,
             rhost,
         } => {
-            // Whatever the verdict, this child is finished: it wrote its
-            // record and `_exit`ed, or it is about to be killed. Either
-            // way NOTHING waits for it here -- `reap`'s `WNOHANG` pass
-            // buries it.
-            state.orphans.push(child);
-            let verdict = match why {
-                WhyFinished::Spoke => verdict_from_pipe(&report_pipe, deadline),
-                WhyFinished::Expired => {
-                    // The child is stuck in something with no deadline of
-                    // its own: a name service that never answers, a home
-                    // directory on a mount that has stopped. SIGKILL
-                    // rather than SIGHUP -- it is this helper's own code,
-                    // it installs no handler, and a process stuck in an
-                    // uninterruptible read would ignore anything catchable
-                    // in any case. Not followed by a blocking wait, for
-                    // the same reason the channel arm above does not wait:
-                    // that would freeze the whole single-threaded helper
-                    // one step past the budget meant to bound it.
-                    log_failed_kill(
-                        nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL),
-                        child,
-                        "SIGKILL on verification timeout",
-                    );
-                    crate::log::warn(
-                        "helper",
-                        &format!(
-                            "the child verifying a proof for {login} said nothing \
-                         within {:?}; killed, and the proof refused",
-                            config.verify_timeout
-                        ),
-                    );
-                    None
-                }
-            };
-            let answer = match verdict {
-                Some(Verdict::Admitted {
-                    account,
-                    identity,
-                    algorithm,
-                }) => {
-                    // Fix F2, unchanged by the fork: the login exists from
-                    // THIS moment, not only once it opens a first channel --
-                    // and this is the one place it can come to exist at all
-                    // (see `LoopState::logins`). A refusal here (the cap,
-                    // or this token already bound to a different account)
-                    // refuses the WHOLE verification, exactly as a bad
-                    // signature would, and carries the same
-                    // `REFUSED_REASON` so the two cannot be told apart.
-                    //
-                    // `rhost` is cloned into `ensure_login`, which keeps its
-                    // own copy on the login entry, so that the accept line
-                    // below can still use the one this process already
-                    // sanitized rather than reading it back out of state.
-                    match ensure_login(state, login_id, &account, rhost.clone()) {
-                        Ok(incarnation) => {
-                            // §10's accept line: a public contract, close
-                            // to `sshd`'s own wording so an existing
-                            // `fail2ban` filter needs only a small edit.
-                            // `login` and `rhost` are ALREADY
-                            // `sanitized_login_name`/`sanitized_rhost` --
-                            // set once, on `PendingWhat::Verify`, the one
-                            // door anything external takes into this root
-                            // process's log -- and `identity` is already
-                            // `SHA256:<fingerprint>`, so this line needs no
-                            // sanitizing of its own, only assembly.
-                            crate::log::info(
+            #[cfg(target_os = "linux")]
+            {
+                let mut answered = answered;
+                let now = Instant::now();
+                let (result, complete) = match custody.as_mut() {
+                    Some(custody) => {
+                        let update = custody.poll(&report, state.stopping, now);
+                        if let Some((signal, error)) = update.signal_failure {
+                            crate::log::error(
                                 "helper",
                                 &format!(
-                                    "Accepted signature for {login} from {rhost} key \
-                                 {algorithm} {identity}"
+                                    "verification cleanup signal {signal} failed: errno {error}"
                                 ),
                             );
-                            let response = Response::Verified {
-                                uid: account.uid.as_raw(),
-                                name: account.name.clone(),
-                                identity,
-                                incarnation,
-                            };
-                            // Exactly what came off the pipe, and never a
-                            // second `account::lookup`: repeating that
-                            // lookup on the loop is the unbounded
-                            // name-service call this entire fork exists to
-                            // be rid of. This cache tracks UID admission;
-                            // channel policy comes from the bound login.
-                            state.verified.insert(account.uid, account);
-                            response
                         }
-                        Err(reason) => {
-                            crate::log::warn(
-                                "helper",
-                                &format!(
-                                    "a Verify request that otherwise checked out was \
-                                 refused: {}",
-                                    crate::log::one_line(reason)
-                                ),
-                            );
-                            Response::Refused {
-                                reason: REFUSED_REASON.to_string(),
-                            }
+                        (
+                            update.result,
+                            matches!(
+                                update.cleanup,
+                                crate::process_scope::scope::Progress::Complete(_)
+                            ),
+                        )
+                    }
+                    None => {
+                        // Missing exact ownership is permanent Unknown, not
+                        // authority to act on the diagnostic child number.
+                        (
+                            (!answered).then_some(Err(super::startup::Failure::Protocol)),
+                            false,
+                        )
+                    }
+                };
+                if !answered {
+                    if let Some(result) = result {
+                        // Preserve the typed deadline diagnostic even on a
+                        // periodic pass, without claiming native cleanup finished.
+                        if matches!(&result, Err(super::startup::Failure::TimedOut)) {
+                            crate::log::warn("helper", &format!(
+                                "the child verifying a proof for {login} said nothing within {:?}; proof refused, cleanup remains owned",
+                                config.verify_timeout
+                            ));
                         }
+                        let verdict = result.ok().and_then(|record| decode_verdict(&record));
+                        publish_verification(
+                            seams,
+                            state,
+                            VerificationReply {
+                                id,
+                                login: &login,
+                                login_id,
+                                rhost: &rhost,
+                            },
+                            verdict,
+                            why,
+                        );
+                        answered = true;
                     }
                 }
-                Some(Verdict::Refused {
-                    reason,
-                    unknown_account,
-                }) => {
-                    // The DETAILED reason to the log; the worker gets only
-                    // the fixed `REFUSED_REASON` -- see that constant's
-                    // docs for why. The reason travels back from the child
-                    // rather than being logged there, so that every line
-                    // about a refusal still comes from the one privileged
-                    // process that has a log at all.
-                    // `one_line`: the child's words about a proof the worker
-                    // chose -- an error text may quote it.
-                    crate::log::warn(
-                        "helper",
-                        &format!(
-                            "a Verify request was refused: {}",
-                            crate::log::one_line(&reason)
-                        ),
-                    );
-                    // §10's refuse line, the mirror of the accept line
-                    // above -- `sshd`'s own two shapes, picked by
-                    // `unknown_account`, which the child decided rather
-                    // than this site guessing it back out of `reason`'s
-                    // free-form words. `login`/`rhost` are the same
-                    // sanitized copies the accept line uses; the WIRE
-                    // answer stays the single `REFUSED_REASON` below
-                    // either way, so this line changes nothing the worker
-                    // can observe.
-                    if unknown_account {
-                        crate::log::warn(
-                            "helper",
-                            &format!("Failed signature for invalid user {login} from {rhost}"),
-                        );
-                    } else {
-                        crate::log::warn(
-                            "helper",
-                            &format!("Failed signature for {login} from {rhost}"),
-                        );
-                    }
-                    Response::Refused {
-                        reason: REFUSED_REASON.to_string(),
-                    }
+                if !(answered && complete) {
+                    state.pending.insert(Pending {
+                        deadline,
+                        what: PendingWhat::Verify {
+                            report,
+                            child,
+                            answered,
+                            custody,
+                            id,
+                            login,
+                            login_id,
+                            rhost,
+                        },
+                    });
                 }
-                None => {
-                    // An incomplete verdict is a refusal, ALWAYS -- see
-                    // `verdict_from_pipe` for why end-of-file here cannot
-                    // mean what it means for a channel's startup report.
-                    // The expired case has already logged a line of its
-                    // own above; this covers a child that died, was killed
-                    // from outside, or wrote something that is not a
-                    // verdict.
-                    if matches!(why, WhyFinished::Spoke) {
+                let _ = config; // request budgets were captured before fork
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let report_pipe = report;
+                // Whatever the verdict, this child is finished: it wrote its
+                // record and `_exit`ed, or it is about to be killed. Either
+                // way NOTHING waits for it here -- `reap`'s `WNOHANG` pass
+                // buries it.
+                state.orphans.push(child);
+                let verdict = match why {
+                    WhyFinished::Spoke => verdict_from_pipe(&report_pipe, deadline),
+                    WhyFinished::Expired => {
+                        // The child is stuck in something with no deadline of
+                        // its own: a name service that never answers, a home
+                        // directory on a mount that has stopped. SIGKILL
+                        // rather than SIGHUP -- it is this helper's own code,
+                        // it installs no handler, and a process stuck in an
+                        // uninterruptible read would ignore anything catchable
+                        // in any case. Not followed by a blocking wait, for
+                        // the same reason the channel arm above does not wait:
+                        // that would freeze the whole single-threaded helper
+                        // one step past the budget meant to bound it.
+                        log_failed_kill(
+                            nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL),
+                            child,
+                            "SIGKILL on verification timeout",
+                        );
                         crate::log::warn(
                             "helper",
                             &format!(
-                                "the child verifying a proof for {login} ended without \
-                             a usable verdict; refusing"
+                                "the child verifying a proof for {login} said nothing \
+                         within {:?}; killed, and the proof refused",
+                                config.verify_timeout
                             ),
                         );
+                        None
                     }
+                };
+
+                let _ = answered;
+                publish_verification(
+                    seams,
+                    state,
+                    VerificationReply {
+                        id,
+                        login: &login,
+                        login_id,
+                        rhost: &rhost,
+                    },
+                    verdict,
+                    why,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn progress_verifications(seams: Seams<'_>, state: &mut LoopState, config: &HelperConfig) {
+    for fd in state.pending.verification_fds() {
+        if let Some(pending) = state.pending.take_ready(fd) {
+            finish_pending(seams, state, config, pending, WhyFinished::Progress);
+        }
+    }
+}
+
+struct VerificationReply<'a> {
+    id: super::protocol::AuthRequestId,
+    login: &'a str,
+    login_id: LoginId,
+    rhost: &'a str,
+}
+
+fn publish_verification(
+    seams: Seams<'_>,
+    state: &mut LoopState,
+    request: VerificationReply<'_>,
+    verdict: Option<Verdict>,
+    why: WhyFinished,
+) {
+    let VerificationReply {
+        id,
+        login,
+        login_id,
+        rhost,
+    } = request;
+    // A late completed proof cannot recreate admission after sticky stop.
+    let verdict = if state.stopping || state.required_publication.is_some() {
+        None
+    } else {
+        verdict
+    };
+    let answer = match verdict {
+        Some(Verdict::Admitted {
+            account,
+            identity,
+            algorithm,
+        }) => {
+            // Fix F2, unchanged by the fork: the login exists from
+            // THIS moment, not only once it opens a first channel --
+            // and this is the one place it can come to exist at all
+            // (see `LoopState::logins`). A refusal here (the cap,
+            // or this token already bound to a different account)
+            // refuses the WHOLE verification, exactly as a bad
+            // signature would, and carries the same
+            // `REFUSED_REASON` so the two cannot be told apart.
+            //
+            // `rhost` is cloned into `ensure_login`, which keeps its
+            // own copy on the login entry, so that the accept line
+            // below can still use the one this process already
+            // sanitized rather than reading it back out of state.
+            match ensure_login(state, login_id, &account, rhost.to_string()) {
+                Ok(incarnation) => {
+                    // §10's accept line: a public contract, close
+                    // to `sshd`'s own wording so an existing
+                    // `fail2ban` filter needs only a small edit.
+                    // `login` and `rhost` are ALREADY
+                    // `sanitized_login_name`/`sanitized_rhost` --
+                    // set once, on `PendingWhat::Verify`, the one
+                    // door anything external takes into this root
+                    // process's log -- and `identity` is already
+                    // `SHA256:<fingerprint>`, so this line needs no
+                    // sanitizing of its own, only assembly.
+                    crate::log::info(
+                        "helper",
+                        &format!(
+                            "Accepted signature for {login} from {rhost} key \
+                                 {algorithm} {identity}"
+                        ),
+                    );
+                    let response = Response::Verified {
+                        uid: account.uid.as_raw(),
+                        name: account.name.clone(),
+                        identity,
+                        incarnation,
+                    };
+                    // Exactly what came off the pipe, and never a
+                    // second `account::lookup`: repeating that
+                    // lookup on the loop is the unbounded
+                    // name-service call this entire fork exists to
+                    // be rid of. This cache tracks UID admission;
+                    // channel policy comes from the bound login.
+                    state.verified.insert(account.uid, account);
+                    response
+                }
+                Err(reason) => {
+                    crate::log::warn(
+                        "helper",
+                        &format!(
+                            "a Verify request that otherwise checked out was \
+                                 refused: {}",
+                            crate::log::one_line(reason)
+                        ),
+                    );
                     Response::Refused {
                         reason: REFUSED_REASON.to_string(),
                     }
                 }
-            };
-            reply(seams.auth, &AuthResponse { id, body: answer });
+            }
         }
-    }
+        Some(Verdict::Refused {
+            reason,
+            unknown_account,
+        }) => {
+            // The DETAILED reason to the log; the worker gets only
+            // the fixed `REFUSED_REASON` -- see that constant's
+            // docs for why. The reason travels back from the child
+            // rather than being logged there, so that every line
+            // about a refusal still comes from the one privileged
+            // process that has a log at all.
+            // `one_line`: the child's words about a proof the worker
+            // chose -- an error text may quote it.
+            crate::log::warn(
+                "helper",
+                &format!(
+                    "a Verify request was refused: {}",
+                    crate::log::one_line(&reason)
+                ),
+            );
+            // §10's refuse line, the mirror of the accept line
+            // above -- `sshd`'s own two shapes, picked by
+            // `unknown_account`, which the child decided rather
+            // than this site guessing it back out of `reason`'s
+            // free-form words. `login`/`rhost` are the same
+            // sanitized copies the accept line uses; the WIRE
+            // answer stays the single `REFUSED_REASON` below
+            // either way, so this line changes nothing the worker
+            // can observe.
+            if unknown_account {
+                crate::log::warn(
+                    "helper",
+                    &format!("Failed signature for invalid user {login} from {rhost}"),
+                );
+            } else {
+                crate::log::warn(
+                    "helper",
+                    &format!("Failed signature for {login} from {rhost}"),
+                );
+            }
+            Response::Refused {
+                reason: REFUSED_REASON.to_string(),
+            }
+        }
+        None => {
+            // An incomplete verdict is a refusal, ALWAYS -- see
+            // `verdict_from_pipe` for why end-of-file here cannot
+            // mean what it means for a channel's startup report.
+            // The expired case has already logged a line of its
+            // own above; this covers a child that died, was killed
+            // from outside, or wrote something that is not a
+            // verdict.
+            if matches!(why, WhyFinished::Spoke) {
+                crate::log::warn(
+                    "helper",
+                    &format!("verification for {login} has no usable verdict; refusing"),
+                );
+            }
+            Response::Refused {
+                reason: REFUSED_REASON.to_string(),
+            }
+        }
+    };
+    reply(seams.auth, &AuthResponse { id, body: answer });
 }
 
 /// Apply what a monitor said about one channel it was asked to start.
@@ -3614,9 +4669,10 @@ fn apply_channel_verdict(
     }
     let cancelled = cancelled || state.retired.contains(&owner);
     match report {
-        StartupReport::Started if cancelled => {
+        StartupReport::Started | StartupReport::Failed(nix::Error::ECANCELED) if cancelled => {
             // `Request::Close` reached this channel while it was still
-            // starting. Its shell is already dead of that `SIGHUP`, and a
+            // starting. Native monitors report ECANCELED explicitly; legacy
+            // monitors may report clean EOF as Started. Its shell is already dead of that `SIGHUP`, and a
             // report pipe at end-of-file says only "the descriptor closed"
             // -- never "the exec took". Answering `Opened` here would hand
             // the worker a terminal whose process is a corpse; the
@@ -3682,7 +4738,7 @@ fn apply_channel_verdict(
                     ),
                 ),
             }
-            reply_with_fd(channels, &Response::Opened { id }, master.as_fd());
+            required_reply_with_fd(channels, state, &Response::Opened { id }, master.as_fd());
         }
         StartupReport::Failed(errno) => {
             drop(master);
@@ -3743,7 +4799,12 @@ fn refuse_starting_channel(
     if let Some(slot) = state.live.get_mut(&id) {
         *slot = ChannelSlot::Cleaning(slot.owner());
     }
-    reply(channels, &Response::Failed { id, reason });
+    required_reply(
+        channels,
+        state,
+        RequiredPublication::Refused,
+        &Response::Failed { id, reason },
+    );
 }
 
 /// What a `Request::Open` asks [`open_channel`] to start, besides whose
@@ -4188,6 +5249,15 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     include!("log_tests.rs");
+    include!("monitor_scope_tests.rs");
+    include!("monitor_retirement_tests.rs");
+    include!("monitor_completion_tests.rs");
+    include!("shutdown_owner_tests.rs");
+    include!("monitor_shutdown_tests.rs");
+    include!("verification_lifecycle_tests.rs");
+    include!("worker_parent_tests.rs");
+    include!("required_reply_tests.rs");
+    include!("stop_signal_tests.rs");
     use super::*;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -6107,7 +7177,7 @@ pub(crate) mod tests {
             for login in &monitor_logins {
                 // SAFETY: as in `serve`'s own loop -- the `Monitor` owns
                 // its seam for as long as it is on the table.
-                let raw = state.monitors[login].seam.as_raw_fd();
+                let raw = state.monitors[login].seam().as_raw_fd();
                 fds.push(PollFd::new(
                     unsafe { BorrowedFd::borrow_raw(raw) },
                     PollFlags::POLLIN,
@@ -6133,6 +7203,8 @@ pub(crate) mod tests {
             settle_ready_pending(self.seams(), state, config, &ready);
             serve_ready_monitors(self.seams(), state, &ready_monitors);
             expire_pending(self.seams(), state, config, Instant::now());
+            #[cfg(target_os = "linux")]
+            progress_verifications(self.seams(), state, config);
         }
     }
 
@@ -6174,6 +7246,7 @@ pub(crate) mod tests {
     /// exits, which is `CLOSE_GRACE_PERIOD` in the worst case (a shell that
     /// ignores `SIGHUP`), and a monitor still there long after that is a
     /// failure worth reporting rather than hanging on.
+    #[cfg(not(target_os = "linux"))]
     fn stop_monitors(state: &mut LoopState) {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
@@ -6182,7 +7255,7 @@ pub(crate) mod tests {
             .drain()
             .map(|(_, monitor)| {
                 // Its end-of-file is what tells a monitor to end.
-                drop(monitor.seam);
+                drop(monitor.process);
                 monitor.pid
             })
             .collect();
@@ -6205,6 +7278,60 @@ pub(crate) mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop_monitors(state: &mut LoopState) {
+        let seams = DirectSeam::new();
+        let owners: Vec<_> = state
+            .monitors
+            .iter()
+            .filter_map(|(owner, monitor)| {
+                matches!(monitor.process, MonitorProcess::Native(_)).then_some(*owner)
+            })
+            .collect();
+        for &owner in &owners {
+            retire_login(&seams.helper, state, owner);
+        }
+        let force_at = Instant::now() + TEST_RECV_TIMEOUT;
+        loop {
+            serve_ready_monitors(seams.seams(), state, &[]);
+            reap_owned_monitors(&seams.helper, state);
+            if owners.iter().all(|owner| {
+                state
+                    .monitors
+                    .get(owner)
+                    .is_none_or(|monitor| monitor.reaped)
+            }) {
+                break;
+            }
+            if Instant::now() >= force_at {
+                for owner in &owners {
+                    if let Some(Monitor {
+                        process: MonitorProcess::Native(native),
+                        ..
+                    }) = state.monitors.get_mut(owner)
+                    {
+                        native.force(Instant::now());
+                    }
+                }
+            }
+            // The deadline only requests exact force, never certifies cleanup.
+            // Real native loss controls use their own exact pinned cleanup;
+            // ordinary handler fixtures must retain these owners until joined.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for owner in owners {
+            assert!(
+                !state.live.values().any(|slot| slot.owner() == owner),
+                "native monitor completion cannot invent a missing shell receipt"
+            );
+            finish_retired(state, owner);
+        }
+        assert!(
+            state.orphans.is_empty(),
+            "Linux verifier custody must remain typed"
+        );
     }
 
     /// Serves one request against `state` and settles whatever it left
@@ -6264,6 +7391,8 @@ pub(crate) mod tests {
             })
             .collect();
         LoopState {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             live: HashMap::new(),
             pending: PendingTable::default(),
             orphans: Vec::new(),
@@ -6275,6 +7404,9 @@ pub(crate) mod tests {
             retired: HashSet::new(),
             highest_channel_id: 0,
             next_incarnation: 1,
+            pam_cleanup: PamCompletion::NotOpened,
+            required_publication: None,
+            stopping: false,
         }
     }
 
@@ -6327,6 +7459,8 @@ pub(crate) mod tests {
     /// is already verified) cannot express.
     fn empty_state() -> LoopState {
         LoopState {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
             live: HashMap::new(),
             pending: PendingTable::default(),
             orphans: Vec::new(),
@@ -6338,6 +7472,9 @@ pub(crate) mod tests {
             retired: HashSet::new(),
             highest_channel_id: 0,
             next_incarnation: 1,
+            pam_cleanup: PamCompletion::NotOpened,
+            required_publication: None,
+            stopping: false,
         }
     }
 
@@ -6758,31 +7895,37 @@ pub(crate) mod tests {
     /// the arming deleted.
     #[test]
     fn a_killed_monitor_takes_its_shells_with_it() {
-        let login = [9u8; 16];
-        let h = helper_with_verified([(login, my_account())]);
-        let (first, first_terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
-        let (second, second_terminal) = shell_pid_behind_channel(&h.channels, 2, my_uid(), login);
-        let monitor = parent_of(first);
-        assert_eq!(
-            parent_of(second),
-            monitor,
-            "setup: both shells must hang off the one monitor of their login"
-        );
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_killed"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let login = [9u8; 16];
+            let h = helper_with_verified([(login, my_account())]);
+            let (first, first_terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
+            let (second, second_terminal) =
+                shell_pid_behind_channel(&h.channels, 2, my_uid(), login);
+            let monitor = parent_of(first);
+            assert_eq!(
+                parent_of(second),
+                monitor,
+                "setup: both shells must hang off the one monitor of their login"
+            );
 
-        nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGKILL)
-            .expect("killing the monitor");
+            nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGKILL)
+                .expect("killing the monitor");
 
-        // Neither is left running with a session nobody can close.
-        for shell in [first, second] {
-            wait_until_process_gone(
+            // Neither is left running with a session nobody can close.
+            for shell in [first, second] {
+                wait_until_process_gone(
                 shell,
                 "a shell must not outlive the monitor that forked it -- it would hold a session \
                  no process is left to close",
             );
+            }
+            drop(first_terminal);
+            drop(second_terminal);
+            h.stop();
         }
-        drop(first_terminal);
-        drop(second_terminal);
-        h.stop();
     }
 
     /// A channel id refused as a duplicate must not extend its monitor's
@@ -7175,6 +8318,18 @@ pub(crate) mod tests {
             "setup: the verification must be waiting on a child of its own"
         );
 
+        #[cfg(target_os = "linux")]
+        let owned_child = {
+            let fd = state.pending.verification_fds()[0];
+            let entry = state.pending.take_ready(fd).unwrap();
+            let child = match &entry.what {
+                PendingWhat::Verify { child, .. } => *child,
+                _ => unreachable!("the only pending entry is verification"),
+            };
+            state.pending.insert(entry); // custody is retained throughout
+            child
+        };
+
         seam.settle(&mut state, &config);
 
         let answer = next_answer(&seam.worker_auth);
@@ -7196,14 +8351,29 @@ pub(crate) mod tests {
              name must not read as a real account; the log holds:\n{log}"
         );
 
-        let child = *state
-            .orphans
-            .first()
-            .expect("the child is left for `reap` to bury, never waited for here");
-        assert_killed_and_reaped(
-            child,
-            "a verification that outlived its deadline must be killed, not merely refused",
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                state.pending.verifying() == 0 && state.orphans.is_empty(),
+                "qualified verification must settle exact custody without orphan transfer"
+            );
+            assert_eq!(
+                nix::sys::wait::waitpid(owned_child, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+                Err(nix::errno::Errno::ECHILD),
+                "the exact verification child must already be reaped by product settlement"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let child = *state
+                .orphans
+                .first()
+                .expect("the child is left for `reap` to bury, never waited for here");
+            assert_killed_and_reaped(
+                child,
+                "a verification that outlived its deadline must be killed, not merely refused",
+            );
+        }
     }
 
     // -- a malformed request cannot forge a line ------------------------
@@ -7294,7 +8464,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED),
-                Next::Stop
+                Next::Failed
             ),
             "a malformed request still stops the helper"
         );
@@ -7308,11 +8478,69 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED),
-                Next::Stop
+                Next::Failed
             ),
             "a malformed request still stops the helper"
         );
         assert_one_unforgeable_line(&read());
+    }
+
+    #[test]
+    fn seam_clean_eof_is_distinct_from_malformed_request() {
+        let config = test_config();
+        for authentication in [false, true] {
+            let mut state = empty_state();
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            let eof = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            super::channel::send(peer, b"invalid-json", None).unwrap();
+            let malformed = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            let seam = DirectSeam::new();
+            let peer = if authentication {
+                &seam.worker_auth
+            } else {
+                &seam.worker
+            };
+            super::channel::send(
+                peer,
+                &vec![b'x'; crate::helper::protocol::MAX_MESSAGE_LEN + 1],
+                None,
+            )
+            .unwrap();
+            let truncated = if authentication {
+                serve_auth_seam(seam.seams(), &mut state, &config, UNPRIVILEGED)
+            } else {
+                serve_channel_seam(&seam.helper, &mut state, &config, UNPRIVILEGED)
+            };
+            assert_eq!(
+                std::mem::discriminant(&truncated),
+                std::mem::discriminant(&malformed)
+            );
+            assert_ne!(
+                std::mem::discriminant(&eof),
+                std::mem::discriminant(&malformed),
+                "clean producer EOF must not erase protocol failure (auth={authentication})"
+            );
+        }
     }
 
     // -- §10's accept and refuse lines --------------------------------
@@ -7806,49 +9034,54 @@ pub(crate) mod tests {
     /// and neither takes a `now` a test could hand it.
     #[test]
     fn a_monitor_that_never_reports_a_close_is_killed() {
-        let login = [12u8; 16];
-        let h = helper_with_verified([(login, my_account())]);
-        let (shell, terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
-        let monitor = parent_of(shell);
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_close_stopped"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let login = [12u8; 16];
+            let h = helper_with_verified([(login, my_account())]);
+            let (shell, terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
+            let monitor = parent_of(shell);
 
-        // Not serving, and unable to become so: no `SIGHUP`, no
-        // escalation, no exit reported.
-        nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGSTOP)
-            .expect("stopping the monitor");
-        super::channel::send(
-            &h.channels,
-            &encode(&Request::Close { id: 1 }).expect("encode"),
-            None,
-        )
-        .expect("send close");
+            // Not serving, and unable to become so: no `SIGHUP`, no
+            // escalation, no exit reported.
+            nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGSTOP)
+                .expect("stopping the monitor");
+            super::channel::send(
+                &h.channels,
+                &encode(&Request::Close { id: 1 }).expect("encode"),
+                None,
+            )
+            .expect("send close");
 
-        wait_until_process_gone(
+            wait_until_process_gone(
             monitor,
             "a monitor that reports no exit within its grace must be killed, or its channel can \
              never be closed",
         );
-        // And the shell goes with it, through the parent-death signal each
-        // one arms: a stopped monitor could not have signalled it.
-        wait_until_process_gone(
-            shell,
-            "and the shell of a monitor that was killed must not be left behind",
-        );
+            // And the shell goes with it, through the parent-death signal each
+            // one arms: a stopped monitor could not have signalled it.
+            wait_until_process_gone(
+                shell,
+                "and the shell of a monitor that was killed must not be left behind",
+            );
 
-        // And the LOGIN went with the monitor: were it left behind, the next
-        // `Open` under this token would fork a second monitor for one login
-        // -- from the next task on, a second PAM session with the first left
-        // open. This is the escalation path's own witness of that; the
-        // killed-from-outside path has
-        // `a_login_never_gets_a_second_monitor`.
-        let (again, fd) = open_result_with_fd(&h.channels, 2, my_uid(), login);
-        assert!(
+            // And the LOGIN went with the monitor: were it left behind, the next
+            // `Open` under this token would fork a second monitor for one login
+            // -- from the next task on, a second PAM session with the first left
+            // open. This is the escalation path's own witness of that; the
+            // killed-from-outside path has
+            // `a_login_never_gets_a_second_monitor`.
+            let (again, fd) = open_result_with_fd(&h.channels, 2, my_uid(), login);
+            assert!(
             matches!(&again, Response::Failed { id: 2, .. }),
             "a login whose monitor was killed for not answering must not be given a second one, \
              got {again:?}"
         );
-        assert!(fd.is_none(), "a refusal must not hand back a terminal");
-        drop(terminal);
-        h.stop();
+            assert!(fd.is_none(), "a refusal must not hand back a terminal");
+            drop(terminal);
+            h.stop();
+        }
     }
 
     /// One login never has two monitors, however its first one was lost.
@@ -7868,51 +9101,56 @@ pub(crate) mod tests {
     /// all, and it reaches the same `forget_login` the other two do.
     #[test]
     fn a_login_never_gets_a_second_monitor() {
-        let login = [21u8; 16];
-        let h = helper_with_verified([(login, my_account())]);
-        // A channel that keeps running, so the monitor is unambiguously
-        // alive and serving when it is killed.
-        let (shell, terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
-        let monitor = parent_of(shell);
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_no_second"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let login = [21u8; 16];
+            let h = helper_with_verified([(login, my_account())]);
+            // A channel that keeps running, so the monitor is unambiguously
+            // alive and serving when it is killed.
+            let (shell, terminal) = shell_pid_behind_channel(&h.channels, 1, my_uid(), login);
+            let monitor = parent_of(shell);
 
-        nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGKILL)
-            .expect("killing the monitor");
+            nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGKILL)
+                .expect("killing the monitor");
 
-        // The channel's end reaching the worker is how the helper says it
-        // has noticed -- so what follows is not a race with the reaper.
-        let (exit, _fd) = answer_to_or_fail(
-            &h.channels,
-            1,
-            "the channel of a monitor that died must be reported to the worker",
-        );
-        assert!(
-            matches!(exit, Response::Exited { id: 1, .. }),
-            "got {exit:?}"
-        );
-        // Held until after that, so the pseudo-terminal cannot hang itself
-        // up and end the shell for reasons of its own.
-        drop(terminal);
+            // The channel's end reaching the worker is how the helper says it
+            // has noticed -- so what follows is not a race with the reaper.
+            let (exit, _fd) = answer_to_or_fail(
+                &h.channels,
+                1,
+                "the channel of a monitor that died must be reported to the worker",
+            );
+            assert!(
+                matches!(exit, Response::Exited { id: 1, .. }),
+                "got {exit:?}"
+            );
+            // Held until after that, so the pseudo-terminal cannot hang itself
+            // up and end the shell for reasons of its own.
+            drop(terminal);
 
-        // Refused, and a monitor is never forked for a refused `Open` --
-        // every path that forks one answers `Opened`. WHICH refusal it is
-        // is determined here, and worth asking for: this login was its
-        // account's last, so `forget_login` dropped the account from
-        // `verified` in the same step, and the uid check runs before the
-        // login check. Naming the reason rules out a whole class of passing
-        // for the wrong cause -- an implementation that left the dead
-        // monitor on file and refused because the send to it failed would
-        // satisfy a bare `Failed { id: 2, .. }` -- and it is the only thing
-        // that pins the other half of losing a monitor: the account's place
-        // in `verified` goes with its last login, however that login ended.
-        let (again, fd) = open_result_with_fd(&h.channels, 2, my_uid(), login);
-        assert!(
+            // Refused, and a monitor is never forked for a refused `Open` --
+            // every path that forks one answers `Opened`. WHICH refusal it is
+            // is determined here, and worth asking for: this login was its
+            // account's last, so `forget_login` dropped the account from
+            // `verified` in the same step, and the uid check runs before the
+            // login check. Naming the reason rules out a whole class of passing
+            // for the wrong cause -- an implementation that left the dead
+            // monitor on file and refused because the send to it failed would
+            // satisfy a bare `Failed { id: 2, .. }` -- and it is the only thing
+            // that pins the other half of losing a monitor: the account's place
+            // in `verified` goes with its last login, however that login ended.
+            let (again, fd) = open_result_with_fd(&h.channels, 2, my_uid(), login);
+            assert!(
             matches!(&again, Response::Failed { id: 2, reason } if reason == UNVERIFIED_ACCOUNT_REASON),
             "a login whose monitor is gone must not be given a second one -- from the next task \
              that is a second PAM session for one login, with the first left open and nobody \
              able to close it: got {again:?}"
         );
-        assert!(fd.is_none(), "a refusal must not hand back a terminal");
-        h.stop();
+            assert!(fd.is_none(), "a refusal must not hand back a terminal");
+            h.stop();
+        }
     }
 
     /// A login that ends with a channel still OPEN takes that channel's
@@ -8202,7 +9440,15 @@ pub(crate) mod tests {
             monitor_owner,
             Monitor {
                 reaped: false,
-                seam: helper_end,
+                write_closed: false,
+                stop_attempted: false,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
+                process: MonitorProcess::Controlled(helper_end),
+                #[cfg(target_os = "linux")]
+                signal_failure: None,
                 pid: Pid::from_raw(i32::MAX),
             },
         );
@@ -8912,6 +10158,7 @@ pub(crate) mod tests {
     /// a test driving the handler directly has no `reap` of its own
     /// running and would otherwise leave a zombie in the test binary for
     /// the rest of the run.
+    #[cfg(not(target_os = "linux"))]
     fn assert_killed_and_reaped(child: Pid, what: &str) {
         use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
@@ -9173,7 +10420,8 @@ pub(crate) mod tests {
             matches!(state.live.get(&1), Some(ChannelSlot::Starting(_))),
             "setup: the request must have reserved the id"
         );
-        let monitor = state.monitors[&owner_for(&state, login)].pid;
+        let owner = owner_for(&state, login);
+        let monitor = state.monitors[&owner].pid;
         let shell = wait_until_child_of(monitor, "the monitor must fork a shell for this Open");
         assert!(
             state.logins.contains_key(&login),
@@ -9216,6 +10464,26 @@ pub(crate) mod tests {
             "the failed outcome must retain its cleanup registration"
         );
         await_cleanup(&seam, &mut state, &test_config(), 1);
+        // Shell cleanup and the monitor's real final PAM/native completion are
+        // independent. Keep pumping both rather than equating their receipts.
+        let final_deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        while state.monitors.contains_key(&owner) {
+            assert!(
+                Instant::now() < final_deadline,
+                "final monitor cleanup did not settle"
+            );
+            seam.one_pass(&mut state, &test_config());
+        }
+        use crate::helper::pam_completion::PamStep::Attempted;
+        assert_eq!(
+            state.pam_cleanup,
+            PamCompletion::Finished {
+                close_session: Attempted(0),
+                delete_cred: Attempted(0),
+                end: Attempted(0),
+            }
+        );
+        assert!(!state.retired.contains(&owner));
         assert!(
             state.monitors.is_empty(),
             "and the login's monitor must be gone with its entry"
@@ -9331,6 +10599,35 @@ pub(crate) mod tests {
         let request = proof_for_login(&key, &my_login(), [8u8; 32], nonce, [53u8; 16]);
         let id = seam.serve_auth(&mut state, request, &config, switches);
 
+        #[cfg(target_os = "linux")]
+        let mut verification_pin = {
+            use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+            let fd = state.pending.verification_fds()[0];
+            let pending = state.pending.take_ready(fd).unwrap();
+            let child = match &pending.what {
+                PendingWhat::Verify { child, .. } => *child,
+                _ => unreachable!(),
+            };
+            state.pending.insert(pending);
+            let pin = helper40_pin_verification(&mut state);
+            // Observe the exact reserved child without consuming the product
+            // owner's final wait. Preserve the panic barrier's exit-code proof.
+            let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+            let status = loop {
+                match waitid(
+                    Id::Pid(child),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                ) {
+                    Ok(WaitStatus::StillAlive) | Err(nix::Error::EINTR) => {}
+                    Ok(status) => break status,
+                    Err(error) => panic!("observe owned panic child: {error}"),
+                }
+                assert!(Instant::now() < deadline, "panic child did not exit");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(status, WaitStatus::Exited(child, PANICKED_CHILD_EXIT));
+            pin
+        };
         seam.settle(&mut state, &config);
 
         let answer = next_answer(&seam.worker_auth);
@@ -9341,15 +10638,31 @@ pub(crate) mod tests {
              never an admission; got {:?}",
             answer.body
         );
-        let child = *state
-            .orphans
-            .last()
-            .expect("the child is left for `reap` to bury");
-        assert_eq!(
-            exit_status_of(child, "the child that panicked must have ENDED"),
-            nix::sys::wait::WaitStatus::Exited(child, PANICKED_CHILD_EXIT),
-            "the child must leave by its own `_exit`, not by unwinding out of the fork"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                state.pending.verifying(),
+                0,
+                "actual cleanup refunds admission"
+            );
+            assert!(state.orphans.is_empty(), "no numeric orphan transfer");
+            assert!(matches!(
+                verification_pin.observe(&mut crate::process_scope::Native),
+                crate::process_scope::Evidence::Exited
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let child = *state
+                .orphans
+                .last()
+                .expect("the child is left for `reap` to bury");
+            assert_eq!(
+                exit_status_of(child, "the child that panicked must have ENDED"),
+                nix::sys::wait::WaitStatus::Exited(child, PANICKED_CHILD_EXIT),
+                "the child must leave by its own `_exit`, not by unwinding out of the fork"
+            );
+        }
     }
 
     /// And the same for the other of the two children: a panic in a
@@ -10984,6 +12297,8 @@ pub(crate) mod tests {
             "setup: the verification must be waiting on a child of its own"
         );
 
+        #[cfg(target_os = "linux")]
+        let mut verification_pin = helper40_pin_verification(&mut state);
         seam.settle(&mut state, &config);
 
         let answer = next_answer(&seam.worker_auth);
@@ -10997,14 +12312,36 @@ pub(crate) mod tests {
             !state.verified.contains_key(&my_uid()),
             "a proof nobody ever finished checking must admit nobody"
         );
-        let child = *state
-            .orphans
-            .first()
-            .expect("the child is left for `reap` to bury, never waited for here");
-        assert_killed_and_reaped(
-            child,
-            "a verification that outlived its deadline must be killed, not merely refused",
-        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                state.pending.verifying(),
+                0,
+                "native cleanup plus actual final wait releases admission"
+            );
+            assert!(
+                state.orphans.is_empty(),
+                "no raw verification orphan remains"
+            );
+            assert!(
+                matches!(
+                    verification_pin.observe(&mut crate::process_scope::Native),
+                    crate::process_scope::Evidence::Exited
+                ),
+                "the exact timed-out verifier must exit before its charge is refunded"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let child = *state
+                .orphans
+                .first()
+                .expect("the child is left for `reap` to bury, never waited for here");
+            assert_killed_and_reaped(
+                child,
+                "a verification that outlived its deadline must be killed, not merely refused",
+            );
+        }
     }
 
     /// A proof whose nonce is already spent must not merely be REFUSED on the
@@ -11155,6 +12492,9 @@ pub(crate) mod tests {
             what: PendingWhat::Verify {
                 report,
                 child: Pid::from_raw(999_999),
+                answered: false,
+                #[cfg(target_os = "linux")]
+                custody: None,
                 id: 1,
                 login: "filler".to_string(),
                 login_id: [0u8; 16],
@@ -11342,19 +12682,63 @@ pub(crate) mod tests {
         }
     }
 
-    /// A verdict that starts arriving and then stops is refused at the
-    /// ENTRY'S OWN deadline, through the loop's own settling path: the loop
-    /// is never parked waiting for the rest. No child at all -- the test
-    /// holds the pipe's write end open with half a record in it, which is
-    /// what a child whose one `write` was split past `PIPE_BUF` and which
-    /// then stalled leaves behind.
-    ///
-    /// Pins both halves: `verdict_from_pipe` honouring the deadline it is
-    /// given, and `finish_pending` handing it the entry's own. A rescue
-    /// thread closes the write end after `RESCUE_AFTER`, so a regression
-    /// fails the elapsed-time assertion below instead of hanging the run.
+    /// A partial record cannot park the helper. Linux uses a real owned child
+    /// retaining its writer: refusal follows the original deadline, while
+    /// admission stays charged through native cleanup and actual final wait.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_verdict_that_stops_arriving_is_refused_at_its_own_deadline() {
+        let whole = encode_verdict(&Verdict::Admitted {
+            account: distinctive_account(),
+            identity: "SHA256:partial".into(),
+            algorithm: "ED25519".into(),
+        });
+        let mut fixture = Helper40VerificationFixture::new(whole[..whole.len() / 2].to_vec(), true);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let pending = fixture.pending(deadline, 77);
+        let fd = match &pending.what {
+            PendingWhat::Verify { report, .. } => report.as_raw_fd(),
+            _ => unreachable!(),
+        };
+        let mut state = empty_state();
+        let seam = DirectSeam::new();
+        state.pending.insert(pending);
+        let started = Instant::now();
+        settle_ready_pending(seam.seams(), &mut state, &test_config(), &[fd]);
+        let first_pass = started.elapsed();
+        let partial_charged = state.pending.verifying();
+        let mut pinned = helper40_pin_verification(&mut state);
+        seam.settle(&mut state, &test_config());
+        let answer = next_answer(&seam.worker_auth);
+        let elapsed = started.elapsed();
+        let admitted = !state.verified.is_empty();
+        let charged = state.pending.verifying();
+        let exited = matches!(
+            pinned.observe(&mut crate::process_scope::Native),
+            crate::process_scope::Evidence::Exited
+        );
+        drop(state);
+        drop(fixture);
+        assert!(
+            first_pass < Duration::from_millis(100),
+            "partial input cannot park the helper until its deadline"
+        );
+        assert_eq!(partial_charged, 1);
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "unfinished verification cannot be refused before its original deadline"
+        );
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(answer.id, 77);
+        assert!(matches!(answer.body, Response::Refused { reason } if reason == REFUSED_REASON));
+        assert!(!admitted);
+        assert_eq!(charged, 0);
+        assert!(exited, "exact child termination precedes admission refund");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_verdict_that_stops_arriving_is_refused_at_its_own_deadline_legacy() {
         const BUDGET: Duration = Duration::from_millis(200);
         const RESCUE_AFTER: Duration = Duration::from_secs(4);
 
@@ -11379,6 +12763,9 @@ pub(crate) mod tests {
             what: PendingWhat::Verify {
                 report,
                 child: Pid::from_raw(999_999),
+                answered: false,
+                #[cfg(target_os = "linux")]
+                custody: None,
                 id: 77,
                 login: "partial".to_string(),
                 login_id: [13u8; 16],
@@ -12288,7 +13675,7 @@ pub(crate) mod tests {
     /// the first reply the helper tries has nowhere to go and nothing is
     /// ever going to make room (this test never reads that seam). The proof
     /// that the helper came back out of it is taken on the OTHER seam: a
-    /// `Nonce` asked afterwards must still be answered. Control: set the
+    /// `Nonce` asked afterwards must still be answered with admission closed. Control: set the
     /// helper's write timeout to `None` in `serve` -- the send then never
     /// returns and no answer ever comes.
     #[test]
@@ -12356,8 +13743,8 @@ pub(crate) mod tests {
         };
         assert_eq!(answer.id, id, "the answer must carry this request's number");
         assert!(
-            matches!(answer.body, Response::Nonce { .. }),
-            "the helper must answer the other seam, got {:?}",
+            matches!(answer.body, Response::NonceUnavailable),
+            "the helper must answer the other seam while refusing new admission after required send loss, got {:?}",
             answer.body
         );
 
@@ -13944,94 +15331,99 @@ pub(crate) mod tests {
     /// waiting fixes.
     #[test]
     fn a_monitor_stuck_in_its_pam_stack_does_not_outlive_its_login() {
-        // What the monitor's `session_budget` is in this test; the daemon
-        // runs on `STARTUP_REPORT_TIMEOUT`, which is why it is a setting
-        // rather than a constant read in the monitor.
-        const BUDGET: Duration = Duration::from_millis(300);
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_pam_open"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            // What the monitor's `session_budget` is in this test; the daemon
+            // runs on `STARTUP_REPORT_TIMEOUT`, which is why it is a setting
+            // rather than a constant read in the monitor.
+            const BUDGET: Duration = Duration::from_millis(300);
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fifo = dir.path().join("never-written-to");
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
-            .expect("mkfifo");
-        // The writer is held HERE, and that is this test's whole cleanup:
-        // when this frame goes -- by returning or by an assertion unwinding
-        // it -- the last writer closes, the script's `read` reaches
-        // end-of-file, and the script exits. A stack that hung on a sleep
-        // instead would leave a process behind on every failing run.
-        //
-        // `O_RDWR`, not `O_WRONLY`: opening a FIFO for writing alone blocks
-        // until a reader appears, and the reader is the very script this
-        // has to be open before.
-        let _writer = nix::fcntl::open(
-            &fifo,
-            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
-            nix::sys::stat::Mode::empty(),
-        )
-        .expect("open the fifo's write end");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fifo = dir.path().join("never-written-to");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+                .expect("mkfifo");
+            // The writer is held HERE, and that is this test's whole cleanup:
+            // when this frame goes -- by returning or by an assertion unwinding
+            // it -- the last writer closes, the script's `read` reaches
+            // end-of-file, and the script exits. A stack that hung on a sleep
+            // instead would leave a process behind on every failing run.
+            //
+            // `O_RDWR`, not `O_WRONLY`: opening a FIFO for writing alone blocks
+            // until a reader appears, and the reader is the very script this
+            // has to be open before.
+            let _writer = nix::fcntl::open(
+                &fifo,
+                nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+                nix::sys::stat::Mode::empty(),
+            )
+            .expect("open the fifo's write end");
 
-        let script = dir.path().join("hang.sh");
-        write_script(&script, &format!("read line < {f}", f = fifo.display()));
-        write_stack(
-            dir.path(),
-            "qshd-test-hanging-session",
-            &format!(
-                "auth required pam_permit.so\n\
+            let script = dir.path().join("hang.sh");
+            write_script(&script, &format!("read line < {f}", f = fifo.display()));
+            write_stack(
+                dir.path(),
+                "qshd-test-hanging-session",
+                &format!(
+                    "auth required pam_permit.so\n\
                  account required pam_permit.so\n\
                  session required pam_exec.so {s}\n\
                  session required pam_permit.so\n",
-                s = script.display()
-            ),
-        );
+                    s = script.display()
+                ),
+            );
 
-        let key = PrivateKey::random(
-            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
-            Algorithm::Ed25519,
-        )
-        .expect("keygen");
-        let keys = tempfile::tempdir().expect("tempdir");
-        let config = HelperConfig {
-            pam_service: "qshd-test-hanging-session".to_string(),
-            pam_confdir: Some(dir.path().to_path_buf()),
-            startup_timeout: BUDGET,
-            ..trusting_config(keys.path(), &key)
-        };
-        let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
-        assert_admits(&h.auth, &key, &h.me);
+            let key = PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                Algorithm::Ed25519,
+            )
+            .expect("keygen");
+            let keys = tempfile::tempdir().expect("tempdir");
+            let config = HelperConfig {
+                pam_service: "qshd-test-hanging-session".to_string(),
+                pam_confdir: Some(dir.path().to_path_buf()),
+                startup_timeout: BUDGET,
+                ..trusting_config(keys.path(), &key)
+            };
+            let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
+            assert_admits(&h.auth, &key, &h.me);
 
-        // Sent, not waited for: this `Open` is never answered while its
-        // monitor is inside the stack, so a test that waited here would
-        // hang instead of measuring anything.
-        let before = direct_children();
-        super::channel::send(
-            &h.channels,
-            &encode(&open_request(1, my_uid().as_raw(), h.login)).expect("encode"),
-            None,
-        )
-        .expect("send the Open");
-        let monitor = wait_for_new_child(
-            &before,
-            "setup: the Open must fork a monitor, or there is nothing here to be stuck",
-        );
+            // Sent, not waited for: this `Open` is never answered while its
+            // monitor is inside the stack, so a test that waited here would
+            // hang instead of measuring anything.
+            let before = direct_children();
+            super::channel::send(
+                &h.channels,
+                &encode(&open_request(1, my_uid().as_raw(), h.login)).expect("encode"),
+                None,
+            )
+            .expect("send the Open");
+            let monitor = wait_for_new_child(
+                &before,
+                "setup: the Open must fork a monitor, or there is nothing here to be stuck",
+            );
 
-        // And now the login ends, the only way the helper can end one.
-        tell_login_ended(&h.auth, h.login);
-        let ended_at = Instant::now();
+            // And now the login ends, the only way the helper can end one.
+            tell_login_ended(&h.auth, h.login);
+            let ended_at = Instant::now();
 
-        // The monitor must go, and go on its own: nothing kills it here.
-        // Without the deadline it stays for as long as the stack does,
-        // which for this stack is for ever.
-        wait_until_process_gone(
-            monitor,
-            "a monitor whose PAM stack will not come back must end itself rather than outlive \
+            // The monitor must go, and go on its own: nothing kills it here.
+            // Without the deadline it stays for as long as the stack does,
+            // which for this stack is for ever.
+            wait_until_process_gone(
+                monitor,
+                "a monitor whose PAM stack will not come back must end itself rather than outlive \
              its login as a root process with a terminal and a transaction open",
-        );
-        let outlived = ended_at.elapsed();
-        assert!(
-            outlived < TEST_RECV_TIMEOUT,
-            "setup: the wait above is what bounds this, and it returned late ({outlived:?})"
-        );
+            );
+            let outlived = ended_at.elapsed();
+            assert!(
+                outlived < TEST_RECV_TIMEOUT,
+                "setup: the wait above is what bounds this, and it returned late ({outlived:?})"
+            );
 
-        h.stop();
+            h.stop();
+        }
     }
 
     /// A monitor stuck in the CLOSING half of its stack does not outlive
@@ -14048,84 +15440,89 @@ pub(crate) mod tests {
     /// would end this one.
     #[test]
     fn a_monitor_stuck_closing_its_session_does_not_outlive_its_login() {
-        // The opening budget; the closing one is twice it, so the monitor's
-        // whole ordeal is bounded by four of these -- under two seconds.
-        const BUDGET: Duration = Duration::from_millis(300);
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_pam_close"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            // The opening budget; the closing one is twice it, so the monitor's
+            // whole ordeal is bounded by four of these -- under two seconds.
+            const BUDGET: Duration = Duration::from_millis(300);
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let fifo = dir.path().join("never-written-to");
-        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
-            .expect("mkfifo");
-        // Held here, so that leaving this frame -- by returning or by an
-        // assertion unwinding it -- releases the script. See
-        // `a_monitor_stuck_in_its_pam_stack_does_not_outlive_its_login`.
-        let _writer = nix::fcntl::open(
-            &fifo,
-            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
-            nix::sys::stat::Mode::empty(),
-        )
-        .expect("open the fifo's write end");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fifo = dir.path().join("never-written-to");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+                .expect("mkfifo");
+            // Held here, so that leaving this frame -- by returning or by an
+            // assertion unwinding it -- releases the script. See
+            // `a_monitor_stuck_in_its_pam_stack_does_not_outlive_its_login`.
+            let _writer = nix::fcntl::open(
+                &fifo,
+                nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+                nix::sys::stat::Mode::empty(),
+            )
+            .expect("open the fifo's write end");
 
-        // Only the CLOSING half hangs. The opening half must go through, or
-        // there would be no session to be stuck closing -- and the channel
-        // that opens below is the control that says it did.
-        let script = dir.path().join("hang-on-close.sh");
-        write_script(
-            &script,
-            &format!(
-                "if [ \"$PAM_TYPE\" = close_session ]; then read line < {f}; fi",
-                f = fifo.display()
-            ),
-        );
-        write_stack(
-            dir.path(),
-            "qshd-test-hanging-close",
-            &format!(
-                "auth required pam_permit.so\n\
+            // Only the CLOSING half hangs. The opening half must go through, or
+            // there would be no session to be stuck closing -- and the channel
+            // that opens below is the control that says it did.
+            let script = dir.path().join("hang-on-close.sh");
+            write_script(
+                &script,
+                &format!(
+                    "if [ \"$PAM_TYPE\" = close_session ]; then read line < {f}; fi",
+                    f = fifo.display()
+                ),
+            );
+            write_stack(
+                dir.path(),
+                "qshd-test-hanging-close",
+                &format!(
+                    "auth required pam_permit.so\n\
                  account required pam_permit.so\n\
                  session required pam_exec.so {s}\n\
                  session required pam_permit.so\n",
-                s = script.display()
-            ),
-        );
+                    s = script.display()
+                ),
+            );
 
-        let key = PrivateKey::random(
-            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
-            Algorithm::Ed25519,
-        )
-        .expect("keygen");
-        let keys = tempfile::tempdir().expect("tempdir");
-        let config = HelperConfig {
-            pam_service: "qshd-test-hanging-close".to_string(),
-            pam_confdir: Some(dir.path().to_path_buf()),
-            startup_timeout: BUDGET,
-            ..trusting_config(keys.path(), &key)
-        };
-        let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
-        assert_admits(&h.auth, &key, &h.me);
+            let key = PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                Algorithm::Ed25519,
+            )
+            .expect("keygen");
+            let keys = tempfile::tempdir().expect("tempdir");
+            let config = HelperConfig {
+                pam_service: "qshd-test-hanging-close".to_string(),
+                pam_confdir: Some(dir.path().to_path_buf()),
+                startup_timeout: BUDGET,
+                ..trusting_config(keys.path(), &key)
+            };
+            let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
+            assert_admits(&h.auth, &key, &h.me);
 
-        let before = direct_children();
-        let (opened, fd) =
-            open_command_with_fd(&h.channels, 1, my_uid(), h.login, "exec sleep 300");
-        assert!(
-            matches!(opened, Response::Opened { .. }),
-            "control: the opening half of this stack must go through, or there is no session \
+            let before = direct_children();
+            let (opened, fd) =
+                open_command_with_fd(&h.channels, 1, my_uid(), h.login, "exec sleep 300");
+            assert!(
+                matches!(opened, Response::Opened { .. }),
+                "control: the opening half of this stack must go through, or there is no session \
              to be stuck closing; got {opened:?}"
-        );
-        let terminal = fd.expect("control: an opened channel comes with its terminal");
-        let monitor = wait_for_new_child(&before, "setup: the Open must fork a monitor");
+            );
+            let terminal = fd.expect("control: an opened channel comes with its terminal");
+            let monitor = wait_for_new_child(&before, "setup: the Open must fork a monitor");
 
-        tell_login_ended(&h.auth, h.login);
+            tell_login_ended(&h.auth, h.login);
 
-        wait_until_process_gone(
+            wait_until_process_gone(
             monitor,
             "a monitor whose stack will not come back OUT of pam_close_session must end itself: \
              nothing else ends it, since the helper's own escalation needs a channel this \
              monitor no longer has",
         );
 
-        h.stop();
-        drop(terminal);
+            h.stop();
+            drop(terminal);
+        }
     }
 
     /// And the deadline STOPS once the stack has come back: a monitor whose
@@ -14212,23 +15609,28 @@ pub(crate) mod tests {
     /// catchable -- is what the arming asks for.
     #[test]
     fn a_monitor_dies_with_its_helper() {
-        let login = [43u8; 16];
-        let h = helper_with_verified([(login, my_account())]);
-        let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), login);
+        #[cfg(target_os = "linux")]
+        adoption_native::run_case(Some("legacy_helper_death"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let login = [43u8; 16];
+            let h = helper_with_verified([(login, my_account())]);
+            let monitor = monitor_pid_behind_channel(&h.channels, 1, my_uid(), login);
 
-        nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGSTOP)
-            .expect("setup: stopping the monitor");
+            nix::sys::signal::kill(monitor, nix::sys::signal::Signal::SIGSTOP)
+                .expect("setup: stopping the monitor");
 
-        // The helper's loop runs on a thread of this process, and a
-        // parent-death signal fires on the death of the parent THREAD --
-        // so ending the loop is this suite's "the helper died".
-        h.stop();
+            // The helper's loop runs on a thread of this process, and a
+            // parent-death signal fires on the death of the parent THREAD --
+            // so ending the loop is this suite's "the helper died".
+            h.stop();
 
-        assert_killed_and_reaped(
+            assert_killed_and_reaped(
             monitor,
             "a monitor must die with the helper that forked it, even when it is in no state to \
              notice its seam close",
         );
+        }
     }
 
     /// The session is closed when the login ends, by the process that
@@ -15128,4 +16530,9 @@ pub(crate) mod tests {
     }
     include!("server_open_tests.rs");
     include!("server_account_binding_tests.rs");
+    include!("monitor_native_integration_tests.rs");
+    include!("adoption_native_tests.rs");
+    include!("adoption_parent_tests.rs");
+    include!("adoption_pump_tests.rs");
+    include!("adoption_legacy_tests.rs");
 }

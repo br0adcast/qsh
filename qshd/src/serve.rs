@@ -525,9 +525,15 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // The UDP socket is bound BEFORE the split so a port below 1024
         // would still be bindable, and so a port already in use fails the
         // service at once rather than after a process tree exists.
-        return crate::helper::split_and_run(
+        return crate::helper::split_and_run_owned(
             helper_config,
-            move |spawner, helper_auth, login_ends| {
+            move |mut spawner, mut helper_auth, login_ends, context| {
+                let stop = context.stop();
+                // Fixed custody is outside all published Arc clients. On an
+                // early construction failure it stops/joins started siblings.
+                let mut auxiliary = crate::helper::worker_threads::WorkerThreads::default();
+                auxiliary.absorb(spawner.take_auxiliary());
+                auxiliary.absorb(helper_auth.take_auxiliary());
                 // Built HERE, in the worker, after the split -- unlike the
                 // personal mode's, below: the helper-backed source of nonces and
                 // verdicts exists only on this side of the fork. The pool, above
@@ -536,8 +542,12 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                 // one. It draws from the one helper client there is, and fills
                 // itself before the runtime below exists.
                 let helper_auth = Arc::new(helper_auth);
-                let nonces = crate::nonce_pool::PooledNonces::start(Arc::clone(&helper_auth))
-                    .context("starting the nonce pool")?;
+                let nonces = crate::nonce_pool::PooledNonces::start_owned_with_hook(
+                    Arc::clone(&helper_auth),
+                    &mut auxiliary,
+                    stop.nonce_pool_hook(),
+                )
+                .context("starting the nonce pool")?;
                 // A fresh allowlist that nothing else holds: see
                 // `refuse_the_allowlist_path` for why both halves matter.
                 let auth = system_server_auth(
@@ -551,7 +561,8 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                     .enable_all()
                     .build()
                     .context("creating the tokio runtime")?;
-                runtime.block_on(transport_daemon::run_serve_loop(
+                let shutdown = stop.shutdown();
+                let manager = context.drive(transport_daemon::run_serve_loop_until_shutdown(
                     socket,
                     keypair.private,
                     auth,
@@ -562,6 +573,12 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                     // one thing that can tell this router a session has gone
                     // sterile. See `transport::LoginEndedReporter`.
                     login_ends,
+                    shutdown,
+                ));
+                // Actual manager join precedes ordered auxiliaries and runtime
+                // disposal; this is not the parent's native/service receipt.
+                Ok(crate::helper::worker_drain::run(
+                    runtime, manager, auxiliary, stop,
                 ))
             },
         );

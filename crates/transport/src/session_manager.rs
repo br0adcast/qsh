@@ -87,6 +87,7 @@ mod lifecycle;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
+pub(crate) use lifecycle::WorkerReceipt;
 #[cfg(test)]
 #[path = "session_manager_fixture.rs"]
 pub(crate) mod fixture;
@@ -1016,6 +1017,12 @@ impl SessionIo {
             }),
             part,
         );
+    }
+    pub(crate) fn spawn_blocking_owned(
+        &self,
+        work: impl FnOnce() + Send + 'static,
+    ) -> WorkerReceipt {
+        self.lifecycle.spawn_blocking(work)
     }
     /// Await the next inbound event. `None` once the session task has ended
     /// (the connection closed or the manager shut down) -- the backend should

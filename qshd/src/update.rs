@@ -42,7 +42,9 @@
 //! the attempt.
 
 use std::fs::File;
-use std::io::{BufRead, Read, Write};
+use std::io::Write;
+#[cfg(not(target_os = "linux"))]
+use std::io::{BufRead, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -1067,7 +1069,18 @@ impl Drop for StagedImage {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[path = "update_scope.rs"]
+mod native_self_check;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
+    native_self_check::run(path, timeout)
+}
+
 /// Run `<path> self-check`, bounded by `timeout`, and read its line.
+/// Non-Linux cleanup remains a separate platform acceptance requirement.
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
     let mut child = spawn_self_check(path)?;
     let deadline = Instant::now() + timeout;
@@ -1121,12 +1134,26 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
     loop {
         let spawned = {
             let _permit = spawn_permit();
-            Command::new(path)
+            let mut command = Command::new(path);
+            command
                 .arg("self-check")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
+                .stderr(Stdio::null());
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::process::CommandExt;
+                // Child-only setup, acknowledged by Command's exec-error pipe.
+                unsafe {
+                    command.pre_exec(|| {
+                        if nix::libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            command.spawn()
         };
         match spawned {
             Ok(child) => return Ok(child),
@@ -1146,8 +1173,10 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 mod tests {
     include!("update_restart_bounds_tests.rs");
     include!("update_open_tests.rs");
+    include!("update_scope_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
+    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2372,27 +2401,68 @@ mod tests {
         path
     }
 
+    fn borrowed_self_check_case(test: &str, body: impl FnOnce()) {
+        #[cfg(target_os = "linux")]
+        crate::test_support::borrowed_scope::run_exact(test, 1, body).assert_clean(1);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = test;
+            body();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_borrowed_self_check_job(marker: &Path) {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+        let mut text = String::new();
+        std::fs::File::open(marker)
+            .unwrap()
+            .take(64)
+            .read_to_string(&mut text)
+            .unwrap();
+        let pid: u32 = text.trim().parse().unwrap();
+        assert!(pid > 0);
+        // The script has been actually waited by run_self_check. Its orphan
+        // is now an exclusively waitable child of this private fixture body.
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0, "pin the exact borrowed self-check job");
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        crate::test_support::borrowed_scope::wait_expected(fd.as_fd());
+    }
+
     /// A self-check that leaves a process behind holding its stdout, and
     /// prints nothing, is given up on within the limit -- reading its output
     /// is bounded too.
     #[test]
     fn a_self_check_whose_output_never_ends_is_given_up_on() {
-        suppress_shell_history();
-        let dir = tempfile::tempdir().unwrap();
-        let path = executable(
-            dir.path(),
-            "held",
-            "#!/bin/sh
-sleep 3 &
-exit 0
-",
-        );
-        let started = Instant::now();
-        let err = run_self_check(&path, Duration::from_secs(1)).unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_millis(1800),
-            "{:?}: {err}",
-            started.elapsed()
+        borrowed_self_check_case(
+            "update::tests::a_self_check_whose_output_never_ends_is_given_up_on",
+            || {
+                suppress_shell_history();
+                let dir = tempfile::tempdir().unwrap();
+                #[cfg(target_os = "linux")]
+                let marker = dir.path().join("borrowed.pid");
+                let script = "#!/bin/sh\nsleep 3 &\nexit 0\n".to_string();
+                #[cfg(target_os = "linux")]
+                let script = script.replace(
+                    "sleep 3 &\n",
+                    &format!(
+                        "sleep 3 &\nprintf '%s\\n' \"$!\" > '{}'\n",
+                        marker.display().to_string().replace('\'', "'\\''")
+                    ),
+                );
+                let path = executable(dir.path(), "held", &script);
+                let started = Instant::now();
+                let err = run_self_check(&path, Duration::from_secs(1)).unwrap_err();
+                let elapsed = started.elapsed();
+                #[cfg(target_os = "linux")]
+                wait_borrowed_self_check_job(&marker);
+                assert!(
+                    elapsed < Duration::from_millis(1800),
+                    "{:?}: {err}",
+                    elapsed
+                );
+            },
         );
     }
 
@@ -2400,18 +2470,34 @@ exit 0
     /// read at once: the line is all there is to read.
     #[test]
     fn a_self_check_that_prints_then_leaves_a_process_behind_is_read_at_once() {
-        suppress_shell_history();
-        let dir = tempfile::tempdir().unwrap();
-        let script = String::from_utf8(script_image(101, 0)).unwrap();
-        let script = script.strip_suffix("exit 0\n").unwrap().to_string() + "sleep 3 &\nexit 0\n";
-        let path = executable(dir.path(), "prints", &script);
-        let started = Instant::now();
-        let check = run_self_check(&path, Duration::from_secs(2)).expect("a self-check line");
-        assert_eq!(check.build, 101);
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+        borrowed_self_check_case(
+            "update::tests::a_self_check_that_prints_then_leaves_a_process_behind_is_read_at_once",
+            || {
+                suppress_shell_history();
+                let dir = tempfile::tempdir().unwrap();
+                #[cfg(target_os = "linux")]
+                let marker = dir.path().join("borrowed.pid");
+                let script = String::from_utf8(script_image(101, 0)).unwrap();
+                let script =
+                    script.strip_suffix("exit 0\n").unwrap().to_string() + "sleep 3 &\nexit 0\n";
+                #[cfg(target_os = "linux")]
+                let script = script.replace(
+                    "sleep 3 &\n",
+                    &format!(
+                        "sleep 3 &\nprintf '%s\\n' \"$!\" > '{}'\n",
+                        marker.display().to_string().replace('\'', "'\\''")
+                    ),
+                );
+                let path = executable(dir.path(), "prints", &script);
+                let started = Instant::now();
+                let check =
+                    run_self_check(&path, Duration::from_secs(2)).expect("a self-check line");
+                let elapsed = started.elapsed();
+                #[cfg(target_os = "linux")]
+                wait_borrowed_self_check_job(&marker);
+                assert_eq!(check.build, 101);
+                assert!(elapsed < Duration::from_secs(1), "{:?}", elapsed);
+            },
         );
     }
 

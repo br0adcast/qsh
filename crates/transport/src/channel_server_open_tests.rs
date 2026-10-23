@@ -345,6 +345,7 @@ mod open24_tests {
                     Box::new(FakeProcess {
                         greeting: None,
                         feed: rx,
+                        held_reads: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                         reads: Arc::new(AtomicUsize::new(0)),
                         exited: Arc::new(AtomicBool::new(false)),
                     }),
@@ -598,7 +599,15 @@ mod open24_tests {
                 },
             )]);
             let (out_tx, _out_rx) = mpsc::channel(1);
-            complete_opens(&io, &mut channels, &mut opening, &out_tx, &update, &context);
+            complete_opens(
+                &io,
+                &mut channels,
+                &mut opening,
+                &out_tx,
+                &update,
+                &context,
+                &mut ReapSet::new(context.opens.registry.clone()),
+            );
             let message = output.try_recv();
             if should_refuse {
                 assert!(
@@ -839,6 +848,7 @@ mod open24_tests {
                         waited: Default::default(),
                         wait_hold: Arc::new((Mutex::new(false), Condvar::new())),
                         exited: Arc::new(AtomicBool::new(true)),
+                        leader_exited: Arc::new(AtomicBool::new(false)),
                         observed: false,
                     }),
                     Box::new(self.screen.lock().unwrap().take().unwrap()),

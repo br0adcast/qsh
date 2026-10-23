@@ -65,6 +65,8 @@ pub mod helper;
 pub mod log;
 #[cfg(feature = "system")]
 pub mod nonce_pool;
+#[cfg(target_os = "linux")]
+mod process_scope;
 pub mod pty;
 pub mod screen;
 pub mod screen_budget;
@@ -97,8 +99,13 @@ pub use transport::ForgetNothing;
 
 /// Shared test-only support, `pub(crate)` so more than one module's test
 /// code can call into it.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_borrowed_scope;
+
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(target_os = "linux")]
+    pub(crate) use crate::test_borrowed_scope as borrowed_scope;
     /// Several unit tests, spread across `pty` and `channel_backend`, spawn
     /// the invoking user's REAL `$SHELL` in a PTY (see
     /// `pty::spawn_shell`). Attached to a PTY that shell is interactive, so
@@ -134,3 +141,10 @@ pub(crate) mod test_support {
 
 #[cfg(all(test, feature = "system"))]
 mod test_allocator;
+
+// The shared fixture supervisor has no dependency on public production APIs.
+#[cfg(all(test, target_os = "linux"))]
+fn qualify_borrowed_fixture() {
+    let _view =
+        process_scope::prepare().expect("private fixture proc namespace/wait qualification");
+}

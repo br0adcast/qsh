@@ -9,3 +9,5 @@ mkdir -p "$1"
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 "${CC:-cc}" -shared -fPIC -Wall -Wextra -Werror \
     "$root/qshd/tests/fixtures/pam/session_groups.c" -lpam -o "$1/session_groups.so"
+"${CC:-cc}" -shared -fPIC -Wall -Wextra -Werror \
+    "$root/qshd/tests/fixtures/pam/owned_session.c" -o "$1/owned_session.so"
