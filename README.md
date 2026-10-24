@@ -194,8 +194,9 @@ See [recovery and session limits](docs/cli-guide.md#recovery-and-session-limits)
   ChaCha20-Poly1305, and BLAKE2s.
 - **Account authentication:** SSH key signatures, or authorization established
   by a successful SSH login. System mode also checks the named account through PAM.
-- **Host identity:** first-use fingerprints require confirmation; changed keys
-  are rejected. SSH host keys and qsh daemon keys are separate trust stores.
+- **Host identity:** unknown direct QSH keys require confirmation. Verified SSH
+  bootstrap can supply the expected qshd key without another QSH trust question.
+  Conflicting keys are refused; SSH host keys and qsh daemon keys remain distinct.
 - **Limits:** encryption does not hide addresses, traffic volume, or timing, and
   cannot protect a compromised client or server. Verify initial fingerprints
   out of band when necessary.

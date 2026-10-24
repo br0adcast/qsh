@@ -593,13 +593,14 @@ at the second retransmit after the cookie, a second or so later.
   §1.2) — `qshd serve` and the system mode always, `transport-ensure`
   whenever it was started with `HOME` — so such a party could seal a forged
   reply as well as the daemon.
-- *A daemon that answers from another address is refused under load.* The
-  client takes a cookie only from the address its msg1 went to. A daemon on
-  a host with several addresses whose replies leave from another one than
-  the client dialled (a secondary address, a virtual IP) has its cookies
-  ignored — although its msg2 would be taken, since msg2 is accepted from
-  any source — and so admits no new client while it is under load. Without
-  load it connects as before.
+- *Replies must come from an eligible endpoint.* The client takes a cookie
+  only from an endpoint its msg1 was sent to. An ordinary initial handshake
+  accepts msg2 only from the dialled endpoint, including without load. Shared
+  recovery accepts a response only from a successfully contacted, unfinished
+  endpoint in that attempt's catalog (see [Shared recovery handshakes](#shared-recovery-handshakes)).
+  These source checks run before Noise processing; they do not replace its
+  proof that the responder holds the expected private key. A reply from an
+  unrelated source cannot complete the handshake.
 
 The diagnostic `transport-echo` and `transport-shell` servers do not use the
 cookie table. They keep one bounded pending allowlist candidate alongside the
@@ -2482,31 +2483,48 @@ session has a regular beat on the wire.
 
 ### 9.3 Trust on first use
 
-Noise IK authenticates the server from the very first message — but only if
-the client already has the right static key. Getting it the first time is
-the weak point, and the code says so plainly: discovery
-(`KeyRequest`/`KeyOffer`) is unauthenticated by nature, "there is nothing
-yet to authenticate it with", which is exactly why `cli/src/trust.rs` shows
-the key's fingerprint and asks a human before pinning it in
-`~/.config/qsh/known_hosts`.
+Noise IK proves the server holds the private key corresponding to the
+expected static public key. Choosing that expected key is a separate trust
+decision, implemented in `cli/src/trust.rs`.
 
-So: **whoever controls the network at the moment of first contact can offer
-their own key** and be pinned. Compare it out of band if that matters to
-you. Both daemons give you something to compare against: `qshd serve` prints
-the SHA-256 fingerprint at startup, to stdout and to its log file
-(`run_serve_command`), and a `transport-ensure` daemon prints the key itself
-as `server-pubkey: <base64>` (`write_transport_ready` in `qshd/src/main.rs`)
-— over the SSH session that started it, which is an already-authenticated
-channel.
+For direct QSH, the client first uses its endpoint's stored pin, or a trusted
+pin for another address on the same command line. Only when neither exists
+does unauthenticated discovery (`KeyRequest`/`KeyOffer`) supply a candidate
+for human confirmation. **An attacker controlling that first exchange can
+offer their own key and have it pinned if the user accepts it.** Compare the
+fingerprint out of band when necessary; `qshd serve` prints it at startup.
+Accepted keys are saved in the configured QSH known-hosts store (see the
+[client trust model](cli-guide.md#authentication-and-host-trust)). Atomic pinning
+refuses a conflicting key accepted by another process while a question was
+open. An unpinned neighbour address is remembered without a question only
+after a handshake proves possession of the expected key.
 
-After pinning, discovery does not run again: it answers anyone who asks, and
-doing it every launch would announce to a bystander that qsh lives here.
-There is one exception, on a failure path the user is about to be told about
-anyway: a server whose static key changed cannot complete an IK handshake
-against the old one, and the transport reports that as silence — which is
-also what a stopped daemon looks like. `changed_key_after_silence` asks once
-at that point, so a changed key produces a loud refusal naming both
-fingerprints instead of being swallowed into "unreachable".
+Verified foreground SSH bootstrap supplies another source of authority.
+The successful SSH login returns the daemon's public key and effective UDP
+port. For that exact command-line address, reported port and post-SSH stage,
+`ssh_server_key` checks existing endpoint and neighbour pins, compares a fresh
+discovery response with the SSH-reported key, and atomically remembers the
+matching key without another QSH trust question. It performs this comparison
+even when the endpoint already has a matching pin. Conflicting pins, discovery
+responses or current-session identities are refused. The bootstrap grant does
+not automatically apply to other addresses or ports.
+
+Here discovery is a consistency check against the verified SSH result, not
+independent authentication. A matching offer does not prove possession; the
+subsequent Noise handshake must still authenticate the expected key. Choosing
+or pinning that key is also separate from admitting the client's account or
+resuming its session.
+
+Ordinary direct login with a pinned key skips discovery, avoiding an extra
+unauthenticated announcement on every launch. Discovery may nevertheless
+repeat for the SSH-bootstrap comparison above or after a failed handshake:
+`after_silence` and `after_neighbour_silence` distinguish an offered different
+key from a daemon that is silent for another reason. Recovery diagnostics do
+not extend the failed handshake's deadline. These unauthenticated responses
+can explain a failure; they never authorize replacing an expected identity.
+Background SSH recovery must also retain the current session's QSH identity
+and satisfy the separate SSH authorization rules in the
+[client trust model](cli-guide.md#authentication-and-host-trust).
 
 ### 9.4 If your SSH key is stolen
 
@@ -2782,11 +2800,21 @@ same reason.
   socket (`control.sock` in the cache directory) is bound inside a fresh
   `0700` directory, made `0600` and only then moved to its name: there is no
   moment when the umask's permissions let anyone else connect.
-- **The local session store is yours alone.** `~/.config/qsh/sessions` holds
-  the tokens that identify sessions on the server (`0700` directory, `0600`
-  files). A token alone admits nobody — a reattach still has to pass the
-  allowlist or probation — but anyone who can read your files can also read
-  your SSH key, which is the real prize.
+- **The client's local trust state is trusted.** QSH pins, SSH known-host
+  entries and recovery grants determine which identities the client accepts;
+  offline release-cache verification assumes its stored checksum is trusted.
+  Protect these files from unauthorized changes. Session tokens live in the
+  configured `sessions` directory (`0700` directory, `0600` files). A token
+  alone admits nobody: a reattach still has to pass account authentication.
+  Reading a token does not imply access to an SSH private key, which may have
+  separate file permissions or remain in an agent or hardware device. See the
+  [client guide](cli-guide.md#authentication-and-host-trust) for store locations
+  and the current SSH recovery authorization rules.
+- **Terminal input is an authority boundary.** Trust questions read answers
+  from the controlling terminal; they do not authenticate who typed or pasted
+  an answer. Session escape parsing treats bracketed paste as literal input,
+  not local escape commands. That does not make pasted shell commands safe or
+  give trust questions the session parser's paste handling.
 - **A session outlives its client, on purpose.** A silent session stays
   routable for `SERVER_DEATH_AFTER` = 24 h, and a backend retained after an
   unexpected death survives `RETAIN_AFTER_DEATH` = 1 h. Everything running
@@ -2800,7 +2828,8 @@ same reason.
   well, against the same `authorized_keys`, so both gates guard it (§3.1.1).
 - **Neither end is defended against its own host.** Someone who controls the
   server can read every session on it; someone who controls your machine can
-  read your key, your tokens and your terminal. Nothing here changes that.
+  control your terminal and use credentials available to the client. Nothing
+  here changes that.
 
 Terminal geometry, admission refusals, payload caps and qualified storage bounds
 are documented in [Terminal resource policy](terminal-resources.md).
