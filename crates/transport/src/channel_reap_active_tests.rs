@@ -219,3 +219,250 @@ fn active39_leader_status_precedes_held_cleanup_without_refunding_owner() {
         "proved completion did not refund exact owner"
     );
 }
+
+struct LostWait(ActiveWait);
+impl ChannelWait for LostWait {
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        let _ = self.0.entered.try_send(());
+        Some(if self.0.complete.load(Ordering::SeqCst) {
+            LeaderStatus::Running
+        } else {
+            LeaderStatus::Unknown("owned fixture observation unavailable".into())
+        })
+    }
+    fn poll_exit(&mut self) -> ChildStatus {
+        if self.0.complete.load(Ordering::SeqCst) {
+            ChildStatus::Reaped { code: None }
+        } else {
+            ChildStatus::Unknown("owned fixture cleanup unavailable".into())
+        }
+    }
+    fn kill(&mut self) {
+        panic!("unknown owner must never be signaled")
+    }
+    fn wait(self: Box<Self>) -> i32 {
+        panic!("exclusive polling required")
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        _: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus {
+        crate::channel_open::CleanupStatus::Unknown
+    }
+}
+
+#[test]
+fn cleanup143_active_loss_without_retirement_is_retained_deduplicated_and_exactly_cleared() {
+    let runtime = runtime();
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let other_registry = ChannelOpenRegistry::new(Default::default());
+    let mut reaps = ReapSet::new(registry.clone());
+    let mut receipts = Vec::new();
+    for instance in 1..=2 {
+        let complete = Arc::new(AtomicBool::new(false));
+        let (entered, observed) = mpsc::sync_channel(1);
+        runtime.block_on(async {
+            reaps.start_active(
+                15 + instance as u8,
+                instance,
+                Box::new(LostWait(ActiveWait {
+                    complete: complete.clone(),
+                    entered,
+                })),
+                None,
+            );
+            reaps.observe_active();
+        });
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        runtime.block_on(async {
+            runtime.spawn_blocking(|| ()).await.unwrap();
+        });
+        receipts.push(complete);
+    }
+    assert_eq!(registry.retiring_count(), 0);
+    let snapshot = registry.cleanup_snapshot().unwrap();
+    assert_eq!(snapshot.observed_unconfirmed_owners, 2);
+    assert_eq!(snapshot.unique_cleanup_debt, 2);
+    assert!(snapshot.leader_unconfirmed);
+    let owner = reaps.owners.get(&1).unwrap().clone();
+    registry.record_observation(&owner, ObservationFailure::Panic);
+    other_registry.record_observation(&owner, ObservationFailure::Panic);
+    other_registry.finish_reap(&owner);
+    registry.finish_reap(&owner); // No terminal proof: cannot clear even this exact owner.
+    assert_eq!(registry.cleanup_snapshot().unwrap(), snapshot);
+    assert_eq!(
+        other_registry
+            .cleanup_snapshot()
+            .unwrap()
+            .unique_cleanup_debt,
+        0
+    );
+    reaps.retire(1);
+    let overlap = registry.cleanup_snapshot().unwrap();
+    assert_eq!(overlap.retiring_channels, 1);
+    assert_eq!(overlap.unique_cleanup_debt, 2);
+    receipts[0].store(true, Ordering::SeqCst);
+    owner.notify();
+    let completed = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), reaps.next())
+            .await
+            .unwrap()
+    });
+    assert_eq!(completed.instance, 1);
+    assert_eq!(
+        completed.code, None,
+        "unknown exit code is confirmed cleanup"
+    );
+    registry.finish_reap(&owner); // Duplicate cannot clear the other capsule.
+    assert_eq!(
+        registry
+            .cleanup_snapshot()
+            .unwrap()
+            .observed_unconfirmed_owners,
+        1
+    );
+    receipts[1].store(true, Ordering::SeqCst);
+    reaps.stop_all();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), reaps.next())
+            .await
+            .unwrap();
+    });
+    assert_eq!(registry.cleanup_snapshot().unwrap().unique_cleanup_debt, 0);
+    drop(reaps);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
+struct TypedFailureWait {
+    kind: ObservationFailure,
+    complete: Arc<AtomicBool>,
+}
+impl ChannelWait for TypedFailureWait {
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        assert!(
+            self.kind != ObservationFailure::Panic || self.complete.load(Ordering::SeqCst),
+            "owned observation panic fixture"
+        );
+        None
+    }
+    fn poll_exit(&mut self) -> ChildStatus {
+        if self.complete.load(Ordering::SeqCst) {
+            ChildStatus::Reaped { code: None }
+        } else {
+            ChildStatus::Unknown("owned cleanup observation fixture".into())
+        }
+    }
+    fn kill(&mut self) {
+        panic!("unconfirmed owner must not be signaled")
+    }
+    fn wait(self: Box<Self>) -> i32 {
+        panic!("exclusive polling required")
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        _: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus {
+        crate::channel_open::CleanupStatus::Unknown
+    }
+}
+
+#[test]
+fn cleanup143_cleanup_failure_and_backend_panic_keep_typed_first_observation() {
+    for kind in [ObservationFailure::Cleanup, ObservationFailure::Panic] {
+        let runtime = runtime();
+        let registry = ChannelOpenRegistry::new(Default::default());
+        let mut reaps = ReapSet::new(registry.clone());
+        let complete = Arc::new(AtomicBool::new(false));
+        runtime.block_on(async {
+            reaps.start(
+                16,
+                1,
+                Box::new(TypedFailureWait {
+                    kind,
+                    complete: complete.clone(),
+                }),
+                None,
+                false,
+            );
+            runtime.spawn_blocking(|| ()).await.unwrap();
+        });
+        let snapshot = registry.cleanup_snapshot().unwrap();
+        assert_eq!(snapshot.unique_cleanup_debt, 1);
+        assert_eq!(snapshot.observed_unconfirmed_owners, 1);
+        assert_eq!(
+            snapshot.cleanup_unconfirmed,
+            kind == ObservationFailure::Cleanup
+        );
+        assert_eq!(
+            snapshot.observation_panicked,
+            kind == ObservationFailure::Panic
+        );
+        let owner = reaps.owners.get(&1).unwrap();
+        registry.record_observation(owner, ObservationFailure::Leader);
+        assert_eq!(registry.cleanup_snapshot().unwrap(), snapshot);
+        complete.store(true, Ordering::SeqCst);
+        owner.notify();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), reaps.next())
+                .await
+                .unwrap();
+        });
+        assert_eq!(registry.cleanup_snapshot().unwrap().unique_cleanup_debt, 0);
+        drop(reaps);
+        runtime.shutdown_timeout(Duration::from_secs(2));
+    }
+}
+
+#[test]
+fn cleanup143_exact_completion_clears_observation_even_without_a_retiring_map_entry() {
+    let runtime = runtime();
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let mut reaps = ReapSet::new(registry.clone());
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered, observed) = mpsc::sync_channel(1);
+    runtime.block_on(async {
+        reaps.start_active(
+            16,
+            1,
+            Box::new(LostWait(ActiveWait {
+                complete: complete.clone(),
+                entered,
+            })),
+            None,
+        );
+        reaps.observe_active();
+    });
+    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    runtime.block_on(async {
+        runtime.spawn_blocking(|| ()).await.unwrap();
+    });
+    let owner = reaps.owners.get(&1).unwrap().clone();
+    assert_eq!(
+        registry
+            .cleanup_snapshot()
+            .unwrap()
+            .observed_unconfirmed_owners,
+        1
+    );
+    // Deliberately omit registry retirement in this private metadata control.
+    // The real exclusive lease still must obtain actual child proof and settle
+    // its resources; clearing must not depend on a retiring-map lookup.
+    owner.state.lock().unwrap().retiring = true;
+    complete.store(true, Ordering::SeqCst);
+    owner.notify();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), reaps.next())
+            .await
+            .unwrap();
+    });
+    assert_eq!(registry.retiring_count(), 0);
+    assert_eq!(
+        registry
+            .cleanup_snapshot()
+            .unwrap()
+            .observed_unconfirmed_owners,
+        0
+    );
+    drop(reaps);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}

@@ -61,6 +61,67 @@ pub struct PortStatus {
     pub connections: u64,
 }
 
+/// A snapshot of registered personal-channel custody only. Empty custody does
+/// not prove that every OS descendant or a privileged helper has completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupStatusResponse {
+    pub domain: CleanupDomain,
+    pub phase: CleanupPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts: Option<CleanupCounts>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupDomain {
+    PersonalChannels,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPhase {
+    Completed,
+    Pending,
+    Unresolved,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupCounts {
+    pub healthy_pending_opens: usize,
+    pub canceled_opens: usize,
+    pub retiring_channels: usize,
+    pub observed_unconfirmed_owners: usize,
+    pub unique_cleanup_debt: usize,
+    pub leader_unconfirmed: bool,
+    pub cleanup_unconfirmed: bool,
+    pub observation_panicked: bool,
+}
+impl CleanupStatusResponse {
+    pub fn from_snapshot(snapshot: Option<transport::channel_open::CleanupSnapshot>) -> Self {
+        let counts = snapshot.map(|s| CleanupCounts {
+            healthy_pending_opens: s.healthy_pending_opens,
+            canceled_opens: s.canceled_opens,
+            retiring_channels: s.retiring_channels,
+            observed_unconfirmed_owners: s.observed_unconfirmed_owners,
+            unique_cleanup_debt: s.unique_cleanup_debt,
+            leader_unconfirmed: s.leader_unconfirmed,
+            cleanup_unconfirmed: s.cleanup_unconfirmed,
+            observation_panicked: s.observation_panicked,
+        });
+        let phase = match counts {
+            None => CleanupPhase::Unknown,
+            Some(c) if c.observed_unconfirmed_owners != 0 => CleanupPhase::Unresolved,
+            Some(c) if c.unique_cleanup_debt != 0 || c.healthy_pending_opens != 0 => {
+                CleanupPhase::Pending
+            }
+            Some(_) => CleanupPhase::Completed,
+        };
+        Self {
+            domain: CleanupDomain::PersonalChannels,
+            phase,
+            counts,
+        }
+    }
+}
+
 /// Response to `STATUS` -- executable version/build/checksum and the list of
 /// ports with the active connection count on each. The fields and their
 /// names are part of a contract with other code that reads them directly
@@ -68,6 +129,10 @@ pub struct PortStatus {
 /// without a coordinated update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Absent on older daemons or a backend without this registered domain.
+    /// Absence means unknown, never completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<CleanupStatusResponse>,
     pub version: String,
     pub build: u64,
     pub checksum: String,
@@ -921,6 +986,7 @@ mod tests {
     #[test]
     fn status_response_round_trips() {
         let resp = StatusResponse {
+            cleanup: None,
             version: "0.1.0".into(),
             build: 42,
             checksum: "ab".repeat(32),
@@ -1347,6 +1413,7 @@ mod tests {
 
     fn status_line(pid: u32) -> String {
         let status = StatusResponse {
+            cleanup: None,
             version: "0.0.0".into(),
             build: 0,
             checksum: String::new(),
@@ -1496,5 +1563,46 @@ mod tests {
         assert_eq!(outcome, StopOutcome::NeverAnswered);
         assert!(outcome.may_have_leaked());
         assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod cleanup143_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup143_old_status_is_unknown_and_new_status_is_additive() {
+        let old = r#"{"version":"0.5.0","build":1,"checksum":"ab","ports":[],"total_connections":2,"pid":42,"future":true}"#;
+        let mut status = StatusResponse::from_line(old).unwrap();
+        assert!(status.cleanup.is_none());
+        assert!(!status.to_line().unwrap().contains("cleanup"));
+        let registry = transport::channel_open::ChannelOpenRegistry::new(Default::default());
+        status.cleanup = Some(CleanupStatusResponse::from_snapshot(
+            registry.try_cleanup_snapshot(),
+        ));
+        assert_eq!(
+            status.cleanup.as_ref().unwrap().phase,
+            CleanupPhase::Completed
+        );
+        let wire = status.to_line().unwrap();
+        assert_eq!(StatusResponse::from_line(wire.trim_end()).unwrap(), status);
+        let legacy: serde_json::Value = serde_json::from_str(old).unwrap();
+        let current: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        for field in [
+            "version",
+            "build",
+            "checksum",
+            "ports",
+            "total_connections",
+            "pid",
+        ] {
+            assert_eq!(legacy[field], current[field]);
+        }
+        let unknown = CleanupStatusResponse::from_snapshot(None);
+        assert_eq!(unknown.phase, CleanupPhase::Unknown);
+        assert!(
+            unknown.counts.is_none(),
+            "unavailable status must not fabricate zero counts"
+        );
     }
 }

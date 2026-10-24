@@ -135,6 +135,7 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool) {
         vec![addr.port()],
         Arc::new(AtomicUsize::new(0)),
         Arc::new(tokio::sync::RwLock::new(())),
+        None,
         async move { signal_rx.await.map_err(anyhow::Error::new) },
     ));
     let connect = || {
@@ -290,6 +291,7 @@ async fn stopping39_failed_enqueue_never_acknowledges_success() {
         stop_tx,
         Arc::new(AtomicUsize::new(0)),
         Arc::new(tokio::sync::RwLock::new(())),
+        None,
         tokio::time::Instant::now() + super::CONTROL_REQUEST_TIMEOUT,
     )
     .await;
@@ -443,6 +445,7 @@ async fn personal39_control_deadline_covers_the_gate_after_reading_the_request()
         stop_tx,
         Arc::new(AtomicUsize::new(0)),
         gate,
+        None,
         tokio::time::Instant::now() + super::CONTROL_REQUEST_TIMEOUT,
     ));
     let setup_deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -557,6 +560,7 @@ async fn personal39_control_deadline_covers_a_backpressured_reply() {
         stop_tx,
         Arc::new(AtomicUsize::new(0)),
         Arc::new(tokio::sync::RwLock::new(())),
+        None,
         tokio::time::Instant::now() + super::CONTROL_REQUEST_TIMEOUT,
     ));
     let setup = std::time::Instant::now() + Duration::from_secs(3);
@@ -613,6 +617,7 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
         stop_tx,
         Arc::new(AtomicUsize::new(0)),
         Arc::new(tokio::sync::RwLock::new(())),
+        None,
     );
     stop_rx
         .recv()
@@ -669,6 +674,7 @@ fn spawn_control_fixture(
         vec![1],
         Arc::new(AtomicUsize::new(0)),
         gate,
+        None,
         stop,
     ))
 }

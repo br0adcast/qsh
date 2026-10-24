@@ -820,3 +820,57 @@ fn open24_factory_fence_rejects_ready_adoption_before_watch_publication() {
     fence.reopen();
     assert!(refused, "ready job adopted across the factory fence");
 }
+
+#[test]
+fn cleanup143_snapshot_preserves_healthy_construction_and_exact_canceled_charge() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 7, 1))
+        .unwrap();
+    let observation = Arc::new(Observation::default());
+    let guard = job.custody().protect(
+        Box::new(Wait(observation.clone())),
+        Box::new(Screen(observation.clone())),
+    );
+    for _ in 0..3 {
+        let snapshot = registry.cleanup_snapshot().unwrap();
+        assert_eq!(snapshot.healthy_pending_opens, 1);
+        assert!(!snapshot.has_cleanup_debt());
+        assert!(!job.custody().is_cancelled());
+    }
+    assert_eq!(observation.waits.load(Ordering::SeqCst), 0);
+    drop(guard);
+    let snapshot = registry.cleanup_snapshot().unwrap();
+    assert_eq!(snapshot.canceled_opens, 1);
+    assert_eq!(snapshot.unique_cleanup_debt, 1);
+    assert_eq!(session.occupied(), 1);
+    observation.confirmed.store(true, Ordering::SeqCst);
+    assert!(matches!(job.cleanup(), CleanupStatus::Confirmed(_)));
+    assert_eq!(registry.cleanup_snapshot().unwrap().unique_cleanup_debt, 0);
+    assert_eq!(session.occupied(), 0);
+}
+
+#[test]
+fn cleanup143_try_snapshot_discards_partial_counts_on_capsule_contention() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 7, 1))
+        .unwrap();
+    let held = job.custody().inner.state.lock().unwrap();
+    assert!(registry.try_cleanup_snapshot().is_none());
+    drop(held);
+    assert_eq!(
+        registry
+            .try_cleanup_snapshot()
+            .unwrap()
+            .healthy_pending_opens,
+        1
+    );
+    let failure = job.custody().refuse_before_creation("owned fixture".into());
+    let SpawnCleanup::NoChild(proof) = failure.cleanup else {
+        unreachable!()
+    };
+    assert!(registry.finish_cleanup(job.id(), &proof));
+}

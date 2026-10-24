@@ -11,7 +11,7 @@ pub use executor::*;
 use crate::auth::Principal;
 use crate::channel::OpenRequest;
 use crate::channel_geometry::ChannelInstance;
-use crate::channel_server::reaping::Capsule as ReapCapsule;
+use crate::channel_server::reaping::{Capsule as ReapCapsule, ObservationFailure};
 use crate::session_manager::LoginId;
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +86,8 @@ struct Retiring {
     uid: u32,
 }
 struct RegistryState {
+    observations: [usize; 3],
+    invalid_projection: bool,
     retiring: HashMap<usize, Retiring>,
     jobs: HashMap<OpenJobId, Arc<Registration>>,
     uids: HashMap<u32, usize>,
@@ -94,6 +96,24 @@ struct RegistryState {
     next_fence: u64,
     fence: Option<u64>,
 }
+/// Read-only registered personal-channel custody, not global process cleanup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupSnapshot {
+    pub healthy_pending_opens: usize,
+    pub canceled_opens: usize,
+    pub retiring_channels: usize,
+    pub observed_unconfirmed_owners: usize,
+    pub unique_cleanup_debt: usize,
+    pub leader_unconfirmed: bool,
+    pub cleanup_unconfirmed: bool,
+    pub observation_panicked: bool,
+}
+impl CleanupSnapshot {
+    pub fn has_cleanup_debt(&self) -> bool {
+        self.unique_cleanup_debt != 0
+    }
+}
+
 pub struct ChannelOpenRegistry {
     state: Mutex<RegistryState>,
     limits: OpenLimits,
@@ -252,6 +272,8 @@ impl ChannelOpenRegistry {
     pub fn new(limits: OpenLimits) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RegistryState {
+                observations: [0; 3],
+                invalid_projection: false,
                 jobs: HashMap::new(),
                 retiring: HashMap::new(),
                 uids: HashMap::new(),
@@ -329,6 +351,77 @@ impl ChannelOpenRegistry {
             registry: self.clone(),
         })
     }
+    /// A blocking metadata read for update preparation. Never invokes cleanup.
+    pub fn cleanup_snapshot(&self) -> Option<CleanupSnapshot> {
+        self.snapshot(false)
+    }
+    /// STATUS abandons the whole observation on contention or inconsistency.
+    pub fn try_cleanup_snapshot(&self) -> Option<CleanupSnapshot> {
+        self.snapshot(true)
+    }
+    fn snapshot(&self, nonblocking: bool) -> Option<CleanupSnapshot> {
+        let state = metadata_lock(&self.state, nonblocking)?;
+        if state.invalid_projection {
+            return None;
+        }
+        let mut result = CleanupSnapshot::default();
+        for entry in state.jobs.values() {
+            if entry.custody.canceled_snapshot(nonblocking)? {
+                result.canceled_opens = result.canceled_opens.checked_add(1)?;
+            } else {
+                result.healthy_pending_opens = result.healthy_pending_opens.checked_add(1)?;
+            }
+        }
+        let mut overlap = [0usize; 3];
+        for entry in state.retiring.values() {
+            if !entry.owner.belongs_to(self) {
+                return None;
+            }
+            if let Some(kind) = entry.owner.observation_state(nonblocking)?.observation {
+                overlap[kind.index()] = overlap[kind.index()].checked_add(1)?;
+            }
+        }
+        for (overlap, total) in overlap.iter().zip(state.observations) {
+            total.checked_sub(*overlap)?;
+            result.observed_unconfirmed_owners =
+                result.observed_unconfirmed_owners.checked_add(total)?;
+        }
+        let overlap = overlap.into_iter().try_fold(0usize, usize::checked_add)?;
+        result.retiring_channels = state.retiring.len();
+        result.unique_cleanup_debt = result
+            .canceled_opens
+            .checked_add(result.retiring_channels)?
+            .checked_add(result.observed_unconfirmed_owners)?
+            .checked_sub(overlap)?;
+        result.leader_unconfirmed = state.observations[0] != 0;
+        result.cleanup_unconfirmed = state.observations[1] != 0;
+        result.observation_panicked = state.observations[2] != 0;
+        Some(result)
+    }
+    // Registry -> one capsule, with no backend callback or resource transfer.
+    pub(crate) fn record_observation(&self, owner: &Arc<ReapCapsule>, kind: ObservationFailure) {
+        if !owner.belongs_to(self) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            let mut state = e.into_inner();
+            state.invalid_projection = true;
+            state
+        });
+        let Some(mut capsule) = owner.observation_state(false) else {
+            state.invalid_projection = true;
+            return;
+        };
+        if capsule.observation.is_some() || capsule.terminal.is_some() {
+            return;
+        }
+        let Some(count) = state.observations[kind.index()].checked_add(1) else {
+            state.invalid_projection = true;
+            return;
+        };
+        capsule.observation = Some(kind);
+        state.observations[kind.index()] = count;
+    }
     pub fn outstanding(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.jobs.len() + state.retiring.len()
@@ -365,7 +458,28 @@ impl ChannelOpenRegistry {
         }
     }
     pub(crate) fn finish_reap(&self, owner: &Arc<ReapCapsule>) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| {
+            let mut state = e.into_inner();
+            state.invalid_projection = true;
+            state
+        });
+        if !owner.belongs_to(self) {
+            return;
+        }
+        // Metadata poisoning makes observation unavailable, but must not
+        // prevent the existing proved resource/capacity settlement.
+        let (mut capsule, poisoned) = owner.completion_state();
+        state.invalid_projection |= poisoned;
+        if capsule.terminal.is_none() {
+            return;
+        }
+        if let Some(kind) = capsule.observation.take() {
+            match state.observations[kind.index()].checked_sub(1) {
+                Some(count) => state.observations[kind.index()] = count,
+                None => state.invalid_projection = true,
+            }
+        }
+        drop(capsule);
         let key = Arc::as_ptr(owner) as usize;
         let Some(entry) = state.retiring.get(&key) else {
             return;
@@ -517,5 +631,37 @@ mod counter_tests {
         assert_eq!(registry.state.lock().unwrap().fence, Some(current.id));
         assert!(current.wait_until(std::time::Instant::now()).is_some());
         current.reopen();
+    }
+}
+
+#[cfg(test)]
+mod cleanup143_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup143_unavailable_never_returns_partial_or_clean_counts() {
+        let registry = ChannelOpenRegistry::new(Default::default());
+        let held = registry.state.lock().unwrap();
+        assert!(registry.try_cleanup_snapshot().is_none());
+        drop(held);
+        registry.state.lock().unwrap().invalid_projection = true;
+        assert!(registry.cleanup_snapshot().is_none());
+        registry.state.lock().unwrap().invalid_projection = false;
+        registry.state.lock().unwrap().observations = [usize::MAX, 1, 0];
+        assert!(registry.cleanup_snapshot().is_none());
+        registry.state.lock().unwrap().observations = [0; 3];
+        assert_eq!(
+            registry.cleanup_snapshot().unwrap(),
+            CleanupSnapshot::default()
+        );
+        let poisoned = registry.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.state.lock().unwrap();
+            panic!("owned poison fixture");
+        })
+        .join()
+        .is_err());
+        assert!(registry.try_cleanup_snapshot().is_none());
+        assert!(registry.cleanup_snapshot().is_none());
     }
 }

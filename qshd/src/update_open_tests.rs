@@ -112,6 +112,202 @@ mod open24_exec_tests {
         }
     }
 
+    fn pending_job(registry: &Arc<ChannelOpenRegistry>) -> transport::channel_open::OpenJob {
+        let session = registry.session().unwrap();
+        registry.try_reserve(&session, OpenRequestSnapshot {
+            owner: me(), login: [0; 16], term: None,
+            request: transport::channel::OpenRequest { stream: 16, kind: transport::channel::ChannelKind::Shell,
+                cols: 80, rows: 24, screen: false, command: Vec::new() },
+            identity: OpenIdentity { session: session.id(), instance: transport::channel_geometry::ChannelInstance::new(1).unwrap(),
+                stream: 16, generation: 0, invalidation_epoch: 0 },
+        }).unwrap()
+    }
+
+    #[test]
+    fn cleanup143_early_refusal_preserves_a_real_active_channel_and_later_update() {
+        use transport::channel::{encode_client, ClientRecord, ChannelKind, OpenRequest, CONTROL_STREAM};
+        use transport::session_manager::{AttachmentContext, ChannelOutput, SessionBackend, SessionInbound, SessionIo, SessionOutbound, StreamData};
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let backend = crate::channel_backend::ChannelSessionBackend::new(Arc::new(crate::screen_budget::ScreenBudget::new(Default::default())));
+            let registry = backend.open_registry();
+            let execs = Arc::new(AtomicUsize::new(0));
+            let observed = execs.clone();
+            let Restartable { daemon, transfer, admission, udp: _udp, control: _control, .. } =
+                verified_transfer_with_registry(dir.path(), Arc::new(move |_, _| { observed.fetch_add(1, Ordering::SeqCst); Errno::ENOENT }), registry.clone());
+            let backend = backend.with_daemon(daemon.clone());
+            let (io, input, mut output) = SessionIo::test_pair_for(me(), [3; 16]);
+            let runner = tokio::spawn(backend.run(io));
+            input.send(SessionInbound::Live(AttachmentContext { generation: 1, session_id: 15, features: transport::Features::CHANNEL_GEOMETRY })).await.unwrap();
+            input.send(SessionInbound::Data(StreamData { stream_id: CONTROL_STREAM, data: encode_client(&ClientRecord::Open(OpenRequest {
+                stream: 16, kind: ChannelKind::Command, cols: 80, rows: 24, screen: false, command: b"/bin/cat".to_vec(),
+            })) })).await.unwrap();
+            async fn exchange(input: &tokio::sync::mpsc::Sender<SessionInbound>, output: &mut tokio::sync::mpsc::UnboundedReceiver<SessionOutbound>, bytes: &[u8]) -> bool {
+                input.send(SessionInbound::Data(StreamData { stream_id: 16, data: bytes.to_vec() })).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    let mut seen = Vec::new();
+                    loop {
+                        if let Some(SessionOutbound::ChannelOutput { stream: 16, output: ChannelOutput::Data(data), .. }) = output.recv().await {
+                            seen.extend(data);
+                            if seen.windows(bytes.len() - 1).any(|part| part == &bytes[..bytes.len()-1]) { break; }
+                        }
+                    }
+                }).await.is_ok()
+            }
+            let opened = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match output.recv().await.unwrap() {
+                        SessionOutbound::ChannelOpened { stream: 16, .. } => break,
+                        SessionOutbound::ReservedControl { bytes, .. } => {
+                            let mut decoder = transport::shell_frame::RecordDeframer::for_control();
+                            if decoder.push(&bytes).iter().any(|record| matches!(transport::channel::decode_server(record), Ok(transport::channel::ServerRecord::Opened { stream: 16 }))) { break; }
+                        }
+                        _ => {}
+                    }
+                }
+            }).await.is_ok();
+            let before_io = if opened { exchange(&input, &mut output, b"before-refusal\n").await } else { false };
+            let job = pending_job(&registry);
+            let receipt = Arc::new(AtomicBool::new(false));
+            drop(job.custody().protect(Box::new(ReceiptWait(receipt.clone())), Box::new(transport::shell_server::NoScreen)));
+            let before = *daemon.restart_signal().borrow();
+            let result = tokio::task::spawn_blocking(move || transfer.restart()).await.unwrap();
+            let unchanged = *daemon.restart_signal().borrow() == before;
+            let after_io = if opened { exchange(&input, &mut output, b"after-refusal\n").await } else { false };
+            let retained = registry.cleanup_snapshot().unwrap().canceled_opens == 1;
+            receipt.store(true, Ordering::SeqCst);
+            assert!(matches!(job.cleanup(), CleanupStatus::Confirmed(_)));
+            drop(job);
+            // End and join the actual PTY/session before outcome assertions.
+            drop(input);
+            tokio::time::timeout(Duration::from_secs(5), runner).await.unwrap().unwrap();
+            assert!(opened && before_io && after_io, "an installed PTY must exchange bytes across early refusal");
+            assert!(matches!(result, UpdateResult::Rejected { code: RejectCode::Other, .. }));
+            assert!(unchanged && retained && !admission.is_closed());
+            assert_eq!(execs.load(Ordering::SeqCst), 0);
+            assert!(!registry.cleanup_snapshot().unwrap().has_cleanup_debt());
+            let image = script_image(101, 0);
+            let mut later = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+            later.write(&image).unwrap();
+            later.verify().unwrap();
+            let _ = tokio::task::spawn_blocking(move || later.restart()).await.unwrap();
+            assert_eq!(execs.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn cleanup143_verify_rejects_known_debt_but_allows_healthy_pending_work() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let Restartable { daemon, transfer, admission, udp: _udp, control: _control, .. } =
+            verified_transfer(dir.path(), Arc::new(|_, _| Errno::ENOENT));
+        drop(transfer);
+        let signal = daemon.restart_signal();
+        let before = *signal.borrow();
+        let job = pending_job(&daemon.opens);
+        let image = script_image(101, 0);
+        let mut healthy = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        healthy.write(&image).unwrap();
+        healthy.verify().expect("healthy pending Open is eligible");
+        assert!(!job.custody().is_cancelled());
+        drop(healthy);
+        job.cancel();
+        let mut canceled = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        canceled.write(&image).unwrap();
+        assert!(matches!(canceled.verify(), Err(UpdateResult::Rejected { code: RejectCode::Other, .. })));
+        assert_eq!(*signal.borrow(), before);
+        assert!(!admission.is_closed());
+        drop(canceled);
+        let failure = job.custody().refuse_before_creation("owned fixture".into());
+        let transport::channel_open::SpawnCleanup::NoChild(proof) = failure.cleanup else { unreachable!() };
+        assert!(daemon.opens.finish_cleanup(job.id(), &proof));
+    }
+
+    #[test]
+    fn cleanup143_healthy_pending_open_reaches_exec_after_fence_cancellation_and_exact_cleanup() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let observed = execs.clone();
+        let Restartable { daemon, transfer, admission, udp: _udp, control: _control, .. } =
+            verified_transfer(dir.path(), Arc::new(move |_, _| { observed.fetch_add(1, Ordering::SeqCst); Errno::ENOENT }));
+        let job = pending_job(&daemon.opens);
+        let receipt = Arc::new(AtomicBool::new(false));
+        let guard = job.custody().protect(Box::new(ReceiptWait(receipt.clone())), Box::new(transport::shell_server::NoScreen));
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !job.custody().is_cancelled() && Instant::now() < deadline { std::thread::yield_now(); }
+            let fence_canceled = job.custody().is_cancelled();
+            receipt.store(true, Ordering::SeqCst);
+            drop(guard);
+            let settled = matches!(job.cleanup(), CleanupStatus::Confirmed(_));
+            (fence_canceled, settled)
+        });
+        let result = transfer.restart();
+        assert_eq!(worker.join().unwrap(), (true, true));
+        assert!(matches!(result, UpdateResult::Rejected { code: RejectCode::ExecFailed, .. }), "injected exec is expected to fail only after reaching exec");
+        assert_eq!(execs.load(Ordering::SeqCst), 1);
+        assert_eq!(daemon.restarts.last.load(Ordering::SeqCst), 1);
+        assert_eq!(daemon.opens.outstanding(), 0);
+        assert!(!admission.is_closed());
+    }
+
+    #[test]
+    fn cleanup143_direct_restart_owns_rollback_before_the_final_fence() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let Restartable { daemon, transfer, admission, udp: _udp, control: _control, .. } =
+            verified_transfer(dir.path(), Arc::new(|_, _| panic!("early refusal must not exec")));
+        drop(transfer);
+        let job = pending_job(&daemon.opens);
+        job.cancel();
+        let image = script_image(101, 0);
+        let staged = StagedImage {
+            offer: offer_for(&image, 101), path: daemon.staging_path(), file: None, created: false,
+            hasher: Sha256::new(), written: 0, closed_admission: false,
+            binary_path: daemon.binary_path.clone(), active: daemon.active.clone(), in_progress: daemon.in_progress.clone(),
+            restarts: daemon.restarts.clone(), opens: daemon.opens.clone(), handover: daemon.handover.clone(), exec: daemon.exec.clone(),
+        };
+        let before = *daemon.restart_signal().borrow();
+        assert!(matches!(Box::new(staged).restart(), UpdateResult::Rejected { code: RejectCode::Other, .. }));
+        assert_eq!(*daemon.restart_signal().borrow(), before);
+        assert!(!admission.is_closed());
+        let failure = job.custody().refuse_before_creation("owned fixture".into());
+        let transport::channel_open::SpawnCleanup::NoChild(proof) = failure.cleanup else { unreachable!() };
+        assert!(daemon.opens.finish_cleanup(job.id(), &proof));
+    }
+
+    #[test]
+    fn cleanup143_debt_after_verify_refuses_before_announcement_and_reopens_admission() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let observed = execs.clone();
+        let Restartable { daemon, transfer, admission, udp: _udp, control: _control, .. } =
+            verified_transfer(dir.path(), Arc::new(move |_, _| { observed.fetch_add(1, Ordering::SeqCst); Errno::ENOENT }));
+        let signal = daemon.restart_signal();
+        let before = *signal.borrow();
+        let job = pending_job(&daemon.opens);
+        job.cancel();
+        let result = transfer.restart();
+        assert!(matches!(result, UpdateResult::Rejected { code: RejectCode::Other, .. }));
+        assert_eq!(*signal.borrow(), before);
+        assert_eq!(execs.load(Ordering::SeqCst), 0);
+        assert!(!admission.is_closed());
+        assert_eq!(daemon.opens.cleanup_snapshot().unwrap().canceled_opens, 1);
+        let failure = job.custody().refuse_before_creation("owned fixture".into());
+        let transport::channel_open::SpawnCleanup::NoChild(proof) = failure.cleanup else { unreachable!() };
+        assert!(daemon.opens.finish_cleanup(job.id(), &proof));
+        assert!(!daemon.opens.cleanup_snapshot().unwrap().has_cleanup_debt());
+    }
+
     #[test]
     fn open24_verified_transfer_fence_failure_reopens_admission_without_releasing_other_fence() {
         let _fds = fd_flags_lock();
@@ -206,13 +402,17 @@ mod open24_exec_tests {
             .unwrap();
         let confirmed = Arc::new(AtomicBool::new(false));
         let notifier = job.custody().cleanup_notifier();
-        drop(job.custody().protect(
+        let guard = job.custody().protect(
             Box::new(ReceiptWait(confirmed.clone())),
             Box::new(transport::shell_server::NoScreen),
-        ));
-        job.cleanup();
-        drop(job); // No runner, mailbox receiver, or watch subscriber survives.
+        );
+        *daemon.restarts.before_open_fence.lock().unwrap() = Some(Box::new(move || {
+            drop(guard);
+            job.cleanup();
+            drop(job); // Debt arrives after preflight; no runner/subscriber survives.
+        }));
         let first_result = transfer.restart();
+        assert_eq!(daemon.restarts.last.load(Ordering::SeqCst), 1, "must reach final fence after announcement");
         let first_execs = execs.load(Ordering::SeqCst);
         let charged_after_timeout = (daemon.opens.outstanding(), session.occupied());
         let admission_reopened = !admission.is_closed();
@@ -323,6 +523,14 @@ mod open24_exec_tests {
                 control: _control,
                 ..
             } = verified_transfer_with_registry(dir.path(), exec, factory.open_registry());
+            let (arrived, observed) = std::sync::mpsc::sync_channel(1);
+            let (release, proceed) = std::sync::mpsc::sync_channel(1);
+            *daemon.restarts.before_open_fence.lock().unwrap() = Some(Box::new(move || {
+                arrived.send(()).unwrap();
+                proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            let first = tokio::task::spawn_blocking(move || transfer.restart());
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
             let context = AttachmentContext {
                 generation: 1,
                 session_id: 11,
@@ -400,9 +608,9 @@ mod open24_exec_tests {
                 1,
                 "cold replacement bypassed outstanding admission"
             );
-            let first = tokio::task::spawn_blocking(move || transfer.restart())
-                .await
-                .unwrap();
+            release.send(()).unwrap();
+            let first = first.await.unwrap();
+            assert_eq!(daemon.restarts.last.load(Ordering::SeqCst), 1, "late debt must reach authoritative final fence");
             assert!(matches!(
                 first,
                 UpdateResult::Rejected {

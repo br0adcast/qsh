@@ -346,6 +346,8 @@ pub(crate) struct RestartCounterExhausted;
 /// `transport::channel_server::RestartSignal`).
 pub(crate) struct Restarts {
     publication: Mutex<()>,
+    #[cfg(test)]
+    before_open_fence: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     tx: watch::Sender<RestartSignal>,
     last: AtomicU64,
     count: Mutex<DrainCount>,
@@ -355,6 +357,8 @@ impl Restarts {
     pub(crate) fn new() -> Restarts {
         Restarts {
             publication: Mutex::new(()),
+            #[cfg(test)]
+            before_open_fence: Mutex::new(None),
             tx: watch::channel(RestartSignal::IDLE).0,
             last: AtomicU64::new(0),
             count: Mutex::new(DrainCount::default()),
@@ -740,6 +744,21 @@ impl StagedImage {
         others_than_offering(self.active.load(Ordering::SeqCst) as u64)
     }
 
+    /// Eligibility only: the authoritative effectful fence still follows.
+    fn cleanup_preflight(&self) -> Result<(), UpdateResult> {
+        match self.opens.cleanup_snapshot() {
+            Some(snapshot) if !snapshot.has_cleanup_debt() => Ok(()),
+            Some(_) => Err(UpdateResult::Rejected {
+                code: RejectCode::Other,
+                detail: "registered channel cleanup is still pending or unconfirmed".into(),
+            }),
+            None => Err(UpdateResult::Rejected {
+                code: RejectCode::Other,
+                detail: "registered channel cleanup observation is unavailable".into(),
+            }),
+        }
+    }
+
     /// Admit handshakes again, if this image closed admission.
     fn reopen_admission(&mut self) {
         if std::mem::take(&mut self.closed_admission) {
@@ -848,12 +867,16 @@ impl UpdateTransfer for StagedImage {
                 others: busy_count(others),
             });
         }
+        if let Err(error) = self.cleanup_preflight() {
+            self.reopen_admission();
+            return Err(error);
+        }
         Ok(())
     }
 
     /// Called by the session runner from a blocking task, like everything
     /// else here: it sleeps, waits for locks and execs.
-    fn restart(self: Box<Self>) -> UpdateResult {
+    fn restart(mut self: Box<Self>) -> UpdateResult {
         let Some(base) = self.handover.clone() else {
             return UpdateResult::Rejected {
                 code: RejectCode::ExecFailed,
@@ -863,6 +886,18 @@ impl UpdateTransfer for StagedImage {
         // Closed already by the last count in `verify`, and kept closed to
         // the exec: no new session from here on (see the module docs).
         base.admission.close();
+        self.closed_admission = true;
+        if let Err(error) = self.cleanup_preflight() {
+            return error;
+        }
+        // Test only: inject a late arrival after the final favorable snapshot.
+        #[cfg(test)]
+        {
+            let hook = self.restarts.before_open_fence.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let fence = match self.opens.begin_restart_fence() {
             Ok(fence) => fence,
             Err(_) => {
