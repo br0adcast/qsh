@@ -7,8 +7,6 @@
 //! it (termios, signals, the socket) stay thin enough to have little left to
 //! get wrong.
 
-use std::collections::VecDeque;
-
 use client::channel::ChannelId;
 use client::ShellState;
 use prediction::DisplayPreference;
@@ -21,7 +19,7 @@ use transport::{LinkState, Stats};
 
 use crate::args::PredictMode;
 use crate::escape::{Command, Escape, Piece, Prefix};
-use crate::input_ingress::{InputBytes, INGRESS_READS};
+use crate::input_ingress::{IngressBudget, InputBytes, PendingInput};
 use crate::mouse::MouseShift;
 use crate::statusline::{self, Link};
 use crate::window::{self, Boxed, Outcome, Roads, Row};
@@ -46,13 +44,6 @@ const RESIZE_QUIET_MS: i64 = 130;
 /// How often the status line's values may change (spec §8.1: once a
 /// second, not on every tick).
 const LINE_REFRESH_MS: i64 = 1_000;
-
-/// Bound on `ShellChannel::Opening`'s queued keystrokes. The round trip to
-/// confirm a channel is ordinarily far shorter than a human can type, but
-/// nothing here can force the far side to ever answer at all -- and a real
-/// terminal limits typeahead too. A whole record exceeding this bound causes
-/// explicit local input failure; accepted typeahead is never clipped.
-const MAX_QUEUED_INPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocalInputFailure {
@@ -204,9 +195,9 @@ enum ShellChannel {
     /// ordinarily far shorter than a human can type, but a busy daemon can
     /// still stretch it long enough for a few keystrokes to land first, and
     /// dropping those silently would be a real, if rare, bug. Bounded by
-    /// [`MAX_QUEUED_INPUT_BYTES`] and sixteen owned records; overflow fails
-    /// explicitly without changing the accepted prefix.
-    Opening { queued: VecDeque<InputBytes> },
+    /// 64 KiB in one independently guarded allocation; overflow fails
+    /// explicitly: reject the append and discard unsent commands with a notice.
+    Opening { queued: PendingInput },
     /// Confirmed: this is the channel input, resizes, and the far side's
     /// own channel events all address.
     Ready(ChannelId),
@@ -217,13 +208,13 @@ enum ShellChannel {
     /// moves with this same bounded queue until the retained shell is Ready.
     Detached {
         ch: Option<ChannelId>,
-        queued: VecDeque<InputBytes>,
+        queued: PendingInput,
     },
     /// A new connection reached the session; waiting for the server's list
     /// of what it still runs (`on_announced`). Pending input keeps its guards.
     Reattaching {
         ch: Option<ChannelId>,
-        queued: VecDeque<InputBytes>,
+        queued: PendingInput,
     },
 }
 
@@ -263,6 +254,7 @@ pub struct Session {
     continuity_notice: Option<OutputGapCause>,
     session_abort: Option<transport::SessionAbortReason>,
     input_failed: bool,
+    pending_input_budget: IngressBudget,
     read_only_notice: bool,
     /// The last shell size, waiting out `RESIZE_QUIET_MS`, and the moment it
     /// may go out.
@@ -367,6 +359,7 @@ impl Session {
             continuity_notice: None,
             session_abort: None,
             input_failed: false,
+            pending_input_budget: IngressBudget::default(),
             read_only_notice: false,
             pending_size: None,
             resize_due_ms: 0,
@@ -423,7 +416,9 @@ impl Session {
                     return Vec::new();
                 }
                 self.input_failed = true;
-                let mut actions = self.leave(1);
+                drop(self.take_pending_input());
+                let mut actions = vec![Action::Keep];
+                actions.extend(self.leave(1));
                 let message = match failure {
                     LocalInputFailure::Channel(error) => format!("qsh: local channel write was not accepted ({error:?})"),
                     LocalInputFailure::Accepted(transport::driver_std::InputFailure::OffsetSpaceExhausted { stream_id }) => format!(
@@ -434,7 +429,12 @@ impl Session {
                     LocalInputFailure::PendingFull => "qsh: pending shell input buffer limit reached".into(),
                     LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
                 };
-                actions.insert(actions.len() - 1, Action::Notice(message));
+                actions.insert(
+                    actions.len() - 1,
+                    Action::Notice(format!(
+                        "{message}; undelivered pending input discarded; leaving without closing the remote session"
+                    )),
+                );
                 actions
             }
             UiEvent::Stdin(bytes) => self.on_stdin(bytes, now_ms),
@@ -663,7 +663,7 @@ impl Session {
             // Our session came back, but everything in it has ended. Nothing
             // to adopt: open a shell the way a fresh session would.
             self.shell_channel = ShellChannel::Opening {
-                queued: VecDeque::new(),
+                queued: PendingInput::default(),
             };
             vec![Action::OpenShell { cols, rows }]
         } else {
@@ -793,7 +793,7 @@ impl Session {
     pub fn assume_channel_opening(&mut self) {
         if self.shell_channel == ShellChannel::Unopened {
             self.shell_channel = ShellChannel::Opening {
-                queued: VecDeque::new(),
+                queued: PendingInput::default(),
             };
         }
     }
@@ -803,6 +803,9 @@ impl Session {
     /// through the exact same path an immediate keystroke takes -- so a
     /// queued keystroke's echo is predicted only after its eventual admission.
     pub fn on_channel_ready(&mut self, ch: ChannelId, now_ms: i64) -> Vec<Action> {
+        if self.input_failed {
+            return Vec::new();
+        }
         // Detached and still-unannounced replacements cannot consume pending
         // commands. Main also filters Ready by the exact current link/channel.
         if matches!(
@@ -816,7 +819,7 @@ impl Session {
         }
         let queued = match std::mem::replace(&mut self.shell_channel, ShellChannel::Ready(ch)) {
             ShellChannel::Opening { queued } => queued,
-            _ => VecDeque::new(),
+            _ => PendingInput::default(),
         };
         if self.raw_cols != 0
             && self.raw_rows != 0
@@ -826,7 +829,7 @@ impl Session {
             self.pending_size = Some(self.desired_size());
         }
         let mut actions = self.due_resize(now_ms);
-        for bytes in queued {
+        if let Some(bytes) = queued.into_input() {
             actions.extend(self.send_now(ch, bytes, now_ms));
         }
         actions
@@ -869,13 +872,21 @@ impl Session {
     /// Splits keyboard bytes into input and prefix commands (spec §8.3), in
     /// order. Input goes to the shell, or to the window while one is open.
     fn on_stdin(&mut self, bytes: InputBytes, now_ms: i64) -> Vec<Action> {
+        if self.input_failed {
+            return Vec::new();
+        }
         let origin = bytes.origin();
         let pieces = self.escape.feed(&bytes);
         drop(bytes);
         let mut actions = Vec::new();
         for piece in pieces {
             match piece {
-                Piece::Input(input) => actions.extend(self.on_input(origin.derived(input), now_ms)),
+                Piece::Input(input) => {
+                    actions.extend(self.on_input(origin.derived(input), now_ms));
+                    if self.input_failed {
+                        return actions;
+                    }
+                }
                 Piece::Command(Command::Leave) => {
                     // Leaving on the user's own instruction is not a shell
                     // that exited: code 1, not 0. The session stays on the
@@ -1182,12 +1193,12 @@ impl Session {
 
     /// Move the single pre-admission queue through reconnect transitions.
     /// Accepted old-driver records never enter this queue and are not replayed.
-    fn take_pending_input(&mut self) -> VecDeque<InputBytes> {
+    fn take_pending_input(&mut self) -> PendingInput {
         match &mut self.shell_channel {
             ShellChannel::Opening { queued }
             | ShellChannel::Detached { queued, .. }
             | ShellChannel::Reattaching { queued, .. } => std::mem::take(queued),
-            _ => VecDeque::new(),
+            _ => PendingInput::default(),
         }
     }
 
@@ -1208,16 +1219,12 @@ impl Session {
         | ShellChannel::Detached { queued, .. }
         | ShellChannel::Reattaching { queued, .. } = &mut self.shell_channel
         {
-            let held: usize = queued.iter().map(InputBytes::len).sum();
-            if bytes.len() > MAX_QUEUED_INPUT_BYTES.saturating_sub(held)
-                || queued.len() == INGRESS_READS
-            {
+            if queued.append(&bytes, &self.pending_input_budget).is_err() {
                 return self.handle(
                     UiEvent::InputFailure(LocalInputFailure::PendingFull),
                     now_ms,
                 );
             }
-            queued.push_back(bytes);
             return Vec::new();
         }
         self.handle(UiEvent::InputFailure(LocalInputFailure::NotReady), now_ms)
@@ -1285,7 +1292,7 @@ impl Session {
                 if matches!(state, LinkState::Live) && self.shell_channel == ShellChannel::Unopened
                 {
                     self.shell_channel = ShellChannel::Opening {
-                        queued: VecDeque::new(),
+                        queued: PendingInput::default(),
                     };
                     let (cols, rows) = self.desired_size();
                     actions.push(Action::OpenShell { cols, rows });
@@ -1594,7 +1601,13 @@ impl Session {
     fn leave(&mut self, code: i32) -> Vec<Action> {
         // A resize still waiting out the debounce must not be swallowed: it
         // is what keeps a warm reconnect from resuming at the wrong size.
-        let mut actions = self.flush_resize();
+        // Local admission failures must finish even when remote writes fail.
+        // A deferred resize is applied by the next attachment's own geometry.
+        let mut actions = if self.input_failed {
+            Vec::new()
+        } else {
+            self.flush_resize()
+        };
         let bytes = self.renderer.finish();
         // `finish` resets the renderer's own idea of the screen; ours has to
         // go with it, or a `handle` call reached after `Exit` (a duplicate
@@ -2922,11 +2935,8 @@ mod tests {
         let overflow = s.handle(UiEvent::Stdin(ingress_input(vec![b'z'; 4096])), 6);
         assert!(matches!(overflow.last(), Some(Action::Exit(1))));
         let flushed = s.on_channel_ready(37, 10);
-        assert_eq!(
-            sent(&flushed),
-            vec![b'x'; 64 * 1024],
-            "whole accepted prefix, no clipped suffix"
-        );
+        assert!(overflow.contains(&Action::Keep));
+        assert!(sent(&flushed).is_empty(), "failed commands never replay");
     }
 
     /// A resize that settles before the channel is confirmed waits (there

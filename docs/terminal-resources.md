@@ -362,3 +362,36 @@ can retain additional combining marks; replay repair preserves cursor position
 and the last input scalar but cannot impose a new memory policy on another
 executable. Protocol-1 clients cannot establish QSH sessions with the current
 protocol-2 daemon.
+
+## Keyboard input during opening and recovery
+
+The CLI retains unsent input while opening the shell channel, reconnecting, or
+waiting for the retained channel to be announced. One compact FIFO spans these
+states; channel readiness transfers its bytes to one guarded send action. Input
+already admitted by a previous transport driver never enters this FIFO and is
+never replayed. Confirmed loss of the previous shell discards its unsent input
+with a notice.
+
+Keyboard source custody and recovery storage have separate bounds:
+
+- Source input retains at most 64 KiB of original bytes and 64 KiB of original
+  allocation capacity across the reader, queued UI events, parser aliases and
+  actions. Each nonempty read consumes byte credit, so there are at most 65,536
+  original read permits. Read count itself does not terminate the client.
+  Provenance aggregation deduplicates permit identities with ordered lookup.
+- Recovery storage owns at most one 64 KiB allocation and reservation per client
+  session, including an emitted action still holding that allocation. Its FIFO
+  metadata does not grow with the number of historical reads. Copying into this
+  FIFO does not refund source credit until every actual source alias drops.
+- The reader additionally owns one fixed 4096-byte scratch read. Existing parser
+  and action copies retain source provenance; these phase allowances and heap
+  wrappers are distinct from the source and recovery allocation bounds above.
+  These limits do not describe total process RSS or transport retention.
+
+At exactly full recovery storage, local escape commands such as `Ctrl-] .`
+remain available through the source phase. An append exceeding the actual byte
+limit is rejected whole. Source saturation that remains after earlier input has
+been processed also fails explicitly. Either local failure reports undelivered
+input, discards unsent commands and exits nonzero without closing the remote
+session. No partial command is silently clipped or replayed on a later attach.
+Bracketed paste keeps its existing literal escape-prefix semantics.
