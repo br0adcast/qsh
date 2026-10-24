@@ -75,6 +75,12 @@ jobs:
           cargo test --lib --no-run --locked
           -p bringup -p client -p connect -p knock -p logging
           -p prediction -p render -p ssh -p terminal -p terminal-size
+      - name: Compile the bringup standalone target boundary
+        run: |
+          echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."
+          cargo check --all-targets -p bringup --locked
+      - name: Portable bringup SSH identity tests
+        run: cargo test -p bringup --test ssh_identity --locked
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Portable CLI tests
