@@ -262,10 +262,12 @@ fn parent_descriptor_survives_rename_without_following_a_planted_directory() {
 #[test]
 fn exact_alias_limit_and_relative_parent_targets_are_validated() {
     let dir = private_dir();
-    let actual = dir.path().join("actual");
+    // Count fixture aliases independently of aliases in the runner's temp path.
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let actual = base.join("actual");
     make_dir(&actual);
     key(&actual.join("key"), 0o600);
-    let sub = dir.path().join("sub");
+    let sub = base.join("sub");
     make_dir(&sub);
     symlink("../actual", sub.join("parent-alias")).unwrap();
     assert_eq!(
@@ -280,22 +282,20 @@ fn exact_alias_limit_and_relative_parent_targets_are_validated() {
         } else {
             format!("alias-{}", index + 1)
         };
-        symlink(target, dir.path().join(format!("alias-{index}"))).unwrap();
+        symlink(target, base.join(format!("alias-{index}"))).unwrap();
     }
     let mut io = Observe::default();
     assert_eq!(
-        read(&dir.path().join("alias-1/key"), Uid::effective(), &mut io)
+        read(&base.join("alias-1/key"), Uid::effective(), &mut io)
             .unwrap()
             .bytes,
         BYTES
     );
     let calls = io.reads;
-    assert!(
-        read(&dir.path().join("alias-0/key"), Uid::effective(), &mut io)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("alias limit")
-    );
+    assert!(read(&base.join("alias-0/key"), Uid::effective(), &mut io)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("alias limit"));
     assert_eq!(io.reads, calls);
 }
