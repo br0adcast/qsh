@@ -428,8 +428,14 @@ fn ctrl_bracket_dot_leaves_and_the_next_run_comes_back() {
 
     answer_yes(&mut first, &screen, &daemon);
     wait_for_the_line(&screen, &daemon);
-    first.type_line("export QSH_MARK=kept");
-    shell_answers(&mut first, &screen, "echo BEFORE'LE'AVING", "BEFORELEAVING");
+    // Queue setup and its proof as one command: sh may print an intervening
+    // prompt after already echoing a separately queued second input line.
+    shell_answers(
+        &mut first,
+        &screen,
+        "export QSH_MARK=kept; echo BEFORE'LE'AVING",
+        "BEFORELEAVING",
+    );
 
     first.master.write_all(b"\x1d.").expect("type ctrl-] .");
     let pressed = Instant::now();
@@ -587,8 +593,12 @@ fn a_silent_link_turns_the_line_red_and_the_reconnect_is_named() {
 
     answer_yes(&mut client, &screen, &daemon);
     wait_for_the_line(&screen, &daemon);
-    client.type_line("export QSH_MARK=kept");
-    shell_answers(&mut client, &screen, "echo BEFORE'CU'T", "BEFORECUT");
+    shell_answers(
+        &mut client,
+        &screen,
+        "export QSH_MARK=kept; echo BEFORE'CU'T",
+        "BEFORECUT",
+    );
     assert!(
         wait_for(Duration::from_secs(10), || ends_with_latency(&screen.top())),
         "a live link shows its latency; top row: {:?}",
