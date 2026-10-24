@@ -722,13 +722,8 @@ fn an_image_that_fails_its_self_check_leaves_the_running_daemon_as_it_was() {
 }
 
 /// A file holding `contents`, open on a descriptor a child inherits.
-fn inheritable_file(dir: &Path, contents: &[u8]) -> std::fs::File {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(dir.join("handover.json"))
-        .expect("a handover file");
+fn inheritable_file(_dir: &Path, contents: &[u8]) -> std::fs::File {
+    let mut file = tempfile::tempfile().expect("an anonymous handover file");
     file.write_all(contents).expect("write it");
     file.seek(SeekFrom::Start(0)).expect("rewind");
     qshd::handover::set_cloexec(file.as_raw_fd(), false).expect("inheritable");

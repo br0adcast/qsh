@@ -408,14 +408,52 @@ fn live_case(bin: &Path, probe: &Path, home: &Path, mode: &str, signal: i32, out
             let server =
                 qshd::load_or_create_transport_key(&cache.join("transport_server_key.bin"))
                     .unwrap();
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let staged = home.join("staged-qshd");
+            let listener = qshd::control::bind_private(&socket).unwrap();
+            // The staged name contains the exec child's PID, like a real
+            // update. Gate that child until its state and image are prepared;
+            // install its exact owner immediately so failed setup still reaps it.
+            let start_gate = home.join("resume-start");
+            nix::unistd::mkfifo(
+                &start_gate,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+            let mut gate = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&start_gate)
+                .unwrap();
+            let mut handover_file = tempfile::tempfile().unwrap();
+            let fds = [
+                udp.as_raw_fd(),
+                listener.as_raw_fd(),
+                handover_file.as_raw_fd(),
+            ];
+            for fd in fds {
+                qshd::handover::set_cloexec(fd, false).unwrap();
+            }
+            command = Command::new("/bin/sh");
+            isolated(&mut command, home, probe);
+            if held_case {
+                command
+                    .env("QSH_TEST_PERSONAL_RELEASE", home.join("close-release"))
+                    .env("QSH_TEST_PERSONAL_HELD", home.join("close-held"));
+            }
+            command.args(["-c", "read task_ready < \"$1/resume-start\"; exec \"$1/.qshd-update-$$-1234\" transport-resume", "qshd-resume-fixture"])
+                .arg(home).env(HANDOVER_FD_ENV, handover_file.as_raw_fd().to_string());
+            let child = command.spawn().unwrap();
+            let pid = child.id();
+            let owner = NativeOwner::spawned(child);
+            for fd in fds {
+                qshd::handover::set_cloexec(fd, true).unwrap();
+            }
+            let staged = home.join(format!(".qshd-update-{pid}-1234"));
             copy_executable(bin, &staged);
             let handover = qshd::handover::Handover {
-                handover_version: 1,
+                handover_version: qshd::state::HANDOVER_VERSION,
                 binary_path: home.join("resumed-qshd"),
-                staged_path: staged.clone(),
+                staged_path: staged,
                 udp_fd: udp.as_raw_fd(),
                 control_fd: listener.as_raw_fd(),
                 control_path: socket.clone(),
@@ -425,33 +463,14 @@ fn live_case(bin: &Path, probe: &Path, home: &Path, mode: &str, signal: i32, out
                 name: "qshd-test-signal".into(),
                 allowlist: qshd::handover::encode_allowlist(&[client_key.public]),
             };
-            let handover_fd = qshd::handover::write_memfd(&handover).unwrap();
-            let fds = [
-                udp.as_raw_fd(),
-                listener.as_raw_fd(),
-                handover_fd.as_raw_fd(),
-            ];
-            for fd in fds {
-                qshd::handover::set_cloexec(fd, false).unwrap();
-            }
-            command = Command::new(staged);
-            isolated(&mut command, home, probe);
-            if held_case {
-                command
-                    .env("QSH_TEST_PERSONAL_RELEASE", home.join("close-release"))
-                    .env("QSH_TEST_PERSONAL_HELD", home.join("close-held"));
-            }
-            command
-                .arg("transport-resume")
-                .env(HANDOVER_FD_ENV, handover_fd.as_raw_fd().to_string());
-            let child = command.spawn();
-            for fd in fds {
-                qshd::handover::set_cloexec(fd, true).unwrap();
-            }
-            let owner = NativeOwner::spawned(child.unwrap());
+            handover_file
+                .write_all(&serde_json::to_vec(&handover).unwrap())
+                .unwrap();
+            handover_file.seek(SeekFrom::Start(0)).unwrap();
+            gate.write_all(b"ready\n").unwrap();
             drop(udp);
             drop(listener);
-            drop(handover_fd);
+            drop(handover_file);
             (owner, server.public, None)
         }
         _ => unreachable!(),

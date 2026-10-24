@@ -2415,7 +2415,25 @@ Then, in order:
    client keys — one-time keys from `ADD-CLIENT` included. The argument is
    `transport-resume`; no other command reads the variable.
 
-The new process renames itself onto the binary's path, flushes the
+Before adopting the inherited sockets, opening the supplied log directory or
+renaming the image, the new process checks that the state descriptor is an open
+anonymous regular file above stderr, all three descriptor numbers are distinct,
+and the sockets have their expected kernel roles and bound UDP port. It checks
+the control listener's original private staging location against its published
+cache path; the kernel bind pathname remains the staging name after publication.
+The staged update must be the running executable, next to the destination and
+named for this update process. Installation directories and destination binary
+names are not fixed. Invalid state is refused before socket ownership transfers
+or replacement occurs; validated sockets then acquire one owner each and regain
+close-on-exec.
+
+This is a cooperative handover from the daemon replaced by exec. The inherited
+file and JSON are not proof of a trusted parent against a malicious same-UID
+process: in particular, the destination basename and renamed control publication
+remain supplied by that parent. Validation rejects malformed or inconsistent
+state; it does not establish a new filesystem security boundary.
+
+The new process renames itself onto the validated binary path, flushes the
 directory, and carries on without binding anything. The server's static key
 is on disk and does not change, so pinned fingerprints stay valid. Live
 sessions do not survive: clients log in again. If the `exec` fails, the

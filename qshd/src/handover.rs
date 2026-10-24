@@ -18,7 +18,7 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::UdpSocket;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,9 @@ use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 #[cfg(target_os = "linux")]
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use serde::{Deserialize, Serialize};
+
+mod validation;
+use validation::{validate_number, validate_paths, validate_sockets};
 
 /// Names the descriptor of the memory file holding the [`Handover`].
 pub const HANDOVER_FD_ENV: &str = "QSHD_HANDOVER_FD";
@@ -124,7 +127,10 @@ struct VersionProbe {
 
 /// Read a handover back from its unnamed file, closing it.
 pub fn read_handover(fd: OwnedFd) -> Result<Handover> {
-    let mut file = File::from(fd);
+    read_description(&mut File::from(fd))
+}
+
+fn read_description(file: &mut File) -> Result<Handover> {
     file.seek(SeekFrom::Start(0))
         .context("rewinding the handover")?;
     let mut json = String::new();
@@ -142,11 +148,46 @@ pub fn read_handover(fd: OwnedFd) -> Result<Handover> {
     serde_json::from_str(&json).context("parsing the handover")
 }
 
-/// The handover this process was started with, if it was started by a
-/// daemon replacing itself. Removes [`HANDOVER_FD_ENV`] so no shell this
-/// daemon spawns inherits it. Call first thing in `main`, while the process
-/// has one thread.
-pub fn take_from_env() -> Result<Option<Handover>> {
+/// A validated, single-use transfer from the cooperative daemon this image
+/// replaced. Numeric descriptor fields are only a serialized description;
+/// socket ownership lives here and cannot be adopted a second time.
+#[derive(Debug)]
+pub struct PreparedHandover {
+    description: Handover,
+    socket: UdpSocket,
+    listener: UnixListener,
+    allowlist: Vec<[u8; 32]>,
+}
+
+impl PreparedHandover {
+    pub fn description(&self) -> &Handover {
+        &self.description
+    }
+
+    pub fn settle_binary(&self) -> Result<()> {
+        settle_binary(&self.description)
+    }
+
+    pub fn into_parts(self) -> (Handover, UdpSocket, UnixListener, Vec<[u8; 32]>) {
+        (self.description, self.socket, self.listener, self.allowlist)
+    }
+}
+
+/// Read and validate inherited state before opening logs or renaming files.
+/// Call once, at startup, before starting threads or opening other descriptors.
+/// The cooperative old daemon remains the authority for the destination name
+/// and the renamed control publication; this does not authenticate a hostile
+/// same-UID producer of descriptors or JSON.
+///
+/// # Safety
+///
+/// Each descriptor accepted by validation must be exclusively available for
+/// ownership transfer: no other Rust owner may own its number. Callers must
+/// prevent concurrent descriptor changes throughout this function. Kernel
+/// validation can reject malformed input, but cannot prove these ownership
+/// preconditions. A fresh exec image, before any descriptor opens or threads,
+/// provides them for the cooperative parent's inherited descriptors.
+pub unsafe fn take_from_env() -> Result<Option<PreparedHandover>> {
     let Some(raw) = std::env::var_os(HANDOVER_FD_ENV) else {
         return Ok(None);
     };
@@ -155,14 +196,42 @@ pub fn take_from_env() -> Result<Option<Handover>> {
         .to_str()
         .and_then(|s| s.parse().ok())
         .with_context(|| format!("{HANDOVER_FD_ENV} is not a descriptor number"))?;
-    if fd < 0 {
-        bail!("{HANDOVER_FD_ENV} is negative");
+    validate_number(fd)?;
+    let stat = nix::sys::stat::fstat(fd).context("inspecting the handover file")?;
+    if stat.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG || stat.st_nlink != 0 {
+        bail!("handover descriptor is not an anonymous regular file");
     }
-    // SAFETY: the daemon that exec'd this process left exactly this
-    // descriptor open for it, and nothing in this fresh process image has
-    // opened, closed or taken ownership of it since.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    read_handover(owned).map(Some)
+    if fcntl(fd, FcntlArg::F_GETFL)? & nix::libc::O_ACCMODE == nix::libc::O_WRONLY {
+        bail!("handover file is not readable");
+    }
+    // SAFETY: startup is single-threaded; kernel checks established a live
+    // inherited file above stdio. No other owner has been created in this image.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    set_cloexec(fd, true)?;
+    let description = read_description(&mut file)?;
+    if description.udp_fd == description.control_fd
+        || description.udp_fd == fd
+        || description.control_fd == fd
+    {
+        bail!("handover descriptors must be distinct");
+    }
+    validate_sockets(&description)?;
+    validate_paths(&description)?;
+    let allowlist = decode_allowlist(&description.allowlist)?;
+    // Validate everything before transferring either socket. If a flag update
+    // fails after transfer, the two unique owners close the accepted pair.
+    // SAFETY: both live inherited descriptors have different numbers and
+    // disjoint kernel roles, and neither has an owner in this fresh image.
+    let socket = unsafe { UdpSocket::from_raw_fd(description.udp_fd) };
+    let listener = unsafe { UnixListener::from_raw_fd(description.control_fd) };
+    set_cloexec(socket.as_raw_fd(), true)?;
+    set_cloexec(listener.as_raw_fd(), true)?;
+    Ok(Some(PreparedHandover {
+        description,
+        socket,
+        listener,
+        allowlist,
+    }))
 }
 
 pub fn set_cloexec(fd: RawFd, on: bool) -> nix::Result<()> {
@@ -283,7 +352,7 @@ pub(crate) fn exec_with_retries(
 /// Rename the staged binary onto the binary's path and flush the directory,
 /// so the rename survives a power cut. `rename` keeps the inode: from here
 /// `/proc/self/exe` names the permanent path.
-pub fn settle_binary(handover: &Handover) -> Result<()> {
+fn settle_binary(handover: &Handover) -> Result<()> {
     std::fs::rename(&handover.staged_path, &handover.binary_path).with_context(|| {
         format!(
             "renaming {} onto {}",
@@ -297,21 +366,6 @@ pub fn settle_binary(handover: &Handover) -> Result<()> {
             .with_context(|| format!("flushing {}", dir.display()))?;
     }
     Ok(())
-}
-
-/// Take ownership of the two sockets the old process left open, and put
-/// close-on-exec back on them: the shells this daemon spawns must not
-/// inherit them.
-pub fn adopt_sockets(handover: &Handover) -> Result<(UdpSocket, UnixListener)> {
-    set_cloexec(handover.udp_fd, true).context("re-arming close-on-exec on the UDP socket")?;
-    set_cloexec(handover.control_fd, true)
-        .context("re-arming close-on-exec on the control socket")?;
-    // SAFETY: both numbers came from the process this one replaced, which
-    // cleared close-on-exec on exactly these two; nothing in this fresh image
-    // has opened, closed or taken ownership of them since.
-    let socket = unsafe { UdpSocket::from_raw_fd(handover.udp_fd) };
-    let listener = unsafe { UnixListener::from_raw_fd(handover.control_fd) };
-    Ok((socket, listener))
 }
 
 #[cfg(test)]

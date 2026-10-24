@@ -10,6 +10,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    // The build script runs on the host; the adapter belongs to the target.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=src/handover/darwin_listener.c");
+        cc::Build::new()
+            .file("src/handover/darwin_listener.c")
+            .flag_if_supported("-std=c11")
+            .warnings(true)
+            .extra_warnings(true)
+            .compile("qsh_handover_darwin");
+        println!("cargo:rustc-link-lib=proc");
+    }
     // Rebuild when HEAD (or a ref it points at) moves, so the stamp tracks
     // commits. Best-effort: even if a rerun is missed, `git log` yields the
     // right value whenever the script does run, and reconcile's `>=` branch
