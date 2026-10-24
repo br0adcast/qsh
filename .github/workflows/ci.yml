@@ -161,6 +161,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_output.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_release_upload.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
 
