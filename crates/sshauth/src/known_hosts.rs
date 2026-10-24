@@ -148,7 +148,11 @@ impl<'a> HostIdentity<'a> {
     }
 }
 
-fn pinned_key(entries: &[Entry], host: &str, port: u16) -> Result<Option<[u8; 32]>, AuthError> {
+fn pinned_key<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    host: &str,
+    port: u16,
+) -> Result<Option<[u8; 32]>, AuthError> {
     let identity = HostIdentity::of(host);
     let mut pinned = None;
     for entry in entries {
@@ -190,6 +194,52 @@ fn parse_line(line: &str) -> Option<Entry> {
     })
 }
 
+/// Original text with spans only for records accepted by the trust parser.
+/// Unknown lines remain text, never entries used for lookup.
+struct Document {
+    text: String,
+    records: Vec<(Entry, std::ops::Range<usize>)>,
+}
+
+impl Document {
+    fn parse(text: String) -> Self {
+        let mut offset = 0;
+        let records = text
+            .split_inclusive('\n')
+            .filter_map(|line| {
+                let range = offset..offset + line.len();
+                offset = range.end;
+                parse_line(line).map(|entry| (entry, range))
+            })
+            .collect();
+        Self { text, records }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.records.iter().map(|(entry, _)| entry)
+    }
+
+    /// Remove only parsed exact-target records, then append a canonical pin.
+    /// Retained bytes keep their line endings; an unterminated tail needs one
+    /// separator so appending cannot turn its text into part of the new record.
+    fn with_pin(&self, host: &str, port: u16, key: &[u8; 32]) -> String {
+        let mut contents = String::with_capacity(self.text.len());
+        let mut offset = 0;
+        for (entry, range) in &self.records {
+            if entry.host == host && entry.port == port {
+                contents.push_str(&self.text[offset..range.start]);
+                offset = range.end;
+            }
+        }
+        contents.push_str(&self.text[offset..]);
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&format!("{host} {port} {}\n", BASE64.encode(key)));
+        contents
+    }
+}
+
 /// The known-hosts file: `host port base64-key`, one entry per line, `#`
 /// comments and blank lines ignored -- the same shape as OpenSSH's own file.
 /// Lookup folds ordinary ASCII DNS letter case and compares strict IP literals
@@ -214,10 +264,12 @@ impl KnownHosts {
     /// (permissions, the path being a directory, ...) is, since silently
     /// treating it as "nothing pinned" would let a broken store masquerade
     /// as a trustworthy empty one.
-    fn read_entries(&self) -> Result<Vec<Entry>, AuthError> {
+    fn read_entries(&self) -> Result<Document, AuthError> {
         match fs::read_to_string(&self.path) {
-            Ok(text) => Ok(text.lines().filter_map(parse_line).collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Ok(text) => Ok(Document::parse(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Document::parse(String::new()))
+            }
             Err(e) => Err(AuthError::Backend(format!(
                 "reading {}: {e}",
                 self.path.display()
@@ -232,7 +284,7 @@ impl KnownHosts {
     pub fn check(&self, host: &str, port: u16, key: &[u8; 32]) -> Result<HostVerdict, AuthError> {
         validate_host_identifier(host)?;
         let entries = self.read_entries()?;
-        match pinned_key(&entries, host, port)? {
+        match pinned_key(entries.entries(), host, port)? {
             None => Ok(HostVerdict::Unknown),
             Some(pinned) if &pinned == key => Ok(HostVerdict::Known),
             Some(pinned) => Ok(HostVerdict::Changed { pinned }),
@@ -253,13 +305,13 @@ impl KnownHosts {
         validate_host_identifier(host)?;
         let _lock = PinLock::acquire(&self.path)?;
 
-        let mut entries = self.read_entries()?;
-        if let Some(pinned) = pinned_key(&entries, host, port)? {
+        let entries = self.read_entries()?;
+        if let Some(pinned) = pinned_key(entries.entries(), host, port)? {
             if &pinned == key {
                 return Ok(());
             }
             let identity = HostIdentity::of(host);
-            if entries.iter().any(|entry| {
+            if entries.entries().any(|entry| {
                 entry.port == port
                     && entry.host != host
                     && identity.matches(HostIdentity::of(&entry.host))
@@ -269,14 +321,7 @@ impl KnownHosts {
                 ));
             }
         }
-        entries.retain(|e| !(e.host == host && e.port == port));
-        entries.push(Entry {
-            host: host.to_string(),
-            port,
-            key: *key,
-        });
-
-        self.write_atomic(render(&entries).as_bytes())
+        self.write_atomic(entries.with_pin(host, port, key).as_bytes())
         // `_lock` is dropped (and released) here, after the rename below
         // has already made the new contents visible.
     }
@@ -299,20 +344,15 @@ impl KnownHosts {
         validate_host_identifier(host)?;
         let _lock = PinLock::acquire(&self.path)?;
 
-        let mut entries = self.read_entries()?;
-        if let Some(pinned) = pinned_key(&entries, host, port)? {
+        let entries = self.read_entries()?;
+        if let Some(pinned) = pinned_key(entries.entries(), host, port)? {
             return Ok(if &pinned == key {
                 HostVerdict::Known
             } else {
                 HostVerdict::Changed { pinned }
             });
         }
-        entries.push(Entry {
-            host: host.to_string(),
-            port,
-            key: *key,
-        });
-        self.write_atomic(render(&entries).as_bytes())?;
+        self.write_atomic(entries.with_pin(host, port, key).as_bytes())?;
         Ok(HostVerdict::Unknown)
     }
 
@@ -364,15 +404,6 @@ impl KnownHosts {
         self.path
             .with_file_name(format!(".{name}.tmp.{}.{nanos}", std::process::id()))
     }
-}
-
-/// The file's contents for `entries`, one `host port base64-key` line each.
-fn render(entries: &[Entry]) -> String {
-    let mut contents = String::new();
-    for e in entries {
-        contents.push_str(&format!("{} {} {}\n", e.host, e.port, BASE64.encode(e.key)));
-    }
-    contents
 }
 
 /// Write a brand-new file with `contents`, owner-only on Unix. `create_new`
@@ -501,6 +532,138 @@ mod tests {
 
     fn base64_key(key: &[u8; 32]) -> String {
         BASE64.encode(key)
+    }
+
+    #[test]
+    fn pin_insertion_preserves_original_text_and_newline_boundaries() {
+        for if_absent in [false, true] {
+            for tail in [
+                "EMPTY",
+                "",
+                "# comment\n\nunknown record\n",
+                "# comment\r\n\r\nunknown record\r\n",
+                "# unterminated",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("known_hosts");
+                let original = if tail == "EMPTY" {
+                    String::new()
+                } else {
+                    format!(
+                        "  other.example\t22\t{} annotation\r\n{tail}",
+                        base64_key(&[1; 32])
+                    )
+                };
+                fs::write(&path, &original).unwrap();
+                let hosts = KnownHosts::open(path.clone());
+                if if_absent {
+                    assert_eq!(
+                        hosts.pin_if_absent("new.example", 22, &[2; 32]).unwrap(),
+                        HostVerdict::Unknown
+                    );
+                } else {
+                    hosts.pin("new.example", 22, &[2; 32]).unwrap();
+                }
+                let separator = if original.is_empty() || original.ends_with('\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    format!(
+                        "{original}{separator}new.example 22 {}\n",
+                        base64_key(&[2; 32])
+                    )
+                    .as_bytes()
+                );
+                assert_eq!(
+                    hosts.check("other.example", 22, &[1; 32]).unwrap(),
+                    if original.is_empty() {
+                        HostVerdict::Unknown
+                    } else {
+                        HostVerdict::Known
+                    }
+                );
+                assert_eq!(
+                    hosts.check("new.example", 22, &[2; 32]).unwrap(),
+                    HostVerdict::Known
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pin_replacement_preserves_unrelated_records_and_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let original = format!("# header\r\ntarget.example 22 {}\r\n\nunknown record\n  other.example 22 {} trailing\r\ntarget.example bad-port invalid\ntarget.example 22 {}\n# tail", base64_key(&[1; 32]), base64_key(&[3; 32]), base64_key(&[1; 32]));
+        fs::write(&path, original).unwrap();
+        let hosts = KnownHosts::open(path.clone());
+        hosts.pin("target.example", 22, &[2; 32]).unwrap();
+        let expected = format!("# header\r\n\nunknown record\n  other.example 22 {} trailing\r\ntarget.example bad-port invalid\n# tail\ntarget.example 22 {}\n", base64_key(&[3; 32]), base64_key(&[2; 32]));
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        assert_eq!(
+            hosts.check("target.example", 22, &[2; 32]).unwrap(),
+            HostVerdict::Known
+        );
+    }
+
+    #[test]
+    fn pin_no_op_preserves_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let original = format!(
+            "# header\r\n\r\n  Example.org\t22 {} trailing\r\nExample.org 22 {}\nunknown record",
+            base64_key(&[1; 32]),
+            base64_key(&[1; 32])
+        );
+        fs::write(&path, &original).unwrap();
+        let hosts = KnownHosts::open(path.clone());
+        for host in ["Example.org", "example.org"] {
+            hosts.pin(host, 22, &[1; 32]).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert_eq!(
+                hosts.pin_if_absent(host, 22, &[1; 32]).unwrap(),
+                HostVerdict::Known
+            );
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert_eq!(
+                hosts.pin_if_absent(host, 22, &[2; 32]).unwrap(),
+                HostVerdict::Changed { pinned: [1; 32] }
+            );
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn preserved_malformed_records_never_grant_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let original = format!("target.example bad {}\ntarget.example 22 !invalid!\ntarget.example 22 YQ==\n#target.example 22 {}\n", base64_key(&[1; 32]), base64_key(&[1; 32]));
+        fs::write(&path, &original).unwrap();
+        let hosts = KnownHosts::open(path.clone());
+        assert_eq!(
+            hosts.check("target.example", 22, &[1; 32]).unwrap(),
+            HostVerdict::Unknown
+        );
+        assert_eq!(
+            hosts.pin_if_absent("target.example", 22, &[2; 32]).unwrap(),
+            HostVerdict::Unknown
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            format!("{original}target.example 22 {}\n", base64_key(&[2; 32])).as_bytes()
+        );
+        assert_eq!(
+            hosts.check("target.example", 22, &[2; 32]).unwrap(),
+            HostVerdict::Known
+        );
+        fs::write(&path, [0xff, b'\n']).unwrap();
+        assert!(hosts.check("target.example", 22, &[2; 32]).is_err());
+        assert!(hosts.pin("target.example", 22, &[2; 32]).is_err());
+        assert!(hosts.pin_if_absent("target.example", 22, &[2; 32]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), [0xff, b'\n']);
     }
 
     fn rejects_injected_pin(if_absent: bool) {
@@ -940,6 +1103,12 @@ mod tests {
             .pin("a.example.org", 60022, &[1u8; 32])
             .expect("pin a");
 
+        let original = format!(
+            "# retained header\r\n{}\nunknown record\n",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, &original).unwrap();
+
         let held = PinLock::acquire(&path).expect("acquire the lock pin() itself uses");
         let hosts_for_thread = KnownHosts::open(path.clone());
         let handle =
@@ -959,6 +1128,10 @@ mod tests {
             .join()
             .expect("pin thread")
             .expect("pin succeeds once the lock is free");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            format!("{original}b.example.org 60022 {}\n", base64_key(&[2; 32])).as_bytes()
+        );
 
         // The point of the lock: a concurrent pin of a DIFFERENT host must
         // never be lost to a last-rename-wins race.
