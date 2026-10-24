@@ -141,6 +141,7 @@ pub struct Daemon {
     #[allow(dead_code)]
     home: tempfile::TempDir,
     shell: PathBuf,
+    parent_env: Vec<(String, String)>,
 }
 
 impl Daemon {
@@ -188,7 +189,8 @@ impl Daemon {
     pub fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (child, output) = spawn_serve(self.home.path(), self.port, &self.shell);
+        let (child, output) =
+            spawn_serve(self.home.path(), self.port, &self.shell, &self.parent_env);
         {
             let before = self
                 .output
@@ -272,6 +274,14 @@ pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
 
 /// Explicit compatibility coverage; generic fixtures always use /bin/sh.
 pub fn start_daemon_with_shell(shell: &Path) -> (Daemon, std::path::PathBuf) {
+    start_daemon_with_shell_env(shell, &[])
+}
+
+/// Synthetic parent environment for startup-isolation regressions.
+pub fn start_daemon_with_shell_env(
+    shell: &Path,
+    parent_env: &[(String, String)],
+) -> (Daemon, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::Builder::new()
         .prefix("qsh shell ' ")
@@ -300,7 +310,7 @@ pub fn start_daemon_with_shell(shell: &Path) -> (Daemon, std::path::PathBuf) {
     .expect("write authorized_keys");
 
     let port = free_udp_port();
-    let (child, output) = spawn_serve(home.path(), port, shell);
+    let (child, output) = spawn_serve(home.path(), port, shell, parent_env);
 
     let daemon = Daemon {
         child,
@@ -308,6 +318,7 @@ pub fn start_daemon_with_shell(shell: &Path) -> (Daemon, std::path::PathBuf) {
         output,
         home,
         shell: shell.to_path_buf(),
+        parent_env: parent_env.to_vec(),
     };
     // Spawning is not readiness: an explicit refusal now ends discovery
     // immediately, so do not race the daemon's first socket bind.
@@ -325,7 +336,12 @@ pub fn start_daemon_with_shell(shell: &Path) -> (Daemon, std::path::PathBuf) {
 
 /// `qshd serve` on `port`, with the host key and `authorized_keys` in
 /// `home`, and everything it prints drained into the returned buffer.
-fn spawn_serve(home: &Path, port: u16, shell: &Path) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>) {
+fn spawn_serve(
+    home: &Path,
+    port: u16,
+    shell: &Path,
+    parent_env: &[(String, String)],
+) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>) {
     let mut command = Command::new(qshd_path());
     let tracked_shell = home.join("tracked-shell");
     let shell = if tracked_shell.exists() {
@@ -333,6 +349,9 @@ fn spawn_serve(home: &Path, port: u16, shell: &Path) -> (Child, std::sync::Arc<M
     } else {
         shell
     };
+    // Synthetic inherited values exercise the same override order without a
+    // test-process reexec or process-global environment mutation.
+    command.envs(parent_env.iter().cloned());
     command.envs(shell_env::prepare(home, shell));
     let mut child = command
         .args([

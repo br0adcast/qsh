@@ -2,78 +2,55 @@
 #![cfg(unix)]
 mod support;
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use support::*;
 
-struct OwnedChild(Child);
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+// The synthetic startup state and the daemon/client guards stay owned by this
+// test process, including while an assertion unwinds.
+struct ForeignStartup {
+    home: tempfile::TempDir,
+    env: Vec<(String, String)>,
 }
 
-// Per-child contamination avoids changing the concurrently running test process.
-fn isolated(test: &str, shell: &Path, foreign_startup: bool) -> bool {
-    if std::env::var_os("QSH_SHELL_FIXTURE_CHILD").is_some() {
-        return true;
-    }
-    let foreign = tempfile::Builder::new()
-        .prefix("foreign shell ' ")
-        .tempdir()
-        .unwrap();
-    let marker = foreign.path().join("startup-ran");
-    let body = format!(
-        "printf 'FOREIGN_STARTUP\\n'; printf x > {}\n",
-        shell_env::quote(&marker)
-    );
-    if foreign_startup {
-        for file in [".zshenv", ".zshrc", "bash-env", "env"] {
-            std::fs::write(foreign.path().join(file), &body).unwrap();
+impl ForeignStartup {
+    fn new(shell: &Path, foreign_startup: bool) -> Self {
+        let home = tempfile::Builder::new()
+            .prefix("foreign shell ' ")
+            .tempdir()
+            .unwrap();
+        let marker = home.path().join("startup-ran");
+        let body = format!(
+            "printf 'FOREIGN_STARTUP\\n'; printf x > {}\n",
+            shell_env::quote(&marker)
+        );
+        if foreign_startup {
+            for file in [".zshenv", ".zshrc", "bash-env", "env"] {
+                std::fs::write(home.path().join(file), &body).unwrap();
+            }
         }
+        let h = home.path().to_str().unwrap().to_owned();
+        let env = vec![
+            ("HOME".into(), h.clone()),
+            ("XDG_CACHE_HOME".into(), h.clone()),
+            ("XDG_CONFIG_HOME".into(), h.clone()),
+            ("SHELL".into(), shell.to_str().unwrap().into()),
+            ("ZDOTDIR".into(), h.clone()),
+            ("BASH_ENV".into(), format!("{h}/bash-env")),
+            ("ENV".into(), format!("{h}/env")),
+            ("HISTFILE".into(), "/dev/null".into()),
+            ("QSH_FIXTURE_CANARY".into(), "owned-startup".into()),
+        ];
+        Self { home, env }
     }
-    let mut log = tempfile::tempfile().unwrap();
-    let mut child = OwnedChild(
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env("QSH_SHELL_FIXTURE_CHILD", "1")
-            .env("HOME", foreign.path())
-            .env("XDG_CACHE_HOME", foreign.path())
-            .env("XDG_CONFIG_HOME", foreign.path())
-            .env("SHELL", shell)
-            .env("ZDOTDIR", foreign.path())
-            .env("BASH_ENV", foreign.path().join("bash-env"))
-            .env("ENV", foreign.path().join("env"))
-            .env("HISTFILE", "/dev/null")
-            .env_remove("SSH_AUTH_SOCK")
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log.try_clone().unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "private-shell child timed out");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    log.seek(SeekFrom::Start(0)).unwrap();
-    let mut output = String::new();
-    log.read_to_string(&mut output).unwrap();
-    assert!(status.success(), "private-shell child failed: {output}");
-    assert!(
-        output.contains("1 passed; 0 failed"),
-        "selected test did not run: {output}"
-    );
-    assert!(!marker.exists(), "foreign startup file was sourced");
-    false
+
+    fn assert_not_sourced(&self) {
+        assert!(
+            !self.home.path().join("startup-ran").exists(),
+            "foreign startup file was sourced"
+        );
+    }
 }
 
 fn installed_shell(name: &str) -> Option<PathBuf> {
@@ -93,68 +70,52 @@ fn installed_shell(name: &str) -> Option<PathBuf> {
 
 #[test]
 fn generic_fixture_executes_first_command_in_predictable_shell() {
-    let name = "generic_fixture_executes_first_command_in_predictable_shell";
-    if !isolated(name, Path::new("/bin/bash"), true) {
-        return;
-    }
     let _serial = serialised();
-    let (daemon, key) = start_daemon();
+    let foreign = ForeignStartup::new(Path::new("/bin/bash"), true);
+    let (daemon, key) = start_daemon_with_shell_env(Path::new("/bin/sh"), &foreign.env);
     check_shell(&daemon, &key, "sh");
+    foreign.assert_not_sourced();
 }
 
 #[test]
 fn explicit_bash_ignores_foreign_startup_and_survives_restart() {
-    explicit(
-        "explicit_bash_ignores_foreign_startup_and_survives_restart",
-        "bash",
-        true,
-    );
+    explicit("bash", true);
 }
 
 #[test]
 fn explicit_zsh_executes_first_input_without_newuser_wizard() {
-    explicit(
-        "explicit_zsh_executes_first_input_without_newuser_wizard",
-        "zsh",
-        false,
-    );
+    explicit("zsh", false);
 }
 
 #[test]
 fn explicit_zsh_ignores_foreign_startup_and_survives_restart() {
-    explicit(
-        "explicit_zsh_ignores_foreign_startup_and_survives_restart",
-        "zsh",
-        true,
-    );
+    explicit("zsh", true);
 }
 
-fn explicit(test: &str, shell: &str, foreign: bool) {
+fn explicit(shell: &str, foreign_startup: bool) {
     let Some(path) = installed_shell(shell) else {
         return;
     };
-    if !isolated(test, &path, foreign) {
-        return;
-    }
     let _serial = serialised();
-    let (mut daemon, key) = start_daemon_with_shell(&path);
+    let foreign = ForeignStartup::new(&path, foreign_startup);
+    let (mut daemon, key) = start_daemon_with_shell_env(&path, &foreign.env);
     check_shell(&daemon, &key, shell);
+    foreign.assert_not_sourced();
     daemon.restart();
     check_shell(&daemon, &key, shell);
+    foreign.assert_not_sourced();
 }
 
 #[test]
 fn tracked_shell_takes_precedence_after_restart() {
-    let name = "tracked_shell_takes_precedence_after_restart";
-    if !isolated(name, Path::new("/bin/bash"), true) {
-        return;
-    }
     let _serial = serialised();
-    let (mut daemon, key) = start_daemon_with_shell(Path::new("/bin/bash"));
+    let foreign = ForeignStartup::new(Path::new("/bin/bash"), true);
+    let (mut daemon, key) = start_daemon_with_shell_env(Path::new("/bin/bash"), &foreign.env);
     daemon.track_shell_starts();
     daemon.restart();
     check_shell(&daemon, &key, "sh");
     assert_eq!(daemon.shell_starts(), 1);
+    foreign.assert_not_sourced();
 }
 
 struct ObservedClient {
@@ -169,6 +130,10 @@ impl Drop for ObservedClient {
 }
 
 fn check_shell(daemon: &Daemon, key: &Path, identity: &str) {
+    check_shell_ready(daemon, key, identity, |_| {});
+}
+
+fn check_shell_ready(daemon: &Daemon, key: &Path, identity: &str, ready: impl FnOnce(u32)) {
     let config = tempfile::tempdir().unwrap();
     let client = spawn_client(daemon, key, config.path());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -197,7 +162,7 @@ fn check_shell(daemon: &Daemon, key: &Path, identity: &str) {
     client.master.write_all(b"yes\n").unwrap();
     // Contiguous markers never occur in the typed command. The nested Bash
     // command also exercises BASH_ENV, which interactive Bash does not read.
-    client.type_line("printf 'FIRST_%s\\n' INPUT; printf 'IDENTITY_%s\\n' \"${0##*/}\"; /bin/bash -c \"printf 'NESTED_%s\\\\n' CLEAN\"");
+    client.type_line("printf 'FIRST_%s\\n' INPUT; printf 'IDENTITY_%s\\n' \"${0##*/}\"; /bin/bash -c \"printf 'NESTED_%s\\\\n' CLEAN\"; printf 'CANARY_%s\\n' \"$QSH_FIXTURE_CANARY\"");
     assert!(
         wait_until(|| text().contains("FIRST_INPUT")),
         "first command lost: {}",
@@ -214,6 +179,11 @@ fn check_shell(daemon: &Daemon, key: &Path, identity: &str) {
         text()
     );
     assert!(
+        wait_until(|| text().contains("CANARY_owned-startup")),
+        "injected environment missing: {}",
+        text()
+    );
+    assert!(
         !text().contains("zsh-newuser-install"),
         "wizard ran: {}",
         text()
@@ -223,6 +193,65 @@ fn check_shell(daemon: &Daemon, key: &Path, identity: &str) {
         "foreign startup ran: {}",
         text()
     );
+    ready(client.child.id());
     client.type_line("exit");
     assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(0));
+}
+
+#[test]
+fn assertion_unwind_reaps_live_daemon_and_client() {
+    use std::cell::Cell;
+    let _serial = serialised();
+    let foreign = ForeignStartup::new(Path::new("/bin/bash"), true);
+    let daemon_pid = Cell::new(0);
+    let client_pid = Cell::new(0);
+    let reached = Cell::new(false);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (daemon, key) = start_daemon_with_shell_env(Path::new("/bin/sh"), &foreign.env);
+        daemon_pid.set(daemon.child.id());
+        check_shell_ready(&daemon, &key, "sh", |pid| {
+            client_pid.set(pid);
+            assert_owned_live(daemon_pid.get());
+            assert_owned_live(pid);
+            reached.set(true);
+            panic!("intentional assertion unwind with live fixture children");
+        });
+    }));
+    assert!(
+        result.is_err() && reached.get(),
+        "control must reach the live-shell assertion"
+    );
+    assert_reaped(daemon_pid.get());
+    assert_reaped(client_pid.get());
+    eprintln!(
+        "unwind control reaped owned daemon PID {} and client PID {}",
+        daemon_pid.get(),
+        client_pid.get()
+    );
+    foreign.assert_not_sourced();
+}
+
+fn assert_owned_live(pid: u32) {
+    let mut status = 0;
+    // These are direct children created by this test, still protected by their
+    // guards. WNOHANG observes ownership without signalling or blocking.
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        0
+    );
+}
+
+fn assert_reaped(pid: u32) {
+    assert_ne!(pid, 0);
+    let mut status = 0;
+    // A child that was merely killed but not waited would return its PID here.
+    // ECHILD proves the owning guard already completed its wait.
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
 }
