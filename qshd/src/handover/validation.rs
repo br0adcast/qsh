@@ -60,6 +60,27 @@ fn socket_address(fd: RawFd) -> Result<(nix::libc::sockaddr_storage, usize)> {
     Ok((address, len as usize))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn is_control_listener(fd: RawFd) -> Result<bool> {
+    Ok(socket_option(fd, nix::libc::SO_ACCEPTCONN)? == 1)
+}
+
+#[cfg(target_os = "macos")]
+fn is_control_listener(fd: RawFd) -> Result<bool> {
+    extern "C" {
+        fn qsh_handover_unix_listener_state(fd: nix::libc::c_int) -> nix::libc::c_int;
+    }
+    // SAFETY: the SDK-compiled adapter accepts only a descriptor number,
+    // reads this process's kernel socket metadata, and returns 0/1 or -errno.
+    match unsafe { qsh_handover_unix_listener_state(fd) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        error if error < 0 => Err(std::io::Error::from_raw_os_error(-error))
+            .context("inspecting inherited control listener state with proc_pidfdinfo"),
+        _ => bail!("invalid inherited control listener state result"),
+    }
+}
+
 pub(super) fn validate_sockets(h: &Handover) -> Result<()> {
     validate_number(h.udp_fd)?;
     validate_number(h.control_fd)?;
@@ -82,7 +103,7 @@ pub(super) fn validate_sockets(h: &Handover) -> Result<()> {
         bail!("inherited UDP socket port does not match the handover");
     }
     if socket_option(h.control_fd, nix::libc::SO_TYPE)? != nix::libc::SOCK_STREAM
-        || socket_option(h.control_fd, nix::libc::SO_ACCEPTCONN)? != 1
+        || !is_control_listener(h.control_fd)?
     {
         bail!("inherited control socket is not a stream listener");
     }

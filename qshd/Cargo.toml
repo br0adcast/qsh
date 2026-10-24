@@ -58,3 +58,7 @@ signature = "=3.0.0"
 libc = "0.2"
 # Source-qualified allocation observer uses the actual upstream heap element layouts.
 alacritty_terminal = "=0.26.0"
+
+[build-dependencies]
+# The Darwin handover query uses SDK structs rather than hard-coded Rust ABI.
+cc = "1"

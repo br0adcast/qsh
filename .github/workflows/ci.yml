@@ -109,7 +109,7 @@ jobs:
           do
             grep -F "test $name ... ok" "$runtime/handover-results.log"
           done
-          grep -F 'validated 34 isolated handover cases' "$runtime/handover-results.log"
+          grep -F 'validated 35 isolated handover cases' "$runtime/handover-results.log"
           grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/handover-results.log"
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked

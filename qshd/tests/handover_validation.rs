@@ -42,6 +42,7 @@ fn malformed_handover_is_refused_before_ownership_or_mutation() {
         "tcp-control",
         "unix-datagram-udp",
         "stream-control",
+        "bound-control",
         "datagram-control",
         "port",
         "control-path",
@@ -200,6 +201,44 @@ fn child(case: &str) {
         "tcp-control" => h.control_fd = TcpListener::bind("127.0.0.1:0").unwrap().into_raw_fd(),
         "tcp-udp" => h.udp_fd = TcpListener::bind("127.0.0.1:0").unwrap().into_raw_fd(),
         "unix-datagram-udp" => h.udp_fd = UnixDatagram::unbound().unwrap().into_raw_fd(),
+        "bound-control" => {
+            let staging = dir.path().join(format!(".c{}", std::process::id()));
+            fs::create_dir(&staging).unwrap();
+            let bound = staging.join("s");
+            // SAFETY: socket returns a fresh owned descriptor on success.
+            let raw = unsafe { nix::libc::socket(nix::libc::AF_UNIX, nix::libc::SOCK_STREAM, 0) };
+            assert!(raw >= 0);
+            let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            // SAFETY: all-zero sockaddr_un is initialized writable storage.
+            let mut address: nix::libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            address.sun_family = nix::libc::AF_UNIX as _;
+            use std::os::unix::ffi::OsStrExt;
+            let name = bound.as_os_str().as_bytes();
+            assert!(name.len() < address.sun_path.len());
+            for (to, from) in address.sun_path.iter_mut().zip(name) {
+                *to = *from as _;
+            }
+            let len = std::mem::offset_of!(nix::libc::sockaddr_un, sun_path) + name.len() + 1;
+            #[cfg(target_os = "macos")]
+            {
+                address.sun_len = len as _;
+            }
+            // SAFETY: address contains the complete, NUL-terminated Unix name.
+            assert_eq!(
+                unsafe {
+                    nix::libc::bind(
+                        socket.as_raw_fd(),
+                        (&address as *const nix::libc::sockaddr_un).cast(),
+                        len as _,
+                    )
+                },
+                0
+            );
+            fs::rename(bound, &control_path).unwrap();
+            fs::remove_dir(staging).unwrap();
+            // Bound and published with the real shape, but never listened.
+            h.control_fd = socket.into_raw_fd();
+        }
         "stream-control" => {
             let (one, _two) = UnixStream::pair().unwrap();
             h.control_fd = one.into_raw_fd();
@@ -259,10 +298,13 @@ fn child(case: &str) {
         );
         return;
     }
-    assert!(
-        take_handover().is_err(),
-        "malformed {case} handover was accepted"
-    );
+    let error = take_handover().expect_err(&format!("malformed {case} handover was accepted"));
+    if case == "bound-control" || case == "stream-control" {
+        assert!(
+            format!("{error:#}").contains("control socket is not a stream listener"),
+            "wrong non-listener diagnostic: {error:#}"
+        );
+    }
     assert!(std::env::var_os(HANDOVER_FD_ENV).is_none());
     assert!(
         handover::is_cloexec(udp_fd).is_ok(),
