@@ -194,7 +194,11 @@ fn start_daemon_from(qshd: &Path) -> (Daemon, PathBuf) {
 }
 
 fn start_daemon_with_ready_timeout(qshd: &Path, timeout: Duration) -> (Daemon, PathBuf) {
-    let home = tempfile::tempdir().expect("tempdir");
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let key = ssh_key::PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
         ssh_key::Algorithm::Ed25519,
@@ -216,7 +220,6 @@ fn start_daemon_with_ready_timeout(qshd: &Path, timeout: Duration) -> (Daemon, P
     )
     .expect("write authorized_keys");
 
-    use std::os::unix::fs::PermissionsExt;
     let shell = home.path().join("tracked-shell");
     std::fs::write(
         &shell,

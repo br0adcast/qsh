@@ -54,6 +54,14 @@ use daemon_guard::{DaemonGuard, DAEMON_STATUS_TIMEOUT};
 /// failure, not turn every sibling into a panic about a poisoned lock.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+// Host-key parents must be private even when the test runner uses umask 0002.
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -204,7 +212,7 @@ fn wait_for_status(sock_path: &std::path::Path, timeout: Duration) -> bool {
 #[test]
 fn transport_ensure_prints_ready_and_creates_socket() {
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("temp dir for XDG_CACHE_HOME is created");
+    let home = private_temp_home().expect("temp dir for XDG_CACHE_HOME is created");
     let cache_dir = home.path().join("qsh");
     let sock_path = cache_dir.join("control.sock");
     let _daemon = DaemonGuard::new(sock_path.clone());
@@ -249,7 +257,7 @@ fn transport_ensure_prints_ready_and_creates_socket() {
 #[test]
 fn transport_ensure_second_invocation_reuses_live_daemon() {
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("temp dir for XDG_CACHE_HOME is created");
+    let home = private_temp_home().expect("temp dir for XDG_CACHE_HOME is created");
     let cache_dir = home.path().join("qsh");
     let sock_path = cache_dir.join("control.sock");
     let _daemon = DaemonGuard::new(sock_path.clone());
@@ -322,10 +330,13 @@ fn transport_ensure_second_invocation_reuses_live_daemon() {
 /// never gets far enough to need it).
 #[test]
 fn transport_ensure_timeout_does_not_start_a_second_daemon() {
+    use std::os::unix::fs::DirBuilderExt;
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("temp dir for XDG_CACHE_HOME is created");
+    let home = private_temp_home().expect("temp dir for XDG_CACHE_HOME is created");
     let cache_dir = home.path().join("qsh");
-    std::fs::create_dir_all(&cache_dir)
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&cache_dir)
         .expect("cache directory is created ahead of time to hold control.sock");
     let sock_path = cache_dir.join("control.sock");
 
@@ -398,7 +409,7 @@ fn transport_ensure_timeout_does_not_start_a_second_daemon() {
 #[test]
 fn transport_ensure_reports_the_port_the_live_daemon_listens_on() {
     let _guard = serialised();
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let sock = home.path().join("qsh").join("control.sock");
     let _daemon = DaemonGuard::new(sock.clone());
     let key = BASE64.encode([7u8; 32]);
@@ -424,7 +435,7 @@ fn transport_ensure_reports_the_port_the_live_daemon_listens_on() {
 #[test]
 fn a_fresh_daemon_reports_only_the_port_it_bound() {
     let _guard = serialised();
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let sock = home.path().join("qsh").join("control.sock");
     let _daemon = DaemonGuard::new(sock.clone());
     let port = free_udp_port();

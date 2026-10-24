@@ -164,7 +164,11 @@ fn help_version_and_self_check_keep_early_exit_semantics() {
 #[test]
 fn a_foreground_daemon_loads_its_exact_non_utf8_host_key_path() {
     use base64::Engine as _;
-    let home = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let path = home.path().join(OsString::from_vec(b"host-\xff".to_vec()));
     let key = qshd::load_or_create_transport_key(&path).unwrap();
     let original = std::fs::read(&path).unwrap();

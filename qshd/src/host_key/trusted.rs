@@ -179,8 +179,8 @@ fn parent(path: &Path, uid: Uid) -> io::Result<(File, OsString)> {
     resolve_parent(path, uid, false)
 }
 
-pub(super) fn prepare_parent(path: &Path, uid: Uid) -> io::Result<File> {
-    resolve_parent(path, uid, true).map(|(parent, _)| parent)
+pub(super) fn prepare_parent(path: &Path, uid: Uid) -> io::Result<(File, OsString)> {
+    resolve_parent(path, uid, true)
 }
 
 pub(super) trait ReadIo {
@@ -266,9 +266,18 @@ fn read_opened(mut file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loa
 
 pub(super) fn read(path: &Path, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loaded> {
     let (parent, leaf) = parent(path, uid)?;
+    read_at(&parent, &leaf, uid, io)
+}
+
+pub(super) fn read_at(
+    parent: &File,
+    leaf: &std::ffi::OsStr,
+    uid: Uid,
+    io: &mut impl ReadIo,
+) -> io::Result<Loaded> {
     let file = owned(fcntl::openat(
         Some(parent.as_raw_fd()),
-        leaf.as_os_str(),
+        leaf,
         LEAF_FLAGS,
         Mode::empty(),
     )?);

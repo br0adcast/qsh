@@ -118,6 +118,17 @@ successful repair warning does not mean an earlier disclosure has been undone;
 rotate a key separately if its secrecy is uncertain. Rejected keys are never
 silently replaced.
 
+Creating a new host key requires the filesystem and kernel to support atomic
+exclusive rename (`renameat2(RENAME_NOREPLACE)` on Linux or
+`renameatx_np(RENAME_EXCL)` on macOS). Unsupported creation fails with an error;
+there is no hard-link fallback. Existing trusted keys still load on those
+filesystems. The daemon writes and syncs a private `0600` staging file in the
+verified parent directory before publication. Concurrent creators load the
+single-linked winner through that same directory descriptor, even if a parent
+pathname changes. Cleanup removes only the creator's own stage and reports
+failures; a crash may leave a private staging file. This does not promise
+power-loss durability of the containing directory.
+
 ## System mode
 
 `qshd serve --system` is the other way to run this same daemon: one

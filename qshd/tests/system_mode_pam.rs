@@ -605,7 +605,9 @@ fn pam_session_open_groups_reach_every_channel() {
         || {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+            let output_dir = dir.path().join("worker-output");
+            std::fs::create_dir(&output_dir).unwrap();
+            std::fs::set_permissions(&output_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
             let account = common::TestAccount::create("qshd-test-groups", "/bin/sh");
             let record = dir.path().join("phases");
             common::install_service_file(&fixture_stack(
@@ -616,7 +618,7 @@ fn pam_session_open_groups_reach_every_channel() {
             let session = common::Session::connect(port, pubkey, &account.key, &account.name);
             session.open_shell();
             let a = proc_values(&session.run_in_shell(GROUP_REPORT), "Groups");
-            let second = dir.path().join("second-channel");
+            let second = output_dir.join("second-channel");
             session.run_another_command(&format!("{GROUP_REPORT} > {}", second.display()));
             let b = proc_values(&std::fs::read_to_string(second).unwrap(), "Groups");
             assert_eq!(a, vec![PAM_GROUP]);

@@ -2,7 +2,7 @@
 use super::*;
 use nix::libc;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) fn qualify_borrowed_fixture() {
@@ -190,6 +190,7 @@ fn isolated(command: &mut Command, home: &Path, probe: &Path) {
     for dir in ["cache", "config", "runtime"] {
         std::fs::create_dir_all(home.join(dir)).unwrap();
     }
+    std::fs::set_permissions(home.join("cache"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = std::fs::File::create(home.join("daemon-output")).unwrap();
     command.stdout(output.try_clone().unwrap()).stderr(output);
 }
@@ -400,7 +401,10 @@ fn live_case(bin: &Path, probe: &Path, home: &Path, mode: &str, signal: i32, out
         }
         "resume" => {
             let cache = home.join("cache/qsh");
-            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&cache)
+                .unwrap();
             let server =
                 qshd::load_or_create_transport_key(&cache.join("transport_server_key.bin"))
                     .unwrap();
@@ -573,7 +577,10 @@ fn personal_unix_signals_join_real_shell_scopes() {
                 previous(info);
             }));
             let bins = stripped_qshd();
-            let fixture = tempfile::tempdir().unwrap();
+            let fixture = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let probe = generated_probe(fixture.path());
             let mut outsider = Command::new("/bin/sleep").arg("60").spawn().unwrap();
             let outsider_pin = Pin::new(outsider.id());
@@ -659,11 +666,17 @@ fn personal_signal_registration_failure_never_admits_a_manager() {
         2,
         || {
             let bins = stripped_qshd();
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
             let probe = generated_probe(dir.path());
             for signal in [libc::SIGTERM, libc::SIGINT] {
                 let home = dir.path().join(format!("register-{signal}"));
-                std::fs::create_dir(&home).unwrap();
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&home)
+                    .unwrap();
                 let port = free_udp_port();
                 let keys = home.join("authorized_keys");
                 std::fs::write(&keys, "").unwrap();

@@ -42,6 +42,13 @@ use daemon_guard::DaemonGuard;
 /// picked by binding and closing.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -381,7 +388,7 @@ fn current_personal_daemon_takes_a_newer_image_over_protocol2() {
     let (_image_dir, image_path, image) = this_qshd_image();
     let new_build = self_check(&image_path).build + 1;
     let labels = format!("{}={new_build}", hex::encode(sha256(&image)));
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
     let kp = generate_keypair();
     let port = free_udp_port();
@@ -564,7 +571,7 @@ fn current_daemon_takes_an_image_through_a_reordering_road() {
     let (_image_dir, image_path, image) = this_qshd_image();
     let new_build = self_check(&image_path).build + 1;
     let labels = format!("{}={new_build}", hex::encode(sha256(&image)));
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
     let kp = generate_keypair();
     let port = free_udp_port();

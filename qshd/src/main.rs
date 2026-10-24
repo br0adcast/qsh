@@ -1448,7 +1448,11 @@ mod tests {
 
     #[test]
     fn transport_key_is_created_then_reused_stably() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("temp dir");
         let path = dir.path().join("transport_server_key.bin");
 
         let first = load_or_create_transport_key(&path).expect("key created");
@@ -1465,7 +1469,10 @@ mod tests {
     #[test]
     fn transport_key_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("temp dir");
         let path = dir.path().join("transport_server_key.bin");
         let _ = load_or_create_transport_key(&path).expect("key created");
         // The private key file is created with 0600 (rw-------)
