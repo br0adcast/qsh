@@ -121,6 +121,20 @@ fn accept_installs_and_opens_shell() {
     screen.wait("INSTALL_OK");
     assert!(image_path(&sb).is_file());
     screen.wait("Uploading qshd");
+    let output = screen.text();
+    let metadata = output
+        .find("Checking release metadata")
+        .expect("metadata wait is visible");
+    let upload = output.find("Uploading qshd").unwrap();
+    assert!(
+        metadata < upload,
+        "metadata phase precedes image upload: {output}"
+    );
+    assert!(output.contains("Ctrl-C cancels"));
+    assert!(
+        !output.contains("Downloading qshd"),
+        "a cache hit has no archive transfer: {output}"
+    );
     client.type_line("exit");
     assert!(wait_for_exit(&mut client.child).unwrap().success());
 }

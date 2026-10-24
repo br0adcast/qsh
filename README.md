@@ -160,7 +160,9 @@ shasum -a 256 --ignore-missing -c SHA256SUMS
 For an interactive `,ssh` connection, qsh can download its **exact release
 version**, verify SHA-256, and transfer the daemon over SFTP. It verifies the
 uploaded file before atomically publishing it in the remote user's cache.
-A verified local cache avoids repeated downloads.
+A verified local cache avoids repeated archive downloads; each installation
+still attempts a release metadata check. See the [installation guide](docs/cli-guide.md#ssh-startup-and-installation)
+for network waits and offline cache limits.
 
 Installation requires your confirmation. It does not use `sudo`, replace a
 system service, or automatically upgrade an existing daemon. Background recovery

@@ -777,3 +777,98 @@ fn archive_outage_after_a_new_checksum_does_not_fall_back_to_old_data() {
             );
     assert!(matches!(result, Err(ImageError::Download(_))));
 }
+
+#[test]
+fn metadata_phase_precedes_fetch_and_only_archive_bytes_reach_download_progress() {
+    use bringup::{BringUpObserver, BringUpProgress, BringUpStage};
+    use qsh::releases::{FetchError, FetchLimits, ReleaseTransport};
+    use std::sync::Mutex;
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<BringUpProgress>>);
+    impl BringUpObserver for Recorder {
+        fn on_progress(&self, event: BringUpProgress) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    struct Transfer {
+        inner: Arc<Fake>,
+        observed: Arc<Recorder>,
+    }
+    impl ReleaseTransport for Transfer {
+        fn fetch(
+            &self,
+            url: &str,
+            limits: FetchLimits,
+            cancel: &knock::Cancel,
+            observer: &dyn BringUpObserver,
+        ) -> Result<Vec<u8>, FetchError> {
+            assert_eq!(
+                self.observed
+                    .0
+                    .lock()
+                    .unwrap()
+                    .first()
+                    .map(|event| event.stage),
+                Some(BringUpStage::CheckingMetadata),
+                "metadata phase must be visible before fetch blocks"
+            );
+            let metadata = url.ends_with("SHA256SUMS");
+            assert_eq!(
+                limits.total,
+                if metadata {
+                    InstallTiming::default().metadata
+                } else {
+                    InstallTiming::default().download
+                }
+            );
+            // Distinguish checksum bytes from actual archive transfer bytes.
+            let completed = if metadata { 99 } else { 123 };
+            observer.on_progress(BringUpProgress {
+                stage: BringUpStage::Downloading,
+                completed,
+                total: Some(completed),
+                finished: true,
+            });
+            self.inner.fetch(url, limits, cancel, observer)
+        }
+    }
+    for cached in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        if cached {
+            load(root.path(), Fake::new(archive())).unwrap();
+        }
+        let observed = Arc::new(Recorder::default());
+        let inner = Fake::new(archive());
+        let source = GitHubImages::with_transport(
+            root.path().into(),
+            Arc::new(Transfer {
+                inner: inner.clone(),
+                observed: observed.clone(),
+            }),
+        );
+        assert_eq!(
+            &*source
+                .load(
+                    &request(),
+                    &InstallTiming::default(),
+                    &knock::Cancel::new(),
+                    observed.as_ref()
+                )
+                .unwrap()
+                .bytes,
+            IMAGE
+        );
+        assert_eq!(inner.calls(), if cached { 1 } else { 2 });
+        let events = observed.0.lock().unwrap();
+        assert_eq!(events.len(), if cached { 2 } else { 3 });
+        assert_eq!(events[0].stage, BringUpStage::CheckingMetadata);
+        assert!(!events[0].finished);
+        assert_eq!(events[1].stage, BringUpStage::CheckingMetadata);
+        assert!(events[1].finished);
+        if !cached {
+            assert_eq!(events[2].stage, BringUpStage::Downloading);
+            assert_eq!(events[2].completed, 123);
+            assert!(events[2].finished);
+        }
+    }
+}

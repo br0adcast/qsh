@@ -1,4 +1,4 @@
-//! Transfer progress before entering the terminal session.
+//! Installation phase and transfer progress before entering the terminal session.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
@@ -92,6 +92,26 @@ impl Progress {
             utf8,
             width,
         } = style;
+        if event.stage == BringUpStage::CheckingMetadata {
+            // A completed check closes the line without claiming that an image
+            // was downloaded. Errors/cancellation close it through Drop instead.
+            if event.finished {
+                return self.finish_line(out);
+            }
+            self.finish_line(out)?;
+            let label = "  Checking release metadata (Ctrl-C cancels)";
+            if interactive {
+                write!(out, "\r\x1b[2K")?;
+                for character in label.chars().take(width.saturating_sub(1)) {
+                    write!(out, "{character}")?;
+                }
+                self.line_open = true;
+            } else {
+                writeln!(out, "{label}")?;
+            }
+            self.last = Some((event.stage, Instant::now()));
+            return out.flush();
+        }
         if !matches!(
             event.stage,
             BringUpStage::Downloading | BringUpStage::Uploading
@@ -320,6 +340,84 @@ mod tests {
             assert!(line.contains("done"));
             assert!(!line.contains("NaN"));
             assert!(line.chars().count() <= 79);
+        }
+    }
+    #[test]
+    fn metadata_wait_is_labelled_cancellable_bounded_and_not_an_archive_transfer() {
+        for interactive in [false, true] {
+            for width in [0, 1, 20, 79] {
+                let mut state = Progress::default();
+                let mut output = Vec::new();
+                state
+                    .update(
+                        &mut output,
+                        BringUpProgress {
+                            stage: BringUpStage::CheckingMetadata,
+                            completed: 0,
+                            total: None,
+                            finished: false,
+                        },
+                        Style {
+                            interactive,
+                            utf8: false,
+                            width,
+                        },
+                    )
+                    .unwrap();
+                state.finish_line(&mut output).unwrap();
+                let text = String::from_utf8(output).unwrap();
+                assert!(!text.contains("Downloading qshd"));
+                assert!(!text.contains("done"));
+                if !interactive || width == 79 {
+                    assert!(text.contains("Checking release metadata"));
+                    assert!(text.contains("Ctrl-C"));
+                }
+                if interactive {
+                    let visible = text.replace("\r\x1b[2K", "");
+                    assert!(
+                        visible.trim_end_matches('\n').chars().count() <= width.saturating_sub(1)
+                    );
+                } else {
+                    assert!(!text.contains(['\r', '\x1b']));
+                    assert_eq!(text.lines().count(), 1);
+                }
+            }
+        }
+    }
+    #[test]
+    fn completed_metadata_phase_closes_before_archive_progress_without_fake_bytes() {
+        for interactive in [false, true] {
+            let style = Style {
+                interactive,
+                utf8: false,
+                width: 80,
+            };
+            let mut state = Progress::default();
+            let mut output = Vec::new();
+            for finished in [false, true] {
+                state
+                    .update(
+                        &mut output,
+                        BringUpProgress {
+                            stage: BringUpStage::CheckingMetadata,
+                            completed: 0,
+                            total: None,
+                            finished,
+                        },
+                        style,
+                    )
+                    .unwrap();
+            }
+            state
+                .update(&mut output, event(64, Some(128), false), style)
+                .unwrap();
+            state.finish_line(&mut output).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert_eq!(text.matches("Checking release metadata").count(), 1);
+            assert_eq!(text.matches("Downloading qshd").count(), 1);
+            assert!(!text.contains("0 B"));
+            assert!(!text.contains("done"));
+            assert_eq!(text.lines().count(), 2);
         }
     }
 }
