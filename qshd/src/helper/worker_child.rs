@@ -23,10 +23,15 @@ async fn drive_with<T>(
 ) -> T {
     use super::worker_protocol::{Frame, StopReason};
     use tokio::io::unix::AsyncFd;
-    let descriptor = match socket
-        .set_nonblocking(true)
-        .and_then(|()| AsyncFd::new(socket))
-    {
+    let descriptor = match socket.set_nonblocking(true).and_then(|()| {
+        // SAFETY: the moved UnixStream owns a valid, fixed fd. The
+        // publisher's try_clone owns a different fd; closing that alias
+        // cannot close or replace this one. Below we only borrow the
+        // stream for receive, never replace it or close its raw fd.
+        // Return/cancellation drops AsyncFd, which deregisters before
+        // dropping the stream, including while readiness is pending.
+        unsafe { AsyncFd::register(socket) }.map_err(std::io::Error::from)
+    }) {
         Ok(descriptor) => descriptor,
         Err(error) => {
             stop.fatal_hook(StopReason::Protocol)(&format!(
