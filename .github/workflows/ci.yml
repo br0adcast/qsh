@@ -154,7 +154,7 @@ jobs:
       # `binutils` is for `strip`: qshd/tests/transport_ensure_update.rs
       # strips its copy of the debug qshd below MAX_UPDATE_SIZE.
       - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils patch
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils patch zsh
 
       - name: Build and release script controls
         run: |
@@ -165,6 +165,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_release_upload.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
@@ -194,6 +195,7 @@ jobs:
         # fixtures must not replace it with their standalone feature build.
         env:
           QSH_TEST_QSHD: ${{ github.workspace }}/target/debug/qshd
+          QSH_REQUIRE_TEST_SHELLS: "1"
         run: >-
           cargo nextest run --profile ci --workspace --lib --bins --tests
           --locked --features qshd/system

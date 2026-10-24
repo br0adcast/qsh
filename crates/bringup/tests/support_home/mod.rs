@@ -62,14 +62,11 @@ impl Sandbox {
         authorized.extend(logins.iter().map(SoftSigner::authorized_line));
         authorized.extend(extra_authorized.iter().map(|l| l.trim_end().to_string()));
         let h = home.path().display().to_string();
+        let mut session_env = ssh_support::shell_env::prepare(home.path(), Path::new("/bin/sh"));
+        session_env.push(("PATH".into(), format!("{h}/bin:/usr/bin:/bin")));
         let sshd = TestSshd::start_with(SshdOptions {
             authorized_keys: authorized,
-            session_env: vec![
-                ("HOME".into(), h.clone()),
-                ("XDG_CACHE_HOME".into(), format!("{h}/.cache")),
-                ("XDG_CONFIG_HOME".into(), format!("{h}/.config")),
-                ("PATH".into(), format!("{h}/bin:/usr/bin:/bin")),
-            ],
+            session_env,
             ..SshdOptions::default()
         });
         let sandbox = Sandbox { sshd, home, logins };
@@ -154,11 +151,11 @@ impl Sandbox {
         let h = self.home.path().display().to_string();
         let seen = self.run(
             probe,
-            "printf '%s|%s|%s' \"$HOME\" \"$XDG_CACHE_HOME\" \"$PATH\"",
+            "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$HOME\" \"$XDG_CACHE_HOME\" \"$PATH\" \"$XDG_CONFIG_HOME\" \"$ZDOTDIR\" \"$SHELL\" \"$BASH_ENV\" \"$ENV\" \"$HISTFILE\"",
         );
         assert_eq!(
             seen,
-            format!("{h}|{h}/.cache|{h}/bin:/usr/bin:/bin"),
+            format!("{h}|{h}/.cache|{h}/bin:/usr/bin:/bin|{h}/.config|{h}|/bin/sh|/dev/null|/dev/null|/dev/null"),
             "sshd did not give the session the private home: refusing to run qshd, \
              it would reach the developer's own daemon"
         );
