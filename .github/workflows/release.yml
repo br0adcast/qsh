@@ -32,6 +32,12 @@ jobs:
     permissions:
       contents: read
 
+  # Focused published-peer checks run for candidate packages and gate publication.
+  released-peer-acceptance:
+    uses: ./.github/workflows/released-peer-acceptance.yml
+    permissions:
+      contents: read
+
   # The same path-filtered CI qualification is mandatory for a release build.
   # Product builds below link this same verified native source statically.
   native-crypto:
@@ -525,7 +531,7 @@ jobs:
   # Keep this separate so branch assembly does not depend on skipped tag CI.
   publish:
     if: github.ref_type == 'tag'
-    needs: [release, ordinary-ci]
+    needs: [release, ordinary-ci, released-peer-acceptance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
