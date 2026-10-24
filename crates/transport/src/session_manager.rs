@@ -101,6 +101,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -2523,6 +2525,18 @@ fn admit_new_backend_or_end_login(
 /// The multi-session manager. Stateless handle; `serve` runs the loop.
 pub struct SessionManager;
 
+/// Transfer a secret to its future before the first poll. This deliberately
+/// runs outside an async body: cancellation before polling must also wipe it.
+fn with_owned_secret<T, F, Fut>(secret: T, run: F) -> impl Future<Output = Fut::Output>
+where
+    T: Zeroize,
+    F: FnOnce(Zeroizing<T>) -> Fut,
+    Fut: Future,
+{
+    let secret = Zeroizing::new(secret);
+    async move { run(secret).await }
+}
+
 impl SessionManager {
     /// Run the session router on `socket`. On a `HandshakeInit` -- plain or
     /// behind a cookie -- that the return-address check lets through (see
@@ -2556,17 +2570,17 @@ impl SessionManager {
     /// [`LoginEndedReports::none()`], which never yields.
     ///
     /// Never returns on its own: it runs until the task is canceled.
-    pub async fn serve(
+    /// Captures an erasing key owner at the call, including before first poll.
+    pub fn serve(
         socket: Arc<UdpSocket>,
         server_priv: [u8; 32],
         auth: ServerAuth,
         factory: BackendFactory,
         active_count: Arc<AtomicUsize>,
         login_ends: LoginEndedReports,
-    ) {
-        // Legacy callers cancel this never-ending future. Cancellation is not
-        // a joined cleanup receipt; daemon STOP uses the explicit API below.
-        let _ = Self::serve_until_shutdown(
+    ) -> impl Future<Output = ()> + Send {
+        // Capture the erasing key owner synchronously, even if never polled.
+        let future = Self::serve_until_shutdown(
             socket,
             server_priv,
             auth,
@@ -2574,16 +2588,45 @@ impl SessionManager {
             active_count,
             login_ends,
             Shutdown::default(),
-        )
-        .await;
+        );
+        async move {
+            // Legacy callers cancel this never-ending future. Cancellation is not
+            // a joined cleanup receipt; daemon STOP uses the explicit API below.
+            let _ = future.await;
+        }
     }
 
     /// Stop accepting input on a sticky request and retain every registered
     /// task until it completes. Backend completion must itself own any process
     /// or blocking-I/O obligations; this API cannot invent those receipts.
-    pub async fn serve_until_shutdown(
+    /// The returned Send future owns the key before its first poll; dropping
+    /// it then or after cancellation erases this owner's array, not caller
+    /// copies or snow's internal key buffers.
+    pub fn serve_until_shutdown(
         socket: Arc<UdpSocket>,
         server_priv: [u8; 32],
+        auth: ServerAuth,
+        factory: BackendFactory,
+        active_count: Arc<AtomicUsize>,
+        login_ends: LoginEndedReports,
+        shutdown: Shutdown,
+    ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
+        with_owned_secret(server_priv, move |server_priv| {
+            Self::serve_with_secret(
+                socket,
+                server_priv,
+                auth,
+                factory,
+                active_count,
+                login_ends,
+                shutdown,
+            )
+        })
+    }
+
+    async fn serve_with_secret(
+        socket: Arc<UdpSocket>,
+        server_priv: Zeroizing<[u8; 32]>,
         auth: ServerAuth,
         factory: BackendFactory,
         active_count: Arc<AtomicUsize>,
@@ -18281,4 +18324,51 @@ mod tests {
     include!("session_manager_restart_bounds_tests.rs");
     include!("session_manager_repaint_bounds_tests.rs");
     include!("session_manager_refusal_retirement_tests.rs");
+}
+
+#[cfg(test)]
+mod key_erasure_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct ObservedSecret(Arc<AtomicBool>);
+    impl zeroize::Zeroize for ObservedSecret {
+        fn zeroize(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn unpolled_future_drops_its_secret_owner() {
+        let wiped = Arc::new(AtomicBool::new(false));
+        let future = with_owned_secret(ObservedSecret(wiped.clone()), |secret| async move {
+            std::future::pending::<()>().await;
+            drop(secret);
+        });
+        fn is_send<T: Send>(_: &T) {}
+        is_send(&future);
+        assert!(!wiped.load(Ordering::SeqCst));
+        drop(future);
+        assert!(wiped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn polled_future_retains_secret_until_cancelled() {
+        let wiped = Arc::new(AtomicBool::new(false));
+        let mut future = Box::pin(with_owned_secret(
+            ObservedSecret(wiped.clone()),
+            |secret| async move {
+                std::future::pending::<()>().await;
+                drop(secret);
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(!wiped.load(Ordering::SeqCst));
+        drop(future);
+        assert!(wiped.load(Ordering::SeqCst));
+    }
 }

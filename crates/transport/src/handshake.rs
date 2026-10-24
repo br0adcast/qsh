@@ -11,7 +11,7 @@ use std::fmt;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use snow::{Builder, HandshakeState};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::wire::TRANSPORT_HEADER_LEN;
 
@@ -42,20 +42,38 @@ fn to_key(bytes: &[u8]) -> [u8; KEY_LEN] {
 }
 
 /// An X25519 static key pair (private and public).
+/// The owned private array is erased on drop; caller copies and snow's
+/// internal buffers are outside this guarantee.
 pub struct Keypair {
     pub private: [u8; KEY_LEN],
     pub public: [u8; KEY_LEN],
 }
 
+impl Zeroize for Keypair {
+    fn zeroize(&mut self) {
+        self.private.zeroize();
+    }
+}
+
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Keypair {}
+
 /// Generate a new random X25519 static key pair.
 pub fn generate_keypair() -> Keypair {
-    let kp = Builder::new(noise_params())
+    let mut kp = Builder::new(noise_params())
         .generate_keypair()
         .expect("Noise key generation cannot fail with fixed parameters");
-    Keypair {
+    let keypair = Keypair {
         private: to_key(&kp.private),
         public: to_key(&kp.public),
-    }
+    };
+    kp.private.zeroize();
+    keypair
 }
 
 /// Noise transport-layer error. `Noise` wraps `snow::Error` so the snow
@@ -202,13 +220,11 @@ impl Handshake {
             state.is_handshake_finished(),
             "the transport keys are taken after the handshake finishes"
         );
-        let (mut k1, mut k2) = state.dangerously_get_raw_split();
-        let keys = TransportKeys::from_split(state.is_initiator(), &k1, &k2, header_aad);
-        // The one copy of the split this module owns, wiped once the ciphers
-        // hold the keys.
-        k1.zeroize();
-        k2.zeroize();
-        keys
+        let (k1, k2) = state.dangerously_get_raw_split();
+        let k1 = Zeroizing::new(k1);
+        let k2 = Zeroizing::new(k2);
+        // These owned split copies drop once the ciphers hold the keys.
+        TransportKeys::from_split(state.is_initiator(), &k1, &k2, header_aad)
     }
 
     fn active_state_mut(&mut self) -> &mut HandshakeState {
@@ -746,5 +762,23 @@ mod tests {
         assert_eq!(a_ini, a_res, "both sides derive the same hash");
         let (b_ini, _) = run();
         assert_ne!(a_ini, b_ini, "a fresh session gets a fresh hash");
+    }
+}
+
+#[cfg(test)]
+mod key_erasure_tests {
+    use super::*;
+
+    #[test]
+    fn static_private_owner_erases_only_private_bytes() {
+        fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let mut key = Keypair {
+            private: [7; KEY_LEN],
+            public: [9; KEY_LEN],
+        };
+        wipes_on_drop(&key);
+        key.zeroize();
+        assert_eq!(key.private, [0; KEY_LEN]);
+        assert_eq!(key.public, [9; KEY_LEN]);
     }
 }
