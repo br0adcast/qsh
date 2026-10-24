@@ -571,6 +571,39 @@ async fn handle_transport_control_connection(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
+    handle_transport_control_connection_with_peer_check(
+        stream,
+        shared_allowlist,
+        ports,
+        stop_tx,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        deadline,
+        |stream| {
+            control::require_same_account(
+                control::peer_uid(stream),
+                nix::unistd::geteuid().as_raw(),
+            )
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_transport_control_connection_with_peer_check(
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    deadline: tokio::time::Instant,
+    check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
+) -> Result<()> {
+    check(&stream)?;
+
     tokio::time::timeout_at(deadline, async {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(read_half);
@@ -1098,3 +1131,7 @@ mod cleanup143_tests {
         assert_eq!(session.occupied(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "transport_control_peer_tests.rs"]
+mod peer_tests;

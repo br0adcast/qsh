@@ -121,6 +121,40 @@ jobs:
           grep -F 'validated 10 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
+      - name: Native control peer-account tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-control-peer.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          # Real foreign-UID qualification runs in the Linux disposable-root
+          # tier; this native job exercises kernel same-UID and failure seams.
+          cargo test -p qshd --lib --locked peer_tests:: -- --nocapture \
+            --skip control::peer_tests::control_peer_root_client_rejects_foreign_server \
+            --skip control::peer_tests::control_peer_foreign_client_rejects_root_server \
+            --skip transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
+            --skip transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \
+            2>&1 | tee "$runtime/results.log"
+          for test in \
+            control::peer_tests::control_peer_account_policy_has_no_root_or_group_bypass \
+            control::peer_tests::control_peer_same_account_uses_kernel_credentials \
+            control::peer_tests::control_client_rejects_peer_before_sending_request \
+            transport_daemon::peer_tests::control_server_rejects_peer_before_read_or_dispatch \
+            transport_daemon::peer_tests::control_peer_same_account_handler_uses_kernel_credentials; do
+            grep -F "test $test ... ok" "$runtime/results.log"
+          done
+          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          if grep -Fq 'SKIPPED' "$runtime/results.log"; then
+            echo '::error::native control peer-account tests reported a runtime skip' >&2
+            exit 1
+          fi
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked
       - name: Discovery tests
@@ -590,6 +624,10 @@ jobs:
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
           run_suite lib qshd --ignored 70 \
+            --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
+            --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
+            --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
+            --require transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \
             --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
             --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \
             --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \
