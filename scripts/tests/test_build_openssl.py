@@ -472,8 +472,8 @@ install_sw:
 	printf 'unsigned long OpenSSL_version_num(void);\n' > $(DESTDIR)INSTALL_PREFIX/include/openssl/crypto.h
 	printf 'unsigned long OpenSSL_version_num(void){return 0x30500090UL;} const char *configured_prefix = "INSTALL_PREFIX";\n' > version.c
 	$(CC) -c version.c -o version.o
-	ar rcs $(DESTDIR)INSTALL_PREFIX/lib/libcrypto.a version.o
-	ar rcs $(DESTDIR)INSTALL_PREFIX/lib/libssl.a version.o
+	$(AR) rcs $(DESTDIR)INSTALL_PREFIX/lib/libcrypto.a version.o
+	$(AR) rcs $(DESTDIR)INSTALL_PREFIX/lib/libssl.a version.o
 ''')
         (source / 'LICENSE.txt').write_text('Generated test fixture; no upstream code.\n')
         with tarfile.open(self.archive, 'w:gz') as archive:
@@ -550,18 +550,52 @@ install_sw:
         self.assertEqual(len(self.count.read_text().splitlines()), 2)
 
     def test_changed_archiver_at_the_same_path_gets_a_new_cache_identity(self):
+        import shlex
         import shutil
         archiver = self.tools / 'owned-ar'
+        calls = self.root / 'archiver-calls'
         actual = shutil.which('ar')
-        archiver.write_text('#!/bin/sh\nexec "' + actual + '" "$@"\n')
+        self.assertIsNotNone(actual)
+        archiver.write_text('#!/bin/sh\nprintf "%s\\n" "$2" >> ' +
+                            shlex.quote(str(calls)) + '\nexec ' +
+                            shlex.quote(actual) + ' "$@"\n')
         archiver.chmod(0o755)
         first = self.run_build('--ar', str(archiver))
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(calls.is_file(), 'selected archiver was not executed')
+        archives = ['libcrypto.a', 'libssl.a']
+        self.assertEqual([Path(line).name for line in calls.read_text().splitlines()], archives)
         archiver.write_text(archiver.read_text() + '# changed toolchain wrapper\n')
         second = self.run_build('--ar', str(archiver))
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertNotEqual(first.stdout, second.stdout)
         self.assertEqual(len(self.count.read_text().splitlines()), 2)
+        self.assertEqual([Path(line).name for line in calls.read_text().splitlines()], archives * 2)
+        cached = self.run_build('--ar', str(archiver))
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.assertEqual(cached.stdout, second.stdout)
+        self.assertEqual(len(self.count.read_text().splitlines()), 2)
+        self.assertEqual([Path(line).name for line in calls.read_text().splitlines()], archives * 2)
+
+    def test_selected_archiver_failure_publishes_nothing(self):
+        import shlex
+        archiver = self.tools / 'failing-ar'
+        calls = self.root / 'archiver-calls'
+        archiver.write_text('#!/bin/sh\nprintf "%s\\n" called > ' +
+                            shlex.quote(str(calls)) +
+                            '\nprintf "%s\\n" "selected archiver failure" >&2\nexit 93\n')
+        archiver.chmod(0o755)
+        self.cache.mkdir()
+        sentinel = self.cache / 'unrelated'
+        sentinel.write_text('keep')
+        result = self.run_build('--ar', str(archiver))
+        self.assertNotEqual(result.returncode, 0, 'selected archiver failure was ignored')
+        self.assertEqual(calls.read_text().splitlines(), ['called'])
+        self.assertIn('selected archiver failure', result.stderr)
+        self.assertEqual(list(self.cache.glob('*/manifest.json')), [])
+        self.assertEqual(list(self.cache.glob('.stage-*')), [])
+        self.assertEqual(list(self.cache.glob('*.lock')), [])
+        self.assertEqual(sentinel.read_text(), 'keep')
 
     def test_modified_archive_in_completed_cache_is_rejected(self):
         first = self.run_build()
