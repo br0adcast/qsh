@@ -71,8 +71,22 @@ fn monitor40_private_producer_body() {
     }
     let rights = (mode == "rights").then(|| std::fs::File::open("/dev/null").unwrap());
     channel::send(&seam, &stage, rights.as_ref().map(AsFd::as_fd)).unwrap();
-    if matches!(mode.as_str(), "refused" | "started") {
-        let outcome = if mode == "refused" {
+    if mode.starts_with("refused-gated") {
+        use std::io::{Read as _, Write as _};
+        let raw = std::env::var("QSH_TEST_MONITOR_GATE_FD")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut gate = unsafe { UnixStream::from_raw_fd(raw) };
+        gate.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        if mode.ends_with("-running") {
+            seam.shutdown(std::net::Shutdown::Read).unwrap();
+        }
+        gate.write_all(b"S").unwrap();
+        gate.read_exact(&mut [0u8; 1]).unwrap();
+    }
+    if matches!(mode.as_str(), "refused" | "started") || mode.starts_with("refused-gated") {
+        let outcome = if mode == "refused" || mode.starts_with("refused-gated") {
             MonitorEvent::Refused {
                 id: 209,
                 why: "fixture account denied".into(),
@@ -85,7 +99,7 @@ fn monitor40_private_producer_body() {
             &seam,
             &encode(&MonitorEvent::CleanupComplete {
                 id: 209,
-                kind: if mode == "refused" {
+                kind: if mode == "refused" || mode.starts_with("refused-gated") {
                     super::super::protocol::CleanupKind::NoChild
                 } else {
                     super::super::protocol::CleanupKind::Reaped
@@ -98,6 +112,13 @@ fn monitor40_private_producer_body() {
     }
     if mode == "malformed-outcome" {
         channel::send(&seam, b"not a monitor record", None).unwrap();
+    }
+    if mode.ends_with("-missing") {
+        return;
+    }
+    if mode.ends_with("-malformed") {
+        channel::send(&seam, b"not a final receipt", None).unwrap();
+        return;
     }
     channel::send(
         &seam,
