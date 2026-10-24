@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::AUTH_NONCE_LEN;
 use crate::congestion::{AckVerdict, CongestionWindow};
@@ -255,6 +256,8 @@ impl AuthPolicy {
 /// `Clone` is needed by the async driver (`driver_tokio`): the echo server
 /// recreates the server `Connection` from the same config on every new
 /// `HandshakeInit`.
+/// Each config erases its private array on drop. As with any Drop type,
+/// non-Copy fields cannot be moved out by destructuring; cloning remains supported.
 #[derive(Clone)]
 pub struct ConnectionConfig {
     pub role: Role,
@@ -274,6 +277,22 @@ pub struct ConnectionConfig {
     /// transport tools may choose NONE; channel owners require CHANNEL_GEOMETRY.
     pub required_features: Features,
 }
+
+// Keep public array inputs compatible with struct literals. Explicit copies
+// remain the caller's responsibility; every owned config clone wipes itself.
+impl Zeroize for ConnectionConfig {
+    fn zeroize(&mut self) {
+        self.local_static_priv.zeroize();
+    }
+}
+
+impl Drop for ConnectionConfig {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ConnectionConfig {}
 
 /// An authenticated handshake cannot satisfy this application profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,7 +564,7 @@ impl StreamState {
 /// (PING/PONG), and address migration on roaming.
 pub struct Connection {
     role: Role,
-    local_priv: [u8; 32],
+    local_priv: Zeroizing<[u8; 32]>,
     remote_pub: Option<[u8; 32]>,
     auth: AuthPolicy,
     /// What this side's configuration allows (`ConnectionConfig::features`).
@@ -900,16 +919,16 @@ impl Connection {
         Self::new_stamped(cfg, now)
     }
 
-    fn new_stamped(cfg: ConnectionConfig, now: Instant) -> Self {
+    fn new_stamped(mut cfg: ConnectionConfig, now: Instant) -> Self {
         let handshake = match cfg.role {
             Role::Server => Some(Handshake::new_responder(&cfg.local_static_priv)),
             Role::Client => None,
         };
         Connection {
             role: cfg.role,
-            local_priv: cfg.local_static_priv,
+            local_priv: Zeroizing::new(cfg.local_static_priv),
             remote_pub: cfg.remote_static_pub,
-            auth: cfg.auth,
+            auth: std::mem::replace(&mut cfg.auth, AuthPolicy::Allowlist(vec![])),
             allowed_features: cfg.features,
             required_features: cfg.required_features,
             offered_features: Features::NONE,
@@ -12383,5 +12402,38 @@ pub(crate) mod tests {
             client.closed_gracefully(),
             "abort must not trigger warm reconnect"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_erasure_tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn cloned_config_private_keys_erase_independently() {
+        fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let mut original = ConnectionConfig {
+            role: Role::Client,
+            local_static_priv: [7; 32],
+            remote_static_pub: Some([9; 32]),
+            auth: AuthPolicy::Allowlist(vec![]),
+            features: Features::NONE,
+            required_features: Features::NONE,
+        };
+        let mut cloned = original.clone();
+        wipes_on_drop(&original);
+        original.zeroize();
+        assert_eq!(original.local_static_priv, [0; 32]);
+        assert_eq!(original.remote_static_pub, Some([9; 32]));
+        assert_eq!(cloned.local_static_priv, [7; 32]);
+        let mut conn = Connection::new(cloned.clone());
+        wipes_on_drop(&conn.local_priv);
+        assert_eq!(*conn.local_priv, [7; 32]);
+        conn.local_priv.zeroize();
+        assert_eq!(*conn.local_priv, [0; 32]);
+        assert_eq!(cloned.local_static_priv, [7; 32]);
+        cloned.zeroize();
+        assert_eq!(cloned.local_static_priv, [0; 32]);
     }
 }
