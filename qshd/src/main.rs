@@ -971,14 +971,14 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let mut backend = channel_backend::ChannelSessionBackend::new(Arc::new(
         qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
     ));
+    let opens = backend.open_registry();
     if !start.binary_path.as_os_str().is_empty() {
         // `None`: the checksum is worked out on the first `About`, off the
         // start-up path. `personal` sweeps away staged files an update that
         // never finished left behind -- all but the one this process may be
         // running from, should its rename have failed.
-        let opens = backend.open_registry();
         backend = backend.with_daemon(Arc::new(update::DaemonSelf::personal(
-            opens,
+            opens.clone(),
             None,
             start.binary_path.clone(),
             nix::unistd::Uid::current().as_raw(),
@@ -1014,6 +1014,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             vec![start.port],
             active_count,
             control_gate,
+            Some(opens),
             signals.requested(),
         )
         .await
@@ -1624,6 +1625,7 @@ mod tests {
     #[test]
     fn ready_ports_are_the_ones_the_live_daemon_reports() {
         let status = control::StatusResponse {
+            cleanup: None,
             version: "0.3.0".into(),
             build: 1,
             checksum: "x".into(),
@@ -1641,6 +1643,7 @@ mod tests {
     #[test]
     fn a_status_without_ports_falls_back_to_the_requested_ones() {
         let status = control::StatusResponse {
+            cleanup: None,
             version: "0.3.0".into(),
             build: 1,
             checksum: "x".into(),

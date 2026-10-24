@@ -40,6 +40,7 @@ fn fake_daemon_process() {
             "{\"stopped\":true}\n".to_string()
         } else {
             StatusResponse {
+                cleanup: None,
                 version: "fake".into(),
                 build: 0,
                 checksum: String::new(),

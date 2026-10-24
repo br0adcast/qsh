@@ -2382,6 +2382,33 @@ staged file is removed; the daemon, its binary and every session go on as
 they were. Nothing has been announced at that point: a `Busy` never follows
 a `Restarting`, and no session is cut for an update that does not happen.
 
+Before announcement, a personal daemon also checks its registered channel
+custody. Pre-existing canceled Opens, retiring channels, or explicitly observed
+unconfirmed ownership reject preparation with code `0 other`, without publishing
+a restart or draining healthy channels. Healthy pending Opens alone remain
+eligible. The check runs again immediately before the restart fence; it is only
+an observation. Debt that appears later still has to satisfy the existing final
+cleanup fence before exec. An actually unavailable or inconsistent observation
+is reported separately as unavailable preparation, never as permanent loss.
+
+Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
+include `cleanup`, with `domain: "personal_channels"` and a `phase` of
+`completed`, `pending`, `unresolved`, or `unknown`. `counts` reports healthy
+pending Opens, canceled Opens, retiring channels, observed unconfirmed owners,
+and unique cleanup debt; an observed owner also in retirement counts once.
+The fixed `leader_unconfirmed`, `cleanup_unconfirmed`, and
+`observation_panicked` flags describe retained backend observations, without
+process identities or arbitrary backend text. Healthy pending Opens report
+`pending` but do not block preparation. Observed unconfirmed owners report
+`unresolved` until exact completion. Contention or an inconsistent observation
+reports `unknown` with counts omitted. A missing `cleanup` field (including an
+older daemon's reply) also means unknown, not completed. `completed` proves
+only that no pending Opens or retained cleanup debt is reported in this
+registered personal-channel domain; healthy installed sessions may still be
+running. It does not prove global process-tree or privileged-helper/PAM cleanup. The
+projection is available on every supported personal-daemon platform and does
+not change protocol negotiation or the final exec fence.
+
 Otherwise the decision is made. The daemon answers `UPDATE_RESULT
 Restarting`, requests `RESTARTING` for every session (the offering one
 included), and waits `RESTART_GRACE` (500 ms); admission stays closed.

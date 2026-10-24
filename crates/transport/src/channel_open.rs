@@ -4,7 +4,7 @@
 //! proof. Capabilities and notifications are not the last resource owner.
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::channel_server::{ChannelWait, SpawnedChannel};
 use crate::shell_server::{ResizeHandle, SessionScreen};
@@ -12,6 +12,15 @@ use crate::shell_server::{ResizeHandle, SessionScreen};
 #[path = "channel_open_registry.rs"]
 mod registry;
 pub use registry::*;
+
+// Metadata reads never recover a poisoned or partial observation.
+pub(crate) fn metadata_lock<T>(mutex: &Mutex<T>, nonblocking: bool) -> Option<MutexGuard<'_, T>> {
+    if nonblocking {
+        mutex.try_lock().ok()
+    } else {
+        mutex.lock().ok()
+    }
+}
 
 /// Holds the watch read guard across admission/final commit. The epoch alone
 /// is not authority: a registry fence must also agree at final adoption.
@@ -126,6 +135,9 @@ pub struct OpenCustody {
 }
 
 impl OpenCustody {
+    pub(crate) fn canceled_snapshot(&self, nonblocking: bool) -> Option<bool> {
+        Some(metadata_lock(&self.inner.state, nonblocking)?.cancelled)
+    }
     pub fn new() -> Self {
         Self::default()
     }

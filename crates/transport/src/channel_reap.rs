@@ -23,19 +23,37 @@ impl ReapNotifier {
     }
 }
 
+/// Only actual backend observation failures are retained, never normal waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationFailure {
+    Leader,
+    Cleanup,
+    Panic,
+}
+impl ObservationFailure {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Leader => 0,
+            Self::Cleanup => 1,
+            Self::Panic => 2,
+        }
+    }
+}
+
 struct Resources {
     child: Option<Box<dyn ChannelWait>>,
     _slot: Option<InstalledSlot>,
     notifier_installed: bool,
 }
-struct State {
+pub(crate) struct State {
+    pub(crate) observation: Option<ObservationFailure>,
     resources: Option<Resources>,
     leased: bool,
     retry: bool,
     stop: bool,
     stop_seen: bool,
     signal_allowed: bool,
-    terminal: Option<Option<i32>>,
+    pub(crate) terminal: Option<Option<i32>>,
     published: bool,
     retiring: bool,
     registering: bool,
@@ -56,6 +74,21 @@ pub(crate) struct Capsule {
     registry: Weak<ChannelOpenRegistry>,
 }
 impl Capsule {
+    pub(crate) fn belongs_to(&self, registry: &ChannelOpenRegistry) -> bool {
+        std::ptr::eq(self.registry.as_ptr(), registry)
+    }
+    pub(crate) fn observation_state(
+        &self,
+        nonblocking: bool,
+    ) -> Option<std::sync::MutexGuard<'_, State>> {
+        crate::channel_open::metadata_lock(&self.state, nonblocking)
+    }
+    pub(crate) fn completion_state(&self) -> (std::sync::MutexGuard<'_, State>, bool) {
+        match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        }
+    }
     fn notify(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -179,12 +212,15 @@ struct Lease {
     resources: Option<Resources>,
 }
 impl Lease {
-    fn unknown(&self, detail: &str) {
+    fn unknown(&self, kind: ObservationFailure, detail: &str) {
         self.owner
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .signal_allowed = false;
+        if let Some(registry) = self.owner.registry.upgrade() {
+            registry.record_observation(&self.owner, kind);
+        }
         log::warn!(
             "channel {}/{} termination is unconfirmed: {detail}",
             self.owner.stream,
@@ -223,7 +259,7 @@ impl Lease {
                 self.owner.ready.notify_one();
             }
             Ok(None) => {}
-            Err(_) => self.unknown("backend observation panicked"),
+            Err(_) => self.unknown(ObservationFailure::Panic, "backend observation panicked"),
         }
         // Unknown/panic returns the exclusive resources through Drop, freeing
         // this worker. An evidence notification racing that return is retained.
@@ -256,7 +292,7 @@ impl Lease {
                         }
                     }
                     LeaderStatus::Unknown(detail) => {
-                        self.unknown(&detail);
+                        self.unknown(ObservationFailure::Leader, &detail);
                         return None;
                     }
                 }
@@ -275,7 +311,7 @@ impl Lease {
             match resources.child.as_mut().expect("owned child").poll_exit() {
                 ChildStatus::Reaped { code } => return Some(code),
                 ChildStatus::Unknown(detail) => {
-                    self.unknown(&detail);
+                    self.unknown(ObservationFailure::Cleanup, &detail);
                     return None;
                 }
                 // The child receipt is latched by IoOwnedWait. Its workers
@@ -443,6 +479,7 @@ impl ReapSet {
                 stop: stop_now,
                 stop_seen: false,
                 signal_allowed: true,
+                observation: None,
                 terminal: None,
                 published: false,
                 retiring: false,
