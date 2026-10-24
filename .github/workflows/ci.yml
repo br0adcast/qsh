@@ -115,6 +115,12 @@ jobs:
           done
           grep -F 'validated 35 isolated handover cases' "$runtime/handover-results.log"
           grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/handover-results.log"
+          # This purpose-built harness runs on its process's main thread before
+          # forking; libtest's worker threads cannot provide that contract.
+          cargo test -p qshd --test detach_process --locked 2>&1 | tee "$runtime/detach-results.log"
+          grep -F 'validated 10 isolated detachment cases' "$runtime/detach-results.log"
+          grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
+          grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked
       - name: Discovery tests
