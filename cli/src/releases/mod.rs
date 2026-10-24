@@ -103,6 +103,13 @@ fn stem(request: &ImageRequest) -> String {
     format!("qsh-{}-{}", request.version, request.platform.target())
 }
 
+// SHA256SUMS bytes are not daemon-image transfer progress. The source owns
+// the explicit metadata phase, including its initial event before network I/O.
+struct MetadataTransfer;
+impl BringUpObserver for MetadataTransfer {
+    fn on_progress(&self, _: bringup::BringUpProgress) {}
+}
+
 impl ImageSource for GitHubImages {
     fn load(
         &self,
@@ -117,6 +124,15 @@ impl ImageSource for GitHubImages {
         check.check()?;
         // Contact GitHub before consulting the cache, without holding its lock.
         let (sums_url, archive_url) = release_urls(request)?;
+        let metadata_progress = |finished| {
+            observer.on_progress(bringup::BringUpProgress {
+                stage: bringup::BringUpStage::CheckingMetadata,
+                completed: 0,
+                total: None,
+                finished,
+            })
+        };
+        metadata_progress(false);
         let sums = match self.transport.fetch(
             &sums_url,
             FetchLimits {
@@ -125,7 +141,7 @@ impl ImageSource for GitHubImages {
                 max_bytes: SUMS_LIMIT,
             },
             cancel,
-            observer,
+            &MetadataTransfer,
         ) {
             Ok(sums) => sums,
             Err(FetchError::TemporarilyUnavailable(reason)) => {
@@ -149,6 +165,7 @@ impl ImageSource for GitHubImages {
             ));
         }
         let archive_sha = archive::expected_hash(&sums, &format!("{}.tar.gz", stem(request)))?;
+        metadata_progress(true);
         let check = Budget::new(timing.verify, cancel);
         if let Some(cache) = cache::optional(
             cache::Cache::open(&self.cache_root, request, &check),

@@ -159,8 +159,24 @@ checksum mismatch, unsafe redirect, or TLS verification failure stops installati
 instead of allowing a stale cache. After a new checksum is received, failure to
 download the matching archive also stops installation.
 
-Upload and startup have separate deadlines and support cancellation;
-time spent answering a prompt does not consume the network budget.
+The release metadata check has a 20-second deadline covering DNS, connection,
+redirects, response headers, and body. It runs before local cache lookup, so even
+a previously cached release can wait for this check on a silent network. The
+metadata check, archive download, upload, and startup have separate deadlines.
+Ctrl-C cancels the wait; cancellation does not select the offline cache or approve
+installation. Time spent answering a prompt does not consume a network budget.
+
+Offline cache verification checks the archive against its last verified checksum
+and extracts the image again. This detects corruption against the stored checksum;
+it does not establish that the published release is still current or has not been
+withdrawn. It assumes a trusted local cache: someone able to replace both an
+archive and its stored checksum can replace that local evidence. The checksum is
+not a release signature or an independent guarantee of origin.
+
+Release HTTPS uses bundled WebPKI CA roots. Adding a private or enterprise CA to
+the operating system's trust store does not automatically add it to this client's
+release trust store. A TLS verification failure stops installation even when a
+cache exists; qsh does not disable certificate verification to use it.
 
 Declining installation ends the address ladder. Installation does not use `sudo`,
 replace a system service, or update a daemon already found on the server.

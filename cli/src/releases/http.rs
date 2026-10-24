@@ -304,7 +304,8 @@ def serve(raw):
    if path.startswith('/status/'):
     code = int(path.rsplit('/', 1)[1]); s.sendall(('HTTP/1.1 %d Status\r\nContent-Length: 0\r\n\r\n' % code).encode()); return
    if path == '/404': s.sendall(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'); return
-   if path == '/headers': time.sleep(2)
+   if path == '/headers':
+    open(sys.argv[1] + '/headers-seen', 'w').close(); time.sleep(2)
    if path == '/huge': s.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n'); return
    if path == '/chunked': s.sendall(b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n8\r\n12345678\r\n0\r\n\r\n'); return
    s.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na')
@@ -710,5 +711,180 @@ while True:
             }
             thread.join().unwrap();
         }
+    }
+
+    const CACHED_IMAGE: &[u8] = b"verified cached metadata-wait fixture";
+
+    fn seeded_release_cache() -> (tempfile::TempDir, bringup::ImageRequest) {
+        use bringup::ImageSource;
+        use sha2::Digest;
+        let request = bringup::ImageRequest::new(
+            bringup::Platform::from_uname("Linux", "x86_64").unwrap(),
+            "0.4.0",
+        )
+        .unwrap();
+        let stem = "qsh-0.4.0-x86_64-unknown-linux-musl";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(CACHED_IMAGE.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, format!("{stem}/qshd"), CACHED_IMAGE)
+            .unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gzip, &tar.into_inner().unwrap()).unwrap();
+        let archive = gzip.finish().unwrap();
+        let sums = format!("{:x}  {stem}.tar.gz\n", sha2::Sha256::digest(&archive)).into_bytes();
+        struct Seed {
+            sums: Vec<u8>,
+            archive: Vec<u8>,
+        }
+        impl ReleaseTransport for Seed {
+            fn fetch(
+                &self,
+                url: &str,
+                _: FetchLimits,
+                _: &Cancel,
+                _: &dyn BringUpObserver,
+            ) -> Result<Vec<u8>, FetchError> {
+                Ok(if url.ends_with("SHA256SUMS") {
+                    self.sums.clone()
+                } else {
+                    self.archive.clone()
+                })
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        crate::releases::GitHubImages::with_transport(
+            root.path().into(),
+            Arc::new(Seed { sums, archive }),
+        )
+        .load(
+            &request,
+            &bringup::InstallTiming::default(),
+            &Cancel::new(),
+            &Silent,
+        )
+        .unwrap();
+        (root, request)
+    }
+
+    fn metadata_source(
+        server: &Server,
+        root: &std::path::Path,
+        trust: bool,
+    ) -> crate::releases::GitHubImages {
+        struct Endpoint {
+            url: String,
+            root: Option<Vec<u8>>,
+        }
+        impl ReleaseTransport for Endpoint {
+            fn fetch(
+                &self,
+                url: &str,
+                limits: FetchLimits,
+                cancel: &Cancel,
+                observer: &dyn BringUpObserver,
+            ) -> Result<Vec<u8>, FetchError> {
+                assert!(
+                    url.ends_with("SHA256SUMS"),
+                    "these cases must not fetch an archive"
+                );
+                let mut builder = reqwest::Client::builder().no_proxy();
+                if let Some(root) = &self.root {
+                    builder =
+                        builder.add_root_certificate(reqwest::Certificate::from_pem(root).unwrap());
+                }
+                fetch(builder, &self.url, limits, cancel, observer)
+            }
+        }
+        crate::releases::GitHubImages::with_transport(
+            root.into(),
+            Arc::new(Endpoint {
+                url: format!("https://localhost:{}/headers", server.port),
+                root: trust.then(|| std::fs::read(server.dir.path().join("cert.pem")).unwrap()),
+            }),
+        )
+    }
+
+    #[test]
+    fn silent_metadata_timeout_uses_reverified_cache() {
+        use bringup::ImageSource;
+        let server = Server::start();
+        let (root, request) = seeded_release_cache();
+        let started = Instant::now();
+        let image = metadata_source(&server, root.path(), true)
+            .load(
+                &request,
+                &bringup::InstallTiming {
+                    metadata: Duration::from_millis(350),
+                    ..Default::default()
+                },
+                &Cancel::new(),
+                &Silent,
+            )
+            .unwrap();
+        assert_eq!(&*image.bytes, CACHED_IMAGE);
+        assert!(
+            server.dir.path().join("headers-seen").exists(),
+            "must reach silent HTTP headers"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "must attempt metadata before cache reuse"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cancelling_silent_metadata_never_selects_seeded_cache() {
+        use bringup::ImageSource;
+        let server = Server::start();
+        let (root, request) = seeded_release_cache();
+        let cancel = Cancel::new();
+        let copy = cancel.clone();
+        let marker = server.dir.path().join("headers-seen");
+        let started = Instant::now();
+        let (result, reached) = std::thread::scope(|scope| {
+            let thread = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !marker.exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let reached = marker.exists();
+                copy.cancel();
+                reached
+            });
+            let result = metadata_source(&server, root.path(), true).load(
+                &request,
+                &bringup::InstallTiming {
+                    metadata: Duration::from_secs(3),
+                    ..Default::default()
+                },
+                &cancel,
+                &Silent,
+            );
+            (result, thread.join().unwrap())
+        });
+        assert!(reached, "cancel only after request reaches silent headers");
+        assert!(matches!(result, Err(ImageError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn invalid_tls_metadata_never_selects_seeded_cache() {
+        use bringup::ImageSource;
+        let server = Server::start();
+        let (root, request) = seeded_release_cache();
+        let result = metadata_source(&server, root.path(), false).load(
+            &request,
+            &bringup::InstallTiming {
+                metadata: Duration::from_secs(2),
+                ..Default::default()
+            },
+            &Cancel::new(),
+            &Silent,
+        );
+        assert!(matches!(result, Err(ImageError::Download(_))), "{result:?}");
     }
 }

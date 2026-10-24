@@ -5,6 +5,8 @@ pub enum BringUpStage {
     Knocking,
     Connecting,
     Locating,
+    /// Fetching and validating release checksum metadata, before any image transfer.
+    CheckingMetadata,
     Downloading,
     Uploading,
     Verifying,
