@@ -54,7 +54,7 @@ pub fn filter(verbose: bool) -> logging::Filter {
 /// cannot be opened (a read-only home, no cache directory) is no log at
 /// all: the run goes on, and nothing is printed about it.
 pub fn init(verbose: bool) {
-    if let Some(sink) = logging::FileSink::open(&path(), MAX_BYTES) {
+    if let Some(sink) = logging::FileSink::open_in_private_dir(&path(), MAX_BYTES) {
         let _ = logging::install(sink, filter(verbose));
     }
 }

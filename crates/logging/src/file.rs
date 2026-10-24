@@ -13,10 +13,12 @@
 //! it is not a writer-count-independent cap or transactional I/O guarantee.
 //! Errors are swallowed: a log must never fail its caller.
 
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use crate::file_path::{Intent, ParentAuthority};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 pub struct FileSink {
@@ -24,57 +26,41 @@ pub struct FileSink {
 }
 
 struct Inner {
-    path: PathBuf,
-    rotated: PathBuf,
+    authority: ParentAuthority,
     max_bytes: u64,
     file: File,
+    #[cfg(test)]
+    before_active_check: Option<Box<dyn FnOnce() + Send>>,
     // One-shot owned phase gate for the actual concurrent preflight test.
     #[cfg(test)]
     before_append: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
-fn open_append(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)
-}
-
 impl FileSink {
-    /// Opens (creating dir 0700 / file 0600) for appending; None when it cannot.
+    /// Opens a log under a declared dedicated application directory. Only that
+    /// current-account-owned final directory may be repaired to private mode.
+    pub fn open_in_private_dir(path: &Path, max_bytes: u64) -> Option<FileSink> {
+        Self::open_with_intent(path, max_bytes, Intent::DeclaredPrivate)
+    }
+
+    /// Opens a validated append target, creating missing components privately.
+    /// Existing generic parents are never chmodded, even when owned by us.
     pub fn open(path: &Path, max_bytes: u64) -> Option<FileSink> {
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .ok()?;
-        }
-        let file = open_append(path).ok()?;
-        // Tighten a pre-existing file and its directory; failure is ignored.
-        if let Ok(m) = file.metadata() {
-            if m.mode() & 0o077 != 0 {
-                let _ = file.set_permissions(Permissions::from_mode(0o600));
-            }
-        }
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            if let Ok(m) = fs::metadata(dir) {
-                if m.mode() & 0o077 != 0 {
-                    let _ = fs::set_permissions(dir, Permissions::from_mode(0o700));
-                }
-            }
-        }
-        let mut rotated = path.as_os_str().to_owned();
-        rotated.push(".1");
+        Self::open_with_intent(path, max_bytes, Intent::Generic)
+    }
+
+    fn open_with_intent(path: &Path, max_bytes: u64, intent: Intent) -> Option<FileSink> {
+        let authority = ParentAuthority::resolve(path, intent, true).ok()?;
+        let file = authority.open_append_checked().ok()?;
         Some(FileSink {
             inner: Mutex::new(Inner {
-                path: path.to_path_buf(),
-                rotated: PathBuf::from(rotated),
+                authority,
                 max_bytes,
                 file,
                 #[cfg(test)]
                 before_append: None,
+                #[cfg(test)]
+                before_active_check: None,
             }),
         })
     }
@@ -91,6 +77,11 @@ impl FileSink {
         for line in lines {
             inner.write_line(line);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn before_active_check_once(&self, action: impl FnOnce() + Send + 'static) {
+        self.inner.lock().unwrap().before_active_check = Some(Box::new(action));
     }
 
     /// A clone of the open file, for code that needs a raw fd (tests).
@@ -123,8 +114,20 @@ impl Inner {
 
     /// Follows other rotations, then admits only a complete fitting record.
     fn prepare(&mut self, bytes: u64) -> bool {
-        if !self.owns_path() && !self.reopen() {
+        let Ok(changed) = self.authority.refresh_route() else {
             return false;
+        };
+        if changed && !self.reopen() {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(action) = self.before_active_check.take() {
+            action();
+        }
+        match self.authority.owns_active(&self.file) {
+            Ok(true) => {}
+            Ok(false) if self.reopen() => {}
+            _ => return false,
         }
         let Ok(metadata) = self.file.metadata() else {
             return false;
@@ -132,7 +135,7 @@ impl Inner {
         if self.fits(metadata.len(), bytes) {
             return true;
         }
-        if self.owns_path() && fs::rename(&self.path, &self.rotated).is_err() {
+        if self.authority.rotate_checked(&self.file).is_err() {
             return false;
         }
         // A raced rotation may already have installed another file. Reopen
@@ -140,8 +143,6 @@ impl Inner {
         if !self.reopen() {
             return false;
         }
-        // Another writer may have filled the reopened file. Drop this record
-        // rather than loop, truncate, or append past the observed threshold.
         self.file
             .metadata()
             .map(|m| self.fits(m.len(), bytes))
@@ -154,18 +155,14 @@ impl Inner {
             .is_some_and(|next| next <= self.max_bytes)
     }
 
-    /// Whether the path still names the file we hold open.
-    fn owns_path(&self) -> bool {
-        match (fs::metadata(&self.path), self.file.metadata()) {
-            (Ok(p), Ok(f)) => p.dev() == f.dev() && p.ino() == f.ino(),
-            _ => false,
-        }
-    }
-
     fn reopen(&mut self) -> bool {
-        match open_append(&self.path) {
+        let Ok(authority) = self.authority.reopen_route() else {
+            return false;
+        };
+        match authority.open_append_checked() {
             Ok(file) => {
                 self.file = file;
+                self.authority = authority;
                 true
             }
             Err(_) => false,

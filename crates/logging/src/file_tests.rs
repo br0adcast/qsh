@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn rotation_bound_failed_reopen_does_not_grow_retained_inode_and_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::private_test_dir().unwrap();
     let path = dir.path().join("client.log");
     let held_path = dir.path().join("held.log");
     let sink = FileSink::open(&path, 100).unwrap();
@@ -28,7 +28,7 @@ fn rotation_bound_failed_reopen_does_not_grow_retained_inode_and_recovers() {
 
 #[test]
 fn rotation_bound_failed_rename_drops_until_rotation_recovers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::private_test_dir().unwrap();
     let path = dir.path().join("client.log");
     let rotated = dir.path().join("client.log.1");
     let sink = FileSink::open(&path, 100).unwrap();
@@ -55,7 +55,7 @@ fn rotation_bound_failed_rename_drops_until_rotation_recovers() {
 #[test]
 fn rotation_bound_missing_or_replaced_parent_does_not_extend_old_file() {
     for replaced in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_test_dir().unwrap();
         let parent = dir.path().join("logs");
         let moved = dir.path().join("held-logs");
         let path = parent.join("client.log");
@@ -82,7 +82,7 @@ fn rotation_bound_missing_or_replaced_parent_does_not_extend_old_file() {
 
 #[test]
 fn rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::private_test_dir().unwrap();
     let path = dir.path().join("client.log");
     let rotated = dir.path().join("client.log.1");
     let sink = FileSink::open(&path, 8).unwrap();
@@ -105,7 +105,7 @@ fn rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records() {
 
 #[test]
 fn rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::private_test_dir().unwrap();
     let path = dir.path().join("client.log");
     let rotated = dir.path().join("client.log.1");
     let original = "existing\n".repeat(100);
@@ -130,7 +130,7 @@ fn rotation_bound_independent_writers_have_a_finite_race_bound_and_recover() {
     const WRITERS: usize = 3;
     const BOUND: u64 = 100;
     const LINE_BYTES: usize = 81;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::private_test_dir().unwrap();
     let path = dir.path().join("client.log");
     let rotated = dir.path().join("client.log.1");
     let (entered, arrivals) = mpsc::channel();

@@ -1,0 +1,328 @@
+//! Logging-specific directory authority. Names are resolved relative to owned
+//! descriptors; trusted filesystem owners may still change their namespace.
+use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
+
+const MAX_ALIASES: usize = 40;
+const MAX_ALIAS_BYTES: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEARCH: OFlags = OFlags::PATH;
+#[cfg(target_vendor = "apple")]
+const SEARCH: OFlags = OFlags::from_bits_retain(libc::O_SEARCH as u32);
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+const SEARCH: OFlags = OFlags::RDONLY;
+const DIRECTORY: OFlags = SEARCH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+const APPEND: OFlags = OFlags::WRONLY
+    .union(OFlags::APPEND)
+    .union(OFlags::CREATE)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NOCTTY)
+    .union(OFlags::CLOEXEC);
+
+#[derive(Clone, Copy)]
+pub(crate) enum Intent {
+    Generic,
+    DeclaredPrivate,
+}
+
+fn refused(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+fn same(a: &Stat, b: &Stat) -> bool {
+    a.st_dev == b.st_dev && a.st_ino == b.st_ino
+}
+
+pub(super) fn trusted_directory(owner: u32, mode: u32, uid: u32) -> bool {
+    (owner == 0 || owner == uid) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+pub(super) fn declared_parent(owner: u32, mode: u32, uid: u32, is_root: bool) -> bool {
+    owner == uid && (mode & 0o077 == 0 || (!is_root && mode & 0o1000 == 0))
+}
+
+pub(super) fn trusted_leaf(owner: u32, links: u64, uid: u32) -> bool {
+    owner == uid && links == 1
+}
+
+fn directory(fd: &impl AsFd, uid: u32) -> io::Result<Stat> {
+    let stat = fs::fstat(fd)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || !trusted_directory(stat.st_uid, stat.st_mode as u32, uid)
+    {
+        return Err(refused("log parent is not a trusted directory"));
+    }
+    Ok(stat)
+}
+
+fn leaf(stat: &Stat, uid: u32) -> io::Result<()> {
+    // nlink_t is narrower on Darwin; keep the policy input platform-neutral.
+    #[allow(clippy::unnecessary_cast)]
+    let links = stat.st_nlink as u64;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || !trusted_leaf(stat.st_uid, links, uid)
+    {
+        return Err(refused(
+            "log leaf is not a single-linked account-owned regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn parts(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .map(|part| match part {
+            Component::RootDir => OsString::from("/"),
+            Component::CurDir => OsString::from("."),
+            Component::ParentDir => OsString::from(".."),
+            Component::Normal(name) => name.to_owned(),
+            Component::Prefix(_) => unreachable!("Unix path has no prefix"),
+        })
+        .collect()
+}
+
+fn alias(parent: &OwnedFd, name: &OsStr, uid: u32) -> io::Result<OsString> {
+    let before = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(before.st_mode) != FileType::Symlink
+        || (before.st_uid != 0 && before.st_uid != uid)
+    {
+        return Err(refused("log parent alias is not trusted"));
+    }
+    let mut buffer = [0u8; MAX_ALIAS_BYTES + 1];
+    let count = fs::readlinkat_raw(parent, name, &mut buffer)?;
+    if count > MAX_ALIAS_BYTES {
+        return Err(refused("log parent alias target is too long"));
+    }
+    let after = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if !same(&before, &after) || before.st_uid != after.st_uid {
+        return Err(refused("log parent alias changed during resolution"));
+    }
+    Ok(OsString::from_vec(buffer[..count].to_vec()))
+}
+
+pub(crate) struct ParentAuthority {
+    route: PathBuf,
+    intent: Intent,
+    directory: OwnedFd,
+    name: OsString,
+    rotated: OsString,
+    uid: u32,
+    is_root: bool,
+}
+
+impl ParentAuthority {
+    pub(crate) fn resolve(path: &Path, intent: Intent, create: bool) -> io::Result<Self> {
+        let route = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let name = route
+            .file_name()
+            .ok_or_else(|| refused("log path has no file name"))?
+            .to_owned();
+        let parent = route
+            .parent()
+            .ok_or_else(|| refused("log path has no parent"))?;
+        let uid = rustix::process::geteuid().as_raw();
+        let root = fs::open("/", DIRECTORY, Mode::empty())?;
+        let root_stat = directory(&root, uid)?;
+        let mut stack = vec![root];
+        let mut pending = parts(parent);
+        let mut aliases = 0;
+        while let Some(name) = pending.pop_front() {
+            if name == "/" {
+                stack.truncate(1);
+                continue;
+            }
+            if name == "." {
+                continue;
+            }
+            if name == ".." {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            let current = stack.last().expect("root stays pinned");
+            // Recheck authority before any lookup that may create a component.
+            directory(current, uid)?;
+            match fs::openat(current, &name, DIRECTORY, Mode::empty()) {
+                Ok(fd) => {
+                    directory(&fd, uid)?;
+                    stack.push(fd);
+                }
+                Err(rustix::io::Errno::NOENT) if create => {
+                    match fs::mkdirat(current, &name, Mode::RWXU) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    let fd = fs::openat(current, &name, DIRECTORY, Mode::empty())?;
+                    directory(&fd, uid)?;
+                    stack.push(fd);
+                }
+                Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                    aliases += 1;
+                    if aliases > MAX_ALIASES {
+                        return Err(refused("log parent alias limit exceeded"));
+                    }
+                    let target = alias(current, &name, uid)?;
+                    let mut expanded = parts(Path::new(&target));
+                    expanded.append(&mut pending);
+                    pending = expanded;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let directory = stack.pop().expect("root stays pinned");
+        let final_stat = self::directory(&directory, uid)?;
+        let mut rotated = name.clone();
+        rotated.push(".1");
+        let authority = Self {
+            route,
+            intent,
+            directory,
+            name,
+            rotated,
+            uid,
+            is_root: same(&root_stat, &final_stat),
+        };
+        authority.validate_parent()?;
+        Ok(authority)
+    }
+
+    fn validate_parent(&self) -> io::Result<Stat> {
+        let stat = directory(&self.directory, self.uid)?;
+        if matches!(self.intent, Intent::DeclaredPrivate)
+            && !declared_parent(stat.st_uid, stat.st_mode as u32, self.uid, self.is_root)
+        {
+            return Err(refused("dedicated log directory cannot be safely repaired"));
+        }
+        Ok(stat)
+    }
+
+    pub(crate) fn open_append_checked(&self) -> io::Result<File> {
+        self.open_append_with_repair(|fd, mode| fs::fchmod(fd, mode).map_err(Into::into))
+    }
+
+    pub(super) fn open_append_with_repair(
+        &self,
+        mut repair: impl FnMut(&OwnedFd, Mode) -> io::Result<()>,
+    ) -> io::Result<File> {
+        let parent = self.validate_parent()?;
+        match fs::statat(&self.directory, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => leaf(&stat, self.uid)?,
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let file = fs::openat(&self.directory, &self.name, APPEND, Mode::RUSR | Mode::WUSR)?;
+        let stat = fs::fstat(&file)?;
+        leaf(&stat, self.uid)?;
+        // O_PATH/search authority does not imply chmod capability. Reopen only
+        // the pinned directory's own dot entry and check exact identity first.
+        let parent_repair =
+            if matches!(self.intent, Intent::DeclaredPrivate) && parent.st_mode & 0o077 != 0 {
+                let fd = fs::openat(
+                    &self.directory,
+                    ".",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                let current = directory(&fd, self.uid)?;
+                if !same(&parent, &current) || current.st_uid != self.uid {
+                    return Err(refused("log directory changed before repair"));
+                }
+                self.validate_parent()?;
+                Some(fd)
+            } else {
+                None
+            };
+        if stat.st_mode & 0o077 != 0 {
+            repair(&file, Mode::RUSR | Mode::WUSR)?;
+            let after = fs::fstat(&file)?;
+            leaf(&after, self.uid)?;
+            if !same(&stat, &after) || after.st_mode & 0o077 != 0 {
+                return Err(refused("log file repair was not established"));
+            }
+        }
+        if let Some(fd) = parent_repair {
+            repair(&fd, Mode::RWXU)?;
+            let after = directory(&fd, self.uid)?;
+            if !same(&parent, &after) || after.st_uid != self.uid || after.st_mode & 0o077 != 0 {
+                return Err(refused("log directory repair was not established"));
+            }
+        }
+        Ok(file.into())
+    }
+
+    /// Re-resolve the captured route without creating missing ancestors. An
+    /// old descriptor is never fallback authority for a vanished route.
+    pub(crate) fn refresh_route(&mut self) -> io::Result<bool> {
+        let next = self.reopen_route()?;
+        let changed = !same(&fs::fstat(&self.directory)?, &fs::fstat(&next.directory)?);
+        *self = next;
+        Ok(changed)
+    }
+
+    fn mutation_parent(&self) -> io::Result<()> {
+        let stat = self.validate_parent()?;
+        if matches!(self.intent, Intent::DeclaredPrivate) && stat.st_mode & 0o077 != 0 {
+            return Err(refused("dedicated log directory permissions changed"));
+        }
+        Ok(())
+    }
+
+    /// Check the name without following aliases. A stale held inode may be
+    /// unlinked after another sink rotates; reopen the current valid name.
+    /// An inode still named active must retain all of its validated metadata.
+    pub(crate) fn owns_active(&self, file: &File) -> io::Result<bool> {
+        self.mutation_parent()?;
+        let named = match fs::statat(&self.directory, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        leaf(&named, self.uid)?;
+        let held = fs::fstat(file)?;
+        if !same(&named, &held) {
+            return Ok(false);
+        }
+        leaf(&held, self.uid)?;
+        if named.st_mode & 0o077 != 0 || held.st_mode & 0o077 != 0 {
+            return Err(refused("active log permissions changed"));
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn rotate_checked(&self, file: &File) -> io::Result<()> {
+        if !self.owns_active(file)? {
+            return Ok(());
+        }
+        // A fitting append does not inspect .1: only replacement needs this
+        // authority. POSIX rename is not inode-conditional against trusted
+        // owners changing these names after validation.
+        match fs::statat(&self.directory, &self.rotated, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => leaf(&stat, self.uid)?,
+            Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.mutation_parent()?;
+        fs::renameat(&self.directory, &self.name, &self.directory, &self.rotated)?;
+        Ok(())
+    }
+
+    pub(crate) fn reopen_route(&self) -> io::Result<Self> {
+        Self::resolve(&self.route, self.intent, false)
+    }
+}

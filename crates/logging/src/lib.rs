@@ -5,6 +5,7 @@
 //! effort: it never panics and never reports write errors.
 
 mod file;
+mod file_path;
 mod format;
 mod logger;
 
@@ -75,14 +76,14 @@ mod tests {
 
     #[test]
     fn existing_loose_modes_are_tightened() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let dir = d.path().join("log");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let p = dir.join("a.log");
         std::fs::write(&p, b"old\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(FileSink::open(&p, 1000).is_some());
+        assert!(FileSink::open_in_private_dir(&p, 1000).is_some());
         let m = |x: &std::path::Path| std::fs::metadata(x).unwrap().permissions().mode() & 0o777;
         assert_eq!(m(&p), 0o600);
         assert_eq!(m(&dir), 0o700);
@@ -145,7 +146,7 @@ mod tests {
 
     #[test]
     fn rotates_past_max_bytes() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let p = d.path().join("log").join("a.log");
         let s = FileSink::open(&p, 200).unwrap();
         let line = "x".repeat(60);
@@ -161,7 +162,7 @@ mod tests {
 
     #[test]
     fn open_under_a_file_is_none() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let f = d.path().join("f");
         std::fs::write(&f, b"x").unwrap();
         assert!(FileSink::open(&f.join("sub").join("a.log"), 100).is_none());
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn permissions() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let p = d.path().join("newdir").join("a.log");
         let s = FileSink::open(&p, 1000).unwrap();
         s.write_lines(&["hi".into()]);
@@ -186,7 +187,7 @@ mod tests {
 
     #[test]
     fn two_sinks_two_threads_keep_lines_whole() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let p = d.path().join("a.log");
         let mk = |tag: &'static str| {
             let s = FileSink::open(&p, 4000).unwrap();
@@ -233,7 +234,7 @@ mod tests {
 
     #[test]
     fn install_once_writes_and_second_returns_false() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::private_test_dir().unwrap();
         let p = d.path().join("i.log");
         let s = FileSink::open(&p, 10_000).unwrap();
         let f = || Filter {
@@ -248,4 +249,15 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].contains("INFO  transport: hello world"));
     }
+}
+
+#[cfg(test)]
+mod file_path_tests;
+
+#[cfg(test)]
+fn private_test_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
 }

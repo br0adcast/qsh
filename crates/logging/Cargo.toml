@@ -8,6 +8,10 @@ description = "Shared log line format and rotating file sink for qsh and qshd"
 
 [dependencies]
 log = { version = "0.4", features = ["std"] }
+rustix = { version = "=1.1.4", features = ["fs", "process"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
