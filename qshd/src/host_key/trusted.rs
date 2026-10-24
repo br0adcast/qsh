@@ -18,7 +18,8 @@ const MAX_ALIAS_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const DIRECTORY_ACCESS: OFlag = OFlag::O_PATH;
 #[cfg(target_vendor = "apple")]
-const DIRECTORY_ACCESS: OFlag = OFlag::O_SEARCH;
+// nix 0.28 omits Apple's search-only flag; retain libc's exact bits.
+const DIRECTORY_ACCESS: OFlag = OFlag::from_bits_retain(nix::libc::O_SEARCH);
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 const DIRECTORY_ACCESS: OFlag = OFlag::O_RDONLY;
 const DIRECTORY_FLAGS: OFlag = DIRECTORY_ACCESS
