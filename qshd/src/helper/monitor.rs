@@ -831,7 +831,12 @@ fn pam_origin(rhost: &str) -> Result<String, PamError> {
         .parse::<SocketAddr>()
         .map(|endpoint| endpoint.ip())
         .or_else(|_| rhost.parse::<IpAddr>())
-        .map(|ip| ip.to_string())
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
+            IpAddr::V4(v4) => v4.to_string(),
+        })
         .map_err(|_| PamError {
             code: super::pam::PAM_SYSTEM_ERR,
             what: "the client address is not a numeric IP or endpoint",
@@ -2105,14 +2110,24 @@ mod tests {
             format!("account required pam_exec.so {}\n", script.display()),
         )
         .expect("write stack");
-        let inputs = [
-            "203.0.113.7:2222",
-            "[2001:db8::7]:2222",
-            "[fe80::7%3]:2222",
-            "203.0.113.7",
-            "2001:db8::7",
+        // Synthetic PAM-boundary inputs, not a dual-stack listener reproduction.
+        let cases = [
+            ("203.0.113.7:2222", "203.0.113.7"),
+            ("[2001:db8::7]:2222", "2001:db8::7"),
+            ("[fe80::7%3]:2222", "fe80::7"),
+            ("203.0.113.7", "203.0.113.7"),
+            ("2001:db8::7", "2001:db8::7"),
+            ("::ffff:203.0.113.7", "203.0.113.7"),
+            ("[::ffff:203.0.113.7]:2222", "203.0.113.7"),
+            ("0:0:0:0:0:ffff:cb00:7107", "203.0.113.7"),
+            ("[::ffff:cb00:7107]:65535", "203.0.113.7"),
+            ("::203.0.113.7", "::cb00:7107"),
+            ("[::cb00:7107]:2222", "::cb00:7107"),
+            ("::", "::"),
+            ("[::1]:2222", "::1"),
+            ("64:ff9b::cb00:7107", "64:ff9b::cb00:7107"),
         ];
-        for endpoint in inputs {
+        for (endpoint, _) in cases {
             let mut pam = remote_transaction(
                 dir.path(),
                 "qshd-test-rhost",
@@ -2125,7 +2140,10 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_to_string(seen).expect("capture"),
-            "203.0.113.7\n2001:db8::7\nfe80::7\n203.0.113.7\n2001:db8::7\n"
+            cases
+                .iter()
+                .map(|(_, expected)| format!("{expected}\n"))
+                .collect::<String>()
         );
     }
 
@@ -2295,7 +2313,20 @@ mod tests {
         for (rule, fallback, expected) in [("+", "-", true), ("-", "+", false)] {
             std::fs::write(&access, format!("{rule}:ALL:{cidr}\n{fallback}:ALL:ALL\n"))
                 .expect("write access policy");
-            for (endpoint, allowed) in [(matching, expected), (outside, !expected)] {
+            // Exercise synthetic PAM-boundary representations of the same IPv4
+            // peers; current production listeners do not establish dual-stack reachability.
+            let mut endpoints = vec![(matching, expected), (outside, !expected)];
+            if family == "ipv4" {
+                endpoints.extend([
+                    ("::ffff:203.0.113.7", expected),
+                    ("[::ffff:203.0.113.7]:2222", expected),
+                    ("[::ffff:cb00:7107]:65535", expected),
+                    ("::ffff:198.51.100.7", !expected),
+                    ("[::ffff:198.51.100.7]:2222", !expected),
+                    ("[::ffff:c633:6407]:65535", !expected),
+                ]);
+            }
+            for (endpoint, allowed) in endpoints {
                 let mut pam =
                     remote_transaction(dir.path(), "qshd-test-access", &me, "/dev/pts/7", endpoint)
                         .expect("start");
