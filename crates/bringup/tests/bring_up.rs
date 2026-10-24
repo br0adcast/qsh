@@ -1,3 +1,7 @@
+// These real-daemon fixtures require Linux pidfd cleanup and procfs;
+// their remote commands also assume Linux tools and image metadata.
+#![cfg(target_os = "linux")]
+
 mod support_home;
 
 use std::sync::Arc;
