@@ -36,7 +36,8 @@ this section.**
 
   ```sh
   QSH_TEST_QSHD="$PWD/target/debug/qshd" \
-    cargo nextest run --profile ci --workspace --lib --bins --tests --locked \
+    python3 scripts/run-nextest-ci.py -- \
+      cargo nextest run --profile ci --workspace --lib --bins --tests --locked \
       --features qshd/system
   cargo test --workspace --doc --locked
   ```
@@ -57,6 +58,26 @@ this section.**
   `--features qshd/system` is required: without it, system-mode code and tests
   are compiled out. Tests requiring root still run in CI's
   separate disposable containers, with the existing checks for silent skips.
+
+  The ordinary runner executes the suite once and checks nextest's captured
+  JUnit report, including successful stdout/stderr. Any runtime `SKIPPED`
+  control fails the job. `scripts/nextest-exclusions.json` names exact test
+  identities that belong to the disposable tier, with their reasons and owners;
+  each must appear as excluded, and other filter exclusions fail. The runner
+  overrides the profile default filter so this manifest owns ordinary selection.
+  Safe tests in
+  those same binaries still execute. The IPv6 PAM CIDR case belongs to the
+  disposable tier with `NET_ADMIN`; the supplementary-group assertion stays
+  mandatory in ordinary CI and requires the runner to have groups.
+  Source-declared `#[ignore]` tests are listed separately, including subprocess
+  bodies exercised by their owning wrappers, manual measurements and explicit
+  key qualification. They are not counted as executed assertions. The existing
+  container checks still verify their ignored-body count and required tests.
+  The report remains at `target/nextest/ci/junit.xml`; the runner prints its size
+  and checking time. With a custom target directory, pass `--report PATH` before
+  `--` to place the report there too. To run the isolated pinned-nextest control,
+  use `QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests
+  -p 'test_nextest_report.py'` (the control compiles only a tiny temporary fixture).
 - The integration tests need an OpenSSH server at
   `/usr/sbin/sshd`, which they start on their own. Without `sshd` those
   tests fail rather than pass having checked nothing; `QSH_NO_SSHD=1`

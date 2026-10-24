@@ -166,6 +166,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
+          QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
@@ -189,7 +190,8 @@ jobs:
       # Each test gets its own process, isolating PAM's descriptor changes.
       # nextest.toml keeps daemon port-selection suites serial while allowing
       # independent tests to overlap. Root-only tests still run below in
-      # disposable containers; their ordinary-user skips are not coverage.
+      # disposable containers. Exact exclusions and source-declared ignores
+      # are reported separately; any executed test emitting SKIPPED fails.
       - name: Unit and integration tests
         # The workspace build supplies this before tests start. Shared bringup
         # fixtures must not replace it with their standalone feature build.
@@ -197,6 +199,7 @@ jobs:
           QSH_TEST_QSHD: ${{ github.workspace }}/target/debug/qshd
           QSH_REQUIRE_TEST_SHELLS: "1"
         run: >-
+          python3 scripts/run-nextest-ci.py --
           cargo nextest run --profile ci --workspace --lib --bins --tests
           --locked --features qshd/system
 
