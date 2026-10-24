@@ -7,6 +7,8 @@
 
 pub mod fake_server;
 
+pub mod shell_env;
+
 use std::collections::VecDeque;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

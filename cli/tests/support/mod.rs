@@ -6,6 +6,12 @@
 
 #![allow(dead_code)]
 
+// Some suites also include the SSH sandbox. Both fixtures share this small
+// test-only module without introducing a production dependency.
+#[allow(clippy::duplicate_mod)]
+#[path = "../../../crates/ssh/tests/support/shell_env.rs"]
+pub mod shell_env;
+
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
@@ -134,6 +140,8 @@ pub struct Daemon {
     // directory -- only after `Drop for Daemon` has killed the daemon above.
     #[allow(dead_code)]
     home: tempfile::TempDir,
+    shell: PathBuf,
+    parent_env: Vec<(String, String)>,
 }
 
 impl Daemon {
@@ -151,8 +159,8 @@ impl Daemon {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf 'started\\n' >> '{}'\nexec /bin/sh \"$@\"\n",
-                self.home.path().join("shell-starts").display()
+                "#!/bin/sh\nprintf 'started\\n' >> {}\nexec /bin/sh \"$@\"\n",
+                shell_env::quote(&self.home.path().join("shell-starts"))
             ),
         )
         .unwrap();
@@ -181,7 +189,8 @@ impl Daemon {
     pub fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (child, output) = spawn_serve(self.home.path(), self.port);
+        let (child, output) =
+            spawn_serve(self.home.path(), self.port, &self.shell, &self.parent_env);
         {
             let before = self
                 .output
@@ -260,8 +269,22 @@ pub fn drain_into(mut reader: impl Read + Send + 'static, sink: std::sync::Arc<M
 
 /// A daemon with one authorized key, and the key's path.
 pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
+    start_daemon_with_shell(Path::new("/bin/sh"))
+}
+
+/// Explicit compatibility coverage; generic fixtures always use /bin/sh.
+pub fn start_daemon_with_shell(shell: &Path) -> (Daemon, std::path::PathBuf) {
+    start_daemon_with_shell_env(shell, &[])
+}
+
+/// Synthetic parent environment for startup-isolation regressions.
+pub fn start_daemon_with_shell_env(
+    shell: &Path,
+    parent_env: &[(String, String)],
+) -> (Daemon, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::Builder::new()
+        .prefix("qsh shell ' ")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .expect("tempdir");
@@ -287,13 +310,15 @@ pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
     .expect("write authorized_keys");
 
     let port = free_udp_port();
-    let (child, output) = spawn_serve(home.path(), port);
+    let (child, output) = spawn_serve(home.path(), port, shell, parent_env);
 
     let daemon = Daemon {
         child,
         port,
         output,
         home,
+        shell: shell.to_path_buf(),
+        parent_env: parent_env.to_vec(),
     };
     // Spawning is not readiness: an explicit refusal now ends discovery
     // immediately, so do not race the daemon's first socket bind.
@@ -311,12 +336,23 @@ pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
 
 /// `qshd serve` on `port`, with the host key and `authorized_keys` in
 /// `home`, and everything it prints drained into the returned buffer.
-fn spawn_serve(home: &Path, port: u16) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>) {
+fn spawn_serve(
+    home: &Path,
+    port: u16,
+    shell: &Path,
+    parent_env: &[(String, String)],
+) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>) {
     let mut command = Command::new(qshd_path());
     let tracked_shell = home.join("tracked-shell");
-    if tracked_shell.exists() {
-        command.env("SHELL", tracked_shell);
-    }
+    let shell = if tracked_shell.exists() {
+        &tracked_shell
+    } else {
+        shell
+    };
+    // Synthetic inherited values exercise the same override order without a
+    // test-process reexec or process-global environment mutation.
+    command.envs(parent_env.iter().cloned());
+    command.envs(shell_env::prepare(home, shell));
     let mut child = command
         .args([
             "serve",
@@ -327,14 +363,6 @@ fn spawn_serve(home: &Path, port: u16) -> (Child, std::sync::Arc<Mutex<Vec<u8>>>
             "--host-key",
             home.join("host_key").to_str().expect("utf-8"),
         ])
-        // `qshd serve` spawns `$SHELL` through `portable_pty`, which copies
-        // the whole parent environment: without an explicit `HOME` here the
-        // spawned shell would be the developer's own real interactive
-        // login shell, sourcing their rc files and appending this test's
-        // typed commands to their real shell history.
-        .env("HOME", home)
-        .env("XDG_CACHE_HOME", home)
-        .env("HISTFILE", "/dev/null")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
