@@ -104,6 +104,20 @@ an error right away, without starting anything.
   sessions — this mode has no shared login for multiple system users,
   unless it's started with `--system` instead; see "System mode" below.
 
+Existing host keys must be regular files owned by the daemon account (root in
+system mode), with a single link. Leaf symlinks and hard links are refused;
+name the actual file with `--host-key` instead. Parent directories must be
+controlled by root or that account. Writable parents are refused except for
+sticky directories with a trusted owner; parent aliases are followed only
+through the same validated traversal.
+
+Owner-only modes such as `0400` remain unchanged. If an otherwise trusted key
+allows group or other access, the daemon tightens the opened file to `0600`
+and verifies the result before reading it. Failed repair stops startup. A
+successful repair warning does not mean an earlier disclosure has been undone;
+rotate a key separately if its secrecy is uncertain. Rejected keys are never
+silently replaced.
+
 ## System mode
 
 `qshd serve --system` is the other way to run this same daemon: one

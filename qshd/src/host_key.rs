@@ -8,10 +8,17 @@ use anyhow::{bail, Context, Result};
 use tempfile::NamedTempFile;
 use transport::handshake::Keypair;
 
+mod trusted;
+
 /// Load a persistent server Noise key, or atomically publish a new one if absent.
 ///
 /// The file holds 64 raw bytes: the 32-byte X25519 private key followed by its
 /// public key. Existing invalid or unreadable files are errors, never replaced.
+/// Existing files are validated through the same opened descriptor before any
+/// secret bytes are read: regular, owned by the effective UID, single-linked,
+/// and below trusted parent directories. Group/other access is repaired on that
+/// descriptor and checked before reading; failed repair is an error. A warning
+/// after successful repair does not claim to undo any earlier disclosure.
 /// Concurrent creators load the winner rather than changing its identity.
 /// Staging files are private from creation (mode 0600 on Unix). The staged file
 /// is synced before publication; this does not promise power-loss durability of
@@ -24,7 +31,15 @@ pub fn load_or_create_transport_key(path: &Path) -> Result<Keypair> {
 // staging/publication path while substituting only the failing operation.
 trait KeyFileIo {
     fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        let loaded = trusted::read(path, nix::unistd::Uid::effective(), &mut trusted::FileIo)?;
+        if let Some(mode) = loaded.repaired_mode {
+            crate::log::warn("qshd", &format!(
+                "host key {} was accessible to more than its owner (mode {mode:03o}); \
+                 verified file permissions tightened to 0600, which cannot undo a possible past disclosure",
+                path.display()
+            ));
+        }
+        Ok(loaded.bytes.to_vec())
     }
 
     fn write(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -73,7 +88,9 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
+    // Secure parent creation is independent of publication. The staged-file
+    // publication path remains unchanged until its compatibility review.
+    let _anchored_parent = trusted::prepare_parent(path, nix::unistd::Uid::effective())
         .with_context(|| format!("creating directory {}", parent.display()))?;
     let mut staged = tempfile::Builder::new()
         .prefix(".qshd-host-key-")
@@ -108,6 +125,14 @@ mod tests {
     use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(10);
+
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     fn assert_identity(path: &Path, key: &Keypair) {
         let stored = std::fs::read(path).unwrap();
@@ -153,7 +178,7 @@ mod tests {
     }
 
     fn fails_without_publishing(failure: Failure, message: &str) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let unrelated = dir.path().join(".qshd-host-key-unrelated");
         std::fs::write(&unrelated, b"unrelated staging file").unwrap();
@@ -210,7 +235,7 @@ mod tests {
 
     #[test]
     fn reader_cannot_observe_partial_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -259,7 +284,7 @@ mod tests {
 
     #[test]
     fn concurrent_creators_return_the_same_published_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (go_a, wait_a) = mpsc::channel();
@@ -301,7 +326,7 @@ mod tests {
                 FileIo.publish(file, path)
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         assert!(load_or_create_with(&path, &mut CorruptWinner).is_err());
         assert_eq!(
@@ -313,7 +338,7 @@ mod tests {
 
     #[test]
     fn existing_corrupt_identity_is_preserved_and_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         std::fs::write(&path, b"incomplete existing identity").unwrap();
         assert!(load_or_create_transport_key(&path).is_err());
@@ -338,7 +363,7 @@ mod tests {
                 ))
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("not-created/host.key");
         let mut denied = DeniedRead { reads: 0 };
         let error = load_or_create_with(&path, &mut denied).err().unwrap();
@@ -362,7 +387,7 @@ mod tests {
 
     #[test]
     fn existing_identity_keeps_its_bytes_and_permissions() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("nested/host.key");
         let key = load_or_create_transport_key(&path).unwrap();
         #[cfg(unix)]
@@ -389,7 +414,7 @@ mod tests {
 
     #[test]
     fn directory_at_identity_path_is_not_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         std::fs::create_dir(&path).unwrap();
         assert!(load_or_create_transport_key(&path).is_err());
@@ -399,8 +424,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn existing_symlink_is_refused_without_changing_its_target() {
+        let dir = private_dir();
+        let target = dir.path().join("original.key");
+        let key = load_or_create_transport_key(&target).unwrap();
+        let link = dir.path().join("host.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = load_or_create_transport_key(&link).is_err();
+        assert_identity(&target, &key);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            refused,
+            "an existing key symlink must fail before its secret is used"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dangling_symlink_at_identity_path_is_not_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let absent = dir.path().join("absent");
         std::os::unix::fs::symlink(&absent, &path).unwrap();
@@ -420,7 +462,7 @@ mod tests {
             assert_eq!(std::fs::read_dir(".").unwrap().count(), 1);
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
