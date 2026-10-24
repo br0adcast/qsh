@@ -195,7 +195,10 @@ fn run(name: &str) {
 #[test] fn excluded() { panic!("must not execute"); }
 #[test] #[ignore = "owned subprocess fixture"] fn body() {}
 ''')
-            env = dict(os.environ, HISTFILE="/dev/null", QSH_FIXTURE_TRACE=str(root))
+            # This fixture asserts the pinned CLI summary as plain text;
+            # scope color selection to its subprocesses, independent of CI.
+            env = dict(os.environ, HISTFILE="/dev/null", QSH_FIXTURE_TRACE=str(root),
+                       CARGO_TERM_COLOR="never")
             env["CARGO_HOME"] = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
             env["RUSTUP_HOME"] = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
             env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "config"), XDG_CACHE_HOME=str(root / "cache"))
