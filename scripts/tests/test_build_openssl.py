@@ -339,6 +339,9 @@ class TimeoutDiagnosticTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == 'linux' and os.uname().machine == 'x86_64', 'fd decoder covers Linux x86_64 ELF64 only')
     def test_actual_owned_pipe_read_reports_only_its_descriptor_metadata(self):
+        self.assert_owned_pipe_read()
+
+    def assert_owned_pipe_read(self):
         from native_timeout_diagnostics import timeout_snapshot
         read, write = os.pipe()
         child = subprocess.Popen([sys.executable, '-c', 'import os,sys; os.read(int(sys.argv[1]), 1)', str(read)],
@@ -346,13 +349,14 @@ class TimeoutDiagnosticTests(unittest.TestCase):
         try:
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                if Path('/proc/' + str(child.pid) + '/wchan').read_text().strip() == 'pipe_read':
+                report = timeout_snapshot(child.pid, [], {}, Path('/unused-fixture'), ROOT)
+                process = next((p for p in report['processes'] if p['pid'] == child.pid), {})
+                call = process.get('syscall', {})
+                if call.get('number') == 0 and call.get('descriptor', {}).get('number') == read:
                     break
                 time.sleep(0.01)
             else:
                 self.fail('owned pipe reader did not reach its blocking read')
-            report = timeout_snapshot(child.pid, [], {}, Path('/unused-fixture'), ROOT)
-            call = report['processes'][0]['syscall']
             self.assertEqual((call['number'], call['name']), (0, 'read'))
             self.assertEqual(call['descriptor']['number'], read)
             self.assertTrue(call['descriptor']['target'].startswith('pipe:['))
@@ -361,6 +365,26 @@ class TimeoutDiagnosticTests(unittest.TestCase):
             os.close(write)
             child.terminate()
             child.wait()
+
+    @unittest.skipUnless(sys.platform == 'linux' and os.uname().machine == 'x86_64', 'fd decoder covers Linux x86_64 ELF64 only')
+    def test_renamed_pipe_wait_symbol_does_not_change_owned_readiness(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        original_text = Path.read_text
+        original_read = diagnostic._read
+        observed = []
+        def renamed_text(path, *args, **kwargs):
+            if path.name == 'wchan' and path.parents[1] == Path('/proc'):
+                return 'anon_pipe_read'
+            return original_text(path, *args, **kwargs)
+        def renamed_read(path, limit=4096):
+            if path.name == 'wchan' and path.parents[1] == Path('/proc'):
+                observed.append('anon_pipe_read')
+                return 'anon_pipe_read'
+            return original_read(path, limit)
+        with patch.object(Path, 'read_text', renamed_text), patch.object(diagnostic, '_read', renamed_read):
+            self.assert_owned_pipe_read()
+        self.assertTrue(observed, 'real owned snapshot did not observe the renamed wait symbol')
 
     def test_original_timeout_emits_diagnostics_without_changing_failure(self):
         import contextlib
