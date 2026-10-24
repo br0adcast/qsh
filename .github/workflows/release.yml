@@ -574,19 +574,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="$GITHUB_REF_NAME"
-          # SemVer: a hyphen introduces a pre-release identifier
-          # (v1.0.0-rc1), which the `v*.*.*` trigger above also matches.
-          prerelease_flag=()
-          case "$tag" in
-            *-*) prerelease_flag=(--prerelease) ;;
-          esac
-          if gh release view "$tag" >/dev/null 2>&1; then
-            # A retry after a previous run failed partway through: the
-            # release already exists, so top up its assets instead of
-            # erroring out on a duplicate `create`.
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --title "qsh ${tag#v}" --notes-file notes.md \
-              "${prerelease_flag[@]}"
-          fi
+          python3 scripts/upload-release-assets.py \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            --notes-file notes.md dist/*
