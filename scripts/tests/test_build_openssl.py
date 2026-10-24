@@ -36,6 +36,11 @@ def run_owned_build(command, env, fixture, timeout=20):
             if isinstance(failure, subprocess.TimeoutExpired):
                 for label, output in [('stdout', failure.stdout), ('stderr', failure.stderr)]:
                     print(label + ' tail: ' + bounded_diagnostic(output, fixture), file=sys.stderr)
+                from native_timeout_diagnostics import timeout_snapshot
+                snapshot = timeout_snapshot(child.pid, command, env, fixture, ROOT)
+                for label, value in snapshot.items():
+                    print('Native fixture timeout ' + label + ': ' +
+                          bounded_diagnostic(json.dumps(value), fixture), file=sys.stderr)
         except BaseException:
             # A broken diagnostic sink or second interrupt cannot drop custody
             # or replace the original deadline/interruption failure.
@@ -86,6 +91,315 @@ def reap_owned_children(force):
         if pid == 0:
             time.sleep(0.01)
     return False
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'owned process diagnostics use Linux procfs')
+class TimeoutDiagnosticTests(unittest.TestCase):
+    def test_snapshot_excludes_arguments_environment_and_unrelated_processes(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            code = 'import time; time.sleep(60)'
+            child = subprocess.Popen([sys.executable, '-c', code, 'PRIVATE_ARG'],
+                                     env=dict(os.environ, PRIVATE_ENV='PRIVATE_VALUE'))
+            unrelated = subprocess.Popen([sys.executable, '-c', code])
+            try:
+                report = timeout_snapshot(child.pid, [], {}, root, ROOT)
+                text = json.dumps(report)
+                self.assertEqual([p['pid'] for p in report['processes']], [child.pid])
+                self.assertNotIn(unrelated.pid, [p['pid'] for p in report['processes']])
+                for private in ['PRIVATE_ARG', 'PRIVATE_ENV', 'PRIVATE_VALUE', code]:
+                    self.assertNotIn(private, text)
+                self.assertIn('executable', report['processes'][0])
+                self.assertIn('state', report['processes'][0])
+            finally:
+                child.terminate()
+                unrelated.terminate()
+                child.wait()
+                unrelated.wait()
+
+    def test_tool_resolution_records_owned_alias_without_dumping_environment(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            tool = root / 'owned-ar'
+            tool.write_text('#!/bin/sh\nexit 93\n')
+            tool.chmod(0o755)
+            alias = root / 'ar'
+            alias.symlink_to(tool)
+            report = timeout_snapshot(os.getpid(), ['--ar', str(alias)],
+                                      {'PATH': str(root), 'PRIVATE_ENV': 'PRIVATE_VALUE'}, root, ROOT)
+            selected = report['tools']['selected_ar']
+            self.assertEqual(selected['path'], '<fixture>/ar')
+            self.assertEqual(selected['resolved'], '<fixture>/owned-ar')
+            self.assertEqual(report['tools']['path_ar']['resolved'], selected['resolved'])
+            self.assertNotIn('PRIVATE_VALUE', json.dumps(report))
+
+    def test_default_musl_compiler_identity_matches_the_builder(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            compiler = root / 'musl-gcc'
+            compiler.write_text('#!/bin/sh\nexit 0\n')
+            compiler.chmod(0o755)
+            report = timeout_snapshot(os.getpid(), ['--target', 'x86_64-unknown-linux-musl'],
+                                      {'PATH': str(root)}, root, ROOT)
+            self.assertEqual(report['tools']['selected_cc']['path'], '<fixture>/musl-gcc')
+
+    def test_missing_root_is_explicit_and_never_scans_other_processes(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            report = timeout_snapshot(123, [], {}, root, ROOT, proc=root)
+            self.assertEqual(report['processes'], [])
+            self.assertIn('unavailable', report['process_status'])
+
+
+    @staticmethod
+    def fake_process(proc, pid, parent, children=(), started=1):
+        directory = proc / str(pid)
+        directory.mkdir(parents=True, exist_ok=True)
+        fields = ['0'] * 20
+        fields[0], fields[1], fields[2], fields[3] = 'S', str(parent), str(pid), str(pid)
+        fields[19] = str(started)
+        (directory / 'stat').write_text(str(pid) + ' (ar) ' + ' '.join(fields))
+        (directory / 'wchan').write_text('pipe_read')
+        if not (directory / 'exe').is_symlink():
+            (directory / 'exe').symlink_to('/usr/bin/ar')
+        task = directory / 'task' / str(pid)
+        task.mkdir(parents=True, exist_ok=True)
+        (task / 'children').write_text(' '.join(map(str, children)))
+
+    def test_descendants_are_bounded_and_parent_mismatch_is_omitted(self):
+        from native_timeout_diagnostics import MAX_PROCESSES, timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_process(root, 100, 1, range(101, 121))
+            self.fake_process(root, 101, 999)
+            for pid in range(102, 121):
+                self.fake_process(root, pid, 100)
+            report = timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            self.assertEqual(len(report['processes']), MAX_PROCESSES)
+            self.assertNotIn(101, [p['pid'] for p in report['processes']])
+            self.assertIn('limit', report['process_status'])
+            self.assertTrue(all(p['executable'] == '/usr/bin/ar' for p in report['processes']))
+
+    def test_changed_ancestor_identity_omits_its_descendants(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_process(root, 100, 1, [101])
+            self.fake_process(root, 101, 100)
+            readlink = os.readlink
+            def changed(path):
+                if Path(path) == root / '101/exe':
+                    self.fake_process(root, 100, 1, [101], started=2)
+                return readlink(path)
+            with patch.object(diagnostic.os, 'readlink', side_effect=changed):
+                report = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            self.assertEqual([p['pid'] for p in report['processes']], [100])
+
+    def test_exited_owned_root_remains_visible_when_executable_is_unavailable(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_process(root, 100, 1)
+            stat = root / '100/stat'
+            stat.write_text(stat.read_text().replace('(ar) S', '(ar) Z'))
+            (root / '100/exe').unlink()
+            report = timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            self.assertEqual(report['processes'][0]['state'], 'Z')
+            self.assertEqual(report['processes'][0]['executable'], 'unavailable')
+
+    def fake_syscall(self, root, number=0, arguments=None, machine=62, elf_class=2):
+        self.fake_process(root, 100, 1)
+        executable = root / 'fixture-elf'
+        executable.write_bytes(b'\x7fELF' + bytes([elf_class, 1, 1]) + bytes(11) + machine.to_bytes(2, 'little'))
+        (root / '100/exe').unlink()
+        (root / '100/exe').symlink_to(executable)
+        arguments = arguments or ['0x3', '0xfeed', '0x10', '0', '0', '0']
+        (root / '100/syscall').write_text(str(number) + ' ' + ' '.join(arguments) + ' 0xdead 0xbeef')
+        (root / '100/fd').mkdir()
+        (root / '100/fdinfo').mkdir()
+        target = root / 'object.o'
+        target.write_text('PRIVATE_BUFFER_CONTENT')
+        (root / '100/fd/3').symlink_to(target)
+        (root / '100/fd/4').symlink_to(root / 'UNRELATED_FD_PATH')
+        (root / '100/fdinfo/3').write_text('pos: 42\nflags: 0100000\nmnt_id: 9\nino: 17\nsecret: PRIVATE_FDINFO\n')
+
+    def test_syscall_descriptor_metadata_does_not_read_buffers_or_other_fds(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            report = timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            call = report['processes'][0]['syscall']
+            self.assertEqual((call['number'], call['name'], call['abi']), (0, 'read', 'Linux x86_64 ELF64'))
+            self.assertEqual(call['descriptor']['number'], 3)
+            self.assertEqual(call['descriptor']['target'], '<fixture>/object.o')
+            self.assertEqual(call['descriptor']['metadata'], {'pos': 42, 'flags': 32768, 'mnt_id': 9, 'ino': 17})
+            encoded = json.dumps(report)
+            for private in ['PRIVATE_BUFFER_CONTENT', 'PRIVATE_FDINFO', 'UNRELATED_FD_PATH', 'feed', 'dead', 'beef']:
+                self.assertNotIn(private, encoded)
+
+    def test_mmap_uses_its_fd_argument_and_unsupported_abi_is_not_guessed(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root, 9, ['0', '0x1000', '1', '2', '3', '0'])
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual((call['name'], call['descriptor']['number']), ('mmap', 3))
+            self.assertEqual(call['descriptor']['target'], '<fixture>/object.o')
+            executable = root / 'fixture-elf'
+            executable.write_bytes(b'\x7fELF' + bytes([1, 1, 1]) + bytes(11) + (3).to_bytes(2, 'little'))
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['number'], 9)
+            self.assertEqual(call['status'], 'unsupported or unavailable executable ABI; fd not decoded')
+            self.assertNotIn('descriptor', call)
+            executable.unlink()
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['number'], 9)
+            self.assertNotIn('descriptor', call)
+
+    def test_anonymous_mmap_does_not_sample_a_positive_ignored_descriptor(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        for flags in ['0x22', '290']:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+                root = Path(temp)
+                self.fake_syscall(root, 9, ['0', '0x1000', '1', flags, '3', '0'])
+                with patch.object(diagnostic, '_fd_metadata', wraps=diagnostic._fd_metadata) as sample:
+                    call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+                sample.assert_not_called()
+                self.assertEqual((call['number'], call['name']), (9, 'mmap'))
+                self.assertNotIn('descriptor', call)
+                self.assertNotIn('object.o', json.dumps(call))
+
+    def test_openat_does_not_sample_a_potentially_ignored_directory_descriptor(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root, 257, ['3', '0xfeed', '0', '0', '0', '0'])
+            with patch.object(diagnostic, '_fd_metadata', wraps=diagnostic._fd_metadata) as sample:
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            sample.assert_not_called()
+            self.assertEqual(call['number'], 257)
+            self.assertNotIn('descriptor', call)
+            self.assertNotIn('object.o', json.dumps(call))
+
+    def test_running_outside_syscall_and_unknown_numbers_never_dump_registers(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            for value in ['running', '-1 0xfeed 0xdead', '9999 3 0xfeed 0 0 0 0 0xdead 0xbeef']:
+                (root / '100/syscall').write_text(value)
+                call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+                self.assertNotIn('descriptor', call)
+                for address in ['feed', 'dead', 'beef']:
+                    self.assertNotIn(address, json.dumps(call))
+
+    def test_syscall_change_discards_sampled_descriptor_path(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            read = diagnostic._read
+            def changed(path, limit=4096):
+                result = read(path, limit)
+                if path == root / '100/fdinfo/3':
+                    (root / '100/syscall').write_text('running')
+                return result
+            with patch.object(diagnostic, '_read', side_effect=changed):
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['status'], 'changed during snapshot; fd metadata omitted')
+            self.assertNotIn('descriptor', call)
+            self.assertNotIn('object.o', json.dumps(call))
+
+    def test_fd_link_change_omits_stale_path(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            read = diagnostic._read
+            def changed(path, limit=4096):
+                result = read(path, limit)
+                if path == root / '100/fdinfo/3':
+                    (root / '100/fd/3').unlink()
+                    (root / '100/fd/3').symlink_to(root / 'replacement')
+                return result
+            with patch.object(diagnostic, '_read', side_effect=changed):
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['descriptor']['status'], 'changed during snapshot')
+            self.assertNotIn('target', call['descriptor'])
+
+    @unittest.skipUnless(sys.platform == 'linux' and os.uname().machine == 'x86_64', 'fd decoder covers Linux x86_64 ELF64 only')
+    def test_actual_owned_pipe_read_reports_only_its_descriptor_metadata(self):
+        self.assert_owned_pipe_read()
+
+    def assert_owned_pipe_read(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        read, write = os.pipe()
+        child = subprocess.Popen([sys.executable, '-c', 'import os,sys; os.read(int(sys.argv[1]), 1)', str(read)],
+                                 pass_fds=(read,))
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                report = timeout_snapshot(child.pid, [], {}, Path('/unused-fixture'), ROOT)
+                process = next((p for p in report['processes'] if p['pid'] == child.pid), {})
+                call = process.get('syscall', {})
+                if call.get('number') == 0 and call.get('descriptor', {}).get('number') == read:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail('owned pipe reader did not reach its blocking read')
+            self.assertEqual((call['number'], call['name']), (0, 'read'))
+            self.assertEqual(call['descriptor']['number'], read)
+            self.assertTrue(call['descriptor']['target'].startswith('pipe:['))
+        finally:
+            os.close(read)
+            os.close(write)
+            child.terminate()
+            child.wait()
+
+    @unittest.skipUnless(sys.platform == 'linux' and os.uname().machine == 'x86_64', 'fd decoder covers Linux x86_64 ELF64 only')
+    def test_renamed_pipe_wait_symbol_does_not_change_owned_readiness(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        original_text = Path.read_text
+        original_read = diagnostic._read
+        observed = []
+        def renamed_text(path, *args, **kwargs):
+            if path.name == 'wchan' and path.parents[1] == Path('/proc'):
+                return 'anon_pipe_read'
+            return original_text(path, *args, **kwargs)
+        def renamed_read(path, limit=4096):
+            if path.name == 'wchan' and path.parents[1] == Path('/proc'):
+                observed.append('anon_pipe_read')
+                return 'anon_pipe_read'
+            return original_read(path, limit)
+        with patch.object(Path, 'read_text', renamed_text), patch.object(diagnostic, '_read', renamed_read):
+            self.assert_owned_pipe_read()
+        self.assertTrue(observed, 'real owned snapshot did not observe the renamed wait symbol')
+
+    def test_original_timeout_emits_diagnostics_without_changing_failure(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                with self.assertRaises(subprocess.TimeoutExpired) as failure:
+                    run_owned_build([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                    dict(os.environ), root, timeout=0.05)
+            self.assertEqual(failure.exception.timeout, 0.05)
+            self.assertIn('Native fixture timeout tools:', output.getvalue())
+            self.assertIn('Native fixture timeout processes:', output.getvalue())
+
 
 
 class NativeBuildTests(unittest.TestCase):
