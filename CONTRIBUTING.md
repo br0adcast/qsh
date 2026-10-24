@@ -2,13 +2,68 @@
 
 File bugs and suggestions under Issues; send changes as a pull request.
 
-## Native crypto prerequisite
+## Rust and native setup
 
-Before the Cargo commands below, build the pinned native RSA backend and export
-its prefix as described in [native crypto](docs/native-crypto.md). Use
-`OPENSSL_DIR` and `OPENSSL_STATIC=1` (or their target-prefixed forms for cross
-builds). A system OpenSSL installation is not a substitute for the qualified
-source/version/target manifest. CI and package builds use the same helper.
+Rust **1.98.1** is the intentional minimum supported version for every workspace
+member. This is a support floor, not a claim that older compilers cannot compile
+the source. The checkout selects it through `rust-toolchain.toml`, whose minimal
+profile also requests rustfmt and Clippy. Ordinary Linux CI uses **1.99.1** for
+current-toolchain quality and runtime checks; portable macOS and the existing
+Linux container job cover the floor.
+
+1. Install the floor toolchain and the current CI toolchain when reproducing
+   those quality checks. Installation does not change the global rustup default:
+
+   ```sh
+   rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+   rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+   ```
+
+2. Install a C compiler and binutils, Perl, make, GnuPG, Python 3, Bash, and curl.
+   macOS needs the Xcode command-line tools/SDK (`xcrun` and `otool`). Linux
+   `qshd/system` builds also require PAM development libraries. Integration tests
+   need the OpenSSH server and client tools described below.
+
+3. Prepare the verified static native RSA backend **before** any Rust product
+   build, then export its prefix:
+
+   ```sh
+   target=$(rustc -vV | sed -n 's/^host: //p')
+   native_prefix=$(bash scripts/build-openssl.sh --target "$target" \
+     --cache "$PWD/target/native-crypto" --jobs 2)
+   export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
+   ```
+
+   Follow [native crypto](docs/native-crypto.md) for source verification, target
+   selection, cross builds, and qualification. Cross builds use the documented
+   target-prefixed variables. A system OpenSSL installation is not a substitute
+   for the qualified source/version/target manifest. CI and package builds use
+   the same helper.
+
+4. Check the effective floor declarations and compile the supported feature
+   boundaries with the existing lockfile:
+
+   ```sh
+   cargo metadata --no-deps --format-version 1 --locked \
+     | python3 scripts/check-rust-version.py
+   cargo build -p qshd --bin qshd --locked
+   cargo check -p transport --lib --no-default-features --locked
+   # Linux system-mode workspace targets:
+   cargo test --workspace --features qshd/system --locked --no-run
+   ```
+
+   These commands use the checkout's 1.98.1 toolchain unless explicitly
+   overridden. They compile the default personal daemon, independent sans-IO
+   transport library, and, on Linux, the complete workspace with the system
+   feature. The existing portable macOS CI selection covers its native surface.
+   They do not replace the current-toolchain runtime checks below.
+
+The Cargo support floor and the exact compiler qualification for terminal
+allocation bounds are separate. A newer compiler satisfying `rust-version`
+does not extend [the resource qualification](docs/terminal-resources.md), whose
+release/hash guard remains in place. Do not bypass a failing floor check by
+ignoring `rust-version`, silently choosing another compiler, or changing the
+lockfile outside a reviewed dependency update.
 
 ## Contribution licensing terms
 
@@ -35,11 +90,11 @@ this section.**
   (CI pins version 0.9.148), then run the same ordinary-user test commands as CI:
 
   ```sh
-  QSH_TEST_QSHD="$PWD/target/debug/qshd" \
+  RUSTUP_TOOLCHAIN=1.99.1 QSH_TEST_QSHD="$PWD/target/debug/qshd" \
     python3 scripts/run-nextest-ci.py -- \
       cargo nextest run --profile ci --workspace --lib --bins --tests --locked \
       --features qshd/system
-  cargo test --workspace --doc --locked
+  RUSTUP_TOOLCHAIN=1.99.1 cargo test --workspace --doc --locked
   ```
 
   Run this from the workspace root. The explicit `QSH_TEST_QSHD` path makes
@@ -82,7 +137,14 @@ this section.**
   `/usr/sbin/sshd`, which they start on their own. Without `sshd` those
   tests fail rather than pass having checked nothing; `QSH_NO_SSHD=1`
   skips them instead, and each skip says so.
-- `cargo fmt` and `cargo clippy` are clean on the files you changed.
+- Reproduce ordinary Linux CI's formatting and Clippy checks with its selected
+  compiler (after the native setup above):
+
+  ```sh
+  RUSTUP_TOOLCHAIN=1.99.1 cargo fmt --all --check
+  RUSTUP_TOOLCHAIN=1.99.1 cargo clippy --workspace --all-targets --locked \
+    --features qshd/system -- -D warnings
+  ```
 - Changes to the native crypto build prerequisite follow
   [its source verification and qualification procedure](docs/native-crypto.md).
 - Changes to GitHub Actions follow

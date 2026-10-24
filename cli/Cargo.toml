@@ -3,6 +3,7 @@ name = "qsh"
 description = "A terminal session that survives a network change"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
