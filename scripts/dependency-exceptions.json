@@ -8,15 +8,5 @@
     "review_by": "2027-01-24",
     "tracking": "https://github.com/br0adcast/qsh/issues/62",
     "reason": "Local RSA preparation and signing use the qualified native backend with no RustCrypto private fallback (#59/#121). Retain guarded native dispatch, parsing, cancellation and platform qualification tests. Upstream formats/public verification and external signers remain separate boundaries; this is not a whole-library safety claim. Review on pin, callsite or advisory changes."
-  },
-  {
-    "id": "RUSTSEC-2025-0069",
-    "package": "daemonize",
-    "version": "0.5.0",
-    "kind": "unmaintained",
-    "owner": "br0adcast (repository maintainer)",
-    "review_by": "2027-01-24",
-    "tracking": "https://github.com/br0adcast/qsh/issues/248",
-    "reason": "The sole qsh call is Daemonize::new().execute() before the runtime. It does not call the privileged_action builder containing the reported generic transmute. Track removal and parent-status handling in #248; retain real daemonization/ensure ownership tests. Maintenance risk remains; no claim that the whole library is safe. Review on pin, callsite, startup-thread or advisory changes."
   }
 ]

@@ -35,9 +35,9 @@ The audit fetches the current official RustSec database and checks a fresh
 registry index, with its own temporary HOME/Cargo configuration. Fetch failures
 are fatal; there is no stale/offline fallback or severity/target filter.
 Vulnerabilities and unmaintained, unsound and yanked findings are denied.
-Informational notices remain visible. The tool receives only the two reviewed
-IDs after the checker verifies that every locked version of each named package
-matches the exact reviewed version. After the same audit pass, the checker
+Informational notices remain visible. The tool receives only the reviewed
+advisory ID after the checker verifies that every locked version of the named
+package matches the exact reviewed version. After the same audit pass, the checker
 verifies each ignored advisory's ID, package and informational kind in the
 freshly fetched database. Changed identity/kind or a second package version
 fails the check.
@@ -90,22 +90,20 @@ exception. Remove obsolete entries rather than leaving broad ignores behind.
 | Exact finding | Rationale and required boundary | Follow-up/review |
 | --- | --- | --- |
 | RUSTSEC-2023-0071, rsa 0.10.0-rc.18, vulnerability | Local RSA preparation and signing use the qualified native backend without a RustCrypto private fallback, completed in #59/#121. Upstream formats/public verification and external signers remain separate boundaries. | #62; maintainer review by 2027-01-24 |
-| RUSTSEC-2025-0069, daemonize 0.5.0, unmaintained | The sole `Daemonize::new().execute()` call precedes the runtime and does not call the `privileged_action` builder containing the cited transmute. Maintenance risk remains; this is not a whole-library safety claim. | #248 tracks bounded replacement and parent-status handling; maintainer review by 2027-01-24 |
 
 Review these entries on any related pin, callsite, startup-thread, native
 backend or advisory change, even before the date. Do not remove RSA support,
 disable verification or suppress another advisory in the same dependency
 family to satisfy a scanner. Other patchable findings require their own fixes
-and review; they do not inherit either disposition.
+and review; they do not inherit this disposition.
 
 Ordinary CI's existing native boundary tests remain required, including
 `native_rsa_route_is_observed_on_the_real_file_signer`,
 `native_rsa_failure_cannot_fall_back_to_a_successful_file_proof`, and
 `native_rsa_cancel_drops_connection_runtime_while_owned_signing_is_held`.
 Keep native parsing, ownership/cancellation and release-platform qualification
-alongside these tests. Keep real daemonization/ensure ownership tests while
-the maintenance disposition exists. Passing signatures or a scanner alone do
-not establish constant-time execution or safety of a whole dependency.
+alongside these tests. Passing signatures or a scanner alone do not establish
+constant-time execution or safety of a whole dependency.
 
 ## Fixture provenance
 
