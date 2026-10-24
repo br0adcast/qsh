@@ -16,6 +16,8 @@ on:
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
+      - 'packaging/bootstrap/**'
+      - 'scripts/tests/test_bootstrap_tools.py'
   push:
     branches: [main]
     paths:
@@ -32,6 +34,8 @@ on:
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
+      - 'packaging/bootstrap/**'
+      - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
   workflow_call:
 
@@ -142,6 +146,15 @@ jobs:
         env:
           FORMAT: ${{ matrix.format }}
         run: docker build -f "packaging/Dockerfile.build-$FORMAT" -t qsh-native-floor packaging
+      - name: Reject untrusted RPMs and prohibit foreign scriptlets
+        if: matrix.format == 'rpm'
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,exec,nosuid --tmpfs /var/tmp:rw,exec,nosuid \
+            --tmpfs /var/log:rw,noexec,nosuid --tmpfs /run:rw,noexec,nosuid \
+            -e HISTFILE=/dev/null -e PYTHONDONTWRITEBYTECODE=1 \
+            -v "$PWD/packaging/bootstrap:/bootstrap:ro" \
+            qsh-native-floor /usr/libexec/platform-python /bootstrap/test-sysroot.py
       - name: Qualify both GNU architectures inside the actual floor
         env:
           FORMAT: ${{ matrix.format }}
