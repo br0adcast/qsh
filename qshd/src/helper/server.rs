@@ -2549,16 +2549,22 @@ fn lose_monitor(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner, w
     retire_login(sock, state, owner);
 }
 
+#[cfg(target_os = "linux")]
+fn close_pipe_error(request: &MonitorRequest, errno: i32) -> bool {
+    matches!(request, MonitorRequest::Close { .. }) && errno == nix::libc::EPIPE
+}
+
 /// Send one request to a login's monitor. Nothing answers here: what the
 /// monitor has to say comes back on its seam, which the loop polls.
 ///
-/// A send that fails is a monitor that is gone or wedged -- the send is
+/// A send that fails normally means a monitor is gone or wedged -- the send is
 /// bounded (`SEAM_SEND_TIMEOUT`, set when the monitor was forked), because
 /// a monitor that stopped reading must not be able to stop the helper that
 /// serves every session on the machine. Either way that monitor's LOGIN
 /// ends with it ([`lose_monitor`]): what it was asked to do cannot reach
 /// it, and a monitor nobody can reach can only hold its channels open for
-/// good.
+/// good. An obsolete Close to an exactly observed exited native producer keeps
+/// its buffered receipt route instead; producer exit alone settles no custody.
 fn tell_monitor(
     sock: &UnixStream,
     state: &mut LoopState,
@@ -2578,6 +2584,24 @@ fn tell_monitor(
         Err(e) => Some((e.to_string(), nix::libc::EINVAL)),
     };
     if let Some((why, errno)) = failed {
+        #[cfg(target_os = "linux")]
+        if close_pipe_error(request, errno) {
+            if let Some(Monitor {
+                process: MonitorProcess::Native(native),
+                ..
+            }) = state.monitors.get_mut(&owner)
+            {
+                // The producer may have exited since the previous loop pass.
+                // This exact nonreaping observation only makes Close obsolete:
+                // keep draining its receipts and native scope before settlement.
+                if matches!(
+                    native.leader(),
+                    crate::process_scope::scope::LeaderStatus::Exited(_)
+                ) {
+                    return;
+                }
+            }
+        }
         if state.stopping {
             // A cooperative-stop send failure is not authority to guess a
             // monitor PID signal. Keep its read route and all cleanup debt.
