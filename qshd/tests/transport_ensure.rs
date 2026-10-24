@@ -312,6 +312,130 @@ fn transport_ensure_second_invocation_reuses_live_daemon() {
     );
 }
 
+/// Owns the fake busy daemon until its worker has been joined.
+struct BusyControlSocket {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BusyControlSocket {
+    fn bind(path: &std::path::Path) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(path)
+            .expect("binding the test busy control socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking test listener");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_accepted = accepted.clone();
+        let (release, cancelled) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Disconnection cancels even if no client ever connects.
+                        if cancelled.recv_timeout(Duration::from_millis(10))
+                            != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("accepting the control connection: {error}"),
+                }
+            };
+            worker_accepted.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Hold the accepted stream until the command's outcome is observed.
+            let _ = cancelled.recv();
+            drop(stream);
+        });
+        Self {
+            release: Some(release),
+            worker: Some(worker),
+            accepted,
+        }
+    }
+
+    fn finish(&mut self) -> std::thread::Result<()> {
+        self.release.take();
+        self.worker.take().map_or(Ok(()), |worker| worker.join())
+    }
+}
+
+impl Drop for BusyControlSocket {
+    fn drop(&mut self) {
+        let result = self.finish();
+        // A worker failure must not replace the command's original panic.
+        if !std::thread::panicking() {
+            result.expect("the test busy daemon thread does not panic");
+        }
+    }
+}
+
+#[test]
+fn busy_control_fixture_joins_after_command_exits_before_connecting() {
+    use std::os::unix::net::UnixStream;
+    let home = private_temp_home().unwrap();
+    let cache_dir = home.path().join("qsh");
+    std::fs::create_dir(&cache_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sock_path = cache_dir.join("control.sock");
+    let worker_path = sock_path.clone();
+    let worker_home = home.path().to_owned();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let supervisor = std::thread::spawn(move || {
+        let busy = BusyControlSocket::bind(&worker_path);
+        let accepted = busy.accepted.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _busy = busy;
+            let output = Command::new(env!("CARGO_BIN_EXE_qshd"))
+                .args(["transport-ensure", "--client-pubkey", "invalid-key"])
+                .env("HOME", &worker_home)
+                .env("XDG_CONFIG_HOME", &worker_home)
+                .env("XDG_CACHE_HOME", &worker_home)
+                .env("HISTFILE", "/dev/null")
+                .output()
+                .expect("early-exit command spawns and is reaped");
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("--client-pubkey: expected valid base64"),
+                "{stderr}"
+            );
+            panic!("original command failure: {stderr}");
+        }));
+        assert!(
+            !accepted.load(std::sync::atomic::Ordering::SeqCst),
+            "invalid-key command must exit before connecting"
+        );
+        completed_tx.send(result).unwrap();
+    });
+    let completion = completed_rx.recv_timeout(Duration::from_secs(2));
+    if completion.is_err() {
+        // Reap even the broken blocking-accept implementation on a RED run.
+        let rescue = UnixStream::connect(&sock_path);
+        let joined = supervisor.join();
+        panic!("busy listener did not cancel before accept; rescue: {rescue:?}; supervisor: {joined:?}");
+    }
+    supervisor.join().unwrap();
+    let panic = completion
+        .unwrap()
+        .expect_err("original command failure must survive cleanup");
+    let diagnostic = panic
+        .downcast_ref::<String>()
+        .expect("string panic diagnostic");
+    assert!(
+        diagnostic.contains("original command failure:"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("--client-pubkey: expected valid base64"),
+        "{diagnostic}"
+    );
+}
+
 /// A control socket that ACCEPTS a connection and then never answers looks
 /// exactly like the diagnosed bug's scenario: a live daemon whose `STATUS`
 /// handler is busy (e.g. hashing its own executable under load), not an
@@ -342,18 +466,7 @@ fn transport_ensure_timeout_does_not_start_a_second_daemon() {
 
     // A "daemon" that accepts the connection but is too busy to answer --
     // the diagnosed scenario, not "nothing is listening".
-    let listener = std::os::unix::net::UnixListener::bind(&sock_path)
-        .expect("binding the test \"busy\" control socket");
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let busy_daemon = std::thread::spawn(move || {
-        let (stream, _addr) = listener
-            .accept()
-            .expect("accepting a connection from transport-ensure");
-        // Hold the connection open well past `transport-ensure`'s read
-        // budget, then release once the test has observed the outcome.
-        let _ = release_rx.recv_timeout(Duration::from_secs(10));
-        drop(stream);
-    });
+    let mut busy_daemon = BusyControlSocket::bind(&sock_path);
 
     // Pre-occupy the port `transport-ensure` would try to bind if it
     // mistook the timeout for "no daemon".
@@ -379,10 +492,21 @@ fn transport_ensure_timeout_does_not_start_a_second_daemon() {
         .output()
         .expect("`qshd transport-ensure` process spawns");
 
-    let _ = release_tx.send(());
-    busy_daemon
-        .join()
-        .expect("the test \"busy\" daemon thread does not panic");
+    let cleanup = busy_daemon.finish();
+    assert!(
+        cleanup.is_ok(),
+        "busy daemon cleanup failed; command status: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        busy_daemon
+            .accepted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "busy-socket regression must accept the real control connection; status: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     assert!(
         !output.status.success(),
