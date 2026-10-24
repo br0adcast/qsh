@@ -16,7 +16,6 @@ hex = "0.4"
 base64 = "0.22"
 dirs = "6"
 portable-pty = "0.9"
-daemonize = "0.5"
 nix = { version = "0.28", features = ["term", "user", "fs", "dir", "process", "signal"] }
 log = "0.4"
 logging = { path = "../crates/logging" }
@@ -63,3 +62,7 @@ alacritty_terminal = "=0.26.0"
 [build-dependencies]
 # The Darwin handover query uses SDK structs rather than hard-coded Rust ABI.
 cc = "1"
+
+[[test]]
+name = "detach_process"
+harness = false

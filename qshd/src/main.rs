@@ -47,6 +47,8 @@
 //! removed -- replaced by the `transport-*`
 //! path above.
 
+mod detach;
+
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -793,7 +795,7 @@ fn ask_status_with(
 /// Becomes the transport daemon: binds the transport's UDP socket and the
 /// control Unix socket SYNCHRONOUSLY, BEFORE the fork (the tokio runtime
 /// does not survive `fork`, so everything async only happens after
-/// `daemonize().execute()`), prints `TRANSPORT-READY` in the parent, and
+/// `detach::detach()`), prints `TRANSPORT-READY` in the parent, and
 /// daemonizes. From here on only the detached daemon runs --
 /// [`transport_daemon::run_transport_daemon`].
 ///
@@ -855,22 +857,25 @@ fn become_transport_daemon(
         None,
     )?;
 
-    // Daemonize: the parent exits after its upstream outcome (the SSH `exec` gets
+    // Daemonize: the parent exits after the first child's outcome (the SSH `exec` gets
     // EOF and returns the captured lines), the daemon inherits the bound
     // sockets.
-    match daemonize::Daemonize::new().execute() {
-        daemonize::Outcome::Parent(result) => {
+    // SAFETY: Rust's Unix startup initializes missing standard descriptors before
+    // main. This synchronous path neither closes/replaces them nor starts threads,
+    // so its owned sockets/lock stay above 2 and no logger/runtime/workers exist.
+    match unsafe { detach::detach() } {
+        detach::Outcome::Parent(result) => {
             // Even a parent wait error does not prove that its forked child
             // failed. Only the child's own guard may now unlink publication.
             cleanup.leave_to_child();
             let parent = result.context("daemonizing qshd (transport parent)")?;
-            std::process::exit(parent.first_child_exit_code);
+            std::process::exit(parent);
         }
-        daemonize::Outcome::Child(result) => {
+        detach::Outcome::Child(result) => {
             result.context("daemonizing qshd (transport child)")?;
         }
     }
-    // Parent/intermediate copies close when daemonize exits them. The final
+    // Parent/intermediate copies close when their processes exit. The final
     // child releases its copy after publication/fork, before serving requests.
     drop(transaction);
 

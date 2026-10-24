@@ -22,6 +22,17 @@ def load_script(name):
     return module
 
 
+def synthetic_maintenance_exception():
+    # Owned local data, not an official advisory or a production exception.
+    identity = ('unmaintained', 'RUSTSEC-2026-9004', 'owned-maintenance', '1.0.0')
+    return {identity: {
+        'kind': identity[0], 'id': identity[1], 'package': identity[2], 'version': identity[3],
+        'owner': 'Owned fixture', 'review_by': '2027-01-24',
+        'tracking': 'https://example.invalid/maintenance',
+        'reason': 'Synthetic local maintenance disposition for identity and kind controls.',
+    }}
+
+
 def receipt(lock, database, count=2, extra=''):
     return ("    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`\n"
             + f"      Loaded 1 security advisories (from {database})\n"
@@ -62,35 +73,35 @@ class AdvisoryGateTests(unittest.TestCase):
                     self.gate.load_exceptions(path, self.today)
 
     def test_ignore_scope_requires_every_locked_version_to_match(self):
-        packages = [{'name': 'rsa', 'version': '0.10.0-rc.18'},
-                    {'name': 'daemonize', 'version': '0.5.0'}]
+        packages = [{'name': 'rsa', 'version': '0.10.0-rc.18'}]
         self.gate.validate_exception_versions(self.exceptions, packages)
         for changed in [packages[1:], packages + [{'name': 'rsa', 'version': '0.10.0-rc.19'}],
-                        [dict(packages[0], version='0.10.0-rc.19'), packages[1]]]:
+                        [dict(packages[0], version='0.10.0-rc.19')]]:
             with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'locked'):
                 self.gate.validate_exception_versions(self.exceptions, changed)
 
     def test_ignored_advisory_identity_kind_and_metadata_must_match_fresh_database(self):
+        exceptions = {**self.exceptions, **synthetic_maintenance_exception()}
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory)
-            for kind, identifier, package, _ in self.exceptions:
+            for kind, identifier, package, _ in exceptions:
                 path = database / 'crates' / package / (identifier + '.md')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('```toml\n[advisory]\n' + f'id="{identifier}"\npackage="{package}"\n'
                                 + (f'informational="{kind}"\n' if kind != 'vulnerability' else '')
                                 + '```\n\n# Owned fixture\n')
-            self.gate.validate_exception_advisories(self.exceptions, database)
-            path = database / 'crates/daemonize/RUSTSEC-2025-0069.md'
+            self.gate.validate_exception_advisories(exceptions, database)
+            path = database / 'crates/owned-maintenance/RUSTSEC-2026-9004.md'
             original = path.read_text()
-            for value in [original.replace('daemonize', 'other'), original.replace('unmaintained', 'unsound'),
-                          original.replace('RUSTSEC-2025-0069', 'RUSTSEC-2026-9001'),
+            for value in [original.replace('owned-maintenance', 'other'), original.replace('unmaintained', 'unsound'),
+                          original.replace('RUSTSEC-2026-9004', 'RUSTSEC-2026-9001'),
                           original.replace('informational="unmaintained"', ''), 'missing TOML fence']:
                 path.write_text(value)
                 with self.subTest(value=value), self.assertRaises(ValueError):
-                    self.gate.validate_exception_advisories(self.exceptions, database)
+                    self.gate.validate_exception_advisories(exceptions, database)
             path.unlink()
             with self.assertRaises(ValueError):
-                self.gate.validate_exception_advisories(self.exceptions, database)
+                self.gate.validate_exception_advisories(exceptions, database)
 
     def test_success_requires_exact_fetch_index_and_lock_receipt(self):
         text = receipt(self.lock, self.database)
@@ -368,11 +379,11 @@ class RealToolPolicyTests(unittest.TestCase):
         self.assertIn('RUSTSEC-2026-9001', result.stdout)
 
     def test_real_maintenance_exception_cannot_hide_new_kind_or_unrelated_warning(self):
-        exceptions = self.reviewed('daemonize')
-        result = self.local_advisory_result('RUSTSEC-2025-0069', 'daemonize', '0.5.0', 'unmaintained', exceptions)
+        exceptions = synthetic_maintenance_exception()
+        result = self.local_advisory_result('RUSTSEC-2026-9004', 'owned-maintenance', '1.0.0', 'unmaintained', exceptions)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.gate.validate_exception_advisories(exceptions, self.root / 'advisories')
-        result = self.local_advisory_result('RUSTSEC-2025-0069', 'daemonize', '0.5.0', 'unsound', exceptions)
+        result = self.local_advisory_result('RUSTSEC-2026-9004', 'owned-maintenance', '1.0.0', 'unsound', exceptions)
         self.assertEqual(result.returncode, 0, result.stderr)  # Tool ignore alone is too broad.
         with self.assertRaisesRegex(ValueError, 'metadata no longer matches'):
             self.gate.validate_exception_advisories(exceptions, self.root / 'advisories')
