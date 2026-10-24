@@ -260,7 +260,11 @@ pub fn drain_into(mut reader: impl Read + Send + 'static, sink: std::sync::Arc<M
 
 /// A daemon with one authorized key, and the key's path.
 pub fn start_daemon() -> (Daemon, std::path::PathBuf) {
-    let home = tempfile::tempdir().expect("tempdir");
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let key = ssh_key::PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
         ssh_key::Algorithm::Ed25519,

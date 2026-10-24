@@ -9,7 +9,9 @@
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, UdpSocket};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "system")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -273,51 +275,6 @@ fn cache_dir(system: bool) -> PathBuf {
         .join("qsh")
 }
 
-/// Checks the host key file's permissions and tightens them to `0600` if
-/// they are wider (readable/writable by group or other). `serve`'s host key
-/// is not a cache-directory key living as long as one `transport-ensure`
-/// login -- it is the permanent identity of an unattended service, and the
-/// whole first-contact trust model (`docs/qshd-service.md`) rests on it
-/// staying secret. `load_or_create_transport_key` already creates it with
-/// `0600` (atomically, no umask-readable window), but that only covers
-/// CREATION: a file that already existed with looser permissions (copied in
-/// by hand, restored from a backup, ...) is loaded as-is. Tightening does
-/// NOT undo a past leak, so a loose mode is warned about loudly (through the
-/// same channel as every other startup warning here) rather than silently
-/// repaired -- but the daemon still starts: refusing to start over a
-/// permissions problem it can fix itself would be a worse failure than
-/// starting, repairing, and complaining (unlike OpenSSH's hard refusal for
-/// private keys, which this deliberately does not copy).
-#[cfg(unix)]
-fn tighten_host_key_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = match std::fs::metadata(path) {
-        Ok(meta) => meta.permissions().mode() & 0o777,
-        // Already loaded successfully by the caller -- a `stat` failing
-        // right after that would be bizarre, but this check is not worth
-        // failing startup over either way.
-        Err(_) => return,
-    };
-    if mode & 0o077 == 0 {
-        return;
-    }
-    let warning = format!(
-        "host key {} was accessible to more than the owner (mode {mode:03o}) -- \
-         permissions fixed to 0600, but this does not undo a possible past leak; if you are \
-         not sure nobody else had access to the file, it is safer to delete it and restart the \
-         daemon -- a new host key will be created",
-        path.display()
-    );
-    // To the file and, `serve` mirroring every line, to stderr -- which
-    // `log` writes without `eprintln!`, so a closed stderr cannot turn this
-    // warning into a panic before the daemon ever binds.
-    log::warn("qshd", &warning);
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn tighten_host_key_permissions(_path: &Path) {}
-
 /// The personal mode serves the account that starts it. As root that
 /// would mean every session running as root, with no PAM stack and no
 /// account check anywhere -- the system mode's job, done without any of
@@ -452,7 +409,6 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
 
     let keypair = crate::load_or_create_transport_key(&parsed.host_key)
         .with_context(|| format!("host key {}", parsed.host_key.display()))?;
-    tighten_host_key_permissions(&parsed.host_key);
 
     // Nothing about `authorized_keys` is fatal here: `AuthorizedKeysVerifier`
     // re-reads the file on every attempt, so an operator may deliberately
@@ -869,26 +825,6 @@ mod tests {
     #[test]
     fn port_zero_is_refused() {
         assert!(parse_serve_args(&args(&["serve", "--port", "0"])).is_err());
-    }
-
-    /// A host key file that already exists with permissions wider than
-    /// `0600` (e.g. copied in by hand) must be tightened in place -- this is
-    /// the permanent identity of an unattended service, not a short-lived
-    /// cache-directory key.
-    #[cfg(unix)]
-    #[test]
-    fn a_wide_open_host_key_is_tightened_to_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("host_key");
-        std::fs::write(&path, [0u8; 64]).expect("write key bytes");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("set wide permissions");
-
-        tighten_host_key_permissions(&path);
-
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "wide permissions must be tightened to 0600");
     }
 
     /// The personal mode refuses to start as root. Its whole shape is "serve

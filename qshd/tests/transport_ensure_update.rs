@@ -55,6 +55,13 @@ use daemon_guard::DaemonGuard;
 /// picked by binding and closing.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -348,7 +355,7 @@ fn send_image(client: &StdClient, image: &[u8]) {
 fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clients() {
     let _serial = serialised();
     let bins = stripped_qshd();
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
 
     let old_build = self_check(&bins.bin).build;
@@ -497,7 +504,7 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
 fn measure_the_image_upload_over_loopback() {
     let _serial = serialised();
     let bins = stripped_qshd();
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
 
     let old_build = self_check(&bins.bin).build;
@@ -597,7 +604,7 @@ fn update_once(
 fn a_resumed_daemon_takes_a_second_update_in_a_row() {
     let _serial = serialised();
     let bins = stripped_qshd();
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
 
     let old_build = self_check(&bins.bin).build;
@@ -665,7 +672,7 @@ fn a_resumed_daemon_takes_a_second_update_in_a_row() {
 fn an_image_that_fails_its_self_check_leaves_the_running_daemon_as_it_was() {
     let _serial = serialised();
     let bins = stripped_qshd();
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let sock = home.path().join("qsh").join("control.sock");
     let old_build = self_check(&bins.bin).build;
 
@@ -736,7 +743,7 @@ fn a_resume_with_an_unreadable_handover_logs_why_and_exits_non_zero() {
     let bins = tempfile::tempdir().expect("binary dir");
     let bin = bins.path().join("qshd");
     copy_executable(Path::new(env!("CARGO_BIN_EXE_qshd")), &bin);
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let file = inheritable_file(
         home.path(),
         br#"{"handover_version":99,"udp_fd":{"not":"a number"}}"#,
@@ -762,7 +769,7 @@ fn a_handover_descriptor_is_ignored_by_every_other_command() {
     let bins = tempfile::tempdir().expect("binary dir");
     let bin = bins.path().join("qshd");
     copy_executable(Path::new(env!("CARGO_BIN_EXE_qshd")), &bin);
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let file = inheritable_file(home.path(), b"not a handover at all");
     let out = Command::new(&bin)
         .arg("self-check")
@@ -783,7 +790,7 @@ fn a_handover_descriptor_is_ignored_by_every_other_command() {
 /// `transport-resume` without a handover is not a daemon of any kind.
 #[test]
 fn a_resume_without_a_handover_is_refused() {
-    let home = tempfile::tempdir().expect("home");
+    let home = private_temp_home().expect("home");
     let out = Command::new(env!("CARGO_BIN_EXE_qshd"))
         .arg("transport-resume")
         .env_remove(HANDOVER_FD_ENV)

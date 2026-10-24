@@ -46,6 +46,13 @@ use daemon_guard::DaemonGuard;
 /// reservation.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -265,7 +272,7 @@ fn connect_with_signature(
 #[test]
 fn a_signed_console_client_reaches_the_daemon_the_app_started() {
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("a temporary HOME is created");
+    let home = private_temp_home().expect("a temporary HOME is created");
     let sock_path = home.path().join("qsh").join("control.sock");
     // After the temp dir, so it drops first: the daemon is gone before the dir.
     let _daemon = DaemonGuard::new(sock_path.clone());

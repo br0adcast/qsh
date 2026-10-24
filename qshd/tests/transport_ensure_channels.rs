@@ -59,6 +59,13 @@ use daemon_guard::DaemonGuard;
 /// was read), not a reservation.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -304,7 +311,7 @@ fn connect_and_open_shell(
 #[test]
 fn transport_ensure_serves_independent_shell_channels() {
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("a temporary XDG_CACHE_HOME is created");
+    let home = private_temp_home().expect("a temporary XDG_CACHE_HOME is created");
     let sock_path = home.path().join("qsh").join("control.sock");
     // After the temp dir, so it drops first: the daemon is gone before the dir.
     let _daemon = DaemonGuard::new(sock_path.clone());

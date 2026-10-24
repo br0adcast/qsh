@@ -301,6 +301,8 @@ pub(crate) fn start_daemon_with_groups(
     groups: Option<Vec<nix::unistd::Gid>>,
 ) -> (Daemon, [u8; 32], u16) {
     use std::os::unix::process::CommandExt;
+    // The host key parent must remain trusted while nobody workers can traverse it.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host_key = dir.join("host_key");
     let mut last_attempt_port = 0u16;
     let mut last_stderr = String::new();

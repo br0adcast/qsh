@@ -49,6 +49,13 @@ use transport::{LinkState, Stats};
 
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -183,7 +190,7 @@ impl Drop for Daemon {
 /// client's private key (for `FileSigner`), and the temp dir backing both
 /// (kept alive so the daemon's host key and authorized-keys file survive).
 fn start_daemon() -> (Daemon, std::path::PathBuf, TempDir) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = private_temp_home().expect("tempdir");
     let (client_key, client_key_path) = write_key(dir.path(), "client");
     let authorized = dir.path().join("authorized_keys");
     let mut f = std::fs::File::create(&authorized).expect("create authorized_keys");

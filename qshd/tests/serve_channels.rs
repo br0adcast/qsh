@@ -45,6 +45,13 @@ use transport::{LinkState, Stats};
 /// handed the same number and race each other's daemon for it.
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -273,7 +280,7 @@ impl ClientEvents for Events {
 #[test]
 fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
     let _serial = serialised();
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = private_temp_home().expect("temp dir");
     let (client_key, client_key_path) = write_key(dir.path(), "client_key");
     let authorized_keys = dir.path().join("authorized_keys");
     std::fs::write(
@@ -400,7 +407,7 @@ fn serve_opens_a_shell_channel_and_reports_its_natural_exit() {
 #[test]
 fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
     let _serial = serialised();
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = private_temp_home().expect("temp dir");
     let (client_key, client_key_path) = write_key(dir.path(), "client_key");
     let authorized_keys = dir.path().join("authorized_keys");
     std::fs::write(
@@ -488,7 +495,7 @@ fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
 fn serve_sends_a_command_channel_in_full_with_the_header_under_aead() {
     const LAST: u32 = 1_200_000;
     let _serial = serialised();
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = private_temp_home().expect("temp dir");
     let (client_key, client_key_path) = write_key(dir.path(), "client_key");
     let authorized_keys = dir.path().join("authorized_keys");
     std::fs::write(
@@ -599,7 +606,7 @@ fn serve_sends_a_command_channel_in_full_with_the_header_under_aead() {
 fn a_channel_that_never_reads_its_input_holds_back_only_its_own_paste() {
     const PASTE: usize = 1 << 20;
     let _serial = serialised();
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = private_temp_home().expect("temp dir");
     let (client_key, client_key_path) = write_key(dir.path(), "client_key");
     let authorized_keys = dir.path().join("authorized_keys");
     std::fs::write(

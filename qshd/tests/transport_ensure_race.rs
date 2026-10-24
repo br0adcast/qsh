@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::net::UdpSocket;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,6 +27,13 @@ use transport::driver_std::{Binder, ClientEvents, StdClient};
 use transport::handshake::generate_keypair;
 use transport::handshake_payload::StartKind;
 use transport::{LinkState, Stats};
+
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
 
 fn pidfd(pid: u32) -> OwnedFd {
     // The marker belongs to our live daemon's child; pin the exact process
@@ -594,7 +601,7 @@ fn stop_then_ensure_reuses_the_port_after_owned_channel_cleanup() {
 
 fn stop_with_silent_channel(keep_descendant: bool, ensure_again: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     // This dedicated, serialized binary owns every descendant it creates.
     // On RED/unwind the guard first kills/reaps the daemon, then adopts and
     // kills/reaps its remaining children. It never signals a reaped PID/group.
@@ -999,10 +1006,13 @@ fn ensure_after_completed_stop(
 #[test]
 fn concurrent_ensure_transactions_leave_one_discoverable_daemon() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let descendants = Descendants::own();
     let cache = home.path().join("qsh");
-    std::fs::create_dir(&cache).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&cache)
+        .unwrap();
     let lock = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1032,8 +1042,11 @@ fn concurrent_ensure_transactions_leave_one_discoverable_daemon() {
     descendants.reap();
 
     for same in [true, false] {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir(home.path().join("qsh")).unwrap();
+        let home = private_temp_home().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(home.path().join("qsh"))
+            .unwrap();
         // Start from a real stale socket, exercising the existing retry path.
         drop(UnixListener::bind(socket(home.path())).unwrap());
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1061,7 +1074,7 @@ fn concurrent_ensure_transactions_leave_one_discoverable_daemon() {
         descendants.reap();
     }
 
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let busy = UdpSocket::bind("0.0.0.0:0").unwrap();
     let failed = Ensure::start(home.path(), busy.local_addr().unwrap().port()).finish();
     assert!(!failed.0);
@@ -1077,7 +1090,7 @@ fn concurrent_ensure_transactions_leave_one_discoverable_daemon() {
 #[test]
 fn stopped_daemon_does_not_unlink_a_replacement_control_socket() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let descendants = Descendants::own();
     let port = ready(Ensure::start(home.path(), 0).finish());
     let path = socket(home.path());
@@ -1114,7 +1127,7 @@ fn stopped_daemon_does_not_unlink_a_replacement_control_socket() {
 #[test]
 fn failed_ready_output_cleans_its_publication_and_releases_the_lock() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let descendants = Descendants::own();
     let failed = Ensure::with_output(home.path(), 0, true).finish();
     assert!(!failed.0, "the output fixture must fail startup");
@@ -1132,7 +1145,7 @@ fn failed_ready_output_cleans_its_publication_and_releases_the_lock() {
 #[test]
 fn descriptor_exhaustion_before_fork_does_not_publish_a_control_socket() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().unwrap();
+    let home = private_temp_home().unwrap();
     let descendants = Descendants::own();
     let failed = Ensure::with_limit(home.path(), 0, false, Some(6)).finish();
     assert!(!failed.0);

@@ -43,11 +43,17 @@ impl Sandbox {
     /// lines) also in sshd's `authorized_keys`: a client that logs in with
     /// its own key, such as `qsh -i <file>`.
     pub fn start_with(extra_authorized: &[String]) -> Sandbox {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let home = tempfile::Builder::new()
             .prefix("qsh home ' ")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        std::fs::create_dir_all(home.path().join(".cache/qsh")).unwrap();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(home.path().join(".cache/qsh"))
+            .unwrap();
         std::fs::create_dir_all(home.path().join("bin")).unwrap();
         let probe = SoftSigner::random();
         let logins: Vec<SoftSigner> = (0..LOGINS).map(|_| SoftSigner::random()).collect();

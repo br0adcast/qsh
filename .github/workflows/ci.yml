@@ -79,6 +79,26 @@ jobs:
         run: |
           echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."
           cargo check --all-targets -p bringup --locked
+      - name: Host key trust and exclusive publication on macOS
+        shell: bash
+        run: |
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-host-key.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -p "$runtime/config" "$runtime/cache"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$runtime" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          set -o pipefail
+          cargo test -p qshd --lib --locked host_key:: -- --nocapture 2>&1 | tee "$runtime/results.log"
+          # This job executes only the portable library selection. Require the
+          # real rename race and injected unsupported-operation controls too.
+          for name in \
+            host_key::tests::concurrent_creators_return_the_same_published_identity \
+            host_key::publication_flow_tests::losing_creator_loads_pinned_winner_after_parent_replacement \
+            host_key::publication_flow_tests::unsupported_exclusive_rename_never_falls_back_to_link_publication
+          do
+            grep -F "test $name ... ok" "$runtime/results.log"
+          done
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked
       - name: Discovery tests

@@ -5,14 +5,26 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use tempfile::NamedTempFile;
+use std::ffi::{CStr, OsStr};
 use transport::handshake::Keypair;
+
+mod publication;
+mod trusted;
 
 /// Load a persistent server Noise key, or atomically publish a new one if absent.
 ///
 /// The file holds 64 raw bytes: the 32-byte X25519 private key followed by its
 /// public key. Existing invalid or unreadable files are errors, never replaced.
+/// Existing files are validated through the same opened descriptor before any
+/// secret bytes are read: regular, owned by the effective UID, single-linked,
+/// and below trusted parent directories. Group/other access is repaired on that
+/// descriptor and checked before reading; failed repair is an error. A warning
+/// after successful repair does not claim to undo any earlier disclosure.
 /// Concurrent creators load the winner rather than changing its identity.
+/// Creation requires filesystem/kernel support for atomic exclusive rename;
+/// unsupported creation fails without a hard-link fallback. Existing trusted
+/// keys do not require this support. All creation operations and winner reads
+/// stay relative to the same verified parent directory descriptor.
 /// Staging files are private from creation (mode 0600 on Unix). The staged file
 /// is synced before publication; this does not promise power-loss durability of
 /// the containing directory or cleanup of temporary names after a process crash.
@@ -24,7 +36,9 @@ pub fn load_or_create_transport_key(path: &Path) -> Result<Keypair> {
 // staging/publication path while substituting only the failing operation.
 trait KeyFileIo {
     fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+        let loaded = trusted::read(path, nix::unistd::Uid::effective(), &mut trusted::FileIo)?;
+        warn_repair(path, loaded.repaired_mode);
+        Ok(loaded.bytes.to_vec())
     }
 
     fn write(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -35,12 +49,16 @@ trait KeyFileIo {
         file.sync_all()
     }
 
-    fn publish(&mut self, file: NamedTempFile, path: &Path) -> io::Result<()> {
-        // PersistError still owns the temporary file. Dropping it removes only
-        // our staging name, including when another creator won the race.
-        file.persist_noclobber(path)
-            .map(|_| ())
-            .map_err(|failure| failure.error)
+    fn stage(&mut self, parent: &File) -> io::Result<publication::Stage> {
+        publication::create(parent)
+    }
+
+    fn publish(&mut self, parent: &File, stage: &CStr, leaf: &OsStr) -> io::Result<()> {
+        publication::rename(parent, stage, leaf)
+    }
+
+    fn cleanup(&mut self, parent: &File, stage: &CStr) -> io::Result<()> {
+        publication::remove(parent, stage)
     }
 }
 
@@ -69,37 +87,82 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     }
 
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating directory {}", parent.display()))?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".qshd-host-key-")
-        .tempfile_in(parent)
+    let (parent, leaf) = trusted::prepare_parent(path, nix::unistd::Uid::effective())
+        .with_context(|| format!("preparing parent for {}", path.display()))?;
+    let mut staged = io
+        .stage(&parent)
         .with_context(|| format!("staging key for {}", path.display()))?;
     let keypair = transport::handshake::generate_keypair();
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(&keypair.private);
     bytes[32..].copy_from_slice(&keypair.public);
-    io.write(staged.as_file_mut(), &bytes)
-        .with_context(|| format!("writing staged key for {}", path.display()))?;
-    io.sync(staged.as_file())
-        .with_context(|| format!("syncing staged key for {}", path.display()))?;
-    match io.publish(staged, path) {
+    let preparation = io
+        .write(&mut staged.file, &bytes)
+        .with_context(|| format!("writing staged key for {}", path.display()))
+        .and_then(|()| {
+            io.sync(&staged.file)
+                .with_context(|| format!("syncing staged key for {}", path.display()))
+        });
+    if let Err(error) = preparation {
+        return Err(cleanup_error(io, &parent, &staged.name, error));
+    }
+    match io.publish(&parent, &staged.name, &leaf) {
         Ok(()) => Ok(keypair),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            // Read exactly once: a corrupt, unreadable or removed winner is an
-            // error, not permission to regenerate or retry publication.
-            let bytes = io
-                .read(path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            decode_key(path, &bytes)
+        Err(error) => {
+            let exists = error.kind() == io::ErrorKind::AlreadyExists;
+            let error = anyhow::Error::new(error).context(format!(
+                "publishing key {} (requires atomic exclusive rename support)",
+                path.display()
+            ));
+            // Only our exclusive staging name is removed. A failed cleanup is
+            // an error even when another creator has already published a key.
+            if let Err(cleanup) = io.cleanup(&parent, &staged.name) {
+                return Err(
+                    error.context(format!("removing owned host key stage failed: {cleanup}"))
+                );
+            }
+            if !exists {
+                return Err(error);
+            }
+            // Never re-resolve the original pathname after an EEXIST race.
+            let loaded = trusted::read_at(
+                &parent,
+                &leaf,
+                nix::unistd::Uid::effective(),
+                &mut trusted::FileIo,
+            )
+            .with_context(|| format!("reading winning key {}", path.display()))?;
+            warn_repair(path, loaded.repaired_mode);
+            decode_key(path, &loaded.bytes)
         }
-        Err(error) => Err(error).with_context(|| format!("publishing key {}", path.display())),
     }
 }
+
+fn cleanup_error(
+    io: &mut impl KeyFileIo,
+    parent: &File,
+    name: &CStr,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match io.cleanup(parent, name) {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("removing owned host key stage failed: {cleanup}")),
+    }
+}
+
+fn warn_repair(path: &Path, mode: Option<u32>) {
+    if let Some(mode) = mode {
+        crate::log::warn("qshd", &format!(
+            "host key {} was accessible to more than its owner (mode {mode:03o}); \
+             verified file permissions tightened to 0600, which cannot undo a possible past disclosure",
+            path.display()
+        ));
+    }
+}
+
+#[cfg(test)]
+#[path = "host_key/publication_flow_tests.rs"]
+mod publication_flow_tests;
 
 #[cfg(test)]
 mod tests {
@@ -108,6 +171,14 @@ mod tests {
     use std::time::Duration;
 
     const WAIT: Duration = Duration::from_secs(10);
+
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
 
     fn assert_identity(path: &Path, key: &Keypair) {
         let stored = std::fs::read(path).unwrap();
@@ -141,19 +212,19 @@ mod tests {
             }
             FileIo.sync(file)
         }
-        fn publish(&mut self, file: NamedTempFile, path: &Path) -> io::Result<()> {
+        fn publish(&mut self, parent: &File, stage: &CStr, leaf: &OsStr) -> io::Result<()> {
             if matches!(self.0, Failure::Publish) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "injected publication failure",
                 ));
             }
-            FileIo.publish(file, path)
+            FileIo.publish(parent, stage, leaf)
         }
     }
 
     fn fails_without_publishing(failure: Failure, message: &str) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let unrelated = dir.path().join(".qshd-host-key-unrelated");
         std::fs::write(&unrelated, b"unrelated staging file").unwrap();
@@ -173,6 +244,43 @@ mod tests {
         let key = load_or_create_transport_key(&path).expect("a subsequent creation succeeds");
         assert_identity(&path, &key);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn parent_path_replacement_does_not_redirect_publication() {
+        use std::os::unix::fs::DirBuilderExt;
+        struct SwapParent {
+            original: std::path::PathBuf,
+            moved: std::path::PathBuf,
+        }
+        impl KeyFileIo for SwapParent {
+            fn write(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+                std::fs::rename(&self.original, &self.moved)?;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&self.original)?;
+                FileIo.write(file, bytes)
+            }
+        }
+        let dir = private_dir();
+        let original = dir.path().join("parent");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&original)
+            .unwrap();
+        let moved = dir.path().join("pinned");
+        let path = original.join("host.key");
+        let key = load_or_create_with(
+            &path,
+            &mut SwapParent {
+                original: original.clone(),
+                moved: moved.clone(),
+            },
+        )
+        .unwrap();
+        assert!(!path.exists(), "replacement directory must stay untouched");
+        assert_identity(&moved.join("host.key"), &key);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
     }
 
     #[test]
@@ -210,7 +318,7 @@ mod tests {
 
     #[test]
     fn reader_cannot_observe_partial_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -250,16 +358,16 @@ mod tests {
         resume: mpsc::Receiver<()>,
     }
     impl KeyFileIo for PausedPublisher {
-        fn publish(&mut self, file: NamedTempFile, path: &Path) -> io::Result<()> {
+        fn publish(&mut self, parent: &File, stage: &CStr, leaf: &OsStr) -> io::Result<()> {
             self.ready.send(()).unwrap();
             self.resume.recv_timeout(WAIT).unwrap();
-            FileIo.publish(file, path)
+            FileIo.publish(parent, stage, leaf)
         }
     }
 
     #[test]
     fn concurrent_creators_return_the_same_published_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let (ready_tx, ready_rx) = mpsc::channel();
         let (go_a, wait_a) = mpsc::channel();
@@ -296,12 +404,23 @@ mod tests {
     fn concurrent_corrupt_winner_is_preserved_and_refused() {
         struct CorruptWinner;
         impl KeyFileIo for CorruptWinner {
-            fn publish(&mut self, file: NamedTempFile, path: &Path) -> io::Result<()> {
-                std::fs::write(path, b"incomplete existing identity")?;
-                FileIo.publish(file, path)
+            fn publish(&mut self, parent: &File, stage: &CStr, leaf: &OsStr) -> io::Result<()> {
+                use std::os::fd::{AsRawFd, FromRawFd};
+                let fd = nix::fcntl::openat(
+                    Some(parent.as_raw_fd()),
+                    leaf,
+                    nix::fcntl::OFlag::O_CREAT
+                        | nix::fcntl::OFlag::O_EXCL
+                        | nix::fcntl::OFlag::O_WRONLY,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )?;
+                // SAFETY: openat returned a uniquely owned descriptor.
+                let mut corrupt = unsafe { File::from_raw_fd(fd) };
+                corrupt.write_all(b"incomplete existing identity")?;
+                FileIo.publish(parent, stage, leaf)
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         assert!(load_or_create_with(&path, &mut CorruptWinner).is_err());
         assert_eq!(
@@ -313,7 +432,7 @@ mod tests {
 
     #[test]
     fn existing_corrupt_identity_is_preserved_and_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         std::fs::write(&path, b"incomplete existing identity").unwrap();
         assert!(load_or_create_transport_key(&path).is_err());
@@ -338,7 +457,7 @@ mod tests {
                 ))
             }
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("not-created/host.key");
         let mut denied = DeniedRead { reads: 0 };
         let error = load_or_create_with(&path, &mut denied).err().unwrap();
@@ -362,7 +481,7 @@ mod tests {
 
     #[test]
     fn existing_identity_keeps_its_bytes_and_permissions() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("nested/host.key");
         let key = load_or_create_transport_key(&path).unwrap();
         #[cfg(unix)]
@@ -389,7 +508,7 @@ mod tests {
 
     #[test]
     fn directory_at_identity_path_is_not_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         std::fs::create_dir(&path).unwrap();
         assert!(load_or_create_transport_key(&path).is_err());
@@ -399,8 +518,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn existing_symlink_is_refused_without_changing_its_target() {
+        let dir = private_dir();
+        let target = dir.path().join("original.key");
+        let key = load_or_create_transport_key(&target).unwrap();
+        let link = dir.path().join("host.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = load_or_create_transport_key(&link).is_err();
+        assert_identity(&target, &key);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            refused,
+            "an existing key symlink must fail before its secret is used"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dangling_symlink_at_identity_path_is_not_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let path = dir.path().join("host.key");
         let absent = dir.path().join("absent");
         std::os::unix::fs::symlink(&absent, &path).unwrap();
@@ -420,7 +556,7 @@ mod tests {
             assert_eq!(std::fs::read_dir(".").unwrap().count(), 1);
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

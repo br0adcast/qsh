@@ -47,6 +47,13 @@ use transport::{LinkState, Stats};
 
 static ONE_DAEMON_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+fn private_temp_home() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn serialised() -> std::sync::MutexGuard<'static, ()> {
     ONE_DAEMON_AT_A_TIME
         .lock()
@@ -237,7 +244,7 @@ impl ClientEvents for Events {
 #[test]
 fn the_announced_terminal_type_reaches_the_shell() {
     let _serial = serialised();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = private_temp_home().expect("tempdir");
     let (client_key, client_key_path) = write_key(dir.path(), "client");
     let authorized = dir.path().join("authorized_keys");
     let mut f = std::fs::File::create(&authorized).expect("create authorized_keys");
