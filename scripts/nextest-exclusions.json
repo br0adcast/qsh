@@ -1,0 +1,142 @@
+{
+  "exclusions": [
+    {
+      "binary": "qshd::system_mode_accounts",
+      "tests": [
+        "a_uid_0_alias_is_refused_while_permit_root_is_off",
+        "an_account_confined_by_its_shell_stays_confined",
+        "attacker_controlled_authorization_is_refused",
+        "the_daemon_refuses_to_start_with_a_dangerous_securebit",
+        "the_daemon_refuses_to_start_without_its_pam_service_file",
+        "two_accounts_each_get_their_own_shell"
+      ],
+      "reason": "Requires disposable root accounts/PAM policy fixture",
+      "owner": "CI container job: run_suite test system_mode_accounts"
+    },
+    {
+      "binary": "qshd::system_mode_pam",
+      "tests": [
+        "a_session_is_closed_when_the_login_ends",
+        "an_expired_account_is_refused",
+        "pam_can_explicitly_grant_numeric_group_zero",
+        "pam_can_remove_all_supplementary_groups",
+        "pam_group_teardown_uses_the_opening_monitor",
+        "pam_groups_are_isolated_between_logins",
+        "pam_receives_only_the_account_group_baseline",
+        "pam_session_open_groups_reach_every_channel",
+        "shell_keeps_groups_established_by_pam",
+        "the_service_file_in_etc_pam_d_is_what_decides"
+      ],
+      "reason": "Requires disposable root accounts/PAM policy fixture",
+      "owner": "CI container job: run_suite test system_mode_pam"
+    },
+    {
+      "binary": "qshd::system_mode_policies",
+      "tests": [
+        "executed_children_receive_account_audit_identity",
+        "executed_children_receive_per_account_limits",
+        "new_pam_sessions_obey_both_nologin_markers",
+        "required_audit_failure_refuses_before_exec",
+        "required_limits_failure_refuses_before_exec",
+        "retained_login_keeps_policy_until_a_new_incarnation"
+      ],
+      "reason": "Requires disposable root accounts/PAM policy fixture",
+      "owner": "CI container job: run_suite test system_mode_policies"
+    },
+    {
+      "binary": "qshd::system_mode_shell",
+      "tests": [
+        "the_system_mode_serves_a_shell_over_the_seam"
+      ],
+      "reason": "Requires disposable root accounts/PAM policy fixture",
+      "owner": "CI container job: run_suite test system_mode_shell"
+    },
+    {
+      "binary": "qshd::serve_system_split",
+      "tests": [
+        "a_monitor_holds_no_seam_and_the_worker_still_sees_the_end",
+        "the_helper_holds_no_network_descriptor_after_the_split",
+        "the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open",
+        "the_worker_ends_itself_when_only_its_authentication_seam_is_lost",
+        "the_worker_holds_no_privileged_log_descriptor_after_the_split",
+        "the_worker_runs_as_its_configured_account"
+      ],
+      "reason": "Requires disposable root account and helper split fixture",
+      "owner": "CI container job: run_suite test serve_system_split"
+    },
+    {
+      "binary": "qshd::system_mode_stop",
+      "tests": [
+        "failed_pam_close_keeps_service_exit_nonzero",
+        "int_retains_helper_until_successful_pam_close",
+        "term_retains_helper_until_successful_pam_close"
+      ],
+      "reason": "Requires disposable root accounts/PAM service-stop fixture",
+      "owner": "CI container job: run_suite test system_mode_stop"
+    },
+    {
+      "binary": "qshd::authorized_keys_privilege",
+      "tests": [
+        "the_effective_account_is_restored_even_when_the_read_fails"
+      ],
+      "reason": "Requires disposable root credential fixture",
+      "owner": "CI container job: run_suite test authorized_keys_privilege"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "helper::server::tests::a_channel_for_an_unverified_account_is_refused",
+        "helper::server::tests::a_drop_that_keeps_capabilities_is_caught",
+        "helper::server::tests::a_wrong_gid_drop_is_caught_by_the_identity_check",
+        "helper::server::tests::a_wrong_supplementary_group_set_is_caught",
+        "helper::server::tests::baseline_group_failure_never_enters_pam",
+        "helper::server::tests::child_rejects_nss_groups_in_place_of_pam_groups",
+        "helper::server::tests::failed_establish_does_not_close_an_unopened_session",
+        "helper::server::tests::failed_session_open_deletes_established_credentials",
+        "helper::server::tests::post_open_group_capture_failure_closes_the_session",
+        "helper::server::tests::the_child_runs_as_the_account_the_channel_was_opened_for",
+        "helper::server::tests::the_child_starts_in_its_home_only_if_the_account_may_enter_it",
+        "helper::server::tests::the_childs_environment_comes_from_passwd_and_nothing_else",
+        "helper::server::tests::the_helper_runs_under_the_units_capabilities",
+        "helper::server::tests::the_terminal_belongs_to_the_account"
+      ],
+      "reason": "Requires real root identity transitions or disposable PAM groups",
+      "owner": "CI container job: run_suite lib qshd"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "helper::server::tests::verifier_parent::verifier39_helper_death_kills_actual_switched_key_reader",
+        "helper::server::tests::verifier_parent::verifier39_helper_death_kills_verifier_after_identity_restoration",
+        "helper::server::tests::verifier_parent::verifier39_identity_restoration_failure_is_terminal",
+        "helper::server::tests::verifier_parent::verifier39_live_parent_allows_actual_signed_key_read_and_restoration",
+        "helper::server::tests::verifier_parent::verifier39_parent_lost_after_effective_gid_change_fails_closed",
+        "helper::server::tests::verifier_parent::verifier39_parent_lost_after_effective_uid_change_fails_closed",
+        "helper::server::tests::verifier_parent::verifier39_parent_lost_after_gid_restoration_fails_closed",
+        "helper::server::tests::verifier_parent::verifier39_parent_lost_after_uid_restoration_fails_closed",
+        "helper::server::tests::verifier_parent::verifier39_parent_lost_before_initial_arm_cannot_enter_lookup",
+        "helper::server::tests::verifier_parent::verifier39_parent_signal_readback_failure_is_terminal",
+        "helper::server::tests::verifier_parent::verifier39_parent_signal_registration_failure_is_terminal",
+        "helper::server::tests::verifier_parent::verifier39_partial_identity_entry_restores_checked_parent_protection"
+      ],
+      "reason": "Requires disposable root credential-transition fixture",
+      "owner": "CI container job: run_suite lib qshd"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "helper::tests::the_system_mode_refuses_a_dangerous_securebit"
+      ],
+      "reason": "Requires root CAP_SETPCAP and setpriv",
+      "owner": "CI container job: run_suite lib qshd"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks"
+      ],
+      "reason": "Requires configured non-loopback IPv6 for PAM AI_ADDRCONFIG",
+      "owner": "CI container job: required IPv6 CIDR wrapper in disposable NET_ADMIN container"
+    }
+  ]
+}
