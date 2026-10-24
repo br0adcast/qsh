@@ -152,6 +152,28 @@ jobs:
       # v2.9.2, pinned by commit so a mutable tag can't change what CI runs.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
+      - name: Verify pinned dependency policy tools
+        run: python3 scripts/install-dependency-tools.py --directory "$RUNNER_TEMP/dependency-tools"
+
+      - name: Dependency policy fixture controls
+        env:
+          QSH_TEST_DEPENDENCY_TOOLS: ${{ runner.temp }}/dependency-tools
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.loadTestsFromName('scripts.tests.test_dependency_policy')
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count and result.wasSuccessful() and not result.skipped else 1)
+          PY
+
+      - name: Dependency advisories and reviewed policy
+        run: >-
+          python3 scripts/check-dependencies.py
+          --tools-directory "$RUNNER_TEMP/dependency-tools"
+          --output-directory "$RUNNER_TEMP/dependency-report"
+
       - name: Install nextest
         run: |
           mkdir -p "$RUNNER_TEMP/nextest"

@@ -1,0 +1,42 @@
+# Existing dependency baseline; rationale and review ownership: docs/dependency-policy.md.
+[graph]
+all-features = true
+exclude-dev = false
+exclude-unpublished = false
+
+[licenses]
+include-dev = true
+include-build = true
+confidence-threshold = 0.8
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+exceptions = [
+    { crate = "bringup@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "client@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "connect@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "knock@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "logging@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "prediction@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "qsh@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "qshd@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "render@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "ssh@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "sshauth@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal-size@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "transport@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
+    { crate = "webpki-roots@1.0.10", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
