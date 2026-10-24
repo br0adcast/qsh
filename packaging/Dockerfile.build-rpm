@@ -81,38 +81,17 @@ RUN dnf -y install epel-release \
 # resolve $basearch as aarch64; nothing here is ever executed on this
 # machine, it is only linked against.
 #
-# `|| true` ON THE TRANSACTION, and the file list below instead of its exit
-# status. A handful of these packages have scriptlets, rpm runs a scriptlet
-# chrooted into the installroot, and the shell it would need there is an
-# aarch64 program this machine cannot execute -- so dnf reports those
-# packages as failed while their files are installed. A sysroot wants the
-# files; the scriptlets have nothing to configure in a directory that is
-# never booted. (Suppressing the scriptlets with `tsflags=noscripts`
-# instead sounds tidier and is worse: it takes `filesystem`'s %pretrans
-# with it, and without that the transaction genuinely fails.)
+# The helper resolves the complete Rocky-only package set, checks every RPM
+# against the explicit Rocky 8 release key, then installs it offline with
+# dependency checks and every script/trigger disabled. The four usr-merge
+# aliases come from the authenticated filesystem payload metadata, replacing
+# its foreign %pretrans. glibc-headers is included in this checked transaction;
+# no foreign %pre script can prevent its headers from being installed.
 #
-# glibc-headers has a shell %pre script too. Unlike a failing %post,
-# that prevents its payload from being installed. Once the initial
-# transaction has established the filesystem, install that package in a
-# checked transaction with scripts disabled. Disabling scripts for the
-# initial transaction would also skip filesystem's required %pretrans.
-#
-# The libgcc_s.so symlink is made by hand because rustc passes `-lgcc_s`
-# and nothing in this sysroot provides that name: Rocky's `libgcc` package
-# ships the runtime `libgcc_s.so.1` alone, and the development symlink
-# lives in the native `gcc` package, which has no business in a sysroot.
-RUN mkdir -p /usr/aarch64-linux-gnu/sys-root \
-    && { dnf -y --installroot=/usr/aarch64-linux-gnu/sys-root \
-        --forcearch=aarch64 --releasever=8 --nogpgcheck \
-        --setopt=install_weak_deps=False \
-        install glibc-devel libgcc pam-devel || true; } \
-    && dnf -y --installroot=/usr/aarch64-linux-gnu/sys-root \
-        --forcearch=aarch64 --releasever=8 --nogpgcheck \
-        --setopt=install_weak_deps=False --setopt=tsflags=noscripts \
-        install glibc-headers \
-    && dnf clean all --installroot=/usr/aarch64-linux-gnu/sys-root \
-    && rm -rf /usr/aarch64-linux-gnu/sys-root/var/lib/rpm \
-    && ln -sf libgcc_s.so.1 /usr/aarch64-linux-gnu/sys-root/usr/lib64/libgcc_s.so \
+# The link-only sysroot also needs libgcc_s.so -> libgcc_s.so.1: that linker
+# name ordinarily lives in the native gcc package, outside this sysroot.
+COPY bootstrap /tmp/qsh-bootstrap
+RUN python3 /tmp/qsh-bootstrap/install-sysroot.py \
     && for f in libc.so libc.so.6 libpam.so libpam.so.0 libgcc_s.so.1 crt1.o crti.o crtn.o; do \
         [ -e "/usr/aarch64-linux-gnu/sys-root/usr/lib64/$f" ] \
             || { echo "the aarch64 sysroot is missing usr/lib64/$f" >&2; exit 1; }; \
@@ -150,12 +129,10 @@ ENV RUSTUP_TOOLCHAIN=1.98.1 \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
-    # Both targets in one `rustup target add`, not two `--target` flags on
-    # rustup-init: that option takes a single value and reports a second
-    # one as an unexpected argument.
-    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+# The direct versioned installer is checked against committed reviewed bytes.
+# Install no toolchain until automatic rustup self-update has been disabled.
+RUN python3 /tmp/qsh-bootstrap/install-rust.py \
+    && rm -rf /tmp/qsh-bootstrap \
     && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
 # Keep tool installation separate from the toolchain layer. This same pinned

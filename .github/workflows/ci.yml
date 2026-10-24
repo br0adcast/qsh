@@ -176,6 +176,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_release_output.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_upload.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_bootstrap_tools.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'

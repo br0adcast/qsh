@@ -137,6 +137,8 @@ RUN dpkg --add-architecture arm64 \
         libpam0g-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY bootstrap /tmp/qsh-bootstrap
+
 # Rust goes under /usr/local so that every uid can use it: the build script
 # runs the container as the invoking user, so that the packages and the
 # build tree it leaves behind on the bind mount are owned by that user and
@@ -146,12 +148,10 @@ ENV RUSTUP_TOOLCHAIN=1.98.1 \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.98.1 \
-    # Both targets in one `rustup target add`, not two `--target` flags on
-    # rustup-init: that option takes a single value and reports a second
-    # one as an unexpected argument.
-    && rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+# The direct versioned installer is checked against committed reviewed bytes.
+# Install no toolchain until automatic rustup self-update has been disabled.
+RUN python3 /tmp/qsh-bootstrap/install-rust.py \
+    && rm -rf /tmp/qsh-bootstrap \
     && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
 # A step of its own so that changing the pin below does not fetch the
