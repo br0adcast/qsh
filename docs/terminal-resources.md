@@ -139,16 +139,20 @@ Drain/Rev collection in shrink_columns allocates a separate exact-length Vec;
 its source backing remains alive during collection. The relevant alloc sources
 are equivalent between the two qualified releases for these operations.
 
-The checkout and package images select 1.98.1; ordinary CI and direct releases
-select 1.99.1. The existing container CI job also runs the focused observer on its
-1.98.1 host compiler. `scripts/check-qualified-rust.sh` asks Cargo to invoke its
+The checkout, package images, portable macOS CI and Linux container CI select
+1.98.1; ordinary Linux CI and direct releases select 1.99.1. Cargo's declared
+1.98.1 support floor is a source/toolchain policy, not an expansion of the two
+exact compiler implementations qualified above. A newer compiler meeting that
+floor does not automatically establish these allocation bounds. The existing
+container CI job runs the focused observer on its 1.98.1 host compiler. `scripts/check-qualified-rust.sh` asks Cargo to invoke its
 selected compiler on a temporary dependency-free probe and checks its actual
 release/hash. Cargo resolves inherited configuration, including dotted and
 quoted compiler keys; the guard does not infer the compiler from `PATH` alone.
 Environment compiler/wrapper overrides are rejected in qualified entrypoints.
 Installing a toolchain alone does not select it; entrypoints set
 `RUSTUP_TOOLCHAIN`. This does not change a developer's global rustup default.
-Downstream builds on other compilers are permitted but outside this qualification.
+Downstream builds on other compilers meeting the support floor are permitted
+but outside this qualification.
 A consuming workspace must propagate the vte patch at its own Cargo root.
 
 On a compiler, dependency, parser, or serializer upgrade: recheck the source

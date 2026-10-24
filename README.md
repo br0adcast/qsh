@@ -208,6 +208,15 @@ Read the [trust model](docs/cli-guide.md#authentication-and-host-trust) and
 
 ## Building and CI
 
+Rust **1.98.1** is the minimum supported version for every workspace member;
+`rust-toolchain.toml` selects it with rustfmt and Clippy. This is an intentional
+support floor, not the oldest compiler that might compile the code. CI covers
+it in the existing Linux container and portable macOS jobs, while ordinary
+Linux quality/runtime checks use 1.99.1. Follow the ordered
+[contributor setup](CONTRIBUTING.md#rust-and-native-setup). The source support
+floor does not widen the exact compiler qualification for
+[terminal resource bounds](docs/terminal-resources.md).
+
 Prepare the verified static OpenSSL prefix described in the
 [native build prerequisites](docs/native-crypto.md), then build both binaries
 from source with Rust:
