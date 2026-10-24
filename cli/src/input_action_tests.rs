@@ -459,3 +459,50 @@ fn client179_actual_session_gone_stop_discards_pending_before_exit() {
     );
     assert!(session.on_channel_ready(16, 5).is_empty());
 }
+
+#[test]
+fn recovery206_local_failure_restores_and_exits_despite_failing_resize_sink() {
+    for failure in [
+        session::LocalInputFailure::IngressFull,
+        session::LocalInputFailure::PendingFull,
+    ] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail = armed.clone();
+        let sink: Sink = Box::new(move |_, _| {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(client::channel::ChannelSendError::Full)
+            } else {
+                Ok(())
+            }
+        });
+        let mut fixture = input_executor(sink, true);
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut session = predictive_input_session();
+        session.handle(UiEvent::Resized { cols: 70, rows: 24 }, 0);
+        let actions = session.handle(UiEvent::InputFailure(failure), 1);
+        let mut output = Vec::new();
+        let mut notices = Vec::new();
+        assert_eq!(
+            apply_actions(
+                actions,
+                &mut output,
+                &mut fixture.links,
+                &mut session,
+                &mut notices,
+                1
+            ),
+            Some(1)
+        );
+        assert!(fixture.links.keep);
+        assert_eq!(notices.len(), 1);
+        assert!(!output.is_empty(), "terminal restored");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "local failure teardown never attempts remote writes"
+        );
+    }
+}

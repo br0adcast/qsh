@@ -1,6 +1,6 @@
 #[test]
 fn whole_ingress_limit_and_empty_input_preserve_actual_allocation() {
-    let budget = IngressBudget::with_limits(8, 2);
+    let budget = IngressBudget::with_limit(8);
     let first = budget.admit_owned(vec![1; 5]).unwrap();
     let bytes = vec![2; 4];
     let pointer = bytes.as_ptr();
@@ -16,8 +16,8 @@ fn whole_ingress_limit_and_empty_input_preserve_actual_allocation() {
 }
 
 #[test]
-fn backing_capacity_and_read_count_are_independent_limits() {
-    let budget = IngressBudget::with_limits(8, 2);
+fn backing_capacity_is_bounded_independently_of_read_count() {
+    let budget = IngressBudget::with_limit(8);
     let mut bytes = Vec::with_capacity(100);
     bytes.push(1);
     let pointer = bytes.as_ptr();
@@ -26,7 +26,7 @@ fn backing_capacity_and_read_count_are_independent_limits() {
     assert_eq!(rejected.bytes.capacity(), 100);
     let a = budget.admit_owned(vec![1]).unwrap();
     let b = budget.admit_owned(vec![2]).unwrap();
-    assert!(budget.admit_slice(&[3]).is_err());
+    assert!(budget.admit_slice(&[3; 7]).is_err());
     assert_eq!(budget.usage(), (2, 2, 2));
     drop((a, b));
     assert_eq!(budget.usage(), (0, 0, 0));
@@ -34,7 +34,7 @@ fn backing_capacity_and_read_count_are_independent_limits() {
 
 #[test]
 fn derived_tail_retains_only_its_actual_unique_read_owners() {
-    let budget = IngressBudget::with_limits(8, 2);
+    let budget = IngressBudget::with_limit(8);
     let mut a = budget.admit_owned(vec![1; 4]).unwrap();
     a.append(budget.admit_owned(vec![2; 4]).unwrap());
     let mut output = InputBuilder::default();
@@ -52,7 +52,7 @@ fn derived_tail_retains_only_its_actual_unique_read_owners() {
 
 #[test]
 fn duplicated_ranges_share_one_obligation_without_guard_amplification() {
-    let budget = IngressBudget::with_limits(8, 2);
+    let budget = IngressBudget::with_limit(8);
     let input = budget.admit_owned(vec![1; 4]).unwrap();
     let mut builder = InputBuilder::default();
     builder.original(&input, 0..2);
@@ -68,7 +68,7 @@ fn duplicated_ranges_share_one_obligation_without_guard_amplification() {
 
 #[test]
 fn continuous_suffix_replacement_does_not_accumulate_consumed_read_owners() {
-    let budget = IngressBudget::with_limits(8, 2);
+    let budget = IngressBudget::with_limit(8);
     let mut tail = budget.admit_owned(vec![1; 4]).unwrap().copy_range(3..4);
     for byte in 2..100 {
         let next = budget.admit_owned(vec![byte; 4]).unwrap();
@@ -86,7 +86,7 @@ fn continuous_suffix_replacement_does_not_accumulate_consumed_read_owners() {
 #[test]
 fn concurrent_ingress_reservation_is_whole_and_atomic() {
     use std::sync::Barrier;
-    let budget = IngressBudget::with_limits(7, 2);
+    let budget = IngressBudget::with_limit(7);
     let barrier = Arc::new(Barrier::new(3));
     let hold = Arc::new(Barrier::new(3));
     let threads: Vec<_> = (0..2)
@@ -110,4 +110,64 @@ fn concurrent_ingress_reservation_is_whole_and_atomic() {
     assert_eq!(budget.usage(), (4, 1, 4));
     drop(inputs);
     assert_eq!(budget.usage(), (0, 0, 0));
+}
+
+#[test]
+fn recovery206_thousand_distinct_reads_are_byte_bounded_not_read_bounded() {
+    let budget = IngressBudget::default();
+    let mut bytes = InputBytes::default();
+    for _ in 0..1000 {
+        bytes.append(budget.admit_slice(b"x").expect("one byte fits"));
+    }
+    assert_eq!(bytes.owner_count(), 1000);
+    assert_eq!(budget.usage(), (1000, 1000, 1000));
+    drop(bytes);
+    assert_eq!(budget.usage(), (0, 0, 0));
+}
+
+#[test]
+fn recovery206_pending_lease_is_shared_with_emitted_action_until_final_alias_drop() {
+    let budget = IngressBudget::default();
+    let source = IngressBudget::default();
+    let mut pending = PendingInput::default();
+    pending
+        .append(&source.admit_slice(b"abc").unwrap(), &budget)
+        .unwrap();
+    assert_eq!(source.usage(), (0, 0, 0));
+    assert_eq!(budget.usage(), (INGRESS_BYTES, 1, INGRESS_BYTES));
+    let input = pending.into_input().unwrap();
+    assert_eq!(input.bytes.capacity(), INGRESS_BYTES);
+    let alias = input.copy_range(1..3);
+    drop(input);
+    let mut next = PendingInput::default();
+    assert!(next
+        .append(&source.admit_slice(b"z").unwrap(), &budget)
+        .is_err());
+    drop(alias);
+    next.append(&source.admit_slice(b"z").unwrap(), &budget)
+        .unwrap();
+    drop(next);
+    assert_eq!(budget.usage(), (0, 0, 0));
+}
+
+#[test]
+fn recovery206_pending_append_is_whole_and_never_grows_past_byte_capacity() {
+    let budget = IngressBudget::default();
+    let source = IngressBudget::default();
+    let mut pending = PendingInput::default();
+    pending
+        .append(
+            &source.admit_slice(&vec![b'x'; INGRESS_BYTES - 1]).unwrap(),
+            &budget,
+        )
+        .unwrap();
+    assert!(pending
+        .append(&source.admit_slice(b"yz").unwrap(), &budget)
+        .is_err());
+    assert_eq!(pending.bytes.len(), INGRESS_BYTES - 1);
+    assert_eq!(pending.bytes.capacity(), INGRESS_BYTES);
+    pending
+        .append(&source.admit_slice(b"z").unwrap(), &budget)
+        .unwrap();
+    assert_eq!(pending.bytes.len(), INGRESS_BYTES);
 }

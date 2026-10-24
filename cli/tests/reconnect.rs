@@ -74,6 +74,113 @@ impl Screen {
     }
 }
 
+/// An owned collector for pressure tests: cancellation and join also work
+/// while a failing test still owns a live client.
+struct OwnedScreenReader {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for OwnedScreenReader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("screen collector joined");
+        }
+    }
+}
+impl Screen {
+    fn owned(client: &Client) -> (Self, OwnedScreenReader) {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collected = seen.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let mut reader = client.master.try_clone().unwrap();
+        let thread = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while !stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut fd = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: this thread owns the live master and one pollfd.
+                if unsafe { libc::poll(&mut fd, 1, 20) } <= 0 {
+                    continue;
+                }
+                match reader.read(&mut bytes) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => collected.lock().unwrap().extend_from_slice(&bytes[..n]),
+                }
+            }
+        });
+        (
+            Self { seen },
+            OwnedScreenReader {
+                stop,
+                thread: Some(thread),
+            },
+        )
+    }
+}
+
+/// Finite PTY input even when a broken client stops draining its terminal.
+fn write_pty_with_deadline(master: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = master.as_raw_fd();
+    // SAFETY: this fixture owns the live master descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: preserve all original descriptor flags except temporary nonblocking mode.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut left = bytes;
+        while !left.is_empty() {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "PTY pressure deadline",
+                ));
+            }
+            match master.write(left) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => left = &left[n..],
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    let mut poll = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: fd remains live and poll points to one valid entry.
+                    unsafe {
+                        libc::poll(&mut poll, 1, 20);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+    // SAFETY: restore the fixture's original flags on every normal result.
+    let restored = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    if restored < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    result
+}
+
 /// What the client wrote to its `--verbose` log so far (`XDG_CACHE_HOME` is
 /// the test's config directory).
 fn verbose_log(config: &std::path::Path) -> String {
@@ -1225,4 +1332,113 @@ fn authenticated_session_loss_discards_pending_before_consent_without_cold_repla
     assert!(!screen.has("OLD-PENDING-EXECUTED"));
     assert_eq!(daemon.shell_starts(), 1);
     exit_cleanly(&mut client, &screen, &daemon);
+}
+
+/// Recovery input never consumes read-count slots in the persistent FIFO.
+/// Actual separate reader events are checked by the InputReader pipe test;
+/// this PTY test proves delivery and shell identity with the real daemon.
+#[test]
+fn recovery206_queued_input_runs_once_in_the_original_shell() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_to(relay.port, &key_path, config.path());
+    let (screen, _collector) = Screen::owned(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    client.type_line("QSH_ORIGINAL_PID=$$; QSH_ONCE=0; echo PID'SAVED'");
+    assert!(wait_until(|| screen.has("PIDSAVED")));
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(wait_until(|| screen.top().contains("reconnecting:")));
+    client
+        .master
+        .write_all(b"QSH_ONCE=$((QSH_ONCE+1)); #")
+        .unwrap();
+    for _ in 0..1000 {
+        client.master.write_all(b"x").unwrap();
+    }
+    client
+        .master
+        .write_all(b"\necho QUEUED\\RESULT:$QSH_ONCE:$QSH_MARK:$((QSH_ORIGINAL_PID==$$))\n")
+        .unwrap();
+    // The relay stays cut until local rendering proves that every preceding
+    // stdin byte was processed in recovery, rather than after a fast attach.
+    client.master.write_all(b"\x1d?").unwrap();
+    assert!(
+        wait_until(|| {
+            let mut model = terminal::TerminalCore::new(COLS, ROWS);
+            model.feed(&screen.bytes());
+            model
+                .frame()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+                .contains("this help")
+        }),
+        "local help must fence recovery input: {}",
+        screen.text()
+    );
+    assert!(client.child.try_wait().unwrap().is_none());
+    client.master.write_all(b"\x1b").unwrap();
+    relay.restore();
+    assert!(
+        wait_for(Duration::from_secs(20), || screen
+            .has("QUEUEDRESULT:1:kept:1")),
+        "{}\n{}",
+        screen.text(),
+        daemon.output_text()
+    );
+    client.type_line("echo FINAL\\COUNT:$QSH_ONCE");
+    assert!(wait_until(|| screen.has("FINALCOUNT:1")));
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+/// This is real source-ingress pressure on a live link, not PendingFull.
+/// An unfinished mouse report retains its guarded source until the byte cap;
+/// the failure must detach rather than send the daemon a destructive Close.
+#[test]
+fn recovery206_live_ingress_byte_limit_keeps_the_daemon_shell() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_client(&daemon, &key_path, config.path());
+    let (screen, _collector) = Screen::owned(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    client.type_line("QSH_ORIGINAL_PID=$$; echo PID'SAVED'");
+    assert!(wait_until(|| screen.has("PIDSAVED")));
+    let mut pressure = b"\x1b[<".to_vec();
+    pressure.resize(64 * 1024, b'1');
+    pressure.push(b'1');
+    let written = write_pty_with_deadline(&mut client.master, &pressure);
+    let status = wait_for_exit(&mut client.child).expect("byte-limit exit");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "{}; PTY write: {written:?}",
+        screen.text()
+    );
+    assert!(
+        wait_until(|| screen.has("keyboard input buffer limit reached")),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        wait_until(|| screen.has("the session is kept on the server")),
+        "{}",
+        screen.text()
+    );
+    let mut resumed = spawn_client(&daemon, &key_path, config.path());
+    let (resumed_screen, _resumed_collector) = Screen::owned(&resumed);
+    resumed.type_line("echo SURVIVING\\SHELL:$QSH_MARK:$((QSH_ORIGINAL_PID==$$))");
+    assert!(
+        wait_until(|| resumed_screen.has("SURVIVINGSHELL:kept:1")),
+        "{}\n{}",
+        resumed_screen.text(),
+        daemon.output_text()
+    );
+    exit_cleanly(&mut resumed, &resumed_screen, &daemon);
 }

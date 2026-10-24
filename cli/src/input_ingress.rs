@@ -4,12 +4,15 @@
 //! Parser/action copies have a separate four-phase content allowance; these
 //! counters are not an allocator or RSS measurement. Range provenance keeps a
 //! suffix from retaining already-consumed reads during continuous input.
+//! Nonempty source permits are byte-bounded (at most INGRESS_BYTES owners),
+//! rather than limited by historical read count. Recovery additionally owns
+//! one independent 64 KiB FIFO allocation/lease per Session, including actions.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 pub const INGRESS_BYTES: usize = 64 * 1024;
-pub const INGRESS_READS: usize = 16;
 pub const READ_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
@@ -21,12 +24,11 @@ struct State {
     reads: usize,
     capacity: usize,
     byte_limit: usize,
-    read_limit: usize,
 }
 
 impl Default for IngressBudget {
     fn default() -> Self {
-        Self::with_limits(INGRESS_BYTES, INGRESS_READS)
+        Self::with_limit(INGRESS_BYTES)
     }
 }
 
@@ -76,13 +78,12 @@ impl IngressBlocked {
 }
 
 impl IngressBudget {
-    fn with_limits(byte_limit: usize, read_limit: usize) -> Self {
+    fn with_limit(byte_limit: usize) -> Self {
         Self(Arc::new(Mutex::new(State {
             bytes: 0,
             reads: 0,
             capacity: 0,
             byte_limit,
-            read_limit,
         })))
     }
 
@@ -90,14 +91,12 @@ impl IngressBudget {
         let state = self.0.lock().expect("keyboard ingress budget");
         bytes <= state.byte_limit.saturating_sub(state.bytes)
             && bytes <= state.byte_limit.saturating_sub(state.capacity)
-            && state.reads < state.read_limit
     }
 
     fn reserve(&self, bytes: usize, capacity: usize) -> Option<Arc<ReadPermit>> {
         let mut state = self.0.lock().expect("keyboard ingress budget");
         if bytes > state.byte_limit.saturating_sub(state.bytes)
             || capacity > state.byte_limit.saturating_sub(state.capacity)
-            || state.reads == state.read_limit
         {
             return None;
         }
@@ -179,18 +178,13 @@ impl Owners {
             _ => false,
         }
     }
-    fn extend_unique(&self, into: &mut Vec<Arc<ReadPermit>>) {
+    fn extend_unique(&self, into: &mut BTreeMap<usize, Arc<ReadPermit>>) {
         if let Some(owners) = &self.0 {
             for owner in owners.iter() {
-                if !into.iter().any(|held| Arc::ptr_eq(owner, held)) {
-                    into.push(owner.clone());
-                }
+                into.entry(Arc::as_ptr(owner) as usize)
+                    .or_insert_with(|| owner.clone());
             }
         }
-        assert!(
-            into.len() <= INGRESS_READS,
-            "one ingress provenance set is bounded by read admission"
-        );
     }
 }
 
@@ -247,15 +241,62 @@ impl Sources {
         out
     }
     fn owners(&self) -> Owners {
-        let mut owners = Vec::new();
+        let mut owners = BTreeMap::new();
         for span in &self.spans {
             span.owners.extend_unique(&mut owners);
         }
         if owners.is_empty() {
             Owners::default()
         } else {
-            Owners(Some(Arc::new(owners)))
+            Owners(Some(Arc::new(owners.into_values().collect())))
         }
+    }
+}
+
+/// Compact recovery FIFO. Its single allocation has a separate per-session
+/// reservation, retained by emitted actions until their final aliases drop.
+/// Original ingress guards are released only by their ordinary owners.
+#[derive(Debug, Default)]
+pub(crate) struct PendingInput {
+    bytes: Vec<u8>,
+    permit: Option<Arc<ReadPermit>>,
+}
+impl PartialEq for PendingInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+impl Eq for PendingInput {}
+impl PendingInput {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+    pub(crate) fn append(&mut self, input: &InputBytes, budget: &IngressBudget) -> Result<(), ()> {
+        if input.len() > INGRESS_BYTES.saturating_sub(self.bytes.len()) {
+            return Err(());
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        if self.permit.is_none() {
+            let permit = budget.reserve(INGRESS_BYTES, INGRESS_BYTES).ok_or(())?;
+            let bytes = Vec::with_capacity(INGRESS_BYTES);
+            if bytes.capacity() > INGRESS_BYTES {
+                return Err(());
+            }
+            self.bytes = bytes;
+            self.permit = Some(permit);
+        }
+        self.bytes.extend_from_slice(input.as_slice());
+        Ok(())
+    }
+    pub(crate) fn into_input(self) -> Option<InputBytes> {
+        self.permit
+            .map(|permit| InputBytes::admitted(self.bytes, permit))
+    }
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -322,7 +363,10 @@ impl InputBytes {
     }
     pub(crate) fn into_vec(self) -> Vec<u8> {
         assert!(
-            self.sources.owners().0.is_none(),
+            self.sources
+                .spans
+                .iter()
+                .all(|span| span.owners.0.is_none()),
             "guarded parser output must retain custody"
         );
         self.bytes

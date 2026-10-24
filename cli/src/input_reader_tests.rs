@@ -49,7 +49,7 @@ fn client179_actual_reader_fences_pressure_and_resumes_or_stops_with_guards_held
         let prefix_bytes: usize = prefix.iter().map(qsh::input_ingress::InputBytes::len).sum();
         let mut resumed = Vec::new();
         let mut failure = false;
-        let mut prefix_processed = true;
+        let prefix_processed = true;
         let mut unexpected = None;
         let mut stopped_before_refund = true;
         if disposition == "cancel" {
@@ -64,14 +64,12 @@ fn client179_actual_reader_fences_pressure_and_resumes_or_stops_with_guards_held
             stop.join().unwrap();
         } else {
             let mut session = geometry_session();
-            if disposition == "retained" {
-                session.assume_channel_opening();
-                for input in prefix {
-                    prefix_processed &= session.handle(UiEvent::Stdin(input), 0).is_empty();
-                }
+            let retained = if disposition == "retained" {
+                Some(prefix)
             } else {
-                drop(prefix); // preceding UI actions actually consumed their input
-            }
+                drop(prefix);
+                None
+            };
             let actions = session.handle(UiEvent::IngressBlocked(blocked), 1);
             failure = actions.iter().any(|a| matches!(a, Action::Exit(1)));
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -87,7 +85,7 @@ fn client179_actual_reader_fences_pressure_and_resumes_or_stops_with_guards_held
                 }
             }
             reader.stop();
-            drop(session);
+            drop((session, retained));
         }
         drop(read);
         let written = writer.join();
@@ -123,4 +121,59 @@ fn client179_actual_reader_fences_pressure_and_resumes_or_stops_with_guards_held
         );
         assert_eq!(budget.usage(), (0, 0, 0));
     }
+}
+
+#[test]
+fn recovery206_actual_reader_thousand_one_byte_reads_share_budget() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut fds = [-1; 2];
+    // SAFETY: space for two new descriptors.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors were freshly created above.
+    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let mut write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    let (tx, rx) = mpsc::channel();
+    let budget = qsh::input_ingress::IngressBudget::default();
+    let reader = InputReader::start_fd(tx, read.as_raw_fd(), budget.clone());
+    let result = (|| -> Result<(), String> {
+        let mut session = geometry_session();
+        session.assume_channel_opening();
+        session.on_channel_ready(16, 0);
+        session.on_link_gone(0);
+        for i in 0..1000 {
+            if i == 16 {
+                session.on_reattached(0);
+            }
+            write.write_all(b"x").map_err(|e| e.to_string())?;
+            let event = rx
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|e| e.to_string())?;
+            if !matches!(&event, UiEvent::Stdin(bytes) if bytes.as_slice() == b"x") {
+                return Err(format!("read {i}: {event:?}"));
+            }
+            if !session.handle(event, 0).is_empty() {
+                return Err(format!("read {i} unexpectedly failed"));
+            }
+            // The next write occurs only after this event's actual read completed.
+        }
+        session.on_announced(&[16], 1);
+        let actions = session.on_channel_ready(16, 2);
+        let bytes: Vec<u8> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendChannel { bytes, .. } => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        if bytes != vec![b'x'; 1000] {
+            return Err("FIFO mismatch".into());
+        }
+        Ok(())
+    })();
+    reader.stop();
+    drop((read, write));
+    assert_eq!(budget.usage(), (0, 0, 0));
+    result.unwrap();
 }

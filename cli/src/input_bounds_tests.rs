@@ -1,35 +1,25 @@
 // Included in session::tests. Uses the actual stdin/escape/mouse/Opening path.
 #[test]
-fn client179_opening_overflow_is_explicit_and_keeps_accepted_prefix() {
+fn client179_opening_overflow_explicitly_discards_unaccepted_commands() {
     let mut session = ready_session();
     session.shell_channel = ShellChannel::Opening {
-        queued: VecDeque::new(),
+        queued: PendingInput::default(),
     };
     for _ in 0..16 {
         let _ = session.handle(UiEvent::Stdin(ingress_input(vec![b'a'; 4096])), 0);
     }
     let prefix = match &session.shell_channel {
-        ShellChannel::Opening { queued } => queued
-            .iter()
-            .flat_map(|input| input.as_slice())
-            .copied()
-            .collect::<Vec<_>>(),
+        ShellChannel::Opening { queued } => queued.as_slice().to_vec(),
         _ => panic!("fixture remains Opening"),
     };
     let actions = session.handle(UiEvent::Stdin(ingress_input(vec![b'z'; 4096])), 1);
     let retained = match &session.shell_channel {
-        ShellChannel::Opening { queued } => queued
-            .iter()
-            .flat_map(|input| input.as_slice())
-            .copied()
-            .collect::<Vec<_>>(),
+        ShellChannel::Opening { queued } => queued.as_slice().to_vec(),
         _ => Vec::new(),
     };
     assert_eq!(prefix, vec![b'a'; 64 * 1024]);
-    assert_eq!(
-        retained, prefix,
-        "no partial suffix or accepted-prefix mutation"
-    );
+    assert!(retained.is_empty(), "failed commands cannot be replayed");
+    assert!(actions.contains(&Action::Keep));
     assert!(
         actions
             .iter()
@@ -44,33 +34,34 @@ fn client179_opening_custody_moves_to_actions_and_refunds_on_final_drop() {
     let budget = crate::input_ingress::IngressBudget::default();
     let mut session = ready_session();
     session.shell_channel = ShellChannel::Opening {
-        queued: VecDeque::new(),
+        queued: PendingInput::default(),
     };
     for _ in 0..16 {
         let input = budget.admit_slice(&[b'a'; 4096]).unwrap();
         assert!(session.handle(UiEvent::Stdin(input), 0).is_empty());
     }
-    assert_eq!(budget.usage(), (64 * 1024, 16, 64 * 1024));
-    assert!(budget.admit_slice(b"z").is_err());
+    assert_eq!(budget.usage(), (0, 0, 0));
+    let pending_budget = session.pending_input_budget.clone();
+    assert_eq!(pending_budget.usage(), (64 * 1024, 1, 64 * 1024));
     let actions = session.on_channel_ready(16, 1);
     assert_eq!(sent(&actions), vec![b'a'; 64 * 1024]);
     assert_eq!(
-        budget.usage(),
-        (64 * 1024, 16, 64 * 1024),
+        pending_budget.usage(),
+        (64 * 1024, 1, 64 * 1024),
         "Ready is not action consumption"
     );
     drop(session);
-    assert_eq!(budget.usage(), (64 * 1024, 16, 64 * 1024));
+    assert_eq!(pending_budget.usage(), (64 * 1024, 1, 64 * 1024));
     drop(actions);
-    assert_eq!(budget.usage(), (0, 0, 0));
+    assert_eq!(pending_budget.usage(), (0, 0, 0));
 }
 
 #[test]
-fn client179_opening_record_limit_is_independent_of_unique_read_count() {
+fn client179_opening_fragments_compact_independently_of_unique_read_count() {
     let budget = crate::input_ingress::IngressBudget::default();
     let mut session = ready_session();
     session.shell_channel = ShellChannel::Opening {
-        queued: VecDeque::new(),
+        queued: PendingInput::default(),
     };
     // One read can contain ordered data fragments separated by local commands.
     let input = budget.admit_slice(&[b'x'; 17]).unwrap();
@@ -81,8 +72,9 @@ fn client179_opening_record_limit_is_independent_of_unique_read_count() {
             .queue_or_send(origin.derived(vec![b'x']), 0)
             .is_empty());
     }
-    let overflow = session.queue_or_send(origin.derived(vec![b'z']), 1);
-    assert!(matches!(overflow.last(), Some(Action::Exit(1))));
+    assert!(session
+        .queue_or_send(origin.derived(vec![b'z']), 1)
+        .is_empty());
     assert_eq!(
         budget.usage(),
         (17, 1, 17),
@@ -90,7 +82,7 @@ fn client179_opening_record_limit_is_independent_of_unique_read_count() {
     );
     drop(origin);
     let actions = session.on_channel_ready(16, 2);
-    assert_eq!(sent(&actions), vec![b'x'; 16]);
+    assert_eq!(sent(&actions), [vec![b'x'; 16], vec![b'z']].concat());
     drop((actions, session));
     assert_eq!(budget.usage(), (0, 0, 0));
 }
@@ -197,9 +189,10 @@ fn client179_incomplete_mouse_tail_retains_all_unique_reads() {
             drop(actions);
         }
         assert_eq!(budget.usage(), (18, 16, 18));
-        assert!(
-            budget.admit_slice(b"1").is_err(),
-            "unfinished tail cannot accumulate uncharged reads"
+        drop(
+            budget
+                .admit_slice(b"1")
+                .expect("another byte fits within the byte limit"),
         );
         drop(session);
         assert_eq!(budget.usage(), (0, 0, 0));
@@ -244,43 +237,22 @@ fn client179_local_tail_handback_retains_then_refunds_actual_owners() {
 }
 
 #[test]
-fn client179_escape_fragments_keep_accepted_prefix_on_later_opening_failure() {
+fn client179_escape_fragments_compact_without_false_opening_failure() {
     let budget = crate::input_ingress::IngressBudget::default();
     let mut session = ready_session();
     session.shell_channel = ShellChannel::Opening {
-        queued: VecDeque::new(),
+        queued: PendingInput::default(),
     };
     let mut read = Vec::new();
-    for _ in 0..16 {
-        read.extend_from_slice(b"a\x1dh"); // data, then an ordered local status toggle
+    for _ in 0..1000 {
+        read.extend_from_slice(b"a\x1dh");
     }
     read.push(b'z');
-    let len = read.len();
     let actions = session.handle(UiEvent::Stdin(budget.admit_owned(read).unwrap()), 0);
-    assert!(sent(&actions).is_empty());
-    assert!(matches!(actions.last(), Some(Action::Exit(1))));
-    assert_eq!(
-        actions
-            .iter()
-            .filter(|action| matches!(action, Action::Notice(_)))
-            .count(),
-        1
-    );
-    assert_eq!(budget.usage().0, len);
-    assert_eq!(
-        budget.usage().1,
-        1,
-        "fragments do not issue new read leases"
-    );
-    drop(actions);
-    let accepted = session.on_channel_ready(16, 1);
-    assert_eq!(
-        sent(&accepted),
-        vec![b'a'; 16],
-        "rejected tail neither replaces nor replays accepted data"
-    );
-    drop((accepted, session));
+    assert!(!actions.iter().any(|a| matches!(a, Action::Exit(_))));
     assert_eq!(budget.usage(), (0, 0, 0));
+    let ready = session.on_channel_ready(16, 1);
+    assert_eq!(sent(&ready), [vec![b'a'; 1000], vec![b'z']].concat());
 }
 
 #[test]
@@ -341,7 +313,7 @@ fn client179_reconnect_keeps_only_unaccepted_suffix_through_repeated_attach() {
         pending.is_empty(),
         "recoverable input is retained, not fatal"
     );
-    assert_eq!(budget.usage(), (7, 1, 7));
+    assert_eq!(budget.usage(), (0, 0, 0));
     assert!(!session.shell.prediction_active());
     assert!(
         session.on_channel_ready(99, 3).is_empty(),
@@ -384,4 +356,114 @@ fn client179_confirmed_shell_loss_discards_pending_once_without_new_shell_replay
         .iter()
         .any(|a| matches!(a, Action::Notice(s) if s.contains("pending input"))));
     assert!(sent(&session.on_channel_ready(16, 6)).is_empty());
+}
+
+#[test]
+fn recovery206_thousand_reads_share_ingress_through_open_and_recovery() {
+    for recovery in [false, true] {
+        let budget = crate::input_ingress::IngressBudget::default();
+        let mut session = ready_session();
+        if recovery {
+            session.on_link_gone(0);
+        } else {
+            session.shell_channel = ShellChannel::Opening {
+                queued: Default::default(),
+            };
+        }
+        let mut expected = Vec::new();
+        for i in 0..1000 {
+            if recovery && i == 16 {
+                session.on_reattached(1);
+            }
+            let byte = b'a' + (i % 26) as u8;
+            expected.push(byte);
+            let actions = session.handle(UiEvent::Stdin(budget.admit_slice(&[byte]).unwrap()), 2);
+            assert!(actions.is_empty(), "read {i}: {actions:?}");
+        }
+        assert_eq!(
+            budget.usage(),
+            (0, 0, 0),
+            "pending has independent compact custody"
+        );
+        if recovery {
+            session.on_announced(&[16], 3);
+        }
+        let actions = session.on_channel_ready(16, 4);
+        assert_eq!(sent(&actions), expected);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::SendChannel { .. }))
+                .count(),
+            1
+        );
+        assert!(sent(&session.on_channel_ready(16, 5)).is_empty());
+    }
+}
+
+#[test]
+fn recovery206_true_pending_limit_keeps_remote_and_stops_later_pieces() {
+    let mut session = ready_session();
+    session.on_link_gone(0);
+    for _ in 0..16 {
+        assert!(session
+            .handle(UiEvent::Stdin(ingress_input(vec![b'x'; 4096])), 0)
+            .is_empty());
+    }
+    let actions = session.handle(UiEvent::Stdin(ingress_input(b"z\x1dhmore".to_vec())), 1);
+    assert!(actions.contains(&Action::Keep));
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::Exit(_)))
+            .count(),
+        1
+    );
+    assert!(matches!(actions.last(), Some(Action::Exit(1))));
+    assert!(
+        session.take_pending_input().is_empty(),
+        "failed pending commands cannot later replay"
+    );
+}
+
+#[test]
+fn recovery206_full_pending_still_parses_split_local_leave() {
+    let budget = crate::input_ingress::IngressBudget::default();
+    let mut session = ready_session();
+    session.on_link_gone(0);
+    for _ in 0..16 {
+        assert!(session
+            .handle(
+                UiEvent::Stdin(budget.admit_slice(&[b'x'; 4096]).unwrap()),
+                0
+            )
+            .is_empty());
+    }
+    assert!(session
+        .handle(UiEvent::Stdin(budget.admit_slice(b"\x1d").unwrap()), 1)
+        .is_empty());
+    let actions = session.handle(UiEvent::Stdin(budget.admit_slice(b".").unwrap()), 2);
+    assert!(actions.contains(&Action::Keep));
+    assert!(matches!(actions.last(), Some(Action::Exit(1))));
+}
+
+#[test]
+fn recovery206_unfinished_mouse_report_can_span_thousand_reads() {
+    let budget = crate::input_ingress::IngressBudget::default();
+    let mut session = ready_session();
+    session.on_link_gone(0);
+    assert!(session
+        .handle(UiEvent::Stdin(budget.admit_slice(b"\x1b[<").unwrap()), 0)
+        .is_empty());
+    for byte in std::iter::repeat_n(b'1', 1000) {
+        let actions = session.handle(UiEvent::Stdin(budget.admit_slice(&[byte]).unwrap()), 0);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Exit(_))));
+    }
+    assert_eq!(
+        budget.usage(),
+        (1003, 1001, 1003),
+        "unfinished report retains actual original aliases"
+    );
+    let _ = session.handle(UiEvent::Stdin(budget.admit_slice(b"M").unwrap()), 1);
+    assert_eq!(budget.usage(), (0, 0, 0));
 }
