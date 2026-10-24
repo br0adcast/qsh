@@ -1087,7 +1087,10 @@ fn run_transport_resume_command() -> Result<()> {
         log::error("update", &format!("transport-resume: {why}"));
         anyhow::anyhow!(why)
     };
-    match handover::take_from_env() {
+    // SAFETY: main enters this branch before opening descriptors or starting
+    // threads. The inherited raw descriptors have no Rust owners in this image;
+    // validation rejects malformed numbers before any ownership construction.
+    match unsafe { handover::take_from_env() } {
         Ok(Some(handover)) => run_transport_resume(handover),
         Ok(None) => Err(refuse(format!(
             "started without a handover ({} is not set): this command is only ever run by a \
@@ -1101,8 +1104,8 @@ fn run_transport_resume_command() -> Result<()> {
 /// The daemon, started again by its own `exec` of an accepted update
 /// (spec §4.4, §4.5): rename itself onto the binary's path, take over the
 /// sockets, and carry on -- no fork, no fresh bind, no new control socket.
-fn run_transport_resume(handover: handover::Handover) -> Result<()> {
-    log::init(&handover.cache_dir);
+fn run_transport_resume(handover: handover::PreparedHandover) -> Result<()> {
+    log::init(&handover.description().cache_dir);
     std::panic::set_hook(Box::new(|info| {
         log::error("qshd", &format!("PANIC: {info}"));
     }));
@@ -1113,7 +1116,7 @@ fn run_transport_resume(handover: handover::Handover) -> Result<()> {
     result
 }
 
-fn resume_personal_daemon(handover: handover::Handover) -> Result<()> {
+fn resume_personal_daemon(handover: handover::PreparedHandover) -> Result<()> {
     // A failed rename leaves this process running from the staged path
     // (which `DaemonSelf::personal` then keeps, as its own executable) and
     // the old file at the binary's path. `About` and `STATUS` hash
@@ -1121,14 +1124,13 @@ fn resume_personal_daemon(handover: handover::Handover) -> Result<()> {
     // check does not see the old file and offers nothing: the daemon runs
     // the new build until it exits. The stale file at the binary's path is
     // replaced on the next daemon start.
-    if let Err(e) = handover::settle_binary(&handover) {
+    if let Err(e) = handover.settle_binary() {
         log::warn("update", &format!("{e:#}"));
     }
-    let (socket, listener) = handover::adopt_sockets(&handover)?;
+    let (handover, socket, listener, allowlist) = handover.into_parts();
     let cleanup = control::SocketCleanup::capture(&listener, &handover.control_path)
         .context("retaining the inherited control socket publication")?;
     let keypair = load_or_create_transport_key(&default_transport_key_path(&handover.cache_dir))?;
-    let allowlist = handover::decode_allowlist(&handover.allowlist)?;
     log::info(
         "update",
         &format!(
