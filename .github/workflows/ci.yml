@@ -175,14 +175,6 @@ jobs:
       - name: Build and release script controls
         run: |
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
-          # Temporary #247 diagnostic: fresh fixtures, stop on the first failure.
-          # Remove before readiness/merge; this is observation, not a retry policy.
-          set -e
-          for attempt in {1..20}; do
-            printf 'Archiver diagnostic attempt %s/20\n' "$attempt"
-            PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=scripts/tests python3 -m unittest \
-              test_build_openssl.BuildCacheTests.test_changed_archiver_at_the_same_path_gets_a_new_cache_identity
-          done
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_released_peer_acceptance.py'

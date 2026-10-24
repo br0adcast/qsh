@@ -212,6 +212,156 @@ class TimeoutDiagnosticTests(unittest.TestCase):
             self.assertEqual(report['processes'][0]['state'], 'Z')
             self.assertEqual(report['processes'][0]['executable'], 'unavailable')
 
+    def fake_syscall(self, root, number=0, arguments=None, machine=62, elf_class=2):
+        self.fake_process(root, 100, 1)
+        executable = root / 'fixture-elf'
+        executable.write_bytes(b'\x7fELF' + bytes([elf_class, 1, 1]) + bytes(11) + machine.to_bytes(2, 'little'))
+        (root / '100/exe').unlink()
+        (root / '100/exe').symlink_to(executable)
+        arguments = arguments or ['0x3', '0xfeed', '0x10', '0', '0', '0']
+        (root / '100/syscall').write_text(str(number) + ' ' + ' '.join(arguments) + ' 0xdead 0xbeef')
+        (root / '100/fd').mkdir()
+        (root / '100/fdinfo').mkdir()
+        target = root / 'object.o'
+        target.write_text('PRIVATE_BUFFER_CONTENT')
+        (root / '100/fd/3').symlink_to(target)
+        (root / '100/fd/4').symlink_to(root / 'UNRELATED_FD_PATH')
+        (root / '100/fdinfo/3').write_text('pos: 42\nflags: 0100000\nmnt_id: 9\nino: 17\nsecret: PRIVATE_FDINFO\n')
+
+    def test_syscall_descriptor_metadata_does_not_read_buffers_or_other_fds(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            report = timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            call = report['processes'][0]['syscall']
+            self.assertEqual((call['number'], call['name'], call['abi']), (0, 'read', 'Linux x86_64 ELF64'))
+            self.assertEqual(call['descriptor']['number'], 3)
+            self.assertEqual(call['descriptor']['target'], '<fixture>/object.o')
+            self.assertEqual(call['descriptor']['metadata'], {'pos': 42, 'flags': 32768, 'mnt_id': 9, 'ino': 17})
+            encoded = json.dumps(report)
+            for private in ['PRIVATE_BUFFER_CONTENT', 'PRIVATE_FDINFO', 'UNRELATED_FD_PATH', 'feed', 'dead', 'beef']:
+                self.assertNotIn(private, encoded)
+
+    def test_mmap_uses_its_fd_argument_and_unsupported_abi_is_not_guessed(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root, 9, ['0', '0x1000', '1', '2', '3', '0'])
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual((call['name'], call['descriptor']['number']), ('mmap', 3))
+            self.assertEqual(call['descriptor']['target'], '<fixture>/object.o')
+            executable = root / 'fixture-elf'
+            executable.write_bytes(b'\x7fELF' + bytes([1, 1, 1]) + bytes(11) + (3).to_bytes(2, 'little'))
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['number'], 9)
+            self.assertEqual(call['status'], 'unsupported or unavailable executable ABI; fd not decoded')
+            self.assertNotIn('descriptor', call)
+            executable.unlink()
+            call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['number'], 9)
+            self.assertNotIn('descriptor', call)
+
+    def test_anonymous_mmap_does_not_sample_a_positive_ignored_descriptor(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        for flags in ['0x22', '290']:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+                root = Path(temp)
+                self.fake_syscall(root, 9, ['0', '0x1000', '1', flags, '3', '0'])
+                with patch.object(diagnostic, '_fd_metadata', wraps=diagnostic._fd_metadata) as sample:
+                    call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+                sample.assert_not_called()
+                self.assertEqual((call['number'], call['name']), (9, 'mmap'))
+                self.assertNotIn('descriptor', call)
+                self.assertNotIn('object.o', json.dumps(call))
+
+    def test_openat_does_not_sample_a_potentially_ignored_directory_descriptor(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root, 257, ['3', '0xfeed', '0', '0', '0', '0'])
+            with patch.object(diagnostic, '_fd_metadata', wraps=diagnostic._fd_metadata) as sample:
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            sample.assert_not_called()
+            self.assertEqual(call['number'], 257)
+            self.assertNotIn('descriptor', call)
+            self.assertNotIn('object.o', json.dumps(call))
+
+    def test_running_outside_syscall_and_unknown_numbers_never_dump_registers(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            for value in ['running', '-1 0xfeed 0xdead', '9999 3 0xfeed 0 0 0 0 0xdead 0xbeef']:
+                (root / '100/syscall').write_text(value)
+                call = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+                self.assertNotIn('descriptor', call)
+                for address in ['feed', 'dead', 'beef']:
+                    self.assertNotIn(address, json.dumps(call))
+
+    def test_syscall_change_discards_sampled_descriptor_path(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            read = diagnostic._read
+            def changed(path, limit=4096):
+                result = read(path, limit)
+                if path == root / '100/fdinfo/3':
+                    (root / '100/syscall').write_text('running')
+                return result
+            with patch.object(diagnostic, '_read', side_effect=changed):
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['status'], 'changed during snapshot; fd metadata omitted')
+            self.assertNotIn('descriptor', call)
+            self.assertNotIn('object.o', json.dumps(call))
+
+    def test_fd_link_change_omits_stale_path(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_syscall(root)
+            read = diagnostic._read
+            def changed(path, limit=4096):
+                result = read(path, limit)
+                if path == root / '100/fdinfo/3':
+                    (root / '100/fd/3').unlink()
+                    (root / '100/fd/3').symlink_to(root / 'replacement')
+                return result
+            with patch.object(diagnostic, '_read', side_effect=changed):
+                call = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['processes'][0]['syscall']
+            self.assertEqual(call['descriptor']['status'], 'changed during snapshot')
+            self.assertNotIn('target', call['descriptor'])
+
+    @unittest.skipUnless(sys.platform == 'linux' and os.uname().machine == 'x86_64', 'fd decoder covers Linux x86_64 ELF64 only')
+    def test_actual_owned_pipe_read_reports_only_its_descriptor_metadata(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        read, write = os.pipe()
+        child = subprocess.Popen([sys.executable, '-c', 'import os,sys; os.read(int(sys.argv[1]), 1)', str(read)],
+                                 pass_fds=(read,))
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if Path('/proc/' + str(child.pid) + '/wchan').read_text().strip() == 'pipe_read':
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail('owned pipe reader did not reach its blocking read')
+            report = timeout_snapshot(child.pid, [], {}, Path('/unused-fixture'), ROOT)
+            call = report['processes'][0]['syscall']
+            self.assertEqual((call['number'], call['name']), (0, 'read'))
+            self.assertEqual(call['descriptor']['number'], read)
+            self.assertTrue(call['descriptor']['target'].startswith('pipe:['))
+        finally:
+            os.close(read)
+            os.close(write)
+            child.terminate()
+            child.wait()
+
     def test_original_timeout_emits_diagnostics_without_changing_failure(self):
         import contextlib
         import io
