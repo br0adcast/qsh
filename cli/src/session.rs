@@ -2759,6 +2759,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unfinished_paste_stays_literal_across_idle_ticks_until_its_complete_end() {
+        let mut s = ready_session();
+        let mut delivered = Vec::new();
+        // A later terminal-generated paste can supply the actual end, but
+        // neither elapsed time nor a truncated end makes commands available.
+        for (now_ms, input, expected) in [
+            (
+                0,
+                Some(b"\x1b[200~unfinished\x1b[20".as_slice()),
+                b"\x1b[200~unfinished".as_slice(),
+            ),
+            (3_600_000, None, b"".as_slice()),
+            (
+                3_600_001,
+                Some(b"\x1d.\x1ds\x1dh\x1dr\x1d?\x1d[".as_slice()),
+                b"\x1b[20\x1d.\x1ds\x1dh\x1dr\x1d?\x1d[".as_slice(),
+            ),
+            (
+                3_600_002,
+                Some(b"\x1b[200~fresh \x1d?\x1b[20".as_slice()),
+                b"\x1b[200~fresh \x1d?".as_slice(),
+            ),
+            (7_200_000, None, b"".as_slice()),
+        ] {
+            let actions = match input {
+                Some(bytes) => s.handle(UiEvent::Stdin(ingress_input(bytes.to_vec())), now_ms),
+                None => s.handle(UiEvent::Tick, now_ms),
+            };
+            assert_eq!(sent(&actions), expected, "at {now_ms}");
+            delivered.extend(sent(&actions));
+            assert!(
+                actions.iter().all(|action| matches!(
+                    action,
+                    Action::SendChannel { ch: 16, .. } | Action::Write(_)
+                )),
+                "at {now_ms}: {actions:?}"
+            );
+            assert!(!s.window_open());
+            assert!(s.history_frame.is_none());
+            assert!(!s.line_shown);
+            assert_eq!(s.size(), (20, 5));
+        }
+
+        let actions = s.handle(
+            UiEvent::Stdin(ingress_input(b"1~\x1d.".to_vec())),
+            7_200_001,
+        );
+        assert_eq!(
+            sent(&actions),
+            b"\x1b[201~",
+            "the held marker prefix and its suffix reach the shell"
+        );
+        delivered.extend(sent(&actions));
+        assert_eq!(
+            delivered,
+            b"\x1b[200~unfinished\x1b[20\x1d.\x1ds\x1dh\x1dr\x1d?\x1d[\x1b[200~fresh \x1d?\x1b[201~"
+        );
+        assert!(actions.iter().all(|action| matches!(
+            action,
+            Action::SendChannel { ch: 16, .. } | Action::Write(_) | Action::Keep | Action::Exit(1)
+        )));
+        assert_eq!(actions.iter().filter(|a| **a == Action::Keep).count(), 1);
+        assert_eq!(actions.iter().filter(|a| **a == Action::Exit(1)).count(), 1);
+        let keep = actions.iter().position(|a| *a == Action::Keep).unwrap();
+        let exit = actions.iter().position(|a| *a == Action::Exit(1)).unwrap();
+        let end = actions
+            .iter()
+            .rposition(|a| matches!(a, Action::SendChannel { .. }))
+            .unwrap();
+        assert!(end < keep && keep < exit, "{actions:?}");
+    }
+
     /// The two halves may arrive in separate reads -- they usually do, since
     /// the user types them as two keystrokes.
     #[test]
