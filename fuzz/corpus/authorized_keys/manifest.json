@@ -61,9 +61,19 @@
       "sha256": "08c24eb605c9f3d2a1343c92fa9fd274f4d412d73faba888f82b0cc6014799f0"
     },
     {
+      "name": "em-space-prefix",
+      "bytes": 199,
+      "sha256": "2da98f4b8d1c3c37c3257a69a245ed75b1d74d18bd73cbc9aa8ef760dfae95d8"
+    },
+    {
       "name": "empty",
       "bytes": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "form-feed-prefix",
+      "bytes": 197,
+      "sha256": "0eae646663b920c42484cfc8aeaa51b3b27a8a0eb8837a71b6a999d93fc0b4fb"
     },
     {
       "name": "from-with-comment",
@@ -74,6 +84,11 @@
       "name": "malformed-line-containing-blob",
       "bytes": 85,
       "sha256": "d32b248091dcc1b7f8cd7eea680a261059a4f1926d9f4d1da4e886e4fee8fa89"
+    },
+    {
+      "name": "nonbreaking-prefix",
+      "bytes": 198,
+      "sha256": "b884923dff8fe8335585d525d6e460f71ef5ff66332668eec3b255c184dbd68d"
     },
     {
       "name": "options-then-bare",
@@ -96,9 +111,24 @@
       "sha256": "c7dee27b7b6b0387b2a7b38995e17052dc1c2ae0ecdd14958fe5f4f9b97d10a8"
     },
     {
+      "name": "semantic-bare-first",
+      "bytes": 2,
+      "sha256": "fcf0a6c700dd13e274b6fba8deea8dd9b26e4eedde3495717cac8408c9c5177f"
+    },
+    {
+      "name": "semantic-restricted-first",
+      "bytes": 2,
+      "sha256": "99be5efb88ca2013bd8e4eb035fd42d5245468fe9afa70d8ba9c1c419a48c4e8"
+    },
+    {
       "name": "tab-separated",
       "bytes": 89,
       "sha256": "51ed281a05dd860276b8a8bc4c2e459a3a0998f15e90f5735caa4fce6b2eac0d"
+    },
+    {
+      "name": "vertical-tab-prefix",
+      "bytes": 197,
+      "sha256": "84d84b5d30ecb68e72be11a18d0fc499ce7491e6567de837e2ea7e2aebe3ab5c"
     }
   ]
 }

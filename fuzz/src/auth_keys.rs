@@ -1,4 +1,4 @@
-//! `authorized_keys` listing rules shared by tests and libFuzzer.
+//! Authorization robustness plus independent generated listing properties.
 //!
 //! One fixed, disposable public key is used so every input is compared
 //! against a stable identity. The target never reads a user file, never
@@ -18,9 +18,9 @@ const PUBLIC_BLOB: [u8; 51] = [
     0xfc, 0x3a, 0x5c,
 ];
 
-const PUBLIC_LINE: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKDahKO+JoO/ACS54FSEpTorgXzvrX/N/HoYCGBd/Dpc test@fingerprint";
+pub(super) const PUBLIC_LINE: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKDahKO+JoO/ACS54FSEpTorgXzvrX/N/HoYCGBd/Dpc test@fingerprint";
 
-fn key() -> ssh_key::PublicKey {
+pub(super) fn key() -> ssh_key::PublicKey {
     sshauth::record::decode_public_key(&PUBLIC_BLOB).expect("the fixed public key is valid")
 }
 
@@ -30,6 +30,7 @@ pub fn exercise(input: &[u8]) {
     if input.len() > MAX_INPUT {
         return;
     }
+    super::auth_semantics::exercise(input);
     let Ok(text) = std::str::from_utf8(input) else {
         return;
     };
@@ -103,6 +104,19 @@ pub fn cases() -> Vec<(&'static str, Vec<u8>)> {
     ];
     let junk = (0..=255u8).map(|i| b'a' + i % 26).collect();
     cases.push(("deterministic-junk", junk));
+    for (name, prefix) in [
+        ("nonbreaking-prefix", "\u{a0}"),
+        ("em-space-prefix", "\u{2003}"),
+        ("vertical-tab-prefix", "\x0b"),
+        ("form-feed-prefix", "\x0c"),
+    ] {
+        cases.push((
+            name,
+            format!("{prefix}{PUBLIC_LINE}\n{PUBLIC_LINE}\n").into_bytes(),
+        ));
+    }
+    cases.push(("semantic-restricted-first", vec![2, 0]));
+    cases.push(("semantic-bare-first", vec![0, 2]));
     cases
 }
 

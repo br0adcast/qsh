@@ -1,4 +1,4 @@
-//! Terminal feed/resize robustness shared by tests and libFuzzer.
+//! Raw terminal robustness and bounded semantic scenes shared with libFuzzer.
 //!
 //! The first four bytes select a bounded initial and post-feed geometry;
 //! every remaining byte is fed to the real emulator. Input is capped so one
@@ -26,6 +26,7 @@ pub fn exercise(input: &[u8]) {
     if input.len() > MAX_INPUT || input.len() < 4 {
         return;
     }
+    super::terminal_semantics::exercise(input);
     let initial = size(input[0], input[1]);
     let resized = size(input[2], input[3]);
     let mut terminal = TerminalCore::with_options(
@@ -60,7 +61,7 @@ fn prefixed(cols: u8, rows: u8, new_cols: u8, new_rows: u8, bytes: &[u8]) -> Vec
 
 /// Synthetic public terminal streams. No recorded session is used.
 pub fn cases() -> Vec<(&'static str, Vec<u8>)> {
-    vec![
+    let mut cases = vec![
         ("empty", prefixed(80, 24, 80, 24, b"")),
         ("ascii", prefixed(80, 24, 40, 12, b"hello world\n")),
         ("cursor", prefixed(80, 24, 80, 24, b"\x1b[10;20H\x1b[2J")),
@@ -112,7 +113,23 @@ pub fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 &(0..256u16).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
             ),
         ),
-    ]
+    ];
+    for (name, kind, parameter) in [
+        ("semantic-csi-lf", 0, 0),
+        ("semantic-alt-grow", 11, 0),
+        ("semantic-saved-grow", 13, 0),
+        ("semantic-wide-grow", 15, 0),
+        ("semantic-repeat-resize", 16, 2),
+        ("semantic-max-geometry", 17, 2),
+        ("semantic-sync-cut", 9, 0),
+        ("semantic-osc-below", 18, 0),
+        ("semantic-osc-at", 18, 1),
+        ("semantic-osc-over", 18, 2),
+        ("semantic-osc-st", 18, 6),
+    ] {
+        cases.push((name, vec![kind, parameter, 3, 0]));
+    }
+    cases
 }
 
 #[cfg(test)]
