@@ -255,7 +255,9 @@ fn authority_owner_and_sticky_policy_is_explicit_without_privilege() {
 fn authority_directory_alias_count_is_bounded() {
     for count in [40, 41] {
         let dir = crate::private_test_dir().unwrap();
-        let target = dir.path().join("target");
+        // Count fixture aliases independently of aliases in the runner temp path.
+        let base = fs::canonicalize(dir.path()).unwrap();
+        let target = base.join("target");
         fs::create_dir(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
         for index in (0..count).rev() {
@@ -264,9 +266,9 @@ fn authority_directory_alias_count_is_bounded() {
             } else {
                 format!("alias{}", index + 1)
             };
-            symlink(next, dir.path().join(format!("alias{index}"))).unwrap();
+            symlink(next, base.join(format!("alias{index}"))).unwrap();
         }
-        let opened = FileSink::open_in_private_dir(&dir.path().join("alias0/log"), 100);
+        let opened = FileSink::open_in_private_dir(&base.join("alias0/log"), 100);
         assert_eq!(opened.is_some(), count == 40);
     }
 }
