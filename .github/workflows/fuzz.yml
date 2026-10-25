@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vendor/**"
       - "crates/transport/**"
       - "crates/sshauth/**"
       - "crates/terminal/**"
@@ -16,6 +19,9 @@ on:
     branches: [main]
     paths:
       - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vendor/**"
       - "crates/transport/**"
       - "crates/sshauth/**"
       - "crates/terminal/**"
@@ -90,11 +96,23 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 \
             python3 -m unittest discover -s fuzz/tools -p 'test_check_corpus.py'
 
+      - name: Verify locked product and fuzz dependency sources
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s fuzz/tools -p 'test_check_dependencies.py'
+          # Fetch with the committed locks before enforcing an offline build.
+          cargo fetch --locked --manifest-path Cargo.toml
+          cargo fetch --locked --manifest-path fuzz/Cargo.toml
+          python3 fuzz/tools/check_dependencies.py --offline
+          sha256sum Cargo.lock fuzz/Cargo.lock > "$RUNNER_TEMP/fuzz-locks.sha256"
+
       - name: Build all ASAN targets
         run: |
           set -euo pipefail
-          cargo fuzz build --target x86_64-unknown-linux-gnu \
+          CARGO_NET_OFFLINE=true cargo fuzz build --target x86_64-unknown-linux-gnu \
             --target-dir "$RUNNER_TEMP/fuzz-target"
+          sha256sum --check "$RUNNER_TEMP/fuzz-locks.sha256"
 
       - name: Run a bounded mutation smoke per target
         run: |
