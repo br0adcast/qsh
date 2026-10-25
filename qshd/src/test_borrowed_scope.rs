@@ -18,6 +18,162 @@ const REPORT: &str = "QSH_TEST_BORROWED_SCOPE_REPORT";
 const BODY_LIMIT: Duration = Duration::from_secs(30);
 static EXPECTED_WAITS: AtomicUsize = AtomicUsize::new(0);
 
+// Reports contain only closed diagnostic codes and bounded numeric facts.
+// In particular, panic payloads, stderr, identities and environment are never copied.
+const REPORT_LIMIT: usize = 1024;
+macro_rules! diagnostic_codes {
+    ($name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum $name { $($variant),+ }
+        impl $name {
+            fn label(code: usize) -> &'static str {
+                match code {
+                    $(value if value == Self::$variant as usize => $label,)+
+                    _ => "unknown",
+                }
+            }
+        }
+    };
+}
+diagnostic_codes!(DiagnosticMode {
+    Unspecified => "unspecified", Close => "close", LeaderFirst => "leader-first",
+    LoginEnded => "login-ended", NegativeControl => "negative-control",
+});
+diagnostic_codes!(DiagnosticPhase {
+    Unspecified => "unspecified", Setup => "setup", Identity => "identity",
+    MemberExec => "member-exec", Membership => "membership", PtyAck => "pty-ack",
+    Receipt => "receipt", Cleanup => "cleanup", Assertions => "assertions", Complete => "complete",
+});
+diagnostic_codes!(DiagnosticAssertion {
+    Unspecified => "unspecified", Opened => "opened", Barrier => "identity-barrier",
+    Pin => "pin", Alive => "jobs-alive", MemberExec => "member-exec",
+    Session => "session-membership", ProcessGroup => "sibling-process-group",
+    Parent => "monitor-parent", Write => "pty-write", Ack => "pty-ack",
+    Receive => "scope-response", Join => "helper-join", Receipt => "scope-receipt",
+    MemberExit => "member-exit", EarlyPam => "no-early-pam-close", PamClosed => "pam-closed",
+    Elapsed => "receipt-deadline", LeaderStatus => "leader-status", Deliberate => "deliberate-assertion",
+});
+
+#[derive(Clone, Copy, Default)]
+struct Diagnostic {
+    mode: usize,
+    phase: usize,
+    assertion: usize,
+    elapsed_ms: usize,
+    observations: usize,
+    cleanup_stops: usize,
+    exit_code: usize,
+}
+impl std::fmt::Debug for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Diagnostic")
+            .field("mode", &DiagnosticMode::label(self.mode))
+            .field("phase", &DiagnosticPhase::label(self.phase))
+            .field("assertion", &DiagnosticAssertion::label(self.assertion))
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("receipt", &(self.observations & 1 != 0))
+            .field("exit_seen", &(self.observations & 2 != 0))
+            .field(
+                "exit_code",
+                &(if self.observations & 2 != 0 {
+                    Some(self.exit_code as u32 as i32)
+                } else {
+                    None
+                }),
+            )
+            .field("member_exited", &(self.observations & 4 != 0))
+            .field("live_member_at_receipt", &(self.observations & 8 != 0))
+            .field("early_pam_close", &(self.observations & 16 != 0))
+            .field("pam_closed", &(self.observations & 32 != 0))
+            .field("helper_joined", &(self.observations & 64 != 0))
+            .field("leader_cleanup_stop", &(self.cleanup_stops & 1 != 0))
+            .field("member_cleanup_stop", &(self.cleanup_stops & 2 != 0))
+            .field("monitor_cleanup_stop", &(self.cleanup_stops & 4 != 0))
+            .finish()
+    }
+}
+impl Diagnostic {
+    fn report_fields(self) -> String {
+        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={}",
+            self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code)
+    }
+    fn from_fields(fields: &std::collections::BTreeMap<String, usize>) -> Self {
+        let field = |name| fields.get(name).copied().unwrap_or(0);
+        Self {
+            mode: field("mode"),
+            phase: field("phase"),
+            assertion: field("assertion"),
+            elapsed_ms: field("elapsed_ms"),
+            observations: field("observations"),
+            cleanup_stops: field("cleanup_stops"),
+            exit_code: field("exit_code"),
+        }
+    }
+}
+thread_local! {
+    static DIAGNOSTIC: std::cell::Cell<Diagnostic> = const { std::cell::Cell::new(Diagnostic {
+        mode: 0, phase: 0, assertion: 0, elapsed_ms: 0, observations: 0, cleanup_stops: 0, exit_code: 0,
+    }) };
+}
+pub(crate) fn diagnostic_mode(mode: DiagnosticMode) {
+    DIAGNOSTIC.set(Diagnostic {
+        mode: mode as usize,
+        ..Diagnostic::default()
+    });
+}
+pub(crate) fn diagnostic_phase(phase: DiagnosticPhase) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            phase: phase as usize,
+            assertion: 0,
+            elapsed_ms: 0,
+            ..cell.get()
+        })
+    });
+}
+// Elapsed is relative to the caller's existing observation budget, not cleanup time.
+pub(crate) fn diagnostic_assertion(assertion: DiagnosticAssertion, elapsed: Duration) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            assertion: assertion as usize,
+            elapsed_ms: elapsed.as_millis().min(usize::MAX as u128) as usize,
+            ..cell.get()
+        })
+    });
+}
+// Fixed bit meanings: receipt, exit response, member exited, live member at receipt,
+// early PAM close, final PAM close, helper joined. No process identities are retained.
+pub(crate) fn diagnostic_observations(bits: usize) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            observations: bits,
+            ..cell.get()
+        })
+    });
+}
+pub(crate) fn diagnostic_exit_code(code: Option<i32>) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            exit_code: code.unwrap_or(0) as u32 as usize,
+            ..cell.get()
+        })
+    });
+}
+// Cleanup updates cannot overwrite the phase/assertion that caused unwinding.
+// Bits identify fixture roles only: leader=1, member=2, monitor=4.
+pub(crate) fn diagnostic_cleanup_stops(bits: usize) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            cleanup_stops: cell.get().cleanup_stops | bits,
+            ..cell.get()
+        })
+    });
+}
+fn write_report(path: impl AsRef<std::path::Path>, report: String) {
+    assert!(report.len() <= REPORT_LIMIT, "bounded fixture report");
+    std::fs::write(path, report).unwrap();
+}
+
 #[derive(Debug)]
 pub(crate) struct Outcome {
     pub(crate) body_success: bool,
@@ -29,6 +185,7 @@ pub(crate) struct Outcome {
     pub(crate) supervisor_rescues: usize,
     pub(crate) no_children: bool,
     pub(crate) supervisor_success: bool,
+    diagnostic: Diagnostic,
 }
 impl Outcome {
     pub(crate) fn assert_clean(&self, expected_waits: usize) {
@@ -276,10 +433,10 @@ fn read_fields(path: &std::path::Path) -> std::collections::BTreeMap<String, usi
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .unwrap()
-        .take(1025)
+        .take((REPORT_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)
         .unwrap();
-    assert!(bytes.len() <= 1024, "bounded fixture report");
+    assert!(bytes.len() <= REPORT_LIMIT, "bounded fixture report");
     String::from_utf8(bytes)
         .unwrap()
         .split_whitespace()
@@ -301,9 +458,9 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             let drain = drain_owned_children();
             let waits = EXPECTED_WAITS.load(Ordering::SeqCst);
             let success = result.is_ok() && waits == expected_waits && drain.adopted == 0;
-            std::fs::write(std::env::var_os(REPORT).unwrap(), format!(
-                "body_success={} expected_waits={waits} body_adopted={} body_rescues={} no_children=1",
-                usize::from(success), drain.adopted, drain.rescues)).unwrap();
+            write_report(std::env::var_os(REPORT).unwrap(), format!(
+                "body_success={} expected_waits={waits} body_adopted={} body_rescues={} no_children=1 {}",
+                usize::from(success), drain.adopted, drain.rescues, DIAGNOSTIC.get().report_fields()));
             std::process::exit(if success { 0 } else { 101 });
         }
         Some("supervisor") => {
@@ -347,10 +504,10 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             let body_ok =
                 status.is_some_and(|s| s.success()) && fields.get("body_success") == Some(&1);
             let success = body_ok && drain.adopted == 0;
-            std::fs::write(report, format!(
-                "body_success={} timed_out={} expected_waits={} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1",
+            write_report(report, format!(
+                "body_success={} timed_out={} expected_waits={} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1 {}",
                 usize::from(body_ok), usize::from(status.is_none()), fields.get("expected_waits").copied().unwrap_or(0),
-                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues)).unwrap();
+                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues, Diagnostic::from_fields(&fields).report_fields()));
             std::process::exit(if success { 0 } else { 101 });
         }
         Some(_) => panic!("unknown private borrowed fixture stage"),
@@ -374,6 +531,7 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
                 supervisor_rescues: fields["supervisor_rescues"],
                 no_children: fields["no_children"] == 1,
                 supervisor_success: status.success(),
+                diagnostic: Diagnostic::from_fields(&fields),
             }
         }
     }
@@ -392,13 +550,62 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(status.success());
+            struct CleanupMarker;
+            impl Drop for CleanupMarker {
+                fn drop(&mut self) {
+                    diagnostic_cleanup_stops(2);
+                }
+            }
+            let _cleanup_marker = CleanupMarker;
+            diagnostic_mode(DiagnosticMode::NegativeControl);
+            diagnostic_phase(DiagnosticPhase::Assertions);
+            diagnostic_assertion(DiagnosticAssertion::Deliberate, Duration::from_millis(7));
             panic!("deliberate original assertion failure");
         });
         assert!(!result.supervisor_success && !result.body_success && !result.timed_out);
+        let report = format!("{result:?}");
+        assert!(report.contains("negative-control"), "{report}");
+        assert!(report.contains("assertions"), "{report}");
+        assert!(report.contains("deliberate-assertion"), "{report}");
+        assert!(
+            !report.contains("deliberate original assertion failure"),
+            "raw panic payload must not be propagated"
+        );
+        assert_eq!(result.diagnostic.elapsed_ms, 7);
+        assert_eq!(result.diagnostic.cleanup_stops, 2);
         assert_eq!(result.body_adopted, 1);
         assert_eq!(result.body_rescues, 1);
         assert_eq!(result.supervisor_adopted, 0);
         assert!(result.no_children);
+    }
+
+    #[test]
+    fn maximum_report_fields_remain_bounded() {
+        diagnostic_observations(2);
+        diagnostic_exit_code(Some(-1));
+        let rendered = format!("{:?}", DIAGNOSTIC.get());
+        assert!(rendered.contains("exit_code: Some(-1)"), "{rendered}");
+        let fields = std::collections::BTreeMap::from([
+            ("mode".into(), usize::MAX),
+            ("phase".into(), usize::MAX),
+            ("assertion".into(), usize::MAX),
+            ("elapsed_ms".into(), usize::MAX),
+            ("observations".into(), usize::MAX),
+            ("cleanup_stops".into(), usize::MAX),
+            ("exit_code".into(), usize::MAX),
+        ]);
+        let diagnostic = Diagnostic::from_fields(&fields);
+        let report = format!("{} {}", "9".repeat(512), diagnostic.report_fields());
+        assert!(report.len() <= REPORT_LIMIT);
+        assert!(format!("{diagnostic:?}").contains("unknown"));
+        let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("bounded-report");
+        write_report(&report_path, report);
+        assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
+        let oversized =
+            std::panic::catch_unwind(|| write_report(&report_path, "x".repeat(REPORT_LIMIT + 1)));
+        assert!(oversized.is_err());
+        assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
     }
 
     #[test]
