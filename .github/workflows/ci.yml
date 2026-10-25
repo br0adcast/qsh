@@ -104,6 +104,11 @@ jobs:
             --require file_path_tests::authority_directory_alias_count_is_bounded \
             --require file_path_tests::authority_fifo_leaf_is_refused_without_blocking_or_parent_repair \
             --require file_path_tests::authority_darwin_var_alias_is_traversed_natively \
+            --require diagnostic_tests::diagnostics_escape_controls_and_bound_multibyte_output \
+            --require diagnostic_tests::diagnostics_preserve_non_utf8_path_bytes_without_terminal_controls \
+            --require diagnostic_tests::diagnostics_preserve_permission_and_io_error_kinds_with_component \
+            --require file_path_tests::diagnostics_name_unsafe_component_and_condition_without_mutating_it \
+            --require file_path_tests::diagnostics_report_nonregular_leaf_and_keep_safe_open_working \
             --require file_path_tests::route_held_file_metadata_changes_are_refused_and_recover \
             --require file_path_tests::route_observed_metadata_change_after_refresh_prevents_append \
             --require file_path_tests::route_rotation_refuses_aliases_and_preserves_outside_metadata \
@@ -116,7 +121,6 @@ jobs:
             --require file::tests::rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records \
             --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
             --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
-          grep -F 'test result: ok. 42 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Release cache authority on macOS
         shell: bash
         run: |
@@ -177,6 +181,8 @@ jobs:
             sessions::tests::inheritance::slot125_a_forked_copy_cannot_unlock_the_live_parent \
             sessions::tests::inheritance::slot125_failed_token_replacement_retains_ownership_until_drop \
             sessions::tests::tuple_framing_preserves_exact_names_without_path_or_length_collisions \
+            sessions::tests::path_diagnostics_unavailable_store_warns_once_and_keeps_usable_token \
+            sessions::tests::path_diagnostics_failed_initial_write_retains_token_and_lock_with_warning \
             sessions::tests::legacy_records_are_never_claimed_or_changed_even_when_locked \
             sessions::tests::exhausting_one_login_does_not_consume_anothers_slots; do
             # --nocapture diagnostics may split a test's name and bare ok.
@@ -190,7 +196,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 25 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 27 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::native session-slot tests reported a runtime skip' >&2
             exit 1
@@ -947,8 +953,11 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 71` is the exact compiled system-library body count.
-          # These bodies are re-invoked by maintained owning subprocess fixtures;
+          # `--ignored 73` is the exact compiled system-library body count:
+          # the prior 71 plus two isolated qshd library log diagnostic bodies.
+          # The deleted-cwd body is in qshd's binary test target, not this
+          # library binary. Keep the strict count and require both library
+          # wrappers below so a missing body or wrapper fails visibly.
           # private_creation_body is owned by
           # log::tests::permissions::log280_private_creation_and_safe_aliases,
           # which requires its child's successful one-test result.
@@ -982,12 +991,12 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 71 isolated bodies are a separate matter and get no
+          # The 73 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 71 \
+          run_suite lib qshd --ignored 73 \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
             --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
@@ -995,6 +1004,8 @@ jobs:
             --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \
             --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \
             --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \
+            --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \
+            --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
             an_undeliverable_signal_is_reported_to_the_helper \
