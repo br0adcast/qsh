@@ -1289,6 +1289,117 @@ a\tb\tc\r\n\
         }
     }
 
+    fn resized_replay_continues(input: &[u8], from: (u16, u16), to: (u16, u16), live: &[u8]) {
+        let mut model = TerminalCore::with_replay(from.0, from.1);
+        let mut twin = TerminalCore::with_replay(from.0, from.1);
+        for core in [&mut model, &mut twin] {
+            core.feed(input);
+            core.resize(to.0, to.1);
+        }
+        let mut client = TerminalCore::with_replay(to.0, to.1);
+        client.feed(&model.replay().unwrap());
+        assert_eq!(model.frame(), client.frame(), "immediate repaint");
+        for core in [&mut model, &mut twin, &mut client] {
+            core.feed(live);
+        }
+        let want = model.frame();
+        let got = client.frame();
+        assert_eq!(
+            (want.cursor_row, want.cursor_col),
+            (got.cursor_row, got.cursor_col),
+            "continuation after resize"
+        );
+        for (index, (want, got)) in want.cells.iter().zip(&got.cells).enumerate() {
+            assert_eq!(want, got, "continuation cell {index}");
+        }
+        assert_eq!(want, got, "continuation modes and palette");
+        assert_eq!(
+            model.frame(),
+            twin.frame(),
+            "repaint must not change model continuation"
+        );
+    }
+
+    #[test]
+    fn resize290_alternate_growth_preserves_repaint_continuation() {
+        resized_replay_continues(b"\x1b[?1049h3 ", (2, 5), (8, 7), b"x");
+    }
+
+    #[test]
+    fn resize290_primary_then_alternate_growth_preserves_repaint_continuation() {
+        resized_replay_continues(b"3\x1b[?1049h ", (2, 5), (8, 7), b"x");
+    }
+
+    #[test]
+    fn resize290_primary_growth_control() {
+        resized_replay_continues(b"3 ", (2, 5), (8, 7), b"x");
+    }
+
+    #[test]
+    fn resize290_returned_primary_growth_control() {
+        resized_replay_continues(b"\x1b[?1049h\x1b[?1049l3 ", (2, 5), (8, 7), b"x");
+    }
+
+    #[test]
+    fn resize290_saved_primary_cursor_grows_before_restore() {
+        resized_replay_continues(b"ab\x1b7\x1b[2;1H", (2, 5), (8, 7), b"\x1b8x");
+    }
+
+    #[test]
+    fn resize290_saved_alternate_cursor_grows_before_restore() {
+        resized_replay_continues(b"\x1b[?1049hab\x1b7\x1b[2;1H", (2, 5), (8, 7), b"\x1b8x");
+    }
+
+    #[test]
+    fn resize290_inactive_primary_cursors_grow_before_return() {
+        resized_replay_continues(b"ab\x1b[?1049h", (2, 5), (8, 7), b"\x1b[?1049lx");
+    }
+
+    #[test]
+    fn resize290_inactive_alternate_saved_cursor_survives_resize_and_repaint_with_prior_state() {
+        let mut model = TerminalCore::with_replay(2, 5);
+        let mut client = TerminalCore::with_replay(2, 5);
+        for core in [&mut model, &mut client] {
+            core.feed(b"\x1b[?1049hab\x1b7\x1b[?1049l");
+            core.resize(8, 7);
+        }
+        // Primary-screen replay deliberately does not restore an unknown
+        // inactive alternate saved cursor. This client already owns that
+        // state; resize must normalize it and repaint must preserve it.
+        client.feed(&model.replay().unwrap());
+        for core in [&mut model, &mut client] {
+            core.feed(b"\x1b[?1049h\x1b8");
+            assert_eq!((core.frame().cursor_row, core.frame().cursor_col), (0, 2));
+            assert!(!core.term.grid().cursor.input_needs_wrap);
+            core.feed(b"x");
+            assert_eq!((core.frame().cursor_row, core.frame().cursor_col), (0, 3));
+            assert_eq!(core.frame().cell(0, 2).ch, 'x');
+        }
+        assert_eq!(model.frame(), client.frame());
+    }
+
+    #[test]
+    fn resize290_blank_wide_shrink_height_and_noop_controls() {
+        for (input, from, to, live) in [
+            (b"\x1b[?1049h  ".as_slice(), (2, 5), (8, 7), b"x".as_slice()),
+            ("\x1b[?1049h界".as_bytes(), (2, 5), (8, 7), b"x"),
+            (
+                "\x1b[?1049h界\x1b7\x1b[2;1H".as_bytes(),
+                (2, 5),
+                (8, 7),
+                b"\x1b8x",
+            ),
+            (b"\x1b[?1049habcdefgh", (8, 5), (2, 3), b"x"),
+            (b"\x1b[?1049h        ", (8, 5), (2, 3), b"x"),
+            ("\x1b[?1049h界123456".as_bytes(), (8, 5), (2, 3), b"x"),
+            (b"\x1b[?1049hab\x1b7\x1b[2;1H", (2, 5), (2, 7), b"\x1b8x"),
+            (b"\x1b[?1049hab", (2, 5), (2, 5), b"x"),
+            (b"\x1b[?1049ha", (2, 5), (8, 7), b"x"),
+        ] {
+            resized_replay_continues(input, from, to, live);
+        }
+    }
+
     /// Re-review, Minor 2: the last printed character (what `CSI b`
     /// repeats) when the cursor waits at the last column over a cell that
     /// is not it -- DECSC over a pending wrap, printing elsewhere, DECRC; and

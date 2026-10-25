@@ -1,0 +1,67 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -45,4 +44,0 @@
+-
+-[[test]]
+-name = "ref"
+-path = "tests/ref.rs"
+--- a/src/grid/resize.rs
++++ b/src/grid/resize.rs
+@@ -113,2 +113,2 @@
+-        // Remove the linewrap special case, by moving the cursor outside of the grid.
+-        if self.cursor.input_needs_wrap && reflow {
++        // Width growth makes the pending insertion column reachable on both screens.
++        if self.cursor.input_needs_wrap {
+@@ -116,0 +117,4 @@
++        }
++        if self.saved_cursor.input_needs_wrap {
++            self.saved_cursor.input_needs_wrap = false;
++            self.saved_cursor.point.column += 1;
+--- a/src/grid/tests.rs
++++ b/src/grid/tests.rs
+@@ -390,0 +391,45 @@
++
++#[test]
++fn qsh_width_growth_unwraps_live_and_saved_cursors_without_reflow() {
++    let mut grid = Grid::<Cell>::new(5, 2, 0);
++    grid.cursor.point.column = Column(1);
++    grid.cursor.input_needs_wrap = true;
++    grid.saved_cursor = grid.cursor.clone();
++    grid.resize(false, 7, 8);
++    assert_eq!((grid.cursor.point.column, grid.cursor.input_needs_wrap), (Column(2), false));
++    assert_eq!((grid.saved_cursor.point.column, grid.saved_cursor.input_needs_wrap), (Column(2), false));
++}
++
++#[test]
++fn qsh_width_growth_unwraps_saved_cursor_with_reflow() {
++    let mut grid = Grid::<Cell>::new(5, 2, 0);
++    grid.saved_cursor.point.column = Column(1);
++    grid.saved_cursor.input_needs_wrap = true;
++    grid.resize(true, 7, 8);
++    assert_eq!((grid.saved_cursor.point.column, grid.saved_cursor.input_needs_wrap), (Column(2), false));
++    assert_eq!((grid.cursor.point.column, grid.cursor.input_needs_wrap), (Column(0), false));
++}
++
++#[test]
++fn qsh_width_shrink_keeps_pending_wrap_at_the_new_edge_without_reflow() {
++    let mut grid = Grid::<Cell>::new(5, 8, 0);
++    grid.cursor.point.column = Column(7);
++    grid.cursor.input_needs_wrap = true;
++    grid.saved_cursor = grid.cursor.clone();
++    grid.resize(false, 3, 2);
++    assert_eq!((grid.cursor.point.column, grid.cursor.input_needs_wrap), (Column(1), true));
++    assert_eq!((grid.saved_cursor.point.column, grid.saved_cursor.input_needs_wrap), (Column(1), true));
++}
++
++#[test]
++fn qsh_height_only_resize_and_noop_keep_pending_wrap() {
++    let mut grid = Grid::<Cell>::new(5, 2, 0);
++    grid.cursor.point.column = Column(1);
++    grid.cursor.input_needs_wrap = true;
++    grid.saved_cursor = grid.cursor.clone();
++    for lines in [5, 7, 3] {
++        grid.resize(false, lines, 2);
++        assert_eq!((grid.cursor.point.column, grid.cursor.input_needs_wrap), (Column(1), true));
++        assert_eq!((grid.saved_cursor.point.column, grid.saved_cursor.input_needs_wrap), (Column(1), true));
++    }
++}
