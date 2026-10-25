@@ -154,7 +154,7 @@ qshd serve --system [--port N] [--host-key PATH] \
 | `--port` | `60022` | same as the personal mode |
 | `--host-key` | `/etc/qshd/host_key` | the machine's host key, owned by root, mode `0600` — see "The host key's move" below |
 | `--authorized-keys-template` | `%h/.ssh/authorized_keys` | where an account's own keys live; `%h` expands to its home directory, `%u` to its login name |
-| `--worker-user` | `qshd` | the unprivileged account the daemon's network-facing half drops to once it has split off from its root-privileged half; the `qshd` package creates this account for you on install |
+| `--worker-user` | `qshd` | the unprivileged account the daemon's network-facing half drops to once it has split off from its root-privileged half; the `qshd` package creates this account if absent |
 | `--permit-root` | off | allow logging in as `uid 0`; refused otherwise |
 
 `--system` only exists in a binary built with the `system` Cargo feature
@@ -217,7 +217,7 @@ needs:
 - `/etc/pam.d/qshd` — the PAM service file the daemon opens once per
   login, marked so a package upgrade never overwrites an administrator's
   edits to it;
-- a system account, `qshd`, created by the package's own install script
+- a system account, `qshd`, created if absent by the package's install script
   (no home directory — `/nonexistent` — shell `/usr/sbin/nologin`): the
   identity the daemon's network-facing half drops to once it has split
   off from its root-privileged half. Removing the package does **not**
@@ -240,6 +240,35 @@ support. The floor itself lives in one place, `QSHD_GLIBC_FLOOR` in
 `packaging/Dockerfile.build-deb` (the `.rpm` side has its own,
 independently pinned) — not repeated here on purpose, so this paragraph
 can't go stale against it the way a copied number could.
+
+### Worker account and trust boundary
+
+Reserve the worker UID solely for qshd. Do not share it with interactive users
+or other services, including accounts with different names that resolve to the
+same UID. Give it only the supplementary groups it needs. This is the
+administrator's responsibility: an account name, a system UID range, or a
+`nologin` shell does not prove that the UID is used exclusively by qshd.
+The package preserves an existing `qshd` account; it does not replace its
+settings or verify exclusive use. Check that account before enabling the
+service, and apply the same requirement when choosing `--worker-user`.
+
+At startup, qshd rejects a worker account with UID 0, primary GID 0, or a
+supplementary GID 0. It sets and checks the worker's real, effective and saved
+user and group IDs and its supplementary groups, checks that no permitted,
+effective or ambient capabilities remain, and verifies that an attempt to
+regain UID 0 fails. These checks do not enforce exclusive use of the account.
+
+The network worker holds the daemon's private host key and user PTY and screen
+state. Compromising it can expose the daemon's identity and session content
+across the accounts it serves. Privilege separation protects the privileged
+helper boundary; it does not provide cross-user confidentiality after worker
+compromise.
+
+Keep restrictions inherited by user shells in mind when editing the system
+unit. Service-wide `NoNewPrivileges` or capability restrictions can break
+`sudo` and other intended privilege transitions; filesystem restrictions can
+also break PAM or access to users' files. Follow the warnings in the shipped
+unit rather than applying a blanket sandbox to the whole service.
 
 ### Turning it on
 
