@@ -212,9 +212,14 @@ impl PredictionEngine {
     /// (a port of mosh's display condition: `apply` is a no-op when prediction
     /// is inactive).
     pub fn apply(&mut self, fb: &Frame) -> Frame {
-        let mut clone = fb.clone();
+        self.apply_owned(fb.clone())
+    }
+
+    /// Apply predictions to an owned snapshot, retaining its cell allocation.
+    /// The authoritative terminal model must not be mutated by presentation.
+    pub fn apply_owned(&mut self, mut frame: Frame) -> Frame {
         if !self.active() {
-            return clone;
+            return frame;
         }
         if self
             .budget
@@ -222,15 +227,15 @@ impl PredictionEngine {
             .is_err()
         {
             self.suppress();
-            return clone;
+            return frame;
         }
         for c in &self.cursors {
-            c.apply(&mut clone, self.confirmed_epoch);
+            c.apply(&mut frame, self.confirmed_epoch);
         }
         for row in &self.overlays {
-            row.apply(&mut clone, self.confirmed_epoch, self.flagging);
+            row.apply(&mut frame, self.confirmed_epoch, self.flagging);
         }
-        clone
+        frame
     }
 
     /// Reset all predictions (a port of `reset`): clear overlays/cursors and
@@ -935,6 +940,46 @@ mod tests {
         assert!(shown.cells[1].combining.is_empty());
         assert_ne!(shown.cells[1].flags & terminal::FLAG_HIDDEN, 0);
         assert_eq!(shown.cells[0], fb.cells[0]);
+    }
+
+    #[test]
+    fn owned_apply_matches_borrowed_cells_and_budget_effects_without_replacing_storage() {
+        for (preference, exhausted) in [
+            (DisplayPreference::Never, false),
+            (DisplayPreference::Always, false),
+            (DisplayPreference::Always, true),
+        ] {
+            let mut borrowed = PredictionEngine::new(preference);
+            let mut owned = PredictionEngine::new(preference);
+            warm_up(&mut borrowed);
+            warm_up(&mut owned);
+            let mut core = terminal::TerminalCore::new(20, 1);
+            core.feed("e\u{301}界\u{302}".as_bytes());
+            let mut source = core.frame();
+            source.cursor_col = 4;
+            source.cells[4].flags = terminal::FLAG_HIDDEN;
+            for engine in [&mut borrowed, &mut owned] {
+                engine.new_user_byte(b'x', &source, 1000);
+                if preference == DisplayPreference::Always {
+                    assert!(engine.active());
+                }
+                if exhausted {
+                    engine.budget.limits.work = 0;
+                }
+            }
+            let expected = borrowed.apply(&source);
+            let pointer = source.cells.as_ptr();
+            let actual = owned.apply_owned(source);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.cells.as_ptr(), pointer);
+            assert_eq!(owned.budget.used, borrowed.budget.used);
+            assert_eq!(owned.budget.bytes, borrowed.budget.bytes);
+            assert_eq!(owned.suppressed_until, borrowed.suppressed_until);
+            assert_eq!(owned.active(), borrowed.active());
+            if exhausted {
+                assert!(!owned.active());
+            }
+        }
     }
 
     // Always: the typed character is visible in the overlaid frame immediately
