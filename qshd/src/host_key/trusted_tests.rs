@@ -337,20 +337,76 @@ fn path_diagnostics_nonregular_and_io_errors_name_the_key() {
     assert!(error.to_string().contains("missing-key"));
 }
 
-#[test]
-fn path_diagnostics_wrong_owner_reports_observed_and_expected_uids() {
-    let dir = private_dir();
-    let path = dir.path().join("owner-key");
-    key(&path, 0o600);
+// A synthetic target UID must not inherit the runner's user-owned TMPDIR
+// ancestors: those correctly fail before the component this fixture controls.
+fn wrong_owner_dir(other: Uid) -> tempfile::TempDir {
+    let base = std::fs::canonicalize("/tmp").unwrap();
+    let (parent, _) = resolve_parent(&base.join("unused-fixture-key"), other, false)
+        .expect("the fixed temporary root must have trusted ancestors");
+    assert_eq!(
+        parent.metadata().unwrap().uid(),
+        0,
+        "root-owned fixture base"
+    );
+    tempfile::Builder::new()
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(base)
+        .unwrap()
+}
+
+fn assert_wrong_owner_component(path: &Path, component: &Path, operation: &str, other: Uid) {
     let actual = Uid::effective().as_raw();
-    let other = Uid::from_raw(actual.wrapping_add(1));
-    let error = read(&path, other, &mut Observe::default()).err().unwrap();
+    let mut observed = Observe::default();
+    let error = read(path, other, &mut observed).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     let text = error.to_string();
     assert!(text.contains(&format!("uid={actual}")), "{text}");
     assert!(text.contains(&format!("uid={}", other.as_raw())), "{text}");
     assert!(
-        text.contains("owner-key")
-            || text.contains(dir.path().file_name().unwrap().to_str().unwrap()),
+        text.starts_with(&format!("{operation} {component:?}: ")),
         "{text}"
     );
+    assert_eq!((observed.reads, observed.repairs), (0, 0));
+    assert_eq!(std::fs::read(path).unwrap(), BYTES);
+    assert_eq!(mode(path), 0o600);
+}
+
+#[test]
+fn path_diagnostics_wrong_owner_reports_observed_and_expected_uids() {
+    let actual = Uid::effective().as_raw();
+    let other = Uid::from_raw(actual.wrapping_add(1));
+    let dir = wrong_owner_dir(other);
+    let path = dir.path().join("owner-key");
+    key(&path, 0o600);
+    // Root-owned ancestors are trusted for every target UID; an ordinary
+    // account's freshly owned directory is itself the first rejected object.
+    let (component, operation) = if actual == 0 {
+        (path.as_path(), "reading host key")
+    } else {
+        (dir.path(), "checking host key ancestor")
+    };
+    assert_wrong_owner_component(&path, component, operation, other);
+}
+
+#[test]
+fn path_diagnostics_nested_owned_temp_root_reports_first_rejected_component() {
+    let actual = Uid::effective().as_raw();
+    let other = Uid::from_raw(actual.wrapping_add(1));
+    let owned_root = wrong_owner_dir(other);
+    let nested_tmp = owned_root.path().join("nested-user-tmp");
+    make_dir(&nested_tmp);
+    let dir = tempfile::Builder::new()
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(&nested_tmp)
+        .unwrap();
+    let path = dir.path().join("owner-key");
+    key(&path, 0o600);
+    // Model a user-owned TMPDIR ancestor independently of the host's TMPDIR.
+    // As root, the documented root-owner exception instead reaches the leaf.
+    let (component, operation) = if actual == 0 {
+        (path.as_path(), "reading host key")
+    } else {
+        (owned_root.path(), "checking host key ancestor")
+    };
+    assert_wrong_owner_component(&path, component, operation, other);
 }
