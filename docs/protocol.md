@@ -289,6 +289,23 @@ Two messages, one round trip:
     |<========================================================> |
 ```
 
+### 2.0 Connection lifecycle
+
+A `Connection` is single-use. A client's `start`, `start_with_payload`,
+`start_session` and `start_recovery` share one start attempt. Once any of
+them has run, another start on the same object returns no datagrams and
+changes nothing, whether the link is `Connecting`, `Live` or `Closed`. This is
+deliberate: the transport keys, session id, outgoing counter, replay window,
+streams and congestion state all belong to one Noise handshake and one
+session. Resetting only some of them would let old-key ciphertext or old
+counters enter a new attempt, and no production path needs reuse. An owner
+that needs another attempt creates a new `Connection`;
+`Connection::has_started` exposes whether a client has consumed its attempt.
+
+A server is created by `accept` or `on_handshake_init` in response to msg1 and
+has no start attempt; `start` on a server returns no datagrams. This is an API
+contract, not a wire-protocol message.
+
 ### 2.1 What msg1 carries
 
 `encode_msg1`, 23 bytes:
