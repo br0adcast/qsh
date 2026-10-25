@@ -137,6 +137,17 @@
       ],
       "reason": "Requires configured non-loopback IPv6 for PAM AI_ADDRCONFIG",
       "owner": "CI container job: required IPv6 CIDR wrapper in disposable NET_ADMIN container"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "control::peer_tests::control_peer_foreign_client_rejects_root_server",
+        "control::peer_tests::control_peer_root_client_rejects_foreign_server",
+        "transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client",
+        "transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client"
+      ],
+      "reason": "Requires disposable root self-exec children with real foreign effective UIDs",
+      "owner": "CI container job: run_suite lib qshd"
     }
   ]
 }

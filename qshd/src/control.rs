@@ -271,10 +271,21 @@ pub fn client_request_with_timeout(
     req: &ControlRequest,
     timeout: Duration,
 ) -> Result<ControlReply> {
+    client_request_with_peer_check(sock_path, req, timeout, check_control_peer)
+}
+
+fn client_request_with_peer_check(
+    sock_path: &Path,
+    req: &ControlRequest,
+    timeout: Duration,
+    check: impl FnOnce(&UnixStream) -> Result<()>,
+) -> Result<ControlReply> {
     let mut stream = match UnixStream::connect(sock_path) {
         Ok(stream) => stream,
         Err(_) => return Ok(ControlReply::NoDaemon),
     };
+
+    check(&stream)?;
 
     stream
         .set_read_timeout(Some(timeout))
@@ -1606,3 +1617,49 @@ mod cleanup143_tests {
         );
     }
 }
+
+/// Authenticate the account at the connected endpoint, never its PID: a
+/// legitimate listener may have been inherited across fork or exec.
+pub(crate) fn peer_uid(stream: &impl std::os::fd::AsFd) -> std::io::Result<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+            .map(|credentials| credentials.uid())
+            .map_err(std::io::Error::from)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        nix::unistd::getpeereid(stream)
+            .map(|(uid, _)| uid.as_raw())
+            .map_err(std::io::Error::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = stream;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "control peer credentials are unsupported on this platform",
+        ))
+    }
+}
+
+pub(crate) fn require_same_account(peer: std::io::Result<u32>, expected: u32) -> Result<()> {
+    let peer = peer.context("reading control peer credentials")?;
+    anyhow::ensure!(
+        peer == expected,
+        "control peer belongs to a different effective account"
+    );
+    Ok(())
+}
+
+fn check_control_peer(stream: &UnixStream) -> Result<()> {
+    require_same_account(peer_uid(stream), nix::unistd::geteuid().as_raw())
+}
+
+#[cfg(test)]
+#[path = "control_peer_tests.rs"]
+mod peer_tests;
+
+#[cfg(test)]
+#[path = "control_peer_fixture.rs"]
+pub(crate) mod peer_fixture;

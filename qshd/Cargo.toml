@@ -16,7 +16,7 @@ hex = "0.4"
 base64 = "0.22"
 dirs = "6"
 portable-pty = "0.9"
-nix = { version = "0.28", features = ["term", "user", "fs", "dir", "process", "signal"] }
+nix = { version = "0.28", features = ["term", "user", "fs", "dir", "process", "signal", "socket"] }
 log = "0.4"
 logging = { path = "../crates/logging" }
 transport = { path = "../crates/transport", features = ["tokio-driver"] }
