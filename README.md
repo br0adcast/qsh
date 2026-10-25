@@ -250,6 +250,7 @@ not the status of any particular run.
 | [Protocol](docs/protocol.md) | Wire format, handshake, sessions, channels, roaming, and threat model. |
 | [Changelog](CHANGELOG.md) | Version-by-version changes. |
 | [Privacy check](docs/private-data-check.md) | Local secret scanning and manual review before publishing. |
+| [Performance baseline](docs/performance-baseline.md) | Measuring CPU, scheduling, traffic and latency, and comparing builds. |
 
 <details>
 <summary><strong>Explore the Rust workspace</strong></summary>

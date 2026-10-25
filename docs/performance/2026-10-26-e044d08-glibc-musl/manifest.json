@@ -1,0 +1,471 @@
+{
+  "tool_version": 1,
+  "created_utc": "2026-10-25T22:42:53.770100+00:00",
+  "source": {
+    "commit": "e044d08e43ecec7f34205beb9c17f5fdb76e4db8",
+    "note": "release profile, rustc 1.98.1; glibc: x86_64-unknown-linux-gnu, unstripped; musl: x86_64-unknown-linux-musl with musl-gcc, stripped as in release.yml"
+  },
+  "host": {
+    "system": "Linux",
+    "kernel": "6.1.0-52-amd64",
+    "machine": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz",
+    "online_cpus": 4,
+    "scaling_governor": null,
+    "clock_ticks": 100,
+    "python": "3.11.2"
+  },
+  "settings": {
+    "repetitions": 5,
+    "order": "interleaved",
+    "seed": 1,
+    "window": 10,
+    "keystrokes": 100,
+    "key_interval": 0.1,
+    "redraw_fps": 20,
+    "saturation_lines": 2000000,
+    "retained_sessions": 8
+  },
+  "terminal": {
+    "cols": 120,
+    "rows": 40
+  },
+  "workloads": [
+    "idle",
+    "typing",
+    "redraw",
+    "saturation",
+    "reconnect",
+    "retained"
+  ],
+  "builds": {
+    "glibc": {
+      "label": "glibc",
+      "qsh": {
+        "sha256": "8731a5718df579344192876c8f721d228b6c579fc77fd4670de72fd094f9f7dd",
+        "bytes": 23313056,
+        "version": [
+          "qsh 0.5.0"
+        ],
+        "elf": true,
+        "linkage": "dynamic",
+        "interpreter": "ld-linux-x86-64.so.2",
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)",
+          "rustc version 1.98.1 (48a229cea 2026-09-01)"
+        ]
+      },
+      "qshd": {
+        "sha256": "50d9a4d8b62a795aed20b014e3b712b27589cd8749c9767e08653d2ffd2c0f37",
+        "bytes": 6806576,
+        "version": [
+          "qshd 0.5.0 (build 1792965238)"
+        ],
+        "elf": true,
+        "linkage": "dynamic",
+        "interpreter": "ld-linux-x86-64.so.2",
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "Linker: LLD 22.1.8 (/checkout/src/llvm-project/llvm 52ed14fcd56afc30f9cccd8ca8ce237c2eef7e04)",
+          "rustc version 1.98.1 (48a229cea 2026-09-01)"
+        ]
+      }
+    },
+    "musl": {
+      "label": "musl",
+      "qsh": {
+        "sha256": "e6f2383904a5777f8ee36cd160092b4e1c8b3377ef19f2ff1e651f19a3a5c541",
+        "bytes": 18579888,
+        "version": [
+          "qsh 0.5.0"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.98.1 (48a229cea 2026-09-01)"
+        ]
+      },
+      "qshd": {
+        "sha256": "f112e0e8f9c37e54eb6e95a877220924a7f137e2346ac834f0a78b7f71909158",
+        "bytes": 4875600,
+        "version": [
+          "qshd 0.5.0 (build 1792965238)"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.98.1 (48a229cea 2026-09-01)"
+        ]
+      }
+    }
+  },
+  "order": [
+    {
+      "index": 0,
+      "repetition": 0,
+      "workload": "idle",
+      "build": "glibc"
+    },
+    {
+      "index": 1,
+      "repetition": 0,
+      "workload": "idle",
+      "build": "musl"
+    },
+    {
+      "index": 2,
+      "repetition": 0,
+      "workload": "typing",
+      "build": "glibc"
+    },
+    {
+      "index": 3,
+      "repetition": 0,
+      "workload": "typing",
+      "build": "musl"
+    },
+    {
+      "index": 4,
+      "repetition": 0,
+      "workload": "redraw",
+      "build": "glibc"
+    },
+    {
+      "index": 5,
+      "repetition": 0,
+      "workload": "redraw",
+      "build": "musl"
+    },
+    {
+      "index": 6,
+      "repetition": 0,
+      "workload": "saturation",
+      "build": "glibc"
+    },
+    {
+      "index": 7,
+      "repetition": 0,
+      "workload": "saturation",
+      "build": "musl"
+    },
+    {
+      "index": 8,
+      "repetition": 0,
+      "workload": "reconnect",
+      "build": "glibc"
+    },
+    {
+      "index": 9,
+      "repetition": 0,
+      "workload": "reconnect",
+      "build": "musl"
+    },
+    {
+      "index": 10,
+      "repetition": 0,
+      "workload": "retained",
+      "build": "glibc"
+    },
+    {
+      "index": 11,
+      "repetition": 0,
+      "workload": "retained",
+      "build": "musl"
+    },
+    {
+      "index": 12,
+      "repetition": 1,
+      "workload": "idle",
+      "build": "musl"
+    },
+    {
+      "index": 13,
+      "repetition": 1,
+      "workload": "idle",
+      "build": "glibc"
+    },
+    {
+      "index": 14,
+      "repetition": 1,
+      "workload": "typing",
+      "build": "musl"
+    },
+    {
+      "index": 15,
+      "repetition": 1,
+      "workload": "typing",
+      "build": "glibc"
+    },
+    {
+      "index": 16,
+      "repetition": 1,
+      "workload": "redraw",
+      "build": "musl"
+    },
+    {
+      "index": 17,
+      "repetition": 1,
+      "workload": "redraw",
+      "build": "glibc"
+    },
+    {
+      "index": 18,
+      "repetition": 1,
+      "workload": "saturation",
+      "build": "musl"
+    },
+    {
+      "index": 19,
+      "repetition": 1,
+      "workload": "saturation",
+      "build": "glibc"
+    },
+    {
+      "index": 20,
+      "repetition": 1,
+      "workload": "reconnect",
+      "build": "musl"
+    },
+    {
+      "index": 21,
+      "repetition": 1,
+      "workload": "reconnect",
+      "build": "glibc"
+    },
+    {
+      "index": 22,
+      "repetition": 1,
+      "workload": "retained",
+      "build": "musl"
+    },
+    {
+      "index": 23,
+      "repetition": 1,
+      "workload": "retained",
+      "build": "glibc"
+    },
+    {
+      "index": 24,
+      "repetition": 2,
+      "workload": "idle",
+      "build": "glibc"
+    },
+    {
+      "index": 25,
+      "repetition": 2,
+      "workload": "idle",
+      "build": "musl"
+    },
+    {
+      "index": 26,
+      "repetition": 2,
+      "workload": "typing",
+      "build": "glibc"
+    },
+    {
+      "index": 27,
+      "repetition": 2,
+      "workload": "typing",
+      "build": "musl"
+    },
+    {
+      "index": 28,
+      "repetition": 2,
+      "workload": "redraw",
+      "build": "glibc"
+    },
+    {
+      "index": 29,
+      "repetition": 2,
+      "workload": "redraw",
+      "build": "musl"
+    },
+    {
+      "index": 30,
+      "repetition": 2,
+      "workload": "saturation",
+      "build": "glibc"
+    },
+    {
+      "index": 31,
+      "repetition": 2,
+      "workload": "saturation",
+      "build": "musl"
+    },
+    {
+      "index": 32,
+      "repetition": 2,
+      "workload": "reconnect",
+      "build": "glibc"
+    },
+    {
+      "index": 33,
+      "repetition": 2,
+      "workload": "reconnect",
+      "build": "musl"
+    },
+    {
+      "index": 34,
+      "repetition": 2,
+      "workload": "retained",
+      "build": "glibc"
+    },
+    {
+      "index": 35,
+      "repetition": 2,
+      "workload": "retained",
+      "build": "musl"
+    },
+    {
+      "index": 36,
+      "repetition": 3,
+      "workload": "idle",
+      "build": "musl"
+    },
+    {
+      "index": 37,
+      "repetition": 3,
+      "workload": "idle",
+      "build": "glibc"
+    },
+    {
+      "index": 38,
+      "repetition": 3,
+      "workload": "typing",
+      "build": "musl"
+    },
+    {
+      "index": 39,
+      "repetition": 3,
+      "workload": "typing",
+      "build": "glibc"
+    },
+    {
+      "index": 40,
+      "repetition": 3,
+      "workload": "redraw",
+      "build": "musl"
+    },
+    {
+      "index": 41,
+      "repetition": 3,
+      "workload": "redraw",
+      "build": "glibc"
+    },
+    {
+      "index": 42,
+      "repetition": 3,
+      "workload": "saturation",
+      "build": "musl"
+    },
+    {
+      "index": 43,
+      "repetition": 3,
+      "workload": "saturation",
+      "build": "glibc"
+    },
+    {
+      "index": 44,
+      "repetition": 3,
+      "workload": "reconnect",
+      "build": "musl"
+    },
+    {
+      "index": 45,
+      "repetition": 3,
+      "workload": "reconnect",
+      "build": "glibc"
+    },
+    {
+      "index": 46,
+      "repetition": 3,
+      "workload": "retained",
+      "build": "musl"
+    },
+    {
+      "index": 47,
+      "repetition": 3,
+      "workload": "retained",
+      "build": "glibc"
+    },
+    {
+      "index": 48,
+      "repetition": 4,
+      "workload": "idle",
+      "build": "glibc"
+    },
+    {
+      "index": 49,
+      "repetition": 4,
+      "workload": "idle",
+      "build": "musl"
+    },
+    {
+      "index": 50,
+      "repetition": 4,
+      "workload": "typing",
+      "build": "glibc"
+    },
+    {
+      "index": 51,
+      "repetition": 4,
+      "workload": "typing",
+      "build": "musl"
+    },
+    {
+      "index": 52,
+      "repetition": 4,
+      "workload": "redraw",
+      "build": "glibc"
+    },
+    {
+      "index": 53,
+      "repetition": 4,
+      "workload": "redraw",
+      "build": "musl"
+    },
+    {
+      "index": 54,
+      "repetition": 4,
+      "workload": "saturation",
+      "build": "glibc"
+    },
+    {
+      "index": 55,
+      "repetition": 4,
+      "workload": "saturation",
+      "build": "musl"
+    },
+    {
+      "index": 56,
+      "repetition": 4,
+      "workload": "reconnect",
+      "build": "glibc"
+    },
+    {
+      "index": 57,
+      "repetition": 4,
+      "workload": "reconnect",
+      "build": "musl"
+    },
+    {
+      "index": 58,
+      "repetition": 4,
+      "workload": "retained",
+      "build": "glibc"
+    },
+    {
+      "index": 59,
+      "repetition": 4,
+      "workload": "retained",
+      "build": "musl"
+    }
+  ]
+}
