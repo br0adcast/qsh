@@ -279,7 +279,7 @@ jobs:
           export XDG_CACHE_HOME="$runtime/cache"
           export HISTFILE=/dev/null
           mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
-          cargo test -p sshauth --lib --locked known_hosts::tests:: -- --nocapture | tee "$runtime/results.log"
+          cargo test -p sshauth --lib --locked known_hosts::tests:: -- --nocapture --test-threads=1 2>&1 | tee "$runtime/results.log"
           for test in \
             pin_insertion_preserves_original_text_and_newline_boundaries \
             pin_replacement_preserves_unrelated_records_and_text \
@@ -287,9 +287,24 @@ jobs:
             preserved_malformed_records_never_grant_trust \
             a_pin_in_progress_blocks_a_concurrent_pin_of_a_different_host_until_it_finishes \
             pin_host_equivalent_first_pins_race_without_creating_conflicting_records \
-            flock_retries_after_being_interrupted_by_a_signal; do
-            grep -F "test known_hosts::tests::$test ... ok" "$runtime/results.log"
+            flock_retries_after_being_interrupted_by_a_signal \
+            pin_authority_unsafe_sources_never_become_unknown \
+            pin_authority_trusted_aliases_and_public_hardlinks_preserve_read_and_entry_write_semantics \
+            pin_authority_raw_routes_and_alias_limits_are_checked \
+            pin_authority_read_errors_never_accept_a_valid_prefix \
+            pin_authority_lock_metadata_and_name_cannot_change_the_transaction \
+            pin_authority_collision_cleanup_never_deletes_an_unowned_name \
+            pin_authority_error_cleanup_removes_only_its_created_inode \
+            pin_authority_replaced_parent_or_source_refuses_before_publication; do
+            awk -v expected="test known_hosts::tests::$test ... " '
+              index($0, expected) == 1 { pending=1 }
+              pending && /(^|[[:space:]])ok$/ { found=1; exit }
+              /^test / && index($0, expected) != 1 { pending=0 }
+              END { exit !found }
+            ' "$runtime/results.log"
           done
+          grep -F 'test result: ok. 33 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          ! grep -F 'SKIPPED' "$runtime/results.log"
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Personal authorization file integrity on macOS
@@ -760,6 +775,35 @@ jobs:
           run_suite test authorized_keys_privilege \
             --require the_effective_account_is_restored_even_when_the_read_fails \
             --require personal_authorized_keys_enforces_real_account_and_root_ownership
+
+          # This package-specific owner boundary uses the existing workspace
+          # build metadata, with an exact package/target lookup rather than
+          # widening the qshd-only artifact helper or compiling another matrix.
+          sshauth_package=$(jq -er '
+            .workspace_members as $members |
+            [.packages[] | select(.name == "sshauth" and
+              (.id as $id | $members | index($id)))] |
+            if length == 1 then .[0].id else error("expected one sshauth workspace package") end
+          ' "$RUNNER_TEMP/workspace.json")
+          pin_bin=$(jq -r --arg package "$sshauth_package" '
+            select(.reason == "compiler-artifact" and .profile.test == true
+              and .package_id == $package and .target.name == "qsh_pin_authority_privilege"
+              and (.target.kind | index("test"))) | .executable
+          ' "$RUNNER_TEMP/build.json")
+          if [ -z "$sshauth_package" ] || [ -z "$pin_bin" ] || [ ! -x "$pin_bin" ]; then
+            echo "::error::no exact sshauth QSH pin ownership test binary was built"
+            failures=$((failures + 1))
+          else
+            echo '::group::QSH pin ownership boundary'
+            if docker run --rm --init -e QSH_PIN_TEST_DISPOSABLE_HOST=1 \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
+              ubuntu:24.04 sh -c 'exec "$@" 2>&1' sh "$pin_bin" --test-threads=1 --nocapture \
+              2>&1 | tee "$logs/qsh_pin_authority_privilege.log"
+            then :; else failures=$((failures + 1)); fi
+            scripts/no-silent-skips.sh "$logs/qsh_pin_authority_privilege.log" \
+              --require qsh_pin_real_account_root_read_and_mutation_boundaries || failures=$((failures + 1))
+            echo '::endgroup::'
+          fi
 
           # The library tests, where the nine `skip_unless_root` tests in
           # `helper/server.rs` live -- and four tests that must NOT run as

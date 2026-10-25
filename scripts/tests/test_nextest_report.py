@@ -61,6 +61,28 @@ class ReportTests(unittest.TestCase):
                              ("tests::body", "skipped", self.module.IGNORE_REASON)])
         self.assertEqual(result, (1, [("qshd", "tests::root")], [("qshd", "tests::body")]))
 
+    def test_qsh_pin_privilege_has_one_exact_disposable_owner(self):
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        binary = "sshauth::qsh_pin_authority_privilege"
+        name = "qsh_pin_real_account_root_read_and_mutation_boundaries"
+        matches = {key: value for key, value in expected.items() if key[0] == binary}
+        self.assertEqual(list(matches), [(binary, name)])
+        self.assertEqual(matches[(binary, name)]["owner"], "CI container job: QSH pin ownership boundary")
+        self.assertIn(f"(binary_id(={binary}) & test(={name}))", self.module.exclusion_filter(expected))
+        root = ET.Element("testsuites", tests="2", failures="0", errors="0")
+        suite = ET.SubElement(root, "testsuite", name=binary, tests="2", failures="0", errors="0")
+        case = ET.SubElement(suite, "testcase", classname=binary, name=name)
+        skip = ET.SubElement(case, "skipped", message=self.module.FILTER_REASON)
+        ordinary = ET.SubElement(suite, "testcase", classname=binary, name="ordinary")
+        ET.SubElement(ordinary, "system-out").text = ""
+        ET.SubElement(ordinary, "system-err").text = ""
+        ET.ElementTree(root).write(self.report)
+        self.assertEqual(self.module.check_report(self.report, matches), (1, [(binary, name)], []))
+        skip.set("message", self.module.IGNORE_REASON)
+        ET.ElementTree(root).write(self.report)
+        with self.assertRaises(ValueError):
+            self.module.check_report(self.report, matches)
+
     def test_successful_runtime_skips_fail_with_actual_identity(self):
         for stream in ("stdout", "stderr"):
             with self.subTest(stream=stream):
