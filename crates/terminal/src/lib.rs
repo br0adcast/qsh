@@ -522,7 +522,7 @@ impl TerminalCore {
         Some(replay::write(
             &mut self.term,
             &replay.tracked,
-            replay.pending.tail(),
+            &replay.pending.tail(),
         ))
     }
 

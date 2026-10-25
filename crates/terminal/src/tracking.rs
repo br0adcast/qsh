@@ -13,6 +13,7 @@
 //! sequence (or UTF-8 character) the input has started and not finished.
 
 use alacritty_terminal::term::cell::Flags;
+use std::borrow::Cow;
 use std::ops::Range;
 use unicode_width::UnicodeWidthChar;
 
@@ -485,14 +486,30 @@ impl PendingSequence {
     }
 
     /// The unfinished part, possibly empty.
-    pub fn tail(&self) -> &[u8] {
+    pub fn tail(&self) -> Cow<'_, [u8]> {
         if self.lost {
-            return &[];
+            return Cow::Borrowed(&[]);
         }
         match classify(&self.bytes) {
-            State::Ground => &[],
-            State::InUtf8(n) => &self.bytes[self.bytes.len() - n..],
-            State::InSequence => &self.bytes,
+            State::Ground => Cow::Borrowed(&[]),
+            State::InUtf8(n) => Cow::Borrowed(&self.bytes[self.bytes.len() - n..]),
+            State::InSequence => {
+                // The snapshot already includes execute effects. Ask the same
+                // parser which bytes execute: OSC ignores C0, DCS headers ignore
+                // them, and DCS passthrough delivers them as payload instead.
+                // CAN/SUB must remain because they also change parser state.
+                let mut parser = Parser::new();
+                let mut control = ExecutedControl::default();
+                let mut tail = Vec::with_capacity(self.bytes.len());
+                for &byte in &self.bytes {
+                    control.executed = false;
+                    parser.advance(&mut control, std::slice::from_ref(&byte));
+                    if !control.executed || matches!(byte, 0x18 | 0x1a) {
+                        tail.push(byte);
+                    }
+                }
+                Cow::Owned(tail)
+            }
         }
     }
 
@@ -514,6 +531,18 @@ impl PendingSequence {
             State::InSequence => {}
         }
         self.check_at = (self.bytes.len() * 2).clamp(CHECK_INTERVAL, MAX_PENDING);
+    }
+}
+
+/// Observe execution without implementing a second parser state machine.
+#[derive(Default)]
+struct ExecutedControl {
+    executed: bool,
+}
+
+impl Perform for ExecutedControl {
+    fn execute(&mut self, _byte: u8) {
+        self.executed = true;
     }
 }
 
@@ -746,6 +775,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_tail_omits_only_executed_controls() {
+        for (input, expected) in [
+            (b"\x1b\n[1\x08".as_slice(), b"\x1b[1".as_slice()),
+            (b"\x1b]0;t\n", b"\x1b]0;t\n"),
+            (b"\x1bP1\n;", b"\x1bP1\n;"),
+            (b"\x1bPqdata\n", b"\x1bPqdata\n"),
+        ] {
+            for split in 0..=input.len() {
+                assert_eq!(tail_after(&[&input[..split], &input[split..]]), expected);
+            }
+        }
+    }
+
+    #[test]
     fn an_unfinished_utf8_character_is_pending() {
         assert_eq!(tail_after(&[b"price: \xE2\x82"]), b"\xE2\x82");
         assert_eq!(tail_after(&[b"\x1b[0mprice: \xE2"]), b"\xE2");
@@ -771,7 +814,7 @@ mod tests {
         p.push(b"plain text \xe2");
         assert_eq!(p.bytes, b"\xe2");
         p.push(b"\x82");
-        assert_eq!(p.tail(), b"\xe2\x82");
+        assert_eq!(p.tail().as_ref(), b"\xe2\x82");
         p.push(b"\xac more");
         assert!(p.bytes.is_empty() && p.tail().is_empty());
         p.push(b"\x1b[0mback to text");
