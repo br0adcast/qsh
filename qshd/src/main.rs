@@ -217,7 +217,7 @@ fn wait_for_daemon_release(transaction: &control::EnsureLock, port: u16) -> Resu
 fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_echo_args(args)?;
 
-    let cache_dir = default_cache_dir();
+    let cache_dir = serve::cache_dir(false);
     let key_path = parsed
         .server_key_file
         .clone()
@@ -334,7 +334,7 @@ fn parse_transport_echo_args(args: &[OsString]) -> Result<ParsedTransportEchoArg
 fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_shell_args(args)?;
 
-    let cache_dir = default_cache_dir();
+    let cache_dir = serve::cache_dir(false);
     let key_path = parsed
         .server_key_file
         .clone()
@@ -657,7 +657,7 @@ const ENSURE_LOCK_WAIT: Duration = Duration::from_secs(5);
 fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
 
-    let cache_dir = default_cache_dir();
+    let cache_dir = serve::cache_dir(false);
     let sock_path = control_sock_path(&cache_dir);
     let transaction = control::EnsureLock::acquire(&sock_path, ENSURE_LOCK_WAIT)
         .context("locking the transport ensure transaction")?;
@@ -1092,7 +1092,7 @@ fn personal_server_auth(
 /// daemon that vanished after an update is looked for in its log.
 fn run_transport_resume_command() -> Result<()> {
     let refuse = |why: String| -> anyhow::Error {
-        log::init(&default_cache_dir());
+        log::init(&serve::cache_dir(false));
         log::error("update", &format!("transport-resume: {why}"));
         anyhow::anyhow!(why)
     };
@@ -1204,17 +1204,6 @@ fn signature_verifier() -> Option<Arc<dyn transport::AuthVerifier>> {
 /// in the daemon's cache directory -- alongside `cert.der`/`server.json`.
 fn default_transport_key_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("transport_server_key.bin")
-}
-
-/// Default daemon cache directory: `dirs::cache_dir()` (on Linux --
-/// `$XDG_CACHE_HOME`, or `~/.cache` if the variable isn't set) plus `qsh`.
-/// Tests use a different directory -- passed directly to the caller as a
-/// parameter (`default_transport_key_path`/`state`); this function is not
-/// involved there.
-fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("qsh")
 }
 
 /// Path to the daemon's control Unix socket: `control.sock` in the cache

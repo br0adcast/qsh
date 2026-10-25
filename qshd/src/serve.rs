@@ -241,8 +241,11 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
 /// itself would pass whatever the constant said.
 pub const SYSTEM_LOG_DIR: &str = "/var/log/qshd";
 
-/// The directory for the diagnostic file log ([`crate::log`]) -- the same
-/// `qshd.log` every other `qshd` subcommand writes to in the personal mode.
+/// The personal daemon cache directory, or the fixed system diagnostic log
+/// directory. Shared with the binary's `transport-*` commands, which also
+/// keep their cached key, control socket and state in the personal directory.
+/// The diagnostic file log ([`crate::log`]) is the same `qshd.log` for every
+/// subcommand in the personal mode.
 /// `serve` does not fork, so its stdout/stderr are whatever the caller (a
 /// terminal, or a service manager) makes of them; the file log is a second,
 /// platform-independent way to find the startup fingerprint and later
@@ -266,7 +269,7 @@ pub const SYSTEM_LOG_DIR: &str = "/var/log/qshd";
 /// own diagnostics, which is what this file is; a service log is not a
 /// per-user cache in the first place, in the personal mode either, but that
 /// mismatch is not this task's to fix.
-fn cache_dir(system: bool) -> PathBuf {
+pub fn cache_dir(system: bool) -> PathBuf {
     if system {
         return PathBuf::from(SYSTEM_LOG_DIR);
     }
@@ -936,7 +939,7 @@ mod tests {
     }
 
     /// The second, non-crashing finding: `cache_dir()`, used only for the
-    /// diagnostic file log, must not depend on `$HOME` in the system mode --
+    /// diagnostic file log in system mode, must not depend on `$HOME` --
     /// the same mistake `authorized_keys`' default made above, just without
     /// a crash to notice it by. `dirs::cache_dir()` falls back to
     /// `getpwuid_r` when `$HOME` is unset (see `dirs_sys::home_dir`), so an
