@@ -58,8 +58,13 @@ impl Drop for MultiplicityCleanup {
         self.shutdown.request();
     }
 }
-async fn multiplicity_control(rig: &mut DeliveryRig) -> crate::channel::ServerRecord {
+async fn multiplicity_control(
+    rig: &mut DeliveryRig,
+    greeting_seen: &mut bool,
+) -> crate::channel::ServerRecord {
     let mut records = crate::shell_frame::RecordDeframer::for_control();
+    let mut shell = crate::shell_frame::RecordDeframer::with_max_payload(64);
+    let mut answer = None;
     let mut packet = vec![0; 65536];
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -69,20 +74,43 @@ async fn multiplicity_control(rig: &mut DeliveryRig) -> crate::channel::ServerRe
                 .client
                 .on_datagram(Instant::now(), source, &packet[..len]);
             for event in rig.client.poll_events() {
-                if let Event::StreamData {
-                    stream_id: crate::channel::CONTROL_STREAM,
-                    data,
-                } = event
-                {
-                    if let Some(raw) = records.push(&data).first() {
-                        return crate::channel::decode_server(raw).unwrap();
+                match event {
+                    Event::StreamData {
+                        stream_id: crate::channel::CONTROL_STREAM,
+                        data,
+                    } => {
+                        if let Some(raw) = records.push(&data).first() {
+                            answer = Some(crate::channel::decode_server(raw).unwrap());
+                        }
                     }
+                    Event::StreamData {
+                        stream_id: 16,
+                        data,
+                    } => {
+                        for raw in shell.push(&data) {
+                            if let crate::shell_frame::ShellRecord::Data(bytes) =
+                                crate::shell_frame::decode_shell(raw).unwrap()
+                            {
+                                assert_eq!(bytes, b"hello from the shell");
+                                *greeting_seen = true;
+                            }
+                        }
+                        assert!(!shell.overflowed(), "bounded initial greeting records");
+                    }
+                    _ => {}
+                }
+            }
+            // Drain the entire event batch: Opened and the greeting may be
+            // delivered together. Returning at Opened would discard that proof.
+            if *greeting_seen {
+                if let Some(answer) = answer.take() {
+                    return answer;
                 }
             }
         }
     })
     .await
-    .expect("actual control reply while provider remains held")
+    .expect("actual control reply and shell greeting while provider remains held")
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -130,9 +158,13 @@ async fn capacity_reachable_warm_repaints_stay_bounded_while_provider_and_delive
         command: vec![],
     }));
     rig.client_sends(CONTROL_STREAM, &open);
-    let opened = multiplicity_control(&mut rig).await;
+    // Opened alone does not prove the blocking reader's greeting was processed.
+    // Require actual shell data so the first repaint consumes ordinary capacity,
+    // rather than a valid data-free lifecycle checkpoint before that greeting.
+    let mut greeting_seen = false;
+    let opened = multiplicity_control(&mut rig, &mut greeting_seen).await;
     rig.client_sends(CONTROL_STREAM, &open);
-    let refused = multiplicity_control(&mut rig).await;
+    let refused = multiplicity_control(&mut rig, &mut greeting_seen).await;
     let mut samples = Vec::new();
     let mut terminal = None;
     let rounds = crate::channel_timeline::ORDINARY_ENTRIES + 1;
