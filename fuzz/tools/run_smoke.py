@@ -28,7 +28,10 @@ FUZZER_OPTIONS = (
     "-malloc_limit_mb=64",
     "-print_final_stats=1",
 )
-COMPLETION = re.compile(rb"#\d+\s+DONE\b")
+# A complete line may end right after DONE; within a longer line's bounded
+# prefix, an actual delimiter byte must follow it.
+COMPLETION = re.compile(rb"#\d+\s+DONE(?![A-Za-z0-9_])")
+COMPLETION_IN_PREFIX = re.compile(rb"#\d+\s+DONE(?=[^A-Za-z0-9_])")
 FAILURE_MARKERS = (b"ERROR:", b"SUMMARY: AddressSanitizer", b"panicked at", b"deadly signal")
 TARGET = re.compile(r"([a-z0-9_]+)=([1-9][0-9]*)")
 LOG_LIMIT = 4 * 1024 * 1024
@@ -119,32 +122,47 @@ def run(command, log, wall_timeout):
     return status if finished else None
 
 
+def completion_in(head, whole):
+    """Whether a line starting with `head` is a completion line.
+
+    `whole` means `head` is the entire line, ended by its newline or by the
+    end of the log. Otherwise `head` is a bounded prefix of a longer line,
+    and the end of that prefix is not a word boundary.
+    """
+    return (COMPLETION if whole else COMPLETION_IN_PREFIX).match(head) is not None
+
+
 def scan(log, chunk=SCAN_CHUNK):
     """Find the completion and failure markers in the whole log.
 
     At most `chunk` bytes are held at a time; a marker split across reads is
-    still found, and completion counts only at the start of a line.
+    still found. Completion counts only at the start of a line and within
+    its first LINE_HEAD bytes, which are collected with one byte more so the
+    byte that follows DONE is known.
     """
     overlap = max(len(marker) for marker in FAILURE_MARKERS) - 1
     completed = False
     found = set()
     carry = b""
-    # The start of the current line, collected up to LINE_HEAD bytes.
     head = b""
+    length = 0
     with log.open("rb") as source:
         while piece := source.readline(chunk):
+            ended = piece.endswith(b"\n")
+            length += len(piece)
             if head is not None:
-                head += piece[:LINE_HEAD - len(head)]
-                if piece.endswith(b"\n") or len(head) >= LINE_HEAD:
-                    completed |= COMPLETION.match(head) is not None
+                head += piece[:LINE_HEAD + 1 - len(head)]
+                if ended or len(head) > LINE_HEAD:
+                    completed |= completion_in(head, whole=ended and length == len(head))
                     head = None
-            if piece.endswith(b"\n"):
+            if ended:
                 head = b""
+                length = 0
             window = carry + piece
             found.update(marker for marker in FAILURE_MARKERS if marker in window)
             carry = window[-overlap:]
     if head:
-        completed |= COMPLETION.match(head) is not None
+        completed |= completion_in(head, whole=length == len(head))
     return completed, [marker for marker in FAILURE_MARKERS if marker in found]
 
 

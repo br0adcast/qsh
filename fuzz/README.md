@@ -179,7 +179,8 @@ new `$run` directory for every run. A failing input is written to
 
 The CI smoke check is `fuzz/tools/run_smoke.py`. It makes the same owned copies
 under a work directory that must not exist yet, runs every listed target and
-fails on a nonzero exit, a wall-clock timeout, a missing `DONE` marker, a
+fails on a nonzero exit, a wall-clock timeout, a missing `#N DONE` completion
+line (recognized within the first 256 bytes of a line), a
 retained artifact or a sanitizer/panic marker anywhere in the output, printing
 every reason with the last lines of the log. The complete output is classified
 before the retained log is cut to its last 4 MiB. The runner reaps a target only

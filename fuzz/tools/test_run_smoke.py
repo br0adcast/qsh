@@ -276,6 +276,35 @@ class ScanTests(unittest.TestCase):
     def test_completion_at_end_without_newline_is_found(self):
         self.assertEqual(self.scan(b"line\n#12 DONE", chunk=3), (True, []))
 
+    def scan_all_chunkings(self, data):
+        """scan() results for read sizes around every relevant boundary."""
+        head = run_smoke.LINE_HEAD
+        return {self.scan(data, chunk=chunk)[0]
+                for chunk in (1, 3, 4, 8, head - 1, head, head + 1, head + 2, 64 * 1024)}
+
+    def test_word_continuing_after_done_is_not_completion(self):
+        # DONE ends exactly at the end of the bounded line prefix.
+        padding = b" " * (run_smoke.LINE_HEAD - len(b"#1DONE"))
+        for data in [b"#1" + padding + b"DONEX\n", b"#1" + padding + b"DONEX",
+                     b"#1" + padding + b"DONE_" + b"x" * 500 + b"\n",
+                     b"#9 DONEX\n", b"#9 DONE_\n", b"#9 DONEX"]:
+            with self.subTest(data=data[-12:]):
+                self.assertEqual(self.scan_all_chunkings(data), {False})
+
+    def test_real_delimiter_or_end_after_done_is_completion(self):
+        padding = b" " * (run_smoke.LINE_HEAD - len(b"#1DONE"))
+        for data in [b"#1" + padding + b"DONE\n", b"#1" + padding + b"DONE",
+                     b"#1" + padding + b"DONE cov: 1" + b"x" * 500 + b"\n",
+                     b"#1" + padding + b"DONE\t" + b"x" * 500,
+                     b"#9 DONE\n", b"#9 DONE", b"line\n#1000\tDONE   cov: 2 ft: 3\n"]:
+            with self.subTest(data=data[-12:]):
+                self.assertEqual(self.scan_all_chunkings(data), {True})
+
+    def test_completion_beyond_the_bounded_prefix_is_not_accepted(self):
+        # Fails closed: the marker must lie within the first LINE_HEAD bytes.
+        padding = b" " * (run_smoke.LINE_HEAD - len(b"#1DONE") + 1)
+        self.assertEqual(self.scan_all_chunkings(b"#1" + padding + b"DONE\n"), {False})
+
     def test_completion_counts_only_at_a_line_start(self):
         completed, markers = self.scan(b"note #9 DONE\n" + b"a" * 20 + b"#9 DONE\n", chunk=8)
         self.assertFalse(completed)
