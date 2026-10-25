@@ -750,6 +750,7 @@ impl ResizeRig {
             }),
             input_consumed: 0,
             last_acked: 0,
+            echo: Default::default(),
             gate: Arc::new(SendGate::new(GateKind::Pipe)),
             screened: false,
             stale: false,
@@ -5411,3 +5412,5 @@ async fn a_writable_that_finds_the_gate_shut_again_waits_for_the_next() {
         ]
     );
 }
+
+include!("channel_server_deadline_tests.rs");

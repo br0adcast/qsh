@@ -466,3 +466,5 @@ fn cleanup143_exact_completion_clears_observation_even_without_a_retiring_map_en
     drop(reaps);
     runtime.shutdown_timeout(Duration::from_secs(2));
 }
+
+include!("channel_reap_deadline_tests.rs");

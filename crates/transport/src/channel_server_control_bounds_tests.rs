@@ -142,7 +142,8 @@ struct ResetAdmissionHooks;
 impl Drop for ResetAdmissionHooks {
     fn drop(&mut self) {
         CONTROL_REFUND_BEFORE_SELECT.with(|hook| drop(hook.borrow_mut().take()));
-        CONTROL_FIRST_ACK_TICK.with(|slot| drop(slot.borrow_mut().take()));
+        CONTROL_BEFORE_SELECT.with(|slot| drop(slot.borrow_mut().take()));
+        SESSION_TIMER_WAKE.with(|slot| drop(slot.borrow_mut().take()));
     }
 }
 
@@ -168,13 +169,13 @@ async fn capacity_about_refund_between_admission_check_and_select_remains_ready(
         }));
     });
     let first_tick = Arc::new(tokio::sync::Notify::new());
-    CONTROL_FIRST_ACK_TICK.with(|slot| *slot.borrow_mut() = Some(first_tick.clone()));
+    CONTROL_BEFORE_SELECT.with(|slot| *slot.borrow_mut() = Some(first_tick.clone()));
     let runner = tokio::spawn(run_channel_session_with(
         io,
         FakeSpawner::new(),
         with_daemon(&FakeDaemon::new()),
     ));
-    // Positively observe the real initial tick before submitting the request.
+    // Positively observe the first registered select before submitting the request.
     // The paused clock then has no unrelated ready timer in the race window.
     tokio::time::timeout(std::time::Duration::from_secs(5), first_tick.notified())
         .await
@@ -207,6 +208,6 @@ async fn capacity_about_refund_between_admission_check_and_select_remains_ready(
     );
     assert_eq!(
         capacity_wakes, 1,
-        "refund must wake select before the next actual ACK tick rescues progress"
+        "refund must wake select before the any unrelated timer can rescue progress"
     );
 }

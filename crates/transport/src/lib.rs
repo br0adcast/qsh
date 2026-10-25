@@ -100,3 +100,6 @@ mod tests {
         assert!(version().starts_with("transport-core "));
     }
 }
+
+#[cfg(feature = "tokio-driver")]
+mod session_deadline;

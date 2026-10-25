@@ -169,6 +169,17 @@ pub enum LeaderStatus {
     Unknown(String),
 }
 
+/// How a live child's non-reaping leader status becomes observable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveObservation {
+    /// Portable bounded observation; no permanent blocking worker is retained.
+    Poll,
+    /// Exact backend notifications include leader exit and connection loss.
+    Notification,
+    /// No independent leader observation (reader EOF still starts retirement).
+    Unavailable,
+}
+
 /// Exclusive child lifecycle operations. The runner calls observation/stop on
 /// blocking workers; a pending or failed observation never releases custody.
 pub trait ChannelWait: Send {
@@ -182,7 +193,13 @@ pub trait ChannelWait: Send {
         None
     }
 
-    /// Wake a parked retirement owner after an exact backend receipt arrives.
+    /// Notification-only implementations must install/recheck sticky evidence
+    /// in set_reap_notifier. The first owned observation always bootstraps it.
+    fn active_observation(&self) -> ActiveObservation {
+        ActiveObservation::Poll
+    }
+
+    /// Wake the exact exclusive owner when leader or cleanup evidence arrives.
     fn set_reap_notifier(&mut self, _notifier: ReapNotifier) {}
 
     /// Force the process down. Called only where the process is not already
@@ -1189,6 +1206,7 @@ struct Channel {
     /// channel rather than per session.
     input_consumed: u64,
     last_acked: u64,
+    echo: crate::session_deadline::EchoDeadline,
     /// The channel's send gate (spec §4.7.2). A screen channel's is looked
     /// at here, per chunk; a line channel's by its reader, before each read.
     gate: Arc<SendGate>,
@@ -1476,8 +1494,28 @@ fn emit_data(io: &SessionIo, ch: &mut Channel, bytes: &[u8]) {
     );
 }
 fn emit_ack(io: &SessionIo, ch: &mut Channel) {
-    let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) else {
-        return;
+    // Repaint owes an ACK even when its offset is unchanged (including zero).
+    // Preserve that obligation across denied admission, not just moved offsets.
+    ch.echo.require();
+    let permit = loop {
+        if let Some(permit) = ch.producer.timeline.try_reserve(EntryClass::Ordinary, 13) {
+            break permit;
+        }
+        ch.echo.block();
+        // The timeline has one coalesced waiter. Never replace a checkpoint or
+        // deferred geometry dependency with the lower-priority echo obligation.
+        if ch.producer.checkpoint_due || ch.producer.deferred.is_some() {
+            return;
+        }
+        match ch.producer.timeline.register_waiter_for(
+            ChannelInstance::new(ch.instance).unwrap(),
+            ch.producer.origin.generation,
+            EntryClass::Ordinary,
+            13,
+        ) {
+            WaitRegistration::Ready => continue,
+            WaitRegistration::Waiting | WaitRegistration::Retired => return,
+        }
     };
     io.send_channel_output(
         ch.request.stream,
@@ -1488,6 +1526,7 @@ fn emit_ack(io: &SessionIo, ch: &mut Channel) {
         None,
     );
     ch.last_acked = ch.input_consumed;
+    ch.echo.accepted();
 }
 fn process_resize(io: &SessionIo, ch: &mut Channel, request: ResizeIntent) -> bool {
     if ch.producer.reply_failed {
@@ -1658,13 +1697,51 @@ fn resume_producer(io: &SessionIo, ch: &mut Channel) {
     if ch.screened && ch.stale && ch.gate.is_open() {
         repaint_stale(io, ch.request.stream, ch);
     }
+    retry_echo(io, ch);
+}
+
+fn retry_echo(io: &SessionIo, ch: &mut Channel) {
+    if ch.input_consumed == ch.last_acked && !ch.echo.pending() {
+        return;
+    }
+    ch.echo.block();
+    if ch.stale
+        || !ch.gate.is_open()
+        || ch.producer.checkpoint_due
+        || ch.producer.deferred.is_some()
+        || ch.producer.reply_failed
+        || ch.producer.eof
+        || ch.producer.failed
+    {
+        return;
+    }
+    ch.echo.retry(tokio::time::Instant::now().into_std());
+    emit_ack(io, ch);
+}
+
+fn retry_blocked_echo(io: &SessionIo, ch: &mut Channel) {
+    if ch.echo.blocked() {
+        retry_echo(io, ch);
+    }
+}
+
+fn channel_deadline(ch: &Channel) -> Option<std::time::Instant> {
+    if ch.producer.reply_failed || ch.producer.eof {
+        return None;
+    }
+    ch.screen
+        .sync_deadline()
+        .into_iter()
+        .chain(ch.echo.deadline())
+        .min()
 }
 
 #[cfg(test)]
 thread_local! {
     static CONTROL_REFUND_BEFORE_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CONTROL_BEFORE_SELECT: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
     static CONTROL_CAPACITY_WAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CONTROL_FIRST_ACK_TICK: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
+    static SESSION_TIMER_WAKE: std::cell::RefCell<Option<Arc<tokio::sync::Notify>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What woke the runner loop.
@@ -1675,8 +1752,8 @@ enum Wakeup {
     /// Output tagged with which channel produced it (`None` chunk = that
     /// channel's reader hit EOF, i.e. its process ended).
     ChannelOut(Option<(u8, u64, Option<Vec<u8>>)>),
-    /// The short echo_ack flush timer, as in `serve_shell`.
-    AckTick,
+    /// The nearest actual echo, synchronized-output or active-observer deadline.
+    Deadline,
     ControlReady,
     CapacityReady,
     About(AboutResult),
@@ -1712,6 +1789,7 @@ fn reset_attachment_outputs(
             reset_producer(ch, context);
             ch.input_consumed = 0;
             ch.last_acked = 0;
+            ch.echo.reset();
             // The same rule `open_channel` uses: ask the channel's
             // OWN screen model, not `ch.request.screen` (what the
             // client originally asked for) -- see
@@ -1895,12 +1973,30 @@ pub async fn run_channel_session_with(
     let (chan_out_tx, mut chan_out_rx) =
         mpsc::channel::<(u8, u64, Option<Vec<u8>>)>(CHANNEL_CAPACITY);
 
-    // Short echo_ack flush timer -- as in `serve_shell`, but swept over every
-    // open channel each tick rather than a single counter.
-    let mut ack_tick = tokio::time::interval(std::time::Duration::from_millis(20));
-    ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Native leader observation still needs a portable bounded poll. Empty,
+    // notification-only, Unknown and retiring owners do not arm this deadline;
+    // retirement has its own exact-owner observation/receipt/join machinery.
+    let mut observe_due: Option<std::time::Instant> = None;
 
     loop {
+        let now = tokio::time::Instant::now().into_std();
+        for ch in channels.values_mut() {
+            if ch.screen.sync_deadline().is_some_and(|due| due <= now) {
+                flush_due_terminal_output(&io, ch, now);
+            }
+            if ch.echo.deadline().is_some_and(|due| due <= now) {
+                retry_echo(&io, ch);
+            }
+        }
+        if observe_due.is_some_and(|due| due <= now) {
+            reaps.observe_active();
+            observe_due = None;
+        }
+        if reaps.needs_active_observation() {
+            observe_due.get_or_insert(now + std::time::Duration::from_millis(20));
+        } else {
+            observe_due = None;
+        }
         // Register before admission checks, including the refund/select race.
         let capacity_changed = global_budget.changed();
         tokio::pin!(capacity_changed);
@@ -2021,6 +2117,20 @@ pub async fn run_channel_session_with(
                 refund();
             }
         }
+        for ch in channels.values_mut() {
+            retry_blocked_echo(&io, ch);
+        }
+        let deadline = channels
+            .values()
+            .filter_map(channel_deadline)
+            .chain(observe_due)
+            .min();
+        #[cfg(test)]
+        CONTROL_BEFORE_SELECT.with(|slot| {
+            if let Some(ready) = slot.borrow_mut().take() {
+                ready.notify_one();
+            }
+        });
         // Accept is committed before the peer can send valid image bytes.
         // Observe its ready receipt before polling inbound data, preserving
         // fairness among all the ordinary runner arms in the inner select.
@@ -2034,7 +2144,7 @@ pub async fn run_channel_session_with(
                     about = next_about(&mut update.about) => Wakeup::About(about),
                     ev = io.recv(), if !retiring => Wakeup::Inbound(ev),
                     c = chan_out_rx.recv() => Wakeup::ChannelOut(c),
-                    _ = ack_tick.tick() => Wakeup::AckTick,
+                    _ = crate::session_deadline::wait(deadline) => Wakeup::Deadline,
                     _ = producer.ready.notified() => Wakeup::OutputReady,
                     _ = producer.opens.notified() => Wakeup::OpenReady,
                     done = reaps.next_event(), if !reaps.is_empty() => Wakeup::Reaped(done),
@@ -2083,6 +2193,7 @@ pub async fn run_channel_session_with(
                         Ok(Some(chunk)) => {
                             // Echo offsets cover admitted network input only.
                             ch.input_consumed += n as u64;
+                            ch.echo.input(tokio::time::Instant::now().into_std());
                             if ch
                                 .input_tx
                                 .as_ref()
@@ -2173,6 +2284,7 @@ pub async fn run_channel_session_with(
                     if ch.stale && ch.gate.is_open() {
                         repaint_stale(&io, stream, ch);
                     }
+                    retry_echo(&io, ch);
                 }
             }
             // An ended channel's output is delivered: its `Exit` now, unless
@@ -2295,29 +2407,15 @@ pub async fn run_channel_session_with(
                 // life, so the shared channel never runs dry while the loop
                 // is still running.
             }
-            Wakeup::AckTick => {
-                reaps.observe_active();
+            Wakeup::Deadline => {
                 #[cfg(test)]
-                {
-                    let fence = CONTROL_FIRST_ACK_TICK.with(|slot| slot.borrow_mut().take());
-                    if let Some(fence) = fence {
-                        fence.notify_one();
+                SESSION_TIMER_WAKE.with(|slot| {
+                    if let Some(ready) = slot.borrow_mut().take() {
+                        ready.notify_one();
                     }
-                }
-                let now = std::time::Instant::now();
-                // Flush a pending echo_ack per channel: input advanced but no
-                // output happened (the program silently ate a keystroke).
-                for (stream, ch) in channels.iter_mut() {
-                    // Parser deadlines belong to models, independent of output
-                    // gates and prediction. Admission never waits for a writer.
-                    flush_due_terminal_output(&io, ch, now);
-                    // Behind a closed gate, and until the repaint, the ack
-                    // waits for the repaint (see repaint_stale).
-                    if ch.stale || !ch.gate.is_open() {
-                        continue;
-                    }
-                    send_echo_ack_if_moved(&io, *stream, ch);
-                }
+                });
+                // Due work is serviced at the next bounded turn, including
+                // turns awakened by other ready sources.
             }
             Wakeup::Restart(_observed) => {
                 let signal = update.current_signal();
@@ -3233,6 +3331,7 @@ impl<'a> PreparedInstallation<'a> {
             screen,
             input_consumed: 0,
             last_acked: 0,
+            echo: Default::default(),
             gate: self.gate,
             screened: false,
             stale: false,
@@ -3278,6 +3377,9 @@ impl ChannelWait for IoOwnedWait {
         ChildStatus::Reaped {
             code: self.reaped.unwrap(),
         }
+    }
+    fn active_observation(&self) -> ActiveObservation {
+        self.child.active_observation()
     }
     fn set_reap_notifier(&mut self, notifier: ReapNotifier) {
         self.child.set_reap_notifier(notifier.clone());

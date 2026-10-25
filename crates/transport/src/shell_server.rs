@@ -54,7 +54,6 @@
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::time::Instant;
 use terminal_size::TerminalSize;
 
 use tokio::net::UdpSocket;
@@ -236,7 +235,6 @@ enum Wakeup {
     Packet(std::io::Result<(usize, SocketAddr)>),
     Timeout,
     PtyOut(Option<Vec<u8>>),
-    AckTick,
 }
 
 fn legacy_shell_config(mut cfg: ConnectionConfig) -> ConnectionConfig {
@@ -305,11 +303,10 @@ pub async fn serve_shell(
     // and the last value sent (so we don't send unchanged values).
     let mut input_consumed: u64 = 0;
     let mut last_acked: u64 = 0;
-    // Short echo_ack flush timer: if input advanced but there was no output
+    // Coalesced echo deadline: if input advanced but there was no output
     // (the program silently ate a keystroke), the acknowledgment still goes
     // out.
-    let mut ack_tick = tokio::time::interval(std::time::Duration::from_millis(20));
-    ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut echo = crate::session_deadline::EchoDeadline::default();
 
     loop {
         // The nearest timer of the current connection (if any).
@@ -318,30 +315,16 @@ pub async fn serve_shell(
             .and_then(Connection::next_timeout)
             .into_iter()
             .chain(pending.next_timeout())
+            .chain(echo.deadline())
             .min();
 
-        let wakeup = match next {
-            Some(deadline) => {
-                let dur = deadline.saturating_duration_since(Instant::now());
-                tokio::select! {
-                    r = socket.recv_from(&mut buf) => Wakeup::Packet(r),
-                    _ = tokio::time::sleep(dur) => Wakeup::Timeout,
-                    c = pty_out_rx.recv() => Wakeup::PtyOut(c),
-                    _ = ack_tick.tick() => Wakeup::AckTick,
-                }
-            }
-            // No timers (no session, or it's closed) -- wait for a packet or
-            // PTY output.
-            None => {
-                tokio::select! {
-                    r = socket.recv_from(&mut buf) => Wakeup::Packet(r),
-                    c = pty_out_rx.recv() => Wakeup::PtyOut(c),
-                    _ = ack_tick.tick() => Wakeup::AckTick,
-                }
-            }
+        let wakeup = tokio::select! {
+            r = socket.recv_from(&mut buf) => Wakeup::Packet(r),
+            _ = crate::session_deadline::wait(next) => Wakeup::Timeout,
+            c = pty_out_rx.recv() => Wakeup::PtyOut(c),
         };
 
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         let mut out: Vec<Datagram> = Vec::new();
         let mut admitted_events = Vec::new();
 
@@ -355,6 +338,7 @@ pub async fn serve_shell(
                         control_buf.clear();
                         input_consumed = 0;
                         last_acked = 0;
+                        echo.reset();
                     }
                     PacketResult::Handled => {}
                     PacketResult::Unrelated => {
@@ -395,22 +379,19 @@ pub async fn serve_shell(
                 // The PTY reader finished -- the shell exited. Wind down.
                 break;
             }
-            Wakeup::AckTick => {
-                // Flush echo_ack on the short timer: input advanced but no
-                // PTY output happened (the program silently ate a
-                // keystroke, e.g. a password prompt or a control sequence)
-                // -- the acknowledgment must still reach the client.
-                if let Some(c) = conn.as_mut() {
-                    if input_consumed != last_acked {
-                        out.extend(c.send(
-                            now,
-                            STREAM_IO,
-                            &encode_record(REC_ECHO_ACK, &input_consumed.to_be_bytes()),
-                        ));
-                        last_acked = input_consumed;
-                    }
+        }
+        if echo.deadline().is_some_and(|due| due <= now) {
+            if let Some(c) = conn.as_mut() {
+                if input_consumed != last_acked {
+                    out.extend(c.send(
+                        now,
+                        STREAM_IO,
+                        &encode_record(REC_ECHO_ACK, &input_consumed.to_be_bytes()),
+                    ));
+                    last_acked = input_consumed;
                 }
             }
+            echo.accepted();
         }
 
         pending.on_timeout(now, &mut out);
@@ -437,6 +418,11 @@ pub async fn serve_shell(
         if reset {
             conn = None;
             control_buf.clear();
+            echo.reset();
+        } else if input_consumed != last_acked {
+            echo.input(now);
+        } else {
+            echo.accepted();
         }
     }
 
@@ -622,13 +608,15 @@ mod tests {
         }
     }
 
-    struct ReplacementWriter(std::sync::mpsc::Sender<Vec<u8>>);
+    struct ReplacementWriter(std::sync::mpsc::Sender<Vec<u8>>, bool);
 
     impl std::io::Write for ReplacementWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .send(bytes.to_vec())
-                .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            if !self.1 {
+                self.0
+                    .send(bytes.to_vec())
+                    .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -678,6 +666,9 @@ mod tests {
 
     impl ReplacementRig {
         async fn new(keys: &[crate::handshake::Keypair]) -> Self {
+            Self::new_with_echo(keys, true).await
+        }
+        async fn new_with_echo(keys: &[crate::handshake::Keypair], echo: bool) -> Self {
             let server_key = crate::handshake::generate_keypair();
             let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = server_socket.local_addr().unwrap();
@@ -694,7 +685,7 @@ mod tests {
                     auth: AuthPolicy::Allowlist(keys.iter().map(|k| k.public).collect()),
                 },
                 Box::new(ReplacementReader(echo_rx)),
-                Box::new(ReplacementWriter(echo_tx)),
+                Box::new(ReplacementWriter(echo_tx, !echo)),
                 Box::new(SharedResize(resize.clone())),
             ));
             Self {
@@ -790,6 +781,16 @@ mod tests {
             };
             stranger.send_to(&packet, self.addr).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn deadlines302_diagnostic_silent_input_acknowledges_without_output() {
+        let key = crate::handshake::generate_keypair();
+        let mut rig = ReplacementRig::new_with_echo(&[key], false).await;
+        rig.connect().await;
+        rig.send(0, b"quiet").await;
+        rig.until(|r| r.ack == 5).await;
+        assert!(rig.output.is_empty());
     }
 
     async fn rejected_replacement_case(kind: u8) {
