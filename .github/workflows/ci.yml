@@ -121,6 +121,7 @@ jobs:
             --require file::tests::rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records \
             --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
             --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
+          grep -F 'test result: ok. 47 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Release cache authority on macOS
         shell: bash
         run: |
