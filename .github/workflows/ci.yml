@@ -79,6 +79,44 @@ jobs:
           cargo test --lib --no-run --locked
           -p bringup -p client -p connect -p knock -p logging
           -p prediction -p render -p ssh -p terminal -p terminal-size
+      - name: Native client log-path authority and rotation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-log-authority.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p logging --lib --locked -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/results.log"
+          scripts/no-silent-skips.sh "$runtime/results.log" \
+            --require file_path_tests::authority_leaf_aliases_never_modify_outside_sentinels \
+            --require file_path_tests::authority_generic_parent_is_never_repaired \
+            --require file_path_tests::authority_declared_parent_and_file_are_repaired \
+            --require file_path_tests::authority_failed_or_unestablished_repair_never_authorizes_a_write \
+            --require file_path_tests::authority_search_only_ancestor_needs_no_directory_read_permission \
+            --require file_path_tests::authority_trusted_absolute_and_relative_directory_aliases_work \
+            --require file_path_tests::authority_directory_alias_count_is_bounded \
+            --require file_path_tests::authority_fifo_leaf_is_refused_without_blocking_or_parent_repair \
+            --require file_path_tests::authority_darwin_var_alias_is_traversed_natively \
+            --require file_path_tests::route_held_file_metadata_changes_are_refused_and_recover \
+            --require file_path_tests::route_observed_metadata_change_after_refresh_prevents_append \
+            --require file_path_tests::route_rotation_refuses_aliases_and_preserves_outside_metadata \
+            --require file_path_tests::route_declared_alias_replacement_revalidates_ancestors_even_for_same_inode \
+            --require file_path_tests::route_relative_path_is_captured_before_later_cwd_changes \
+            --require tests::two_sinks_two_threads_keep_lines_whole \
+            --require file::tests::rotation_bound_failed_reopen_does_not_grow_retained_inode_and_recovers \
+            --require file::tests::rotation_bound_failed_rename_drops_until_rotation_recovers \
+            --require file::tests::rotation_bound_missing_or_replaced_parent_does_not_extend_old_file \
+            --require file::tests::rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records \
+            --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
+            --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
+          grep -F 'test result: ok. 42 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Compile the bringup standalone target boundary
         run: |
           echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."

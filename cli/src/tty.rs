@@ -1118,7 +1118,11 @@ mod tests {
     /// this process would take the test runner's own stderr with it.
     /// Returns the child's exit status, its stderr and what it set aside.
     fn run_child(case: &str) -> (std::process::ExitStatus, String, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private tempdir");
         let aside = dir.path().join("aside");
         let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args([
