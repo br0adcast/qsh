@@ -39,15 +39,21 @@ fn control_client_rejects_peer_before_sending_request() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("control");
             let listener = UnixListener::bind(&path).unwrap();
+            let (ready, configured) = std::sync::mpsc::channel();
             let observer = std::thread::spawn(move || {
                 // The client connects synchronously before applying the seam.
                 let mut stream = super::peer_fixture::accept(
                     &listener,
                     std::time::Instant::now() + Duration::from_secs(2),
                 );
+                // Accepted sockets inherit the nonblocking listener mode on Darwin.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
+                // Darwin rejects socket options after the peer has closed.
+                // Install the bound before allowing the rejection seam to close it.
+                ready.send(()).unwrap();
                 let mut bytes = Vec::new();
                 stream.read_to_end(&mut bytes).unwrap();
                 bytes
@@ -57,6 +63,9 @@ fn control_client_rejects_peer_before_sending_request() {
                 &request,
                 Duration::from_millis(50),
                 |stream| {
+                    configured
+                        .recv_timeout(Duration::from_secs(2))
+                        .context("waiting for the owned observer read timeout")?;
                     let actual = peer_uid(stream)?;
                     if retrieval_error {
                         require_same_account(
@@ -69,10 +78,22 @@ fn control_client_rejects_peer_before_sending_request() {
                 },
             );
             let bytes = observer.join().unwrap();
-            assert!(
-                result.is_err(),
-                "credential failure must be a hard error: {result:?}"
-            );
+            let error = result.expect_err("credential failure must be a hard error");
+            if retrieval_error {
+                assert_eq!(error.to_string(), "reading control peer credentials");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::EIO)
+                );
+            } else {
+                assert_eq!(
+                    error.to_string(),
+                    "control peer belongs to a different effective account"
+                );
+            }
             assert!(bytes.is_empty(), "a rejected server received request bytes");
         }
     }
