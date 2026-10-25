@@ -435,6 +435,7 @@ impl Session {
                 actions.extend(self.leave(1));
                 let message = match failure {
                     LocalInputFailure::Channel(error) => format!("qsh: local channel write was not accepted ({error:?})"),
+                    LocalInputFailure::Accepted(transport::driver_std::InputFailure::DriverUnavailable) => "qsh: local transport wait or socket failed after input admission".into(),
                     LocalInputFailure::Accepted(transport::driver_std::InputFailure::OffsetSpaceExhausted { stream_id }) => format!(
                         "qsh: accepted input on stream {stream_id} exceeded transport offset space; input was not replayed"
                     ),
@@ -1702,6 +1703,29 @@ mod tests {
                 .collect();
             assert!(text.contains("file logging disabled"), "{text}");
         }
+    }
+
+    #[test]
+    fn wake300_driver_unavailable_is_a_terminal_local_notice_without_replay() {
+        let mut s = session();
+        let event = UiEvent::InputFailure(LocalInputFailure::Accepted(
+            transport::driver_std::InputFailure::DriverUnavailable,
+        ));
+        let actions = s.handle(event, 0);
+        assert!(actions.contains(&Action::Keep));
+        assert!(actions.contains(&Action::Exit(1)));
+        assert!(actions.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("local transport wait or socket failed"))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::SendChannel { .. })));
+        assert!(s
+            .handle(
+                UiEvent::InputFailure(LocalInputFailure::Accepted(
+                    transport::driver_std::InputFailure::DriverUnavailable
+                )),
+                1
+            )
+            .is_empty());
     }
 
     #[test]

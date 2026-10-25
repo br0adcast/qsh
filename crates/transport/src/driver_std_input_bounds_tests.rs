@@ -127,7 +127,7 @@ fn client179_withheld_ack_and_credit_bound_actual_reliable_input() {
 fn client179_command_fixture(limit: usize, entries: usize) -> (StdClient, Receiver<Command>) {
     let (tx, rx) = mpsc::channel();
     let mut client = StdClient::dead();
-    client.tx = Mutex::new(tx);
+    client.tx = Mutex::new(wait::WakeSender::new(tx, client.wake.clone()));
     client.stop.store(0, Ordering::SeqCst);
     client.driver_thread = Some(thread::spawn(|| thread::current().id()).join().unwrap());
     client.input_budget = ClientInputBudget::with_limits(limit, entries);

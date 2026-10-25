@@ -1453,6 +1453,8 @@ fn dropping_the_command_channel_ends_the_driver_even_with_a_signer() {
     });
 
     let (tx, rx) = mpsc::channel::<Command>();
+    let wake = Arc::new(wait::Notifier::default());
+    let tx = wait::WakeSender::new(tx, wake.clone());
     let (state_tx, state_rx) = mpsc::channel::<LinkState>();
     let stats = Arc::new(Mutex::new(Stats::default()));
     let binder: Arc<dyn Binder> = Arc::new(OkBinder);
@@ -1479,6 +1481,7 @@ fn dropping_the_command_channel_ends_the_driver_even_with_a_signer() {
             signer,
             DriverSetup::default(),
             rx,
+            wake,
             Arc::new(AtomicU8::new(0)),
             stats,
             Arc::new(AtomicBool::new(false)),
@@ -2168,7 +2171,7 @@ fn path_down_arrives_on_time_while_junk_floods_the_socket() {
 
 /// Review focus: the drain of already-arrived datagrams takes what is
 /// waiting and puts the socket back into blocking mode -- a socket left
-/// non-blocking would turn the loop's timed `recv_from` into a busy spin.
+/// non-blocking would change the existing blocking UDP send behavior.
 #[test]
 fn draining_ready_datagrams_takes_what_is_waiting_and_leaves_the_socket_blocking() {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -2182,7 +2185,14 @@ fn draining_ready_datagrams_takes_what_is_waiting_and_leaves_the_socket_blocking
     let client_kp = crate::handshake::generate_keypair();
     let mut conn = Connection::new(client_cfg(client_kp.private, server_kp.public));
     let mut buf = vec![0u8; RECV_BUF_LEN];
-    let out = drain_ready(&sock, &mut conn, &mut buf, READY_DRAIN_MAX);
+    let out = drain_ready(
+        &sock,
+        &mut conn,
+        &mut buf,
+        READY_DRAIN_MAX,
+        &wait::Clock::default(),
+    )
+    .unwrap();
     assert!(out.is_empty(), "junk draws no answer");
     sock.set_read_timeout(Some(Duration::from_millis(100)))
         .expect("read timeout");
@@ -2802,6 +2812,7 @@ fn a_client_counting_explicitly_is_held_to_a_window_until_it_reports() {
         default_consumption: crate::conn::Consumption::Explicit,
         stream_consumption: Vec::new(),
         input_budget: None,
+        ..DriverSetup::default()
     };
     let data = vec![b'w'; 2 * 1024 * 1024];
     let (client, chunks, progress) =
@@ -2995,3 +3006,6 @@ fn capacity_wire_driver_reports_terminal_reason_before_same_batch_closed() {
     assert_eq!(state, LinkState::Closed);
 }
 include!("driver_std_input_bounds_tests.rs");
+
+#[path = "driver_std_wake_tests.rs"]
+mod wake_tests;
