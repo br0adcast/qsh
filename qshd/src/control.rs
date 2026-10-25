@@ -1100,21 +1100,51 @@ mod tests {
     /// budget -- the ordinary case.
     #[test]
     fn peer_answers_is_answered() {
+        fn answer(listener: UnixListener, deadline: std::time::Instant) {
+            let mut stream = super::peer_fixture::accept(&listener, deadline);
+            stream
+                .set_nonblocking(false)
+                .expect("restore blocking mode on the accepted fixture stream");
+            stream
+                .set_read_timeout(Some(ANSWER_TIMEOUT))
+                .expect("bound the fixture request read");
+            let mut request = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut request)
+                .expect("read the actual request before answering");
+            assert_eq!(request, "STATUS\n");
+            stream
+                .write_all(b"STATUS-OK\n")
+                .expect("write the canned response");
+        }
+
         let dir = tempfile::tempdir().expect("temp dir for the answering listener");
         let sock_path = dir.path().join("answers.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the answering listener");
         let server = std::thread::spawn(move || {
-            let (mut stream, _addr) = listener.accept().expect("accept one connection");
-            stream
-                .write_all(b"STATUS-OK\n")
-                .expect("write the canned response");
+            answer(listener, std::time::Instant::now() + ANSWER_TIMEOUT);
         });
 
         let reply =
-            client_request_with_timeout(&sock_path, &ControlRequest::Status, ANSWER_TIMEOUT)
-                .expect("an answered request is not an error");
-        assert_eq!(reply, ControlReply::Answered("STATUS-OK".to_string()));
+            client_request_with_timeout(&sock_path, &ControlRequest::Status, ANSWER_TIMEOUT);
         server.join().expect("answering thread does not panic");
+        assert_eq!(
+            reply.expect("an answered request is not an error"),
+            ControlReply::Answered("STATUS-OK".to_string())
+        );
+
+        let listener = UnixListener::bind(dir.path().join("no-connect.sock")).unwrap();
+        let observer = std::thread::spawn(move || {
+            answer(listener, std::time::Instant::now());
+        });
+        let failure = observer
+            .join()
+            .expect_err("expired accept must terminate the observer");
+        let message = failure
+            .downcast_ref::<String>()
+            .expect("the bounded accept reports its owned fixture error");
+        assert!(message.contains("owned peer accept failed"), "{message}");
+        assert!(message.contains("WouldBlock"), "{message}");
     }
 
     /// A peer that accepts the connection but NEVER answers (and never
