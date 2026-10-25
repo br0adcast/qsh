@@ -222,6 +222,74 @@ pub async fn run_transport_daemon_until_stop(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .context("switching the control socket to non-blocking mode")?;
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .context("adopting the control socket into tokio")?;
+
+    run_transport_daemon_with_acceptor(
+        socket,
+        server_priv,
+        auth,
+        backend,
+        listener,
+        ports,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        stop,
+    )
+    .await
+}
+
+/// Only errors that can clear while this listening socket remains valid are
+/// retried. Unknown errors remain fatal rather than hiding a broken listener.
+fn recoverable_control_accept(error: &std::io::Error) -> bool {
+    use nix::libc;
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    ) || matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+const CONTROL_ACCEPT_RETRY_INITIAL: Duration = Duration::from_millis(50);
+const CONTROL_ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+const CONTROL_ACCEPT_WARNING_INTERVAL: Duration = Duration::from_secs(5);
+
+trait ControlAcceptor {
+    fn accept(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<tokio::net::UnixStream>> + Send;
+}
+
+impl ControlAcceptor for tokio::net::UnixListener {
+    async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+        tokio::net::UnixListener::accept(self)
+            .await
+            .map(|(stream, _)| stream)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transport_daemon_with_acceptor(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    mut listener: impl ControlAcceptor,
+    ports: Vec<u16>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
     // Sized here, where every socket the daemon serves passes -- one it
     // bound, and one an older binary handed over on an update (spec §4.12).
     transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
@@ -230,12 +298,6 @@ pub async fn run_transport_daemon_until_stop(
         .context("switching the transport UDP socket to non-blocking mode")?;
     let socket = tokio::net::UdpSocket::from_std(socket)
         .context("adopting the transport UDP socket into tokio")?;
-
-    listener
-        .set_nonblocking(true)
-        .context("switching the control socket to non-blocking mode")?;
-    let listener = tokio::net::UnixListener::from_std(listener)
-        .context("adopting the control socket into tokio")?;
 
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
 
@@ -271,6 +333,9 @@ pub async fn run_transport_daemon_until_stop(
 
     tokio::pin!(stop);
     let mut trigger_error = None;
+    let mut retry_at = None;
+    let mut retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
+    let mut last_accept_warning: Option<tokio::time::Instant> = None;
     let completed = loop {
         tokio::select! {
             biased;
@@ -282,15 +347,35 @@ pub async fn run_transport_daemon_until_stop(
             result = &mut manager_loop => break Some(result),
             result = handlers.join_next(), if !handlers.is_empty() => {
                 if let Some(Err(error)) = result {
+                    // No accepted handler is deliberately aborted here. Panic
+                    // can mean poisoned shared allowlist state; cancellation
+                    // also loses an owned request. Fail closed and join all
+                    // remaining handlers and sessions instead of isolating it.
                     trigger_error = Some(anyhow::Error::new(error).context("joining transport control task"));
                     break None;
                 }
             }
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
-                    shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone()),
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => continue,
+            _ = async {
+                if let Some(deadline) = retry_at {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if retry_at.is_some() => retry_at = None,
+            accepted = listener.accept(), if retry_at.is_none() => match accepted {
+                Ok(stream) => {
+                    retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
+                    spawn_control_handler(&mut handlers, stream,
+                        shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
+                        active_count.clone(), control_gate.clone(), cleanup_registry.clone());
+                }
+                Err(error) if recoverable_control_accept(&error) => {
+                    let now = tokio::time::Instant::now();
+                    if last_accept_warning.is_none_or(|last| now.duration_since(last) >= CONTROL_ACCEPT_WARNING_INTERVAL) {
+                        log::warn("qshd", &format!("error accepting transport control connection; retrying: {error}"));
+                        last_accept_warning = Some(now);
+                    }
+                    retry_at = Some(now + retry_delay);
+                    retry_delay = (retry_delay * 2).min(CONTROL_ACCEPT_RETRY_MAX);
+                }
                 Err(error) => {
                     trigger_error = Some(anyhow::Error::new(error).context("accepting transport control connection"));
                     break None;
