@@ -15,6 +15,7 @@ resolver = "2"
 # Match the product parser, including qsh's bounded OSC handling.
 [patch.crates-io]
 vte = { path = "../vendor/vte" }
+alacritty_terminal = { path = "../vendor/alacritty_terminal" }
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
