@@ -107,6 +107,40 @@ export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="$OWNED/native-openssl"
 export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
 ```
 
+### Dependency source and lock preflight
+
+The standalone workspace repeats the product's `vendor/vte` patch so terminal
+fuzzing exercises the shipped parser, including its bounded OSC handling.
+`tools/check_dependencies.py` compares every shared resolved package's version
+and source identity (the canonical manifest path for local packages). Fuzz
+versions must occur in the product graph; extra product packages or versions
+are allowed. Equal version numbers alone do not establish source parity.
+
+The intentional fuzz-only packages are `qsh-channel-fuzz`, `libfuzzer-sys`, and
+its `arbitrary` and `jobserver` support dependencies. Features intentionally
+differ: the isolated parser harness does not enable product runtime/platform
+features, and its `ssh-key` edge names the public key type used by the harness.
+The check therefore does not require whole-graph or feature-set equality.
+Review feature changes separately when changing either manifest.
+
+Before setting `CARGO_NET_OFFLINE=true`, fetch with both committed locks. Then
+run the source check and record both hashes before building:
+
+```sh
+CARGO_NET_OFFLINE=false cargo fetch --locked --manifest-path Cargo.toml
+CARGO_NET_OFFLINE=false cargo fetch --locked --manifest-path fuzz/Cargo.toml
+python3 fuzz/tools/check_dependencies.py --offline
+sha256sum Cargo.lock fuzz/Cargo.lock > "$OWNED/fuzz-locks.sha256"
+CARGO_NET_OFFLINE=true cargo fuzz build --target x86_64-unknown-linux-gnu \
+  --target-dir "$CARGO_TARGET_DIR"
+sha256sum --check "$OWNED/fuzz-locks.sha256"
+```
+
+`cargo-fuzz 0.13.2` does not forward `--locked` to its build. Locked Cargo
+metadata preflight, offline compilation, and the before/after lock hashes
+prevent accepting a silently changed dependency graph. Commit intentional lock
+updates explicitly and repeat the source check after dependency changes.
+
 Generate the checked-in seeds and verify their inventory:
 
 ```sh
@@ -140,9 +174,12 @@ budgets. It only reads files; it does not execute a parser or a fuzz engine.
 ## CI strategy
 
 `.github/workflows/fuzz.yml` is limited to pull requests and pushes that touch
-`fuzz/`, the three parsers it covers, or the workflow itself, plus manual
-dispatch. It installs the pinned toolchain and verified `cargo-fuzz` source,
-builds all six ASAN targets, verifies every corpus manifest, and runs a short
+`fuzz/`, the four local crates it uses (`transport`, `sshauth`, `terminal`,
+and `terminal-size`), root dependency manifests/lock, vendored sources, native
+crypto build inputs, or the workflow itself, plus manual dispatch. It installs
+the pinned toolchain and verified `cargo-fuzz` source,
+checks locked source parity, builds all six ASAN targets offline with unchanged
+lock hashes, verifies every corpus manifest, and runs a short
 1,000-execution smoke per target. Continuous or scheduled fuzzing is not part
 of CI; longer mutation runs remain a local qualification step because their
 cost is not proportionate to every change.
