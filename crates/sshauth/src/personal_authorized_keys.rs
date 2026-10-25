@@ -328,11 +328,25 @@ mod tests {
         assert!(read(&link).is_ok());
         mode(&p, 0o600);
         assert!(read(&link).is_ok());
-        let bytes = d
-            .path()
-            .join(std::ffi::OsString::from_vec(b"keys-\xff".to_vec()));
-        file(&bytes);
-        assert!(read(&bytes).is_ok());
+        let name = std::ffi::OsString::from_vec(b"keys-\xff".to_vec());
+        assert_eq!(parts(name.as_bytes()), VecDeque::from([name.clone()]));
+        let bytes = d.path().join(name);
+        match std::fs::write(&bytes, "public keys\n") {
+            Ok(()) => {
+                mode(&bytes, 0o644);
+                assert_eq!(read(&bytes).unwrap(), "public keys\n");
+            }
+            Err(error) => {
+                // Some native filesystems reject this filename during creation.
+                // Exercise reader refusal on that same raw path, not an early
+                // return. Hardlink and invalid-content assertions always run.
+                assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{error}");
+                let lookup = std::fs::symlink_metadata(&bytes).unwrap_err();
+                let reader = read(&bytes).unwrap_err();
+                assert!(lookup.raw_os_error().is_some());
+                assert_eq!(reader.raw_os_error(), lookup.raw_os_error());
+            }
+        }
         std::fs::write(&p, [0xff]).unwrap();
         assert_eq!(read(&p).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
