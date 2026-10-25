@@ -90,6 +90,50 @@ impl Fixture {
         }
     }
 
+    pub(crate) fn wait_for_server_ready(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        self.wait_for_socket();
+        let ready = self.path.with_extension("ready");
+        while !ready.exists() {
+            assert!(
+                self.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "foreign server exited before its setup receipt"
+            );
+            let _ = self.remaining();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let metadata = std::fs::symlink_metadata(&ready).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.uid(), FOREIGN);
+        assert_eq!(
+            std::fs::read(&ready).unwrap(),
+            b"owned server setup complete"
+        );
+    }
+
+    /// Path authority follows the client, independently of the listener process.
+    pub(crate) fn own_path_for_client(&self, client_uid: u32, server_uid: u32) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        assert!(nix::unistd::geteuid().is_root());
+        let parent = self.path.parent().unwrap();
+        assert_eq!(parent, self._dir.path().join("child"));
+        let directory = std::fs::symlink_metadata(parent).unwrap();
+        assert!(directory.is_dir());
+        assert_eq!(directory.uid(), FOREIGN);
+        let socket = std::fs::symlink_metadata(&self.path).unwrap();
+        assert!(socket.file_type().is_socket());
+        assert_eq!(socket.uid(), server_uid);
+        assert_eq!(socket.mode() & 0o777, 0o666);
+        std::os::unix::fs::chown(parent, Some(client_uid), Some(client_uid)).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(&self.path, Some(client_uid), Some(client_uid)).unwrap();
+        assert_eq!(std::fs::symlink_metadata(parent).unwrap().uid(), client_uid);
+        assert_eq!(
+            std::fs::symlink_metadata(&self.path).unwrap().uid(),
+            client_uid
+        );
+    }
+
     pub(crate) fn finish(&mut self) {
         loop {
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
@@ -165,6 +209,13 @@ pub(crate) fn allow_fixture_connection(path: &Path) {
     // Permit the socket connect so EACCES cannot masquerade as peer rejection.
     // These modes apply only to this deliberately cross-account test fixture.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).unwrap();
+}
+
+pub(crate) fn mark_server_ready(path: &Path) {
+    assert_eq!(nix::unistd::geteuid().as_raw(), FOREIGN);
+    let temporary = path.with_extension("ready-new");
+    std::fs::write(&temporary, b"owned server setup complete").unwrap();
+    std::fs::rename(temporary, path.with_extension("ready")).unwrap();
 }
 
 pub(crate) fn accept(

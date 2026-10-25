@@ -98,10 +98,9 @@ async fn personal39_signal_preserves_a_failed_manager_outcome_after_all_joins() 
 }
 
 async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::control::private_test_dir().unwrap();
     let path = dir.path().join("control.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let cleanup = crate::control::SocketCleanup::capture(&listener, &path).unwrap();
+    let (listener, cleanup) = crate::control::bind_private_owned(&path).unwrap();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
     let server = generate_keypair();
@@ -482,7 +481,7 @@ async fn personal39_control_deadline_covers_the_gate_after_reading_the_request()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn personal39_signal_preserves_an_admitted_gate_held_stop_ack() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::control::private_test_dir().unwrap();
     let path = dir.path().join("control.sock");
     let gate = Arc::new(tokio::sync::RwLock::new(()));
     let held = gate.clone().write_owned().await;
@@ -645,8 +644,7 @@ fn spawn_control_fixture(
     allowlist: Arc<Mutex<Vec<[u8; 32]>>>,
     stop: impl Future<Output = anyhow::Result<()>> + Send + 'static,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
-    let cleanup = crate::control::SocketCleanup::capture(&listener, path).unwrap();
+    let (listener, cleanup) = crate::control::bind_private_owned(path).unwrap();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let server = generate_keypair();
     tokio::spawn(super::run_transport_daemon_until_stop(
@@ -682,7 +680,7 @@ fn spawn_control_fixture(
 #[tokio::test]
 async fn personal39_a_panicked_control_task_fails_the_joined_daemon() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::control::private_test_dir().unwrap();
     let path = dir.path().join("control.sock");
     let allowlist = Arc::new(Mutex::new(Vec::new()));
     let poisoned = allowlist.clone();

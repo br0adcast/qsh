@@ -11,6 +11,11 @@ use transport::handshake::Keypair;
 mod publication;
 mod trusted;
 
+/// Shared private directory policy; no key reading or permission repair.
+pub(crate) fn trusted_parent(path: &Path, create: bool) -> io::Result<(File, std::ffi::OsString)> {
+    trusted::resolve_parent(path, nix::unistd::Uid::effective(), create)
+}
+
 /// Load a persistent server Noise key, or atomically publish a new one if absent.
 ///
 /// The file holds 64 raw bytes: the 32-byte X25519 private key followed by its

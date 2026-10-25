@@ -17,7 +17,7 @@ fn control_peer_account_policy_has_no_root_or_group_bypass() {
 
 #[test]
 fn control_peer_same_account_uses_kernel_credentials() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = super::private_test_dir().unwrap();
     let path = dir.path().join("control");
     let listener = UnixListener::bind(&path).unwrap();
     let client = UnixStream::connect(&path).unwrap();
@@ -36,7 +36,7 @@ fn control_client_rejects_peer_before_sending_request() {
             ControlRequest::AddClient([7; 32]),
             ControlRequest::Stop,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::private_test_dir().unwrap();
             let path = dir.path().join("control");
             let listener = UnixListener::bind(&path).unwrap();
             let (ready, configured) = std::sync::mpsc::channel();
@@ -107,6 +107,7 @@ fn control_peer_root_client_rejects_foreign_server() {
         assert_eq!(role, "server");
         let listener = UnixListener::bind(&path).unwrap();
         peer_fixture::allow_fixture_connection(&path);
+        peer_fixture::mark_server_ready(&path);
         let mut stream = peer_fixture::accept(
             &listener,
             std::time::Instant::now() + Duration::from_secs(4),
@@ -125,11 +126,15 @@ fn control_peer_root_client_rejects_foreign_server() {
     }
     let mut fixture = Fixture::new();
     fixture.spawn(NAME, "server");
-    fixture.wait_for_socket();
+    fixture.wait_for_server_ready();
+    fixture.own_path_for_client(0, peer_fixture::FOREIGN);
     let result =
         client_request_with_timeout(&fixture.path, &ControlRequest::Status, fixture.remaining());
     fixture.finish();
-    assert!(format!("{:#}", result.unwrap_err()).contains("control peer"));
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "control peer belongs to a different effective account"
+    );
 }
 
 #[test]
@@ -141,7 +146,10 @@ fn control_peer_foreign_client_rejects_root_server() {
         let error =
             client_request_with_timeout(&path, &ControlRequest::Status, Duration::from_secs(4))
                 .unwrap_err();
-        assert!(format!("{error:#}").contains("control peer"));
+        assert_eq!(
+            error.to_string(),
+            "control peer belongs to a different effective account"
+        );
         return;
     }
     if !peer_fixture::enabled(NAME) {
@@ -150,6 +158,7 @@ fn control_peer_foreign_client_rejects_root_server() {
     let mut fixture = Fixture::new();
     let listener = UnixListener::bind(&fixture.path).unwrap();
     peer_fixture::allow_fixture_connection(&fixture.path);
+    fixture.own_path_for_client(peer_fixture::FOREIGN, 0);
     fixture.spawn(NAME, "client");
     let mut stream = peer_fixture::accept(&listener, fixture.deadline);
     assert_eq!(peer_uid(&stream).unwrap(), peer_fixture::FOREIGN);

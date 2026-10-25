@@ -104,7 +104,7 @@ fn alias_target(parent: &File, name: &std::ffi::OsStr, uid: Uid) -> io::Result<O
 /// Each subsequent lookup stays relative to an owned, verified directory.
 /// Parent aliases use this same traversal for their targets; canonicalize then
 /// reopen would not pin the object. Root/current UID may still change their data.
-fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<(File, OsString)> {
+pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<(File, OsString)> {
     let leaf = path
         .file_name()
         .ok_or_else(|| refused("host key path has no file name"))?
