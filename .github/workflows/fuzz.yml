@@ -1,0 +1,129 @@
+name: Fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/transport/**"
+      - "crates/sshauth/**"
+      - "crates/terminal/**"
+      - "crates/terminal-size/**"
+      - "scripts/build-openssl.sh"
+      - "scripts/build_openssl.py"
+      - "scripts/openssl/**"
+      - ".github/workflows/fuzz.yml"
+  push:
+    branches: [main]
+    paths:
+      - "fuzz/**"
+      - "crates/transport/**"
+      - "crates/sshauth/**"
+      - "crates/terminal/**"
+      - "crates/terminal-size/**"
+      - "scripts/build-openssl.sh"
+      - "scripts/build_openssl.py"
+      - "scripts/openssl/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: "nightly-2026-10-24"
+
+jobs:
+  fuzz-smoke:
+    name: Build and smoke the parser fuzz targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify the exact source commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install nightly-2026-10-24 --profile minimal --no-self-update
+
+      - name: Install the verified cargo-fuzz source
+        run: |
+          set -euo pipefail
+          crate="$RUNNER_TEMP/cargo-fuzz-0.13.2.crate"
+          source="$RUNNER_TEMP/cargo-fuzz-source"
+          mkdir -p "$source"
+          curl --fail --location --silent --show-error \
+            https://static.crates.io/crates/cargo-fuzz/cargo-fuzz-0.13.2.crate \
+            -o "$crate"
+          echo "5acfd01930e49823e58c30dd8012d3338a620377d7c7d4cc140ca4b2169400e2  $crate" \
+            | sha256sum --check -
+          tar -xzf "$crate" -C "$source"
+          cp fuzz/tools/cargo-fuzz-0.13.2.Cargo.lock \
+            "$source/cargo-fuzz-0.13.2/Cargo.lock"
+          cargo install --path "$source/cargo-fuzz-0.13.2" --locked \
+            --root "$RUNNER_TEMP/fuzz-tools"
+          echo "$RUNNER_TEMP/fuzz-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Build the pinned native crypto prefix
+        run: |
+          set -euo pipefail
+          prefix=$(bash scripts/build-openssl.sh \
+            --target x86_64-unknown-linux-gnu \
+            --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
+          echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: Verify every corpus inventory
+        run: |
+          set -euo pipefail
+          for target in channel_codec handshake_payload wire_datagram deframer \
+            authorized_keys terminal_feed_resize; do
+            python3 fuzz/tools/check_corpus.py \
+              "fuzz/corpus/$target/manifest.json" "fuzz/corpus/$target"
+          done
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s fuzz/tools -p 'test_check_corpus.py'
+
+      - name: Build all ASAN targets
+        run: |
+          set -euo pipefail
+          cargo fuzz build --target x86_64-unknown-linux-gnu \
+            --target-dir "$RUNNER_TEMP/fuzz-target"
+
+      - name: Run a bounded mutation smoke per target
+        run: |
+          set -euo pipefail
+          declare -A max_len=(
+            [channel_codec]=65537
+            [handshake_payload]=512
+            [wire_datagram]=2048
+            [deframer]=4096
+            [authorized_keys]=8192
+            [terminal_feed_resize]=8196
+          )
+          work="$RUNNER_TEMP/fuzz-smoke"
+          for target in "${!max_len[@]}"; do
+            corpus="$work/$target/corpus"
+            artifacts="$work/$target/artifacts"
+            mkdir -p "$corpus" "$artifacts"
+            cp fuzz/corpus/"$target"/* "$corpus/"
+            rm -f "$corpus/manifest.json"
+            log="$work/$target/run.log"
+            "$RUNNER_TEMP/fuzz-target/x86_64-unknown-linux-gnu/release/$target" \
+              "$corpus" -artifact_prefix="$artifacts/" -seed=1 \
+              -max_len="${max_len[$target]}" -runs=1000 -max_total_time=10 \
+              -timeout=2 -rss_limit_mb=512 -malloc_limit_mb=64 \
+              -print_final_stats=1 > "$log" 2>&1
+            grep -q "DONE" "$log"
+            test -z "$(find "$artifacts" -type f -print -quit)"
+            if grep -Eq "ERROR:|SUMMARY: AddressSanitizer|panicked at|deadly signal" "$log"; then
+              cat "$log"
+              exit 1
+            fi
+          done

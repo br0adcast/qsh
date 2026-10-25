@@ -1,0 +1,94 @@
+{
+  "format": "full datagram or fixed handshake body bytes",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "bad-kind",
+      "bytes": 2,
+      "sha256": "9d1c30a2a7e68aa057473e50d789160535797a9a133042c9c54eec2da5595dad"
+    },
+    {
+      "name": "cookie-init-body",
+      "bytes": 112,
+      "sha256": "d589ff6cd02989edd89685fa136623914f31b1f57d5378d11917a7ddad75f776"
+    },
+    {
+      "name": "cookie-init-datagram",
+      "bytes": 114,
+      "sha256": "184d39b23ecb3caee031e8f9fb1172a9e3feacb5acd82660a480bf5ad98192d9"
+    },
+    {
+      "name": "cookie-reply-body",
+      "bytes": 33,
+      "sha256": "ac05979db1d870714e966045aa4e7708eb451c6115acc308b3d905b7d87fca70"
+    },
+    {
+      "name": "cookie-reply-datagram",
+      "bytes": 35,
+      "sha256": "762630b09e3f7d627a5644baa10c8958b0062677d8794d2837fb3bc26a88200c"
+    },
+    {
+      "name": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "handshake-init-empty",
+      "bytes": 2,
+      "sha256": "99be5efb88ca2013bd8e4eb035fd42d5245468fe9afa70d8ba9c1c419a48c4e8"
+    },
+    {
+      "name": "handshake-resp-body",
+      "bytes": 6,
+      "sha256": "422059d8a8d0e9cdfe3151165de26afd23034ffece55edc706d1c9c6d815045f"
+    },
+    {
+      "name": "key-offer-body",
+      "bytes": 33,
+      "sha256": "a1d0a4860f3fa4d52de1a6edb36c31a4bf440e506f551dcb8b65ff543e3f5811"
+    },
+    {
+      "name": "key-offer-datagram",
+      "bytes": 35,
+      "sha256": "fe17508535b808e3206379dd202eaa9bf3c3d9fa307fe942005e5fa66c1f76fb"
+    },
+    {
+      "name": "key-offer-short",
+      "bytes": 32,
+      "sha256": "61654d245bb900424f09bb54ae535fb7017db1ef23860f7a85459c53d6dc45ec"
+    },
+    {
+      "name": "key-request",
+      "bytes": 64,
+      "sha256": "b4b148d0978bfaf771c49fed678275488b44d159e769a97bf92ba4bbaa0a655d"
+    },
+    {
+      "name": "one-byte",
+      "bytes": 1,
+      "sha256": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"
+    },
+    {
+      "name": "transport-aead",
+      "bytes": 34,
+      "sha256": "967f761b88410519b2a28ac395d9d6e305f61a2063f0efa5a3022452d8fda224"
+    },
+    {
+      "name": "transport-empty",
+      "bytes": 18,
+      "sha256": "ef666da560d6d34d529334c3349bf5c7680ea5de3de5cb7f93f01d67fdcc1b63"
+    },
+    {
+      "name": "transport-short",
+      "bytes": 4,
+      "sha256": "5a3e80a37915b1601c363acd1601df7ef257d5d32c664004a2ec0484a4f60628"
+    },
+    {
+      "name": "wrong-version",
+      "bytes": 2,
+      "sha256": "ea5dbf9596d187e9500f23e9a680109475341cf4e81f7e043f7d97152c10772f"
+    }
+  ]
+}

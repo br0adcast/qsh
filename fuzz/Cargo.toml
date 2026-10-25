@@ -1,0 +1,65 @@
+[package]
+name = "qsh-channel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+resolver = "2"
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+transport = { path = "../crates/transport", default-features = false }
+sshauth = { path = "../crates/sshauth" }
+terminal = { path = "../crates/terminal" }
+terminal-size = { path = "../crates/terminal-size" }
+# The same exact upstream parser sshauth passes to key_is_listed; this edge
+# only names the fixed public key type in the harness.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519"] }
+
+[[bin]]
+name = "channel_codec"
+path = "fuzz_targets/channel_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake_payload"
+path = "fuzz_targets/handshake_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_datagram"
+path = "fuzz_targets/wire_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deframer"
+path = "fuzz_targets/deframer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authorized_keys"
+path = "fuzz_targets/authorized_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_feed_resize"
+path = "fuzz_targets/terminal_feed_resize.rs"
+test = false
+doc = false
+bench = false

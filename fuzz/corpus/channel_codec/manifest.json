@@ -1,0 +1,104 @@
+{
+  "format": "kind byte followed by payload, without five-byte envelope",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "about-extension",
+      "bytes": 52,
+      "sha256": "1a342a27b32977b2a94c14ba9d74dbe56c400bea54cf106dc808c46609077e12"
+    },
+    {
+      "name": "about-full",
+      "bytes": 50,
+      "sha256": "a1514cbb131bb94dfafeb20a76d686d1753aea482443b2bb74f91834bb6125dc"
+    },
+    {
+      "name": "about-request-extension",
+      "bytes": 4,
+      "sha256": "b0bac56d00069e3af42fef4d85c7416e2d9945ec32bf269c481a94aa0bed0118"
+    },
+    {
+      "name": "about-short",
+      "bytes": 48,
+      "sha256": "49d85563872be8c44bcb7825feca4181af27e87c5409d357548c1db537c992d5"
+    },
+    {
+      "name": "close",
+      "bytes": 2,
+      "sha256": "ba3d722a88cacce18f22962612eda4d50e7a61cd9b7db60694043efed2a61448"
+    },
+    {
+      "name": "command-max",
+      "bytes": 4106,
+      "sha256": "a66e5255eddb74065844893dda75d31b091510efadf5a37eaba98bb304c68029"
+    },
+    {
+      "name": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "invalid-utf8-term",
+      "bytes": 2,
+      "sha256": "c9da98b55afa34593cdb711ffb1b67965ec9bedb3688bb41339b8a17f7577094"
+    },
+    {
+      "name": "resize-boundary",
+      "bytes": 22,
+      "sha256": "2ecdef15ba9f998551e6021399f5e65b4da6c82e97d3fb5b67dbd348575e95e4"
+    },
+    {
+      "name": "resize-zero-ids",
+      "bytes": 22,
+      "sha256": "a39ffac75c3723d4638972040048efb7674bcd5ff136096ee46cbaef46b46e58"
+    },
+    {
+      "name": "shell-open",
+      "bytes": 10,
+      "sha256": "33dff0bb04d850a05eaf7d70e4ac65fa85adcc8019229c967bf3a05e42768217"
+    },
+    {
+      "name": "snapshot-empty",
+      "bytes": 3,
+      "sha256": "cb96f3dc74e0cacc86b70f6713a332c88f6300defeb150c23d78be829231a95c"
+    },
+    {
+      "name": "snapshot-max",
+      "bytes": 36387,
+      "sha256": "678d1fee372f271321c9a629cbb2b7fb111232dc9666b008c95f6c5449979f38"
+    },
+    {
+      "name": "term-max",
+      "bytes": 65,
+      "sha256": "9609d5c92b0b4dd6491841bba57281ff958bf7f8cff96419aa8da4c251662a58"
+    },
+    {
+      "name": "truncated-open",
+      "bytes": 1,
+      "sha256": "c555eab45d08845ae9f10d452a99bfcb06f74a50b988fe7e48dd323789b88ee3"
+    },
+    {
+      "name": "unknown",
+      "bytes": 1,
+      "sha256": "a8100ae6aa1940d0b663bb31cd466142ebbdbd5187131b92d93818987832eb89"
+    },
+    {
+      "name": "update-answer",
+      "bytes": 2,
+      "sha256": "bbb3afa31af1adf2deb2cd3774f62df5807acf44963fc296e62de13b00380a6b"
+    },
+    {
+      "name": "update-offer",
+      "bytes": 56,
+      "sha256": "90b55b5fd8a7d8388c99c8bb9541a443ac6e453ed1be50ac52d00b424548effa"
+    },
+    {
+      "name": "update-result",
+      "bytes": 2,
+      "sha256": "512f843c7b45913b2109e87cb29cc3857d2dcb48a02d304515e1e5eabd64bd29"
+    }
+  ]
+}
