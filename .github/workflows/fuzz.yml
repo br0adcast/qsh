@@ -95,6 +95,8 @@ jobs:
           done
           PYTHONDONTWRITEBYTECODE=1 \
             python3 -m unittest discover -s fuzz/tools -p 'test_check_corpus.py'
+          PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s fuzz/tools -p 'test_run_smoke.py'
 
       - name: Verify locked product and fuzz dependency sources
         run: |
@@ -114,34 +116,34 @@ jobs:
             --target-dir "$RUNNER_TEMP/fuzz-target"
           sha256sum --check "$RUNNER_TEMP/fuzz-locks.sha256"
 
+      - name: Run the ordinary harness and oracle tests
+        run: |
+          set -euo pipefail
+          CARGO_NET_OFFLINE=true cargo test --manifest-path fuzz/Cargo.toml \
+            --locked --lib --target-dir "$RUNNER_TEMP/fuzz-test-target"
+          sha256sum --check "$RUNNER_TEMP/fuzz-locks.sha256"
+
       - name: Run a bounded mutation smoke per target
         run: |
           set -euo pipefail
-          declare -A max_len=(
-            [channel_codec]=65537
-            [handshake_payload]=512
-            [wire_datagram]=2048
-            [deframer]=4096
-            [authorized_keys]=8192
-            [terminal_feed_resize]=8196
-          )
-          work="$RUNNER_TEMP/fuzz-smoke"
-          for target in "${!max_len[@]}"; do
-            corpus="$work/$target/corpus"
-            artifacts="$work/$target/artifacts"
-            mkdir -p "$corpus" "$artifacts"
-            cp fuzz/corpus/"$target"/* "$corpus/"
-            rm -f "$corpus/manifest.json"
-            log="$work/$target/run.log"
-            "$RUNNER_TEMP/fuzz-target/x86_64-unknown-linux-gnu/release/$target" \
-              "$corpus" -artifact_prefix="$artifacts/" -seed=1 \
-              -max_len="${max_len[$target]}" -runs=1000 -max_total_time=10 \
-              -timeout=2 -rss_limit_mb=512 -malloc_limit_mb=64 \
-              -print_final_stats=1 > "$log" 2>&1
-            grep -q "DONE" "$log"
-            test -z "$(find "$artifacts" -type f -print -quit)"
-            if grep -Eq "ERROR:|SUMMARY: AddressSanitizer|panicked at|deadly signal" "$log"; then
-              cat "$log"
-              exit 1
-            fi
-          done
+          # Every target runs; each failure reason and a bounded log tail are
+          # printed before this step fails.
+          python3 fuzz/tools/run_smoke.py \
+            --binaries "$RUNNER_TEMP/fuzz-target/x86_64-unknown-linux-gnu/release" \
+            --seeds-root fuzz/corpus --work "$RUNNER_TEMP/fuzz-smoke" \
+            --runs 1000 --max-total-time 10 --wall-timeout 120 \
+            channel_codec=65537 handshake_payload=512 wire_datagram=2048 \
+            deframer=4096 authorized_keys=8192 terminal_feed_resize=8196
+
+      # Only the bounded run logs and libFuzzer's failing inputs, never the
+      # mutated corpora, the toolchain or the workspace.
+      - name: Retain failing smoke logs and inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-smoke-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/fuzz-smoke/*/run.log
+            ${{ runner.temp }}/fuzz-smoke/*/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
