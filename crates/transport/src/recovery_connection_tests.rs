@@ -54,6 +54,19 @@ fn start(client: &mut Connection, now: Instant) -> Vec<Datagram> {
 }
 
 #[test]
+fn an_empty_recovery_catalog_consumes_the_single_start_attempt() {
+    let (mut client, _config, now) = fixture();
+    assert!(client
+        .start_recovery(now, Vec::new(), StartKind::Warm, [5; 16])
+        .is_empty());
+    assert_eq!(client.state(), LinkState::Closed);
+    assert!(client.has_started());
+    assert!(client
+        .start_session(now, address(0), StartKind::Cold, [5; 16])
+        .is_empty());
+}
+
+#[test]
 fn shared_recovery_same_msg1_selects_one_source_before_any_queued_output() {
     let (mut client, config, now) = fixture();
     let outgoing = start(&mut client, now);
@@ -291,7 +304,7 @@ fn shared_recovery_preserves_configured_minimum_and_does_not_expand_offer() {
 }
 
 #[test]
-fn shared_recovery_rejection_does_not_leak_its_minimum_into_single_endpoint_restart() {
+fn a_rejected_recovery_closes_the_connection_and_a_fresh_start_keeps_the_configured_minimum() {
     let (mut client, mut config, now) = fixture();
     config.features =
         Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
@@ -304,18 +317,29 @@ fn shared_recovery_rejection_does_not_leak_its_minimum_into_single_endpoint_rest
     assert!(client.keys.is_none());
     assert_eq!(client.required_features, Features::NONE);
 
-    // This restart rejected before keys or application state existed. It
-    // does not qualify resetting a previously established connection (#148).
+    // A connection is single-use: the rejected recovery cannot be "retried"
+    // on the same object, and no old-session state is adopted by a new one.
     let later = now + Duration::from_secs(1);
-    let outgoing = client.start_session(later, address(0), StartKind::Cold, [6; 16]);
-    assert!(client.recovery_handshake().is_none());
-    let mut server = Connection::new(config);
+    assert!(client
+        .start_session(later, address(0), StartKind::Cold, [6; 16])
+        .is_empty());
+    assert_eq!(client.state(), LinkState::Closed);
+    assert!(client.has_started());
+
+    // A fresh connection owns only the configured minimum; the recovery-only
+    // AUTH_ACCEPTED requirement is not inherited.
+    let (mut fresh, mut fresh_config, _) = fixture();
+    fresh_config.features =
+        Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
+    let outgoing = fresh.start_session(later, address(0), StartKind::Cold, [6; 16]);
+    assert_eq!(outgoing.len(), 1);
+    let mut server = Connection::new(fresh_config);
     let response = server.on_datagram(later, address(99), &outgoing[0].bytes);
-    client.poll_events();
-    client.on_datagram(later, address(0), &response[0].bytes);
-    assert_eq!(client.state(), LinkState::Live);
-    assert!(!client.features().contains(Features::AUTH_ACCEPTED));
-    assert!(client.poll_events().contains(&Event::HandshakeDone));
+    fresh.poll_events();
+    fresh.on_datagram(later, address(0), &response[0].bytes);
+    assert_eq!(fresh.state(), LinkState::Live);
+    assert!(!fresh.features().contains(Features::AUTH_ACCEPTED));
+    assert!(fresh.poll_events().contains(&Event::HandshakeDone));
 }
 
 #[test]
@@ -363,8 +387,8 @@ fn shared_recovery_retries_until_explicit_owner_retirement_or_cancellation() {
 }
 
 #[test]
-fn shared_recovery_fresh_attempt_can_select_remaining_endpoint_after_rejection() {
-    let (mut client, mut config, now) = fixture();
+fn a_fresh_recovery_connection_selects_the_remaining_endpoint_after_rejection() {
+    let (mut client, config, now) = fixture();
     let mut old_config = config.clone();
     old_config.features =
         Features::from_bits(Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits());
@@ -374,10 +398,27 @@ fn shared_recovery_fresh_attempt_can_select_remaining_endpoint_after_rejection()
     let old_response = old_server.on_datagram(now, address(99), &outgoing[1].bytes);
     client.on_datagram(now, address(1), &old_response[0].bytes);
     assert_eq!(client.state(), LinkState::Closed);
+    assert!(client.has_started());
     client.poll_events();
 
     let later = now + Duration::from_secs(1);
-    let outgoing = client.start_recovery(
+    // A rejected attempt cannot be restarted on the same object. The fresh
+    // attempt below must be a new Connection with a new Noise ephemeral.
+    assert!(client
+        .start_recovery(
+            later,
+            vec![RecoveryEndpoint {
+                address: 0,
+                endpoint: address(0),
+            }],
+            StartKind::Warm,
+            [5; 16],
+        )
+        .is_empty());
+    assert_eq!(client.state(), LinkState::Closed);
+
+    let (mut fresh, mut fresh_config, _) = fixture();
+    let outgoing = fresh.start_recovery(
         later,
         vec![RecoveryEndpoint {
             address: 0,
@@ -386,17 +427,20 @@ fn shared_recovery_fresh_attempt_can_select_remaining_endpoint_after_rejection()
         StartKind::Warm,
         [5; 16],
     );
-    client.recovery_handshake_sent(later, address(0), true);
-    assert!(client
-        .on_datagram(later, address(1), &old_response[0].bytes)
+    assert_eq!(outgoing.len(), 1);
+    fresh.recovery_handshake_sent(later, address(0), true);
+    // The old attempt's msg2 was sealed for another initiator. Even from the
+    // fresh attempt's endpoint it cannot select the session.
+    assert!(fresh
+        .on_datagram(later, address(0), &old_response[0].bytes)
         .is_empty());
-    assert_eq!(client.state(), LinkState::Connecting);
-    assert!(client.poll_events().is_empty());
-    config.features = Features::SUPPORTED;
-    let mut server = Connection::new(config);
+    assert_eq!(fresh.state(), LinkState::Connecting);
+    assert!(fresh.poll_events().is_empty());
+    fresh_config.features = Features::SUPPORTED;
+    let mut server = Connection::new(fresh_config);
     let response = server.on_datagram(later, address(99), &outgoing[0].bytes);
-    client.on_datagram(later, address(0), &response[0].bytes);
-    assert_eq!(client.state(), LinkState::Live);
-    assert_eq!(client.active_path(), Some(address(0)));
-    assert!(client.features().contains(Features::AUTH_ACCEPTED));
+    fresh.on_datagram(later, address(0), &response[0].bytes);
+    assert_eq!(fresh.state(), LinkState::Live);
+    assert_eq!(fresh.active_path(), Some(address(0)));
+    assert!(fresh.features().contains(Features::AUTH_ACCEPTED));
 }

@@ -564,6 +564,14 @@ impl StreamState {
 /// (PING/PONG), and address migration on roaming.
 pub struct Connection {
     role: Role,
+    /// Whether this client has consumed its single start attempt.
+    ///
+    /// A `Connection` is bound to one handshake attempt and one session. A
+    /// second start call is unsupported: it emits no datagram and changes
+    /// nothing, because the keys, session id, counters, replay window and
+    /// streams of the previous session cannot be safely reused. Callers that
+    /// need another attempt create a new `Connection`.
+    client_started: bool,
     local_priv: Zeroizing<[u8; 32]>,
     remote_pub: Option<[u8; 32]>,
     auth: AuthPolicy,
@@ -926,6 +934,7 @@ impl Connection {
         };
         Connection {
             role: cfg.role,
+            client_started: false,
             local_priv: Zeroizing::new(cfg.local_static_priv),
             remote_pub: cfg.remote_static_pub,
             auth: std::mem::replace(&mut cfg.auth, AuthPolicy::Allowlist(vec![])),
@@ -1138,9 +1147,36 @@ impl Connection {
         })
     }
 
+    /// Consume the one start attempt. A server has none (it is built by
+    /// `accept`/`on_datagram`), and a client has exactly one.
+    fn begin_start(&mut self) -> bool {
+        if !matches!(self.role, Role::Client) || self.client_started {
+            return false;
+        }
+        self.client_started = true;
+        true
+    }
+
+    /// Whether this client has already consumed its single start attempt.
+    /// Always `false` for a server, which is created in response to a msg1
+    /// rather than started by its owner.
+    pub fn has_started(&self) -> bool {
+        self.client_started
+    }
+
     /// Start the connection. The client builds the IK initiator, remembers the
     /// peer, and returns the first handshake datagram. Empty for the server: it
     /// waits for the first message from the client.
+    ///
+    /// A `Connection` is single-use. The first client start call binds it to
+    /// one handshake attempt for that session; every later `start`,
+    /// `start_with_payload`, `start_session` or `start_recovery` call returns
+    /// an empty vector and leaves the connection untouched. There is no
+    /// supported restart-after-`Connecting`, after-`Live` or after-`Closed`
+    /// path: the previous session's keys, session id, counters, replay window
+    /// and streams are never reset or reused. Create a new `Connection` for a
+    /// new attempt. [`Connection::has_started`] exposes the state for owners
+    /// that want to assert this contract.
     ///
     /// This is the no-payload form kept for backwards compatibility; it
     /// delegates to [`Connection::start_with_payload`] with an empty msg1
@@ -1155,12 +1191,20 @@ impl Connection {
     /// first handshake datagram (the msg1 payload is the versioned handshake
     /// body -- see [`crate::handshake_payload::encode_msg1`]). Empty for the
     /// server: it waits for the first message from the client.
+    ///
+    /// This method is the single entry point for the one start attempt a
+    /// `Connection` supports. A second call, after `Connecting`, `Live` or
+    /// `Closed`, returns an empty vector without changing state; see
+    /// [`Connection::start`] for the lifecycle contract.
     pub fn start_with_payload(
         &mut self,
         now: Instant,
         peer: SocketAddr,
         msg1_payload: &[u8],
     ) -> Vec<Datagram> {
+        if !self.begin_start() {
+            return Vec::new();
+        }
         self.recovery_handshake = None;
         self.session_abort = None;
         self.closed_gracefully = false;
@@ -1172,9 +1216,6 @@ impl Connection {
         // silence on a road. Harmless today only because `on_timeout`
         // returns early while there are no keys.
         self.last_recv_ordinary = now;
-        if !matches!(self.role, Role::Client) {
-            return Vec::new();
-        }
         // A client without the server's static key is misconfigured. This is
         // reachable via the public API, so we don't panic: close gracefully.
         let remote_pub = match self.remote_pub {
@@ -1187,8 +1228,8 @@ impl Connection {
         let mut hs = Handshake::new_initiator(&self.local_priv, &remote_pub);
         self.msg1_sent_at = Some(now);
         self.handshake_retransmitted = false;
-        // A new handshake seeds its own round trip; the previous session's
-        // measurement says nothing about this one.
+        // This handshake seeds its own round trip; no earlier measurement
+        // can describe the session this Connection is now bound to.
         self.rtt = None;
         self.rtt_estimator = RttEstimator::default();
         self.rto_backoff = 0;
@@ -1215,6 +1256,9 @@ impl Connection {
     /// Start a client session (spec §5.2): msg1 carries `start_kind`,
     /// `token`, the method `cfg.auth` implements, and the features
     /// `cfg.features` allows that this build implements.
+    ///
+    /// Like every start form, this consumes the `Connection`'s single start
+    /// attempt; a later call returns no datagrams.
     pub fn start_session(
         &mut self,
         now: Instant,
@@ -1235,6 +1279,10 @@ impl Connection {
     /// Requires negotiated `AUTH_ACCEPTED` in addition to the configured
     /// minimum, before Live or queued output. The offered bits are unchanged.
     /// Ordinary single-endpoint starts retain the configured feature minimum.
+    ///
+    /// This consumes the `Connection`'s single start attempt, even when
+    /// `endpoints` is empty (which closes it). A later start returns no
+    /// datagrams.
     pub fn start_recovery(
         &mut self,
         now: Instant,
@@ -1243,7 +1291,9 @@ impl Connection {
         token: [u8; SESSION_TOKEN_LEN],
     ) -> Vec<Datagram> {
         let Some(first) = endpoints.first() else {
-            self.set_state(LinkState::Closed);
+            if self.begin_start() {
+                self.set_state(LinkState::Closed);
+            }
             return Vec::new();
         };
         // Construct the initiator once. Its initial datagram is replaced by

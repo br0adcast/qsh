@@ -5736,19 +5736,35 @@ fn a_handshake_through_a_cookie_seeds_no_round_trip() {
     assert_eq!(client.rtt(), None);
 }
 
-/// A handshake started afresh forgets the cookie of the one before: that
-/// cookie was bound to the old msg1's ephemeral key, and the new msg1
-/// goes out plain, retransmits and all, until a cookie answers IT.
+/// A `Connection` is single-use. A second start while `Connecting` is
+/// rejected without touching the one initiator already underway: its cookie
+/// (bound to that msg1's ephemeral key) and its retransmit bytes stay as
+/// they were, and the connection remains `Connecting`.
 #[test]
-fn a_new_handshake_forgets_the_cookie_of_the_old_one() {
+fn a_second_start_while_connecting_is_rejected_and_keeps_the_handshake() {
     let (mut client, saddr, body) = started_client();
     let _ = client.on_datagram(
         Instant::now(),
         saddr,
         &encode_cookie_reply(&echo_of(&body), &[1; COOKIE_LEN]),
     );
-    let fresh = client.start_session(Instant::now(), saddr, StartKind::Cold, [4; 16]);
-    assert_eq!(client.handshake_datagrams(), fresh);
+    assert!(client.has_started());
+    let retransmit = client.handshake_datagrams();
+    assert!(
+        !retransmit.is_empty(),
+        "the original msg1 is still under way"
+    );
+
+    for out in [
+        client.start(Instant::now(), saddr),
+        client.start_with_payload(Instant::now(), saddr, &body),
+        client.start_session(Instant::now(), saddr, StartKind::Cold, [9; 16]),
+    ] {
+        assert!(out.is_empty(), "reuse must emit no datagram");
+        assert_eq!(client.state(), LinkState::Connecting);
+        assert_eq!(client.handshake_datagrams(), retransmit);
+        assert_eq!(client.cookie_for_test(), Some([1; COOKIE_LEN]));
+    }
 }
 
 /// Review focus: the seed lasts only until the first PONG.
@@ -5775,17 +5791,183 @@ fn the_first_pong_replaces_the_handshake_seed() {
     );
 }
 
-/// Starting again forgets the previous handshake's measurement: a new
-/// session must not show, or time its PINGs by, the old one's round trip.
+/// The rejected start in `Connecting` did not create a second handshake: the
+/// original initiator still reads the msg2 meant for it and reaches `Live`.
 #[test]
-fn starting_again_forgets_the_previous_round_trip() {
-    let (mut client, _server, _caddr, saddr, t0) =
+fn a_rejected_start_while_connecting_leaves_the_original_handshake_usable() {
+    let server_kp = generate_keypair();
+    let client_kp = generate_keypair();
+    let caddr = addr("198.51.100.7:40000");
+    let saddr = addr("198.51.100.1:41000");
+    let mut client = Connection::new(ConnectionConfig {
+        required_features: crate::Features::NONE,
+        features: Features::SUPPORTED,
+        role: Role::Client,
+        local_static_priv: client_kp.private,
+        remote_static_pub: Some(server_kp.public),
+        auth: AuthPolicy::Allowlist(Vec::new()),
+    });
+    let mut server = Connection::new(ConnectionConfig {
+        required_features: crate::Features::NONE,
+        features: Features::SUPPORTED,
+        role: Role::Server,
+        local_static_priv: server_kp.private,
+        remote_static_pub: None,
+        auth: AuthPolicy::Allowlist(vec![client_kp.public]),
+    });
+    let t0 = Instant::now();
+    let msg1 = client.start_session(t0, saddr, StartKind::Cold, [3; 16]);
+    let body = match parse(&msg1[0].bytes) {
+        Ok(Frame::Handshake {
+            kind: Kind::HandshakeInit,
+            body,
+        }) => body.to_vec(),
+        _ => panic!("msg1"),
+    };
+    let _ = client.on_datagram(
+        t0,
+        saddr,
+        &encode_cookie_reply(&echo_of(&body), &[1; COOKIE_LEN]),
+    );
+    let before = client.handshake_datagrams();
+    assert!(client
+        .start_session(t0, saddr, StartKind::Cold, [9; 16])
+        .is_empty());
+    assert_eq!(client.handshake_datagrams(), before);
+
+    let msg2 = server.on_datagram(t0 + Duration::from_millis(1), caddr, &msg1[0].bytes);
+    client.on_datagram(t0 + Duration::from_millis(2), saddr, &msg2[0].bytes);
+    assert_eq!(client.state(), LinkState::Live);
+    assert_eq!(client.session_id(), server.session_id());
+    assert!(client.poll_events().contains(&Event::HandshakeDone));
+}
+
+/// A second start after `Live` is rejected and preserves every piece of the
+/// existing session: keys, session id, round trip, features, congestion
+/// window, sender progress and replay state. Old-key traffic keeps working;
+/// a replayed old datagram still does not.
+#[test]
+fn a_second_start_after_live_is_rejected_and_preserves_the_session() {
+    let (mut client, mut server, _caddr, saddr, t0) =
         handshake_taking(Duration::from_millis(40), false);
-    assert!(client.rtt().is_some(), "the handshake seeded a round trip");
-    let _ = client.start_session(t0 + Duration::from_secs(5), saddr, StartKind::Cold, [0; 16]);
-    assert_eq!(client.rtt(), None);
-    assert_eq!(client.rto(), DEFAULT_RTO);
-    assert_eq!(client.stats(t0 + Duration::from_secs(5)).rtt_ms, 0);
+    assert_eq!(client.state(), LinkState::Live);
+    let session_id = client.session_id();
+    let rtt = client.rtt();
+    let features = client.features();
+    let keys_use_header = client.keys_use_header_for_test();
+    assert!(keys_use_header.is_some(), "transport keys are installed");
+    let now = t0 + Duration::from_millis(80);
+    let stats = client.stats(now);
+
+    // Leave queued, unacknowledged bytes on a stream so sender state is not
+    // trivially empty.
+    let _ = client.send(now, 0, b"unacknowledged");
+    let progress = client.stream_progress(0);
+    assert!(progress.queued > 0);
+    let window = client.congestion_window_for_test();
+
+    // One old datagram is delivered once, then retried after the rejected
+    // start; only the first delivery may produce stream data.
+    let old = server.send(now, 0, b"old session");
+    let old_bytes: Vec<Vec<u8>> = old.into_iter().map(|d| d.bytes).collect();
+    for bytes in &old_bytes {
+        let _ = client.on_datagram(now, saddr, bytes);
+    }
+    let delivered = client.poll_events();
+    assert!(delivered
+        .iter()
+        .any(|event| matches!(event, Event::StreamData { stream_id: 0, data } if data.as_slice() == b"old session")));
+
+    let rejected = client.start_session(
+        now + Duration::from_secs(5),
+        saddr,
+        StartKind::Cold,
+        [0; 16],
+    );
+    assert!(rejected.is_empty());
+    assert_eq!(client.state(), LinkState::Live);
+    assert_eq!(client.session_id(), session_id);
+    assert_eq!(client.rtt(), rtt);
+    assert_eq!(client.features(), features);
+    assert_eq!(client.peer(), Some(saddr));
+    assert_eq!(client.keys_use_header_for_test(), keys_use_header);
+    assert_eq!(client.stats(now), stats);
+    assert_eq!(client.stream_progress(0), progress);
+    assert_eq!(client.congestion_window_for_test(), window);
+    assert_eq!(client.peer_static(), None);
+
+    // The replay window survived too: the same old-key ciphertext is still a
+    // replay, while fresh old-key traffic still reaches the same session.
+    for bytes in &old_bytes {
+        let _ = client.on_datagram(now, saddr, bytes);
+    }
+    assert!(!client
+        .poll_events()
+        .iter()
+        .any(|event| matches!(event, Event::StreamData { .. })));
+    let fresh = server.send(now, 0, b"same session");
+    for datagram in fresh {
+        let _ = client.on_datagram(now, saddr, &datagram.bytes);
+    }
+    assert!(client
+        .poll_events()
+        .iter()
+        .any(|event| matches!(event, Event::StreamData { stream_id: 0, data } if data.as_slice() == b"same session")));
+}
+
+/// A second start after `Closed` is rejected for both a graceful close and an
+/// abandoned link. The connection stays deaf: ciphertext sealed under the old
+/// session's keys is ignored, not adopted by a new session.
+#[test]
+fn a_second_start_after_closed_is_rejected_and_ignores_old_ciphertext() {
+    for graceful in [false, true] {
+        let (mut client, mut server, _caddr, saddr) = established_pair();
+        let _ = client.poll_events();
+        let now = Instant::now();
+        let session_id = client.session_id();
+        let old = server.send(now, 0, b"after close");
+        let old_bytes: Vec<Vec<u8>> = old.into_iter().map(|d| d.bytes).collect();
+        if graceful {
+            let _ = client.close(now);
+            assert!(client.closed_gracefully());
+        } else {
+            client.abandon();
+            assert!(!client.closed_gracefully());
+        }
+        assert_eq!(client.state(), LinkState::Closed);
+        let _ = client.poll_events();
+        assert!(client.has_started());
+        let rejected = client.start_session(
+            now + Duration::from_millis(1),
+            saddr,
+            StartKind::Cold,
+            [0; 16],
+        );
+        assert!(rejected.is_empty(), "graceful={graceful}");
+        assert_eq!(client.state(), LinkState::Closed);
+        assert_eq!(client.session_id(), session_id);
+        for bytes in &old_bytes {
+            let _ = client.on_datagram(now + Duration::from_millis(2), saddr, bytes);
+        }
+        assert!(
+            client.poll_events().is_empty(),
+            "closed connection must stay deaf (graceful={graceful})"
+        );
+    }
+}
+
+/// A server has no start attempt: `start` is a no-op and does not disturb a
+/// connection that `accept` already made `Live`.
+#[test]
+fn a_server_start_is_a_no_op_after_accept() {
+    let (_client, mut server, _caddr, _saddr) = established_pair();
+    let session_id = server.session_id();
+    let state = server.state();
+    let out = server.start(Instant::now(), addr("198.51.100.1:41000"));
+    assert!(out.is_empty());
+    assert!(!server.has_started());
+    assert_eq!(server.state(), state);
+    assert_eq!(server.session_id(), session_id);
 }
 
 /// Spec §9.2 (4 / 9.1): 300 µs is a measurement, not "nothing measured".
