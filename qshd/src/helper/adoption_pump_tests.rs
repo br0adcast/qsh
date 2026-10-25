@@ -22,6 +22,11 @@ mod adoption_pump {
     }
 
     #[test]
+    fn adoption40_parent_pump_lost_login_end_reply_preserves_actual_failure() {
+        super::adoption_native::run_case(Some("healthy_reply_lost"));
+    }
+
+    #[test]
     fn adoption40_parent_pump_joins_separate_shell_session_after_monitor_loss() {
         super::adoption_native::run_case(Some("shell_missing"));
     }
@@ -104,7 +109,7 @@ mod adoption_pump {
                 ),
             );
         }
-        let stack = if matches!(mode, "healthy" | "shell_missing") {
+        let stack = if matches!(mode, "healthy" | "healthy_reply_lost" | "shell_missing") {
             "auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n".to_string()
         } else {
             format!("auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_exec.so {}\nsession required pam_permit.so\n",script.display())
@@ -142,8 +147,36 @@ mod adoption_pump {
             HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
             _ => panic!("qualified pump returned an unqualified result"),
         };
+        let receipt = format!(
+            "forced_worker={}, required_publication={:?}, channel_receipts={:?}, missing_pam={}, pam_received={:?}, monitor_failure={:?}",
+            outcome.forced_worker,
+            outcome.required_publication,
+            outcome.channel_receipts,
+            outcome.missing_pam,
+            outcome.pam_received,
+            outcome.monitor_failure,
+        );
+        std::fs::write(dir.join("helper-result"), &receipt).unwrap();
         assert!(!outcome.adoption_failed);
-        if matches!(mode, "missing_cleanup" | "shell_missing") {
+        if mode == "healthy_reply_lost" {
+            assert!(outcome.forced_worker && outcome.failed(), "{receipt}");
+            assert!(
+                matches!(
+                    outcome.required_publication,
+                    Some(RequiredPublicationFailure {
+                        kind: RequiredPublication::LoginEnded,
+                        error: PublicationError::Send(nix::libc::EPIPE),
+                    })
+                ),
+                "actual closed receiver must retain the required LoginEnded failure: {receipt}"
+            );
+            assert!(outcome.pam_received.succeeded(), "{receipt}");
+            assert_eq!(outcome.missing_pam, 0, "{receipt}");
+            assert!(!outcome.channel_receipts.any(), "{receipt}");
+            assert!(outcome.monitor_failure.is_none(), "{receipt}");
+            assert!(!outcome.worker.terminal_received);
+            assert!(!dir.join("finished").exists());
+        } else if matches!(mode, "missing_cleanup" | "shell_missing") {
             assert!(outcome.forced_worker && outcome.failed());
             assert!(outcome.missing_pam > 0 && outcome.channel_receipts.cleanup > 0);
             assert!(
@@ -155,9 +188,10 @@ mod adoption_pump {
                 assert!(dir.join("stopped").exists());
             }
         } else {
+            assert!(outcome.required_publication.is_none(), "{receipt}");
             assert!(
                 !outcome.forced_worker,
-                "PAM failure alone/healthy cleanup cannot force worker"
+                "PAM failure alone/healthy cleanup cannot force worker: {receipt}"
             );
             assert!(!outcome.channel_receipts.any());
             assert!(outcome.worker.terminal_received && dir.join("finished").exists());
@@ -261,7 +295,22 @@ mod adoption_pump {
             }
             if mode != "shell_missing" {
                 // LoginEnded is an authentication-seam tell, not a channel request.
+                if mode == "healthy_reply_lost" {
+                    // The required response cannot reach this owned receiver.
+                    channels.shutdown(std::net::Shutdown::Read).unwrap();
+                }
                 tell(&auth, Request::LoginEnded { login: [40; 16] });
+                if mode != "healthy_reply_lost" {
+                    // The tell returning proves only its send. Keep the required
+                    // reply route alive until the helper retires this incarnation.
+                    let (bytes, fd) = channel::recv(&channels).unwrap().unwrap();
+                    assert!(fd.is_none(), "LoginEnded cannot carry a descriptor");
+                    assert!(
+                        matches!(decode::<Response>(&bytes).unwrap(),
+                            Response::LoginEnded { login, incarnation: 1 } if login == [40; 16]),
+                        "actual LoginEnded for the seeded login must precede peer close"
+                    );
+                }
             }
         }
         let mut observed = Vec::new();
@@ -367,7 +416,10 @@ mod adoption_pump {
                 panic!("injected owned driver failure after private actors pinned");
             }
         }
-        if !matches!(mode, "missing_cleanup" | "shell_missing") {
+        if !matches!(
+            mode,
+            "missing_cleanup" | "shell_missing" | "healthy_reply_lost"
+        ) {
             std::fs::write(dir.join("release"), b"release").unwrap();
         }
         drop(channels);
