@@ -4,8 +4,9 @@
 //! `@revoked` -- and appended to after a person said yes. The core never
 //! reads these files (`crates/ssh` takes the known keys as a parameter).
 
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+mod storage;
+
+use std::io;
 use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -93,19 +94,25 @@ impl KnownHosts {
     }
 
     pub fn lookup(&self, host: &str, port: u16) -> Result<HostKeys, ReadError> {
+        self.lookup_with(host, port, storage::read)
+    }
+
+    fn lookup_with(
+        &self,
+        host: &str,
+        port: u16,
+        mut read: impl FnMut(&std::path::Path) -> io::Result<storage::ReadSnapshot>,
+    ) -> Result<HostKeys, ReadError> {
         let name = entry_name(host, port).to_ascii_lowercase();
         let mut out = HostKeys::default();
+        let mut bindings = Vec::new();
         for file in self.files() {
-            let bytes = match std::fs::read(file) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(ReadError {
-                        path: file.to_owned(),
-                        source,
-                    })
-                }
-            };
+            let snapshot = read(file).map_err(|source| ReadError {
+                path: file.to_owned(),
+                source,
+            })?;
+            let (bytes, binding) = snapshot.into_parts();
+            bindings.push((file, binding));
             for line_bytes in bytes.split(|&b| b == b'\n') {
                 let Ok(line) = std::str::from_utf8(line_bytes) else {
                     continue;
@@ -128,10 +135,30 @@ impl KnownHosts {
         }
         let revoked = &out.revoked;
         out.known.retain(|k| !revoked.contains(k));
+        // Keep both sources pinned until the entire lookup is ready: a user
+        // store changed while reading the system store must not grant trust.
+        for (path, binding) in bindings {
+            binding.validate().map_err(|source| ReadError {
+                path: path.to_owned(),
+                source,
+            })?;
+        }
         Ok(out)
     }
 
     pub fn add(&self, host: &str, port: u16, key_type: &str, wire: &[u8]) -> std::io::Result<()> {
+        self.add_with(host, port, key_type, wire, storage::read_tail, || Ok(()))
+    }
+
+    fn add_with(
+        &self,
+        host: &str,
+        port: u16,
+        key_type: &str,
+        wire: &[u8],
+        read_tail: impl FnOnce(&mut std::fs::File) -> io::Result<Option<u8>>,
+        after_tail: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         if host.is_empty()
             || host.starts_with(['!', '@', '|'])
             || host.contains(|c: char| {
@@ -151,30 +178,12 @@ impl KnownHosts {
                 "key_type must not be empty or contain whitespace, comma, or hash",
             ));
         }
-        if let Some(dir) = self.user.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)?;
-        }
-        let needs_newline = std::fs::read(&self.user)
-            .map(|b| b.last().is_some_and(|c| *c != b'\n'))
-            .unwrap_or(false);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&self.user)?;
-        let mut text = String::new();
-        if needs_newline {
-            text.push('\n');
-        }
-        text.push_str(&format!(
+        let record = format!(
             "{} {key_type} {}\n",
             entry_name(host, port),
             B64.encode(wire)
-        ));
-        file.write_all(text.as_bytes())
+        );
+        storage::AppendFile::open(&self.user)?.append_with(record.as_bytes(), read_tail, after_tail)
     }
 }
 
@@ -291,12 +300,14 @@ mod tests {
     }
 
     fn store(user: &str) -> (tempfile::TempDir, KnownHosts) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
-        std::fs::write(&path, user).unwrap();
+        authority_write(&path, user).unwrap();
         let kh = KnownHosts::new(path, None);
         (dir, kh)
     }
+
+    include!("known_hosts/authority_tests.rs");
 
     fn hashed(name: &str, salt: &[u8]) -> String {
         let mut mac = Hmac::<sha1::Sha1>::new_from_slice(salt).unwrap();
@@ -310,7 +321,7 @@ mod tests {
 
     #[test]
     fn missing_optional_stores_are_empty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let kh = KnownHosts::new(dir.path().join("user"), Some(dir.path().join("system")));
         assert_eq!(kh.lookup("h", 22).unwrap(), HostKeys::default());
     }
@@ -319,11 +330,11 @@ mod tests {
     fn permission_errors_preserve_path_and_source_for_either_store() {
         use std::os::unix::fs::PermissionsExt;
         for system_fails in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = authority_dir();
             let user = dir.path().join("user");
             let system = dir.path().join("system");
-            std::fs::write(&user, line("h", K1)).unwrap();
-            std::fs::write(&system, format!("@revoked {}", line("h", K1))).unwrap();
+            authority_write(&user, line("h", K1)).unwrap();
+            authority_write(&system, format!("@revoked {}", line("h", K1))).unwrap();
             let failed = if system_fails { &system } else { &user };
             std::fs::set_permissions(failed, std::fs::Permissions::from_mode(0o0)).unwrap();
             let kh = KnownHosts::new(user.clone(), Some(system.clone()));
@@ -339,7 +350,7 @@ mod tests {
     #[test]
     fn io_failure_is_not_an_absent_optional_store() {
         // A symlink loop deterministically fails read with ELOOP, without permissions or env changes.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("loop");
         std::os::unix::fs::symlink(&path, &path).unwrap();
         let kh = KnownHosts::new(path.clone(), None);
@@ -429,9 +440,9 @@ mod tests {
 
     #[test]
     fn the_system_file_is_read_too() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let system = dir.path().join("ssh_known_hosts");
-        std::fs::write(&system, line("h", K2)).unwrap();
+        authority_write(&system, line("h", K2)).unwrap();
         let kh = KnownHosts::new(dir.path().join("missing"), Some(system));
         assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K2.to_vec()]);
     }
@@ -454,7 +465,7 @@ mod tests {
     #[test]
     fn adding_creates_the_directory_and_a_private_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join(".ssh").join("known_hosts");
         KnownHosts::new(path.clone(), None)
             .add("h", 22, "ssh-ed25519", K1)
@@ -485,7 +496,7 @@ mod tests {
 
     #[test]
     fn non_utf8_line_does_not_hide_the_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         // File with: invalid UTF-8 comment, valid line K1, @revoked line K2
         let mut content = b"# bad comment: ".to_vec();
@@ -494,7 +505,7 @@ mod tests {
         content.extend_from_slice(line("h", K1).as_bytes());
         content
             .extend_from_slice(format!("@revoked h ssh-ed25519 {}\n", B64.encode(K2)).as_bytes());
-        std::fs::write(&path, content).unwrap();
+        authority_write(&path, content).unwrap();
         let kh = KnownHosts::new(path, None);
         let keys = kh.lookup("h", 22).unwrap();
         assert_eq!(keys.known, vec![K1.to_vec()]);
@@ -510,26 +521,26 @@ mod tests {
 
     #[test]
     fn the_same_key_in_both_files_appears_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let system = dir.path().join("ssh_known_hosts");
-        std::fs::write(&system, line("h", K1)).unwrap();
+        authority_write(&system, line("h", K1)).unwrap();
         let user_path = dir.path().join("known_hosts");
-        std::fs::write(&user_path, line("h", K1)).unwrap();
+        authority_write(&user_path, line("h", K1)).unwrap();
         let kh = KnownHosts::new(user_path, Some(system));
         assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
     }
 
     #[test]
     fn revoked_in_system_file_removes_known_from_user_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let system = dir.path().join("ssh_known_hosts");
-        std::fs::write(
+        authority_write(
             &system,
             format!("@revoked h ssh-ed25519 {}\n", B64.encode(K1)),
         )
         .unwrap();
         let user_path = dir.path().join("known_hosts");
-        std::fs::write(&user_path, line("h", K1)).unwrap();
+        authority_write(&user_path, line("h", K1)).unwrap();
         let kh = KnownHosts::new(user_path, Some(system));
         let keys = kh.lookup("h", 22).unwrap();
         assert!(keys.known.is_empty());
@@ -547,9 +558,9 @@ mod tests {
     #[test]
     fn crlf_line_endings_work() {
         let text = format!("h ssh-ed25519 {}\r\n", B64.encode(K1));
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
-        std::fs::write(&path, &text).unwrap();
+        authority_write(&path, &text).unwrap();
         let kh = KnownHosts::new(path, None);
         // The \r becomes part of the patterns after splitting on \n, but trim() removes it
         assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
@@ -590,7 +601,7 @@ mod tests {
 
     #[test]
     fn add_rejects_empty_host() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         let kh = KnownHosts::new(path, None);
         let err = kh.add("", 22, "ssh-ed25519", K1);
@@ -600,7 +611,7 @@ mod tests {
 
     #[test]
     fn add_rejects_host_with_whitespace() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         let kh = KnownHosts::new(path, None);
         let err = kh.add("host name", 22, "ssh-ed25519", K1);
@@ -610,7 +621,7 @@ mod tests {
 
     #[test]
     fn add_rejects_host_with_comma_or_hash() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         let kh = KnownHosts::new(path, None);
         let err_comma = kh.add("host,name", 22, "ssh-ed25519", K1);
@@ -621,7 +632,7 @@ mod tests {
 
     #[test]
     fn add_rejects_empty_key_type() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         let kh = KnownHosts::new(path, None);
         let err = kh.add("host", 22, "", K1);
@@ -631,7 +642,7 @@ mod tests {
 
     #[test]
     fn add_rejects_key_type_with_whitespace_comma_or_hash() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let path = dir.path().join("known_hosts");
         let kh = KnownHosts::new(path, None);
         let err_space = kh.add("host", 22, "ssh ed25519", K1);
@@ -648,7 +659,7 @@ mod tests {
             ("*.example", "other.example"),
             ("h?st.example", "host.example"),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = authority_dir();
             let kh = KnownHosts::new(dir.path().join("known_hosts"), None);
             let result = kh.add(host, 22, "ssh-ed25519", K1);
             assert!(
@@ -661,7 +672,7 @@ mod tests {
 
     #[test]
     fn single_host_approval_cannot_become_another_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = authority_dir();
         let kh = KnownHosts::new(dir.path().join("known_hosts"), None);
         let result = kh.add("[other.example]:2222", 22, "ssh-ed25519", K1);
         assert!(
@@ -692,7 +703,7 @@ mod tests {
             "|1|salt|hash",
         ] {
             for port in [22, 2222] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = authority_dir();
                 let parent = dir.path().join("missing").join(".ssh");
                 let kh = KnownHosts::new(parent.join("known_hosts"), None);
                 let error = kh.add(host, port, "ssh-ed25519", K1).unwrap_err();
@@ -704,7 +715,7 @@ mod tests {
 
                 let path = dir.path().join("known_hosts");
                 let sentinel = line("existing.example", K2);
-                std::fs::write(&path, sentinel.as_bytes()).unwrap();
+                authority_write(&path, sentinel.as_bytes()).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
                 let before = std::fs::metadata(&path).unwrap();
                 let kh = KnownHosts::new(path.clone(), None);
@@ -730,7 +741,7 @@ mod tests {
             "::1",
         ] {
             for port in [22, 2222] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = authority_dir();
                 let path = dir.path().join("known_hosts");
                 let kh = KnownHosts::new(path.clone(), None);
                 kh.add(host, port, "ssh-ed25519", K1).unwrap();

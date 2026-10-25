@@ -506,22 +506,199 @@ fn a_name_that_does_not_resolve_is_one_failed_address() {
     assert!(!screen.text().contains("panicked"), "{}", screen.text());
 }
 
+// Only these two acceptance controls opt into retaining sshd custody through
+// wait errors. Preserve Sandbox's existing daemon-before-sshd cleanup order;
+// its later Drop sees a terminal cached sshd and an already stopped daemon.
+struct SshAuthoritySandbox(Sandbox);
+impl std::ops::Deref for SshAuthoritySandbox {
+    type Target = Sandbox;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for SshAuthoritySandbox {
+    fn drop(&mut self) {
+        drop(support_home::daemon_guard::DaemonGuard::new(
+            self.0.cache().join("control.sock"),
+        ));
+        self.0.sshd.finish_owned();
+    }
+}
+
+struct SshAuthorityPty {
+    client: Client,
+    reader: Option<std::thread::JoinHandle<()>>,
+    lost_wait: bool,
+}
+impl SshAuthorityPty {
+    fn new(client: Client) -> (Self, Screen) {
+        use std::io::Read;
+        let mut owner = Self {
+            client,
+            reader: None,
+            lost_wait: false,
+        };
+        let mut master = owner.client.master.try_clone().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let output = seen.clone();
+        owner.reader = Some(std::thread::spawn(move || {
+            let mut bytes = [0u8; 4096];
+            loop {
+                match master.read(&mut bytes) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        let mut output = output.lock().unwrap();
+                        assert!(
+                            output.len() + n <= 1024 * 1024,
+                            "owned PTY output is bounded"
+                        );
+                        output.extend_from_slice(&bytes[..n]);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => return,
+                    Err(error) => panic!("owned PTY read failed: {error}"),
+                }
+            }
+        }));
+        (owner, Screen { seen, from: 0 })
+    }
+    fn poll(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let result = self.client.child.try_wait();
+        if let Err(error) = &result {
+            self.lost_wait |= error.raw_os_error() == Some(libc::ECHILD);
+        }
+        result
+    }
+    fn result(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.poll()? {
+                if self.reader.take().unwrap().join().is_err() {
+                    return Err(std::io::Error::other("owned PTY reader failed"));
+                }
+                return Ok(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned PTY client result deadline",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+impl Drop for SshAuthorityPty {
+    fn drop(&mut self) {
+        let mut killed = false;
+        let mut reported = false;
+        loop {
+            match self.poll() {
+                Ok(Some(_)) => break,
+                Err(error) => {
+                    if !reported {
+                        eprintln!("owned PTY wait failed; retaining custody: {error}");
+                        reported = true;
+                    }
+                    if !self.lost_wait && !killed {
+                        let _ = self.client.child.kill();
+                        killed = true;
+                    }
+                }
+                Ok(None) if !self.lost_wait && !killed => {
+                    let _ = self.client.child.kill();
+                    killed = true;
+                }
+                Ok(None) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                eprintln!("owned PTY reader failed during cleanup");
+            }
+        }
+    }
+}
+
 #[test]
 fn ssh_brings_qshd_up_and_qsh_logs_in_with_the_process_key() {
     let Some(()) = ssh_support::sshd_or_skip() else {
         return;
     };
+    ssh_host_authority_bootstrap(false);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ssh_approved_key_save_failure_warns_and_keeps_the_authenticated_session() {
+    assert_ne!(
+        nix::unistd::geteuid().as_raw(),
+        0,
+        "0444 refusal must be qualified by a real nonroot client"
+    );
+    ssh_support::sshd_or_skip().expect("this acceptance requires the owned OpenSSH server");
+    ssh_host_authority_bootstrap(true);
+}
+
+fn ssh_host_authority_bootstrap(readonly: bool) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let _serial = serialised();
-    let home = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("private client home");
+    let known_path = home.path().join(".ssh/known_hosts");
+    let mut expected_save_error = None;
+    let before = if readonly {
+        std::fs::create_dir(known_path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            known_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(&known_path, b"").unwrap();
+        std::fs::set_permissions(&known_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(
+            qsh::known_hosts::KnownHosts::new(known_path.clone(), None)
+                .lookup("127.0.0.1", 22)
+                .unwrap(),
+            qsh::known_hosts::HostKeys::default()
+        );
+        let denied = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&known_path)
+            .unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(libc::EACCES));
+        expected_save_error = Some(denied.to_string());
+        Some(std::fs::metadata(&known_path).unwrap())
+    } else {
+        None
+    };
     let (key, public) = client_key(home.path());
-    let sb = Sandbox::start_with(&[public]);
+    let sb = SshAuthoritySandbox(Sandbox::start_with(&[public]));
     sb.cache_real_qshd(qshd::state::QSHD_VERSION);
     let sandbox_home = sb.home.path().to_path_buf();
     let q = free_udp_port();
     let sshd = sb.sshd.port;
     let address = format!("127.0.0.1:{q},ssh={sshd}");
-    let mut client = spawn_qsh(&["-i", key.to_str().expect("utf-8"), &address], home.path());
-    let mut screen = Screen::of(&client);
+    let (mut client, mut screen) = SshAuthorityPty::new(spawn_qsh(
+        &["-i", key.to_str().expect("utf-8"), &address],
+        home.path(),
+    ));
+    #[cfg(target_os = "linux")]
+    if readonly {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", client.client.child.id())).unwrap();
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .expect("owned client UID receipt");
+        let uids: Vec<u32> = uid.split_whitespace().map(|n| n.parse().unwrap()).collect();
+        assert_eq!(uids, vec![nix::unistd::geteuid().as_raw(); 4]);
+        assert_ne!(uids[1], 0, "actual PTY client must be nonroot");
+    }
     let sshd_log = || sb.sshd.log();
 
     for line in [
@@ -535,20 +712,56 @@ fn ssh_brings_qshd_up_and_qsh_logs_in_with_the_process_key() {
             screen.text()
         );
     }
-    answer_yes(&mut client);
+    let offered =
+        ssh::host_key_info(&ssh_support::wire_of(&sb.sshd.host_public_key_line())).unwrap();
+    assert!(
+        screen.has(&offered.fingerprint),
+        "the actual server key must be the one approved: {}",
+        screen.text()
+    );
+    // SshStep's first KEX refuses the unknown key before authentication.
+    // Only one approval is sent. The readonly store stays empty, so reaching
+    // authenticated bootstrap and this QSH shell requires the second SSH
+    // attempt to use the explicitly approved key retained in memory.
+    answer_yes(&mut client.client);
+    if readonly {
+        assert!(
+            screen.next(&format!(
+                "qsh: could not save the key to {}",
+                known_path.display()
+            )),
+            "missing save warning: {}",
+            screen.text()
+        );
+    }
+    if let Some(expected) = &expected_save_error {
+        assert!(
+            screen.has(expected),
+            "save failure must be the actual readonly refusal: {}",
+            screen.text()
+        );
+    }
     assert!(
         screen.next(&format!("qsh: 127.0.0.1: qshd started, port {q}")),
         "qshd must come up on the port asked for; client saw: {}\nsshd: {}",
         screen.text(),
         sshd_log()
     );
-    decline_recovery_binding(&mut client, &mut screen);
+    decline_recovery_binding(&mut client.client, &mut screen);
     assert!(
         !screen.text().contains("Key fingerprint"),
         "the verified SSH result establishes the daemon key without another trust question: {}",
         screen.text()
     );
-    a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
+    client.client.type_line("echo IN'PUT'OK");
+    assert!(
+        screen.next("INPUTOK"),
+        "authenticated shell did not answer: {}",
+        screen.text()
+    );
+    client.client.type_line("exit");
+    let status = client.result();
+    assert_eq!(status.unwrap().code(), Some(0), "{}", screen.text());
 
     assert!(
         !screen.text().contains("Install qshd"),
@@ -556,13 +769,25 @@ fn ssh_brings_qshd_up_and_qsh_logs_in_with_the_process_key() {
         screen.text()
     );
     assert!(!screen.text().contains("daemon installation was declined"));
-    let known = std::fs::read_to_string(home.path().join(".ssh/known_hosts")).unwrap_or_default();
-    assert!(
-        known
-            .lines()
-            .any(|l| l.starts_with(&format!("[127.0.0.1]:{sshd} "))),
-        "the accepted ssh host key must be remembered: {known:?}"
-    );
+    let known = std::fs::read_to_string(&known_path).unwrap();
+    if let Some(before) = before {
+        let after = std::fs::metadata(&known_path).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode(), before.uid()),
+            (after.dev(), after.ino(), after.mode(), after.uid())
+        );
+        assert!(
+            known.is_empty(),
+            "failed save must leave the readonly store empty"
+        );
+    } else {
+        assert!(
+            known
+                .lines()
+                .any(|l| l.starts_with(&format!("[127.0.0.1]:{sshd} "))),
+            "the accepted ssh host key must be remembered: {known:?}"
+        );
+    }
     assert!(
         sb.cache().join("control.sock").exists(),
         "the daemon runs in the sandbox's private cache"
