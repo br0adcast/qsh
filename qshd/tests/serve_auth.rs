@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -109,7 +110,10 @@ fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathB
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let (listed, listed_path) = write_key(dir.path(), "listed");
     let (_stranger, stranger_path) = write_key(dir.path(), "stranger");
 
@@ -117,6 +121,8 @@ async fn a_listed_key_gets_a_session_and_a_stranger_does_not() {
     let mut f = std::fs::File::create(&authorized).expect("create");
     writeln!(f, "{}", listed.public_key().to_openssh().expect("openssh")).expect("write");
     f.flush().expect("flush");
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .expect("owned authorization fixture mode");
 
     // The server: signature policy, a real authorized_keys verifier.
     let server_kp = generate_keypair();

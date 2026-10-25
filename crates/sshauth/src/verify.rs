@@ -1,6 +1,5 @@
 //! Checking a client's proof against a user's `authorized_keys`.
 
-use std::fs;
 use std::path::PathBuf;
 
 use ssh_key::authorized_keys::Entry;
@@ -33,7 +32,7 @@ impl AuthorizedKeysVerifier {
     /// parsing and matching to [`key_is_listed`] -- see that function's docs
     /// for why the two are split apart.
     fn is_authorized(&self, key: &PublicKey) -> Result<bool, AuthError> {
-        let text = fs::read_to_string(&self.path)
+        let text = crate::personal_authorized_keys::read(&self.path)
             .map_err(|e| AuthError::Backend(format!("reading {}: {e}", self.path.display())))?;
         key_is_listed(&text, key)
     }
@@ -273,7 +272,9 @@ impl AuthVerifier for AuthorizedKeysVerifier {
 mod tests {
     use super::*;
     use ssh_key::{Algorithm, EcdsaCurve, PrivateKey};
+    use std::fs;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use transport::auth::{auth_challenge, auth_challenge_v2, AuthError, AuthV2, AuthVerifier};
 
     use crate::record::{encode_public_key, encode_signature};
@@ -686,6 +687,7 @@ mod tests {
             format!("{}\n", key.public_key().to_openssh().unwrap()),
         )
         .expect("write authorized_keys");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owned fixture mode");
         path
     }
 
@@ -694,7 +696,10 @@ mod tests {
     /// client claimed.
     #[test]
     fn a_v2_record_verifies_and_yields_the_daemons_own_account() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("tempdir");
         let key = PrivateKey::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             Algorithm::Ed25519,
@@ -726,7 +731,10 @@ mod tests {
     /// domains exist precisely so one cannot stand in for the other.
     #[test]
     fn a_v2_record_signed_over_the_v1_challenge_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("tempdir");
         let key = PrivateKey::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             Algorithm::Ed25519,
@@ -756,7 +764,10 @@ mod tests {
     /// and a client built before version 2 existed must keep working.
     #[test]
     fn a_v1_record_still_verifies() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("tempdir");
         let key = PrivateKey::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             Algorithm::Ed25519,

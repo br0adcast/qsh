@@ -77,7 +77,8 @@
     {
       "binary": "qshd::authorized_keys_privilege",
       "tests": [
-        "the_effective_account_is_restored_even_when_the_read_fails"
+        "the_effective_account_is_restored_even_when_the_read_fails",
+        "personal_authorized_keys_enforces_real_account_and_root_ownership"
       ],
       "reason": "Requires disposable root credential fixture",
       "owner": "CI container job: run_suite test authorized_keys_privilege"
