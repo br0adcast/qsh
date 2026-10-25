@@ -169,9 +169,19 @@ installation. Time spent answering a prompt does not consume a network budget.
 Offline cache verification checks the archive against its last verified checksum
 and extracts the image again. This detects corruption against the stored checksum;
 it does not establish that the published release is still current or has not been
-withdrawn. It assumes a trusted local cache: someone able to replace both an
-archive and its stored checksum can replace that local evidence. The checksum is
-not a release signature or an independent guarantee of origin.
+withdrawn. Cache reuse requires trusted root- or current-account-owned directories
+and public data without group or other write access, plus a private current-account
+lock. Safe 0755 directories, 0644 public files and trusted cache-root aliases remain
+supported; aliases below the cache root are refused. Refused storage does not prevent
+installation from freshly downloaded, verified bytes. Existing permissions are not
+repaired. A cache operation retains its original directory and lock identities and
+refuses observed replacement rather than adopting another route.
+
+Root and processes already controlling the same account remain trusted: someone
+able to replace both an archive and its stored checksum can replace that local
+evidence. Filesystem checks do not make pathname publication atomic against those
+actors. The checksum is not a release signature or an independent guarantee of
+origin.
 
 Release HTTPS uses bundled WebPKI CA roots. Adding a private or enterprise CA to
 the operating system's trust store does not automatically add it to this client's

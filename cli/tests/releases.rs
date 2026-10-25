@@ -7,6 +7,13 @@ use std::{
     sync::{atomic::AtomicUsize, Arc},
 };
 use support::*;
+fn cache_test_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn load(root: &std::path::Path, transport: Arc<Fake>) -> Result<bringup::DaemonImage, ImageError> {
     GitHubImages::with_transport(root.into(), transport).load(
         &request(),
@@ -22,7 +29,7 @@ fn object(root: &std::path::Path, archive: &[u8]) -> std::path::PathBuf {
 
 #[test]
 fn optional_cache_open_failure_still_returns_verified_download() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let blocked = root.path().join("cache");
     fs::write(&blocked, b"keep this file").unwrap();
     let online = Fake::new(archive());
@@ -38,7 +45,7 @@ fn optional_cache_open_failure_still_returns_verified_download() {
 
 #[test]
 fn optional_cache_lock_failure_still_returns_verified_download() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let lock = root
         .path()
         .join("releases/0.4.0/x86_64-unknown-linux-musl/.lock");
@@ -52,7 +59,7 @@ fn optional_cache_lock_failure_still_returns_verified_download() {
 
 #[test]
 fn optional_cache_publication_failure_keeps_verified_image() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let pointer = root
         .path()
         .join("releases/0.4.0/x86_64-unknown-linux-musl/current.json");
@@ -66,7 +73,7 @@ fn optional_cache_publication_failure_keeps_verified_image() {
 
 #[test]
 fn optional_cache_repair_failure_keeps_reverified_offline_image() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let cached_image = object(root.path(), &bytes).join("image");
@@ -81,7 +88,7 @@ fn optional_cache_repair_failure_keeps_reverified_offline_image() {
 
 #[test]
 fn optional_cache_archive_read_failure_downloads_and_verifies_fresh_image() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let cached_archive = object(root.path(), &bytes).join("archive");
@@ -96,7 +103,7 @@ fn optional_cache_archive_read_failure_downloads_and_verifies_fresh_image() {
 
 #[test]
 fn optional_cache_failure_never_bypasses_metadata_or_archive_verification() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let blocked = root.path().join("cache");
     fs::write(&blocked, b"storage unavailable").unwrap();
     for metadata in [
@@ -115,7 +122,7 @@ fn optional_cache_failure_never_bypasses_metadata_or_archive_verification() {
 
 #[test]
 fn offline_cache_never_uses_a_different_release_version() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     let mut other = request();
     other.version = "0.4.1".into();
@@ -133,8 +140,8 @@ fn offline_cache_never_uses_a_different_release_version() {
 #[test]
 fn optional_cache_does_not_follow_unsafe_descendants() {
     use std::os::unix::fs::symlink;
-    let root = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
+    let outside = cache_test_dir().unwrap();
     let sentinel = outside.path().join("keep");
     fs::write(&sentinel, b"unchanged").unwrap();
     symlink(outside.path(), root.path().join("releases")).unwrap();
@@ -151,7 +158,7 @@ fn optional_cache_does_not_follow_unsafe_descendants() {
 
 #[test]
 fn optional_cache_cannot_hide_publication_deadline() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let blocked = root.path().join("cache");
     fs::write(&blocked, b"storage unavailable").unwrap();
     let online = Fake::new(archive());
@@ -192,7 +199,7 @@ fn optional_cache_cannot_hide_cancellation_after_metadata() {
             Ok(sums(&archive()))
         }
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let blocked = root.path().join("cache");
     fs::write(&blocked, b"storage unavailable").unwrap();
     let result = GitHubImages::with_transport(blocked, Arc::new(CancelAfterMetadata)).load(
@@ -224,8 +231,8 @@ fn release_cache_path_uses_xdg_then_home_independently_of_host_os() {
 
 #[test]
 fn selected_release_cache_loads_complete_generation_when_github_is_unreachable() {
-    let home = tempfile::tempdir().unwrap();
-    let xdg = tempfile::tempdir().unwrap();
+    let home = cache_test_dir().unwrap();
+    let xdg = cache_test_dir().unwrap();
     for configured in [Some(xdg.path().as_os_str()), None] {
         let root = qsh::releases::release_cache_root(configured, home.path());
         let expected = if configured.is_some() {
@@ -252,7 +259,7 @@ fn exact_release_urls_and_invalid_literal_requests() {
     );
     assert!(archive.ends_with("/v0.4.0/qsh-0.4.0-aarch64-apple-darwin.tar.gz"));
     req.version = "../escape".into();
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let fake = Fake::new(support::archive());
     assert!(matches!(release_urls(&req), Err(ImageError::Invalid(_))));
     assert!(matches!(
@@ -269,7 +276,7 @@ fn exact_release_urls_and_invalid_literal_requests() {
 }
 #[test]
 fn valid_cache_is_offline_and_repairs_image_from_verified_archive() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     assert_eq!(
         &*load(root.path(), Fake::new(bytes.clone())).unwrap().bytes,
@@ -287,7 +294,7 @@ fn valid_cache_is_offline_and_repairs_image_from_verified_archive() {
 }
 #[test]
 fn corrupt_archive_is_redownloaded_and_generation_repaired() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     fs::write(object(root.path(), &bytes).join("archive"), b"broken").unwrap();
@@ -314,7 +321,7 @@ fn missing_duplicate_and_malformed_sums_or_wrong_digest_fail() {
             calls: AtomicUsize::new(0),
             offline: false,
         });
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         assert!(matches!(load(root.path(), fake), Err(ImageError::Checksum)));
     }
 }
@@ -330,7 +337,7 @@ fn traversal_links_special_entries_duplicates_and_missing_image_fail() {
         vec![("/absolute", b'0', IMAGE)],
         vec![("other", b'0', IMAGE)],
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         assert!(matches!(
             load(root.path(), Fake::new(gzip(&tar(&entries)))),
             Err(ImageError::Archive(_))
@@ -356,7 +363,7 @@ fn entry_image_stream_and_download_limits_are_enforced() {
             (&name, b'0', IMAGE),
         ])),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         assert!(matches!(
             load(root.path(), Fake::new(bytes)),
             Err(ImageError::Archive(_))
@@ -376,7 +383,7 @@ fn entry_image_stream_and_download_limits_are_enforced() {
             calls: AtomicUsize::new(0),
             offline: false,
         });
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         assert!(matches!(
             load(root.path(), fake),
             Err(ImageError::Download(_))
@@ -385,7 +392,7 @@ fn entry_image_stream_and_download_limits_are_enforced() {
 }
 #[test]
 fn cancellation_prevents_cache_or_network_work() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let fake = Fake::new(archive());
     let cancel = knock::Cancel::new();
     cancel.cancel();
@@ -403,11 +410,11 @@ fn cancellation_prevents_cache_or_network_work() {
 #[test]
 fn unsafe_receipts_and_symlinks_are_never_used() {
     use std::os::unix::fs::symlink;
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let target = root.path().join("releases/0.4.0/x86_64-unknown-linux-musl");
-    let outside = tempfile::tempdir().unwrap();
+    let outside = cache_test_dir().unwrap();
     let victim = outside.path().join("victim");
     fs::write(&victim, b"untouched").unwrap();
     fs::remove_file(object(root.path(), &bytes).join("image")).unwrap();
@@ -424,7 +431,7 @@ fn unsafe_receipts_and_symlinks_are_never_used() {
 }
 #[test]
 fn corrupt_receipt_cannot_bless_a_modified_image() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let path = object(root.path(), &bytes);
@@ -442,11 +449,49 @@ fn corrupt_receipt_cannot_bless_a_modified_image() {
 }
 #[test]
 fn concurrent_processes_publish_a_complete_generation() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let exe = std::env::current_exe().unwrap();
-    let mut children = Vec::new();
+    struct Workers<'a> {
+        children: Vec<std::process::Child>,
+        _root: &'a tempfile::TempDir,
+    }
+    impl Drop for Workers<'_> {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                match child.try_wait() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {
+                        let _ = child.kill();
+                    }
+                    Err(error) => eprintln!(
+                        "owned cache worker observation failed; retaining custody: {error}"
+                    ),
+                }
+                let mut reported = false;
+                loop {
+                    match child.wait() {
+                        Ok(_) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            if !reported {
+                                eprintln!(
+                                    "owned cache worker wait failed; retaining custody: {error}"
+                                );
+                                reported = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut workers = Workers {
+        children: Vec::new(),
+        _root: &root,
+    };
     for _ in 0..2 {
-        children.push(
+        workers.children.push(
             std::process::Command::new(&exe)
                 .args(["--exact", "cache_process_worker", "--nocapture"])
                 .env("QSH_TEST_RELEASE_CACHE", root.path())
@@ -473,8 +518,18 @@ fn concurrent_processes_publish_a_complete_generation() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     fs::write(root.path().join("go"), b"").unwrap();
-    for mut child in children {
-        assert!(child.wait().unwrap().success());
+    for child in &mut workers.children {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned cache worker exceeded its result deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
     let offline = Fake::offline();
     assert_eq!(&*load(root.path(), offline.clone()).unwrap().bytes, IMAGE);
@@ -506,7 +561,7 @@ fn cache_process_worker() {
 #[test]
 fn cancelled_lock_wait_returns_promptly() {
     use std::os::fd::AsRawFd;
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     let lock = fs::File::open(
         root.path()
@@ -547,7 +602,7 @@ fn truncated_gzip_and_hidden_special_entries_cannot_be_published() {
         gzip(&tar(&[(&name, b'0', IMAGE), (&link, b'2', b"")])),
         gzip(&tar(&[(&name, b'0', IMAGE), (&traversal, b'0', b"")])),
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         assert!(matches!(
             load(root.path(), Fake::new(bytes)),
             Err(ImageError::Archive(_))
@@ -560,7 +615,7 @@ fn truncated_gzip_and_hidden_special_entries_cannot_be_published() {
 }
 #[test]
 fn failed_download_preserves_prior_generation_and_pointer() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let target = root.path().join("releases/0.4.0/x86_64-unknown-linux-musl");
@@ -581,7 +636,7 @@ fn failed_download_preserves_prior_generation_and_pointer() {
 }
 #[test]
 fn offline_image_repair_honors_publication_budget() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let bytes = archive();
     load(root.path(), Fake::new(bytes.clone())).unwrap();
     let image_path = object(root.path(), &bytes).join("image");
@@ -627,7 +682,7 @@ fn another_download_does_not_hold_the_cache_lock() {
             self.fake.fetch(url, limits, cancel, observer)
         }
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let source = GitHubImages::with_transport(
@@ -667,7 +722,7 @@ fn another_download_does_not_hold_the_cache_lock() {
 
 #[test]
 fn a_cache_hit_checks_current_metadata_without_downloading_the_archive() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     let online = Fake::new(archive());
     assert_eq!(&*load(root.path(), online.clone()).unwrap().bytes, IMAGE);
@@ -676,7 +731,7 @@ fn a_cache_hit_checks_current_metadata_without_downloading_the_archive() {
 
 #[test]
 fn changed_published_checksum_replaces_the_cached_generation() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     let replacement = b"a replacement verified daemon";
     let updated = Fake::new(gzip(&tar(&[(&format!("{STEM}/qshd"), b'0', replacement)])));
@@ -689,7 +744,7 @@ fn changed_published_checksum_replaces_the_cached_generation() {
 
 #[test]
 fn invalid_metadata_never_falls_back_to_a_valid_cache() {
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     for sums in [
         vec![],
@@ -725,7 +780,7 @@ fn rejected_metadata_and_cancel_never_use_a_cached_image() {
             Err(FetchError::Rejected(self.0.clone()))
         }
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     for error in [
         ImageError::Unavailable("HTTP 404".into()),
@@ -764,7 +819,7 @@ fn archive_outage_after_a_new_checksum_does_not_fall_back_to_old_data() {
             }
         }
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = cache_test_dir().unwrap();
     load(root.path(), Fake::new(archive())).unwrap();
     let updated = gzip(&tar(&[(&format!("{STEM}/qshd"), b'0', b"updated image")]));
     let result =
@@ -833,7 +888,7 @@ fn metadata_phase_precedes_fetch_and_only_archive_bytes_reach_download_progress(
         }
     }
     for cached in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = cache_test_dir().unwrap();
         if cached {
             load(root.path(), Fake::new(archive())).unwrap();
         }
@@ -871,4 +926,98 @@ fn metadata_phase_precedes_fetch_and_only_archive_bytes_reach_download_progress(
             assert!(events[2].finished);
         }
     }
+}
+
+#[test]
+fn cache_authority_rejects_writable_cache_but_keeps_verified_online_install() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = cache_test_dir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let bytes = archive();
+    load(root.path(), Fake::new(bytes.clone())).unwrap();
+    let pointer = root
+        .path()
+        .join("releases/0.4.0/x86_64-unknown-linux-musl/current.json");
+    let before = fs::read(&pointer).unwrap();
+    let lock = pointer.parent().unwrap().join(".lock");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        matches!(
+            load(root.path(), Fake::offline()),
+            Err(ImageError::Download(_))
+        ),
+        "a publicly readable lock is not cache authority"
+    );
+    assert_eq!(
+        fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(
+        matches!(
+            load(root.path(), Fake::offline()),
+            Err(ImageError::Download(_))
+        ),
+        "writable cache is not offline evidence"
+    );
+    let online = Fake::new(bytes);
+    assert_eq!(&*load(root.path(), online.clone()).unwrap().bytes, IMAGE);
+    assert_eq!(
+        online.calls(),
+        2,
+        "refused cache requires a fresh verified archive"
+    );
+    assert_eq!(fs::read(&pointer).unwrap(), before);
+    assert_eq!(
+        fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+}
+
+#[test]
+fn cache_authority_preserves_safe_public_modes_and_root_aliases() {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    let owner = cache_test_dir().unwrap();
+    fs::set_permissions(owner.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let root = owner.path().join("cache");
+    let bytes = archive();
+    load(&root, Fake::new(bytes.clone())).unwrap();
+    fn public_modes(path: &std::path::Path) {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                public_modes(&entry.path());
+                fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            } else if entry.file_name() != ".lock" {
+                fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+    }
+    public_modes(&root);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    let archive_path = object(&root, &bytes).join("archive");
+    let hardlink = owner.path().join("archive-hardlink");
+    fs::hard_link(&archive_path, &hardlink).unwrap();
+    assert!(fs::metadata(&archive_path).unwrap().nlink() > 1);
+    let alias = owner.path().join("alias");
+    symlink(&root, &alias).unwrap();
+    assert_eq!(&*load(&alias, Fake::offline()).unwrap().bytes, IMAGE);
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(&archive_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let objects = root.join("releases/0.4.0/x86_64-unknown-linux-musl/objects");
+    let moved = owner.path().join("objects");
+    fs::rename(&objects, &moved).unwrap();
+    symlink(&moved, &objects).unwrap();
+    assert!(matches!(
+        load(&alias, Fake::offline()),
+        Err(ImageError::Download(_))
+    ));
+    assert_eq!(fs::read(&hardlink).unwrap(), bytes);
 }
