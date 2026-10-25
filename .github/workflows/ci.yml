@@ -123,6 +123,29 @@ jobs:
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked
+      - name: Portable pin-store text and locking tests
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-pin-store.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p sshauth --lib --locked known_hosts::tests:: -- --nocapture | tee "$runtime/results.log"
+          for test in \
+            pin_insertion_preserves_original_text_and_newline_boundaries \
+            pin_replacement_preserves_unrelated_records_and_text \
+            pin_no_op_preserves_original_bytes \
+            preserved_malformed_records_never_grant_trust \
+            a_pin_in_progress_blocks_a_concurrent_pin_of_a_different_host_until_it_finishes \
+            pin_host_equivalent_first_pins_race_without_creating_conflicting_records \
+            flock_retries_after_being_interrupted_by_a_signal; do
+            grep -F "test known_hosts::tests::$test ... ok" "$runtime/results.log"
+          done
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Portable CLI tests
