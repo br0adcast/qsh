@@ -26,8 +26,32 @@ pub fn compose(
             terminal_size::MAX_VIEWPORT_ROWS - u16::from(line.is_some()),
         ),
     );
+    finish_compose(shell, line, plate, boxed)
+}
+
+/// Compose chrome on an already-owned presentation frame without cloning its grid.
+pub fn compose_owned(
+    shell: Frame,
+    line: Option<&[Cell]>,
+    plate: Option<&str>,
+    boxed: Option<&Boxed>,
+) -> Frame {
+    let size = terminal_size::ViewportSize::new(
+        shell.cols,
+        terminal_size::MAX_VIEWPORT_ROWS - u16::from(line.is_some()),
+    );
+    let shell = crate::viewport::project_owned(shell, size);
+    finish_compose(shell, line, plate, boxed)
+}
+
+fn finish_compose(
+    shell: Frame,
+    line: Option<&[Cell]>,
+    plate: Option<&str>,
+    boxed: Option<&Boxed>,
+) -> Frame {
     let mut out = match plate {
-        Some(text) => status::overlay(&shell, text),
+        Some(text) => status::overlay_owned(shell, text),
         None => shell,
     };
     if let Some(line) = line {
@@ -48,7 +72,7 @@ pub fn compose(
         out.cursor_visible = false;
     }
     let size = terminal_size::ViewportSize::new(out.cols, out.rows);
-    crate::viewport::project(&out, size)
+    crate::viewport::project_owned(out, size)
 }
 
 /// Puts `boxed`'s cells over `frame`, clipped at its edges. A wide glyph
@@ -176,5 +200,30 @@ mod tests {
             .cells
             .iter()
             .all(|c| c.flags & terminal::FLAG_DIM == 0));
+    }
+    #[test]
+    fn owned_composition_preserves_each_original_neighbour_repair_pass() {
+        let mut source = Frame::blank(4, 1);
+        source.cells[0].flags = terminal::FLAG_LEADING_WIDE_SPACER | FLAG_WIDE;
+        source.cells[1].flags = FLAG_WIDE | FLAG_WIDE_SPACER;
+        source.cells[2].flags = FLAG_WIDE | FLAG_WIDE_SPACER;
+        source.cells[3].ch = 'X';
+        let saved = source.clone();
+        for plate in [None, Some("")] {
+            let borrowed = compose(&source, None, plate, None);
+            let actual = compose_owned(source.clone(), None, plate, None);
+            assert_eq!(actual, borrowed);
+            assert_eq!(&actual.cells[..2], &[Cell::blank(), Cell::blank()]);
+            assert_eq!(
+                actual.cells[2],
+                if plate.is_some() {
+                    Cell::blank()
+                } else {
+                    source.cells[2]
+                }
+            );
+            assert_eq!(actual.cells[3], source.cells[3]);
+        }
+        assert_eq!(source, saved);
     }
 }

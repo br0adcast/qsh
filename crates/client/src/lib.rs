@@ -105,7 +105,7 @@ impl ShellState {
         }
         self.prediction.set_send_interval(rtt_ms);
         self.prediction.cull(&auth, now_ms);
-        self.prediction.apply(&auth)
+        self.prediction.apply_owned(auth)
     }
 
     /// Framed stream 0 from the server: DATA records feed the terminal,
@@ -135,7 +135,7 @@ impl ShellState {
         // coordinates are tied to the live bottom and no longer match in a scrolled frame.
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
-            self.prediction.apply(&auth)
+            self.prediction.apply_owned(auth)
         } else {
             auth
         }
@@ -179,7 +179,7 @@ impl ShellState {
         let auth = self.terminal.frame();
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
-            self.prediction.apply(&auth)
+            self.prediction.apply_owned(auth)
         } else {
             auth
         }
@@ -195,7 +195,7 @@ impl ShellState {
         self.prediction.set_send_interval(rtt_ms);
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
-            self.prediction.apply(&auth)
+            self.prediction.apply_owned(auth)
         } else {
             auth
         }
@@ -213,7 +213,7 @@ impl ShellState {
         self.prediction.set_send_interval(rtt_ms);
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
-            self.prediction.apply(&auth)
+            self.prediction.apply_owned(auth)
         } else {
             auth
         }
@@ -277,7 +277,7 @@ impl ShellState {
         if predict {
             self.prediction.set_send_interval(rtt_ms);
             self.prediction.cull(&auth, now_ms);
-            Some(self.prediction.apply(&auth))
+            Some(self.prediction.apply_owned(auth))
         } else {
             Some(auth)
         }

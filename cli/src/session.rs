@@ -1516,48 +1516,40 @@ impl Session {
         if self.raw_cols == 0 || self.raw_rows == 0 {
             return Vec::new();
         }
-        let mut history = self.history_frame.clone();
-        if let Some(h) = &mut history {
-            if h.cols != frame.cols || h.rows != frame.rows {
-                *h = frame.clone();
-                self.history_frame = Some(h.clone());
+        if let Some(history) = &mut self.history_frame {
+            if history.cols != frame.cols || history.rows != frame.rows {
+                *history = frame.clone();
             }
-            h.cursor_visible = false;
-            h.mouse_tracking = MouseTracking::Off;
-            h.mouse_sgr = false;
-            h.app_cursor = false;
-            h.app_keypad = false;
         }
-        let frame = history.as_ref().unwrap_or(frame);
-        let projected = crate::viewport::project_padded(
+        let frame = self.history_frame.as_ref().unwrap_or(frame);
+        let mut projected = crate::viewport::project_padded(
             frame,
             terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on())),
         );
-        let frame = &projected;
-        self.shell_mouse = frame.mouse_tracking != MouseTracking::Off;
-        // The hidden-status alarm replaces the entire top row on a copy; it
-        // must also remain visible while local scrollback is being inspected.
-        let alarm = if !self.line_on() && self.outage() {
-            let mut copy = frame.clone();
-            if copy.rows > 0 {
-                for (cell, alarm) in copy
-                    .cells
-                    .iter_mut()
-                    .take(usize::from(copy.cols))
-                    .zip(self.recovery_cells())
-                {
-                    *cell = alarm;
-                }
+        if self.history_frame.is_some() {
+            projected.cursor_visible = false;
+            projected.mouse_tracking = MouseTracking::Off;
+            projected.mouse_sgr = false;
+            projected.app_cursor = false;
+            projected.app_keypad = false;
+        }
+        self.shell_mouse = projected.mouse_tracking != MouseTracking::Off;
+        // This is presentation-owned storage: the alarm never touches retained history.
+        let alarm = !self.line_on() && self.outage();
+        if alarm && projected.rows > 0 {
+            for (cell, alarm) in projected
+                .cells
+                .iter_mut()
+                .take(usize::from(projected.cols))
+                .zip(self.recovery_cells())
+            {
+                *cell = alarm;
             }
-            Some(copy)
-        } else {
-            None
-        };
-        let frame = alarm.as_ref().unwrap_or(frame);
+        }
         let line = self.line_on().then(|| self.line_cells());
         let plate = if !self.line_on() && self.live_notice().is_some() {
             self.live_notice().map(str::to_owned)
-        } else if self.line_on() || alarm.is_some() {
+        } else if self.line_on() || alarm {
             None
         } else if self.history_frame.is_some() {
             Some(statusline::scroll_part(
@@ -1568,7 +1560,8 @@ impl Session {
             self.plate_text(now_ms)
         };
         let boxed = self.window_box();
-        let mut shown = overlay::compose(frame, line.as_deref(), plate.as_deref(), boxed.as_ref());
+        let mut shown =
+            overlay::compose_owned(projected, line.as_deref(), plate.as_deref(), boxed.as_ref());
         if self.recovery_view.is_some() && matches!(self.window, Some(Open::Roads(_))) {
             // Recovery details reserve row zero: keep its activity contrast
             // while the shell behind the window is dimmed.
@@ -2291,6 +2284,51 @@ mod tests {
     fn shown_row(s: &Session, row: u16) -> String {
         let f = s.last_frame.as_ref().expect("painted frame");
         (0..f.cols).map(|c| f.cell(row, c).ch).collect()
+    }
+
+    #[test]
+    fn history_paint_preserves_retained_storage_metadata_and_complete_cells() {
+        let mut s = session_with_history();
+        s.handle(UiEvent::Stdin(ingress_input(b"\x1d[".to_vec())), 2);
+        let history = s.history_frame.as_mut().unwrap();
+        history.cursor_col = 1;
+        history.cursor_row = 1;
+        history.cursor_visible = true;
+        history.mouse_tracking = MouseTracking::Motion;
+        history.mouse_sgr = true;
+        history.app_cursor = true;
+        history.app_keypad = true;
+        history.bracketed_paste = true;
+        history.origin_mode = true;
+        history.alt_screen = true;
+        let mut clustered = terminal::TerminalCore::new(40, 1);
+        clustered.feed("e\u{301}界\u{302}".as_bytes());
+        history.cells[..3].copy_from_slice(&clustered.frame().cells[..3]);
+        history.cells[0].flags |= terminal::FLAG_HIDDEN;
+        std::sync::Arc::make_mut(&mut history.palette).default_fg = 0x123456;
+        let saved = history.clone();
+        let pointer = history.cells.as_ptr();
+        for now in [3, 1003] {
+            let incoming = s.shell.frame(now, 0);
+            s.paint_at(&incoming, now);
+            assert_eq!(s.history_frame.as_ref(), Some(&saved));
+            assert_eq!(s.history_frame.as_ref().unwrap().cells.as_ptr(), pointer);
+            let shown = s.last_frame.as_ref().unwrap();
+            assert!(
+                !shown.cursor_visible && !shown.app_cursor && !shown.app_keypad && !shown.mouse_sgr
+            );
+            assert_eq!(shown.mouse_tracking, MouseTracking::Off);
+            assert!(shown.origin_mode && shown.bracketed_paste && shown.alt_screen);
+            assert_eq!(&shown.cells[40..], &saved.cells);
+            assert!(std::sync::Arc::ptr_eq(&shown.palette, &saved.palette));
+        }
+        let mut replacement = terminal::Frame::blank(39, 5);
+        replacement.cells[0].ch = 'R';
+        s.paint_at(&replacement, 1004);
+        assert_eq!(s.history_frame.as_ref(), Some(&replacement));
+        let retained = s.history_frame.as_ref().unwrap().cells.as_ptr();
+        s.paint_at(&replacement, 1005);
+        assert_eq!(s.history_frame.as_ref().unwrap().cells.as_ptr(), retained);
     }
 
     #[test]

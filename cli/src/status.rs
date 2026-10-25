@@ -134,7 +134,11 @@ pub fn bracketed(host: &str) -> String {
 /// `frame` with `text` painted across the top row, in reverse video, cut to
 /// the width of the row.
 pub fn overlay(frame: &Frame, text: &str) -> Frame {
-    let mut out = frame.clone();
+    overlay_owned(frame.clone(), text)
+}
+
+/// Paint a plate on presentation storage supplied by the caller.
+pub fn overlay_owned(mut out: Frame, text: &str) -> Frame {
     if out.cols == 0 || out.rows == 0 {
         return out;
     }
@@ -154,7 +158,7 @@ pub fn overlay(frame: &Frame, text: &str) -> Frame {
     }
     // Text and the surviving underlying cells can both end with half a pair.
     let size = terminal_size::ViewportSize::new(out.cols, out.rows);
-    out = crate::viewport::project(&out, size);
+    out = crate::viewport::project_owned(out, size);
     out
 }
 

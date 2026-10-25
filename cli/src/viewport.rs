@@ -2,50 +2,103 @@
 use terminal::{Cell, Frame, FLAG_LEADING_WIDE_SPACER, FLAG_WIDE, FLAG_WIDE_SPACER};
 use terminal_size::ViewportSize;
 
+// Enumerate every field: adding Frame metadata must prompt an explicit review.
+fn metadata(frame: &Frame, cols: u16, rows: u16, cells: Vec<Cell>) -> Frame {
+    Frame {
+        cols,
+        rows,
+        cells,
+        cursor_col: frame.cursor_col,
+        cursor_row: frame.cursor_row,
+        cursor_visible: frame.cursor_visible,
+        app_cursor: frame.app_cursor,
+        app_keypad: frame.app_keypad,
+        origin_mode: frame.origin_mode,
+        mouse_tracking: frame.mouse_tracking,
+        mouse_sgr: frame.mouse_sgr,
+        bracketed_paste: frame.bracketed_paste,
+        alt_screen: frame.alt_screen,
+        palette: std::sync::Arc::clone(&frame.palette),
+    }
+}
+
+fn repaired(cell: Cell, previous_flags: u16, col: u16, cols: u16) -> Cell {
+    if cell.flags & FLAG_LEADING_WIDE_SPACER != 0
+        || (cell.flags & FLAG_WIDE != 0 && col + 1 >= cols)
+        || (cell.flags & FLAG_WIDE_SPACER != 0 && (col == 0 || previous_flags & FLAG_WIDE == 0))
+    {
+        Cell::blank()
+    } else {
+        cell
+    }
+}
+
+fn clip_cursor(frame: &mut Frame, cols: u16, rows: u16) {
+    if frame.cursor_col >= cols || frame.cursor_row >= rows {
+        frame.cursor_visible = false;
+        frame.cursor_col = 0;
+        frame.cursor_row = 0;
+    }
+}
+
 /// Crop before adding chrome; a partial wide glyph is never printable.
 pub fn project(frame: &Frame, size: ViewportSize) -> Frame {
-    let mut out = frame.clone();
-    out.cols = frame.cols.min(size.cols());
-    out.rows = frame.rows.min(size.rows());
-    out.cells.clear();
-    for row in 0..out.rows {
-        for col in 0..out.cols {
-            let mut cell = *frame.cell(row, col);
-            if cell.flags & FLAG_LEADING_WIDE_SPACER != 0
-                || (cell.flags & FLAG_WIDE != 0 && col + 1 >= out.cols)
-                || (cell.flags & FLAG_WIDE_SPACER != 0
-                    && (col == 0 || frame.cell(row, col - 1).flags & FLAG_WIDE == 0))
-            {
-                cell = Cell::blank();
-            }
-            out.cells.push(cell);
+    let cols = frame.cols.min(size.cols());
+    let rows = frame.rows.min(size.rows());
+    let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
+    for row in 0..rows {
+        let mut previous_flags = 0;
+        for col in 0..cols {
+            let cell = *frame.cell(row, col);
+            cells.push(repaired(cell, previous_flags, col, cols));
+            previous_flags = cell.flags;
         }
     }
-    if out.cursor_col >= out.cols || out.cursor_row >= out.rows {
-        out.cursor_visible = false;
-        out.cursor_col = 0;
-        out.cursor_row = 0;
-    }
+    let mut out = metadata(frame, cols, rows, cells);
+    clip_cursor(&mut out, cols, rows);
     out
 }
 
 /// Fill the bounded physical presentation area without reflowing the shell.
-/// Cursor visibility is decided while cropping, so padding never exposes a
-/// cursor outside the committed grid.
+/// Cursor clipping uses the cropped grid, so padding never reveals a cursor.
 pub fn project_padded(frame: &Frame, size: ViewportSize) -> Frame {
-    let mut out = project(frame, size);
-    let (cols, rows) = (out.cols, out.rows);
-    let cropped = std::mem::take(&mut out.cells);
-    out.cols = size.cols();
-    out.rows = size.rows();
-    out.cells = vec![Cell::blank(); usize::from(out.cols) * usize::from(out.rows)];
+    let cols = frame.cols.min(size.cols());
+    let rows = frame.rows.min(size.rows());
+    let cells = vec![Cell::blank(); usize::from(size.cols()) * usize::from(size.rows())];
+    let mut out = metadata(frame, size.cols(), size.rows(), cells);
+    clip_cursor(&mut out, cols, rows);
     for row in 0..rows {
-        let src = usize::from(row) * usize::from(cols);
-        let dst = usize::from(row) * usize::from(out.cols);
-        out.cells[dst..dst + usize::from(cols)]
-            .copy_from_slice(&cropped[src..src + usize::from(cols)]);
+        let mut previous_flags = 0;
+        for col in 0..cols {
+            let cell = *frame.cell(row, col);
+            *out.cell_mut(row, col) = repaired(cell, previous_flags, col, cols);
+            previous_flags = cell.flags;
+        }
     }
     out
+}
+
+/// Apply the same crop/repair pass to storage already owned by presentation.
+/// Read each original cell before compacting; repaired neighbours are not input.
+pub(crate) fn project_owned(mut frame: Frame, size: ViewportSize) -> Frame {
+    let old_cols = usize::from(frame.cols);
+    let cols = frame.cols.min(size.cols());
+    let rows = frame.rows.min(size.rows());
+    for row in 0..rows {
+        let mut previous_flags = 0;
+        for col in 0..cols {
+            let source = usize::from(row) * old_cols + usize::from(col);
+            let target = usize::from(row) * usize::from(cols) + usize::from(col);
+            let cell = frame.cells[source];
+            frame.cells[target] = repaired(cell, previous_flags, col, cols);
+            previous_flags = cell.flags;
+        }
+    }
+    frame.cells.truncate(usize::from(cols) * usize::from(rows));
+    frame.cols = cols;
+    frame.rows = rows;
+    clip_cursor(&mut frame, cols, rows);
+    frame
 }
 
 #[cfg(test)]
@@ -99,5 +152,94 @@ mod complete_cell_tests {
         let clipped = project(&source, ViewportSize::new(2, 2));
         assert_eq!(clipped.cells[0], source.cells[0]);
         assert_eq!(clipped.cells[1], Cell::blank());
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::sync::Arc;
+    use terminal::{Color, MouseTracking, TerminalCore, FLAG_HIDDEN};
+
+    #[test]
+    fn padding_and_clipping_preserve_complete_metadata_and_cells() {
+        let mut core = TerminalCore::new(4, 2);
+        core.feed("e\u{301}界\u{302}x".as_bytes());
+        let mut source = core.frame();
+        source.cursor_col = 3;
+        source.cursor_row = 1;
+        source.cursor_visible = true;
+        source.app_cursor = true;
+        source.app_keypad = true;
+        source.origin_mode = true;
+        source.mouse_tracking = MouseTracking::Drag;
+        source.mouse_sgr = true;
+        source.bracketed_paste = true;
+        source.alt_screen = true;
+        source.cells[0].flags |= FLAG_HIDDEN;
+        source.cells[0].fg = Color::Indexed(7);
+        source.cells[0].bg = Color::Rgb(0x123456);
+        Arc::make_mut(&mut source.palette).default_bg = 0x123456;
+        let saved = source.clone();
+        let padded = project_padded(&source, ViewportSize::new(6, 3));
+        let mut expected = source.clone();
+        expected.cols = 6;
+        expected.rows = 3;
+        expected.cells = vec![Cell::blank(); 18];
+        expected.cells[..4].copy_from_slice(&source.cells[..4]);
+        expected.cells[6..10].copy_from_slice(&source.cells[4..8]);
+        assert_eq!(padded, expected);
+        assert!(Arc::ptr_eq(&padded.palette, &source.palette));
+        let clipped = project_padded(&source, ViewportSize::new(2, 3));
+        expected.cols = 2;
+        expected.cells = vec![
+            source.cells[0],
+            Cell::blank(),
+            source.cells[4],
+            source.cells[5],
+            Cell::blank(),
+            Cell::blank(),
+        ];
+        expected.cursor_visible = false;
+        expected.cursor_col = 0;
+        expected.cursor_row = 0;
+        assert_eq!(clipped, expected);
+        assert_eq!(source, saved);
+    }
+
+    #[test]
+    fn repair_reads_original_neighbours_and_preserves_pass_order() {
+        let mut source = Frame::blank(3, 1);
+        source.cells[0].flags = FLAG_LEADING_WIDE_SPACER | FLAG_WIDE;
+        source.cells[1].flags = FLAG_WIDE_SPACER;
+        let once = project(&source, ViewportSize::new(3, 1));
+        assert_eq!(once.cells[0], Cell::blank());
+        assert_eq!(once.cells[1], source.cells[1]);
+        let twice = project(&once, ViewportSize::new(3, 1));
+        assert_eq!(twice.cells[1], Cell::blank());
+    }
+    #[test]
+    fn owned_crop_preserves_storage_and_the_borrowed_single_pass_result() {
+        let mut source = Frame::blank(7, 3);
+        source.cells[0].flags = FLAG_LEADING_WIDE_SPACER | FLAG_WIDE;
+        source.cells[1].flags = FLAG_WIDE_SPACER;
+        source.cursor_col = 6;
+        source.cursor_row = 2;
+        for size in [
+            ViewportSize::new(7, 3),
+            ViewportSize::new(3, 2),
+            ViewportSize::new(0, 0),
+        ] {
+            let owned = source.clone();
+            let pointer = owned.cells.as_ptr();
+            let capacity = owned.cells.capacity();
+            let expected = project(&source, size);
+            let actual = project_owned(owned, size);
+            assert_eq!(actual, expected);
+            assert_eq!(
+                (actual.cells.as_ptr(), actual.cells.capacity()),
+                (pointer, capacity)
+            );
+        }
     }
 }
