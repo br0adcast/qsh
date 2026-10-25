@@ -314,12 +314,29 @@ key. Alt-letter after the prefix has the same bytes as Esc then that letter, so
 the letter is sent to the remote application. Bracketed-paste contents never
 execute local prefix commands, even when a marker arrives across multiple reads.
 
+If the terminal sends a paste-start marker without its matching end marker,
+qsh keeps treating subsequent input as literal paste, including `Ctrl-] .`.
+Waiting does not restore local commands. If you know the original input source
+has finished and no input remains queued, a terminal action that sends a complete
+bracketed paste can supply the missing end marker. Its content and markers still
+go to the remote application; local commands become available after the end
+marker. This depends on your terminal sending those markers. qsh cannot confirm
+that an input source has finished, and this is not a universal recovery method.
+
+To end the client instead, use another terminal to send an operating-system
+termination signal to the identified qsh process. `SIGTERM`, `SIGHUP`, `SIGINT`
+and `SIGQUIT` use qsh's normal exit path, which may end the remote session;
+they are not a session-preserving detach. Typing `Ctrl-C` or `Ctrl-Z` in raw
+mode does not send these operating-system signals to qsh. Closing the terminal
+also does not guarantee a retained session.
+
 `--escape ^X` changes the prefix; `--escape ^b` selects Ctrl-B.
 Avoid `^[` and `^M` unless you intend to intercept Escape or Enter.
 With `^[`, the history command `Esc [` is also the beginning of a paste marker;
 it waits for another byte to distinguish the command from a paste.
-`--escape none` disables the prefix; leave using the shell's `exit`, a signal,
-or by closing the terminal.
+`--escape none` disables the prefix. The shell's `exit`, an external termination
+signal, or closing the terminal can end the run; these do not promise to retain
+the remote session.
 
 The connection panel lists routes in command-line order with state and latency.
 Arrows or `1`–`8` select a row; Enter switches to an answering spare route. Escape
