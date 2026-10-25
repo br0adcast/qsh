@@ -55,6 +55,14 @@ class ReportTests(unittest.TestCase):
         self.assertIn("binary_id(=qsh::release_cache_authority_privilege)", expression)
         self.assertIn("test(=release_cache_root_readonly_and_foreign_owner_boundaries)", expression)
 
+    def test_ssh_host_authority_exclusion_has_one_exact_root_owner(self):
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        key = ("qsh::ssh_known_hosts_authority_privilege", "ssh_known_hosts_real_owner_read_and_append_boundaries")
+        self.assertEqual([item for item in expected if item[0] == key[0]], [key])
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite test ssh_known_hosts_authority_privilege")
+        self.assertEqual(self.module.exclusion_filter({key: expected[key]}),
+                         "not ((binary_id(=qsh::ssh_known_hosts_authority_privilege) & test(=ssh_known_hosts_real_owner_read_and_append_boundaries)))")
+
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),
                              ("tests::safe", "stdout", "<&> ordinary output"),

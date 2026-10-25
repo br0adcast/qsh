@@ -127,9 +127,24 @@ The client uses only the selected XDG store. Previous macOS files under
 `~/Library/Application Support/qsh` are not imported or linked automatically;
 existing files remain untouched. Server-side qshd state and host keys are unaffected.
 
-SSH independently uses `~/.ssh/known_hosts`, including hashed entries,
-`[host]:port`, and revoked keys. Unknown SSH keys need confirmation; changed
-ones are refused. When that verified SSH login starts qshd, its returned daemon
+SSH independently reads `~/.ssh/known_hosts` and `/etc/ssh/ssh_known_hosts`,
+including hashed entries, `[host]:port`, and revoked keys. Both configured stores
+must be readable or ordinarily absent; an unsafe or unreadable store stops SSH
+before a connection starts. Public regular files owned by root or the current
+user are accepted when neither group nor others can write them. Trusted parent
+and file aliases, public hardlinks, and safe searchable directories remain
+supported; observed path or metadata changes are refused. Malformed lines and
+invalid UTF-8 lines remain ignored individually, without hiding valid neighbors.
+
+Unknown SSH keys need confirmation; changed ones are refused. Saving an accepted
+key requires a current-user-owned file and reads its complete tail through the
+same descriptor used for append. A trusted final alias appends to its actual
+target; hardlink names share the change. Existing modes are preserved. Creating
+entries requires a current-user-owned safe parent; no permissions are repaired.
+Dangling aliases or a new entry appearing during creation cause a save error.
+If saving fails, qsh warns and may still connect using the specifically approved
+key for this attempt. Append does not serialize other writers or roll back a
+partial write. When that verified SSH login starts qshd, its returned daemon
 key binds only the same address and the UDP port it reports. qsh compares discovery
 with that key and atomically remembers it without another QSH trust question.
 Conflicting existing pins, discovery keys, or session identities are refused;

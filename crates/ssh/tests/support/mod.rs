@@ -37,6 +37,8 @@ pub struct TestSshd {
     pub dir: tempfile::TempDir,
     pub port: u16,
     child: Child,
+    terminal: bool,
+    lost_wait: bool,
     first_host_pub: String,
 }
 
@@ -133,6 +135,8 @@ impl TestSshd {
                         dir,
                         port,
                         child,
+                        terminal: false,
+                        lost_wait: false,
                         first_host_pub: format!("host_{}.pub", kinds[0]),
                     };
                 }
@@ -194,8 +198,37 @@ impl TestSshd {
     }
 
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.terminal {
+            return;
+        }
+        if !self.lost_wait {
+            let _ = self.child.kill();
+        }
+        match self.child.wait() {
+            Ok(_) => self.terminal = true,
+            Err(error) => self.lost_wait |= error.raw_os_error() == Some(libc::ECHILD),
+        }
+    }
+
+    /// Retain this exact returned fixture child and its directory until wait
+    /// proves terminal completion. Never signal after terminal/ECHILD evidence.
+    pub fn finish_owned(&mut self) {
+        self.kill();
+        let mut reported = false;
+        while !self.terminal {
+            match self.child.wait() {
+                Ok(_) => self.terminal = true,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    self.lost_wait |= error.raw_os_error() == Some(libc::ECHILD);
+                    if !reported {
+                        eprintln!("owned sshd wait failed; retaining custody: {error}");
+                        reported = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 }
 

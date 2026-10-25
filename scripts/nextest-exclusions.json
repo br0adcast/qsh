@@ -165,6 +165,14 @@
       ],
       "reason": "Requires disposable root self-exec with real account and foreign owners",
       "owner": "CI container job: QSH pin ownership boundary"
+    },
+    {
+      "binary": "qsh::ssh_known_hosts_authority_privilege",
+      "tests": [
+        "ssh_known_hosts_real_owner_read_and_append_boundaries"
+      ],
+      "reason": "Requires disposable-root self-exec children with real foreign effective UIDs",
+      "owner": "CI container job: run_suite test ssh_known_hosts_authority_privilege"
     }
   ]
 }

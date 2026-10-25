@@ -576,9 +576,12 @@ mod tests {
 
     #[test]
     fn unreadable_stores_stop_foreground_and_background_before_ssh() {
+        use std::os::unix::fs::PermissionsExt;
         for background in [false, true] {
             for system_fails in [false, true] {
                 let home = tempfile::tempdir().unwrap();
+                std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
                 let user = home.path().join("known_hosts");
                 let system = home.path().join("ssh_known_hosts");
                 let failed = if system_fails { &system } else { &user };
@@ -586,6 +589,7 @@ mod tests {
                 // A trusted key cannot make an unavailable revocation store safe.
                 let readable = if system_fails { &user } else { &system };
                 std::fs::write(readable, "host.invalid ssh-ed25519 AQID\n").unwrap();
+                std::fs::set_permissions(readable, std::fs::Permissions::from_mode(0o600)).unwrap();
                 let known = KnownHosts::new(user.clone(), Some(system.clone()));
                 let tty = Tty::at(home.path().join("no-tty"));
                 let step = SshStep {

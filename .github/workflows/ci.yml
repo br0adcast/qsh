@@ -195,6 +195,42 @@ jobs:
             echo '::error::native session-slot tests reported a runtime skip' >&2
             exit 1
           fi
+      - name: Native SSH known-host authority and caller tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-ssh-host-authority.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qsh --lib --locked known_hosts::tests:: -- --color never --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/results.log"
+          for name in \
+            known_hosts::tests::ssh_host_authority_reads_refuse_unsafe_and_special_evidence \
+            known_hosts::tests::ssh_host_authority_public_aliases_missing_and_raw_routes \
+            known_hosts::tests::ssh_host_authority_complete_reads_preserve_parser_and_bindings \
+            known_hosts::tests::ssh_host_authority_append_preserves_target_alias_hardlink_and_modes \
+            known_hosts::tests::ssh_host_authority_append_tail_and_write_share_one_object \
+            known_hosts::tests::ssh_host_authority_append_read_errors_are_not_ignored \
+            known_hosts::tests::ssh_host_authority_creation_is_exclusive_and_never_repairs \
+            known_hosts::tests::non_utf8_line_does_not_hide_the_file \
+            known_hosts::tests::revoked_in_system_file_removes_known_from_user_file \
+            known_hosts::tests::wildcards_and_negation_work_like_openssh \
+            known_hosts::tests::hashed_entries_match \
+            known_hosts::tests::io_failure_is_not_an_absent_optional_store \
+            known_hosts::tests::permission_errors_preserve_path_and_source_for_either_store; do
+            grep -Fx "test $name ... ok" "$runtime/results.log"
+          done
+          grep -F 'test result: ok. 41 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          if grep -Fq SKIPPED "$runtime/results.log"; then exit 1; fi
+          cargo test -p qsh --lib --locked ssh_step::tests::unreadable_stores_stop_foreground_and_background_before_ssh -- --exact --color never --nocapture \
+            2>&1 | tee "$runtime/caller.log"
+          grep -Fx 'test ssh_step::tests::unreadable_stores_stop_foreground_and_background_before_ssh ... ok' "$runtime/caller.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/caller.log"
+          if grep -Fq SKIPPED "$runtime/caller.log"; then exit 1; fi
       - name: Compile the bringup standalone target boundary
         run: |
           echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."
@@ -716,7 +752,7 @@ jobs:
             if length == 1 then .[0].id else error("expected one qshd workspace package") end
           ' "$RUNNER_TEMP/workspace.json")
 
-          # The cache ownership fixture is the one qsh target in this tier.
+          # The named cache and SSH ownership fixtures use qsh here.
           qsh_package=$(jq -er '
             .workspace_members as $members |
             [.packages[] | select(.name == "qsh" and
@@ -729,7 +765,7 @@ jobs:
           # which share a target name.
           binary() {
             package=$qshd_package
-            if [ "$1" = test ] && [ "$2" = release_cache_authority_privilege ]; then
+            if [ "$1" = test ] && { [ "$2" = release_cache_authority_privilege ] || [ "$2" = ssh_known_hosts_authority_privilege ]; }; then
               package=$qsh_package
             fi
             jq -r --arg package "$package" --arg kind "$1" --arg name "$2" \
@@ -794,7 +830,7 @@ jobs:
             # all" is a different answer from "which failed", and a broken
             # run is exactly when both are worth having.
             scripts/no-silent-skips.sh "$logs/$name.log" "$@" || bad=1
-            if [ "$name" = release_cache_authority_privilege ]; then
+            if [ "$name" = release_cache_authority_privilege ] || [ "$name" = ssh_known_hosts_authority_privilege ]; then
               grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$logs/$name.log" || bad=1
             fi
             failures=$((failures + bad))
@@ -821,6 +857,8 @@ jobs:
           # --nocapture.
           run_suite test release_cache_authority_privilege \
             --require release_cache_root_readonly_and_foreign_owner_boundaries
+          run_suite test ssh_known_hosts_authority_privilege \
+            --require ssh_known_hosts_real_owner_read_and_append_boundaries
           run_suite test serve_system_split \
             --require the_worker_runs_as_its_configured_account
           run_suite test system_mode_accounts \

@@ -228,6 +228,10 @@ pub struct Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // A caller's exact owner may already have observed/reaped termination.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
