@@ -11,7 +11,8 @@
 //! bound is max(initial size, B + (N - 1) * L), at worst max(initial size, N * B).
 //! This assumes regular-file metadata/append semantics and no outside writes;
 //! it is not a writer-count-independent cap or transactional I/O guarantee.
-//! Errors are swallowed: a log must never fail its caller.
+//! Append errors are swallowed. The fallible startup API lets callers report a
+//! disabled sink without making logging a requirement for their work.
 
 use crate::file_path::{Intent, ParentAuthority};
 #[cfg(test)]
@@ -40,7 +41,7 @@ impl FileSink {
     /// Opens a log under a declared dedicated application directory. Only that
     /// current-account-owned final directory may be repaired to private mode.
     pub fn open_in_private_dir(path: &Path, max_bytes: u64) -> Option<FileSink> {
-        Self::open_with_intent(path, max_bytes, Intent::DeclaredPrivate)
+        Self::try_open_in_private_dir(path, max_bytes).ok()
     }
 
     /// Opens a validated append target, creating missing components privately.
@@ -49,10 +50,25 @@ impl FileSink {
         Self::open_with_intent(path, max_bytes, Intent::Generic)
     }
 
+    /// Fallible startup API: the caller can surface why its file sink is disabled.
+    pub fn try_open_in_private_dir(path: &Path, max_bytes: u64) -> std::io::Result<FileSink> {
+        Self::try_open_with_intent(path, max_bytes, Intent::DeclaredPrivate)
+    }
+
     fn open_with_intent(path: &Path, max_bytes: u64, intent: Intent) -> Option<FileSink> {
-        let authority = ParentAuthority::resolve(path, intent, true).ok()?;
-        let file = authority.open_append_checked().ok()?;
-        Some(FileSink {
+        Self::try_open_with_intent(path, max_bytes, intent).ok()
+    }
+
+    fn try_open_with_intent(
+        path: &Path,
+        max_bytes: u64,
+        intent: Intent,
+    ) -> std::io::Result<FileSink> {
+        let authority = ParentAuthority::resolve(path, intent, true)?;
+        let file = authority
+            .open_append_checked()
+            .map_err(|error| crate::path_error(path, "opening log file", error))?;
+        Ok(FileSink {
             inner: Mutex::new(Inner {
                 authority,
                 max_bytes,

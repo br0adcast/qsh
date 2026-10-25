@@ -102,6 +102,12 @@ fn run(a: args::Args) -> i32 {
         a.addresses[0].qsh_port,
     );
 
+    if let Some(warning) = claim.take_warning() {
+        let line = format!("qsh: {warning}");
+        let _ = writeln!(std::io::stderr(), "{line}");
+        log::shown_warning(&line);
+    }
+
     let mut setup = Arc::new(Setup::new(
         a,
         // The one Noise static key of this process (spec §4.2).
@@ -701,6 +707,9 @@ impl Links {
                 self.catalog.seed(AddressId(*addr), endpoint);
             }
         }
+        if let Some(warning) = round.take_warning() {
+            actions.extend(sess.handle(UiEvent::DiagnosticWarning(warning), now_ms));
+        }
         self.round = None;
         match ended {
             Round::Connected { connected, events } => {
@@ -1023,7 +1032,15 @@ impl Links {
                 Instant::now(),
             )
         });
-        sess.handle(UiEvent::RecoveryStatus { view }, now_ms)
+        let mut actions = sess.handle(UiEvent::RecoveryStatus { view }, now_ms);
+        if let Some(warning) = self
+            .round
+            .as_ref()
+            .and_then(background::RoundTask::take_warning)
+        {
+            actions.extend(sess.handle(UiEvent::DiagnosticWarning(warning), now_ms));
+        }
+        actions
     }
 
     /// Tells `Session` how the live connection's roads look, when it is time

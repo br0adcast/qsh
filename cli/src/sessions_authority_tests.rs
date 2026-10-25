@@ -258,3 +258,42 @@ fn slot139_replacement_refuses_displaced_routes_and_keeps_lock() {
     }
     assert!(failures.is_empty(), "{failures:?}");
 }
+
+#[test]
+fn path_diagnostics_unavailable_store_warns_once_and_keeps_usable_token() {
+    let d = slot139_fixture();
+    let parent = d.path().join("unsafe\nparent");
+    std::fs::create_dir(&parent).unwrap();
+    slot139_mode(&parent, 0o777);
+    let mut owner = claim(&parent.join("sessions"), "alice", "example.invalid", 60000);
+    let token = owner.token;
+    let warning = owner.take_warning().expect("visible persistence warning");
+    assert!(warning.contains("future recovery") && warning.contains("unsafe\\nparent"), "{warning}");
+    assert!(!warning.contains(&hex(&token)));
+    assert!(owner.take_warning().is_none());
+    assert!(owner._lock.is_none());
+    assert_ne!(token, [0; 16]);
+    assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777, 0o777);
+}
+
+#[test]
+fn path_diagnostics_failed_initial_write_retains_token_and_lock_with_warning() {
+    let d = slot139_fixture();
+    let name = slot_name("alice", "example.invalid", 60000, 0);
+    let path = d.path().join(&name);
+    std::fs::write(&path, b"not a token").unwrap();
+    slot139_mode(&path, 0o600);
+    let store = Store::open(d.path(), DirectoryIntent::Generic).unwrap();
+    let file = OpenOptions::new().read(true).open(&path).unwrap();
+    let (parent, binding) = store.binding(&name).unwrap();
+    assert!(lock_exclusive(&file));
+    let mut owner = claim_locked(SlotLock::new(file, parent, binding), read_token_bytes).unwrap();
+    let token = owner.token;
+    let warning = owner.take_warning().expect("failed write is visible");
+    assert!(warning.contains("future recovery"));
+    assert!(!warning.contains(&hex(&token)));
+    assert_eq!(owner.token, token);
+    assert!(owner._lock.is_some());
+    assert_lock_from_subprocess(&path, false);
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a token");
+}

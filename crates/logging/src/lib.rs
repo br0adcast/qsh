@@ -4,11 +4,13 @@
 //! sink and a `log::Log` with a per-component filter. Logging is best
 //! effort: it never panics and never reports write errors.
 
+mod diagnostic;
 mod file;
 mod file_path;
 mod format;
 mod logger;
 
+pub use diagnostic::{diagnostic, path_error};
 pub use file::FileSink;
 pub use format::{breaks_the_line, component_of, format_lines};
 
@@ -260,4 +262,50 @@ fn private_test_dir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn diagnostics_preserve_permission_and_io_error_kinds_with_component() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::StorageFull,
+        ] {
+            let error = super::path_error(
+                std::path::Path::new("component\nname"),
+                "opening log",
+                kind.into(),
+            );
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains("component\\nname"));
+            assert!(!error.to_string().contains('\n'));
+        }
+    }
+
+    #[test]
+    fn diagnostics_preserve_non_utf8_path_bytes_without_terminal_controls() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff\n".to_vec()));
+        let error = super::path_error(
+            &path,
+            "opening",
+            std::io::ErrorKind::PermissionDenied.into(),
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("\\x") && message.contains("\\n"),
+            "{message}"
+        );
+        assert!(!message.contains('\u{fffd}') && !message.contains('\n'));
+    }
+
+    #[test]
+    fn diagnostics_escape_controls_and_bound_multibyte_output() {
+        let message = super::diagnostic(&format!("a\n\x1b\u{202e}{}", "🦀".repeat(2048)));
+        assert!(message.starts_with("a\\n\\u{1b}\\u{202e}"));
+        assert!(message.len() <= 1024);
+        assert!(message.ends_with("[truncated]"));
+        assert!(!message.chars().any(char::is_control));
+    }
 }

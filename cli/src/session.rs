@@ -58,6 +58,8 @@ pub enum LocalInputFailure {
 /// Everything that can happen to the client.
 #[derive(PartialEq, Eq, Debug)]
 pub enum UiEvent {
+    /// Owner-polled startup diagnostic from generation-valid SSH recovery.
+    DiagnosticWarning(String),
     /// Authenticated terminal failure for the exact stamped live link.
     SessionAborted(transport::SessionAbortReason),
     /// Explicit synchronous rejection or accepted-input failure; never replay it.
@@ -251,6 +253,7 @@ pub struct Session {
     desired_size: terminal_size::TerminalSize,
     geometry_instance: Option<ChannelInstance>,
     resize_notice: Option<String>,
+    diagnostic_notice: Option<String>,
     continuity_notice: Option<OutputGapCause>,
     session_abort: Option<transport::SessionAbortReason>,
     input_failed: bool,
@@ -356,6 +359,7 @@ impl Session {
             desired_size: size,
             geometry_instance: None,
             resize_notice: None,
+            diagnostic_notice: None,
             continuity_notice: None,
             session_abort: None,
             input_failed: false,
@@ -387,6 +391,16 @@ impl Session {
 
     pub fn handle(&mut self, ev: UiEvent, now_ms: i64) -> Vec<Action> {
         match ev {
+            UiEvent::DiagnosticWarning(message) => {
+                let message = logging::diagnostic(&message);
+                if self.diagnostic_notice.as_ref() == Some(&message) {
+                    return Vec::new();
+                }
+                self.diagnostic_notice = Some(message.clone());
+                let mut actions = self.repaint(now_ms);
+                actions.push(Action::Notice(message));
+                actions
+            }
             UiEvent::SessionAborted(reason) => {
                 if self.session_abort.is_some() {
                     return Vec::new();
@@ -759,16 +773,19 @@ impl Session {
     }
 
     fn live_notice(&self) -> Option<&str> {
-        self.resize_notice.as_deref().or_else(|| {
-            self.continuity_notice.map(|cause| match cause {
-                OutputGapCause::PreviousConnectionOutputUnconfirmed => {
-                    "Output continuity lost: some previous output was not confirmed."
-                }
-                OutputGapCause::TerminalReplyFailure => {
-                    "Terminal replies failed: channel stopped; some output may be missing."
-                }
+        self.resize_notice
+            .as_deref()
+            .or_else(|| {
+                self.continuity_notice.map(|cause| match cause {
+                    OutputGapCause::PreviousConnectionOutputUnconfirmed => {
+                        "Output continuity lost: some previous output was not confirmed."
+                    }
+                    OutputGapCause::TerminalReplyFailure => {
+                        "Terminal replies failed: channel stopped; some output may be missing."
+                    }
+                })
             })
-        })
+            .or(self.diagnostic_notice.as_deref())
     }
 
     /// Marks the shell channel as already requested, without emitting an
@@ -1650,6 +1667,42 @@ mod tests {
 
     use super::*;
     use render::TermCaps;
+
+    #[test]
+    fn path_diagnostics_warning_is_visible_during_recovery_and_after_resume_without_flood() {
+        for status_line in [false, true] {
+            let mut s = lined(100, 8);
+            s.line_shown = status_line;
+            let message = "qsh: host: qshd: file logging disabled";
+            let actions = s.handle(UiEvent::DiagnosticWarning(message.into()), 0);
+            let text: String = s
+                .last_frame
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert!(text.contains("file logging disabled"), "{text}");
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::Notice(text) if text == message)));
+            assert!(s
+                .handle(UiEvent::DiagnosticWarning(message.into()), 1)
+                .is_empty());
+            s.handle(UiEvent::RecoveryStatus { view: None }, 2);
+            s.handle(UiEvent::Link(LinkState::Live), 3);
+            let text: String = s
+                .last_frame
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert!(text.contains("file logging disabled"), "{text}");
+        }
+    }
 
     #[test]
     fn stage6_boundary_geometry_clears_predictions_even_at_the_same_size() {

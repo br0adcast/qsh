@@ -25,6 +25,8 @@ struct State {
     observed_sweep: Option<SweepId>,
     ssh_activity: Option<(u64, AddressId)>,
     ssh_retry_at: Option<Instant>,
+    warning: Option<String>,
+    last_warnings: Vec<Option<String>>,
 }
 
 struct SshAttempt {
@@ -92,6 +94,8 @@ impl Recovery {
                 observed_sweep: None,
                 ssh_activity: None,
                 ssh_retry_at: None,
+                warning: None,
+                last_warnings: vec![None; addresses],
             }),
             retry_now: AtomicBool::new(false),
             diagnostics: (0..addresses)
@@ -356,8 +360,28 @@ impl Recovery {
         })
     }
 
-    /// Same lock as reset/cancel/recovered: a late worker cannot publish a port.
+    /// A single pending owner-polled diagnostic, never a worker event queue.
+    pub fn take_warning(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .warning
+            .take()
+    }
+
+    #[cfg(test)]
     fn publish_ready(&self, attempt: &SshAttempt, addr: usize, port: u16) -> bool {
+        self.publish_ready_with_warning(attempt, addr, port, None)
+    }
+
+    /// Same lock as reset/cancel/recovered: a late worker cannot publish a port.
+    fn publish_ready_with_warning(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+        port: u16,
+        warning: Option<String>,
+    ) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.cancel.is_cancelled()
             || state.local_send_failure
@@ -377,6 +401,13 @@ impl Recovery {
             state.changed(self.epoch);
             for diagnostic in &self.diagnostics {
                 diagnostic.invalidate();
+            }
+        }
+        if let Some(warning) = warning {
+            let warning = logging::diagnostic(&warning);
+            if state.last_warnings[addr].as_ref() != Some(&warning) {
+                state.warning = Some(warning.clone());
+                state.last_warnings[addr] = Some(warning);
             }
         }
         true
@@ -450,15 +481,16 @@ impl Recovery {
                         }) {
                             Ok(ready) => {
                                 let port = ready.port_for(address.qsh_port);
-                                if recovery.publish_ready(&attempt, i, port) {
+                                let warning = ready
+                                    .warning
+                                    .as_deref()
+                                    .map(|warning| report::qshd_warning(&address.host, warning));
+                                if recovery.publish_ready_with_warning(&attempt, i, port, warning) {
                                     log::shown(&report::qshd_ready(
                                         &address.host,
                                         address.qsh_port,
                                         port,
                                     ));
-                                    if let Some(warning) = ready.warning {
-                                        log::shown(&report::qshd_warning(&address.host, &warning));
-                                    }
                                 }
                             }
                             Err(crate::ssh_step::SshStepError::NeedsPrompt) => log::log(&format!(
@@ -533,6 +565,44 @@ mod tests {
         }
         let attempt = r.begin_ssh().unwrap();
         assert!(r.publish_ready(&attempt, addr, port));
+    }
+
+    #[test]
+    fn path_diagnostics_recovery_warning_is_generation_checked_and_taken_once() {
+        let r = Recovery::new(EPOCH, 2);
+        ready(&r, 0, 60000);
+        r.begin_sweep(SweepId(2));
+        for i in 0..2 {
+            r.finish(
+                r.revision(),
+                EPOCH,
+                SweepId(2),
+                AddressId(i),
+                AddressOutcome::Failed,
+            );
+        }
+        let attempt = r.begin_ssh().unwrap();
+        assert!(r.publish_ready_with_warning(
+            &attempt,
+            0,
+            60000,
+            Some("file logging disabled".into())
+        ));
+        assert_eq!(r.take_warning().as_deref(), Some("file logging disabled"));
+        assert!(r.take_warning().is_none());
+        assert!(r.publish_ready_with_warning(
+            &attempt,
+            0,
+            60000,
+            Some("file logging disabled".into())
+        ));
+        assert!(
+            r.take_warning().is_none(),
+            "same daemon status must not flood the owner"
+        );
+        r.update_endpoints(EPOCH, vec![]);
+        assert!(!r.publish_ready_with_warning(&attempt, 0, 60000, Some("stale warning".into())));
+        assert!(r.take_warning().is_none());
     }
 
     #[test]

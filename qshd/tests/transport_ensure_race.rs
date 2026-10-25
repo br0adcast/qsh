@@ -163,6 +163,16 @@ impl Ensure {
     }
 
     fn with_limit(home: &Path, port: u16, fail_output: bool, limit: Option<u64>) -> Self {
+        Self::with_environment(home, port, fail_output, limit, false)
+    }
+
+    fn with_environment(
+        home: &Path,
+        port: u16,
+        fail_output: bool,
+        limit: Option<u64>,
+        relative_home: bool,
+    ) -> Self {
         use std::os::unix::process::CommandExt;
         let out = tempfile::tempfile().unwrap();
         let err = tempfile::tempfile().unwrap();
@@ -184,6 +194,9 @@ impl Ensure {
                 });
             }
         }
+        if relative_home {
+            command.current_dir(home);
+        }
         let child = command
             .args([
                 "transport-ensure",
@@ -192,9 +205,16 @@ impl Ensure {
                 "--port",
                 &port.to_string(),
             ])
-            .env("HOME", home)
+            .env("HOME", if relative_home { Path::new(".") } else { home })
             .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_CACHE_HOME", home)
+            .env(
+                "XDG_CACHE_HOME",
+                if relative_home {
+                    PathBuf::from("relative-xdg-ignored")
+                } else {
+                    home.to_owned()
+                },
+            )
             .env("HISTFILE", "/dev/null")
             .env_remove("SSH_AUTH_SOCK")
             .env_remove("SSH_AGENT_PID")
@@ -1180,4 +1200,79 @@ fn descriptor_exhaustion_before_fork_does_not_publish_a_control_socket() {
     assert_ne!(ready(Ensure::start(home.path(), 0).finish()), 0);
     status(&socket(home.path()));
     descendants.reap();
+}
+
+#[test]
+fn path_diagnostics_detached_log_failure_survives_ready_and_reuse() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = private_temp_home().unwrap();
+    let descendants = Descendants::own();
+    let cache = home.path().join("qsh");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&cache)
+        .unwrap();
+    // A nonregular sink is synthetic and does not prevent daemon/session startup.
+    std::fs::create_dir(cache.join("qshd.log")).unwrap();
+    let first = Ensure::start(home.path(), 0).finish();
+    assert!(first.0, "{}", first.2);
+    let body = |output: &str| -> serde_json::Value {
+        let line = output
+            .lines()
+            .find_map(|line| line.strip_prefix("TRANSPORT-READY "))
+            .unwrap();
+        serde_json::from_str(line).unwrap()
+    };
+    let first_body = body(&first.1);
+    let warning = first_body["warning"]
+        .as_str()
+        .expect("startup warning in successful bootstrap");
+    assert!(
+        warning.contains("file logging disabled") && warning.contains("qshd.log"),
+        "{warning}"
+    );
+    assert!(warning.len() <= 1024);
+    assert_eq!(first.2.matches("file logging disabled").count(), 1);
+    let current = status(&socket(home.path()));
+    assert_eq!(current.logging_warning.as_deref(), Some(warning));
+    let second = Ensure::start(home.path(), 0).finish();
+    assert!(second.0, "{}", second.2);
+    assert_eq!(body(&second.1)["warning"].as_str(), Some(warning));
+    assert_eq!(status(&socket(home.path())).pid, current.pid);
+    let reply = client_request_with_timeout(
+        &socket(home.path()),
+        &ControlRequest::Stop,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(reply, ControlReply::Answered(_)));
+    wait_owned_daemon(current.pid);
+    descendants.reap();
+}
+
+#[test]
+fn path_diagnostics_relative_cache_route_survives_detach_and_status_reuse() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let home = private_temp_home().unwrap();
+    let descendants = Descendants::own();
+    let first = Ensure::with_environment(home.path(), 0, false, None, true).finish();
+    let port = ready(first);
+    let socket = home.path().join(".cache/qsh/control.sock");
+    let initial = status(&socket);
+    assert!(initial.logging_warning.is_none());
+    assert!(home.path().join(".cache/qsh/qshd.log").is_file());
+    assert_eq!(
+        ready(Ensure::with_environment(home.path(), 0, false, None, true).finish()),
+        port
+    );
+    assert_eq!(status(&socket).pid, initial.pid);
+    let reply = client_request_with_timeout(&socket, &ControlRequest::Stop, Duration::from_secs(5))
+        .unwrap();
+    assert!(matches!(reply, ControlReply::Answered(_)));
+    wait_owned_daemon(initial.pid);
+    descendants.reap();
+    assert!(
+        !socket.exists(),
+        "the detached guard retains the original route too"
+    );
 }

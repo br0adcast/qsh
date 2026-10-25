@@ -587,9 +587,8 @@ struct TransportReadyBody {
     /// The ports the daemon actually listens on -- for a live daemon, from
     /// its `STATUS`, not the ones this call asked for.
     ports: Vec<u16>,
-    /// Present (non-null) only when the daemon was kept because other
-    /// clients are active and its version differs -- the app shows this as
-    /// a connect/cancel dialog. Serialized as `null` otherwise (no
+    /// A startup diagnostic or a reason for keeping an older live daemon.
+    /// Clients surface this to the caller. Serialized as `null` otherwise (no
     /// `#[serde(skip_serializing_if)]`: the field is always present in the
     /// JSON, the client tolerates both `null` and an absent field).
     warning: Option<String>,
@@ -633,8 +632,46 @@ fn write_transport_ready(
     w.flush().context("flushing output")
 }
 
+/// Both reasons survive composition; bound each before joining so a long
+/// version warning cannot hide the persistent log diagnostic.
+fn combined_warning(version: Option<&str>, logging: Option<&str>) -> Option<String> {
+    match (version, logging) {
+        (None, None) => None,
+        (Some(warning), None) | (None, Some(warning)) => Some(logging::diagnostic(warning)),
+        (Some(version), Some(log)) => {
+            // Incoming STATUS is bounded by the local control protocol too.
+            let part = |text: &str| {
+                let text = logging::diagnostic(text);
+                if text.len() <= 384 {
+                    return text;
+                }
+                let mut end = 384;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}[truncated]", &text[..end])
+            };
+            Some(logging::diagnostic(&format!(
+                "{}; {}",
+                part(version),
+                part(log)
+            )))
+        }
+    }
+}
+
 /// Bound contention separately from the client's total ensure budget.
 const ENSURE_LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Capture the caller's route before detach changes cwd, preserving aliases/..
+/// and avoiding a cwd lookup when an absolute route already exists.
+fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
+    if cache_dir.is_absolute() {
+        Ok(cache_dir)
+    } else {
+        std::env::current_dir().map(|directory| directory.join(cache_dir))
+    }
+}
 
 /// The `transport-ensure` subcommand: a self-installing SELF-DAEMONIZING
 /// server for the NEW transport, that survives the SSH `exec` closing.
@@ -657,7 +694,8 @@ const ENSURE_LOCK_WAIT: Duration = Duration::from_secs(5);
 fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
 
-    let cache_dir = serve::cache_dir(false);
+    let cache_dir = absolute_cache_route(serve::cache_dir(false))
+        .context("resolving the personal cache directory")?;
     let sock_path = control_sock_path(&cache_dir);
     let transaction = control::EnsureLock::acquire(&sock_path, ENSURE_LOCK_WAIT)
         .context("locking the transport ensure transaction")?;
@@ -701,7 +739,8 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                         &mut std::io::stdout(),
                         &keypair.public,
                         &ready_ports(&status, &parsed.ports),
-                        warning.as_deref(),
+                        combined_warning(warning.as_deref(), status.logging_warning.as_deref())
+                            .as_deref(),
                     )?;
                     return Ok(());
                 }
@@ -853,11 +892,17 @@ fn become_transport_daemon(
     // Only the port actually bound is reported: `--default-port` is parsed
     // but not bound here.
     transaction.validate_route()?;
+    // Only own the sink here: no global logger, mutex or threads before fork.
+    // Readiness carries the warning because successful SSH stderr may be discarded.
+    let prepared_log = log::prepare(cache_dir);
+    if let Some(warning) = prepared_log.warning() {
+        let _ = writeln!(std::io::stderr(), "qshd: {warning}");
+    }
     write_transport_ready(
         &mut std::io::stdout(),
         &keypair.public,
         std::slice::from_ref(&bound_port),
-        None,
+        prepared_log.warning(),
     )?;
 
     // Daemonize: the parent exits after the first child's outcome (the SSH `exec` gets
@@ -865,7 +910,8 @@ fn become_transport_daemon(
     // sockets.
     // SAFETY: Rust's Unix startup initializes missing standard descriptors before
     // main. This synchronous path neither closes/replaces them nor starts threads,
-    // so its owned sockets/lock stay above 2 and no logger/runtime/workers exist.
+    // so its owned sockets/lock/prepared log stay above 2 and no global logger,
+    // runtime or workers exist.
     match unsafe { detach::detach() } {
         detach::Outcome::Parent(result) => {
             // Even a parent wait error does not prove that its forked child
@@ -884,7 +930,7 @@ fn become_transport_daemon(
 
     // From here on -- ONLY the daemon. stdout/stderr went to /dev/null:
     // events and panics are written to `<cache_dir>/qshd.log`.
-    log::init(cache_dir);
+    log::install_prepared(prepared_log);
     std::panic::set_hook(Box::new(|info| {
         log::error("qshd", &format!("PANIC: {info}"));
     }));
@@ -1617,6 +1663,7 @@ mod tests {
     #[test]
     fn ready_ports_are_the_ones_the_live_daemon_reports() {
         let status = control::StatusResponse {
+            logging_warning: None,
             cleanup: None,
             version: "0.3.0".into(),
             build: 1,
@@ -1635,6 +1682,7 @@ mod tests {
     #[test]
     fn a_status_without_ports_falls_back_to_the_requested_ones() {
         let status = control::StatusResponse {
+            logging_warning: None,
             cleanup: None,
             version: "0.3.0".into(),
             build: 1,
@@ -1644,6 +1692,93 @@ mod tests {
             pid: 1,
         };
         assert_eq!(ready_ports(&status, &[60022]), vec![60022]);
+    }
+
+    #[test]
+    fn path_diagnostics_absolute_cache_route_works_with_deleted_cwd() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::path_diagnostics_deleted_cwd_body",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    #[ignore = "isolated cwd mutation, invoked by absolute cache route wrapper"]
+    fn path_diagnostics_deleted_cwd_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+        std::fs::remove_dir(&cwd).unwrap();
+        assert!(std::env::current_dir().is_err());
+        let absolute = dir.path().join("cache");
+        assert_eq!(
+            super::absolute_cache_route(absolute.clone()).unwrap(),
+            absolute
+        );
+        assert!(qshd::log::prepare(&absolute).warning().is_none());
+        std::env::set_current_dir("/").unwrap();
+    }
+
+    #[test]
+    fn path_diagnostics_relative_cache_route_survives_resume_representation() {
+        let relative = std::path::PathBuf::from("relative/../cache");
+        let absolute = super::absolute_cache_route(relative.clone()).unwrap();
+        assert_eq!(absolute, std::env::current_dir().unwrap().join(relative));
+        let handover = qshd::handover::Handover {
+            handover_version: state::HANDOVER_VERSION,
+            binary_path: absolute.join("qshd"),
+            staged_path: absolute.join("staged"),
+            udp_fd: 5,
+            control_fd: 6,
+            control_path: absolute.join("control.sock"),
+            cache_dir: absolute.clone(),
+            port: 60000,
+            ports: vec![60000],
+            name: "owned-fixture".into(),
+            allowlist: vec![],
+        };
+        let restored: qshd::handover::Handover =
+            serde_json::from_slice(&serde_json::to_vec(&handover).unwrap()).unwrap();
+        assert!(restored.cache_dir.is_absolute());
+        assert_eq!(restored.cache_dir, absolute);
+        assert_eq!(restored.control_path.parent(), Some(absolute.as_path()));
+    }
+
+    #[test]
+    fn path_diagnostics_combines_version_and_logging_warnings_without_loss() {
+        let warning = super::combined_warning(
+            Some(&"\x1b".repeat(2048)),
+            Some("file logging disabled: log-path"),
+        )
+        .unwrap();
+        assert!(warning.contains("file logging disabled: log-path"));
+        assert!(warning.len() <= 1024 && !warning.contains('\x1b'));
+        let mut output = Vec::new();
+        write_transport_ready(&mut output, &[7; 32], &[60000], Some(&warning)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), 2);
+        let json: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .nth(1)
+                .unwrap()
+                .strip_prefix("TRANSPORT-READY ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["warning"].as_str(), Some(warning.as_str()));
     }
 
     #[test]

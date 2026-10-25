@@ -131,6 +131,15 @@ mod tests {
     }
 
     #[test]
+    fn successful_bootstrap_retains_logging_warning_without_stderr() {
+        let warning =
+            "file logging disabled: opening daemon log /owned/qshd.log: Permission denied";
+        let json = serde_json::json!({"version": "0.5.0", "ports": [60000], "warning": warning});
+        let ready = parse(0, &ready_out(&json.to_string())).unwrap();
+        assert_eq!(ready.warning.as_deref(), Some(warning));
+    }
+
+    #[test]
     fn a_warning_is_kept() {
         let r = parse(
             0,

@@ -7,6 +7,7 @@
 //! Nothing secret is written: a knock is only a mark on its address, and
 //! no password, passphrase or key material ever reaches a record.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::args::{Args, PredictMode};
@@ -51,12 +52,19 @@ pub fn filter(verbose: bool) -> logging::Filter {
 }
 
 /// Opens the log and installs it as the process's logger. A log that
-/// cannot be opened (a read-only home, no cache directory) is no log at
-/// all: the run goes on, and nothing is printed about it.
+/// cannot be opened is disabled for this run; one startup warning explains why.
 pub fn init(verbose: bool) {
-    if let Some(sink) = logging::FileSink::open_in_private_dir(&path(), MAX_BYTES) {
-        let _ = logging::install(sink, filter(verbose));
-    }
+    static ATTEMPTED: std::sync::Once = std::sync::Once::new();
+    ATTEMPTED.call_once(|| {
+        match logging::FileSink::try_open_in_private_dir(&path(), MAX_BYTES) {
+            Ok(sink) => { let _ = logging::install(sink, filter(verbose)); }
+            Err(error) => {
+                let warning = logging::diagnostic(&format!(
+                    "file logging disabled: {error}. Check this path's ownership, permissions and free space"));
+                let _ = writeln!(std::io::stderr(), "qsh: {warning}");
+            }
+        }
+    });
 }
 
 /// Where the log is, the path the person is told to look at.
@@ -232,5 +240,45 @@ mod tests {
         assert_eq!(limit(&loud, "qsh"), LevelFilter::Debug);
         assert_eq!(limit(&loud, "connect"), LevelFilter::Debug);
         assert_eq!(limit(&loud, "russh"), LevelFilter::Info);
+    }
+    #[test]
+    fn path_diagnostics_initial_log_failure_is_visible_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let cache = dir.path().join("cache\nname");
+        std::fs::create_dir_all(cache.join("qsh/log")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "log::tests::path_diagnostics_initial_log_failure_body",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HOME", dir.path())
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("HISTFILE", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("file logging disabled").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(stderr.contains("cache\\nname"), "{stderr}");
+        assert!(!stderr.contains("cache\nname"));
+    }
+
+    #[test]
+    #[ignore = "isolated logger environment, run by initial failure wrapper"]
+    fn path_diagnostics_initial_log_failure_body() {
+        init(false);
+        init(false);
     }
 }

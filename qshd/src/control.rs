@@ -131,6 +131,9 @@ impl CleanupStatusResponse {
 /// without a coordinated update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Bounded same-account startup diagnostic, never credential contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging_warning: Option<String>,
     /// Absent on older daemons or a backend without this registered domain.
     /// Absence means unknown, never completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1097,6 +1100,7 @@ mod tests {
     #[test]
     fn status_response_round_trips() {
         let resp = StatusResponse {
+            logging_warning: Some("file logging disabled: /owned/qshd.log".into()),
             cleanup: None,
             version: "0.1.0".into(),
             build: 42,
@@ -1558,6 +1562,7 @@ mod tests {
 
     fn status_line(pid: u32) -> String {
         let status = StatusResponse {
+            logging_warning: None,
             cleanup: None,
             version: "0.0.0".into(),
             build: 0,
