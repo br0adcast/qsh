@@ -1,6 +1,13 @@
 //! Synthetic keys and loopback-only SSH responses exercise the real trust boundary.
 use super::*;
+// Reuse the Linux sandbox's instance instead of loading the module twice.
+#[cfg(target_os = "linux")]
 use crate::ssh_step::test_support::ssh_support::fake_server as fake;
+// Other platforms need neither the real-daemon sandbox nor Linux pidfds.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+#[path = "../../crates/ssh/tests/support/fake_server.rs"]
+mod fake;
 
 fn fixture(keys: &[[u8; 32]]) -> (tempfile::TempDir, fake::FakeServer, Setup) {
     use base64::Engine as _;

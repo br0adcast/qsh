@@ -533,7 +533,9 @@ impl Attempted {
     }
 }
 
-#[cfg(test)]
+// The real-daemon sandbox uses Linux pidfds for owned cleanup. Portable
+// bootstrap fixtures include their fake SSH server directly instead.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "../../crates/bringup/tests/support_home/mod.rs"]
 pub(crate) mod test_support;
 
@@ -542,6 +544,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[cfg(target_os = "linux")]
     use super::test_support as support_home;
 
     #[test]
@@ -634,6 +637,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn background_missing_daemon_never_calls_image_source() {
         struct Spy(std::sync::atomic::AtomicUsize);
         impl bringup::ImageSource for Spy {
