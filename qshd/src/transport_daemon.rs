@@ -793,7 +793,7 @@ mod tests {
     /// waits, and is answered once the gate is free again.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_waits_while_the_gate_is_held_for_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::control::private_test_dir().unwrap();
         let gate = Arc::new(tokio::sync::RwLock::new(()));
         let path = control_server(dir.path(), Arc::clone(&gate));
         let held = gate.clone().write_owned().await;
