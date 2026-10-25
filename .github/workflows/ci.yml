@@ -156,6 +156,7 @@ jobs:
           # This purpose-built harness runs on its process's main thread before
           # forking; libtest's worker threads cannot provide that contract.
           cargo test -p qshd --test detach_process --locked 2>&1 | tee "$runtime/detach-results.log"
+          grep -F 'validated independent EOF and lock-release observations' "$runtime/detach-results.log"
           grep -F 'validated 10 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"

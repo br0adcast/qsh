@@ -34,6 +34,8 @@ fn main() {
     #[cfg(target_os = "linux")]
     // SAFETY: only this isolated controller adopts its own fixture descendants.
     assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    eof_and_lock_release_are_independent();
+    println!("validated independent EOF and lock-release observations");
     for code in [0, 1, 7] {
         let status = owned_status(Command::new(std::env::current_exe().unwrap()).args([
             "--worker",
@@ -249,8 +251,8 @@ fn worker(args: &[String]) {
                 .unwrap();
             let mut byte = [0];
             assert_eq!(release.read(&mut byte).unwrap(), 0);
-            // Keep the completion pipe alive until process exit. EOF is cooperative
-            // completion evidence on macOS, not a claim of adopted-child reaping.
+            // Keep the report pipe alive until process exit. EOF observes only
+            // this descriptor closing; other inherited descriptors may close later.
             std::mem::forget(report);
             // SAFETY: final fixture child exits without duplicated parent destructors.
             unsafe { libc::_exit(0) }
@@ -264,6 +266,118 @@ fn pipe() -> (OwnedFd, OwnedFd) {
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     // SAFETY: pipe returned two new descriptors, each transferred exactly once.
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+}
+
+fn eof_and_lock_release_are_independent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("lock");
+    let lock = std::fs::File::create(&path).unwrap();
+    // SAFETY: this single-threaded controller owns the fixture descriptor.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let mut holder = Some(lock.try_clone().unwrap());
+    drop(lock);
+    let (read, write) = pipe();
+    drop(write);
+    let mut report = std::fs::File::from(read);
+    assert_eq!(report.read(&mut [0]).unwrap(), 0, "actual report EOF");
+    let contender = std::fs::File::open(&path).unwrap();
+    // A duplicate description can outlive the report writer, just as another
+    // exit-time descriptor close can follow the pipe close on Darwin.
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let mut failures = Vec::new();
+    let expired = acquire_lock_before(contender.as_raw_fd(), Instant::now(), || {});
+    if expired.unwrap_err().kind() != std::io::ErrorKind::TimedOut {
+        failures.push("held lock did not exhaust the explicit deadline");
+    }
+    assert!(holder.is_some(), "expiry must retain the exact holder");
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let mut contentions = 0;
+    let released = acquire_lock_before(
+        contender.as_raw_fd(),
+        Instant::now() + Duration::from_secs(5),
+        || {
+            contentions += 1;
+            drop(holder.take());
+        },
+    );
+    assert_eq!(contentions, 1, "release follows actual kernel contention");
+    assert!(holder.is_none());
+    if released.is_err() {
+        failures.push("report EOF did not wait for actual lock availability");
+    }
+    let error = acquire_lock_before(-1, Instant::now() + Duration::from_secs(5), || {
+        panic!("an unexpected descriptor error must not be retried")
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    assert!(failures.is_empty(), "{failures:?}");
+    drop(contender);
+    let expired = std::fs::File::open(&path).unwrap();
+    let error = acquire_lock_before(expired.as_raw_fd(), Instant::now(), || {
+        panic!("an expired free lock must not reach contention")
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let independent = std::fs::File::open(&path).unwrap();
+    // SAFETY: the independent owned description proves expiry acquired nothing.
+    assert_eq!(
+        unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+}
+
+fn acquire_lock_before(
+    fd: i32,
+    deadline: Instant,
+    mut contended: impl FnMut(),
+) -> std::io::Result<()> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "waiting for actual lock availability: deadline expired",
+            ));
+        }
+        // SAFETY: ordinary callers retain their owned descriptor; the negative
+        // control passes -1 to obtain EBADF without inventing a Rust fd owner.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => {}
+            _ => return Err(error),
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("waiting for actual lock availability: {error}"),
+            ));
+        }
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            contended();
+        }
+        // Backoff only paces retries; success requires an actual flock result.
+        std::thread::sleep(left.min(Duration::from_millis(1)));
+    }
 }
 
 fn detached_case(closed: i32) {
@@ -354,10 +468,7 @@ fn detached_case(closed: i32) {
     assert!(readable(custody.report.as_raw_fd(), deadline));
     assert_eq!(custody.report.read(&mut [0]).unwrap(), 0);
     assert!(wait_before(&mut custody.child, deadline).unwrap().success());
-    assert_eq!(
-        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-        0
-    );
+    acquire_lock_before(contender.as_raw_fd(), deadline, || {}).unwrap();
     assert!(reap_adopted(deadline));
 }
 fn readable(fd: i32, deadline: Instant) -> bool {
