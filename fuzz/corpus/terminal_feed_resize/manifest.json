@@ -1,0 +1,84 @@
+{
+  "format": "four geometry bytes followed by terminal input bytes",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "alt-screen",
+      "bytes": 30,
+      "sha256": "f50373d65babfab7470f0824fdffd2e22b51e6f0c71402ab9d997507ba034e92"
+    },
+    {
+      "name": "ascii",
+      "bytes": 16,
+      "sha256": "b7a76ebe856811ba342a458dd13b88c76179c9fd4522f593d16699eac9833fbc"
+    },
+    {
+      "name": "bracketed-paste",
+      "bytes": 22,
+      "sha256": "c35123bad840bc767dae6d0452013a0376c1c6ab815f2a156323f65fa55ff5b0"
+    },
+    {
+      "name": "charset",
+      "bytes": 14,
+      "sha256": "22e5d8ec0893eff1eafa6b676da9e3d2c1238972a689011e55a61e65c9643ffa"
+    },
+    {
+      "name": "control-bytes",
+      "bytes": 11,
+      "sha256": "73a1b32a24ec34dc84015718a607355f6532050854e98f78eaae8811001a1999"
+    },
+    {
+      "name": "cursor",
+      "bytes": 16,
+      "sha256": "62874dfe727a30239c74c8939afeb87a5700bc0c2353e65e22e734417bdfa840"
+    },
+    {
+      "name": "deterministic-junk",
+      "bytes": 260,
+      "sha256": "854e90a7d589933b9cbfa74acc5ebb9bab35b746bbc0c3d134a1e56b85c6a051"
+    },
+    {
+      "name": "empty",
+      "bytes": 4,
+      "sha256": "018ea8a2d44c4bff76ba8d8d96cf2faf2e552050fe12ddc0ba67af9cfbab7295"
+    },
+    {
+      "name": "invalid-utf8",
+      "bytes": 8,
+      "sha256": "f81e9afe41be4561af84eba0570a91c060171d5509793b716e1a3d8ce45031b9"
+    },
+    {
+      "name": "osc-title",
+      "bytes": 18,
+      "sha256": "79c4e8fb79e2605706c82074f386af97346c64c8a5b3d0c5b83924ba62c53da5"
+    },
+    {
+      "name": "resize-boundaries",
+      "bytes": 12,
+      "sha256": "7ca621fecf1aa55b9a8489ed1f289513ae91da48aeedeffdee1b6512cad411e5"
+    },
+    {
+      "name": "scrollback",
+      "bytes": 244,
+      "sha256": "0a3213a82eed7e1a0d5f9ebdd88a366c282c93cfbd482ea88ad395cdd9a70e89"
+    },
+    {
+      "name": "sgr",
+      "bytes": 21,
+      "sha256": "b4192683e2e49eb6261e16e3b6a77b187500db1ca6590b7218b404cadc5718b1"
+    },
+    {
+      "name": "sync-update",
+      "bytes": 24,
+      "sha256": "6fdea5768586823c5fc324e067eca050cde7eadb5fcb08d15256f7841747b26d"
+    },
+    {
+      "name": "wide-combining",
+      "bytes": 15,
+      "sha256": "17b80e51f46afee309a15f291c18c53af40bfc1d4ddce31b0f44ba7442a2ab61"
+    }
+  ]
+}

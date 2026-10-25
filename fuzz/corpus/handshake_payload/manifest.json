@@ -1,0 +1,89 @@
+{
+  "format": "raw msg1 or msg2 payload bytes",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "msg1-all-features",
+      "bytes": 23,
+      "sha256": "ed5ea36e72f8a9146bba27bbfb7c3df0b5acae58d18dbfb86254d930b2eea15b"
+    },
+    {
+      "name": "msg1-cold-allowlist",
+      "bytes": 23,
+      "sha256": "c09bbbfc795c06b46629e3cd5907ec24d2af9d5b5f9c5263b1cb4e81b64a034d"
+    },
+    {
+      "name": "msg1-short",
+      "bytes": 18,
+      "sha256": "8fc172975f53daa6e76e9f61c0414d693d5a3eb4c662441a65ba5273dc39d613"
+    },
+    {
+      "name": "msg1-tail",
+      "bytes": 36,
+      "sha256": "a8491825d97b753e68651b44130dc27fc626e504c448536ad4931b1fd5c1fafb"
+    },
+    {
+      "name": "msg1-unknown-method",
+      "bytes": 23,
+      "sha256": "9457279987549cd50f32bbec4b7292505692d3dec804ce7f623d896dccc652ae"
+    },
+    {
+      "name": "msg1-unknown-start",
+      "bytes": 23,
+      "sha256": "bb319a004b93d4b2cf46cddb24573c491180e209a10532bfe1c2eb30f9a08583"
+    },
+    {
+      "name": "msg1-warm-signature",
+      "bytes": 23,
+      "sha256": "07540865f4040b2c15fb118cb368d823cf7b56907b5e1b66acd4231184c3a3b3"
+    },
+    {
+      "name": "msg2-all-features",
+      "bytes": 30,
+      "sha256": "6fc97d2f22486772126e5e8936f9ddab42c48d19e79a72d42e87dfce55a151ae"
+    },
+    {
+      "name": "msg2-base",
+      "bytes": 26,
+      "sha256": "5327658760c69f866771c67cf8d496213cbc1523a85003f0510462316ddfb8f2"
+    },
+    {
+      "name": "msg2-resumed",
+      "bytes": 30,
+      "sha256": "f4acf0fea458cf8841a941c604f0881ab46d0a25950db6be9f36ba8137f93197"
+    },
+    {
+      "name": "msg2-short",
+      "bytes": 8,
+      "sha256": "d59cc0c678cc7c320a7fadd4dbdc1139fbc79d55f36aac96ced19d81a43ff2ca"
+    },
+    {
+      "name": "msg2-tail",
+      "bytes": 43,
+      "sha256": "09a3e319b0b50bc3cf201964a748c209c114ed8e2da9cc0d5ed51dbcd1cf169b"
+    },
+    {
+      "name": "msg2-wrong-version",
+      "bytes": 30,
+      "sha256": "d82bebad844d6bdddbcd5dff2b3e042d8102b0b7902b522ace8b4daf0c312c8e"
+    },
+    {
+      "name": "version-only",
+      "bytes": 1,
+      "sha256": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"
+    },
+    {
+      "name": "wrong-version",
+      "bytes": 19,
+      "sha256": "9f83412475f4342b5c1e302ee014e148cb7e81c4cef45c60c85c199f995a095f"
+    }
+  ]
+}

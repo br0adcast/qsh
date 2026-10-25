@@ -1,0 +1,28 @@
+# Isolated fuzz graph policy; product deny.toml is unchanged.
+[graph]
+all-features = true
+exclude-dev = false
+exclude-unpublished = false
+[licenses]
+include-dev = true
+include-build = true
+confidence-threshold = 0.8
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+exceptions = [
+    { crate = "qsh-channel-fuzz@0.0.0", allow = ["AGPL-3.0-only"] },
+    { crate = "sshauth@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "transport@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal-size@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "libfuzzer-sys@0.4.13", allow = ["NCSA", "Apache-2.0 WITH LLVM-exception"] },
+]
+[licenses.private]
+ignore = false
+[bans]
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+wildcards = "warn"
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,104 @@
+{
+  "format": "UTF-8 authorized_keys text",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "bare",
+      "bytes": 98,
+      "sha256": "400c2267e850b17da7d607217a25ff2e9d3355f899d64b4011b804bccce056da"
+    },
+    {
+      "name": "bare-crlf",
+      "bytes": 99,
+      "sha256": "9cd0575a689bb9ddd3355b752bf68d719df75408425330495117ffa54e82c81b"
+    },
+    {
+      "name": "bare-no-newline",
+      "bytes": 97,
+      "sha256": "e7a16ac01c51c5fbbce22cf950f1efde8007ec11ad5526185562e15516554baa"
+    },
+    {
+      "name": "bare-then-options",
+      "bytes": 205,
+      "sha256": "0c3a5daf47cf95ac76ad7cfe8ed7e0210fc86b57641f3dc69fe323e013934a77"
+    },
+    {
+      "name": "bare-with-leading-space",
+      "bytes": 100,
+      "sha256": "a28661b89b03fe94eaf3b720c642b8cdac71d76028ed0cdc6a7cf0a538a97649"
+    },
+    {
+      "name": "blank",
+      "bytes": 2,
+      "sha256": "75a11da44c802486bc6f65640aa48a730f0f684c5c07a42ba3cd1735eb3fb070"
+    },
+    {
+      "name": "command-with-comment",
+      "bytes": 116,
+      "sha256": "03c5887c198eeae23ca3febea3fa728bc0ac6afbcf414abce753076d956170c4"
+    },
+    {
+      "name": "command-without-comment",
+      "bytes": 87,
+      "sha256": "8ae5ed51360192d39f70233dc6aa04b8ced38b591a5effaa03f955746549f17b"
+    },
+    {
+      "name": "comment-only",
+      "bytes": 14,
+      "sha256": "aa9e5e8dda051cf50b9ae5b3cb3872c61bf885b233c499d4ede9b22fcafc3524"
+    },
+    {
+      "name": "commented-key",
+      "bytes": 100,
+      "sha256": "6c922179aadcecba38b2bbe974d8b221c4ef4d7f15491f58d4aec86641e8a8d9"
+    },
+    {
+      "name": "deterministic-junk",
+      "bytes": 256,
+      "sha256": "08c24eb605c9f3d2a1343c92fa9fd274f4d412d73faba888f82b0cc6014799f0"
+    },
+    {
+      "name": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "from-with-comment",
+      "bytes": 120,
+      "sha256": "af3ca17cdf25998729f2eb72db576f45742f3b1267fdadddd395666e9412d25e"
+    },
+    {
+      "name": "malformed-line-containing-blob",
+      "bytes": 85,
+      "sha256": "d32b248091dcc1b7f8cd7eea680a261059a4f1926d9f4d1da4e886e4fee8fa89"
+    },
+    {
+      "name": "options-then-bare",
+      "bytes": 205,
+      "sha256": "399180703fa725c6d7fe611b0d6bf2bc9c3a417410b3420cf16b7ba6630dc6fa"
+    },
+    {
+      "name": "other-key",
+      "bytes": 87,
+      "sha256": "8e6470ce7b6ec0e24166bc06da51e80a4ef248f4a5d17fe986f51af2b865d4b5"
+    },
+    {
+      "name": "quoted-hash",
+      "bytes": 129,
+      "sha256": "a9eed0fff256aa615857a25a4c73b9a39503367580c4a4ea1a8c1e0aec0dcb2d"
+    },
+    {
+      "name": "restrict-with-comment",
+      "bytes": 107,
+      "sha256": "c7dee27b7b6b0387b2a7b38995e17052dc1c2ae0ecdd14958fe5f4f9b97d10a8"
+    },
+    {
+      "name": "tab-separated",
+      "bytes": 89,
+      "sha256": "51ed281a05dd860276b8a8bc4c2e459a3a0998f15e90f5735caa4fce6b2eac0d"
+    }
+  ]
+}

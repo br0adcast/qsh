@@ -1,0 +1,84 @@
+{
+  "format": "raw control or shell record stream",
+  "provenance": "Synthetic public protocol encoders and explicit malformed/extension inputs; no recorded traffic, hosts, keys, or session data",
+  "regenerate": "cargo run --manifest-path fuzz/Cargo.toml --example generate_corpus --locked --offline -- fuzz/corpus",
+  "maximum_seed_files": 32,
+  "maximum_total_bytes": 262144,
+  "files": [
+    {
+      "name": "control-limit",
+      "bytes": 5,
+      "sha256": "4727e20acf12b273c89716cb93dcd7d84c2e9dbbcdefe5a57737eb860713d0cb"
+    },
+    {
+      "name": "data",
+      "bytes": 10,
+      "sha256": "01cc2c521e69293f581e0df49c071c2e9d44b16586b36024872d77244b405be6"
+    },
+    {
+      "name": "data-ack",
+      "bytes": 23,
+      "sha256": "f0dcedfd63e08489d50a4463b6b51d026e76f588a596c872893ce0050fd48df7"
+    },
+    {
+      "name": "deterministic-junk",
+      "bytes": 64,
+      "sha256": "fdeab9acf3710362bd2658cdc9a29e8f9c757fcf9811603a8c447cd1d9151108"
+    },
+    {
+      "name": "empty",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "geometry-applied",
+      "bytes": 27,
+      "sha256": "53231b653d67611c43d41d7d8b796a5c086811718de4ae06f08410a340b6e970"
+    },
+    {
+      "name": "geometry-refused",
+      "bytes": 27,
+      "sha256": "89e0a0776c79ec4006907d5ef96f4e345a31134137c0a1b8148a3e06ca02bf07"
+    },
+    {
+      "name": "huge-length",
+      "bytes": 13,
+      "sha256": "ef96a7d83d5b7739ce82ea6d69bff485388f855552c29646b56c35768d134ad1"
+    },
+    {
+      "name": "known-kind-wrong-size",
+      "bytes": 39,
+      "sha256": "31153ac578411c0dfc638f1a3e7c8727b04f1264b3d4da6669d48d3f18dab656"
+    },
+    {
+      "name": "malformed-then-data",
+      "bytes": 19,
+      "sha256": "393a1831e91baa740108ccedba3c3ce11355358258a9ea898f1530cc6e14c437"
+    },
+    {
+      "name": "output-gap",
+      "bytes": 14,
+      "sha256": "bc62208f351e86f6c02292da546ddeb56c6b6cb71c4af5d672d3e33873c49f64"
+    },
+    {
+      "name": "partial-header",
+      "bytes": 3,
+      "sha256": "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c"
+    },
+    {
+      "name": "partial-payload",
+      "bytes": 7,
+      "sha256": "4d3228c9bf04286e229aa907575e4b6efb359f9d293eba1cadcd28060819df88"
+    },
+    {
+      "name": "two-data",
+      "bytes": 20,
+      "sha256": "0b44921d8184ea72845b18da54d4e2a7cc8e614b49e0410f7eee97b134a72bce"
+    },
+    {
+      "name": "unknown-then-data",
+      "bytes": 18,
+      "sha256": "35e241757924cecb57c7a1af444e18ccbc7bf5d69bab246c2f062c44fd97d50e"
+    }
+  ]
+}
