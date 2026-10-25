@@ -83,6 +83,21 @@ host-list syntax; the CLI still owns comma-separated address settings.
 Session tokens live in the adjacent `sessions` directory. XDG overrides must be
 absolute paths; empty or relative values use the defaults above.
 
+The CLI treats its sessions directory as dedicated private storage. It validates
+the directory route and each regular, single-linked, same-user slot before use,
+and can tighten initial directory/file permissions after locking a free slot.
+It never changes shared ancestors or occupied slots. A later displaced path or
+unsafe permission change prevents token replacement; the held token and lock
+remain intact. Generic library callers do not authorize directory repair.
+
+Token files accept the existing trimmed 32-digit hexadecimal form within 4096
+bytes. Damaged or oversized contents can be replaced with a fresh token. A read
+I/O error leaves that file untouched and falls back to another slot or an
+in-memory token. Initial saving is best effort; replacement reports errors.
+Writes retain the locked inode and do not promise crash-atomic persistence.
+There is no automatic local token expiration. A token alone does not authorize
+reattachment: the server still requires account authentication.
+
 The client uses only the selected XDG store. Previous macOS files under
 `~/Library/Application Support/qsh` are not imported or linked automatically;
 existing files remain untouched. Server-side qshd state and host keys are unaffected.

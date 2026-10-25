@@ -26,6 +26,7 @@ pub mod report;
 pub mod road_catalog;
 pub mod session;
 pub mod sessions;
+mod sessions_store;
 pub mod signals;
 pub mod ssh_authorization;
 pub mod ssh_bindings;

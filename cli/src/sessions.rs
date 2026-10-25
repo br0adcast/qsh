@@ -19,10 +19,15 @@
 //! stale lock to clean up. A free slot with an existing token is the session
 //! someone left behind, waiting to be returned to.
 
+use crate::sessions_store::{DirectoryIntent, SlotBinding, Store};
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::mem::ManuallyDrop;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +35,7 @@ use std::path::{Path, PathBuf};
 /// resuming and takes a fresh token that is never written down. An unbounded
 /// scan would turn a stuck lock into a hang.
 const MAX_SLOTS: usize = 16;
+const MAX_TOKEN_BYTES: usize = 4096;
 
 /// The session token this run should use, and the lock that says it is ours.
 pub struct Claim {
@@ -42,14 +48,21 @@ pub struct Claim {
 struct SlotLock {
     file: File,
     owner_pid: libc::pid_t,
+    parent: File,
+    binding: ManuallyDrop<SlotBinding>,
 }
 
 impl SlotLock {
     // Construct immediately after successful flock, before fallible token I/O.
-    fn new(file: File) -> Self {
+    fn new(file: File, parent: File, binding: SlotBinding) -> Self {
         // SAFETY: getpid has no preconditions and is async-signal-safe.
         let owner_pid = unsafe { libc::getpid() };
-        Self { file, owner_pid }
+        Self {
+            file,
+            owner_pid,
+            parent,
+            binding: ManuallyDrop::new(binding),
+        }
     }
 }
 
@@ -57,7 +70,9 @@ impl Drop for SlotLock {
     fn drop(&mut self) {
         // SAFETY: getpid has no preconditions, including in a forked child.
         if unsafe { libc::getpid() } != self.owner_pid {
-            return; // Field destruction closes only this copy's descriptor.
+            // File fields still close; the copied heap-only binding is retained
+            // until exec/_exit. Never touch inherited allocator state here.
+            return;
         }
         loop {
             // SAFETY: our File still owns the valid descriptor until this
@@ -69,6 +84,12 @@ impl Drop for SlotLock {
                 break; // Other errors retain the existing best-effort close.
             }
         }
+        // SAFETY: the private binding is initialized exactly once in new(),
+        // never taken/cloned/manually dropped elsewhere, and this owner-PID
+        // branch runs once. Fork copies skip heap destruction. No access follows.
+        unsafe {
+            ManuallyDrop::drop(&mut self.binding);
+        }
     }
 }
 
@@ -77,11 +98,9 @@ impl Claim {
     pub fn replace_token(&mut self) -> std::io::Result<[u8; 16]> {
         let token = fresh_token();
         if let Some(slot) = &mut self._lock {
-            let file = &mut slot.file;
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(format!("{}\n", hex(&token)).as_bytes())?;
-            file.flush()?;
+            slot.binding
+                .validate_private_current(&slot.parent, &slot.file)?;
+            write_token(&mut slot.file, &token)?;
         }
         self.token = token;
         Ok(token)
@@ -97,65 +116,100 @@ impl Claim {
 /// behavior -- a new session every launch. Resuming is a convenience, and
 /// losing it must not stop someone connecting.
 pub fn claim(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
-    if std::fs::create_dir_all(dir).is_err() {
+    claim_with_intent(dir, login, host, port, DirectoryIntent::Generic)
+}
+
+/// Claim in a caller-declared dedicated session directory. Unlike generic
+/// claim, verified initial preparation may tighten this directory to 0700.
+/// Shared sticky directories and filesystem root are never permission-repaired.
+pub fn claim_in_private_dir(dir: &Path, login: &str, host: &str, port: u16) -> Claim {
+    claim_with_intent(dir, login, host, port, DirectoryIntent::DeclaredPrivate)
+}
+fn claim_with_intent(
+    dir: &Path,
+    login: &str,
+    host: &str,
+    port: u16,
+    intent: DirectoryIntent,
+) -> Claim {
+    let Ok(store) = Store::open(dir, intent) else {
         return Claim {
             token: fresh_token(),
             _lock: None,
         };
-    }
-    // The directory holds session tokens: nobody else's business.
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-
-    for slot in 0..MAX_SLOTS {
-        let path = dir.join(slot_name(login, host, port, slot));
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-        else {
+    };
+    for index in 0..MAX_SLOTS {
+        let name = slot_name(login, host, port, index);
+        let Ok(file) = store.open_candidate(&name) else {
+            continue;
+        };
+        // Both descriptor duplication and binding allocation precede flock.
+        let Ok((parent, binding)) = store.binding(&name) else {
             continue;
         };
         if !lock_exclusive(&file) {
-            // Another live `qsh` holds this slot: its session is not ours to
-            // take.
             continue;
         }
-        let mut slot = SlotLock::new(file);
-        let file = &mut slot.file;
-        let mut text = String::new();
-        if file.read_to_string(&mut text).is_ok() {
-            if let Some(token) = parse_token(text.trim()) {
-                return Claim {
-                    token,
-                    _lock: Some(slot),
-                };
-            }
+        let slot = SlotLock::new(file, parent, binding);
+        if store
+            .prepare_locked(&slot.parent, &slot.file, &slot.binding)
+            .is_err()
+        {
+            continue;
         }
-        // Empty (a slot just created) or unreadable (a truncated write, a
-        // hand-edited file): mint one and write it down. A failed write is
-        // not fatal -- this run still gets a usable token, it just will not
-        // be resumable.
-        let token = fresh_token();
-        let _ = file.set_len(0);
-        // Truncating does not move the cursor, which the read above left at
-        // the end of whatever was there: without this the new token would be
-        // written AFTER the hole, and read back as junk next time.
-        let _ = file.seek(SeekFrom::Start(0));
-        let _ = file.write_all(format!("{}\n", hex(&token)).as_bytes());
-        let _ = file.flush();
-        return Claim {
-            token,
-            _lock: Some(slot),
-        };
+        if let Ok(owner) = claim_locked(slot, read_token_bytes) {
+            return owner;
+        }
     }
-
     Claim {
         token: fresh_token(),
         _lock: None,
     }
+}
+
+fn read_token_bytes(file: &mut File) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.take((MAX_TOKEN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_token(file: &mut File, token: &[u8; 16]) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(format!("{}\n", hex(token)).as_bytes())?;
+    file.flush()
+}
+
+fn claim_locked(
+    mut slot: SlotLock,
+    read: impl FnOnce(&mut File) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Claim> {
+    slot.binding
+        .validate_private_current(&slot.parent, &slot.file)?;
+    // An I/O failure is not evidence of damaged contents: leave this candidate
+    // untouched and let acquisition try another slot or an in-memory token.
+    let bytes = read(&mut slot.file)?;
+    if bytes.len() <= MAX_TOKEN_BYTES {
+        if let Ok(text) = String::from_utf8(bytes) {
+            if let Some(token) = parse_token(text.trim()) {
+                return Ok(Claim {
+                    token,
+                    _lock: Some(slot),
+                });
+            }
+        }
+    }
+    let token = fresh_token();
+    slot.binding
+        .validate_private_current(&slot.parent, &slot.file)?;
+    // Initial persistence remains best effort. Stop at the first write error,
+    // retain this exact lock, and use the fresh token even if it was not saved.
+    let _ = write_token(&mut slot.file, &token);
+    Ok(Claim {
+        token,
+        _lock: Some(slot),
+    })
 }
 
 /// Default store location: `~/.config/qsh/sessions`, beside `known_hosts`.
@@ -210,10 +264,11 @@ fn lock_exclusive(file: &File) -> bool {
 mod tests {
     use super::*;
     include!("sessions_inheritance_tests.rs");
+    include!("sessions_authority_tests.rs");
 
     #[test]
     fn each_login_resumes_its_own_token_on_the_same_endpoint() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let alice = claim(dir.path(), "alice", "example.org", 60000).token;
         let bob = claim(dir.path(), "bob", "example.org", 60000).token;
         assert_ne!(
@@ -229,7 +284,7 @@ mod tests {
 
     #[test]
     fn logins_hold_independent_numbered_slots_across_processes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let alice = claim(dir.path(), "alice", "example.org", 60000);
         let bob = claim(dir.path(), "bob", "example.org", 60000);
         let alice_second = claim(dir.path(), "alice", "example.org", 60000);
@@ -258,7 +313,7 @@ mod tests {
 
     #[test]
     fn replacement_preserves_each_logins_token_and_lock() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let mut alice = claim(dir.path(), "alice", "example.org", 60000);
         let mut bob = claim(dir.path(), "bob", "example.org", 60000);
         let bob_original = bob.token;
@@ -325,7 +380,7 @@ mod tests {
 
     #[test]
     fn legacy_records_are_never_claimed_or_changed_even_when_locked() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let path = dir.path().join("example.org_60000_0");
         let contents = "0123456789abcdef0123456789abcdef\n";
         std::fs::write(&path, contents).unwrap();
@@ -392,14 +447,14 @@ mod tests {
         let long = "用户/".repeat(1000);
         let name = slot_name(&long, &long, 60000, 15);
         assert_eq!(name.len(), 70);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let first = claim(dir.path(), &long, &long, 60000).token;
         assert_eq!(claim(dir.path(), &long, &long, 60000).token, first);
     }
 
     #[test]
     fn exhausting_one_login_does_not_consume_anothers_slots() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let claims: Vec<_> = (0..16)
             .map(|_| claim(dir.path(), "alice", "example.org", 60000))
             .collect();
@@ -423,7 +478,7 @@ mod tests {
 
     #[test]
     fn replacing_a_token_keeps_the_claim_and_persists_only_its_slot() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let mut first = claim(dir.path(), "alice", "example.org", 60000);
         let original = first.token;
         let second = claim(dir.path(), "alice", "example.org", 60000);
@@ -449,7 +504,7 @@ mod tests {
     /// left behind, so the server hands back the same session.
     #[test]
     fn the_same_host_gets_the_same_token_next_time() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = slot139_fixture();
         let first = claim(dir.path(), "alice", "example.org", 60000).token;
         // The first run ends: its lock goes with it.
         let second = claim(dir.path(), "alice", "example.org", 60000).token;
@@ -464,7 +519,7 @@ mod tests {
     /// connection -- the first terminal's shell, silently taken away.
     #[test]
     fn a_second_run_while_the_first_holds_its_slot_gets_another_token() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = slot139_fixture();
         let first = claim(dir.path(), "alice", "example.org", 60000);
         let second = claim(dir.path(), "alice", "example.org", 60000);
         assert_ne!(
@@ -486,7 +541,7 @@ mod tests {
     /// sessions -- the daemon on each keeps its own.
     #[test]
     fn hosts_and_ports_do_not_share_a_slot() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = slot139_fixture();
         let a = claim(dir.path(), "alice", "example.org", 60000).token;
         let b = claim(dir.path(), "alice", "example.org", 60022).token;
         let c = claim(dir.path(), "alice", "other.example", 60000).token;
@@ -499,7 +554,7 @@ mod tests {
     /// take the run down with it: a fresh token is written over it.
     #[test]
     fn a_damaged_token_file_is_replaced_rather_than_trusted() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = slot139_fixture();
         let path = dir.path().join(slot_name("alice", "example.org", 60000, 0));
         std::fs::write(&path, "not a token at all\n").expect("write");
         let claimed = claim(dir.path(), "alice", "example.org", 60000);
@@ -513,7 +568,7 @@ mod tests {
     /// nobody else's business on a shared machine.
     #[test]
     fn the_store_keeps_its_files_to_itself() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = slot139_fixture();
         let store = dir.path().join("sessions");
         let claimed = claim(&store, "alice", "example.org", 60000);
         drop(claimed);

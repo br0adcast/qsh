@@ -4,7 +4,7 @@ mod inheritance {
     use std::io;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
-    use std::process::{Command, ExitStatus};
+    use std::process::{Child, Command, ExitStatus};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -24,6 +24,34 @@ mod inheritance {
             libc::write(fd, (&byte as *const u8).cast(), 1) == 1
                 && libc::poll(&mut poll, 1, 10_000) == 1
                 && libc::read(fd, (&mut release as *mut u8).cast(), 1) == 1
+        }
+    }
+
+    // A wait error is not completion. Keep the exact child and the enclosing
+    // fixture alive; after an unexpected error request termination once, then
+    // keep waiting. Only a terminal wait result permits destruction.
+    fn wait_owned(
+        child: &mut Child,
+        mut wait: impl FnMut(&mut Child) -> io::Result<ExitStatus>,
+    ) -> ExitStatus {
+        let mut reported = false;
+        loop {
+            match wait(child) {
+                Ok(status) => return status,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    if !reported {
+                        eprintln!("owned session fixture wait failed; retaining child and retrying: {error}");
+                        // ECHILD removes our evidence that the numeric PID
+                        // still names this child. Retain custody without signal.
+                        if error.raw_os_error() != Some(libc::ECHILD) {
+                            let _ = child.kill();
+                        }
+                        reported = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
         }
     }
 
@@ -55,7 +83,9 @@ mod inheritance {
                         }
                     });
                 }
-                let result = command.spawn().and_then(|mut child| child.wait());
+                let result = command
+                    .spawn()
+                    .map(|mut child| wait_owned(&mut child, Child::wait));
                 drop(peer);
                 result
             });
@@ -97,6 +127,7 @@ mod inheritance {
         }
         fn reap(&mut self) -> libc::c_int {
             let mut status = 0;
+            let mut reported = false;
             loop {
                 // SAFETY: pid names our unreaped child and status is writable.
                 let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
@@ -104,9 +135,20 @@ mod inheritance {
                     self.reaped = true;
                     return status;
                 }
-                if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    self.reaped = true;
-                    return -1;
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    if !reported {
+                        eprintln!(
+                            "owned fork fixture wait failed; retaining child and retrying: {error}"
+                        );
+                        if error.raw_os_error() != Some(libc::ECHILD) {
+                            // SAFETY: this owned child has no other reaper and
+                            // wait has not reported loss of child identity.
+                            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+                        }
+                        reported = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -122,7 +164,7 @@ mod inheritance {
 
     #[test]
     fn slot125_owner_drop_releases_the_replacement_while_a_child_is_pre_exec() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let mut owner = claim(dir.path(), "alice", "example.invalid", 60000);
         let child = PreExecChild::start();
         let replacement = owner.replace_token().unwrap();
@@ -144,7 +186,7 @@ mod inheritance {
 
     #[test]
     fn slot125_a_forked_copy_cannot_unlock_the_live_parent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let owner = claim(dir.path(), "alice", "example.invalid", 60000);
         let original = owner.token;
         let path = dir
@@ -190,7 +232,7 @@ mod inheritance {
     }
     #[test]
     fn slot125_failed_token_replacement_retains_ownership_until_drop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = slot139_fixture();
         let initial = claim(dir.path(), "alice", "example.invalid", 60000);
         let original = initial.token;
         drop(initial);
@@ -201,10 +243,18 @@ mod inheritance {
         assert!(lock_exclusive(&file));
         let mut owner = Claim {
             token: original,
-            _lock: Some(SlotLock::new(file)),
+            _lock: Some({
+                let store = Store::open(dir.path(), DirectoryIntent::Generic).unwrap();
+                let (parent, binding) = store
+                    .binding(path.file_name().unwrap().to_str().unwrap())
+                    .unwrap();
+                binding.validate_private_current(&parent, &file).unwrap();
+                SlotLock::new(file, parent, binding)
+            }),
         };
         let child = PreExecChild::start();
-        let failed = owner.replace_token().is_err();
+        let error = owner.replace_token().unwrap_err();
+        let failed = error.raw_os_error().is_some();
         let token_retained = owner.token == original;
         assert_lock_from_subprocess(&path, false);
         drop(owner);
@@ -215,5 +265,49 @@ mod inheritance {
         assert!(status.success());
         assert!(failed, "read-only token storage must reject replacement");
         assert!(token_retained && persisted_token_retained);
+        // A transient wait failure must retain an actual owned child until a
+        // real terminal wait result, rather than release its fixture early.
+        let mut probe = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let mut calls = 0;
+        let _terminal = wait_owned(&mut probe, |child| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                child.wait()
+            }
+        });
+        assert_eq!(
+            calls, 2,
+            "injected error is followed by exact terminal wait"
+        );
+        // ECHILD must not authorize signaling a possibly reused numeric PID.
+        // This owned child cannot finish successfully until the second call
+        // supplies input; an erroneous kill would make its status fail.
+        let mut probe = Command::new("/bin/sh")
+            .args(["-c", "read value"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut calls = 0;
+        let terminal = wait_owned(&mut probe, |child| {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::ECHILD))
+            } else {
+                if let Some(mut input) = child.stdin.take() {
+                    let _ = input.write_all(b"owned\n");
+                }
+                child.wait()
+            }
+        });
+        assert_eq!(calls, 2);
+        assert!(
+            terminal.success(),
+            "ECHILD observation must not trigger kill"
+        );
     }
 }

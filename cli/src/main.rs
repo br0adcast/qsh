@@ -95,7 +95,7 @@ fn run(a: args::Args) -> i32 {
     // Which session for this login and endpoint this run is coming back to.
     // The lock is held for the whole run: another `qsh` using that tuple takes
     // the next slot instead of stealing this one's shell.
-    let mut claim = sessions::claim(
+    let mut claim = sessions::claim_in_private_dir(
         &config.join("sessions"),
         &a.login,
         &a.addresses[0].host,
