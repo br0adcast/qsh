@@ -80,6 +80,31 @@ A unique stored key that differs from the offered key still produces the
 ordinary changed-key refusal. This QSH pin format is separate from OpenSSH's
 host-list syntax; the CLI still owns comma-separated address settings.
 
+On Unix, QSH pins are read only through validated paths owned by root or the
+current effective account. Ordinary directories and regular pin files must not
+be writable by group or others; trusted sticky directories may be traversed.
+Safe public files such as `0644` pins, trusted aliases, and public-data hardlinks
+are supported. Unsafe, unreadable, dangling, special, or invalid UTF-8 sources
+cause a pin-store error, never an empty-store first-use prompt. A genuinely
+missing ordinary store remains empty, and checking it creates nothing.
+
+Writers retain the configured store's permanent sibling lock. That lock must be
+a regular, singly linked `0600` file owned by the current account; existing
+objects are never repaired with chmod or chown. A trusted root-owned source may
+be read, and an existing account-owned lock permits a true no-op in a read-only
+trusted directory. Publishing a pin requires a current-account-owned directory
+that is not writable by others. New directories use `0700`; new pins use `0600`.
+
+A trusted final alias may supply the initial pins, but publication replaces the
+configured entry under its original sibling lock and leaves the alias target
+and other hardlinks unchanged. Observed route, source, lock, or temporary-name
+replacement causes refusal. Updates write and sync a complete sibling temporary
+file before atomic rename; failed cleanup removes only its own still-named
+inode, never a collision or substituted entry. This does not add a file-size
+limit, lock timeout, directory-fsync durability, or an atomic snapshot against
+concurrent edits by root or the same account. These rules apply to the QSH store;
+OpenSSH's separate host-key store is not changed by them.
+
 Session tokens live in the adjacent `sessions` directory. XDG overrides must be
 absolute paths; empty or relative values use the defaults above.
 

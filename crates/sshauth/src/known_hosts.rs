@@ -5,15 +5,14 @@
 //! loudly rather than trusted quietly -- that case is either a reinstalled
 //! server or an attacker, and the two are indistinguishable from here.
 //!
-//! Every write (`pin`) rewrites the whole file to a sibling temp file and
-//! then `rename`s it into place, so a crash mid-write can never leave a
-//! half-written line for `check` to stumble over: readers only ever see the
-//! old complete file or the new complete one. On Unix both the known-hosts
-//! file and its temp file are created `0600` so only the owner can read
-//! which servers this client trusts. A failure after the temp file is
-//! created (a write error, a failed rename) removes it; only a hard crash in
-//! that same narrow window can leave an orphaned `.known_hosts.tmp.*` file
-//! behind, and that file is inert -- `check` never reads it.
+//! Every write (`pin`) writes and syncs a complete sibling temporary file,
+//! then atomically renames it over the configured entry. On Unix new files
+//! are `0600`; validated existing public pin files may also be readable by
+//! others. Reads and publication validate the observed route and authority.
+//! Failed cleanup removes only the exact created temporary inode still at
+//! its owned name. Unknown/moved names are retained, and temporary files
+//! never grant trust. This does not add directory-fsync crash durability or
+//! an atomic snapshot against concurrent edits by root/the same UID.
 //!
 //! `pin` also holds an advisory lock (`flock` on a sibling `.lock` file --
 //! never on `self.path` itself, since `pin` replaces that path's inode via
@@ -28,7 +27,13 @@
 //! it is not a precedent for skipping the lock here.)
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, not(unix)))]
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(any(test, not(unix)))]
+use std::fs::OpenOptions;
+#[cfg(any(test, not(unix)))]
 use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -37,6 +42,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use transport::auth::AuthError;
+
+#[cfg(unix)]
+mod storage;
 
 /// What the store says about a host's key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -251,6 +259,21 @@ pub struct KnownHosts {
     path: PathBuf,
 }
 
+struct LoadedDocument {
+    document: Document,
+    #[cfg(unix)]
+    binding: storage::ReadBinding,
+}
+impl LoadedDocument {
+    fn validate(&self) -> Result<(), AuthError> {
+        #[cfg(unix)]
+        self.binding.validate().map_err(|error| {
+            AuthError::Backend(format!("checking QSH pin-store authority: {error}"))
+        })?;
+        Ok(())
+    }
+}
+
 impl KnownHosts {
     /// A store backed by `path` (usually `~/.config/qsh/known_hosts`). The
     /// file need not exist yet -- an absent file just means nothing is
@@ -264,12 +287,28 @@ impl KnownHosts {
     /// (permissions, the path being a directory, ...) is, since silently
     /// treating it as "nothing pinned" would let a broken store masquerade
     /// as a trustworthy empty one.
-    fn read_entries(&self) -> Result<Document, AuthError> {
+    #[cfg(unix)]
+    fn read_entries(&self) -> Result<LoadedDocument, AuthError> {
+        let (text, binding) = storage::read(&self.path)
+            .map_err(|error| {
+                AuthError::Backend(format!("reading {}: {error}", self.path.display()))
+            })?
+            .into_parts();
+        Ok(LoadedDocument {
+            document: Document::parse(text),
+            binding,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn read_entries(&self) -> Result<LoadedDocument, AuthError> {
         match fs::read_to_string(&self.path) {
-            Ok(text) => Ok(Document::parse(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Document::parse(String::new()))
-            }
+            Ok(text) => Ok(LoadedDocument {
+                document: Document::parse(text),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(LoadedDocument {
+                document: Document::parse(String::new()),
+            }),
             Err(e) => Err(AuthError::Backend(format!(
                 "reading {}: {e}",
                 self.path.display()
@@ -284,7 +323,9 @@ impl KnownHosts {
     pub fn check(&self, host: &str, port: u16, key: &[u8; 32]) -> Result<HostVerdict, AuthError> {
         validate_host_identifier(host)?;
         let entries = self.read_entries()?;
-        match pinned_key(entries.entries(), host, port)? {
+        let pinned = pinned_key(entries.document.entries(), host, port)?;
+        entries.validate()?;
+        match pinned {
             None => Ok(HostVerdict::Unknown),
             Some(pinned) if &pinned == key => Ok(HostVerdict::Known),
             Some(pinned) => Ok(HostVerdict::Changed { pinned }),
@@ -303,15 +344,16 @@ impl KnownHosts {
     /// racing -- see the module doc-comment.
     pub fn pin(&self, host: &str, port: u16, key: &[u8; 32]) -> Result<(), AuthError> {
         validate_host_identifier(host)?;
-        let _lock = PinLock::acquire(&self.path)?;
+        let mut lock = PinLock::acquire(&self.path)?;
 
-        let entries = self.read_entries()?;
-        if let Some(pinned) = pinned_key(entries.entries(), host, port)? {
+        let entries = self.read_locked(&lock)?;
+        if let Some(pinned) = pinned_key(entries.document.entries(), host, port)? {
             if &pinned == key {
+                Self::validate_locked(&lock, &entries)?;
                 return Ok(());
             }
             let identity = HostIdentity::of(host);
-            if entries.entries().any(|entry| {
+            if entries.document.entries().any(|entry| {
                 entry.port == port
                     && entry.host != host
                     && identity.matches(HostIdentity::of(&entry.host))
@@ -321,8 +363,13 @@ impl KnownHosts {
                 ));
             }
         }
-        self.write_atomic(entries.with_pin(host, port, key).as_bytes())
-        // `_lock` is dropped (and released) here, after the rename below
+        Self::validate_locked(&lock, &entries)?;
+        self.write_locked(
+            &mut lock,
+            &entries,
+            entries.document.with_pin(host, port, key).as_bytes(),
+        )
+        // The single transaction lock is released here, after the rename
         // has already made the new contents visible.
     }
 
@@ -342,17 +389,23 @@ impl KnownHosts {
         key: &[u8; 32],
     ) -> Result<HostVerdict, AuthError> {
         validate_host_identifier(host)?;
-        let _lock = PinLock::acquire(&self.path)?;
+        let mut lock = PinLock::acquire(&self.path)?;
 
-        let entries = self.read_entries()?;
-        if let Some(pinned) = pinned_key(entries.entries(), host, port)? {
+        let entries = self.read_locked(&lock)?;
+        if let Some(pinned) = pinned_key(entries.document.entries(), host, port)? {
+            Self::validate_locked(&lock, &entries)?;
             return Ok(if &pinned == key {
                 HostVerdict::Known
             } else {
                 HostVerdict::Changed { pinned }
             });
         }
-        self.write_atomic(entries.with_pin(host, port, key).as_bytes())?;
+        Self::validate_locked(&lock, &entries)?;
+        self.write_locked(
+            &mut lock,
+            &entries,
+            entries.document.with_pin(host, port, key).as_bytes(),
+        )?;
         Ok(HostVerdict::Unknown)
     }
 
@@ -362,86 +415,103 @@ impl KnownHosts {
         &self.path
     }
 
-    /// Replace the file's contents without ever leaving a half-written
-    /// file on disk: write to a fresh sibling temp file, then `rename` it
-    /// over `self.path`. `rename` on the same filesystem is atomic, so a
-    /// crash or a kill signal between the two calls leaves either the old
-    /// file (untouched) or the new one (complete) -- never a mix of both.
-    /// Any failure after the temp file is created removes it, so an
-    /// ordinary error path never leaves it behind.
+    fn read_locked(&self, lock: &PinLock) -> Result<LoadedDocument, AuthError> {
+        #[cfg(unix)]
+        {
+            let (text, binding) = lock.transaction.read().map_err(storage_error)?.into_parts();
+            Ok(LoadedDocument {
+                document: Document::parse(text),
+                binding,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock;
+            self.read_entries()
+        }
+    }
+
+    fn validate_locked(lock: &PinLock, entries: &LoadedDocument) -> Result<(), AuthError> {
+        #[cfg(unix)]
+        {
+            lock.transaction
+                .validate(&entries.binding)
+                .map_err(storage_error)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lock;
+            entries.validate()
+        }
+    }
+
+    fn write_locked(
+        &self,
+        lock: &mut PinLock,
+        entries: &LoadedDocument,
+        contents: &[u8],
+    ) -> Result<(), AuthError> {
+        #[cfg(unix)]
+        {
+            lock.transaction
+                .replace(&entries.binding, contents)
+                .map_err(storage_error)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (lock, entries);
+            self.write_atomic(contents)
+        }
+    }
+
+    #[cfg(not(unix))]
     fn write_atomic(&self, contents: &[u8]) -> Result<(), AuthError> {
         if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
             fs::create_dir_all(dir)
                 .map_err(|e| AuthError::Backend(format!("creating {}: {e}", dir.display())))?;
         }
-        let tmp_path = self.temp_path();
-        if let Err(e) = write_owner_only(&tmp_path, contents) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(AuthError::Backend(format!(
-                "writing {}: {e}",
-                tmp_path.display()
-            )));
-        }
-        fs::rename(&tmp_path, &self.path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            AuthError::Backend(format!("replacing {}: {e}", self.path.display()))
-        })
-    }
-
-    /// A sibling path in the same directory (so the later `rename` stays on
-    /// one filesystem), named uniquely enough that two `pin` calls -- even
-    /// from two threads of the same process -- do not collide.
-    fn temp_path(&self) -> PathBuf {
-        let name = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("known_hosts");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        self.path
-            .with_file_name(format!(".{name}.tmp.{}.{nanos}", std::process::id()))
+        let tmp_path = temp_path_for(&self.path);
+        // A collision is never ours. This backend has no qualified inode/name
+        // identity check for failed cleanup, so retain rather than guess.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(storage_error)?;
+        file.write_all(contents)
+            .and_then(|()| file.sync_all())
+            .map_err(storage_error)?;
+        drop(file);
+        fs::rename(&tmp_path, &self.path).map_err(storage_error)
     }
 }
 
-/// Write a brand-new file with `contents`, owner-only on Unix. `create_new`
-/// (rather than `create` + `truncate`) refuses to follow a pre-planted
-/// symlink at this exact path -- cheap insurance, since `path` is always a
-/// freshly chosen temp path (see `temp_path`) that has no legitimate reason
-/// to already exist.
-#[cfg(unix)]
-fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
+fn storage_error(error: std::io::Error) -> AuthError {
+    AuthError::Backend(format!("QSH pin-store transaction: {error}"))
 }
-
-#[cfg(not(unix))]
-fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
+fn temp_path_for(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("known_hosts");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(".{name}.tmp.{}.{nanos}", std::process::id()))
 }
 
 /// An advisory lock held across `pin`'s whole read-modify-write-rename --
 /// see the module doc-comment for why it exists and why it lives on a
 /// SIBLING file rather than `self.path`.
 ///
-/// Unix only: `flock(2)` via a raw fd. Other targets get a no-op lock (the
+/// Unix only: one retained transaction owns the actual flock. Other targets
+/// get a no-op lock (the
 /// same reach as the rest of this module's Unix-specific hardening, e.g.
 /// owner-only permissions).
 #[cfg(unix)]
 struct PinLock {
-    /// Kept alive only to hold the fd open -- and therefore the flock held
-    /// -- until this guard drops. Never read from directly.
-    _file: File,
+    transaction: storage::Transaction,
 }
 
 #[cfg(not(unix))]
@@ -449,61 +519,10 @@ struct PinLock;
 
 #[cfg(unix)]
 impl PinLock {
-    /// Block until the lock for `known_hosts_path` is free, then hold it
-    /// until the returned guard is dropped.
-    fn acquire(known_hosts_path: &Path) -> Result<PinLock, AuthError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-
-        let lock_path = lock_path_for(known_hosts_path);
-        if let Some(dir) = lock_path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            fs::create_dir_all(dir)
-                .map_err(|e| AuthError::Backend(format!("creating {}: {e}", dir.display())))?;
-        }
-        // The lock file is long-lived and reused by every `pin` -- it holds
-        // no data, it exists only to be flock'd, so there is nothing to
-        // reset or clean up between calls. `O_NOFOLLOW` refuses to open it
-        // if the last path component is a symlink -- the same class of
-        // pre-planted-symlink concern as the temp file's `create_new`,
-        // except this file IS reused across calls, so `create_new` isn't
-        // the right tool here. Nothing is ever written through this
-        // handle beyond its own creation, so the worst a followed symlink
-        // could do is lock the wrong file, never corrupt one -- but
-        // refusing it costs nothing.
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false) // reused across calls; its bytes are never read
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&lock_path)
-            .map_err(|e| {
-                AuthError::Backend(format!("opening lock file {}: {e}", lock_path.display()))
-            })?;
-        // SAFETY: `file` is a valid, open file descriptor for the duration
-        // of this call, which is all `flock` needs.
-        //
-        // Retried on `EINTR`: `flock` blocks while another holder has the
-        // lock, and a signal delivered during that wait (this crate is
-        // used by a terminal CLI, which handles `SIGWINCH` on every window
-        // resize) interrupts the syscall without the lock being free yet.
-        // Treating that as a hard failure would fail an ordinary `pin()`
-        // for no reason other than someone resizing their terminal.
-        loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc == 0 {
-                break;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(AuthError::Backend(format!(
-                "locking {}: {err}",
-                lock_path.display()
-            )));
-        }
-        Ok(PinLock { _file: file })
+    fn acquire(path: &Path) -> Result<Self, AuthError> {
+        Ok(Self {
+            transaction: storage::Transaction::acquire(path).map_err(storage_error)?,
+        })
     }
 }
 
@@ -529,6 +548,36 @@ fn lock_path_for(known_hosts_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    include!("known_hosts/authority_tests.rs");
+
+    fn private_test_dir() -> std::io::Result<tempfile::TempDir> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+        }
+        #[cfg(not(unix))]
+        tempfile::tempdir()
+    }
+
+    fn write_test_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?
+                .write_all(contents.as_ref())
+        }
+        #[cfg(not(unix))]
+        fs::write(path, contents)
+    }
 
     fn base64_key(key: &[u8; 32]) -> String {
         BASE64.encode(key)
@@ -544,7 +593,7 @@ mod tests {
                 "# comment\r\n\r\nunknown record\r\n",
                 "# unterminated",
             ] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = private_test_dir().unwrap();
                 let path = dir.path().join("known_hosts");
                 let original = if tail == "EMPTY" {
                     String::new()
@@ -554,7 +603,7 @@ mod tests {
                         base64_key(&[1; 32])
                     )
                 };
-                fs::write(&path, &original).unwrap();
+                write_test_file(&path, &original).unwrap();
                 let hosts = KnownHosts::open(path.clone());
                 if if_absent {
                     assert_eq!(
@@ -595,10 +644,10 @@ mod tests {
 
     #[test]
     fn pin_replacement_preserves_unrelated_records_and_text() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir().unwrap();
         let path = dir.path().join("known_hosts");
         let original = format!("# header\r\ntarget.example 22 {}\r\n\nunknown record\n  other.example 22 {} trailing\r\ntarget.example bad-port invalid\ntarget.example 22 {}\n# tail", base64_key(&[1; 32]), base64_key(&[3; 32]), base64_key(&[1; 32]));
-        fs::write(&path, original).unwrap();
+        write_test_file(&path, original).unwrap();
         let hosts = KnownHosts::open(path.clone());
         hosts.pin("target.example", 22, &[2; 32]).unwrap();
         let expected = format!("# header\r\n\nunknown record\n  other.example 22 {} trailing\r\ntarget.example bad-port invalid\n# tail\ntarget.example 22 {}\n", base64_key(&[3; 32]), base64_key(&[2; 32]));
@@ -611,14 +660,14 @@ mod tests {
 
     #[test]
     fn pin_no_op_preserves_original_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir().unwrap();
         let path = dir.path().join("known_hosts");
         let original = format!(
             "# header\r\n\r\n  Example.org\t22 {} trailing\r\nExample.org 22 {}\nunknown record",
             base64_key(&[1; 32]),
             base64_key(&[1; 32])
         );
-        fs::write(&path, &original).unwrap();
+        write_test_file(&path, &original).unwrap();
         let hosts = KnownHosts::open(path.clone());
         for host in ["Example.org", "example.org"] {
             hosts.pin(host, 22, &[1; 32]).unwrap();
@@ -638,10 +687,10 @@ mod tests {
 
     #[test]
     fn preserved_malformed_records_never_grant_trust() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir().unwrap();
         let path = dir.path().join("known_hosts");
         let original = format!("target.example bad {}\ntarget.example 22 !invalid!\ntarget.example 22 YQ==\n#target.example 22 {}\n", base64_key(&[1; 32]), base64_key(&[1; 32]));
-        fs::write(&path, &original).unwrap();
+        write_test_file(&path, &original).unwrap();
         let hosts = KnownHosts::open(path.clone());
         assert_eq!(
             hosts.check("target.example", 22, &[1; 32]).unwrap(),
@@ -659,7 +708,7 @@ mod tests {
             hosts.check("target.example", 22, &[2; 32]).unwrap(),
             HostVerdict::Known
         );
-        fs::write(&path, [0xff, b'\n']).unwrap();
+        write_test_file(&path, [0xff, b'\n']).unwrap();
         assert!(hosts.check("target.example", 22, &[2; 32]).is_err());
         assert!(hosts.pin("target.example", 22, &[2; 32]).is_err());
         assert!(hosts.pin_if_absent("target.example", 22, &[2; 32]).is_err());
@@ -667,7 +716,7 @@ mod tests {
     }
 
     fn rejects_injected_pin(if_absent: bool) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir().unwrap();
         let path = dir.path().join("known_hosts");
         let hosts = KnownHosts::open(path.clone());
         hosts.pin("sentinel.example", 60022, &[1; 32]).unwrap();
@@ -718,7 +767,7 @@ mod tests {
         );
         for host in invalid {
             for operation in 0..3 {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = private_test_dir().unwrap();
                 let parent = dir.path().join("absent");
                 let hosts = KnownHosts::open(parent.join("known_hosts"));
                 let result = match operation {
@@ -758,7 +807,7 @@ mod tests {
             ("name#tag", "name#tag", true),
             ("name#tag", "NAME#tag", false),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_test_dir().unwrap();
             let path = dir.path().join("known_hosts");
             let hosts = KnownHosts::open(path.clone());
             hosts.pin(stored, 60022, &[1; 32]).unwrap();
@@ -806,7 +855,7 @@ mod tests {
             ("fe80::a%eth0", "FE80:0:0:0:0:0:0:a%eth0"),
         ] {
             for reverse in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
+                let dir = private_test_dir().unwrap();
                 let path = dir.path().join("known_hosts");
                 let keys = if reverse {
                     [[2; 32], [1; 32]]
@@ -819,7 +868,7 @@ mod tests {
                     base64_key(&keys[1]),
                     base64_key(&[9; 32])
                 );
-                fs::write(&path, &before).unwrap();
+                write_test_file(&path, &before).unwrap();
                 let hosts = KnownHosts::open(path.clone());
                 for query in [first, second] {
                     for offered in [[1; 32], [2; 32], [3; 32]] {
@@ -846,13 +895,13 @@ mod tests {
     #[test]
     fn pin_host_same_key_aliases_are_known_but_cross_alias_replacement_is_refused() {
         for duplicate in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_test_dir().unwrap();
             let path = dir.path().join("known_hosts");
             let mut before = format!("Example.org 60022 {}\n", base64_key(&[1; 32]));
             if duplicate {
                 before.push_str(&format!("example.ORG 60022 {}\n", base64_key(&[1; 32])));
             }
-            fs::write(&path, &before).unwrap();
+            write_test_file(&path, &before).unwrap();
             let hosts = KnownHosts::open(path.clone());
             assert_eq!(
                 hosts.check("EXAMPLE.ORG", 60022, &[1; 32]).unwrap(),
@@ -880,7 +929,7 @@ mod tests {
 
     #[test]
     fn pin_host_equivalent_first_pins_race_without_creating_conflicting_records() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir().unwrap();
         let path = dir.path().join("known_hosts");
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let workers = [("Race.Example", [1; 32]), ("race.example", [2; 32])].map(|(host, key)| {
@@ -931,7 +980,7 @@ mod tests {
 
     #[test]
     fn an_unknown_host_is_reported_as_unknown_then_pinned() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
         let hosts = KnownHosts::open(path.clone());
         assert_eq!(
@@ -955,7 +1004,7 @@ mod tests {
     /// fingerprint comes back so the user can see what changed.
     #[test]
     fn a_changed_key_is_reported_with_the_pinned_one() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let hosts = KnownHosts::open(dir.path().join("known_hosts"));
         hosts.pin("example.org", 60022, &[1u8; 32]).expect("pin");
         match hosts.check("example.org", 60022, &[2u8; 32]).unwrap() {
@@ -966,9 +1015,9 @@ mod tests {
 
     #[test]
     fn comments_and_blank_lines_are_ignored() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
-        std::fs::write(
+        write_test_file(
             &path,
             format!(
                 "# a comment\n\nexample.org 60022 {}\n",
@@ -1009,7 +1058,7 @@ mod tests {
     /// winning and a key the user just approved would look `Changed` forever.
     #[test]
     fn re_pinning_a_changed_key_replaces_the_old_entry() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let hosts = KnownHosts::open(dir.path().join("known_hosts"));
         hosts
             .pin("example.org", 60022, &[1u8; 32])
@@ -1026,7 +1075,7 @@ mod tests {
     /// of a pinned one -- only exact equality counts.
     #[test]
     fn a_similar_but_different_host_name_does_not_match() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let hosts = KnownHosts::open(dir.path().join("known_hosts"));
         hosts.pin("example.org", 60022, &[1u8; 32]).expect("pin");
         assert_eq!(
@@ -1050,9 +1099,9 @@ mod tests {
     /// lookup.
     #[test]
     fn lines_with_a_bad_port_or_key_are_skipped() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
-        std::fs::write(
+        write_test_file(
             &path,
             format!(
                 "example.org not-a-port {}\nexample.org 60022 not-base64!!\nexample.org 60022 {}\nexample.com 60022 {}\n",
@@ -1073,7 +1122,7 @@ mod tests {
     #[test]
     fn the_file_is_created_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
         let hosts = KnownHosts::open(path.clone());
         hosts.pin("example.org", 60022, &[1u8; 32]).expect("pin");
@@ -1096,7 +1145,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_pin_in_progress_blocks_a_concurrent_pin_of_a_different_host_until_it_finishes() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
         let hosts = KnownHosts::open(path.clone());
         hosts
@@ -1107,7 +1156,7 @@ mod tests {
             "# retained header\r\n{}\nunknown record\n",
             fs::read_to_string(&path).unwrap()
         );
-        fs::write(&path, &original).unwrap();
+        write_test_file(&path, &original).unwrap();
 
         let held = PinLock::acquire(&path).expect("acquire the lock pin() itself uses");
         let hosts_for_thread = KnownHosts::open(path.clone());
@@ -1152,11 +1201,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_lock_file_refuses_to_follow_a_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
         let lock_path = dir.path().join(".known_hosts.lock");
         let elsewhere = dir.path().join("elsewhere");
-        std::fs::write(&elsewhere, b"").expect("write the symlink's target");
+        write_test_file(&elsewhere, b"").expect("write the symlink's target");
         std::os::unix::fs::symlink(&elsewhere, &lock_path)
             .expect("plant a symlink at the lock path");
 
@@ -1171,7 +1220,7 @@ mod tests {
     /// which it was.
     #[test]
     fn pin_if_absent_pins_only_a_host_with_nothing_on_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let hosts = KnownHosts::open(dir.path().join("known_hosts"));
 
         assert_eq!(
@@ -1218,7 +1267,7 @@ mod tests {
 
         extern "C" fn no_op_handler(_: libc::c_int) {}
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_test_dir().expect("tempdir");
         let path = dir.path().join("known_hosts");
 
         // Stand in for another process's in-flight pin.

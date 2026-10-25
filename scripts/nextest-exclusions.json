@@ -157,6 +157,14 @@
       ],
       "reason": "Requires disposable root self-exec children for real root-readonly and foreign-owner cache authority",
       "owner": "CI container job: run_suite test release_cache_authority_privilege"
+    },
+    {
+      "binary": "sshauth::qsh_pin_authority_privilege",
+      "tests": [
+        "qsh_pin_real_account_root_read_and_mutation_boundaries"
+      ],
+      "reason": "Requires disposable root self-exec with real account and foreign owners",
+      "owner": "CI container job: QSH pin ownership boundary"
     }
   ]
 }
