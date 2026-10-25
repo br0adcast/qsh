@@ -428,9 +428,17 @@ struct Logger {
 
 impl Logger {
     fn open(path: PathBuf, rotated_path: PathBuf, max_bytes: u64) -> std::io::Result<Logger> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Self::open_with(path, rotated_path, max_bytes, open_log_file)
+    }
+
+    fn open_with(
+        path: PathBuf,
+        rotated_path: PathBuf,
+        max_bytes: u64,
+        open: impl FnOnce(&Path) -> std::io::Result<File>,
+    ) -> std::io::Result<Logger> {
+        let file = open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        restrict_to_owner(&path);
         Ok(Logger {
             path,
             rotated_path,
@@ -459,7 +467,7 @@ impl Logger {
     /// retries opening the new path; it must not rename the retained old inode
     /// a second time. Diagnostics use nonpanicking stderr, never this mutex.
     fn rotate(&mut self) -> bool {
-        self.rotate_with(|path| OpenOptions::new().create(true).append(true).open(path))
+        self.rotate_with(open_log_file)
     }
 
     fn rotate_with(&mut self, open: impl FnOnce(&Path) -> std::io::Result<File>) -> bool {
@@ -470,7 +478,6 @@ impl Logger {
             }
             let file = open(&self.path)?;
             let written = file.metadata()?.len();
-            restrict_to_owner(&self.path);
             self.file = file;
             self.written = written;
             self.pending_open = false;
@@ -517,17 +524,65 @@ fn append_counted(writer: &mut impl Write, written: &mut u64, mut bytes: &[u8]) 
     }
 }
 
-/// `0600` permissions on the log file (it holds diagnostics for a specific
-/// user). Errors are ignored: the log must never crash the daemon.
-fn restrict_to_owner(path: &Path) {
+fn open_log_file(path: &Path) -> std::io::Result<File> {
+    open_log_file_with(
+        path,
+        nix::unistd::Uid::effective().as_raw(),
+        apply_log_permissions,
+    )
+}
+
+/// Prepare the held sink before it can receive diagnostics. Nonblocking open
+/// avoids waiting on a FIFO before its type can be checked; aliases retain
+/// their usual meaning. Permission errors disable the file sink, not qshd.
+fn open_log_file_with(
+    path: &Path,
+    owner: u32,
+    apply: impl FnOnce(&File) -> std::io::Result<()>,
+) -> std::io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open(path)?;
+    let validate = || {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != owner {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon log must be a regular file owned by the effective user",
+            ));
+        }
+        Ok(metadata)
+    };
+    validate()?;
+    apply(&file)?;
+    if validate()?.mode() & 0o7777 != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon log permissions could not be restricted to 0600",
+        ));
+    }
+    Ok(file)
+}
+
+fn apply_log_permissions(file: &File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    file.set_permissions(fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{joined, Level, Logger};
     use std::time::{Duration, UNIX_EPOCH};
+
+    mod permissions {
+        use super::{Duration, Logger};
+        include!("log/permission_tests.rs");
+    }
 
     /// One record's text as [`super::write_record`] hands it to the file.
     fn text(at_ms: u64, msg: &str) -> String {

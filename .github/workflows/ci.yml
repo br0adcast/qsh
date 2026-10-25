@@ -255,6 +255,29 @@ jobs:
           do
             grep -F "test $name ... ok" "$runtime/results.log"
           done
+          cargo test -p qshd --lib --locked log280_ -- --nocapture --test-threads=1 --color=never \
+            2>&1 | tee "$runtime/log-permission-results.log"
+          for name in \
+            log::tests::permissions::log280_private_creation_and_safe_aliases \
+            log::tests::permissions::log280_permission_failures_refuse_initial_and_rotated_sinks \
+            log::tests::permissions::log280_path_replacement_cannot_redirect_permissions \
+            log::tests::permissions::log280_unsuitable_or_unconfirmed_held_files_are_not_repaired; do
+            # --nocapture diagnostics may split a test's name and bare ok.
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/log-permission-results.log"
+          done
+          grep -F 'test result: ok. 4 passed; 0 failed; 0 ignored;' "$runtime/log-permission-results.log"
+          if grep -Fq 'SKIPPED' "$runtime/log-permission-results.log"; then
+            echo '::error::native daemon log permission tests reported a runtime skip' >&2
+            exit 1
+          fi
           # Execute the portable handover boundary on the native kernel too:
           # anonymous tempfile, sockaddr layout, executable inode and renamed
           # Unix bind paths must all be exercised, without skipped cases.
@@ -924,9 +947,11 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 70` is the exact compiled system-library body count.
+          # `--ignored 71` is the exact compiled system-library body count.
           # These bodies are re-invoked by maintained owning subprocess fixtures;
-          # the 19 additions to public main have an explicit wrapper mapping.
+          # private_creation_body is owned by
+          # log::tests::permissions::log280_private_creation_and_safe_aliases,
+          # which requires its child's successful one-test result.
           # Keep the strict count: a new isolated body requires deliberate review.
           #
           # One --require for this binary too, not the zero an earlier
@@ -957,12 +982,12 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 70 isolated bodies are a separate matter and get no
+          # The 71 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 70 \
+          run_suite lib qshd --ignored 71 \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
             --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
