@@ -181,7 +181,8 @@ refused. Repeated interior `/` separators are allowed. Configure the real,
 absolute path to a safe store when replacing an older symlink-based setup.
 Even a private directory below a writable ancestor such as `/tmp` is refused;
 the sticky bit does not exempt a directory from the ownership/write policy.
-These restrictions apply to system mode; personal-mode key loading is unchanged.
+These restrictions apply to system mode. Personal mode uses the public-file
+integrity rules described in "The authorized-keys file" below.
 
 The helper walks through owned directory descriptors and reads the same opened
 file it validated, so replacing a pathname cannot redirect an in-progress read.
@@ -382,6 +383,31 @@ The format is the usual OpenSSH `authorized_keys`: one line per key,
 name matches the regular SSH authorized-keys file, on a machine that
 already has key-based login set up you likely won't need to create
 anything — `qshd serve` uses the same key list.
+
+Personal mode treats this as a public authorization list, not a secret key.
+The opened regular file must belong to root or the daemon's actual effective
+user and must not be writable by group or others. Both account-owned `0600`
+and `0644` files work, as do root-owned stores that the daemon account can read.
+Hardlinks are allowed. The daemon never changes ownership or permissions to
+make an unsafe list acceptable; unsafe or unreadable sources refuse login.
+
+Explicit absolute and relative paths, non-UTF-8 path names, and trusted parent
+or leaf symlinks are supported. Every traversed directory and symlink must be
+owned by root or the daemon account. Writable directories require the sticky
+bit and a trusted owner; other group- or world-writable ancestors are refused.
+Search-only ancestors are supported. Resolution is bounded to 40 symlinks and
+4096 bytes per symlink target, with the resolved file checked before reading.
+The same validated descriptor is read, so replacing a pathname cannot redirect
+that attempt. This does not freeze contents against root or the daemon account
+editing in place; a later attempt reopens and revalidates the configured path.
+
+The complete list must be valid UTF-8 and no larger than 1MiB (1,048,576 bytes).
+An authorizing first line does not make an oversized or invalid list acceptable.
+This bounds bytes read, not the wall time of regular-file or network filesystem
+I/O. Proof signatures are checked before file lookup, and the existing key
+options and first-matching-line rules still apply. These public-file rules are
+separate from system mode's stricter path/credential rules and the host key's
+secret-file creation and repair policy.
 
 If the file doesn't exist yet (typical for a fresh user), create it and
 add the public key of the client you'll connect with, the same way you

@@ -220,6 +220,38 @@ jobs:
           done
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
+      - name: Personal authorization file integrity on macOS
+        shell: bash
+        run: |
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-personal-keys.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -p "$runtime/config" "$runtime/cache"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$runtime" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          set -o pipefail
+          cargo test -p sshauth --lib --test personal_authorized_keys --locked personal_authorized_keys -- --nocapture 2>&1 | tee "$runtime/results.log"
+          for name in \
+            personal_authorized_keys::tests::trusted_alias_bounds_are_finite \
+            personal_authorized_keys::tests::descriptor_replacement_keeps_opened_object \
+            personal_authorized_keys::tests::growth_after_open_is_bounded \
+            personal_authorized_keys::tests::nonregular_and_writable_objects_are_refused \
+            personal_authorized_keys::tests::search_only_and_sticky_ancestors_are_supported \
+            personal_authorized_keys::tests::public_hardlinks_and_invalid_utf8_have_explicit_results \
+            personal_authorized_keys_trusted_explicit_paths_and_aliases_authorize \
+            personal_authorized_keys_unsafe_sources_never_produce_principal \
+            personal_authorized_keys_oversized_valid_prefix_never_authorizes \
+            personal_authorized_keys_each_attempt_revalidates_replaced_authority \
+            personal_authorized_keys_bad_signature_fails_before_file_lookup
+          do
+            grep -Fx "test $name ... ok" "$runtime/results.log"
+          done
+          grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          if grep -q 'SKIPPED' "$runtime/results.log"; then
+            echo '::error::personal authorization integrity selection skipped a test'
+            exit 1
+          fi
       - name: Portable CLI tests
         run: |
           cargo test -p qsh --test recovery_port_probe --locked
@@ -637,7 +669,8 @@ jobs:
           run_suite test system_mode_shell \
             --require the_system_mode_serves_a_shell_over_the_seam
           run_suite test authorized_keys_privilege \
-            --require the_effective_account_is_restored_even_when_the_read_fails
+            --require the_effective_account_is_restored_even_when_the_read_fails \
+            --require personal_authorized_keys_enforces_real_account_and_root_ownership
 
           # The library tests, where the nine `skip_unless_root` tests in
           # `helper/server.rs` live -- and four tests that must NOT run as

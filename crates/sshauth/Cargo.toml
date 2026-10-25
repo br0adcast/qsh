@@ -25,6 +25,7 @@ sha2 = "0.10"
 # transitive dependency of the workspace at this exact version, so this adds
 # no new crate to the supply chain -- just a direct edge to one already there.
 libc = "0.2"
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
 
 # Shared private-file decoding uses upstream format and key conversions.
 openssl = "=0.10.81"
@@ -39,6 +40,8 @@ p384 = { version = "0.14", default-features = false, features = ["arithmetic", "
 p521 = { version = "0.14", default-features = false, features = ["arithmetic", "pem"] }
 
 [dev-dependencies]
+# Safe portable FIFO fixture creation; rustix does not expose mkfifo on Apple.
+nix = { version = "0.28", default-features = false, features = ["fs"] }
 serde_json = "1"
 rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
 tempfile = "3"
