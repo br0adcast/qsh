@@ -46,6 +46,15 @@ class ReportTests(unittest.TestCase):
         self.write(cases)
         return self.module.check_report(self.report, self.expected if expected is None else expected)
 
+    def test_cache_authority_privilege_exclusion_has_exact_owner_and_identity(self):
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        key = ("qsh::release_cache_authority_privilege", "release_cache_root_readonly_and_foreign_owner_boundaries")
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite test release_cache_authority_privilege")
+        self.assertEqual([entry for entry in expected if "release_cache_authority" in entry[0]], [key])
+        expression = self.module.exclusion_filter({key: expected[key]})
+        self.assertIn("binary_id(=qsh::release_cache_authority_privilege)", expression)
+        self.assertIn("test(=release_cache_root_readonly_and_foreign_owner_boundaries)", expression)
+
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),
                              ("tests::safe", "stdout", "<&> ordinary output"),

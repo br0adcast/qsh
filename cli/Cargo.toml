@@ -24,6 +24,7 @@ libc = "0.2"
 nix = { version = "0.28", features = ["term", "signal"] }
 prediction = { path = "../crates/prediction" }
 rand = "0.8"
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
 render = { path = "../crates/render" }
 sha1 = "0.10"
 sha2 = "0.10"
@@ -44,6 +45,8 @@ transport = { path = "../crates/transport" }
 unicode-width = "0.2.2"
 
 [dev-dependencies]
+# Safe FIFO creation on both Linux and Apple; do not rely on feature union.
+nix = { version = "0.28", default-features = false, features = ["fs"] }
 http = "1.5"
 transport = { path = "../crates/transport", features = ["testnet"] }
 tempfile = "3"

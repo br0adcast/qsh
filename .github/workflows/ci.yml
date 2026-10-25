@@ -117,6 +117,39 @@ jobs:
             --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
             --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
           grep -F 'test result: ok. 42 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+      - name: Release cache authority on macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-cache-authority.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -m 700 -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qsh --lib --locked cache_authority_ -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/storage.log"
+          for name in \
+            releases::cache::storage::tests::cache_authority_lock_policy_and_binding_are_checked \
+            releases::cache::storage::tests::cache_authority_reads_are_bounded_and_nonfollowing \
+            releases::cache::storage::tests::cache_authority_root_walk_preserves_raw_search_and_alias_bounds \
+            releases::cache::storage::tests::cache_authority_substitution_refuses_read_and_mutation \
+            releases::cache::storage::tests::cache_authority_publication_keeps_one_lock_and_pointer_last \
+            releases::cache::storage::tests::cache_authority_cleanup_never_removes_replacements; do
+            grep -F "test $name ... ok" "$runtime/storage.log"
+          done
+          if grep -q 'SKIPPED' "$runtime/storage.log"; then exit 1; fi
+          grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$runtime/storage.log"
+          cargo test -p qsh --test releases --locked cache_authority_ -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/releases.log"
+          for name in \
+            cache_authority_rejects_writable_cache_but_keeps_verified_online_install \
+            cache_authority_preserves_safe_public_modes_and_root_aliases; do
+            grep -F "test $name ... ok" "$runtime/releases.log"
+          done
+          if grep -q 'SKIPPED' "$runtime/releases.log"; then exit 1; fi
+          grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/releases.log"
       - name: Compile the bringup standalone target boundary
         run: |
           echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."
@@ -594,11 +627,23 @@ jobs:
             if length == 1 then .[0].id else error("expected one qshd workspace package") end
           ' "$RUNNER_TEMP/workspace.json")
 
+          # The cache ownership fixture is the one qsh target in this tier.
+          qsh_package=$(jq -er '
+            .workspace_members as $members |
+            [.packages[] | select(.name == "qsh" and
+              (.id as $id | $members | index($id)))] |
+            if length == 1 then .[0].id else error("expected one qsh workspace package") end
+          ' "$RUNNER_TEMP/workspace.json")
+
           # The executable for one cargo target: `<kind>` tells the library
           # test binary (`lib`) apart from the `qshd` binary's own (`bin`),
           # which share a target name.
           binary() {
-            jq -r --arg package "$qshd_package" --arg kind "$1" --arg name "$2" \
+            package=$qshd_package
+            if [ "$1" = test ] && [ "$2" = release_cache_authority_privilege ]; then
+              package=$qsh_package
+            fi
+            jq -r --arg package "$package" --arg kind "$1" --arg name "$2" \
               'select(.reason == "compiler-artifact" and .profile.test == true
                       and .package_id == $package
                       and .target.name == $name and (.target.kind | index($kind)))
@@ -660,6 +705,9 @@ jobs:
             # all" is a different answer from "which failed", and a broken
             # run is exactly when both are worth having.
             scripts/no-silent-skips.sh "$logs/$name.log" "$@" || bad=1
+            if [ "$name" = release_cache_authority_privilege ]; then
+              grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$logs/$name.log" || bad=1
+            fi
             failures=$((failures + bad))
             echo "::endgroup::"
           }
@@ -682,6 +730,8 @@ jobs:
           # scripts/no-silent-skips.sh for what --require checks and why a
           # plain `grep -q "test NAME ... ok"` does not work under
           # --nocapture.
+          run_suite test release_cache_authority_privilege \
+            --require release_cache_root_readonly_and_foreign_owner_boundaries
           run_suite test serve_system_split \
             --require the_worker_runs_as_its_configured_account
           run_suite test system_mode_accounts \

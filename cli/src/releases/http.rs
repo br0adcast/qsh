@@ -754,7 +754,11 @@ while True:
                 })
             }
         }
-        let root = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         crate::releases::GitHubImages::with_transport(
             root.path().into(),
             Arc::new(Seed { sums, archive }),

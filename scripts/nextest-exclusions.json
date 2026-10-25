@@ -149,6 +149,14 @@
       ],
       "reason": "Requires disposable root self-exec children with real foreign effective UIDs",
       "owner": "CI container job: run_suite lib qshd"
+    },
+    {
+      "binary": "qsh::release_cache_authority_privilege",
+      "tests": [
+        "release_cache_root_readonly_and_foreign_owner_boundaries"
+      ],
+      "reason": "Requires disposable root self-exec children for real root-readonly and foreign-owner cache authority",
+      "owner": "CI container job: run_suite test release_cache_authority_privilege"
     }
   ]
 }
