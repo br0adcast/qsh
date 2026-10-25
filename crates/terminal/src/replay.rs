@@ -1241,6 +1241,54 @@ a\tb\tc\r\n\
         differential("repaint inside UTF-8", 40, 10, b"a\xe4\xbd", b"", b"\xa0b");
     }
 
+    #[test]
+    fn replay_does_not_repeat_linefeed_inside_escape() {
+        differential("ESC LF", 10, 3, b"abc\x1b\n", b"", b"Dnext");
+    }
+
+    #[test]
+    fn replay_does_not_repeat_linefeed_inside_csi_parameters() {
+        differential("CSI LF", 10, 3, b"abc\x1b[1\n", b"", b"Cnext");
+    }
+
+    #[test]
+    fn replay_does_not_repeat_backspace_inside_escape() {
+        differential("ESC BS", 10, 3, b"abc\x1b\x08", b"", b"Dnext");
+    }
+
+    #[test]
+    fn replay_does_not_repeat_scrolling_inside_csi() {
+        differential(
+            "bottom LF",
+            10,
+            3,
+            b"top\r\nmid\r\nbot\x1b[\n",
+            b"",
+            b"Cnext",
+        );
+    }
+
+    #[test]
+    fn replay_controls_follow_parser_state_at_every_cut() {
+        for (name, script) in [
+            ("ESC intermediate", b"abc\x1b(\n0qqq".as_slice()),
+            ("CSI entry", b"abc\x1b[\n2Cnext"),
+            ("CSI intermediate", b"abc\x1b[1 \nqnext"),
+            ("CSI ignore", b"abc\x1b[1 2\nCnext"),
+            ("OSC", b"abc\x1b]0;t\nitle\x07next"),
+            ("DCS header", b"abc\x1bP1\n;2qdata\n\x1b\\next"),
+            ("DCS intermediate", b"abc\x1bP1 \nqdata\x1b\\next"),
+            ("DCS ignore", b"abc\x1bP1 2\nqdata\x1b\\next"),
+            ("CAN", b"abc\x1b[1\n\x18next"),
+            ("SUB", b"abc\x1b[1\n\x1anext"),
+            ("DCS CAN", b"abc\x1bPqdata\n\x18next"),
+            ("OSC SUB", b"abc\x1b]0;title\n\x1anext"),
+            ("string to ESC", b"abc\x1bPqdata\x1b\n[2Cnext"),
+        ] {
+            every_cut(name, 10, 3, script);
+        }
+    }
+
     /// Re-review, Minor 2: the last printed character (what `CSI b`
     /// repeats) when the cursor waits at the last column over a cell that
     /// is not it -- DECSC over a pending wrap, printing elsewhere, DECRC; and
