@@ -1131,12 +1131,36 @@ For a later run of `qsh` to return to the shell an earlier one left behind,
 the token has to survive the process. `cli/src/sessions.rs` keeps it in
 `~/.config/qsh/sessions` (or `$XDG_CONFIG_HOME/qsh/sessions`) as numbered
 slots per effective login, exact first configured host text, and QSH port
-(`MAX_SLOTS` = 16 per tuple, directory `0700`, files `0600`). There is no DNS
+(`MAX_SLOTS` = 16 per tuple). New directories are `0700` and new files `0600`.
+The CLI declares this directory dedicated: initial preparation can tighten a
+validated same-user directory or file after acquiring its slot lock. Existing
+private modes need not be exactly `0700`/`0600`. Generic library callers do not
+authorize permission repair of existing directories. There is no DNS
 resolution, case normalization, or alias merging in this local key. A run takes
 the lowest slot no live process holds, where "holds" is an exclusive `flock` —
 released by the kernel however the process dies, so there is no stale lock and
 no pid file. Two terminals using the same tuple get different tokens; different
 logins have independent tokens and locks, each starting at slot zero.
+
+Directory traversal accepts trusted root/current-effective-user ancestors and
+aliases, including trusted sticky shared directories, but refuses other writable
+ancestors. A slot must be a non-followed, regular, single-linked file owned by
+the current effective user. Neither ancestors, shared sticky directories nor
+the filesystem root are permission-repaired. Occupied slots are not changed.
+Before reading or replacing a token, the original route and filename must still
+identify the retained parent and file, with private slot permissions. A later
+unsafe mode or displaced name is refused without repair or retargeting.
+
+Token input is limited to 4096 bytes, using a bounded read of at most 4097 bytes.
+Within that limit, the existing UTF-8 whitespace trimming and 32-hex-digit
+grammar remain unchanged. Empty, invalid or oversized validated contents can be
+reinitialized; an actual read I/O error instead leaves contents untouched and
+tries another slot or a fresh in-memory token. Initial persistence is best
+effort and retains the lock on a write failure. Explicit replacement returns an
+error without changing the in-memory token or releasing its lock. Writes stay
+on the locked inode; they are not atomic against crashes and do not add an
+`fsync` guarantee. Files have no local expiration policy. Route checks are
+observations, not an atomic filesystem snapshot against trusted owners.
 
 Filenames are `v2-<lowercase SHA-256 hex>-<slot>`. The hash input is
 `b"qsh/session-slot/v2\0"`, followed by the login's UTF-8 byte length as a
@@ -2849,7 +2873,7 @@ same reason.
   entries and recovery grants determine which identities the client accepts;
   offline release-cache verification assumes its stored checksum is trusted.
   Protect these files from unauthorized changes. Session tokens live in the
-  configured `sessions` directory (`0700` directory, `0600` files). A token
+  configured private `sessions` directory (new directories `0700`, files `0600`). A token
   alone admits nobody: a reattach still has to pass account authentication.
   Reading a token does not imply access to an SSH private key, which may have
   separate file permissions or remain in an agent or hardware device. See the

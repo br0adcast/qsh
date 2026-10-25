@@ -150,6 +150,51 @@ jobs:
           done
           if grep -q 'SKIPPED' "$runtime/releases.log"; then exit 1; fi
           grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/releases.log"
+      - name: Native client session-slot authority and inheritance tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-session-slots.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qsh --lib --locked sessions -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/results.log"
+          for name in \
+            sessions::tests::slot139_planted_leaves_cannot_change_outside_objects \
+            sessions::tests::slot139_directory_repair_requires_explicit_intent \
+            sessions::tests::slot139_bounded_trim_and_read_failures_have_distinct_results \
+            sessions::tests::slot139_replacement_refuses_displaced_routes_and_keeps_lock \
+            sessions_store::tests::slot139_traversal_preserves_aliases_and_raw_paths \
+            sessions_store::tests::slot139_nonregular_owner_and_alias_bounds_are_checked \
+            sessions_store::tests::slot139_substitution_and_failed_repairs_preserve_sentinels \
+            sessions::tests::inheritance::slot125_owner_drop_releases_the_replacement_while_a_child_is_pre_exec \
+            sessions::tests::inheritance::slot125_a_forked_copy_cannot_unlock_the_live_parent \
+            sessions::tests::inheritance::slot125_failed_token_replacement_retains_ownership_until_drop \
+            sessions::tests::tuple_framing_preserves_exact_names_without_path_or_length_collisions \
+            sessions::tests::legacy_records_are_never_claimed_or_changed_even_when_locked \
+            sessions::tests::exhausting_one_login_does_not_consume_anothers_slots; do
+            # --nocapture diagnostics may split a test's name and bare ok.
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
+          done
+          grep -F 'test result: ok. 25 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          if grep -Fq 'SKIPPED' "$runtime/results.log"; then
+            echo '::error::native session-slot tests reported a runtime skip' >&2
+            exit 1
+          fi
       - name: Compile the bringup standalone target boundary
         run: |
           echo "bringup bring_up/install real-daemon fixtures are Linux-only (pidfd, procfs, Linux tools); they do not execute on macOS."
