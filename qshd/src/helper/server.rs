@@ -2256,6 +2256,212 @@ fn request_kind(request: &Request) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginRefusal {
+    Capacity,
+    AccountBinding,
+    IdentityExhausted,
+}
+impl LoginRefusal {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Capacity => "already holding MAX_LOGINS live or unresolved logins",
+            Self::AccountBinding => "its login is already bound to a different account",
+            Self::IdentityExhausted => "login identity exhausted",
+        }
+    }
+}
+
+/// Fixed local diagnostics over registered helper custody, never an admission
+/// decision, an owner advance, or a claim of operating-system tree completion.
+struct CapacityCounts {
+    admitted: u16,
+    provisional: u16,
+    retiring: u16,
+    retiring_pending: u16,
+    charged: u16,
+    unconfirmed: u16,
+    missing_monitor: u16,
+    wait_lost: u16,
+    monitor_failed: u16,
+    receipt_lost: u16,
+    retired_slots: u16,
+    wait_outstanding: u16,
+    receipt_outstanding: u16,
+    pam: PamCompletion,
+}
+
+fn capacity_owner_is_charged(state: &LoopState, owner: MonitorOwner) -> bool {
+    state.retired.contains(&owner)
+        || state
+            .logins
+            .get(&owner.login)
+            .is_some_and(|entry| entry.incarnation == owner.incarnation)
+}
+
+fn capacity_count(counter: &mut u16, yes: bool) -> Option<()> {
+    *counter = counter.checked_add(u16::from(yes))?;
+    Some(())
+}
+
+impl CapacityCounts {
+    fn observe(
+        &mut self,
+        state: &LoopState,
+        owner: MonitorOwner,
+        retired: bool,
+        established: bool,
+    ) -> Option<()> {
+        let monitor = state.monitors.get(&owner);
+        // A provisional login without a monitor/slot has acquired no process
+        // obligation. Missing evidence where a monitor IS required is retained
+        // unconfirmed ownership, never permission to refund the charge.
+        let missing = monitor.is_none()
+            && (retired || established || state.live.values().any(|slot| slot.owner() == owner));
+        let wait_lost = monitor.is_some_and(|monitor| monitor.wait_lost);
+        let failed = monitor.is_some_and(|monitor| monitor.failure.is_some());
+        let receipt_lost =
+            monitor.is_some_and(|monitor| monitor.seam_closed && monitor.completion.is_none());
+        let unconfirmed = missing || wait_lost || failed || receipt_lost;
+        capacity_count(&mut self.missing_monitor, missing)?;
+        capacity_count(&mut self.wait_lost, wait_lost)?;
+        capacity_count(&mut self.monitor_failed, failed)?;
+        capacity_count(&mut self.receipt_lost, receipt_lost)?;
+        // Reasons overlap; this exact owner contributes only once.
+        capacity_count(&mut self.unconfirmed, unconfirmed)?;
+        capacity_count(&mut self.retiring_pending, retired && !unconfirmed)?;
+        if let Some(monitor) = monitor {
+            capacity_count(&mut self.wait_outstanding, retired && !monitor.reaped)?;
+            capacity_count(
+                &mut self.receipt_outstanding,
+                retired && monitor.completion.is_none(),
+            )?;
+            if let Some(completion) = monitor.completion {
+                self.pam.merge(completion);
+            }
+        }
+        Some(())
+    }
+}
+
+fn capacity_snapshot(state: &LoopState) -> Option<CapacityCounts> {
+    let charged = state.logins.len().checked_add(state.retired.len())?;
+    if charged > MAX_LOGINS
+        || state.monitors.len() > MAX_LOGINS
+        || state.live.len() > MAX_LOGINS.checked_mul(MAX_CHANNELS_PER_LOGIN)?
+    {
+        return None;
+    }
+    // Different incarnations of the same token are separate charges. Exact
+    // active/retired overlap or an uncharged owner is an inconsistent snapshot.
+    if state.logins.iter().any(|(&login, entry)| {
+        state.retired.contains(&MonitorOwner {
+            login,
+            incarnation: entry.incarnation,
+        })
+    }) || state
+        .monitors
+        .keys()
+        .any(|&owner| !capacity_owner_is_charged(state, owner))
+        || state
+            .live
+            .values()
+            .any(|slot| !capacity_owner_is_charged(state, slot.owner()))
+    {
+        return None;
+    }
+    let mut counts = CapacityCounts {
+        admitted: u16::try_from(state.logins.len()).ok()?,
+        provisional: u16::try_from(
+            state
+                .logins
+                .values()
+                .filter(|entry| !entry.established)
+                .count(),
+        )
+        .ok()?,
+        retiring: u16::try_from(state.retired.len()).ok()?,
+        charged: u16::try_from(charged).ok()?,
+        retiring_pending: 0,
+        unconfirmed: 0,
+        missing_monitor: 0,
+        wait_lost: 0,
+        monitor_failed: 0,
+        receipt_lost: 0,
+        retired_slots: u16::try_from(
+            state
+                .live
+                .values()
+                .filter(|slot| state.retired.contains(&slot.owner()))
+                .count(),
+        )
+        .ok()?,
+        wait_outstanding: 0,
+        receipt_outstanding: 0,
+        pam: state.pam_cleanup,
+    };
+    // These borrowed bounded walks do not poll native owners or move resources.
+    for (&login, entry) in &state.logins {
+        counts.observe(
+            state,
+            MonitorOwner {
+                login,
+                incarnation: entry.incarnation,
+            },
+            false,
+            entry.established,
+        )?;
+    }
+    for &owner in &state.retired {
+        counts.observe(state, owner, true, false)?;
+    }
+    Some(counts)
+}
+
+fn capacity_pam_step(step: super::pam_completion::PamStep) -> &'static str {
+    use super::pam_completion::PamStep;
+    match step {
+        PamStep::Skipped => "skipped",
+        PamStep::Attempted(0) => "ok",
+        PamStep::Attempted(_) => "failed",
+    }
+}
+
+impl std::fmt::Display for CapacityCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "charged={} limit={} admitted={} provisional={} retiring={} retiring_pending={} unconfirmed={} missing_monitor={} wait_lost={} monitor_failed={} receipt_lost={} retired_slots={} wait_outstanding={} receipt_outstanding={}",
+            self.charged, MAX_LOGINS, self.admitted, self.provisional, self.retiring, self.retiring_pending, self.unconfirmed, self.missing_monitor, self.wait_lost, self.monitor_failed, self.receipt_lost, self.retired_slots, self.wait_outstanding, self.receipt_outstanding)?;
+        match self.pam {
+            PamCompletion::NotOpened => f.write_str(" pam=not_opened"),
+            PamCompletion::Finished {
+                close_session,
+                delete_cred,
+                end,
+            } => {
+                // Merge may retain the first of several nonzero codes. Only a
+                // fixed outcome category is logged, independent of map order.
+                write!(
+                    f,
+                    " pam=finished pam_close={} pam_delete_cred={} pam_end={}",
+                    capacity_pam_step(close_session),
+                    capacity_pam_step(delete_cred),
+                    capacity_pam_step(end)
+                )
+            }
+        }
+    }
+}
+
+fn login_refusal_diagnostic(state: &LoopState, reason: LoginRefusal) -> String {
+    if reason != LoginRefusal::Capacity {
+        return reason.message().to_owned();
+    }
+    match capacity_snapshot(state) {
+        Some(counts) => format!("{}; helper_capacity {counts}", reason.message()),
+        None => format!("{}; helper_capacity=unavailable", reason.message()),
+    }
+}
+
 /// Ensure a login entry exists for `login`, tied to `account` -- called by
 /// `Request::Verify`'s success arm, and by nothing else: a login exists from
 /// the moment its account proves itself, before it has opened any channel
@@ -2271,8 +2477,8 @@ fn request_kind(request: &Request) -> &'static str {
 /// canonical NSS name (the FIRST account a proof verified for a login wins --
 /// a later proof for the same token naming another account is refused, and
 /// `Request::Open` refuses another uid or canonical name under it). Both
-/// refusals share `REFUSED_REASON` on the wire (the error string returned here
-/// is for the caller's OWN log line
+/// refusals share `REFUSED_REASON` on the wire (the fixed local reason returned
+/// here is for the caller's OWN log line
 /// only, never sent to the worker), so neither leaks which one fired.
 ///
 /// A new entry starts PROVISIONAL ([`LoginState::provisional`]): the helper
@@ -2287,19 +2493,21 @@ fn ensure_login(
     login: LoginId,
     account: &Account,
     rhost: String,
-) -> Result<u64, &'static str> {
+) -> Result<u64, LoginRefusal> {
     if let Some(entry) = state.logins.get(&login) {
         return if entry.account.uid == account.uid && entry.account.name == account.name {
             Ok(entry.incarnation)
         } else {
-            Err("its login is already bound to a different account")
+            Err(LoginRefusal::AccountBinding)
         };
     }
     if state.logins.len() + state.retired.len() >= MAX_LOGINS {
-        return Err("already holding MAX_LOGINS live or unresolved logins");
+        return Err(LoginRefusal::Capacity);
     }
     let fresh = state.next_incarnation;
-    let next = fresh.checked_add(1).ok_or("login identity exhausted")?;
+    let next = fresh
+        .checked_add(1)
+        .ok_or(LoginRefusal::IdentityExhausted)?;
     state.logins.insert(
         login,
         LoginState::provisional(account.clone(), rhost, fresh),
@@ -4577,7 +4785,7 @@ fn publish_verification(
                         &format!(
                             "a Verify request that otherwise checked out was \
                                  refused: {}",
-                            crate::log::one_line(reason)
+                            crate::log::one_line(&login_refusal_diagnostic(state, reason))
                         ),
                     );
                     Response::Refused {
@@ -5304,6 +5512,7 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     include!("log_tests.rs");
+    include!("capacity_diagnostic_tests.rs");
     include!("monitor_scope_tests.rs");
     include!("monitor_retirement_tests.rs");
     include!("monitor_completion_tests.rs");

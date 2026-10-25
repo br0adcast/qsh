@@ -671,6 +671,40 @@ Without a client at hand, a handshake-parsing attempt can still be tested
 from the transport side (with a key-discovery request, without
 authentication).
 
+### Helper capacity warnings
+
+In system mode, a new login refused at the helper's 256-login limit adds a
+`helper_capacity` summary to the local warning. The client still receives the
+same generic authentication refusal. The summary contains counts and fixed
+outcome categories, without account or session identifiers.
+
+`charged` is the sum of `admitted` logins and `retiring` owners whose cleanup
+still retains capacity. `provisional` is a subset of admitted logins, not an
+additional charge. A reattach to an existing login does not need a new charge.
+`retiring_pending` describes retirement without observed loss: waiting for an
+exact monitor completion, a final PAM receipt, or channel cleanup is ordinary
+pending work. Even evidence-ready retirement stays charged until the helper
+actually settles it. Age alone does not release a retained owner.
+
+`unconfirmed` counts distinct owners with an expected monitor missing, a lost
+wait, a recorded monitor failure, or a closed monitor connection without a final
+receipt. Missing receipt alone is not evidence of failure. The individual
+reason counts can overlap; do not add them to obtain an owner count.
+`retired_slots`, `wait_outstanding`, and `receipt_outstanding` count separate
+cleanup obligations and can also overlap. Healthy provisional logins without
+a monitor or channel are not classified as unconfirmed.
+
+`pam=not_opened` means no PAM transaction outcome is recorded. `pam=finished`
+reports each cleanup step as `skipped`, `ok`, or `failed`. An unsuccessful PAM
+outcome can remain visible after its owner has settled and released capacity;
+it does not by itself mean custody was lost. If the registered tables cannot
+be summarized consistently, the warning says `helper_capacity=unavailable`
+instead of presenting partial counts.
+
+This summary appears only on capacity refusal. It describes the helper's
+registered owners and retained evidence, not a continuously queryable status
+service or proof that every operating-system process has stopped.
+
 ### What a log line looks like
 
 Every line of `qshd.log` has the same header shape as the `qsh` client's
