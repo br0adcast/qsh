@@ -14,6 +14,11 @@ fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
 #[cfg(target_os = "linux")]
 fn monitor_sibling_jobs_body() {
     use super::super::protocol::CleanupKind;
+    use crate::test_support::borrowed_scope::{
+        diagnostic_assertion as checkpoint, diagnostic_cleanup_stops, diagnostic_exit_code,
+        diagnostic_mode, diagnostic_observations, diagnostic_phase as phase,
+        DiagnosticAssertion as Check, DiagnosticMode as Mode, DiagnosticPhase as Phase,
+    };
     use nix::libc;
     use std::io::Read;
     use std::os::fd::{AsFd, AsRawFd, FromRawFd};
@@ -21,6 +26,7 @@ fn monitor_sibling_jobs_body() {
     struct Pin(OwnedFd);
     impl Pin {
         fn new(pid: i32) -> Self {
+            checkpoint(Check::Pin, Duration::ZERO);
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
             assert!(fd >= 0, "pin the held fixture process");
             Self(unsafe { OwnedFd::from_raw_fd(fd as i32) })
@@ -108,6 +114,11 @@ fn monitor_sibling_jobs_body() {
         }
         fn finish(&mut self) -> bool {
             if let Some(jobs) = &self.jobs {
+                // Observe fixture intervention before it can conceal an earlier
+                // product failure. Cleanup never overwrites the failing checkpoint.
+                diagnostic_cleanup_stops(
+                    usize::from(!jobs.leader.exited()) | (usize::from(!jobs.member.exited()) << 1),
+                );
                 jobs.leader.stop();
                 jobs.member.stop();
             }
@@ -127,6 +138,7 @@ fn monitor_sibling_jobs_body() {
                 drop(dir);
             }
             if let Some(jobs) = self.jobs.take() {
+                diagnostic_cleanup_stops(usize::from(!jobs.monitor.exited()) << 2);
                 jobs.monitor.stop();
                 // The helper thread is already joined: no competing product
                 // waiter can lose numeric-PID authority to fixture cleanup.
@@ -151,6 +163,13 @@ fn monitor_sibling_jobs_body() {
     drop(self_pin);
 
     for mode in ["close", "leader-first", "login-ended"] {
+        diagnostic_mode(match mode {
+            "close" => Mode::Close,
+            "leader-first" => Mode::LeaderFirst,
+            _ => Mode::LoginEnded,
+        });
+        phase(Phase::Setup);
+        let setup_started = Instant::now();
         let dir = tempfile::tempdir().unwrap();
         let ids = dir.path().join("ids");
         let ack = dir.path().join("ack");
@@ -176,6 +195,7 @@ fn monitor_sibling_jobs_body() {
         // sleeps: this fixture creates exactly one known sibling-PGID job.
         let script = format!("set -m; trap '' HUP; /bin/sleep inf & member=$!; printf '%s %s %s\\n' \"$$\" \"$member\" \"$PPID\" > '{}'; IFS= read -r nonce; printf '%s %s %s %s\\n' \"$nonce\" \"$$\" \"$member\" \"$PPID\" > '{}'; {ending}", ids.display(), ack.display());
         let command = format!("exec /bin/bash -c '{}'", script.replace('\'', "'\\''"));
+        checkpoint(Check::Opened, setup_started.elapsed());
         let (opened, master) = open_command_with_fd(
             &case.helper().channels,
             391,
@@ -184,7 +204,10 @@ fn monitor_sibling_jobs_body() {
             &command,
         );
         case.master = master;
+        checkpoint(Check::Opened, setup_started.elapsed());
         assert!(matches!(opened, Response::Opened { id: 391 }));
+        phase(Phase::Identity);
+        let identity_started = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(2);
         let numbers = loop {
             if let Ok(text) = std::fs::read_to_string(&ids) {
@@ -196,6 +219,7 @@ fn monitor_sibling_jobs_body() {
                     break pids;
                 }
             }
+            checkpoint(Check::Barrier, identity_started.elapsed());
             assert!(
                 Instant::now() < deadline,
                 "owned helper jobs did not reach their barrier"
@@ -209,23 +233,31 @@ fn monitor_sibling_jobs_body() {
             member: Pin::new(numbers[1]),
             monitor: Pin::new(numbers[2]),
         };
+        checkpoint(Check::Alive, identity_started.elapsed());
         assert!(!jobs.leader.exited() && !jobs.member.exited() && !jobs.monitor.exited());
+        phase(Phase::MemberExec);
+        let exec_started = Instant::now();
         while std::fs::read_link(format!("/proc/{}/exe", numbers[1]))
             .ok()
             .and_then(|p| p.file_name().map(|s| s == "sleep"))
             != Some(true)
         {
+            checkpoint(Check::MemberExec, exec_started.elapsed());
             assert!(
                 Instant::now() < deadline,
                 "fixture member did not exec sleep"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        phase(Phase::Membership);
+        checkpoint(Check::Session, identity_started.elapsed());
         assert_eq!(unsafe { libc::getsid(numbers[0]) }, numbers[0]);
         assert_eq!(unsafe { libc::getsid(numbers[1]) }, numbers[0]);
+        checkpoint(Check::ProcessGroup, identity_started.elapsed());
         assert_ne!(unsafe { libc::getpgid(numbers[1]) }, unsafe {
             libc::getpgid(numbers[0])
         });
+        checkpoint(Check::Parent, identity_started.elapsed());
         let mut status = String::new();
         std::fs::File::open(format!("/proc/{}/status", numbers[0]))
             .unwrap()
@@ -243,13 +275,16 @@ fn monitor_sibling_jobs_body() {
             parent, numbers[2],
             "captured monitor is the live actor's kernel parent"
         );
+        checkpoint(Check::Alive, identity_started.elapsed());
         assert!(!jobs.leader.exited() && !jobs.member.exited() && !jobs.monitor.exited());
+        phase(Phase::PtyAck);
         let started = Instant::now();
         let nonce = format!(
             "owned-{}",
             dir.path().file_name().unwrap().to_string_lossy()
         );
         let input = format!("{nonce}\n");
+        checkpoint(Check::Write, started.elapsed());
         assert_eq!(
             nix::unistd::write(case.master.as_ref().unwrap(), input.as_bytes()).unwrap(),
             input.len()
@@ -257,6 +292,7 @@ fn monitor_sibling_jobs_body() {
         let expected = format!("{nonce} {} {} {}\n", numbers[0], numbers[1], numbers[2]);
         let ack_deadline = Instant::now() + Duration::from_secs(2);
         while std::fs::read_to_string(&ack).ok().as_deref() != Some(expected.as_str()) {
+            checkpoint(Check::Ack, started.elapsed());
             assert!(
                 Instant::now() < ack_deadline,
                 "owned PTY actor did not authenticate captured identities"
@@ -267,6 +303,8 @@ fn monitor_sibling_jobs_body() {
         // actor answered AFTER capture. Together with captured SID membership
         // this excludes stale PID reuse before assigning any stop authority.
         case.jobs = Some(jobs);
+        phase(Phase::Receipt);
+        checkpoint(Check::Receive, started.elapsed());
         case.helper().channels.set_nonblocking(true).unwrap();
         if mode == "close" {
             channel::send(
@@ -284,6 +322,7 @@ fn monitor_sibling_jobs_body() {
         let mut early_close = false;
         let mut receipt_with_live_member = false;
         while Instant::now() < deadline && !receipt {
+            checkpoint(Check::Receive, started.elapsed());
             let jobs = case.jobs.as_ref().unwrap();
             early_close |= closed.exists() && !jobs.member.exited();
             match channel::recv(&case.helper().channels) {
@@ -311,31 +350,50 @@ fn monitor_sibling_jobs_body() {
             }
         }
         let member_product_exited = case.jobs.as_ref().unwrap().member.exited();
+        let observation_bits = usize::from(receipt)
+            | (usize::from(exited.is_some()) << 1)
+            | (usize::from(member_product_exited) << 2)
+            | (usize::from(receipt_with_live_member) << 3)
+            | (usize::from(early_close) << 4);
+        diagnostic_observations(observation_bits);
+        diagnostic_exit_code(exited);
         // Do not keep the helper alive for PAM closure: LoginEnded followed by
         // immediate helper stop is the original retiring-monitor regression.
         let elapsed = started.elapsed();
+        phase(Phase::Cleanup);
         let joined = case.finish(); // exact-instance cleanup and real join precede assertions
-        eprintln!("owned helper acceptance {mode}: receipt={receipt}, member_exited={member_product_exited}, closed={}, joined={joined}", closed.exists());
+        diagnostic_observations(
+            observation_bits | (usize::from(closed.exists()) << 5) | (usize::from(joined) << 6),
+        );
+        phase(Phase::Assertions);
+        checkpoint(Check::Join, elapsed);
         assert!(joined, "the owned helper thread must actually join");
+        checkpoint(Check::Receipt, elapsed);
         assert!(
             receipt && exited.is_some(),
             "missing scope receipt/exit in mode {mode}"
         );
+        checkpoint(Check::MemberExit, elapsed);
         assert!(
             !receipt_with_live_member && member_product_exited,
             "scope receipt outlived its sibling-PGID member in mode {mode}"
         );
+        checkpoint(Check::EarlyPam, elapsed);
         assert!(
             !early_close,
             "PAM closed while the owned member was alive in mode {mode}"
         );
+        checkpoint(Check::PamClosed, elapsed);
         assert!(
             closed.exists(),
             "PAM close must run after ordinary helper teardown ({mode})"
         );
+        checkpoint(Check::Elapsed, elapsed);
         assert!(elapsed < Duration::from_secs(5));
         if mode == "leader-first" {
+            checkpoint(Check::LeaderStatus, elapsed);
             assert_eq!(exited, Some(0));
         }
+        phase(Phase::Complete);
     }
 }
