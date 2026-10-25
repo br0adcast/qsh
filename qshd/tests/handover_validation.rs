@@ -9,6 +9,14 @@ use std::process::Command;
 
 use qshd::handover::{self, Handover, HANDOVER_FD_ENV};
 
+fn private_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 const CASE: &str = "QSHD_HANDOVER_VALIDATION_CASE";
 
 #[test]
@@ -58,7 +66,7 @@ fn malformed_handover_is_refused_before_ownership_or_mutation() {
         "success-nonstandard-name",
     ] {
         count += 1;
-        let home = tempfile::tempdir().unwrap();
+        let home = private_dir();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -132,7 +140,7 @@ fn child(case: &str) {
         );
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_dir();
     let binary = dir.path().join(if case == "success-nonstandard-name" {
         ".qshd-update-custom-name"
     } else {
@@ -318,7 +326,7 @@ fn child(case: &str) {
 #[test]
 fn invalid_socket_or_allowlist_cannot_rename_or_unlink_during_resume() {
     for bad_socket in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let binary = dir.path().join("custom-daemon-name");
         fs::write(&binary, b"destination sentinel").unwrap();
         // This deliberately unrelated stage must never be renamed. The old

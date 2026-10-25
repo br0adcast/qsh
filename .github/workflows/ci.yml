@@ -272,6 +272,35 @@ jobs:
             echo '::error::native control peer-account tests reported a runtime skip' >&2
             exit 1
           fi
+          cargo test -p qshd --lib --locked control::path_tests:: -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/path-results.log"
+          for test in \
+            control::path_tests::directory_untrusted_parent_refuses_lock_without_mutation \
+            control::path_tests::directory_trust_failure_is_not_no_daemon \
+            control::path_tests::directory_safe_modes_and_aliases_are_not_repaired \
+            control::path_tests::directory_trusted_missing_endpoint_does_not_create_parents \
+            control::path_tests::directory_transaction_refuses_replacement_for_every_request_and_reuse \
+            control::path_tests::directory_existing_stage_alias_never_unlinks_outside_sentinel \
+            control::path_tests::directory_unrelated_final_entries_are_not_replaced \
+            control::path_tests::directory_existing_same_pid_stage_is_not_cleaned_speculatively \
+            control::path_tests::directory_search_only_ancestor_is_supported_without_chmod \
+            control::path_tests::directory_cleanup_uses_owned_parent_not_replacement_route \
+            control::path_tests::directory_stage_boundaries_refuse_replacement_without_outside_mutation \
+            control::path_tests::directory_publication_failure_cleans_stage_and_preserves_unrelated_entry \
+            control::path_tests::directory_changed_staged_socket_permissions_are_not_published \
+            control::path_tests::directory_lock_wait_never_adopts_a_replacement_parent \
+            control::path_tests::directory_observed_stage_alias_before_chmod_cannot_touch_sentinel \
+            control::path_tests::directory_sweep_refuses_a_replaced_candidate_name \
+            control::path_tests::directory_connect_infrastructure_error_is_not_no_daemon \
+            control::path_tests::directory_post_publication_failure_cleans_only_its_owned_socket \
+            control::path_tests::directory_relative_socket_spelling_survives_a_long_owned_cwd; do
+            grep -F "test $test ... ok" "$runtime/path-results.log"
+          done
+          grep -F 'test result: ok. 19 passed; 0 failed; 0 ignored;' "$runtime/path-results.log"
+          if grep -Fq 'SKIPPED' "$runtime/path-results.log"; then
+            echo '::error::native control path tests reported a runtime skip' >&2
+            exit 1
+          fi
       - name: Portable bringup SSH identity tests
         run: cargo test -p bringup --test ssh_identity --locked
       - name: Portable inline SSH bootstrap tests

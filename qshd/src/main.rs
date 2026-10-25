@@ -187,12 +187,12 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// daemon removes it before exiting), and the port should become bindable
 /// again (checked via a trial bind-and-release, since the real bind for
 /// production use will have to happen later anyway).
-fn wait_for_daemon_release(sock_path: &Path, port: u16) -> Result<()> {
+fn wait_for_daemon_release(transaction: &control::EnsureLock, port: u16) -> Result<()> {
     let deadline = std::time::Instant::now() + RELEASE_TIMEOUT;
     let mut delay = Duration::from_millis(50);
 
     loop {
-        let sock_gone = !sock_path.exists();
+        let sock_gone = !transaction.endpoint_exists()?;
         let port_free = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok();
         if sock_gone && port_free {
             return Ok(());
@@ -672,7 +672,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
 
     // Try the control socket BEFORE binding our own sockets -- like
     // `run_ensure`: is a daemon already alive.
-    match ask_status(&sock_path)? {
+    match ask_status(&transaction, &sock_path)? {
         control::ControlReply::Answered(line) => {
             let status = control::StatusResponse::from_line(&line)
                 .context("parsing the transport control socket's STATUS response")?;
@@ -694,11 +694,9 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                     // key to its IN-MEMORY allowlist, then print
                     // `TRANSPORT-READY` and exit -- no fork.
                     if let Some(pubkey) = parsed.client_pubkey {
-                        control::client_request(
-                            &sock_path,
-                            &control::ControlRequest::AddClient(pubkey),
-                        )?;
+                        transaction.request(&control::ControlRequest::AddClient(pubkey))?;
                     }
+                    transaction.validate_route()?;
                     write_transport_ready(
                         &mut std::io::stdout(),
                         &keypair.public,
@@ -711,8 +709,8 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                     // The daemon is stale (`Replace`): ask it to stop,
                     // wait for the socket/port to be released, and become
                     // the daemon ourselves.
-                    control::client_request(&sock_path, &control::ControlRequest::Stop)?;
-                    wait_for_daemon_release(&sock_path, parsed.port)?;
+                    transaction.request(&control::ControlRequest::Stop)?;
+                    wait_for_daemon_release(&transaction, parsed.port)?;
                     // Falls through to the "become the daemon" branch below.
                 }
             }
@@ -767,9 +765,12 @@ const REPLACEMENT_RETRY: Duration = Duration::from_millis(500);
 /// the new binary. Reading that as "no daemon" would send this process off
 /// to bind a port the daemon still holds. A genuinely stale socket file
 /// costs half a second here.
-fn ask_status(sock_path: &Path) -> Result<control::ControlReply> {
+fn ask_status(
+    transaction: &control::EnsureLock,
+    sock_path: &Path,
+) -> Result<control::ControlReply> {
     ask_status_with(sock_path, REPLACEMENT_RETRY, || {
-        control::client_request(sock_path, &control::ControlRequest::Status)
+        transaction.request(&control::ControlRequest::Status)
     })
 }
 
@@ -838,7 +839,8 @@ fn become_transport_daemon(
     // from its first instant (spec §4.16, QSH-14). By this point there is
     // definitely no live daemon (see `run_transport_ensure`), so a file at
     // the name is a stale one, and `bind_private` replaces it.
-    let (listener, mut cleanup) = control::bind_private_owned(sock_path)
+    let (listener, mut cleanup) = transaction
+        .bind_private_owned()
         .with_context(|| format!("binding the control socket {}", sock_path.display()))?;
     let bound_port = socket
         .local_addr()
@@ -850,6 +852,7 @@ fn become_transport_daemon(
     // `print_ready` in `become_daemon`).
     // Only the port actually bound is reported: `--default-port` is parsed
     // but not bound here.
+    transaction.validate_route()?;
     write_transport_ready(
         &mut std::io::stdout(),
         &keypair.public,

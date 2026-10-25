@@ -1163,13 +1163,19 @@ fn descriptor_exhaustion_before_fork_does_not_publish_a_control_socket() {
         "allocation failure left publication: {}",
         failed.2
     );
-    assert!(
-        std::fs::read_dir(home.path().join("qsh"))
-            .unwrap()
-            .flatten()
-            .all(|entry| !entry.file_name().as_encoded_bytes().starts_with(b".c")),
-        "failed staging is removed"
-    );
+    // Descriptor allocation can fail before the storage parent is created.
+    let no_staging = match std::fs::read_dir(home.path().join("qsh")) {
+        Ok(mut entries) => entries.all(|entry| {
+            !entry
+                .expect("inspect the staging directory entry")
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b".c")
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => panic!("inspect the staging directory: {error}"),
+    };
+    assert!(no_staging, "failed staging is removed");
     assert!(Descendants::children().is_empty());
     assert_ne!(ready(Ensure::start(home.path(), 0).finish()), 0);
     status(&socket(home.path()));

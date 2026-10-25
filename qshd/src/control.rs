@@ -22,6 +22,8 @@
 //! conflated again, regardless of how fast or slow `STATUS` itself gets in
 //! the future.
 
+mod path;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -280,18 +282,52 @@ fn client_request_with_peer_check(
     timeout: Duration,
     check: impl FnOnce(&UnixStream) -> Result<()>,
 ) -> Result<ControlReply> {
-    let mut stream = match UnixStream::connect(sock_path) {
+    let authority = match path::EndpointAuthority::open(sock_path, false) {
+        Ok(authority) => authority,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ControlReply::NoDaemon)
+        }
+        Err(error) => return Err(error).context("validating the control endpoint parent"),
+    };
+    client_request_at(&authority, req, timeout, check)
+}
+
+fn client_request_at(
+    authority: &path::EndpointAuthority,
+    req: &ControlRequest,
+    timeout: Duration,
+    check: impl FnOnce(&UnixStream) -> Result<()>,
+) -> Result<ControlReply> {
+    authority.validate_route()?;
+    if authority.entry()?.is_none() {
+        authority.validate_route()?;
+        return Ok(ControlReply::NoDaemon);
+    }
+    let mut stream = match UnixStream::connect(&authority.syscall_path) {
         Ok(stream) => stream,
-        Err(_) => return Ok(ControlReply::NoDaemon),
+        Err(error) => {
+            authority.validate_route()?;
+            return match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    Ok(ControlReply::NoDaemon)
+                }
+                _ => Err(error).context("connecting to the trusted control endpoint"),
+            };
+        }
     };
 
+    authority.validate_route()?;
     check(&stream)?;
+    // A relative-path peer check may observe a process-wide cwd/route change.
+    // Refuse it before any request bytes, not only after the response.
+    authority.validate_route()?;
 
     stream
         .set_read_timeout(Some(timeout))
         .context("setting the control socket's read timeout")?;
 
     if stream.write_all(format_request(req).as_bytes()).is_err() {
+        authority.validate_route()?;
         return Ok(ControlReply::NoDaemon);
     }
     // Half-close the write side -- signals the server that the request is
@@ -301,14 +337,16 @@ fn client_request_with_peer_check(
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    match reader.read_line(&mut line) {
+    let reply = match reader.read_line(&mut line) {
         Ok(0) => Ok(ControlReply::NoDaemon), // closed with no response -- no one home
         Ok(_) => Ok(ControlReply::Answered(
             line.trim_end_matches('\n').to_string(),
         )),
         Err(e) if is_timeout(&e) => Ok(ControlReply::TimedOut),
         Err(_) => Ok(ControlReply::NoDaemon), // other read errors (e.g. reset) -- as before
-    }
+    };
+    authority.validate_route()?;
+    reply
 }
 
 /// Was this read error a timeout expiring (as set by `set_read_timeout`),
@@ -444,6 +482,7 @@ fn daemon_gone(pid: u32, sock: &Path) -> bool {
 /// Drop only closes this descriptor, never LOCK_UN: a fork inherits the same
 /// open-file description, so the lock ends only after its last copy closes.
 pub struct EnsureLock {
+    authority: path::EndpointAuthority,
     _file: std::fs::File,
 }
 
@@ -452,27 +491,21 @@ impl EnsureLock {
     /// `patience`. This does not bound filesystem operations or the transaction
     /// performed after acquisition. A timeout never removes or unlocks the file.
     pub fn acquire(socket: &Path, patience: Duration) -> std::io::Result<Self> {
+        Self::acquire_prepared(socket, patience, || {})
+    }
+
+    fn acquire_prepared(
+        socket: &Path,
+        patience: Duration,
+        opened: impl FnOnce(),
+    ) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-        let parent = socket
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-        let mut name = socket.as_os_str().to_os_string();
-        name.push(".lock");
-        let path = std::path::PathBuf::from(name);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
-            .open(&path)?;
+        use std::os::unix::fs::MetadataExt;
+        let authority = path::EndpointAuthority::open(socket, true)?;
+        authority.entry()?;
+        let file = authority.open_lock()?;
         let metadata = file.metadata()?;
+        let identity = nix::sys::stat::fstat(file.as_raw_fd())?;
         if !metadata.is_file()
             || metadata.uid() != nix::unistd::geteuid().as_raw()
             || metadata.nlink() != 1
@@ -483,6 +516,7 @@ impl EnsureLock {
                 "the ensure lock must be a private, singly linked regular file owned by this user",
             ));
         }
+        opened();
         let deadline = std::time::Instant::now()
             .checked_add(patience)
             .ok_or_else(|| {
@@ -519,14 +553,42 @@ impl EnsureLock {
                 _ => return Err(error),
             }
         }
-        let current = std::fs::symlink_metadata(&path)?;
-        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "the ensure lock changed while waiting",
-            ));
+        authority.validate_route()?;
+        let current = nix::sys::stat::fstatat(
+            Some(authority.parent.as_raw_fd()),
+            authority.lock.as_os_str(),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        if !path::same(&current, &identity) {
+            return Err(path::refused("the ensure lock changed while waiting"));
         }
-        Ok(Self { _file: file })
+        Ok(Self {
+            authority,
+            _file: file,
+        })
+    }
+
+    /// Reject an observed route change; never move an active transaction.
+    pub fn validate_route(&self) -> std::io::Result<()> {
+        self.authority.validate_route()
+    }
+
+    pub fn request(&self, request: &ControlRequest) -> Result<ControlReply> {
+        client_request_at(
+            &self.authority,
+            request,
+            CLIENT_READ_TIMEOUT,
+            check_control_peer,
+        )
+    }
+
+    pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
+        bind_with_authority(&self.authority)
+    }
+
+    pub fn endpoint_exists(&self) -> std::io::Result<bool> {
+        self.validate_route()?;
+        Ok(self.authority.entry()?.is_some())
     }
 }
 
@@ -536,9 +598,10 @@ impl EnsureLock {
 /// The duplicate is close-on-exec; only the original listener crosses update
 /// handover, whose resumed owner creates its own guard before serving.
 pub struct SocketCleanup {
-    path: std::path::PathBuf,
-    device: u64,
-    inode: u64,
+    parent: std::fs::File,
+    leaf: std::ffi::OsString,
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
     remove_on_drop: bool,
     _listener: UnixListener,
 }
@@ -555,18 +618,33 @@ impl SocketCleanup {
     /// A live inherited listener prevents another ensure from replacing it;
     /// arbitrary external same-UID pathname mutation is outside this contract.
     pub fn capture(listener: &UnixListener, path: &Path) -> std::io::Result<Self> {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_socket() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "the published control path is not a socket",
+        let authority = path::EndpointAuthority::open(path, false)?;
+        authority.validate_route()?;
+        let metadata = authority.entry()?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the control publication is missing",
+            )
+        })?;
+        if metadata.st_mode & 0o7777 != 0o600 {
+            return Err(path::refused(
+                "the inherited control publication must be private",
             ));
         }
+        Self::from_authority(listener, &authority, &metadata)
+    }
+
+    fn from_authority(
+        listener: &UnixListener,
+        authority: &path::EndpointAuthority,
+        metadata: &nix::libc::stat,
+    ) -> std::io::Result<Self> {
+        let parent = authority.parent.try_clone()?;
         Ok(Self {
-            path: path.to_owned(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            parent,
+            leaf: authority.leaf.clone(),
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
             remove_on_drop: true,
             _listener: listener.try_clone()?,
         })
@@ -578,13 +656,23 @@ impl Drop for SocketCleanup {
         if !self.remove_on_drop {
             return;
         }
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if let Ok(current) = std::fs::symlink_metadata(&self.path) {
-            if current.file_type().is_socket()
-                && current.dev() == self.device
-                && current.ino() == self.inode
+        use nix::fcntl::AtFlags;
+        use nix::sys::stat::{fstatat, SFlag};
+        use std::os::fd::AsRawFd;
+        if let Ok(current) = fstatat(
+            Some(self.parent.as_raw_fd()),
+            self.leaf.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            if current.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFSOCK.bits()
+                && current.st_dev == self.device
+                && current.st_ino == self.inode
             {
-                let _ = std::fs::remove_file(&self.path);
+                let _ = nix::unistd::unlinkat(
+                    Some(self.parent.as_raw_fd()),
+                    self.leaf.as_os_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
             }
         }
     }
@@ -596,14 +684,9 @@ impl Drop for SocketCleanup {
 /// bind at a length a plain bind at the final name would have accepted.
 const STAGED_NAME: &str = "s";
 
-/// Bind a Unix socket at `dir.join(name)`, tightened to `0600` before
-/// returning. Never creates `dir` itself -- it only ever binds inside a
-/// directory the caller already made -- so this step can never be the one
-/// that binds a socket before a directory's mode is tightened (task 6
-/// review, Minor 2): the absence of that window is by construction, not a
-/// race this function has to win. [`bind_private`] is the only caller, and
-/// it always makes `dir` `0700` (one `mkdir(2)`, no separate `chmod`)
-/// before calling this.
+/// Low-level pathname-bind fixture for the original permission/length tests.
+/// Production binds through the verified exclusive stage in `path::Stage`.
+#[cfg(test)]
 fn bind_in(dir: &Path, name: &str) -> std::io::Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     let staged = dir.join(name);
@@ -618,8 +701,8 @@ fn bind_in(dir: &Path, name: &str) -> std::io::Result<UnixListener> {
 }
 
 /// Bind the control socket at `path` so that nobody but its owner can reach
-/// it, not even for an instant (spec §4.16, QSH-14): bound (via
-/// [`bind_in`]) inside a fresh `0700` directory next to `path` -- where the
+/// it, not even for an instant (spec §4.16, QSH-14): bound inside a verified
+/// fresh `0700` directory next to `path`, where the
 /// umask's permissions on the file let nobody in -- tightened to `0600`,
 /// then renamed into place, which also replaces a stale file of a daemon
 /// that died. Not a process-wide umask: that would race every other thread
@@ -628,59 +711,47 @@ fn bind_in(dir: &Path, name: &str) -> std::io::Result<UnixListener> {
 /// The staging name (`.c<pid>/s`) is kept short on purpose (task 6 review,
 /// Minor 1): the earlier scheme (`.control-<pid>.bind/control.sock`) added
 /// about 22 bytes over the final name, long enough that a `path` a plain
-/// `bind` would still accept could refuse here with `ENAMETOOLONG` --
-/// [`bind_in`]'s error names the staging path it actually failed on, since
+/// `bind` would still accept could refuse here with `ENAMETOOLONG`.
+/// The binding error names the staging path it actually failed on, since
 /// that is the one that may be too long even though `path` itself is not.
 pub fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
-    bind_private_prepared(path, |listener, _| Ok(listener))
+    let (listener, mut cleanup) = bind_private_owned(path)?;
+    // This convenience API deliberately leaves the endpoint to its caller.
+    cleanup.leave_to_child();
+    Ok(listener)
 }
 
-/// Bind with cleanup ownership already allocated before publishing the path.
-/// The caller serializes replacement of this control path with EnsureLock.
-/// A failed descriptor clone leaves only private staging, never a published
-/// endpoint that no owner can remove.
+/// Standalone binding convenience; production ensure uses its retained lock.
 pub fn bind_private_owned(path: &Path) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    bind_private_prepared(path, |listener, staged| {
-        let mut cleanup = SocketCleanup::capture(&listener, staged)?;
-        cleanup.path = path.to_owned();
-        Ok((listener, cleanup))
-    })
+    bind_with_authority(&path::EndpointAuthority::open(path, false)?)
 }
 
-fn bind_private_prepared<T>(
-    path: &Path,
-    prepare: impl FnOnce(UnixListener, &Path) -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    use std::os::unix::fs::DirBuilderExt;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    sweep_stale_staging(parent, std::time::SystemTime::now());
-    let staging = parent.join(format!(".c{}", std::process::id()));
-    let staged = staging.join(STAGED_NAME);
-    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&staging) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // A leftover of an earlier run with this pid: only what it held.
-        let _ = std::fs::remove_file(&staged);
-        let _ = std::fs::remove_dir(&staging);
-        std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
-    }
-    let bound = bind_in(&staging, STAGED_NAME).and_then(|listener| {
-        let prepared = prepare(listener, &staged)?;
-        std::fs::rename(&staged, path)?;
-        Ok(prepared)
-    });
-    let _ = std::fs::remove_file(&staged);
-    let _ = std::fs::remove_dir(&staging);
-    bound
+fn bind_with_authority(
+    authority: &path::EndpointAuthority,
+) -> std::io::Result<(UnixListener, SocketCleanup)> {
+    bind_prepared(authority, |_| {})
 }
 
-/// How long a staging directory must have gone unchanged before
-/// [`sweep_stale_staging`] takes it for a crash's leftover. `bind_private`
-/// keeps its own for the few system calls between `mkdir` and `rmdir`; a
-/// minute is far past that even on a machine that stalls, so a sweep never
-/// removes the directory of a bind still in progress -- not even one whose
-/// pid it cannot see (another pid namespace sharing the directory).
+fn bind_prepared(
+    authority: &path::EndpointAuthority,
+    configure: impl FnOnce(&mut path::Stage),
+) -> std::io::Result<(UnixListener, SocketCleanup)> {
+    authority.validate_route()?;
+    authority.entry()?;
+    sweep_stale_staging_at(&authority.parent, std::time::SystemTime::now());
+    let mut stage = path::Stage::create(authority)?;
+    configure(&mut stage);
+    let listener = stage.bind(authority)?;
+    // Allocate every cleanup descriptor before publication. On a later error,
+    // this guard owns only this socket in this pinned parent, never a new route.
+    let cleanup = SocketCleanup::from_authority(&listener, authority, stage.socket())?;
+    stage.publish(authority)?;
+    Ok((listener, cleanup))
+}
+
+/// Minimum staging age for conservative crash recovery. Age is a heuristic;
+/// the separate PID check also preserves every process visible to this caller.
+/// Neither check proves that an inaccessible PID namespace has no live owner.
 const STALE_STAGING_AFTER: Duration = Duration::from_secs(60);
 
 /// The pid in a staging directory's name, if the name is exactly what
@@ -724,32 +795,36 @@ fn process_exists(pid: i32) -> bool {
 /// directory by name with `AT_REMOVEDIR`, which removes only an empty
 /// directory and never follows a symlink. Anything else in `parent` is
 /// never touched. Returns how many directories were removed.
+#[cfg(test)]
 fn sweep_stale_staging(parent: &Path, now: std::time::SystemTime) -> usize {
+    let Ok(authority) = path::EndpointAuthority::open(&parent.join("control.sock"), false) else {
+        return 0;
+    };
+    sweep_stale_staging_at(&authority.parent, now)
+}
+
+fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) -> usize {
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::Mode;
     use std::os::fd::AsRawFd;
-
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return 0;
-    };
-    let Ok(parent_dir) = Dir::open(
-        parent,
+    let Ok(mut entries) = Dir::openat(
+        Some(parent.as_raw_fd()),
+        ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
     ) else {
         return 0;
     };
     let mut removed = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    for entry in entries.iter().flatten() {
+        let Ok(name) = entry.file_name().to_str() else {
             continue;
         };
         let Some(pid) = staging_pid(name) else {
             continue;
         };
-        if remove_if_stale(parent_dir.as_raw_fd(), name, pid, now) {
+        if remove_if_stale(parent.as_raw_fd(), name, pid, now) {
             removed += 1;
         }
     }
@@ -762,6 +837,16 @@ fn remove_if_stale(
     name: &str,
     pid: i32,
     now: std::time::SystemTime,
+) -> bool {
+    remove_if_stale_prepared(parent, name, pid, now, || {})
+}
+
+fn remove_if_stale_prepared(
+    parent: std::os::fd::RawFd,
+    name: &str,
+    pid: i32,
+    now: std::time::SystemTime,
+    before_remove: impl FnOnce(),
 ) -> bool {
     use nix::dir::Dir;
     use nix::fcntl::{AtFlags, OFlag};
@@ -823,7 +908,22 @@ fn remove_if_stale(
     if socket && unlinkat(Some(fd), STAGED_NAME, UnlinkatFlags::NoRemoveDir).is_err() {
         return false;
     }
+    before_remove();
+    let Ok(current) = fstatat(Some(parent), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return false;
+    };
+    if !path::same(&current, &st) {
+        return false;
+    }
     unlinkat(Some(parent), name, UnlinkatFlags::RemoveDir).is_ok()
+}
+
+#[cfg(test)]
+pub(crate) fn private_test_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
 }
 
 #[cfg(test)]
@@ -835,7 +935,7 @@ mod tests {
     #[test]
     fn ensure_lock_rejects_unsafe_files_without_modifying_them() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let socket = dir.path().join("control.sock");
         let lock = dir.path().join("control.sock.lock");
         let target = dir.path().join("untouched");
@@ -865,7 +965,7 @@ mod tests {
     #[test]
     fn ensure_lock_lasts_until_the_last_inherited_descriptor_closes() {
         use std::os::fd::AsRawFd;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let socket = dir.path().join("control.sock");
         let held = EnsureLock::acquire(&socket, Duration::from_secs(1)).unwrap();
         let inherited = held._file.try_clone().unwrap();
@@ -900,7 +1000,7 @@ mod tests {
 
     #[test]
     fn daemonization_parent_leaves_publication_to_the_child_owner() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let path = dir.path().join("control.sock");
         let listener = bind_private(&path).unwrap();
         let mut parent = SocketCleanup::capture(&listener, &path).unwrap();
@@ -917,7 +1017,7 @@ mod tests {
     #[test]
     fn socket_cleanup_keeps_listener_alive_until_its_own_path_is_removed() {
         use std::os::fd::AsRawFd;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let path = dir.path().join("control.sock");
         let listener = bind_private(&path).unwrap();
         let cleanup = SocketCleanup::capture(&listener, &path).unwrap();
@@ -1045,7 +1145,7 @@ mod tests {
     /// daemon, full stop.
     #[test]
     fn no_socket_file_is_no_daemon() {
-        let dir = tempfile::tempdir().expect("temp dir for a nonexistent socket path");
+        let dir = super::private_test_dir().expect("temp dir for a nonexistent socket path");
         let sock_path = dir.path().join("nope.sock");
         assert_eq!(
             client_request_with_timeout(&sock_path, &ControlRequest::Status, TEST_TIMEOUT)
@@ -1060,7 +1160,7 @@ mod tests {
     /// caller is concerned.
     #[test]
     fn refused_connection_is_no_daemon() {
-        let dir = tempfile::tempdir().expect("temp dir for a stale socket file");
+        let dir = super::private_test_dir().expect("temp dir for a stale socket file");
         let sock_path = dir.path().join("stale.sock");
         {
             // Bind and immediately drop the listener WITHOUT removing the
@@ -1080,7 +1180,7 @@ mod tests {
     /// a peer closing without a word counts the same as nothing listening).
     #[test]
     fn peer_closes_without_a_word_is_no_daemon() {
-        let dir = tempfile::tempdir().expect("temp dir for the accept-then-close listener");
+        let dir = super::private_test_dir().expect("temp dir for the accept-then-close listener");
         let sock_path = dir.path().join("closes.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the accept-then-close listener");
         let server = std::thread::spawn(move || {
@@ -1118,7 +1218,7 @@ mod tests {
                 .expect("write the canned response");
         }
 
-        let dir = tempfile::tempdir().expect("temp dir for the answering listener");
+        let dir = super::private_test_dir().expect("temp dir for the answering listener");
         let sock_path = dir.path().join("answers.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the answering listener");
         let server = std::thread::spawn(move || {
@@ -1154,7 +1254,7 @@ mod tests {
     /// `NoDaemon`.
     #[test]
     fn peer_accepts_and_stays_silent_is_timed_out() {
-        let dir = tempfile::tempdir().expect("temp dir for the silent listener");
+        let dir = super::private_test_dir().expect("temp dir for the silent listener");
         let sock_path = dir.path().join("silent.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind the silent listener");
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -1180,7 +1280,7 @@ mod tests {
     #[test]
     fn the_control_socket_is_owner_only_from_the_start() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let path = dir.path().join("control.sock");
         let _listener = bind_private(&path).expect("bound");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -1196,7 +1296,7 @@ mod tests {
     /// A stale socket file of a daemon that died is replaced.
     #[test]
     fn a_stale_socket_file_is_replaced() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let path = dir.path().join("control.sock");
         drop(UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "the dead daemon's file stays");
@@ -1215,12 +1315,13 @@ mod tests {
     #[test]
     fn a_path_near_the_kernel_limit_that_bound_before_still_binds() {
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::DirBuilderExt;
         // The staging path never includes the FINAL name (it is always
         // `<parent>/.c<pid>/s`), so what matters here is the PARENT
         // directory's own length -- a real long path comes from a deep or
         // long-named cache directory, with the final component always the
         // fixed name `control.sock`.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let base_len = dir.path().as_os_str().as_bytes().len();
         // Aim for a parent path of about 80 bytes: the final path
         // (parent + "/control.sock") sits at about 93, comfortably under a
@@ -1230,7 +1331,10 @@ mod tests {
         let target_parent_len = 80usize;
         let pad = target_parent_len.saturating_sub(base_len + 1).max(1);
         let parent = dir.path().join("x".repeat(pad));
-        std::fs::create_dir(&parent).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&parent)
+            .unwrap();
         let path = parent.join("control.sock");
         let total_len = path.as_os_str().as_bytes().len();
         assert!(
@@ -1256,7 +1360,7 @@ mod tests {
     /// rather than by racing a clock.
     #[test]
     fn bind_in_never_creates_its_own_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let missing = dir.path().join("does-not-exist");
         let err = bind_in(&missing, "s").expect_err("no directory, no bind");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -1270,7 +1374,7 @@ mod tests {
     #[test]
     fn bind_in_binds_inside_an_owner_only_directory() {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let staging = dir.path().join("staging");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -1314,7 +1418,7 @@ mod tests {
     #[test]
     fn a_start_sweeps_only_its_own_stale_staging_directories() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let at = |name: &str| dir.path().join(name);
         let dead = dead_pids(9);
         let empty = format!(".c{}", dead[0]);
@@ -1344,7 +1448,7 @@ mod tests {
         std::fs::write(at(&with_file).join("x"), b"").unwrap();
         std::fs::write(at(&file_named_s).join(STAGED_NAME), b"").unwrap();
         std::fs::set_permissions(at(&open_mode), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let target = super::private_test_dir().unwrap();
         let pointed = target.path().join("pointed");
         private_dir(&pointed);
         drop(UnixListener::bind(pointed.join(STAGED_NAME)).unwrap());
@@ -1389,7 +1493,7 @@ mod tests {
     #[test]
     fn bind_private_sweeps_stale_staging_next_to_its_socket() {
         use std::os::unix::fs::DirBuilderExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let stale = dir.path().join(format!(".c{}", dead_pids(1)[0]));
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -1469,7 +1573,7 @@ mod tests {
 
     #[test]
     fn stopping39_ack_waits_for_real_exit_and_reports_still_live() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let sock = dir.path().join("control.sock");
         let pid = std::process::id();
         let stops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1496,7 +1600,7 @@ mod tests {
 
     #[test]
     fn stopping_where_there_is_no_socket_is_no_daemon_at_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let started = std::time::Instant::now();
         let outcome =
             stop_daemon_and_wait(&dir.path().join("control.sock"), Duration::from_secs(10));
@@ -1515,7 +1619,7 @@ mod tests {
     /// input -- is gone.
     #[test]
     fn a_lost_stop_is_sent_again_and_the_wait_lasts_until_the_process_is_gone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let sock = dir.path().join("control.sock");
         let mut child = std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
@@ -1550,7 +1654,7 @@ mod tests {
     /// with its pid. (Its pid is this test's own, which does stay.)
     #[test]
     fn a_process_that_stays_after_stop_is_reported() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let sock = dir.path().join("control.sock");
         let pid = std::process::id();
         let _daemon = FakeDaemon::start(&sock, move |line| match line {
@@ -1572,7 +1676,7 @@ mod tests {
     /// A daemon that does not name its pid: its socket going is the stop.
     #[test]
     fn without_a_pid_the_socket_going_is_the_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let sock = dir.path().join("control.sock");
         let path = sock.clone();
         let _daemon = FakeDaemon::start(&sock, move |line| match line {
@@ -1590,7 +1694,7 @@ mod tests {
     /// Nothing answers STATUS: no STOP goes out, and it says so.
     #[test]
     fn a_socket_that_never_answers_gets_no_stop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::private_test_dir().unwrap();
         let sock = dir.path().join("control.sock");
         let stops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = stops.clone();
@@ -1693,3 +1797,7 @@ mod peer_tests;
 #[cfg(test)]
 #[path = "control_peer_fixture.rs"]
 pub(crate) mod peer_fixture;
+
+#[cfg(test)]
+#[path = "control_path_tests.rs"]
+mod path_tests;
