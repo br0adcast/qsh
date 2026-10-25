@@ -757,6 +757,13 @@ that follows it) and `transport` (sessions: admission, refusals, caps,
 teardown). A record of several lines repeats the whole header on each
 line, and control characters in the text are replaced with `?`.
 
+New daemon log files are created with mode `0600`. On initial open and after
+rotation, qshd accepts only a regular file owned by its effective user, sets
+`0600` on the opened file descriptor and verifies the result. Failure to open
+or prepare the file leaves that file sink unavailable; the daemon and its
+sessions continue, with standard-error logging unchanged. These checks apply
+when the sink is opened, not continuously to later external permission changes.
+
 Every line means every line: in system mode the journal gets the
 helper's and the worker's lines too — each accepted and refused login,
 the detailed reason for each refusal, and the client-supplied login name
