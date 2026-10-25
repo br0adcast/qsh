@@ -64,7 +64,9 @@ pub fn key_is_listed(text: &str, key: &PublicKey) -> Result<bool, AuthError> {
     let key_blob = key_blob(key)?;
 
     for line in text.lines() {
-        let line = line.trim();
+        // OpenSSH skips only space/tab before an entry. Unicode trimming
+        // could turn a malformed listing into an unrestricted bare key.
+        let line = line.trim_start_matches([' ', '\t']);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -484,6 +486,39 @@ mod tests {
         assert!(key_is_listed(&text, k.public_key()).unwrap());
         assert!(!key_is_listed(&format!(" # {openssh}\n"), k.public_key()).unwrap());
         assert!(!key_is_listed(&text, other.public_key()).unwrap());
+    }
+
+    #[test]
+    fn unsupported_leading_whitespace_does_not_authorize_a_key() {
+        let k = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        for prefix in ["\u{a0}", "\u{b}", "\u{c}", "\u{85}", "\u{2003}"] {
+            for suffix in ["", " user comment"] {
+                let line = format!("{prefix}{openssh}{suffix}\n");
+                assert!(
+                    !key_is_listed(&line, k.public_key()).unwrap(),
+                    "unsupported prefix {prefix:?} must not authorize a key"
+                );
+                assert!(
+                    !key_is_listed(&format!("{line}{openssh}\n"), k.public_key()).unwrap(),
+                    "a malformed listing must block a later bare duplicate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supported_listing_whitespace_preserves_comments_and_restrictions() {
+        let k = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        for prefix in ["", " ", "\t", " \t "] {
+            let text = format!("{prefix}# {openssh}\r\n{prefix}{openssh} user comment\r\n");
+            assert!(key_is_listed(&text, k.public_key()).unwrap());
+            for options in ["restrict", "command=\"echo #x\"", "malformed"] {
+                let text = format!("{prefix}{options} {openssh}\r\n{openssh}\r\n");
+                assert!(!key_is_listed(&text, k.public_key()).unwrap());
+            }
+        }
     }
 
     #[test]
