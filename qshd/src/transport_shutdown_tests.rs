@@ -16,6 +16,7 @@ use transport::{LinkState, ServerAuth, SessionBackend, SessionIo, Stats};
 
 struct HeldRun {
     started: Notify,
+    received: Notify,
     cleaning: Notify,
     release: Semaphore,
     finished: Notify,
@@ -25,6 +26,7 @@ impl HeldRun {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             started: Notify::new(),
+            received: Notify::new(),
             cleaning: Notify::new(),
             release: Semaphore::new(0),
             finished: Notify::new(),
@@ -41,7 +43,11 @@ impl SessionBackend for HeldCleanup {
         let run = self.runs[self.next.fetch_add(1, Ordering::SeqCst)].clone();
         Box::pin(async move {
             run.started.notify_one();
-            while io.recv().await.is_some() {}
+            while let Some(inbound) = io.recv().await {
+                if matches!(inbound, transport::session_manager::SessionInbound::Data(_)) {
+                    run.received.notify_one();
+                }
+            }
             run.cleaning.notify_one();
             run.release.acquire().await.unwrap().forget();
             run.finished.notify_one();
@@ -79,25 +85,53 @@ impl ClientEvents for Noop {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_does_not_complete_while_owned_backend_cleanup_is_held() {
-    stop_with_held_cleanup(false, false, false).await;
+    stop_with_held_cleanup(false, false, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_keeps_a_replaced_backend_until_its_cleanup_finishes() {
-    stop_with_held_cleanup(true, false, false).await;
+    stop_with_held_cleanup(true, false, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn personal39_signal_drains_the_manager_while_retaining_a_silent_control() {
-    stop_with_held_cleanup(false, true, false).await;
+    stop_with_held_cleanup(false, true, false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn personal39_signal_preserves_a_failed_manager_outcome_after_all_joins() {
-    stop_with_held_cleanup(false, true, true).await;
+    stop_with_held_cleanup(false, true, true, None).await;
 }
 
-async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool) {
+struct InjectedAcceptor {
+    listener: tokio::net::UnixListener,
+    errors: tokio::sync::mpsc::UnboundedReceiver<i32>,
+    attempts: Arc<AtomicUsize>,
+}
+impl super::ControlAcceptor for InjectedAcceptor {
+    async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+        tokio::select! {
+            biased;
+            Some(errno) = self.errors.recv() => {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from_raw_os_error(errno))
+            }
+            accepted = self.listener.accept() => accepted.map(|(stream, _)| stream),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept294_pressure_preserves_sessions_and_stop_drain() {
+    stop_with_held_cleanup(false, false, false, Some(nix::libc::EMFILE)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept294_pressure_preserves_sessions_and_signal_drain() {
+    stop_with_held_cleanup(false, true, false, Some(nix::libc::ENOBUFS)).await;
+}
+
+async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool, pressure: Option<i32>) {
     let dir = crate::control::private_test_dir().unwrap();
     let path = dir.path().join("control.sock");
     let (listener, cleanup) = crate::control::bind_private_owned(&path).unwrap();
@@ -109,34 +143,67 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool) {
     runs[0].fail.store(fail, Ordering::SeqCst);
     let _release_on_unwind = ReleaseOnDrop(runs.clone());
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
-    let mut daemon = tokio::spawn(super::run_transport_daemon_until_stop(
-        socket,
-        server.private,
-        ServerAuth {
-            allowlist: Arc::new(Mutex::new(vec![client_key.public])),
-            verifier: None,
-            server_pub: server.public,
-            self_principal: Principal {
-                uid: 1000,
-                name: "fixture".into(),
-                identity: "allowlist".into(),
-                incarnation: 0,
-            },
-            nonces: Arc::new(crate::RandomNonces),
-            logins: Arc::new(crate::ForgetNothing),
+    let (pressure_tx, pressure_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let auth = ServerAuth {
+        allowlist: Arc::new(Mutex::new(vec![client_key.public])),
+        verifier: None,
+        server_pub: server.public,
+        self_principal: Principal {
+            uid: 1000,
+            name: "fixture".into(),
+            identity: "allowlist".into(),
+            incarnation: 0,
         },
-        Arc::new(HeldCleanup {
-            runs: runs.clone(),
-            next: AtomicUsize::new(0),
-        }),
-        listener,
-        cleanup,
-        vec![addr.port()],
-        Arc::new(AtomicUsize::new(0)),
-        Arc::new(tokio::sync::RwLock::new(())),
-        None,
-        async move { signal_rx.await.map_err(anyhow::Error::new) },
-    ));
+        nonces: Arc::new(crate::RandomNonces),
+        logins: Arc::new(crate::ForgetNothing),
+    };
+    let backend = Arc::new(HeldCleanup {
+        runs: runs.clone(),
+        next: AtomicUsize::new(0),
+    });
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    let stop = async move { signal_rx.await.map_err(anyhow::Error::new) };
+    let mut daemon = if pressure.is_some() {
+        listener.set_nonblocking(true).unwrap();
+        let listener = InjectedAcceptor {
+            listener: tokio::net::UnixListener::from_std(listener).unwrap(),
+            errors: pressure_rx,
+            attempts: attempts.clone(),
+        };
+        tokio::spawn(async move {
+            let _cleanup = cleanup;
+            super::run_transport_daemon_with_acceptor(
+                socket,
+                server.private,
+                auth,
+                backend,
+                listener,
+                vec![addr.port()],
+                Arc::new(AtomicUsize::new(0)),
+                gate,
+                None,
+                stop,
+            )
+            .await
+        })
+    } else {
+        // Original shutdown cases still exercise the public adoption wrapper
+        // and keep SocketCleanup owned by the daemon until all joins finish.
+        tokio::spawn(super::run_transport_daemon_until_stop(
+            socket,
+            server.private,
+            auth,
+            backend,
+            listener,
+            cleanup,
+            vec![addr.port()],
+            Arc::new(AtomicUsize::new(0)),
+            gate,
+            None,
+            stop,
+        ))
+    };
     let connect = || {
         StdClient::connect(
             addr,
@@ -171,8 +238,35 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool) {
     } else {
         None
     };
+    if let Some(errno) = pressure {
+        for _ in 0..4 {
+            pressure_tx.send(errno).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accept error injected after authenticated session started");
+        // A fresh input reaching the authenticated backend is a positive
+        // manager-progress barrier, independent of wall-clock retry timing.
+        let admitted = client.send_bytes(0, b"pressure probe".to_vec());
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), runs[0].received.notified()).await;
+        if admitted.is_err() || received.is_err() {
+            let _ = signal_tx.send(());
+            runs[0].release.add_permits(1);
+            let outcome = join_test_daemon(daemon).await;
+            client.close();
+            panic!("accept pressure prevented live backend input: {outcome:?}");
+        }
+    }
     let mut silent = None;
-    let stop_ack = if signal {
+    let stop_ack = if signal && pressure.is_some() {
+        signal_tx.send(()).unwrap();
+        None
+    } else if signal {
         silent = Some(tokio::net::UnixStream::connect(&path).await.unwrap());
         // A later STATUS round trip proves the listener passed the silent
         // connection to its owned task before we request shutdown.
@@ -725,4 +819,258 @@ async fn join_test_daemon(
             panic!("test daemon did not join: {error}; canceled task: {joined:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn accept294_cancelled_handler_join_retains_other_handlers() {
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
+    let mut handlers = tokio::task::JoinSet::new();
+    let cancelled = handlers.spawn(std::future::pending::<()>());
+    cancelled.abort();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    handlers.spawn(async move {
+        release_rx.await.unwrap();
+    });
+    let mut join = Box::pin(super::join_control_handlers(&mut handlers, &mut stop_rx));
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(join.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    release_tx.send(()).unwrap();
+    assert!(
+        join.await.is_err(),
+        "unexpected cancellation remains a failed joined outcome"
+    );
+    assert!(
+        handlers.is_empty(),
+        "failure cannot discard another owned handler"
+    );
+    drop(stop_tx);
+}
+
+fn spawn_accept_fixture(
+    path: &std::path::Path,
+    gate: Arc<tokio::sync::RwLock<()>>,
+    allowlist: Arc<Mutex<Vec<[u8; 32]>>>,
+    stop: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    errors: tokio::sync::mpsc::UnboundedReceiver<i32>,
+    attempts: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let (listener, cleanup) = crate::control::bind_private_owned(path).unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server = generate_keypair();
+    listener.set_nonblocking(true).unwrap();
+    tokio::spawn(async move {
+        let _cleanup = cleanup;
+        super::run_transport_daemon_with_acceptor(
+            socket,
+            server.private,
+            ServerAuth {
+                allowlist,
+                verifier: None,
+                server_pub: server.public,
+                self_principal: Principal {
+                    uid: 1000,
+                    name: "fixture".into(),
+                    identity: "allowlist".into(),
+                    incarnation: 0,
+                },
+                nonces: Arc::new(crate::RandomNonces),
+                logins: Arc::new(crate::ForgetNothing),
+            },
+            Arc::new(HeldCleanup {
+                runs: [HeldRun::new(), HeldRun::new()],
+                next: AtomicUsize::new(0),
+            }),
+            InjectedAcceptor {
+                listener: tokio::net::UnixListener::from_std(listener).unwrap(),
+                errors,
+                attempts,
+            },
+            vec![1],
+            Arc::new(AtomicUsize::new(0)),
+            gate,
+            None,
+            stop,
+        )
+        .await
+    })
+}
+
+#[tokio::test]
+async fn accept294_unknown_listener_errors_fail_and_join() {
+    for errno in [
+        nix::libc::EBADF,
+        nix::libc::EINVAL,
+        nix::libc::EACCES,
+        nix::libc::EIO,
+    ] {
+        let dir = crate::control::private_test_dir().unwrap();
+        let path = dir.path().join("control.sock");
+        let (errors_tx, errors_rx) = tokio::sync::mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        errors_tx.send(errno).unwrap();
+        let daemon = spawn_accept_fixture(
+            &path,
+            Arc::new(tokio::sync::RwLock::new(())),
+            Arc::new(Mutex::new(Vec::new())),
+            std::future::pending(),
+            errors_rx,
+            attempts.clone(),
+        );
+        let result = join_test_daemon(daemon).await;
+        assert!(
+            result.is_err(),
+            "unclassified errno {errno} must fail closed"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !path.exists(),
+            "listener cleanup stays owned through joined failure"
+        );
+    }
+}
+
+// These fixtures own futures and sockets only, with no native process custody.
+// Use a real-time watchdog so a regression cannot freeze a paused-clock test;
+// failure still aborts AND joins its exclusively owned daemon task.
+async fn wait_for_accept_fixture(
+    daemon: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    condition: impl Fn() -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !condition() {
+        if daemon.is_finished() || std::time::Instant::now() >= deadline {
+            daemon.abort();
+            let outcome = daemon.await;
+            panic!("accept fixture did not reach its barrier: {outcome:?}");
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn accept294_admitted_stop_interrupts_retry_and_drains_its_ack() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let dir = crate::control::private_test_dir().unwrap();
+    let path = dir.path().join("control.sock");
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    let held = gate.clone().write_owned().await;
+    let (errors_tx, errors_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut daemon = spawn_accept_fixture(
+        &path,
+        gate.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+        std::future::pending(),
+        errors_rx,
+        attempts.clone(),
+    );
+    let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+    client.write_all(b"STOP\n").await.unwrap();
+    wait_for_accept_fixture(&mut daemon, || Arc::strong_count(&gate) >= 4).await;
+    errors_tx.send(nix::libc::ENOMEM).unwrap();
+    wait_for_accept_fixture(&mut daemon, || attempts.load(Ordering::SeqCst) > 0).await;
+    let before = tokio::time::Instant::now();
+    drop(held);
+    let mut reply = String::new();
+    tokio::io::BufReader::new(client)
+        .read_line(&mut reply)
+        .await
+        .unwrap();
+    join_test_daemon(daemon).await.unwrap();
+    assert_eq!(reply, "{\"stopping\":true}\n");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        before,
+        "STOP cannot wait for accept backoff"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn accept294_backoff_is_capped_and_resets_after_success() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let dir = crate::control::private_test_dir().unwrap();
+    let path = dir.path().join("control.sock");
+    let (errors_tx, errors_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let mut daemon = spawn_accept_fixture(
+        &path,
+        Arc::new(tokio::sync::RwLock::new(())),
+        Arc::new(Mutex::new(Vec::new())),
+        async move { stop_rx.await.map_err(anyhow::Error::new) },
+        errors_rx,
+        attempts.clone(),
+    );
+    for errno in [
+        nix::libc::EMFILE,
+        nix::libc::ENFILE,
+        nix::libc::ENOBUFS,
+        nix::libc::ENOMEM,
+        nix::libc::EINTR,
+        nix::libc::ECONNABORTED,
+        nix::libc::ECONNRESET,
+        nix::libc::EAGAIN,
+    ] {
+        errors_tx.send(errno).unwrap();
+    }
+    wait_for_accept_fixture(&mut daemon, || attempts.load(Ordering::SeqCst) > 0).await;
+    for (index, delay) in [50, 100, 200, 400, 800, 1000, 1000].into_iter().enumerate() {
+        tokio::time::advance(Duration::from_millis(delay - 1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            index + 1,
+            "retry must wait its deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !daemon.is_finished(),
+            "recoverable accept error terminated manager"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            index + 2,
+            "retry resumes at its capped deadline"
+        );
+    }
+    let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+    client.write_all(b"STATUS\n").await.unwrap();
+    tokio::time::advance(Duration::from_millis(1000)).await;
+    let mut reply = String::new();
+    tokio::io::BufReader::new(client)
+        .read_line(&mut reply)
+        .await
+        .unwrap();
+    assert!(
+        !reply.is_empty(),
+        "successful accept after resource recovery"
+    );
+    errors_tx.send(nix::libc::EMFILE).unwrap();
+    errors_tx.send(nix::libc::EMFILE).unwrap();
+    wait_for_accept_fixture(&mut daemon, || attempts.load(Ordering::SeqCst) >= 9).await;
+    tokio::time::advance(Duration::from_millis(49)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 9);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        10,
+        "successful accept reset the retry delay"
+    );
+    stop_tx.send(()).unwrap();
+    join_test_daemon(daemon).await.unwrap();
 }
