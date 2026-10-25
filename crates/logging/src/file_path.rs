@@ -61,7 +61,9 @@ fn directory(fd: &impl AsFd, uid: u32) -> io::Result<Stat> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
         || !trusted_directory(stat.st_uid, stat.st_mode as u32, uid)
     {
-        return Err(refused("log parent is not a trusted directory"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "log parent must be a trusted directory: uid={} mode={:04o}; expected root or uid={uid}, no group/other write unless sticky",
+            stat.st_uid, stat.st_mode & 0o7777)));
     }
     Ok(stat)
 }
@@ -73,9 +75,9 @@ fn leaf(stat: &Stat, uid: u32) -> io::Result<()> {
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
         || !trusted_leaf(stat.st_uid, links, uid)
     {
-        return Err(refused(
-            "log leaf is not a single-linked account-owned regular file",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "log leaf must be a single-linked account-owned regular file: uid={} mode={:04o} links={links}; expected uid={uid}",
+            stat.st_uid, stat.st_mode & 0o7777)));
     }
     Ok(())
 }
@@ -137,13 +139,16 @@ impl ParentAuthority {
             .ok_or_else(|| refused("log path has no parent"))?;
         let uid = rustix::process::geteuid().as_raw();
         let root = fs::open("/", DIRECTORY, Mode::empty())?;
-        let root_stat = directory(&root, uid)?;
+        let root_stat = directory(&root, uid)
+            .map_err(|e| crate::path_error(Path::new("/"), "checking log ancestor", e))?;
+        let mut resolved = PathBuf::from("/");
         let mut stack = vec![root];
         let mut pending = parts(parent);
         let mut aliases = 0;
         while let Some(name) = pending.pop_front() {
             if name == "/" {
                 stack.truncate(1);
+                resolved = PathBuf::from("/");
                 continue;
             }
             if name == "." {
@@ -152,37 +157,63 @@ impl ParentAuthority {
             if name == ".." {
                 if stack.len() > 1 {
                     stack.pop();
+                    resolved.pop();
                 }
                 continue;
             }
+            let component = resolved.join(&name);
             let current = stack.last().expect("root stays pinned");
             // Recheck authority before any lookup that may create a component.
-            directory(current, uid)?;
+            directory(current, uid)
+                .map_err(|e| crate::path_error(&resolved, "checking log ancestor", e))?;
             match fs::openat(current, &name, DIRECTORY, Mode::empty()) {
                 Ok(fd) => {
-                    directory(&fd, uid)?;
+                    directory(&fd, uid)
+                        .map_err(|e| crate::path_error(&component, "checking log ancestor", e))?;
                     stack.push(fd);
+                    resolved = component;
                 }
                 Err(rustix::io::Errno::NOENT) if create => {
                     match fs::mkdirat(current, &name, Mode::RWXU) {
                         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                        Err(error) => return Err(error.into()),
+                        Err(error) => {
+                            return Err(crate::path_error(
+                                &component,
+                                "resolving log ancestor",
+                                error.into(),
+                            ))
+                        }
                     }
-                    let fd = fs::openat(current, &name, DIRECTORY, Mode::empty())?;
-                    directory(&fd, uid)?;
+                    let fd = fs::openat(current, &name, DIRECTORY, Mode::empty()).map_err(|e| {
+                        crate::path_error(&component, "opening log ancestor", e.into())
+                    })?;
+                    directory(&fd, uid)
+                        .map_err(|e| crate::path_error(&component, "checking log ancestor", e))?;
                     stack.push(fd);
+                    resolved = component;
                 }
                 Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
                     aliases += 1;
                     if aliases > MAX_ALIASES {
-                        return Err(refused("log parent alias limit exceeded"));
+                        return Err(crate::path_error(
+                            &component,
+                            "checking log alias",
+                            refused("log parent alias limit exceeded"),
+                        ));
                     }
-                    let target = alias(current, &name, uid)?;
+                    let target = alias(current, &name, uid)
+                        .map_err(|e| crate::path_error(&component, "checking log alias", e))?;
                     let mut expanded = parts(Path::new(&target));
                     expanded.append(&mut pending);
                     pending = expanded;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(crate::path_error(
+                        &component,
+                        "resolving log ancestor",
+                        error.into(),
+                    ))
+                }
             }
         }
         let directory = stack.pop().expect("root stays pinned");
@@ -198,7 +229,13 @@ impl ParentAuthority {
             uid,
             is_root: same(&root_stat, &final_stat),
         };
-        authority.validate_parent()?;
+        authority.validate_parent().map_err(|error| {
+            crate::path_error(
+                authority.route.parent().unwrap_or(Path::new("/")),
+                "checking dedicated log directory",
+                error,
+            )
+        })?;
         Ok(authority)
     }
 

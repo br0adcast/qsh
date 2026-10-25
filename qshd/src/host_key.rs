@@ -74,7 +74,7 @@ fn decode_key(path: &Path, bytes: &[u8]) -> Result<Keypair> {
     if bytes.len() != 64 {
         bail!(
             "key file {} is corrupt: expected 64 bytes, found {}",
-            path.display(),
+            logging::diagnostic(&path.to_string_lossy()),
             bytes.len()
         );
     }
@@ -89,24 +89,45 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
     match io.read(path) {
         Ok(bytes) => return decode_key(path, &bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading {}", logging::diagnostic(&path.to_string_lossy()))
+            })
+        }
     }
 
     let (parent, leaf) = trusted::prepare_parent(path, nix::unistd::Uid::effective())
-        .with_context(|| format!("preparing parent for {}", path.display()))?;
-    let mut staged = io
-        .stage(&parent)
-        .with_context(|| format!("staging key for {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "preparing parent for {}",
+                logging::diagnostic(&path.to_string_lossy())
+            )
+        })?;
+    let mut staged = io.stage(&parent).with_context(|| {
+        format!(
+            "staging key for {}",
+            logging::diagnostic(&path.to_string_lossy())
+        )
+    })?;
     let keypair = transport::handshake::generate_keypair();
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(&keypair.private);
     bytes[32..].copy_from_slice(&keypair.public);
     let preparation = io
         .write(&mut staged.file, &bytes)
-        .with_context(|| format!("writing staged key for {}", path.display()))
+        .with_context(|| {
+            format!(
+                "writing staged key for {}",
+                logging::diagnostic(&path.to_string_lossy())
+            )
+        })
         .and_then(|()| {
-            io.sync(&staged.file)
-                .with_context(|| format!("syncing staged key for {}", path.display()))
+            io.sync(&staged.file).with_context(|| {
+                format!(
+                    "syncing staged key for {}",
+                    logging::diagnostic(&path.to_string_lossy())
+                )
+            })
         });
     if let Err(error) = preparation {
         return Err(cleanup_error(io, &parent, &staged.name, error));
@@ -117,7 +138,7 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
             let exists = error.kind() == io::ErrorKind::AlreadyExists;
             let error = anyhow::Error::new(error).context(format!(
                 "publishing key {} (requires atomic exclusive rename support)",
-                path.display()
+                logging::diagnostic(&path.to_string_lossy())
             ));
             // Only our exclusive staging name is removed. A failed cleanup is
             // an error even when another creator has already published a key.
@@ -136,7 +157,12 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
                 nix::unistd::Uid::effective(),
                 &mut trusted::FileIo,
             )
-            .with_context(|| format!("reading winning key {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "reading winning key {}",
+                    logging::diagnostic(&path.to_string_lossy())
+                )
+            })?;
             warn_repair(path, loaded.repaired_mode);
             decode_key(path, &loaded.bytes)
         }
@@ -160,7 +186,7 @@ fn warn_repair(path: &Path, mode: Option<u32>) {
         crate::log::warn("qshd", &format!(
             "host key {} was accessible to more than its owner (mode {mode:03o}); \
              verified file permissions tightened to 0600, which cannot undo a possible past disclosure",
-            path.display()
+            logging::diagnostic(&path.to_string_lossy())
         ));
     }
 }

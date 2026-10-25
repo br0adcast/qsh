@@ -2432,6 +2432,14 @@ an observation. Debt that appears later still has to satisfy the existing final
 cleanup fence before exec. An actually unavailable or inconsistent observation
 is reported separately as unavailable preparation, never as permanent loss.
 
+Personal local-control status replies may include `logging_warning`, a bounded,
+escaped startup diagnostic for the same-account caller when the daemon's file
+sink could not be initialized. No credential contents or arbitrary stderr are
+included. The process retains this preparation outcome; resume initializes a
+new outcome. `transport-ensure` carries it in `TRANSPORT-READY.warning` on both
+fresh startup and reuse, alongside any version warning. Missing or null means
+no known initialization warning; this does not promise successful later writes.
+
 Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
 include `cleanup`, with `domain: "personal_channels"` and a `phase` of
 `completed`, `pending`, `unresolved`, or `unknown`. `counts` reports healthy

@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{self, AtFlags, OFlag};
 use nix::sys::stat::{self, Mode, SFlag};
@@ -45,10 +45,20 @@ fn directory(file: File, uid: Uid) -> io::Result<File> {
         return Err(refused("host key parent is not a directory"));
     }
     if metadata.uid() != 0 && metadata.uid() != uid.as_raw() {
-        return Err(refused("host key parent has an untrusted owner"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "host key parent has untrusted uid={} mode={:04o}; expected root or uid={}",
+                metadata.uid(),
+                metadata.mode() & 0o7777,
+                uid.as_raw()
+            ),
+        ));
     }
     if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-        return Err(refused("host key parent is writable by group or others"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "host key parent is writable by group or others: uid={} mode={:04o}; expected no group/other write unless sticky",
+            metadata.uid(), metadata.mode() & 0o7777)));
     }
     Ok(file)
 }
@@ -78,7 +88,14 @@ fn alias_target(parent: &File, name: &std::ffi::OsStr, uid: Uid) -> io::Result<O
         ));
     }
     if metadata.st_uid != 0 && metadata.st_uid != uid.as_raw() {
-        return Err(refused("host key parent alias has an untrusted owner"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "host key parent alias has untrusted uid={}; expected root or uid={}",
+                metadata.st_uid,
+                uid.as_raw()
+            ),
+        ));
     }
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in host key parent"))?;
@@ -123,11 +140,13 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
         uid,
     )?;
     let mut stack = vec![root];
+    let mut resolved = PathBuf::from("/");
     let mut pending = parts(&absolute);
     let mut aliases = 0;
     while let Some(name) = pending.pop_front() {
         if name == "/" {
             stack.truncate(1);
+            resolved = PathBuf::from("/");
             continue;
         }
         if name == "." {
@@ -136,9 +155,11 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
         if name == ".." {
             if stack.len() > 1 {
                 stack.pop();
+                resolved.pop();
             }
             continue;
         }
+        let component = resolved.join(&name);
         let current = stack.last().expect("root stays pinned");
         match fcntl::openat(
             Some(current.as_raw_fd()),
@@ -146,31 +167,59 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
             DIRECTORY_FLAGS,
             Mode::empty(),
         ) {
-            Ok(fd) => stack.push(directory(owned(fd), uid)?),
+            Ok(fd) => {
+                stack.push(directory(owned(fd), uid).map_err(|e| {
+                    logging::path_error(&component, "checking host key ancestor", e)
+                })?);
+                resolved = component;
+            }
             Err(nix::errno::Errno::ENOENT) if create => {
                 match stat::mkdirat(Some(current.as_raw_fd()), name.as_os_str(), Mode::S_IRWXU) {
                     Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        return Err(logging::path_error(
+                            &component,
+                            "creating host key ancestor",
+                            error.into(),
+                        ))
+                    }
                 }
                 let fd = fcntl::openat(
                     Some(current.as_raw_fd()),
                     name.as_os_str(),
                     DIRECTORY_FLAGS,
                     Mode::empty(),
-                )?;
-                stack.push(directory(owned(fd), uid)?);
+                )
+                .map_err(|e| {
+                    logging::path_error(&component, "opening host key ancestor", e.into())
+                })?;
+                stack.push(directory(owned(fd), uid).map_err(|e| {
+                    logging::path_error(&component, "checking host key ancestor", e)
+                })?);
+                resolved = component;
             }
             Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
                 aliases += 1;
                 if aliases > MAX_ALIASES {
-                    return Err(refused("host key parent alias limit exceeded"));
+                    return Err(logging::path_error(
+                        &component,
+                        "checking host key alias",
+                        refused("host key parent alias limit exceeded"),
+                    ));
                 }
-                let target = alias_target(current, &name, uid)?;
+                let target = alias_target(current, &name, uid)
+                    .map_err(|e| logging::path_error(&component, "checking host key alias", e))?;
                 let mut target = parts(Path::new(&target));
                 target.append(&mut pending);
                 pending = target;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(logging::path_error(
+                    &component,
+                    "resolving host key ancestor",
+                    error.into(),
+                ))
+            }
         }
     }
     Ok((stack.pop().expect("root stays pinned"), leaf))
@@ -206,7 +255,15 @@ fn validate(file: &File, uid: Uid) -> io::Result<Metadata> {
         return Err(refused("host key is not a regular file"));
     }
     if metadata.uid() != uid.as_raw() {
-        return Err(refused("host key has an untrusted owner"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "host key has untrusted uid={} mode={:04o}; expected uid={}",
+                metadata.uid(),
+                metadata.mode() & 0o7777,
+                uid.as_raw()
+            ),
+        ));
     }
     if metadata.nlink() != 1 {
         return Err(refused("host key must have exactly one link"));
@@ -268,6 +325,7 @@ fn read_opened(mut file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loa
 pub(super) fn read(path: &Path, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loaded> {
     let (parent, leaf) = parent(path, uid)?;
     read_at(&parent, &leaf, uid, io)
+        .map_err(|error| logging::path_error(path, "reading host key", error))
 }
 
 pub(super) fn read_at(

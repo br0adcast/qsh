@@ -410,8 +410,12 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     log::mirror_to_stderr();
     log::init(&cache_dir(parsed.system));
 
-    let keypair = crate::load_or_create_transport_key(&parsed.host_key)
-        .with_context(|| format!("host key {}", parsed.host_key.display()))?;
+    let keypair = crate::load_or_create_transport_key(&parsed.host_key).with_context(|| {
+        format!(
+            "host key {}",
+            logging::diagnostic(&parsed.host_key.to_string_lossy())
+        )
+    })?;
 
     // Nothing about `authorized_keys` is fatal here: `AuthorizedKeysVerifier`
     // re-reads the file on every attempt, so an operator may deliberately

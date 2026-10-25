@@ -128,6 +128,7 @@ pub fn transport_status_response(
     cleanup_registry: Option<&ChannelOpenRegistry>,
 ) -> Result<StatusResponse> {
     Ok(StatusResponse {
+        logging_warning: crate::log::initialization_warning().map(str::to_owned),
         cleanup: cleanup_registry.map(|registry| {
             control::CleanupStatusResponse::from_snapshot(registry.try_cleanup_snapshot())
         }),

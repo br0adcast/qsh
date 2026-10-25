@@ -43,6 +43,7 @@ pub struct Claim {
     /// Owning-process drop releases the slot even while a concurrent child
     /// retains an inherited descriptor before exec. None for a throwaway token.
     _lock: Option<SlotLock>,
+    warning: Option<String>,
 }
 
 struct SlotLock {
@@ -94,6 +95,11 @@ impl Drop for SlotLock {
 }
 
 impl Claim {
+    /// Taken once before the terminal UI starts; never contains token contents.
+    pub fn take_warning(&mut self) -> Option<String> {
+        self.warning.take()
+    }
+
     /// Replace only this run's token, retaining its exclusive slot lock.
     pub fn replace_token(&mut self) -> std::io::Result<[u8; 16]> {
         let token = fresh_token();
@@ -132,38 +138,67 @@ fn claim_with_intent(
     port: u16,
     intent: DirectoryIntent,
 ) -> Claim {
-    let Ok(store) = Store::open(dir, intent) else {
-        return Claim {
-            token: fresh_token(),
-            _lock: None,
-        };
+    let store = match Store::open(dir, intent) {
+        Ok(store) => store,
+        Err(error) => return ephemeral(dir, error),
     };
+    let mut failure = None;
     for index in 0..MAX_SLOTS {
         let name = slot_name(login, host, port, index);
-        let Ok(file) = store.open_candidate(&name) else {
-            continue;
+        let file = match store.open_candidate(&name) {
+            Ok(file) => file,
+            Err(error) => {
+                failure.get_or_insert_with(|| {
+                    logging::path_error(&dir.join(&name), "opening session slot", error)
+                });
+                continue;
+            }
         };
         // Both descriptor duplication and binding allocation precede flock.
-        let Ok((parent, binding)) = store.binding(&name) else {
-            continue;
+        let (parent, binding) = match store.binding(&name) {
+            Ok(binding) => binding,
+            Err(error) => {
+                failure.get_or_insert(error);
+                continue;
+            }
         };
         if !lock_exclusive(&file) {
             continue;
         }
         let slot = SlotLock::new(file, parent, binding);
-        if store
-            .prepare_locked(&slot.parent, &slot.file, &slot.binding)
-            .is_err()
-        {
+        if let Err(error) = store.prepare_locked(&slot.parent, &slot.file, &slot.binding) {
+            failure.get_or_insert(error);
             continue;
         }
-        if let Ok(owner) = claim_locked(slot, read_token_bytes) {
-            return owner;
+        match claim_locked(slot, read_token_bytes) {
+            Ok(owner) => return owner,
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
         }
     }
+    ephemeral(
+        dir,
+        failure.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "all 16 session slots are busy; close an unused qsh client and retry",
+            )
+        }),
+    )
+}
+
+fn persistence_warning(path: &Path, error: std::io::Error) -> String {
+    logging::diagnostic(&format!(
+        "session persistence disabled; this connection remains usable but future recovery may be unavailable: {}. Check ownership, permissions and free space for this path; no unsafe path was repaired",
+        logging::path_error(path, "saving session", error)))
+}
+
+fn ephemeral(path: &Path, error: std::io::Error) -> Claim {
     Claim {
         token: fresh_token(),
         _lock: None,
+        warning: Some(persistence_warning(path, error)),
     }
 }
 
@@ -196,6 +231,7 @@ fn claim_locked(
                 return Ok(Claim {
                     token,
                     _lock: Some(slot),
+                    warning: None,
                 });
             }
         }
@@ -205,10 +241,13 @@ fn claim_locked(
         .validate_private_current(&slot.parent, &slot.file)?;
     // Initial persistence remains best effort. Stop at the first write error,
     // retain this exact lock, and use the fresh token even if it was not saved.
-    let _ = write_token(&mut slot.file, &token);
+    let warning = write_token(&mut slot.file, &token)
+        .err()
+        .map(|error| persistence_warning(&slot.binding.diagnostic_path(), error));
     Ok(Claim {
         token,
         _lock: Some(slot),
+        warning,
     })
 }
 

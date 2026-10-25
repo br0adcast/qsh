@@ -11,7 +11,8 @@ pub(crate) enum Outcome {
 ///
 /// # Safety
 /// The caller must be single-threaded, before logger/runtime/background worker
-/// initialization. No other waiter or signal handler may reap the first child.
+/// initialization. An owned CLOEXEC log file may be prepared without installing
+/// the logger or creating mutexes. No other waiter or signal handler may reap the first child.
 /// No Rust-owned handle may refer to descriptors 0, 1 or 2: redirection replaces
 /// those descriptors, so an inherited owner could later close the replacement.
 /// The binary relies on Rust Unix startup initializing missing standard fds and

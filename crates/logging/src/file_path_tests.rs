@@ -567,3 +567,34 @@ fn authority_darwin_var_alias_is_traversed_natively() {
     sink.write_lines(&["native var alias".into()]);
     assert_eq!(fs::read(path).unwrap(), b"native var alias\n");
 }
+
+#[test]
+fn diagnostics_name_unsafe_component_and_condition_without_mutating_it() {
+    let d = crate::private_test_dir().unwrap();
+    let unsafe_parent = d.path().join("unsafe\n\x1bparent");
+    fs::create_dir(&unsafe_parent).unwrap();
+    fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let path = unsafe_parent.join("private/log");
+    let error = FileSink::try_open_in_private_dir(&path, 100)
+        .err()
+        .expect("refused");
+    let text = error.to_string();
+    assert!(text.contains("unsafe\\n\\u{1b}parent"), "{text}");
+    assert!(text.contains("0777") && text.contains("uid="), "{text}");
+    assert!(!text.contains('\n') && !text.contains('\x1b'));
+    assert_eq!(mode(&unsafe_parent), 0o777);
+    assert!(!unsafe_parent.join("private").exists());
+}
+
+#[test]
+fn diagnostics_report_nonregular_leaf_and_keep_safe_open_working() {
+    let d = crate::private_test_dir().unwrap();
+    let bad = d.path().join("directory");
+    fs::create_dir(&bad).unwrap();
+    let error = FileSink::try_open_in_private_dir(&bad, 100)
+        .err()
+        .expect("refused");
+    assert!(error.to_string().contains("directory"));
+    assert!(error.to_string().contains("regular file"));
+    assert!(FileSink::try_open_in_private_dir(&d.path().join("good"), 100).is_ok());
+}

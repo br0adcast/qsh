@@ -90,6 +90,7 @@ mod tests {
 
     fn daemon(build: u64, checksum: &str, conns: u64) -> StatusResponse {
         StatusResponse {
+            logging_warning: None,
             cleanup: None,
             version: "0.1.0".into(),
             build,

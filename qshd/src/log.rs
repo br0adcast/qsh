@@ -24,8 +24,8 @@
 //! is this module's, not the shared crate's: rotation after a privilege
 //! drop, [`mute`] and the system mode's forks are the daemon's business.
 //!
-//! The log is a best-effort helper: I/O errors are silently swallowed, and
-//! writing to the log must never crash the daemon.
+//! The log is best effort: initial sink failure is retained for startup/control
+//! diagnostics; later write failures never crash the daemon.
 
 use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
@@ -130,37 +130,84 @@ pub(crate) fn record_worker(pid: u32, level: Level, component: &str, message: &s
     }
 }
 
-/// Initializes the file log at `<cache_dir>/qshd.log` (once, in the daemon
-/// after daemonization). Repeated calls are ignored. If the file cannot be
-/// opened, the log stays uninitialized -- [`record`] then writes nothing to
-/// a file (a [`mirror_to_stderr`] still gets its copy).
-///
-/// Also installs the `log` crate's global logger (see [`Adapter`]), once per
-/// process, so records from `transport` and the daemon's own `log::` macros
-/// reach this same sink.
-///
-/// `cache_dir` is created here (best-effort) if it does not exist yet:
-/// `Logger::open`'s `OpenOptions::create(true)` only creates the FILE, not
-/// its parent directory, and every caller used to get away with that only
-/// because something else (a key file living inside the same directory)
-/// happened to create it first. `serve`'s host key lives elsewhere, so
-/// nothing else creates this directory before `init` runs -- without this,
-/// the open below fails, the logger stays uninitialized, and every later
-/// `log` call is a silent, permanent no-op.
-pub fn init(cache_dir: &Path) {
-    install_adapter();
+/// An owned file prepared before detaching, without global logger state,
+/// mutexes or threads. Install only in the final child; its fd is CLOEXEC.
+pub struct PreparedLog {
+    logger: Option<Logger>,
+    warning: Option<String>,
+}
+
+impl PreparedLog {
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+}
+
+/// Prepare exactly the sink the daemon will use. Call before readiness is
+/// reported so a failed open can travel through the startup warning channel.
+pub fn prepare(cache_dir: &Path) -> PreparedLog {
+    // Detach changes cwd to /. Capture the lexical absolute route now, without
+    // canonicalizing aliases or requiring a not-yet-created target to exist.
+    let directory = if cache_dir.is_absolute() {
+        Ok(cache_dir.to_owned())
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(cache_dir))
+            .map_err(|error| {
+                logging::path_error(cache_dir, "resolving daemon log directory", error)
+            })
+    };
+    let logger = directory.and_then(|directory| {
+        let path = directory.join(LOG_FILE_NAME);
+        fs::create_dir_all(&directory)
+            .map_err(|error| {
+                logging::path_error(&directory, "creating daemon log directory", error)
+            })
+            .and_then(|()| {
+                Logger::open(path.clone(), directory.join(ROTATED_FILE_NAME), MAX_BYTES)
+                    .map_err(|error| logging::path_error(&path, "opening daemon log", error))
+            })
+    });
+    match logger {
+        Ok(logger) => PreparedLog { logger: Some(logger), warning: None },
+        Err(error) => PreparedLog {
+            logger: None,
+            warning: Some(logging::diagnostic(&format!(
+                "file logging disabled: {error}. Check this path's ownership, permissions and free space"))),
+        },
+    }
+}
+
+static INITIALIZATION_WARNING: OnceLock<Option<String>> = OnceLock::new();
+
+/// Retained for the process lifetime, including control STATUS after resume.
+pub fn initialization_warning() -> Option<&'static str> {
+    INITIALIZATION_WARNING
+        .get()
+        .and_then(|warning| warning.as_deref())
+}
+
+/// Install after daemonization; never reopen or replace a failed preparation.
+pub fn install_prepared(prepared: PreparedLog) {
     if LOGGER.get().is_some() {
         return;
     }
-    let _ = fs::create_dir_all(cache_dir);
-    let logger = Logger::open(
-        cache_dir.join(LOG_FILE_NAME),
-        cache_dir.join(ROTATED_FILE_NAME),
-        MAX_BYTES,
-    );
-    if let Ok(logger) = logger {
-        let _ = LOGGER.set(Mutex::new(Some(Sink::File(logger))));
+    install_adapter();
+    let _ = INITIALIZATION_WARNING.set(prepared.warning);
+    let _ = LOGGER.set(Mutex::new(prepared.logger.map(Sink::File)));
+}
+
+/// Foreground/service startup. Failure is best effort and reported once on
+/// stderr (the service journal), even when file logging cannot be installed.
+pub fn init(cache_dir: &Path) {
+    if LOGGER.get().is_some() {
+        return;
     }
+    let prepared = prepare(cache_dir);
+    if let Some(warning) = prepared.warning() {
+        let _ = writeln!(std::io::stderr(), "qshd: {warning}");
+    }
+    install_prepared(prepared);
 }
 
 /// Set by a process that must never write to this file again -- see
@@ -546,14 +593,14 @@ fn open_log_file_with(
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY | nix::libc::O_CLOEXEC)
         .open(path)?;
     let validate = || {
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.uid() != owner {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "daemon log must be a regular file owned by the effective user",
+                format!("daemon log must be a regular file owned by the effective user: uid={} mode={:04o}; expected uid={owner}", metadata.uid(), metadata.mode() & 0o7777),
             ));
         }
         Ok(metadata)
@@ -582,6 +629,76 @@ mod tests {
     mod permissions {
         use super::{Duration, Logger};
         include!("log/permission_tests.rs");
+    }
+
+    #[test]
+    fn path_diagnostics_relative_preparation_rotates_after_detach_cwd_change() {
+        run_alone("log::tests::path_diagnostics_relative_preparation_body");
+    }
+
+    #[test]
+    #[ignore = "isolated cwd mutation, invoked by relative preparation wrapper"]
+    fn path_diagnostics_relative_preparation_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let mut prepared = super::prepare(std::path::Path::new("relative/cache"));
+        assert!(prepared.warning().is_none());
+        let logger = prepared.logger.as_mut().unwrap();
+        logger.max_bytes = 64;
+        std::env::set_current_dir("/").unwrap();
+        for _ in 0..6 {
+            logger.write_text("owned cwd-change rotation sentinel\n");
+        }
+        assert!(
+            dir.path().join("relative/cache/qshd.log.1").is_file(),
+            "rotation must retain the originally prepared location"
+        );
+        assert!(logger.path.is_absolute() && logger.rotated_path.is_absolute());
+        assert!(
+            std::fs::metadata(dir.path().join("relative/cache/qshd.log"))
+                .unwrap()
+                .len()
+                <= 64
+        );
+    }
+
+    #[test]
+    fn path_diagnostics_prepared_log_has_owned_cloexec_descriptor_without_global_state() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = super::prepare(dir.path());
+        assert!(prepared.warning().is_none());
+        let fd = prepared.logger.as_ref().unwrap().file.as_raw_fd();
+        assert!(fd > 2);
+        // SAFETY: this owned descriptor stays live throughout fcntl.
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+        assert_ne!(flags & nix::libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn path_diagnostics_foreground_failure_warns_once_and_survives_in_status() {
+        let (_, stderr) = run_alone("log::tests::path_diagnostics_failed_init_body");
+        assert_eq!(
+            stderr.matches("file logging disabled").count(),
+            1,
+            "{stderr}"
+        );
+        assert!(!stderr.contains("untrusted\nname"));
+    }
+
+    #[test]
+    #[ignore = "isolated logger state; invoked by foreground failure wrapper"]
+    fn path_diagnostics_failed_init_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("untrusted\nname");
+        std::fs::write(&blocked, b"synthetic non-directory").unwrap();
+        super::init(&blocked);
+        super::init(&blocked);
+        let warning = super::initialization_warning().expect("retained startup diagnostic");
+        assert!(warning.contains("untrusted\\nname"), "{warning}");
+        assert!(warning.len() <= 1024);
+        let status = crate::transport_daemon::transport_status_response(&[60000], 0, None).unwrap();
+        assert_eq!(status.logging_warning.as_deref(), Some(warning));
     }
 
     /// One record's text as [`super::write_record`] hands it to the file.

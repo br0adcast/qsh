@@ -47,7 +47,9 @@ fn directory(file: &File, uid: u32) -> io::Result<Stat> {
     if FileType::from_raw_mode(m.st_mode) != FileType::Directory
         || !trusted_directory(m.st_uid, m.st_mode as u32, uid)
     {
-        return Err(refused("session ancestor is not a trusted directory"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "session ancestor must be a trusted directory: uid={} mode={:04o}; expected root or uid={uid}, no group/other write unless sticky",
+            m.st_uid, m.st_mode & 0o7777)));
     }
     Ok(m)
 }
@@ -58,9 +60,9 @@ fn leaf(m: &Stat, uid: u32) -> io::Result<()> {
     if FileType::from_raw_mode(m.st_mode) != FileType::RegularFile
         || !trusted_leaf(m.st_uid, links, uid)
     {
-        return Err(refused(
-            "session slot is not a single-linked account-owned regular file",
-        ));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "session slot must be a single-linked account-owned regular file: uid={} mode={:04o} links={links}; expected uid={uid}",
+            m.st_uid, m.st_mode & 0o7777)));
     }
     Ok(())
 }
@@ -84,6 +86,7 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
     let root = File::from(fs::open("/", DIRECTORY, Mode::empty())?);
     let root_stat = directory(&root, uid)?;
     let mut stack = vec![root];
+    let mut resolved = PathBuf::from("/");
     let mut pending = parts(route.as_os_str().as_bytes());
     let mut aliases = 0;
     while let Some(name) = pending.pop_front() {
@@ -93,21 +96,30 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
         if name == ".." {
             if stack.len() > 1 {
                 stack.pop();
+                resolved.pop();
             }
             continue;
         }
+        let component = resolved.join(&name);
         let parent = stack.last().expect("root stays pinned");
         match fs::statat(parent, &name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(m) if FileType::from_raw_mode(m.st_mode) == FileType::Symlink => {
                 if m.st_uid != 0 && m.st_uid != uid {
-                    return Err(refused("session directory alias has an untrusted owner"));
+                    return Err(logging::path_error(&component, "checking session alias", io::Error::new(io::ErrorKind::PermissionDenied, format!("session directory alias has untrusted uid={}; expected root or uid={uid}", m.st_uid))));
                 }
                 aliases += 1;
                 if aliases > MAX_ALIASES {
-                    return Err(refused("session directory alias limit exceeded"));
+                    return Err(logging::path_error(
+                        &component,
+                        "checking session alias",
+                        refused("session directory alias limit exceeded"),
+                    ));
                 }
                 let mut buffer = [0u8; MAX_ALIAS_BYTES + 1];
-                let count = fs::readlinkat_raw(parent, &name, &mut buffer[..])?;
+                let count =
+                    fs::readlinkat_raw(parent, &name, &mut buffer[..]).map_err(|error| {
+                        logging::path_error(&component, "reading session alias", error.into())
+                    })?;
                 alias_length(count)?;
                 let after = fs::statat(parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
                 if !same(&m, &after) || m.st_uid != after.st_uid {
@@ -116,6 +128,7 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
                 let target = &buffer[..count];
                 if target.starts_with(b"/") {
                     stack.truncate(1);
+                    resolved = PathBuf::from("/");
                 }
                 let mut target = parts(target);
                 target.append(&mut pending);
@@ -126,14 +139,32 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
             Err(rustix::io::Errno::NOENT) if create => {
                 match fs::mkdirat(parent, &name, Mode::RWXU) {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        return Err(logging::path_error(
+                            &component,
+                            "resolving session ancestor",
+                            e.into(),
+                        ))
+                    }
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(logging::path_error(
+                    &component,
+                    "resolving session ancestor",
+                    e.into(),
+                ))
+            }
         }
-        let file = File::from(fs::openat(parent, &name, DIRECTORY, Mode::empty())?);
-        directory(&file, uid)?;
+        let file = File::from(
+            fs::openat(parent, &name, DIRECTORY, Mode::empty()).map_err(|e| {
+                logging::path_error(&component, "opening session ancestor", e.into())
+            })?,
+        );
+        directory(&file, uid)
+            .map_err(|e| logging::path_error(&component, "checking session ancestor", e))?;
         stack.push(file);
+        resolved = component;
     }
     let file = stack.pop().expect("root stays pinned");
     let m = directory(&file, uid)?;
@@ -141,9 +172,10 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
         && (m.st_uid != uid
             || (m.st_mode & 0o077 != 0 && (same(&m, &root_stat) || m.st_mode & 0o1000 != 0)))
     {
-        return Err(refused(
-            "dedicated session directory cannot be safely repaired",
-        ));
+        return Err(logging::path_error(&resolved, "checking dedicated session directory",
+            io::Error::new(io::ErrorKind::PermissionDenied, format!(
+                "dedicated session directory cannot be safely repaired: uid={} mode={:04o}; expected private directory owned by uid={uid}",
+                m.st_uid, m.st_mode & 0o7777))));
     }
     Ok(file)
 }
@@ -260,6 +292,10 @@ impl Store {
     }
 }
 impl SlotBinding {
+    pub(crate) fn diagnostic_path(&self) -> PathBuf {
+        self.route.join(&self.name)
+    }
+
     fn validate_current(&self, parent: &File, slot: &File) -> io::Result<()> {
         let uid = rustix::process::geteuid().as_raw();
         let current = resolve(&self.route, self.intent, false)?;
@@ -417,7 +453,8 @@ mod tests {
                 let actual = Store::open(&path, DirectoryIntent::Generic)
                     .err()
                     .expect("same raw path refused");
-                assert_eq!(actual.raw_os_error(), e.raw_os_error());
+                assert_eq!(actual.kind(), e.kind());
+                assert!(actual.to_string().contains("os error"));
             }
         }
     }

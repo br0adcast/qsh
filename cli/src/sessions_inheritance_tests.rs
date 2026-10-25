@@ -243,6 +243,7 @@ mod inheritance {
         assert!(lock_exclusive(&file));
         let mut owner = Claim {
             token: original,
+            warning: None,
             _lock: Some({
                 let store = Store::open(dir.path(), DirectoryIntent::Generic).unwrap();
                 let (parent, binding) = store

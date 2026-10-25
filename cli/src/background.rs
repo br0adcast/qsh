@@ -62,6 +62,10 @@ impl RoundTask {
         self.recovery.update_endpoints(epoch, endpoints);
     }
 
+    pub fn take_warning(&self) -> Option<String> {
+        self.recovery.take_warning()
+    }
+
     pub fn activity(&self) -> crate::recovery::Activity {
         self.recovery.activity()
     }

@@ -463,6 +463,13 @@ tokens and numbered locks. Reordering addresses, changing the login or port, or
 using another spelling or alias for the host can select a different session;
 qsh does not resolve or normalize host names when choosing a local record.
 
+If the local session store cannot be opened or written, qsh prints one warning
+before drawing the terminal. The current connection remains usable, but future
+recovery may be unavailable because its token was not saved. The warning names
+the failing path and condition without printing the token. Inspect the reported
+component's ownership, permissions, and available space; qsh does not repair an
+unsafe ancestor or replace another account's file.
+
 The login-scoped storage format uses `v2-<hash>-<slot>` filenames. Older host-only
 records remain untouched and are never automatically imported or claimed: they
 contain no trustworthy login attribution. After upgrading from that format, qsh
@@ -562,7 +569,12 @@ race their size checks: with N cooperating writers and maximum record size L,
 the conservative per-inode bound is the larger of its initial size and
 1 MiB + (N - 1) × L, at worst the larger of its initial size and N MiB; this
 excludes outside writes. Directories use mode 0700 and files 0600. Logging
-failures do not end the session or overwrite its screen.
+failures do not end the session or overwrite its screen. Initial file-log
+failure produces one startup warning naming the path and condition. Personal
+daemon startup carries its log warning through the successful SSH bootstrap;
+a reused daemon reports the retained warning again to its next connecting
+caller. During SSH recovery, the warning appears in the active terminal notice
+area and is retained after reconnection; repeated identical warnings are suppressed. Service-mode startup reports it on stderr for the service manager.
 
 Records contain a UTC timestamp with milliseconds, PID, level, and component:
 
