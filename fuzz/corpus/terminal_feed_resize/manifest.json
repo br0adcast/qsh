@@ -66,6 +66,61 @@
       "sha256": "0a3213a82eed7e1a0d5f9ebdd88a366c282c93cfbd482ea88ad395cdd9a70e89"
     },
     {
+      "name": "semantic-alt-grow",
+      "bytes": 4,
+      "sha256": "05bc5615f49cf64261be5715422df34ec993fb19223c68428e07af67dc2876fe"
+    },
+    {
+      "name": "semantic-csi-lf",
+      "bytes": 4,
+      "sha256": "1112da16eb081d8d3dedf4cfb31fb10f96d713988136da3dc00e9f0c8def0e0e"
+    },
+    {
+      "name": "semantic-max-geometry",
+      "bytes": 4,
+      "sha256": "45e08fef9aefd9edfeb8fdca83c5dc08d09354fec8d697df6537e0185d00eec0"
+    },
+    {
+      "name": "semantic-osc-at",
+      "bytes": 4,
+      "sha256": "a47232a8639d6fa5d50022a9c25e49348ff9bd04cf123f037394458ba8b75db9"
+    },
+    {
+      "name": "semantic-osc-below",
+      "bytes": 4,
+      "sha256": "155b9b7ead57d32eaf2ddfdf09de9941b62cb663d6d3dca7927c26e4016429c3"
+    },
+    {
+      "name": "semantic-osc-over",
+      "bytes": 4,
+      "sha256": "a5cd841a46ee26e2938bf35f9dbede380b6c77394393b53efda5df0299aefe10"
+    },
+    {
+      "name": "semantic-osc-st",
+      "bytes": 4,
+      "sha256": "a4f5e3963be27cc4b7d6b6c552a10b79838eef041ba3b9c8398b836652f32c94"
+    },
+    {
+      "name": "semantic-repeat-resize",
+      "bytes": 4,
+      "sha256": "3732ac465f48b13d187a9b02cacc18582acb123b3feee15feac9bf8437cc2d24"
+    },
+    {
+      "name": "semantic-saved-grow",
+      "bytes": 4,
+      "sha256": "b72bedc7203cd19ad4d7b955b0d4112296b05f0709998275c8c4efa3c7b1ade3"
+    },
+    {
+      "name": "semantic-sync-cut",
+      "bytes": 4,
+      "sha256": "bfc846017f4bf1a9a27d6bff431951df2f8eb8c7454484d8baabd4a4e6f7bc55"
+    },
+    {
+      "name": "semantic-wide-grow",
+      "bytes": 4,
+      "sha256": "82d3126b33c166427752dbf9c5c4a9ee5d2743d0c380c95df6196acac3ffa978"
+    },
+    {
       "name": "sgr",
       "bytes": 21,
       "sha256": "b4192683e2e49eb6261e16e3b6a77b187500db1ca6590b7218b404cadc5718b1"

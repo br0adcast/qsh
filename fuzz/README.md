@@ -17,19 +17,79 @@ keys, session data or user paths.
 | `handshake_payload` | raw msg1 or msg2 payload | 512 B | A successful parse survives canonical re-encoding. Accepted extension tails and absent compatibility fields are compared semantically, not by original byte equality. |
 | `wire_datagram` | full datagram, or a fixed handshake body | 2,048 B | A successful frame survives re-encoding. Key offers, cookie replies and cookie-wrapped msg1 bodies round-trip. |
 | `deframer` | raw control or shell record stream | 4,096 B | Feeding the same stream in several chunkings produces the same records, overflow state, buffered tail and sticky shell error. Decoded shell records re-encode exactly. |
-| `authorized_keys` | UTF-8 `authorized_keys` text | 8,192 B | Listing decisions are deterministic; ordinary tests pin bare, commented, restricted and malformed lines against one fixed public key. Invalid UTF-8 is outside this parser's boundary. |
-| `terminal_feed_resize` | four geometry bytes plus terminal input | 8,196 B | The real emulator accepts arbitrary feed/resize splits without panic, and the returned frame dimensions agree with the model after resizing. |
+| `authorized_keys` | UTF-8 `authorized_keys` text | 8,192 B | Determinism, independent closed-language permission decisions and bare/restricted-prefix properties against one fixed public key. Invalid UTF-8 is outside this parser's boundary. |
+| `terminal_feed_resize` | four geometry bytes plus terminal input | 8,196 B | Raw emulator robustness/geometry plus bounded generated daemon repaint, continuation, synchronized flush and OSC boundary properties. |
 
 The channel target checks the public channel decoders. The deframer target
 checks the record envelope separately; it is not a second channel parser. The
-terminal target checks robustness and geometry consistency, not visual
-correctness or every VT semantics. The authorized-keys target uses only a
+terminal target retains arbitrary-byte robustness and adds the explicitly
+bounded semantic domain below; it does not establish every VT semantics. The authorized-keys target uses only a
 public test key already present in the product's fingerprint fixtures.
+
+## Semantic domains
+
+The terminal input format and 8,196-byte raw cap are unchanged. The original
+four geometry bytes still select dimensions in 2..80 by 1..24, and all remaining
+bytes reach the history-128, replay-disabled robustness model unchanged.
+Independently, the first three bytes select a supported scene, bounded parameter
+and prefix cut. This generated lane uses history zero and replay enabled, matching
+the daemon. Each iteration runs one of 27 recipes, at most three models, three
+resizes and 16,384 generated VT bytes. Repaint size is bounded by model geometry,
+not by that generated-input limit.
+
+Recipes cover partial UTF-8/ESC/CSI/OSC/DCS, executed C0 controls, cancellation,
+primary/alternate and saved-cursor width growth, blank/wide boundaries,
+repeated shrink/grow/no-op/height-only resize, modes and synchronized output.
+Normal scenes use 10x3 or 2x5 models, with resize destinations up to 8x7. A
+separate short-text recipe selects one supported boundary geometry: 512x1,
+2x256 or 512x256. It does not multiply every scene by maximum geometry.
+
+A fresh replica and a replica that saw an actual prior prefix receive the
+source repaint. Full visible cells, cursor, exposed modes and palette, plus
+StateSnapshot equality, are checked after repaint, after subsequent bytes and
+after explicit synchronized-output flush. Replicas never repaint themselves
+to canonicalize a difference. Snapshot equality alone is not an independent
+VT oracle: literal cursor/text checks and historical defect controls accompany
+it. No C0 bytes or cell flags are removed from the strict comparator.
+
+The generated strict language avoids the replay exclusions documented in
+`crates/terminal/src/replay.rs`: title/hyperlink metadata, bottom-row wrap
+representation, orphan wide placeholders, certain origin-region cursor cases,
+and the inactive alternate saved cursor while primary is shown. The inactive
+saved-cursor ordinary test uses a client that already owns that state; it does
+not claim a fresh client can recover untransmitted state. A separate deterministic
+orphan trailing-spacer test pins the single lost flag for that exact recipe and
+its later visible character placement. Such characterization does not normalize
+arbitrary failures or admit orphan states into the strict generator. Arbitrary
+raw streams retain robustness coverage, without universal replay promises.
+
+The OSC recipe expands compact seeds into payloads of 8,191, 8,192 or 8,193
+counted bytes, including `0;` and excluding the two-byte ESC] introducer and
+BEL/ST terminator. Consequently it crosses the product limit without enlarging
+the arbitrary-input cap. A recording listener on the exact same vendored VTE
+0.15.0 parser verifies exact dispatch through 8,192 and whole-command rejection
+at 8,193, normal following text, and splits at the introducer, limit and ST.
+Terminal repaint/continuation is checked separately; title replay is not assumed.
+The direct VTE dependency enables std, already enabled through the terminal;
+source-aware graph checking remains required.
+
+Authorization retains arbitrary UTF-8 determinism and also generates at most
+16 canonical lines with at most 32 safe ASCII comment characters. The builder
+assigns an independent expected result from the first decisive bare, restricted
+or malformed matching line. It covers ASCII space/tab positives, Unicode/VT/FF
+prefix rejection, comments, other keys and both restriction/bare orders; it does
+not invoke the product Entry parser to calculate expectations. For arbitrary
+UTF-8 suffixes, a known bare-key prefix must allow and a known restricted-key
+prefix must deny. Each transformed listing is capped at 8,192 bytes on a UTF-8
+boundary; the original raw input is still checked separately. Invalid UTF-8
+remains outside the text parser's boundary, though its bytes can select a
+bounded generated recipe. These properties are deliberately conservative, not
+a full independent OpenSSH authorization implementation.
 
 ## Budgets
 
 The checked-in corpora are limited to 32 files and 256 KiB per target. The
-current corpora contain 15-19 seeds each. Input length limits are enforced by
+current corpora contain 15-26 seeds each. Input length limits are enforced by
 the shared property before allocation; the corpus budget is separate.
 
 The local qualification used libFuzzer's own budgets:

@@ -140,3 +140,6 @@ mod tests {
         exercise(&vec![0xff; MAX_INPUT + 1]);
     }
 }
+
+mod auth_semantics;
+mod terminal_semantics;
