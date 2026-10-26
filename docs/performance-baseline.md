@@ -728,3 +728,181 @@ support keeping that default and report the ranges observed on one 4-CPU
 VM. They do not show that worker counts are equivalent elsewhere, and
 establish no setting for hosts with many CPUs or for the system mode's 128
 sessions, which were not measured.
+
+## Frame storage reuse: 2026-10-26
+
+These runs compare the client's presentation path before and after #306
+reused frame storage, in process, without a daemon or a terminal. The
+end-to-end harness above cannot isolate it: a presented frame is a few
+hundred microseconds of client CPU between network events.
+
+### What a presented frame allocated
+
+Before the change, every presented frame allocated four complete cell grids:
+
+- the snapshot of the screen model;
+- the projection onto the display;
+- the copy with the status row;
+- the renderer's retained copy of what it drew.
+
+With the scroll shortcut, the renderer built a shifted copy too, and every
+snapshot allocated a new palette. A cell is 92 bytes, mostly the inline
+storage of 16 combining marks, so one grid is 880 KiB at 200x50 and 11.5 MiB
+at the largest display, 512x257.
+
+Since the change, each of these writes into storage kept from earlier frames.
+Every reused frame has one owner and is overwritten in full, so no frame
+shares cells with another. The cell representation is unchanged.
+
+### Procedure
+
+`cli/examples/frame_storage.rs` drives a `Session` with a status line,
+predictions off and a truecolor terminal, through a fixed workload. After
+16 warm-up steps it measures every step, which is one event or a short
+sequence of events. It runs in one of two modes:
+
+- **Counting mode** counts every heap allocation in the step: calls, bytes,
+  and allocations at least as large as one grid. It also records the live
+  heap, both after the step and at its peak within the step, and the
+  process's `VmRSS` and `VmHWM` at the end. Each workload runs in its own
+  process, so `VmHWM` is that workload's.
+- **Timed mode** (`--time`) only times the steps. Steps are timed with a
+  monotonic clock, so a step's time includes any preemption.
+
+Both modes hash everything written to the terminal, so two builds can be
+checked for identical output.
+
+| Workload | Each step |
+|---|---|
+| `stream-WxH` | One colored line of the full width on a full primary screen, so the screen scrolls under the status line. |
+| `append-512x257` | The same lines on an initially empty screen, which they do not fill within the measured steps. |
+| `echo-200x50` | One character, and a new prompt line every 40th step: an interactive echo. |
+| `alternate-WxH` | On the alternate screen, every row rewritten with new text and color: a full-screen application. |
+| `combining-200x50` | As `alternate`, with four combining marks on every cell, all changing. |
+| `history-200x50` | In the history view over 2,000 lines, page up four times and then down four times. |
+| `resize-200x50` | The display alternates between 160x40 and 200x50, the shell geometry follows, and one line is printed. |
+
+`WxH` is the display. The shell is one row shorter because of the status
+line, and a grid holds the shell's cells.
+
+The builds compared are `main` at `2dc32d4` with the same harness file added,
+and the change at `09236be`. Each was built in release mode for glibc
+(`x86_64-unknown-linux-gnu`) and for musl (`x86_64-unknown-linux-musl`,
+built with `musl-gcc` as the release is), with rustc 1.98.1. The runs used 5
+interleaved pairs: within each pair and libc, `main` ran first in odd pairs
+and the change first in even ones. Each build ran every workload in both
+modes, one process per workload and mode.
+
+The runs used the same host as above, which was not idle. Raw data and binary
+hashes are in
+[`performance/2026-10-26-frame-storage/`](performance/2026-10-26-frame-storage/).
+All 400 runs completed. For every workload and libc, every run of both builds
+in both modes wrote byte-identical terminal output.
+
+### Allocations and memory
+
+Allocation counts and heap figures were identical in all five pairs and for
+both libcs. They are shown as `main -> change`, per measured step:
+
+| Workload | Grid | Grid-sized allocations | Allocated KiB | Peak above live heap, KiB | Live heap after the step, KiB |
+|---|---:|---:|---:|---:|---:|
+| `stream-80x24` | 165 KiB | 4 -> 0 | 692 -> 15 | 512 -> 9 | 4,407 -> 4,580 |
+| `stream-200x50` | 880 KiB | 4 -> 0 | 3,613 -> 55 | 2,679 -> 35 | 9,054 -> 9,954 |
+| `stream-512x257` | 11,776 KiB | 4 -> 0 | 47,764 -> 567 | 35,422 -> 303 | 44,024 -> 55,847 |
+| `append-512x257` | 11,776 KiB | 4 -> 0 | 47,250 -> 53 | 35,422 -> 49 | 31,864 -> 43,687 |
+| `echo-200x50` | 880 KiB | 4 -> 0 | 3,580 -> 21 | 2,678 -> 19 | 4,326 -> 5,225 |
+| `alternate-200x50` | 880 KiB | 4 -> 0 | 3,674 -> 115 | 2,709 -> 64 | 4,339 -> 5,238 |
+| `alternate-512x257` | 11,776 KiB | 4 -> 0 | 48,338 -> 1,140 | 35,706 -> 587 | 31,994 -> 43,817 |
+| `combining-200x50` | 880 KiB | 4 -> 0 | 6,615 -> 3,056 | 2,925 -> 393 | 5,177 -> 6,076 |
+| `history-200x50` | 880 KiB | 5 -> 0 | 4,498 -> 57 | 2,680 -> 34 | 14,657 -> 15,575 |
+| `resize-200x50` | 880 KiB | 12 -> 2 | 14,693 -> 7,420 | 4,879 -> 4,408 | 9,487 -> 10,385 |
+
+Process memory at the end of each workload, as medians in KiB over five runs.
+Runs varied by at most about 2%.
+
+| Workload | glibc VmRSS | glibc VmHWM | musl VmRSS | musl VmHWM |
+|---|---:|---:|---:|---:|
+| `stream-80x24` | 5,464 -> 5,072 | 5,592 -> 5,072 | 3,500 -> 3,672 | 3,844 -> 3,676 |
+| `stream-200x50` | 11,996 -> 10,452 | 13,032 -> 10,452 | 8,760 -> 9,704 | 11,320 -> 9,704 |
+| `stream-512x257` | 80,424 -> 56,624 | 80,464 -> 56,844 | 44,232 -> 56,068 | 79,656 -> 56,444 |
+| `append-512x257` | 67,632 -> 44,216 | 79,496 -> 44,216 | 31,224 -> 43,096 | 66,632 -> 43,144 |
+| `echo-200x50` | 8,304 -> 5,672 | 8,304 -> 5,672 | 3,356 -> 4,252 | 5,992 -> 4,272 |
+| `alternate-200x50` | 6,844 -> 5,656 | 8,424 -> 5,656 | 3,440 -> 4,356 | 5,996 -> 4,368 |
+| `alternate-512x257` | 68,184 -> 44,484 | 79,868 -> 44,772 | 31,368 -> 43,208 | 67,060 -> 43,672 |
+| `combining-200x50` | 9,104 -> 7,200 | 9,192 -> 7,200 | 4,388 -> 5,292 | 7,148 -> 5,572 |
+| `history-200x50` | 17,748 -> 16,148 | 17,748 -> 16,148 | 14,988 -> 15,952 | 17,548 -> 15,956 |
+| `resize-200x50` | 13,172 -> 10,916 | 13,172 -> 10,916 | 9,192 -> 10,100 | 13,248 -> 13,116 |
+
+### CPU per presented step
+
+Medians, with the range over the five pairs, in microseconds. The last column
+counts the pairs in which the change was faster.
+
+| Workload | glibc `main` | glibc change | ratio | faster | musl `main` | musl change | ratio | faster |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `stream-80x24` | 138 [129-150] | 126 [115-128] | 0.92 | 5/5 | 648 [633-655] | 422 [414-459] | 0.65 | 5/5 |
+| `stream-200x50` | 880 [812-901] | 738 [701-814] | 0.84 | 5/5 | 3,637 [3,587-3,777] | 2,434 [2,340-2,531] | 0.67 | 5/5 |
+| `stream-512x257` | 18,184 [17,809-18,587] | 15,537 [15,315-16,602] | 0.85 | 5/5 | 41,687 [41,076-42,214] | 35,021 [34,423-35,882] | 0.84 | 5/5 |
+| `append-512x257` | 81,638 [78,915-87,169] | 82,097 [77,322-85,910] | 1.01 | 3/5 | 479,439 [476,912-484,312] | 467,914 [464,461-469,180] | 0.98 | 5/5 |
+| `echo-200x50` | 981 [940-1,029] | 790 [745-808] | 0.81 | 5/5 | 6,222 [5,867-6,316] | 4,625 [4,446-4,939] | 0.74 | 5/5 |
+| `alternate-200x50` | 1,481 [1,260-1,581] | 849 [781-878] | 0.57 | 5/5 | 2,804 [2,647-2,935] | 1,489 [1,438-1,703] | 0.53 | 5/5 |
+| `alternate-512x257` | 19,070 [18,693-19,919] | 16,817 [16,636-17,682] | 0.88 | 5/5 | 30,760 [28,472-32,144] | 23,536 [23,294-24,229] | 0.77 | 5/5 |
+| `combining-200x50` | 3,690 [3,440-4,601] | 3,678 [3,426-4,160] | 1.00 | 3/5 | 7,880 [7,438-8,251] | 6,981 [6,365-7,437] | 0.89 | 5/5 |
+| `history-200x50` | 1,100 [1,077-1,236] | 1,019 [953-1,069] | 0.93 | 5/5 | 4,285 [3,979-4,545] | 2,571 [2,467-2,855] | 0.60 | 5/5 |
+| `resize-200x50` | 5,476 [5,126-5,896] | 3,681 [3,549-4,363] | 0.67 | 5/5 | 13,970 [13,679-14,610] | 11,325 [11,107-12,388] | 0.81 | 5/5 |
+
+### What these runs show, for this host only
+
+- **Grid allocations are gone from steady presentation.** No step of any
+  workload but `resize` allocates a grid. Allocated bytes per step fall by a
+  factor of 30 to 900. The exceptions are `resize` and `combining-200x50`,
+  where the emulator's own per-cell storage for combining marks dominates.
+  Outside `resize`, the peak heap within a step falls from about three grids
+  to well under one.
+- **Two allocations remain per resize.** A size change invalidates the
+  renderer, which then drops its retained frame and copies the next frame
+  anew. Both paints of a resize step do this. The emulator's own resize
+  allocations are unchanged.
+- **One more grid is retained.** Between steps, the shell keeps the replaced
+  painted frame for its next snapshot, which adds one grid to the live heap:
+  0.9 MiB at 200x50 and 11.5 MiB at 512x257. The peak falls by more than it
+  adds. How this shows in process memory depends on the allocator:
+  - glibc kept freed grids, so `VmRSS` and `VmHWM` fall, by about 23 MiB
+    at 512x257.
+  - musl returned each freed grid to the system, so `VmRSS` rises by about
+    one grid, while `VmHWM` falls, by up to about 23 MiB.
+
+  The shell keeps at most two such frames. Storage more than twice the size
+  a frame needs is replaced rather than reused, so a shrunken display does
+  not keep the larger grid.
+- **CPU per step falls in most workloads.** The change was faster in all
+  five pairs for 18 of the 20 workload and libc combinations:
+  - with glibc, the median fell by 7-43%;
+  - with musl, whose allocator maps and unmaps large blocks, it fell by
+    11-47%, and by 2% for `append-512x257`.
+
+  The two exceptions, `append-512x257` and `combining-200x50` with glibc,
+  are unchanged within their spread.
+- **Much of the remaining time is elsewhere.** These causes are not part of
+  this change:
+  - **Scroll detection.** `append-512x257` costs 80 ms per line with glibc
+    and 470 ms with musl. A profile of `main` attributes 60% of it to
+    `Renderer::render`. By the code, the cause is scroll detection: on a
+    screen whose top rows do not change, `scrolled_by` compares the
+    unchanged rows again for every candidate shift, which is quadratic in
+    the number of rows.
+  - **Remaining full-grid passes.** In the glibc profile of `echo-200x50`,
+    a step spends its time in rendering, model extraction and projection,
+    each a full pass over the grid.
+  - **Cell comparison under musl.** The musl profile of `echo-200x50`
+    spends 73% of its time in `memcmp`. The call stacks could not be
+    unwound in the static binary, so the source is not established. The
+    likely source is the comparison of whole cells, including all 16
+    combining-mark slots of every cell, when deciding whether a frame
+    changed and when diffing rows.
+
+These runs measure frame storage only. Representing combining marks
+differently, comparing only the marks a cell holds, damage-tracked row
+updates, and avoiding the duplicate retained frame in the session and the
+renderer remain separate decisions, for which these figures are the
+baseline.
