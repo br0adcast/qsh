@@ -378,19 +378,19 @@ class RelayAndTerminalTests(unittest.TestCase):
         writer = os.dup(terminal.slave)
         terminal.start()
         master = terminal.master
-        alive_at_release = []
-        release = terminal.release
-        terminal.release = lambda: (alive_at_release.append(terminal.thread.is_alive()), release())
+        reading_at_release = self.watch_release(terminal)
         try:
             os.write(writer, b'x')
             terminal.wait_for(b'x', 2)
+            self.assertTrue(terminal.reading)
             self.assertTrue(terminal.close())
-            self.assertEqual(alive_at_release, [False])
+            self.assertEqual(reading_at_release, [False])
             self.assertFalse(is_open(master))
             self.assertTrue(terminal.close())
-            self.assertEqual(alive_at_release, [False])
+            self.assertEqual(reading_at_release, [False])
         finally:
             os.close(writer)
+            self.stop_fixture_thread(terminal)
 
     def test_reader_that_does_not_give_custody_back_keeps_the_descriptors_open(self):
         terminal = perf.Terminal(80, 24)
@@ -403,6 +403,66 @@ class RelayAndTerminalTests(unittest.TestCase):
             terminal.reading = False
         self.assertTrue(terminal.close())
         self.assertEqual([is_open(fd) for fd in descriptors], [False] * 4)
+
+    def watch_release(self, terminal):
+        """Whether the reader held custody each time the descriptors were
+        released. The contract is custody given back, not a finished thread:
+        the thread may still be unwinding after it gave custody back."""
+        seen = []
+        release = terminal.release
+
+        def watched():
+            with terminal.custody:
+                seen.append(terminal.reading)
+            release()
+
+        terminal.release = watched
+        return seen
+
+    def stop_fixture_thread(self, terminal):
+        """Stop and join the reader thread, then release, whatever the test
+        asserted."""
+        if not terminal.released:
+            os.write(terminal.wake_write, b'x')
+        terminal.thread.join(5)
+        self.assertFalse(terminal.thread.is_alive())
+        self.assertTrue(terminal.close())
+
+    def test_release_follows_custody_even_while_the_thread_is_still_unwinding(self):
+        terminal = perf.Terminal(80, 24)
+        writer = os.dup(terminal.slave)
+        master = terminal.master
+        drained, gate = threading.Event(), threading.Event()
+        drain = terminal.drain
+
+        def drain_then_pause():
+            drain()
+            drained.set()
+            gate.wait(5)
+
+        terminal.thread = threading.Thread(target=drain_then_pause, daemon=True)
+        alive_at_release = []
+        release = terminal.release
+        terminal.release = lambda: (alive_at_release.append(terminal.thread.is_alive()), release())
+        try:
+            terminal.start()
+            deadline = time.monotonic() + 5
+            while not terminal.reading:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            # The reader gives custody back but its thread has not exited.
+            os.write(terminal.wake_write, b'x')
+            self.assertTrue(drained.wait(5))
+            self.assertTrue(terminal.close(timeout=0.1))
+            self.assertEqual(alive_at_release, [True])
+            self.assertFalse(terminal.reading)
+            self.assertFalse(is_open(master))
+        finally:
+            gate.set()
+            os.close(writer)
+            terminal.thread.join(5)
+            self.assertFalse(terminal.thread.is_alive())
+            self.assertTrue(terminal.close())
 
     def interrupted_start(self, terminal, entered):
         """Start the reader for real, then raise a termination signal before
@@ -443,16 +503,15 @@ class RelayAndTerminalTests(unittest.TestCase):
         terminal = perf.Terminal(80, 24)
         writer = os.dup(terminal.slave)
         master = terminal.master
-        alive_at_release = []
-        release = terminal.release
-        terminal.release = lambda: (alive_at_release.append(terminal.thread.is_alive()), release())
+        reading_at_release = self.watch_release(terminal)
         try:
             self.interrupted_start(terminal, entered=True)
             self.assertTrue(terminal.close())
-            self.assertEqual(alive_at_release, [False])
+            self.assertEqual(reading_at_release, [False])
             self.assertFalse(is_open(master))
         finally:
             os.close(writer)
+            self.stop_fixture_thread(terminal)
 
     def test_terminal_setup_failure_closes_both_descriptors(self):
         opened = []
