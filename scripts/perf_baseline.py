@@ -18,12 +18,14 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import pwd
 import random
 import re
 import select
+import shutil
 import signal
 import socket
 import statistics
@@ -36,8 +38,8 @@ import threading
 import time
 
 
-TOOL_VERSION = 3
-WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained")
+TOOL_VERSION = 4
+WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
 SETTLE = 2.0
@@ -53,6 +55,11 @@ FRAME_MARKERS = (b"\x1b[?25h", b"\x1b[?25l")
 ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 PR_SET_CHILD_SUBREAPER = 36
 PARENT_ENVIRONMENT = ("PATH",)
+RUNTIME_WORKERS = re.compile(r"runtime workers (\d+)")
+# The system mode's diagnostic log, a fixed path (qshd's SYSTEM_LOG_DIR).
+SYSTEM_LOG = Path("/var/log/qshd/qshd.log")
+# Set only on a disposable machine, as for qshd's own system-mode suites.
+DISPOSABLE_HOST_VAR = "QSHD_TEST_DISPOSABLE_HOST"
 
 REDRAW_SCRIPT = """\
 import sys, time
@@ -278,6 +285,39 @@ def build_spec(text):
     if not separator or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not directory:
         raise argparse.ArgumentTypeError(f"expected NAME=DIRECTORY, got {text!r}")
     return name, Path(directory)
+
+
+def cpu_list(text):
+    """A Linux CPU list such as `0`, `0-1` or `0,2-3`, as a sorted list."""
+    cpus = set()
+    for part in text.split(","):
+        first, separator, last = part.partition("-")
+        if not first.isdigit() or (separator and not last.isdigit()):
+            raise argparse.ArgumentTypeError(f"expected a CPU list such as 0-1,3, got {text!r}")
+        cpus.update(range(int(first), int(last if separator else first) + 1))
+    if not cpus:
+        raise argparse.ArgumentTypeError(f"empty CPU list {text!r}")
+    return sorted(cpus)
+
+
+def cpu_text(cpus):
+    return ",".join(str(cpu) for cpu in cpus)
+
+
+def variant_spec(text):
+    """NAME=BUILD[,system][,cpus=LIST][,threads=N]: a build, whether qshd
+    runs in the system mode, the CPUs it may run on, and how many async
+    runtime workers it is told to run."""
+    name, separator, rest = text.partition("=")
+    fields = re.fullmatch(r"([A-Za-z0-9_.-]+)(,system)?(?:,cpus=([0-9,-]+?))?(?:,threads=([0-9]+))?", rest)
+    if not separator or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not fields:
+        raise argparse.ArgumentTypeError(f"expected NAME=BUILD[,system][,cpus=LIST][,threads=N], got {text!r}")
+    build, system, cpus, threads = fields.groups()
+    if threads is not None and int(threads) < 1:
+        raise argparse.ArgumentTypeError(f"threads must be at least 1, got {text!r}")
+    return name, {"build": build, "mode": "system" if system else "personal",
+                  "qshd_cpus": cpu_list(cpus) if cpus else None,
+                  "runtime_threads": int(threads) if threads else None}
 
 
 # --- Ordering and statistics -------------------------------------------------
@@ -628,15 +668,21 @@ def spawn_on(terminal, command, env, cwd):
 
 
 class Relay:
-    """UDP relay between one client and the daemon: exact per-run traffic."""
+    """UDP relay between the clients and the daemon: exact per-run traffic.
+
+    Each client address gets its own socket toward the daemon, so the
+    daemon sees every client at an address of its own and each reply goes
+    back to the client it was sent to.
+    """
 
     def __init__(self, daemon_port):
+        self.daemon_port = daemon_port
         self.front = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.front.bind(("127.0.0.1", 0))
         self.port = self.front.getsockname()[1]
-        self.back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.back.connect(("127.0.0.1", daemon_port))
-        self.client = None
+        # Client address -> its socket toward the daemon, and back.
+        self.backs = {}
+        self.clients = {}
         self.cut = False
         self.stopping = False
         self.condition = threading.Condition()
@@ -647,9 +693,18 @@ class Relay:
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
 
+    def back_for(self, client):
+        back = self.backs.get(client)
+        if back is None:
+            back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            back.connect(("127.0.0.1", self.daemon_port))
+            self.backs[client] = back
+            self.clients[back] = client
+        return back
+
     def loop(self):
         while not self.stopping:
-            ready, _, _ = select.select([self.front, self.back], [], [], 0.1)
+            ready, _, _ = select.select([self.front, *self.clients], [], [], 0.1)
             for sock in ready:
                 try:
                     data, source = sock.recvfrom(65536)
@@ -661,21 +716,18 @@ class Relay:
                         self.counts["dropped_datagrams"] += 1
                         continue
                     if sock is self.front:
-                        self.client = source
                         self.counts["c2s_datagrams"] += 1
                         self.counts["c2s_bytes"] += len(data)
                         self.c2s_arrivals.append(now)
                         self.condition.notify_all()
-                        target = None
                     else:
                         self.counts["s2c_datagrams"] += 1
                         self.counts["s2c_bytes"] += len(data)
-                        target = self.client
                 try:
                     if sock is self.front:
-                        self.back.send(data)
-                    elif target:
-                        self.front.sendto(data, target)
+                        self.back_for(source).send(data)
+                    else:
+                        self.front.sendto(data, self.clients[sock])
                 except OSError:
                     pass
 
@@ -712,7 +764,8 @@ class Relay:
         self.stopping = True
         self.thread.join(2)
         self.front.close()
-        self.back.close()
+        for back in self.backs.values():
+            back.close()
 
 
 def udp_inodes(port):
@@ -742,22 +795,45 @@ def socket_inodes(pid):
     return found
 
 
-def holds_port(owned, port):
+def holds_port(owned, port, also=()):
     """Whether the owned, still running process holds `port`.
 
     Fails when the process has exited, or when any socket bound to the port
     belongs to another process: traffic must never reach a foreign listener.
     The process is unreaped while its descriptors are read, so its PID
-    cannot have been reused.
+    cannot have been reused. `also` names its own children, such as the
+    system mode's worker, that may hold the port too.
     """
     if owned.wait(0):
         raise SetupError(f"qshd exited with {owned.status}")
     bound = udp_inodes(port)
     if not bound:
         return False
-    if bound - socket_inodes(owned.pid):
+    held = socket_inodes(owned.pid)
+    for pid in also:
+        try:
+            held |= socket_inodes(pid)
+        except OSError:
+            raise SetupError(f"qshd's worker {pid} is gone") from None
+    if bound - held:
         raise SetupError(f"UDP port {port} is bound by a process other than the owned qshd")
     return True
+
+
+def write_as(account, path, data, mode):
+    """Write a file in an account's home, owned by that account."""
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    os.chown(path.parent, account.pw_uid, account.pw_gid)
+    path.write_bytes(data)
+    os.chown(path, account.pw_uid, account.pw_gid)
+    os.chmod(path, mode)
+
+
+def uid_of(pid):
+    for line in read(f"/proc/{pid}/status").splitlines():
+        if line.startswith("Uid:"):
+            return int(line.split()[1])
+    raise SetupError(f"no Uid line for {pid}")
 
 
 def free_udp_port():
@@ -769,10 +845,12 @@ def free_udp_port():
 # --- One run ---------------------------------------------------------------
 
 class Rig:
-    def __init__(self, build, root):
-        self.build = build
+    def __init__(self, variant, root):
+        self.build = variant["directory"]
+        self.variant = variant
         self.root = root
         self.daemon = None
+        self.daemon_facts = {}
         self.relay = None
         self.port = None
         self.terminals = []
@@ -782,35 +860,124 @@ class Rig:
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "qsh-bench", "-f", str(self.key)],
                        check=True, capture_output=True, timeout=30,
                        env=minimal_environment(self.server_home))
-        (self.server_home / "authorized_keys").write_bytes((self.server_home / "id_ed25519.pub").read_bytes())
-        (self.server_home / "redraw.py").write_text(REDRAW_SCRIPT, encoding="utf-8")
+        public = (self.server_home / "id_ed25519.pub").read_bytes()
+        # The system mode serves an existing account: its sessions start in
+        # that account's home, and its helper reads that account's keys.
+        self.system = variant.get("mode") == "system"
+        self.worker = None
+        self.log_offset = 0
+        if self.system:
+            self.account = pwd.getpwnam(variant["system_account"])
+            self.session_home = Path(self.account.pw_dir)
+            write_as(self.account, self.session_home / ".ssh" / "authorized_keys", public, 0o600)
+            write_as(self.account, self.session_home / "redraw.py", REDRAW_SCRIPT.encode(), 0o644)
+        else:
+            self.session_home = self.server_home
+            (self.server_home / "authorized_keys").write_bytes(public)
+            (self.server_home / "redraw.py").write_text(REDRAW_SCRIPT, encoding="utf-8")
 
     def start_daemon(self):
         port = free_udp_port()
         env = minimal_environment(self.server_home, {"SHELL": "/bin/sh", "ZDOTDIR": str(self.server_home),
                                                      "BASH_ENV": "/dev/null", "ENV": "/dev/null"})
-        self.daemon = Daemon([str(self.build / "qshd"), "serve", "--port", str(port),
-                              "--authorized-keys", str(self.server_home / "authorized_keys"),
-                              "--host-key", str(self.server_home / "host_key")],
-                             env, self.root / "qshd.log", self.server_home)
+        cpus, threads = self.variant["effective_qshd_cpus"], self.variant["runtime_threads"]
+        # taskset sets the CPUs before it executes qshd, in the same process,
+        # so the runtime sizes its default from them.
+        command = (["taskset", "-c", cpu_text(cpus)] if cpus else []) + [
+            str(self.build / "qshd"), "serve", "--port", str(port),
+            "--host-key", str(self.server_home / "host_key")]
+        if self.system:
+            command += ["--system", "--worker-user", self.variant["worker_user"],
+                        "--authorized-keys-template", "%h/.ssh/authorized_keys"]
+            self.log_offset = SYSTEM_LOG.stat().st_size if SYSTEM_LOG.exists() else 0
+        else:
+            command += ["--authorized-keys", str(self.server_home / "authorized_keys")]
+        if threads is not None:
+            command += ["--runtime-threads", str(threads)]
+        self.daemon = Daemon(command, env, self.root / "qshd.log", self.server_home)
         deadline = time.monotonic() + SETUP_TIMEOUT
-        while not holds_port(self.daemon, port):
+        while self.system and self.worker is None:
+            self.worker = self.find_worker()
+            if self.worker is None:
+                if self.daemon.wait(0) or time.monotonic() > deadline:
+                    raise SetupError("qshd started no worker")
+                time.sleep(0.05)
+        while not holds_port(self.daemon, port, self.also()):
             if time.monotonic() > deadline:
                 raise SetupError("qshd did not bind its port")
             time.sleep(0.05)
         self.port = port
+        self.daemon_facts = self.daemon_identity(deadline)
         self.relay = Relay(port)
 
+    def also(self):
+        return [self.worker] if self.worker else []
+
+    def runtime_pid(self):
+        """The process that runs the async runtime: the system mode's
+        worker, or the personal daemon itself."""
+        return self.worker or self.daemon.pid
+
+    def find_worker(self):
+        """The system mode's worker: the helper's child that has dropped to
+        the worker account."""
+        worker_uid = pwd.getpwnam(self.variant["worker_user"]).pw_uid
+        found = []
+        for pid, _ in children_of(self.daemon.pid):
+            try:
+                if uid_of(pid) == worker_uid:
+                    found.append(pid)
+            except OSError:
+                continue
+        if len(found) > 1:
+            raise SetupError(f"qshd has {len(found)} worker processes")
+        return found[0] if found else None
+
+    def session_processes(self):
+        return [child for child in children_of(self.daemon.pid) if child[0] != self.worker]
+
+    def daemon_identity(self, deadline):
+        """The CPUs the running qshd may use and the runtime workers its log
+        reports, checked against what the variant asked for."""
+        status = dict(line.partition(":")[::2] for line in read(f"/proc/{self.runtime_pid()}/status").splitlines())
+        allowed = cpu_list(status["Cpus_allowed_list"].strip())
+        cpus, threads = self.variant["effective_qshd_cpus"], self.variant["runtime_threads"]
+        if cpus and allowed != cpus:
+            raise SetupError(f"qshd runs on CPUs {cpu_text(allowed)}, expected {cpu_text(cpus)}")
+        log = SYSTEM_LOG if self.system else self.server_home / ".cache" / "qsh" / "qshd.log"
+        workers = None
+        while workers is None:
+            try:
+                with open(log, "rb") as source:
+                    source.seek(self.log_offset)
+                    found = RUNTIME_WORKERS.search(source.read().decode("utf-8", "replace"))
+            except FileNotFoundError:
+                found = None
+            if found:
+                workers = int(found.group(1))
+            elif threads is None or time.monotonic() > deadline:
+                # Builds without the log line report nothing; that is only
+                # an error when a worker count was asked for.
+                break
+            else:
+                time.sleep(0.05)
+        if threads is not None and workers != threads:
+            raise SetupError(f"qshd reports {workers} runtime workers, expected {threads}")
+        facts = {"allowed_cpus": allowed, "runtime_workers": workers}
+        if self.system:
+            facts["mode"] = "system"
+        return facts
+
     def start_client(self, name, options=()):
-        if not holds_port(self.daemon, self.port):
+        if not holds_port(self.daemon, self.port, self.also()):
             raise SetupError("qshd no longer holds its port")
         home = private_home(self.root / name)
         terminal = Terminal(COLS, ROWS)
         self.terminals.append(terminal)
         env = minimal_environment(home, {"TERM": "xterm-256color", "HTTPS_PROXY": "http://127.0.0.1:1",
                                          "https_proxy": "http://127.0.0.1:1", "NO_PROXY": "", "no_proxy": ""})
-        command = [str(self.build / "qsh"), "--port", str(self.relay.port), "-i", str(self.key), *options,
-                   "127.0.0.1"]
+        target = f"{self.account.pw_name}@127.0.0.1" if self.system else "127.0.0.1"
+        command = [str(self.build / "qsh"), "--port", str(self.relay.port), "-i", str(self.key), *options, target]
         client = Client(spawn_on(terminal, command, env, home), terminal)
         self.clients.append(client)
         terminal.start()
@@ -822,7 +989,10 @@ class Rig:
         return client
 
     def snapshot(self, client=None):
-        state = {"t": time.monotonic(), "qshd": sample_process(self.daemon.pid), "relay": self.relay.snapshot()}
+        state = {"t": time.monotonic(), "qshd": sample_process(self.runtime_pid()), "relay": self.relay.snapshot()}
+        if self.system:
+            # The privileged helper: sessions, PAM and verdicts.
+            state["qshd_helper"] = sample_process(self.daemon.pid)
         if client is not None:
             state["qsh"] = sample_process(client.pid)
             state["terminal"] = client.terminal.counters()
@@ -854,6 +1024,8 @@ class Client(Owned):
 def window(before, after):
     seconds = after["t"] - before["t"]
     result = {"seconds": round(seconds, 3), "qshd": process_delta(before["qshd"], after["qshd"], seconds)}
+    if "qshd_helper" in before:
+        result["qshd_helper"] = process_delta(before["qshd_helper"], after["qshd_helper"], seconds)
     relay = {key: after["relay"][key] - before["relay"][key] for key in before["relay"]}
     relay.update({f"{key}_per_s": round(value / seconds, 2) for key, value in list(relay.items())})
     result["relay"] = relay
@@ -958,7 +1130,7 @@ def run_retained(rig, settings):
         if not client.wait(SETUP_TIMEOUT):
             raise SetupError(f"client {index} did not leave after Ctrl-] .")
     time.sleep(SETTLE)
-    shells = len(children_of(rig.daemon.pid))
+    shells = len(rig.session_processes())
     if shells != settings.retained_sessions:
         raise SetupError(f"{shells} session processes under qshd, expected {settings.retained_sessions}")
     before = rig.snapshot()
@@ -966,18 +1138,65 @@ def run_retained(rig, settings):
     return {"window": window(before, rig.snapshot()), "sessions": settings.retained_sessions}
 
 
+def run_busy(rig, settings):
+    """Echo latency of one typing session while `busy_sessions` others
+    redraw their whole screen, all through the same qshd.
+
+    Only echoes are measured: with several clients behind the relay, the
+    next client datagram need not be the typing client's.
+    """
+    probe = rig.start_client("probe", ("--predict", "never", "--status", "off"))
+    probe.terminal.write(b"stty -icanon; cat > /dev/null\n")
+    seconds = math.ceil(settings.keystrokes * settings.key_interval + 3 * SETTLE + 5)
+    busy = [rig.start_client(f"busy-{index}") for index in range(settings.busy_sessions)]
+    launches = []
+    for client in busy:
+        launches.append((client.terminal.counters()[0], time.monotonic()))
+        client.terminal.write(f"python3 ~/redraw.py {settings.redraw_fps} {seconds} {COLS} {ROWS - 1}; "
+                              f"echo BUSY-$((6*7))\n".encode())
+    time.sleep(SETTLE)
+    echo = []
+    before = rig.snapshot(probe)
+    bytes_before = sum(client.terminal.counters()[0] for client in busy)
+    for index in range(settings.keystrokes):
+        key = KEYS[index % len(KEYS):index % len(KEYS) + 1]
+        offset = probe.terminal.counters()[0]
+        start = time.monotonic()
+        probe.terminal.write(key)
+        try:
+            echo.append((probe.terminal.wait_for(key, 2.0, offset) - start) * 1000)
+        except SetupError:
+            pass
+        time.sleep(max(0.0, settings.key_interval - (time.monotonic() - start)))
+    result = {"window": window(before, rig.snapshot(probe)), "sessions": settings.busy_sessions + 1,
+              "keystrokes": settings.keystrokes, "missing_echoes": settings.keystrokes - len(echo)}
+    delivered = sum(client.terminal.counters()[0] for client in busy) - bytes_before
+    result["busy_terminal_bytes_per_s"] = round(delivered / result["window"]["seconds"])
+    result["echo_ms"] = {"p50": percentile(echo, 0.5), "p90": percentile(echo, 0.9),
+                         "max": max(echo) if echo else None, "samples": [round(v, 3) for v in echo]}
+    # Each redraw paces itself and runs `seconds` when its output is never
+    # held back; how much longer it took is how far qshd fell behind.
+    overrun = [client.terminal.wait_for(b"BUSY-42", seconds + 60, offset) - launched - seconds
+               for client, (offset, launched) in zip(busy, launches)]
+    result["busy_overrun_s"] = {"median": round(statistics.median(overrun), 3), "max": round(max(overrun), 3)}
+    if result["missing_echoes"]:
+        raise Incomplete(f"{len(echo)} of {settings.keystrokes} echoes observed", result)
+    return result
+
+
 RUNNERS = {"idle": run_idle, "typing": run_typing, "redraw": run_redraw, "saturation": run_saturation,
-           "reconnect": run_reconnect, "retained": run_retained}
+           "reconnect": run_reconnect, "retained": run_retained, "busy": run_busy}
 
 
-def run_one(build, workload, settings, root):
+def run_one(variant, workload, settings, root):
     record = {"workload": workload, "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "ok": False}
     harness_before = os.times()
     rig = None
     try:
-        rig = Rig(build, root)
+        rig = Rig(variant, root)
         rig.start_daemon()
+        record["qshd"] = rig.daemon_facts
         record["result"] = RUNNERS[workload](rig, settings)
         record["ok"] = True
     except Incomplete as error:
@@ -1022,24 +1241,62 @@ def command_run(args):
         for binary in ("qsh", "qshd"):
             if not os.access(directory / binary, os.X_OK):
                 sys.exit(f"{name}: {binary} is not an executable in the given directory")
+    variants = dict(args.variant or [])
+    if len(variants) != len(args.variant or []):
+        sys.exit("variant names must be unique")
+    if not variants:
+        variants = {name: {"build": name, "mode": "personal", "qshd_cpus": None, "runtime_threads": None}
+                    for name in builds}
+    allowed = sorted(os.sched_getaffinity(0))
+    if any(variant.get("mode") == "system" for variant in variants.values()):
+        # It writes the account's authorized_keys and runs qshd as root.
+        if os.geteuid() != 0 or os.environ.get(DISPOSABLE_HOST_VAR) != "1":
+            sys.exit(f"system-mode variants run only as root on a disposable host ({DISPOSABLE_HOST_VAR}=1)")
+        if not args.system_account:
+            sys.exit("system-mode variants need --system-account")
+        for account in (args.system_account, args.worker_user):
+            try:
+                pwd.getpwnam(account)
+            except KeyError:
+                sys.exit(f"no account named {account}")
+    for name, variant in variants.items():
+        variant.setdefault("mode", "personal")
+        if variant["mode"] == "system":
+            variant.update(system_account=args.system_account, worker_user=args.worker_user)
+        if variant["build"] not in builds:
+            sys.exit(f"variant {name}: no build named {variant['build']}")
+        if not set(variant["qshd_cpus"] or []) <= set(allowed):
+            sys.exit(f"variant {name}: CPUs {cpu_text(variant['qshd_cpus'])} are not all available")
+        if (variant["qshd_cpus"] or args.harness_cpus) and not shutil.which("taskset"):
+            sys.exit("placing qshd on CPUs needs taskset")
+        # A qshd without CPUs of its own keeps every CPU the harness had.
+        variant["effective_qshd_cpus"] = variant["qshd_cpus"] or (allowed if args.harness_cpus else None)
+    if args.harness_cpus:
+        if not set(args.harness_cpus) <= set(allowed):
+            sys.exit(f"harness CPUs {cpu_text(args.harness_cpus)} are not all available")
+        # Before any thread or child exists, so all of them inherit it.
+        os.sched_setaffinity(0, args.harness_cpus)
     become_subreaper()
     install_signal_handlers()
     workloads = args.workloads.split(",")
     unknown = sorted(set(workloads) - set(WORKLOADS))
     if unknown:
         sys.exit(f"unknown workloads: {', '.join(unknown)}")
-    order = schedule(builds, workloads, args.repetitions, args.order, args.seed)
+    if "busy" in workloads and args.busy_sessions < 1:
+        sys.exit("the busy workload needs at least one busy session")
+    order = schedule(variants, workloads, args.repetitions, args.order, args.seed)
     manifest = {
         "tool_version": TOOL_VERSION,
         "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "source": {"commit": args.source_commit, "note": args.note},
-        "host": host_identity(),
+        "host": dict(host_identity(), allowed_cpus=allowed),
         "settings": {key: getattr(args, key) for key in ("repetitions", "order", "seed", "window", "keystrokes",
                                                          "key_interval", "redraw_fps", "saturation_lines",
-                                                         "retained_sessions")},
+                                                         "retained_sessions", "busy_sessions", "harness_cpus")},
         "terminal": {"cols": COLS, "rows": ROWS},
         "workloads": workloads,
         "builds": identify(builds),
+        "variants": variants,
         "order": [{"index": index, "repetition": rep, "workload": workload, "build": name}
                   for index, (rep, workload, name) in enumerate(order)],
     }
@@ -1047,7 +1304,8 @@ def command_run(args):
     failed = 0
     try:
         with tempfile.TemporaryDirectory(prefix="qsh-perf-") as scratch:
-            failed = run_all(order, builds, args, Path(scratch), out)
+            failed = run_all(order, {name: dict(variant, directory=builds[variant["build"]])
+                                     for name, variant in variants.items()}, args, Path(scratch), out)
     except Interrupted as signal_name:
         leftovers = reap_owned(time.monotonic() + 10)
         print(f"interrupted by {signal_name}; completed runs are in {out}"
@@ -1065,12 +1323,12 @@ def identify(builds):
         sys.exit(f"cannot identify the builds: {error}")
 
 
-def run_all(order, builds, args, scratch, out):
+def run_all(order, variants, args, scratch, out):
     failed = 0
     for index, (repetition, workload, name) in enumerate(order):
         root = scratch / f"{index:04d}"
         root.mkdir(mode=0o700)
-        record = run_one(builds[name], workload, args, root)
+        record = run_one(variants[name], workload, args, root)
         record.update({"index": index, "repetition": repetition, "build": name})
         path = out / "runs" / f"{index:04d}-{name}-{workload}-{repetition}.json"
         path.write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
@@ -1102,7 +1360,7 @@ def summary(manifest, runs):
             table.setdefault(run["workload"], {}).setdefault(metric, {}).setdefault(run["build"], []).append(
                 (run["repetition"], value))
     rows = []
-    builds = list(manifest["builds"])
+    builds = columns(manifest)
     for workload in manifest["workloads"]:
         for metric, per_build in sorted(table.get(workload, {}).items()):
             row = {"workload": workload, "metric": metric, "builds": {}}
@@ -1132,9 +1390,15 @@ def number(value):
     return f"{value:.3g}"
 
 
+def columns(manifest):
+    """Variants are what runs are named after; manifests before version 4
+    name runs after their builds."""
+    return list(manifest.get("variants") or manifest["builds"])
+
+
 def markdown(manifest, result, metrics=None):
     lines = []
-    builds = list(manifest["builds"])
+    builds = columns(manifest)
     header = "| Workload | Metric | " + " | ".join(f"{b} median (p25-p75, n)" for b in builds) + " |"
     if len(builds) == 2:
         header += f" {builds[1]}/{builds[0]} | pairs with {builds[1]} lower (tied) |"
@@ -1187,6 +1451,15 @@ def main():
     run.add_argument("--redraw-fps", type=int, default=20)
     run.add_argument("--saturation-lines", type=int, default=2_000_000)
     run.add_argument("--retained-sessions", type=int, default=8)
+    run.add_argument("--busy-sessions", type=int, default=4, help="redrawing sessions beside the typing one")
+    run.add_argument("--variant", action="append", type=variant_spec,
+                     metavar="NAME=BUILD[,system][,cpus=LIST][,threads=N]",
+                     help="run a build with qshd on these CPUs and with this many runtime workers; "
+                          "repeat to compare (default: each build as it is)")
+    run.add_argument("--harness-cpus", type=cpu_list, metavar="LIST",
+                     help="CPUs for the harness, its relay and the clients; qshd keeps its own")
+    run.add_argument("--system-account", help="existing account the system-mode variants log in as")
+    run.add_argument("--worker-user", default="nobody", help="--worker-user for system-mode variants")
     run.add_argument("--source-commit", help="source commit the builds were made from")
     run.add_argument("--note", help="free-form build description, such as the toolchain")
     run.set_defaults(handler=command_run)

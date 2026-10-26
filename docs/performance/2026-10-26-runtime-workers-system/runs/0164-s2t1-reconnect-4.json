@@ -1,0 +1,101 @@
+{
+ "workload": "reconnect",
+ "started_utc": "2026-10-26T12:47:11.236560+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0,
+   1
+  ],
+  "runtime_workers": 1,
+  "mode": "system"
+ },
+ "result": {
+  "outage": {
+   "seconds": 10.002,
+   "qshd": {
+    "cpu_s": 0.0,
+    "cpu_percent": 0.0,
+    "run_s_live_threads": 0.0014,
+    "runqueue_wait_s_live_threads": 0.0,
+    "timeslices_per_s": 1.7,
+    "voluntary_switches_per_s": 1.7,
+    "involuntary_switches_per_s": 0.0,
+    "threads_start": 8,
+    "threads_end": 8,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 5024,
+    "rss_kib": 5024
+   },
+   "qshd_helper": {
+    "cpu_s": 0.01,
+    "cpu_percent": 0.1,
+    "run_s_live_threads": 0.0031,
+    "runqueue_wait_s_live_threads": 0.0,
+    "timeslices_per_s": 5.0,
+    "voluntary_switches_per_s": 5.0,
+    "involuntary_switches_per_s": 0.0,
+    "threads_start": 1,
+    "threads_end": 1,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 5664,
+    "rss_kib": 5664
+   },
+   "relay": {
+    "c2s_datagrams": 0,
+    "c2s_bytes": 0,
+    "s2c_datagrams": 0,
+    "s2c_bytes": 0,
+    "dropped_datagrams": 30,
+    "c2s_datagrams_per_s": 0.0,
+    "c2s_bytes_per_s": 0.0,
+    "s2c_datagrams_per_s": 0.0,
+    "s2c_bytes_per_s": 0.0,
+    "dropped_datagrams_per_s": 3.0
+   },
+   "qsh": {
+    "cpu_s": 0.04,
+    "cpu_percent": 0.4,
+    "run_s_live_threads": 0.0486,
+    "runqueue_wait_s_live_threads": 0.0005,
+    "timeslices_per_s": 53.19,
+    "voluntary_switches_per_s": 52.99,
+    "involuntary_switches_per_s": 0.2,
+    "threads_start": 9,
+    "threads_end": 9,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 13236,
+    "rss_kib": 12616
+   },
+   "terminal": {
+    "bytes": 305,
+    "presented_frames": 2,
+    "presented_frames_per_s": 0.2
+   }
+  },
+  "recovery_s": 1.45
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 0.026,
+   "system_s": 0.01,
+   "voluntary_switches": 358,
+   "involuntary_switches": 26
+  },
+  "clients": [
+   {
+    "user_s": 0.063,
+    "system_s": 0.032,
+    "voluntary_switches": 789,
+    "involuntary_switches": 22
+   }
+  ]
+ },
+ "harness_cpu_s": 0.05,
+ "index": 164,
+ "repetition": 4,
+ "build": "s2t1"
+}

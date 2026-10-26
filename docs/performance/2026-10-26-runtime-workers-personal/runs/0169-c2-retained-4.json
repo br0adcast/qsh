@@ -1,0 +1,107 @@
+{
+ "workload": "retained",
+ "started_utc": "2026-10-26T11:23:31.961767+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0,
+   1
+  ],
+  "runtime_workers": 2
+ },
+ "result": {
+  "window": {
+   "seconds": 10.001,
+   "qshd": {
+    "cpu_s": 0.33,
+    "cpu_percent": 3.3,
+    "run_s_live_threads": 0.3151,
+    "runqueue_wait_s_live_threads": 0.0529,
+    "timeslices_per_s": 826.39,
+    "voluntary_switches_per_s": 638.81,
+    "involuntary_switches_per_s": 187.57,
+    "threads_start": 22,
+    "threads_end": 24,
+    "threads_exited": 0,
+    "threads_created": 2,
+    "peak_rss_kib": 8932,
+    "rss_kib": 8932
+   },
+   "relay": {
+    "c2s_datagrams": 0,
+    "c2s_bytes": 0,
+    "s2c_datagrams": 70,
+    "s2c_bytes": 3780,
+    "dropped_datagrams": 0,
+    "c2s_datagrams_per_s": 0.0,
+    "c2s_bytes_per_s": 0.0,
+    "s2c_datagrams_per_s": 7.0,
+    "s2c_bytes_per_s": 377.95,
+    "dropped_datagrams_per_s": 0.0
+   }
+  },
+  "sessions": 8
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 0.283,
+   "system_s": 0.283,
+   "voluntary_switches": 9522,
+   "involuntary_switches": 2137
+  },
+  "clients": [
+   {
+    "user_s": 0.024,
+    "system_s": 0.008,
+    "voluntary_switches": 48,
+    "involuntary_switches": 10
+   },
+   {
+    "user_s": 0.025,
+    "system_s": 0.004,
+    "voluntary_switches": 57,
+    "involuntary_switches": 20
+   },
+   {
+    "user_s": 0.017,
+    "system_s": 0.012,
+    "voluntary_switches": 61,
+    "involuntary_switches": 18
+   },
+   {
+    "user_s": 0.016,
+    "system_s": 0.012,
+    "voluntary_switches": 49,
+    "involuntary_switches": 13
+   },
+   {
+    "user_s": 0.014,
+    "system_s": 0.014,
+    "voluntary_switches": 54,
+    "involuntary_switches": 20
+   },
+   {
+    "user_s": 0.02,
+    "system_s": 0.008,
+    "voluntary_switches": 58,
+    "involuntary_switches": 14
+   },
+   {
+    "user_s": 0.019,
+    "system_s": 0.01,
+    "voluntary_switches": 66,
+    "involuntary_switches": 17
+   },
+   {
+    "user_s": 0.014,
+    "system_s": 0.014,
+    "voluntary_switches": 59,
+    "involuntary_switches": 12
+   }
+  ]
+ },
+ "harness_cpu_s": 0.08,
+ "index": 169,
+ "repetition": 4,
+ "build": "c2"
+}

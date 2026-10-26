@@ -1728,6 +1728,202 @@ mod tests {
                 "only the first client may ever have reached the helper with a proof"
             );
         }
+
+        /// How long a slow verification takes: twice [`STALL`], as PAM or a
+        /// loaded helper may.
+        const SLOW_VERIFY: Duration = Duration::from_secs(2);
+
+        /// Delays every verification by [`SLOW_VERIFY`] once `slow` is set,
+        /// and records how long each one took.
+        struct SlowVerifier {
+            inner: Arc<dyn transport::auth::AuthVerifier>,
+            slow: Arc<AtomicBool>,
+            took: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl transport::auth::AuthVerifier for SlowVerifier {
+            fn verify(
+                &self,
+                handshake_hash: &[u8; 32],
+                record: &transport::auth::AuthRecord,
+                login: transport::session_manager::LoginId,
+                rhost: &str,
+            ) -> Result<Principal, transport::auth::AuthError> {
+                let started = Instant::now();
+                if self.slow.load(Ordering::SeqCst) {
+                    std::thread::sleep(SLOW_VERIFY);
+                }
+                let verdict = self.inner.verify(handshake_hash, record, login, rhost);
+                self.took.lock().expect("took").push(started.elapsed());
+                verdict
+            }
+        }
+
+        /// With the router and every session on one runtime worker
+        /// (`--runtime-threads 1`), a verification that takes
+        /// [`SLOW_VERIFY`] waits off that worker: a live session keeps its
+        /// echoes meanwhile, and the slow login still gets in.
+        ///
+        /// A stub helper admits everyone. A first client, A, gets in at
+        /// once; then verifications turn slow, and while A sends a byte to
+        /// be echoed every [`PROBE_EVERY`], a second client, B, logs in.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_slow_verification_holds_up_nothing_on_one_runtime_worker() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let key_path = dir.path().join("key");
+            let key = ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                ssh_key::Algorithm::Ed25519,
+            )
+            .expect("keygen");
+            std::fs::write(
+                &key_path,
+                key.to_openssh(ssh_key::LineEnding::LF)
+                    .expect("encode")
+                    .as_bytes(),
+            )
+            .expect("write the key");
+
+            let (worker, stub) = stub_helper(
+                |_| Pace::After(Duration::ZERO),
+                Some(Response::Verified {
+                    uid: 4242,
+                    name: "anyone".to_string(),
+                    identity: "SHA256:anyone".to_string(),
+                    incarnation: 0,
+                }),
+            );
+            let helper = client(worker);
+            let pool = PooledNonces::with_max_age(Arc::clone(&helper), Duration::from_secs(600))
+                .expect("the nonce pool");
+            let server_kp = generate_keypair();
+            let mut auth = system_server_auth(
+                server_kp.public,
+                helper,
+                Arc::clone(&pool),
+                "qshd",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("the system mode's setup");
+            let slow = Arc::new(AtomicBool::new(false));
+            let took = Arc::new(Mutex::new(Vec::new()));
+            auth.verifier = Some(Arc::new(SlowVerifier {
+                inner: auth.verifier.expect("the system mode verifies"),
+                slow: Arc::clone(&slow),
+                took: Arc::clone(&took),
+            }));
+
+            let socket = Arc::new(
+                tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind"),
+            );
+            let addr = socket.local_addr().expect("addr");
+            let granted = Arc::new(AtomicUsize::new(0));
+            let server = tokio::spawn(SessionManager::serve(
+                socket,
+                server_kp.private,
+                auth,
+                BackendFactory(Arc::new(Echo {
+                    granted: Arc::clone(&granted),
+                })),
+                Arc::new(AtomicUsize::new(0)),
+                LoginEndedReports::none(),
+            ));
+
+            let a_events = Arc::new(Events::default());
+            let a = Arc::new(connect(
+                addr,
+                server_kp.public,
+                [1u8; 16],
+                &key_path,
+                Arc::clone(&a_events),
+            ));
+            a.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
+            assert!(
+                wait_until(TEST_WAIT, || a_events.received().bytes == b"hello"),
+                "setup: the first client must get its session"
+            );
+
+            slow.store(true, Ordering::SeqCst);
+            let probing = Arc::new(AtomicBool::new(true));
+            let probe = std::thread::spawn({
+                let a = Arc::clone(&a);
+                let probing = Arc::clone(&probing);
+                move || {
+                    while probing.load(Ordering::SeqCst) {
+                        a.send_bytes(0, b".".to_vec())
+                            .expect("fixture input admitted");
+                        std::thread::sleep(PROBE_EVERY);
+                    }
+                }
+            });
+            assert!(
+                wait_until(TEST_WAIT, || a_events.received().bytes.len()
+                    > b"hello".len()),
+                "setup: the probe's bytes must come back"
+            );
+
+            let b_events = Arc::new(Events::default());
+            let watch_from = Instant::now();
+            let b = connect(
+                addr,
+                server_kp.public,
+                [2u8; 16],
+                &key_path,
+                Arc::clone(&b_events),
+            );
+            b.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
+            let b_got_in = wait_until(TEST_WAIT, || b_events.received().bytes == b"hello");
+            let watch_until = Instant::now();
+            probing.store(false, Ordering::SeqCst);
+            probe.join().expect("the probe");
+
+            let echoes: Vec<Instant> = a_events
+                .received()
+                .arrivals
+                .iter()
+                .copied()
+                .filter(|at| *at >= watch_from && *at <= watch_until)
+                .collect();
+            let took: Vec<Duration> = took.lock().expect("took").clone();
+            b.close();
+            a.close();
+            server.abort();
+
+            let mut edges = vec![watch_from];
+            edges.extend(echoes);
+            edges.push(watch_until);
+            let longest_silence = edges
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .max()
+                .unwrap_or_default();
+            println!(
+                "slow verification: took {took:?}; {} echoes, longest silence \
+                 {longest_silence:?}",
+                edges.len() - 2
+            );
+            assert!(b_got_in, "the slow login must still get in");
+            assert!(
+                took.iter().any(|took| *took >= SLOW_VERIFY),
+                "setup: B's verification must have been slow: {took:?}"
+            );
+            assert!(
+                longest_silence < STALL,
+                "the live session went {longest_silence:?} without an echo while a login \
+                 was being verified: the verification held the runtime's only worker"
+            );
+            assert_eq!(
+                granted.load(Ordering::SeqCst),
+                2,
+                "both clients get a session"
+            );
+            assert_eq!(stub.verifies(), 2, "both proofs reach the helper");
+        }
+
         /// A helper that is alive but has stopped reading, its seam full. The
         /// router still ends logins (a graceful close) and releases nonces (a
         /// probation that ends unproven) on its own task; neither may wait on
