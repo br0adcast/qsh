@@ -159,6 +159,7 @@ impl Auth17WirePeer {
                 default_consumption: consumption,
                 stream_consumption: vec![(AUTH_STREAM, Consumption::Explicit)],
                 input_budget: None,
+                ..DriverSetup::default()
             },
         );
         Self {

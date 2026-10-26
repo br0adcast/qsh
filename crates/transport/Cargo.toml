@@ -21,6 +21,8 @@ rand = "0.8"
 blake2 = "0.10"
 # Socket buffer sizes (spec §4.12): set, and read back what the OS granted.
 socket2 = "0.6"
+# Wakeable socket readiness and producer notifications in the std driver.
+polling = "=3.11.0"
 # Diagnostics as records (`log::warn!` and the like): lifecycle notices
 # (cap-eviction, refusals, GC teardown) and the client's warnings. Whoever
 # links the crate decides where they go -- the `qsh` client's log file,

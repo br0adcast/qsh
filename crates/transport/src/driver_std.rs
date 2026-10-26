@@ -5,18 +5,14 @@
 //! and handshake retransmit. It exposes plain Rust traits to the outside
 //! (`ClientEvents`, `Binder`).
 //!
-//! Design. The thread runs a loop: it computes the sleep deadline as the
-//! nearer of the core timer (`Connection::next_timeout`) and its own
-//! handshake-retransmit timer, clamps it from above with a short command poll
-//! interval, sets `set_read_timeout`, and does `recv_from` (the socket is
-//! deliberately unconnected -- see `make_socket`). A packet goes into
-//! `on_datagram` with its real source address, together with up to
-//! `READY_DRAIN_MAX` more that have already arrived; then, after every wake-up
-//! whatever woke it, the timers that are due run
-//! (`Connection::on_timeout_if_due`, and the msg1 retransmit). Afterward it
-//! sends all outgoing datagrams and forwards core events to the external
-//! callbacks. Commands (`send_bytes`, `rebind`, `close`) arrive over
-//! an mpsc channel and are drained at the start of each iteration.
+//! Design. The driver waits for UDP readability, explicit producer notification,
+//! or its nearest core/handshake/statistics deadline. Commands and authentication
+//! results are enqueued before waking the current or following wait. Readiness
+//! is only a hint: a bounded nonblocking receive pass restores blocking mode
+//! before any send, preserving the existing UDP send/error/retry behavior.
+//! Kernel-blocked sends and blocked caller callbacks remain existing limitations;
+//! this wait change does not introduce a second transmit queue. Timers run after
+//! every bounded turn, including notification and busy socket turns.
 //!
 //! Handshake retransmit. During the `Connecting` phase the core returns
 //! `next_timeout() == None` (it has nothing to wait for until transport keys
@@ -120,11 +116,8 @@
 //! caller queued before the handshake completed is on the wire STRICTLY
 //! AHEAD of the proof, ALWAYS, not just occasionally -- and even with an
 //! instantaneous signer, the record itself can only leave on the loop
-//! iteration after signing finishes at the earliest (and up to
-//! `COMMAND_POLL_INTERVAL`, 50 ms, later than that, if the driver happens to
-//! be parked in `recv_from` when the result arrives -- negligible against the
-//! 5-second `AUTH_DEADLINE`, but it is the same self-pipe latency debt the
-//! module's opening doc already calls out for commands in general).
+//! iteration after signing finishes at the earliest. The signing result wakes
+//! the current or next readiness wait without waiting for unrelated UDP input.
 //!
 //! It is a DELIBERATE choice not to hold the caller's own writes back while a
 //! signer is still working, for exactly the reason above: doing so would
@@ -149,6 +142,9 @@
 //! installed no logger, that reason is simply not
 //! visible anywhere.
 
+#[path = "driver_std_wait.rs"]
+mod wait;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -170,30 +166,20 @@ use crate::recovery_handshake::RecoveryEndpoint;
 use crate::send_gate::{ClientAdmission, GateKind, GateTable, GateWait};
 use crate::udp_buffers::{tune_udp_buffers, BufferReport};
 
-/// Upper bound on the loop's sleep: how often the driver wakes up to check
-/// the command queue, even if the network and timers are quiet. A deliberate
-/// simplification versus instant wakeup of the socket from another thread (a
-/// known debt: a self-pipe/socketpair would give zero input latency instead
-/// of this 50 ms).
-const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
 /// Retransmit period for the handshake message until `Live` is established.
 pub(crate) const HANDSHAKE_RETRANSMIT: Duration = Duration::from_millis(500);
 
-/// If `socket.recv` blocked far longer than the (<= `COMMAND_POLL_INTERVAL`)
-/// read timeout we asked for, the OS froze this thread -- an app Doze/standby.
-/// Rather than declare the link dead (which forces a slow SSH reconnect), the
-/// driver treats the wake as a rebind/resume: a fresh socket on the current
-/// network, a restarted liveness window, and a forced PING, so a still-alive
-/// server session hot-migrates to us over UDP. Chosen well above any GC or
-/// scheduling pause (~1 s) and below the client death window.
+/// Lateness beyond the requested readiness deadline that suggests a thread
+/// freeze. Statistics always bound intended idle waits to one second. Resume
+/// transactionally replaces the socket and restarts ping/liveness; monotonic
+/// suspend behavior still depends on the platform, as before.
 const FREEZE_RESUME_AFTER: Duration = Duration::from_secs(5);
 
 /// Receive buffer size for a single UDP datagram.
 const RECV_BUF_LEN: usize = 64 * 1024;
 
-/// How many already-arrived datagrams one pass of the loop takes in after the
-/// one it woke for, before it runs timers and hands out events (spec §4.1):
+/// How many datagrams one readable pass takes before running timers and
+/// handing out events (spec §4.1):
 /// fewer passes and callbacks under a flood, and still no longer than about a
 /// millisecond before the next look at the command queue (keystrokes).
 const READY_DRAIN_MAX: usize = 64;
@@ -212,7 +198,7 @@ const READY_DRAIN_MAX: usize = 64;
 const STATS_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// How long `StdClient::stream_progress` waits for the driver to answer:
-/// several times `COMMAND_POLL_INTERVAL`, the longest it can take to notice.
+/// a bounded response deadline even if the owner or OS stalls.
 const PROGRESS_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long `StdClient::use_road` waits for the driver to act on the request: the same bound
@@ -223,6 +209,28 @@ const USE_ROAD_REPLY_TIMEOUT: Duration = PROGRESS_REPLY_TIMEOUT;
 /// socket: on change, and once every [`STATS_HEARTBEAT`] regardless.
 fn stats_are_due(cur: Stats, last: Stats, since_last_publish: Duration) -> bool {
     cur != last || since_last_publish >= STATS_HEARTBEAT
+}
+
+fn next_wait_deadline(
+    now: Instant,
+    core: Option<Instant>,
+    handshake: Option<Instant>,
+    last_stats: Instant,
+    continuation: bool,
+) -> Instant {
+    let mut deadline = last_stats + STATS_HEARTBEAT;
+    for candidate in [core, handshake].into_iter().flatten() {
+        deadline = deadline.min(candidate);
+    }
+    if continuation {
+        deadline = deadline.min(now);
+    }
+    deadline
+}
+
+fn freeze_late(requested_deadline: Instant, wait_started: Instant, now: Instant) -> bool {
+    // An already overdue core timer is work to service, not time asleep.
+    now.saturating_duration_since(requested_deadline.max(wait_started)) > FREEZE_RESUME_AFTER
 }
 
 /// Incremental facts for the owner of one shared recovery attempt. No event
@@ -322,7 +330,11 @@ pub enum SendBlocked {
 /// A terminal local failure discovered after whole-record admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputFailure {
-    OffsetSpaceExhausted { stream_id: u8 },
+    /// Accepted input cannot be serviced because the local wait/socket owner failed.
+    DriverUnavailable,
+    OffsetSpaceExhausted {
+        stream_id: u8,
+    },
 }
 
 /// A whole owned record that was not accepted. No bytes were queued or
@@ -394,6 +406,8 @@ struct AuthResult {
 /// promise -- the driver thread may already be reading.
 #[derive(Clone, Debug, Default)]
 pub struct DriverSetup {
+    #[cfg(test)]
+    pub(crate) wait_control: Option<Arc<wait::TestControl>>,
     /// How the streams nobody declared count their consumption (spec
     /// §4.10.1): `OnDelivery` for the app, `Explicit` for the console
     /// client (spec §4.13). AUTH_STREAM is always consumed by the driver.
@@ -415,7 +429,8 @@ struct RoadSnapshot {
 /// shared latest statistics, and the thread handle. All methods take `&self`,
 /// so the type can be shared through `Arc`.
 pub struct StdClient {
-    tx: Mutex<Sender<Command>>,
+    tx: Mutex<wait::WakeSender<Command>>,
+    wake: Arc<wait::Notifier>,
     input_budget: ClientInputBudget,
     stop: Arc<AtomicU8>,
     stats: Arc<Mutex<Stats>>,
@@ -510,6 +525,9 @@ impl StdClient {
         setup: DriverSetup,
     ) -> StdClient {
         let (tx, rx) = mpsc::channel::<Command>();
+        let wake = Arc::new(wait::Notifier::default());
+        let tx = wait::WakeSender::new(tx, wake.clone());
+        let wake_thread = wake.clone();
         let input_budget = setup.input_budget.clone().unwrap_or_default();
         let stop = Arc::new(AtomicU8::new(0));
         let stop_thread = Arc::clone(&stop);
@@ -542,6 +560,7 @@ impl StdClient {
                 signer,
                 setup,
                 rx,
+                wake_thread,
                 stop_thread,
                 stats_thread,
                 resumed_thread,
@@ -557,6 +576,7 @@ impl StdClient {
         let driver_thread = Some(handle.thread().id());
         StdClient {
             tx: Mutex::new(tx),
+            wake,
             input_budget,
             stop,
             stats,
@@ -640,8 +660,10 @@ impl StdClient {
     /// no-ops, statistics are zero.
     pub fn dead() -> StdClient {
         let (tx, _rx) = mpsc::channel::<Command>();
+        let wake = Arc::new(wait::Notifier::default());
         StdClient {
-            tx: Mutex::new(tx),
+            tx: Mutex::new(wait::WakeSender::new(tx, wake.clone())),
+            wake,
             input_budget: ClientInputBudget::default(),
             stop: Arc::new(AtomicU8::new(2)),
             driver_thread: None,
@@ -747,12 +769,24 @@ impl StdClient {
         self.admit_bytes(stream_id, data, false)
     }
 
+    fn input_unavailable(&self) -> bool {
+        self.is_gone() || self.stop.load(Ordering::SeqCst) != 0 || self.wake.failed()
+    }
+
+    fn full_or_gone(&self) -> SendBlocked {
+        if self.input_unavailable() {
+            SendBlocked::Gone
+        } else {
+            SendBlocked::Full
+        }
+    }
+
     fn admit_bytes(&self, stream_id: u8, data: Vec<u8>, bounded: bool) -> Result<(), SendRejected> {
         if data.is_empty() {
             return Ok(());
         }
         let tx = self.tx.lock().expect("command channel mutex");
-        if self.is_gone() || self.stop.load(Ordering::SeqCst) != 0 {
+        if self.input_unavailable() {
             return Err(SendRejected {
                 reason: SendBlocked::Gone,
                 data,
@@ -763,7 +797,7 @@ impl StdClient {
             Ok(None) => unreachable!("nonempty input has a record obligation"),
             Err(()) => {
                 return Err(SendRejected {
-                    reason: SendBlocked::Full,
+                    reason: self.full_or_gone(),
                     data,
                 })
             }
@@ -775,7 +809,7 @@ impl StdClient {
             ClientAdmission::Full => {
                 drop(permit);
                 return Err(SendRejected {
-                    reason: SendBlocked::Full,
+                    reason: self.full_or_gone(),
                     data,
                 });
             }
@@ -834,7 +868,7 @@ impl StdClient {
         if data.is_empty() {
             return Ok(());
         }
-        if self.is_gone() || self.stop.load(Ordering::SeqCst) != 0 {
+        if self.input_unavailable() {
             return Err(SendRejected {
                 reason: SendBlocked::Gone,
                 data,
@@ -850,7 +884,7 @@ impl StdClient {
         match gate.wait_open_for(timeout) {
             GateWait::Open => self.admit_bytes(stream_id, data, true),
             GateWait::TimedOut => Err(SendRejected {
-                reason: SendBlocked::Full,
+                reason: self.full_or_gone(),
                 data,
             }),
             GateWait::Closed => Err(SendRejected {
@@ -937,6 +971,7 @@ impl StdClient {
     /// For a user-initiated disconnect.
     pub fn close(&self) {
         self.stop.fetch_max(1, Ordering::SeqCst);
+        self.wake.notify();
         self.join_driver();
     }
 
@@ -947,6 +982,7 @@ impl StdClient {
     /// user-initiated disconnect, which must keep using `close`.
     pub fn detach(&self) {
         self.stop.fetch_max(2, Ordering::SeqCst);
+        self.wake.notify();
         self.join_driver();
     }
 
@@ -1093,31 +1129,42 @@ impl SendRecord {
     }
 }
 
-/// Take in up to `max` datagrams already waiting on `socket`, without waiting
-/// for more. The socket is back in blocking mode before this returns, whatever
-/// happened: left non-blocking, the loop's timed `recv_from` would return at
-/// once for ever -- a busy spin.
+fn with_receive_mode<T>(
+    mut set_mode: impl FnMut(bool) -> std::io::Result<()>,
+    receive: impl FnOnce() -> T,
+) -> std::io::Result<T> {
+    set_mode(true)?;
+    let batch = receive();
+    set_mode(false)?;
+    Ok(batch)
+}
+
+/// A readable hint can be stale. Drain nonblocking, then restore blocking
+/// before any generated datagram reaches the unchanged blocking send path.
 fn drain_ready(
     socket: &UdpSocket,
     conn: &mut Connection,
     buf: &mut [u8],
     max: usize,
-) -> Vec<Datagram> {
-    let mut out = Vec::new();
-    if socket.set_nonblocking(true).is_err() {
-        return out;
-    }
-    for _ in 0..max {
-        match socket.recv_from(buf) {
-            Ok((len, src)) => out.extend(conn.on_datagram(Instant::now(), src, &buf[..len])),
-            Err(_) => break,
-        }
-    }
-    let _ = socket.set_nonblocking(false);
-    out
+    clock: &wait::Clock,
+) -> std::io::Result<Vec<Datagram>> {
+    with_receive_mode(
+        |nonblocking| socket.set_nonblocking(nonblocking),
+        || {
+            let mut out = Vec::new();
+            for _ in 0..max {
+                match socket.recv_from(buf) {
+                    Ok((len, src)) => out.extend(conn.on_datagram(clock.now(), src, &buf[..len])),
+                    Err(_) => break,
+                }
+            }
+            out
+        },
+    )
 }
 
 /// A `recv` timeout surfaces as `WouldBlock` (unix) or `TimedOut` (windows).
+#[cfg(test)]
 fn is_read_timeout(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -1148,6 +1195,7 @@ fn run_driver(
     signer: Option<Arc<dyn AuthSigner>>,
     setup: DriverSetup,
     rx: Receiver<Command>,
+    wake: Arc<wait::Notifier>,
     stop: Arc<AtomicU8>,
     shared_stats: Arc<Mutex<Stats>>,
     resumed_flag: Arc<AtomicBool>,
@@ -1166,18 +1214,38 @@ fn run_driver(
     // never handed outside, so its liveness can never mask `rx` losing its
     // only external sender (a `StdClient` dropped without close()/detach()).
     let (auth_tx, auth_rx) = mpsc::channel::<AuthResult>();
+    let auth_tx = wait::WakeSender::new(auth_tx, wake.clone());
+    #[cfg(test)]
+    let clock = wait::Clock::controlled(setup.wait_control.clone());
+    #[cfg(not(test))]
+    let clock = wait::Clock::default();
 
-    let mut socket = match make_socket(binder.as_ref()) {
-        Some((s, buffers)) => {
-            *buffers_out.lock().expect("buffers mutex") = Some(buffers);
-            s
-        }
+    let (socket, initial_buffers) = match make_socket(binder.as_ref()) {
+        Some(pair) => pair,
         None => {
             events.on_state(LinkState::Closed);
             return;
         }
     };
 
+    #[cfg(test)]
+    let initialized = match setup.wait_control.clone() {
+        Some(control) => wait::DriverWait::controlled(socket, &wake, control),
+        None => wait::DriverWait::new(socket, &wake),
+    };
+    #[cfg(not(test))]
+    let initialized = wait::DriverWait::new(socket, &wake);
+    let mut socket = match initialized {
+        Ok(socket) => socket,
+        Err(error) => {
+            log::error!("cannot initialize the client readiness wait: {error}");
+            stop.fetch_max(2, Ordering::SeqCst);
+            events.on_state(LinkState::Closed);
+            return;
+        }
+    };
+
+    *buffers_out.lock().expect("buffers mutex") = Some(initial_buffers);
     let mut sends = SendRecord::new(last_send_error, Arc::clone(&events));
     let allowlist_proof = matches!(cfg.auth, crate::conn::AuthPolicy::Allowlist(_));
     let mut owned = DriverConnection {
@@ -1195,7 +1263,7 @@ fn run_driver(
     // by the application. Override even an explicit per-stream setup once;
     // on-delivery accounting owns its credit, with no duplicate report.
     conn.set_stream_consumption(AUTH_STREAM, Consumption::OnDelivery);
-    let start = Instant::now();
+    let start = clock.now();
     // The first msg1; the connection keeps it and hands it back for every
     // retransmit, byte for byte -- behind the daemon's cookie once one
     // arrived (spec §4.16). msg1 carries the start kind, the token, the
@@ -1209,7 +1277,7 @@ fn run_driver(
             conn.start_recovery(start, endpoints, start_kind, session_token)
         }
     };
-    send_recovery_aware(&socket, &first_msg1, &mut sends, conn);
+    send_recovery_aware(socket.socket(), &first_msg1, &mut sends, conn);
 
     // The handshake retransmit timer is driven by the driver: during
     // `Connecting` the core doesn't ask to be woken for it.
@@ -1228,11 +1296,20 @@ fn run_driver(
     let mut state = LinkState::Connecting;
     events.on_state(state);
     let mut last_stats = Stats::default();
-    let mut last_stats_at = Instant::now();
+    let mut last_stats_at = clock.now();
 
     let mut buf = vec![0u8; RECV_BUF_LEN];
 
     loop {
+        if wake.failed() {
+            report_input_failure(
+                conn,
+                events.as_ref(),
+                &stop,
+                InputFailure::DriverUnavailable,
+            );
+            return;
+        }
         // 1. Commands from the channel (at the start of the iteration).
         let mut should_close = stop.load(Ordering::SeqCst) != 0;
         // Whether the teardown (once `should_close` is set) puts a `Close`
@@ -1245,6 +1322,7 @@ fn run_driver(
         // handle being dropped afterward.
         let mut graceful = stop.load(Ordering::SeqCst) != 2;
         let mut command_count = 0;
+        let mut command_processed = false;
         while !should_close && command_count < INPUT_TURN {
             let disposition = stop.load(Ordering::SeqCst);
             if disposition != 0 {
@@ -1253,28 +1331,48 @@ fn run_driver(
                 break;
             }
             command_count += 1;
-            match rx.try_recv() {
+            let command = rx.try_recv();
+            command_processed |= command.is_ok();
+            #[cfg(test)]
+            if let (Some(control), Ok(command)) = (&setup.wait_control, &command) {
+                control.command(match command {
+                    Command::Send { stream_id, .. } => format!("Send:{stream_id}"),
+                    Command::Consumed { .. } => "Consumed".into(),
+                    Command::Rebind => "Rebind".into(),
+                    Command::SetDeathAfter(_) => "SetDeathAfter".into(),
+                    Command::SetPaths(_) => "SetPaths".into(),
+                    Command::SetStreamClass { .. } => "SetStreamClass".into(),
+                    Command::StreamProgress { .. } => "StreamProgress".into(),
+                    Command::UseRoad { .. } => "UseRoad".into(),
+                    Command::UnconsumedForTest(_) => "UnconsumedForTest".into(),
+                });
+            }
+            match command {
                 Ok(Command::Send { stream_id, record }) => {
                     inputs.push(stream_id, record);
                 }
                 Ok(Command::Rebind) => {
                     if let Some((new_sock, buffers)) = make_socket(binder.as_ref()) {
-                        socket = new_sock;
-                        *buffers_out.lock().expect("buffers mutex") = Some(buffers);
-                        // Nudge migration: force an immediate PING from the
-                        // new address (the server will migrate to the new
-                        // source, and the client will also grab a fresh RTT
-                        // reading). request_ping also restarts the
-                        // congestion window and takes what is in flight for
-                        // lost, so on_timeout resends it under the fresh
-                        // window -- the oldest first, the rest as ACKs open
-                        // it.
-                        // request_ping also restarts the liveness window, so a
-                        // rebind after a network gap is not counted as death.
-                        let now = Instant::now();
-                        conn.request_ping(now);
-                        let out = conn.on_timeout(now);
-                        send_all(&socket, &out, &mut sends);
+                        match socket.replace(new_sock) {
+                            Ok(true) => {
+                                *buffers_out.lock().expect("buffers mutex") = Some(buffers);
+                                let now = clock.now();
+                                conn.request_ping(now);
+                                let out = conn.on_timeout(now);
+                                send_all(socket.socket(), &out, &mut sends);
+                            }
+                            Ok(false) => {} // Registration failed cleanly; old route stays active.
+                            Err(error) => {
+                                log::error!("cannot replace the client socket safely: {error}");
+                                report_input_failure(
+                                    conn,
+                                    events.as_ref(),
+                                    &stop,
+                                    InputFailure::DriverUnavailable,
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
                 Ok(Command::SetDeathAfter(after)) => conn.set_death_after(after),
@@ -1283,7 +1381,7 @@ fn run_driver(
                     let _ = reply.send(conn.stream_progress(stream_id));
                 }
                 Ok(Command::UseRoad { addr, reply }) => {
-                    let now = Instant::now();
+                    let now = clock.now();
                     // Decided here, on the driver thread, so nothing can move the session
                     // between this look and the request: `Connection::use_road` answers
                     // `Ok(())` both for a move and for the road already in use.
@@ -1294,7 +1392,7 @@ fn run_driver(
                             // The forced PING goes out now, down the new road: the server
                             // follows the session on its first ordinary packet from there.
                             let out = conn.on_timeout(now);
-                            send_all(&socket, &out, &mut sends);
+                            send_all(socket.socket(), &out, &mut sends);
                             UseRoadOutcome::Moved
                         }
                         Err(UseRoadError::NotAnswering) => UseRoadOutcome::NotAnswering,
@@ -1314,9 +1412,9 @@ fn run_driver(
                     let _ = reply.send(conn.unconsumed_streams());
                 }
                 Ok(Command::Consumed { stream_id, n }) => {
-                    let now = Instant::now();
+                    let now = clock.now();
                     let out = conn.on_consumed(now, stream_id, n);
-                    send_all(&socket, &out, &mut sends);
+                    send_all(socket.socket(), &out, &mut sends);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1335,8 +1433,8 @@ fn run_driver(
         graceful &= disposition != 2;
         inputs.acknowledge(conn);
         if !should_close {
-            match inputs.drain(conn, Instant::now(), &gates) {
-                Ok(out) => send_all(&socket, &out, &mut sends),
+            match inputs.drain(conn, clock.now(), &gates) {
+                Ok(out) => send_all(socket.socket(), &out, &mut sends),
                 Err(failure) => {
                     report_input_failure(conn, events.as_ref(), &stop, failure);
                     should_close = true;
@@ -1352,14 +1450,16 @@ fn run_driver(
         // (`Empty`, or `Disconnected` -- which cannot happen while this
         // function is running, since it holds `auth_tx` for its whole
         // lifetime) both mean "nothing more to do this iteration".
+        let mut auth_processed = false;
         while let Ok(AuthResult { generation, record }) = auth_rx.try_recv() {
+            auth_processed = true;
             // A processed stop also retires results already queued by the signer.
             if !should_close && generation == auth_generation {
                 match record {
                     Some(bytes) => {
-                        let now = Instant::now();
+                        let now = clock.now();
                         let out = conn.send(now, AUTH_STREAM, &bytes);
-                        send_all(&socket, &out, &mut sends);
+                        send_all(socket.socket(), &out, &mut sends);
                     }
                     None => {
                         // The signer could not produce a proof at all (a
@@ -1389,9 +1489,9 @@ fn run_driver(
                 // a warm reconnect (see `Connection::close`). A no-op if the
                 // handshake never completed (no transport keys yet) -- nothing
                 // to close.
-                let now = Instant::now();
+                let now = clock.now();
                 let out = conn.close(now);
-                send_all(&socket, &out, &mut sends);
+                send_all(socket.socket(), &out, &mut sends);
             }
             // A detach tears down locally without putting anything on the
             // wire: the server just sees silence and retains the backend for
@@ -1399,83 +1499,94 @@ fn run_driver(
             break;
         }
 
-        // 2. Sleep deadline: the nearer of the core timer and the handshake
-        //    timer, clamped above by the command poll interval.
-        let now = Instant::now();
-        let mut deadline = conn.next_timeout();
-        if command_count == INPUT_TURN || inputs.turn_full() {
-            deadline = Some(now); // bounded work remains: service UDP, then continue promptly
-        }
+        // 2. Socket readiness, producer notification, or the nearest real timer.
+        let now = clock.now();
         let handshake_deadline = if let Some(schedule) = conn.recovery_handshake() {
             schedule.next_deadline()
         } else {
             handshake_pending.then_some(handshake_sent_at + HANDSHAKE_RETRANSMIT)
         };
-        if let Some(hs_deadline) = handshake_deadline {
-            deadline = Some(deadline.map_or(hs_deadline, |d| d.min(hs_deadline)));
-        }
-        let cap = now + COMMAND_POLL_INTERVAL;
-        let effective = match deadline {
-            Some(d) => d.min(cap),
-            None => cap,
+        let effective = next_wait_deadline(
+            now,
+            conn.next_timeout(),
+            handshake_deadline,
+            last_stats_at,
+            command_processed
+                || auth_processed
+                || command_count == INPUT_TURN
+                || inputs.turn_full(),
+        );
+        let wait_started = clock.now();
+        let mut readable = match socket.wait(effective) {
+            Ok(readable) => readable,
+            Err(error) => {
+                log::error!("client readiness wait failed: {error}");
+                report_input_failure(
+                    conn,
+                    events.as_ref(),
+                    &stop,
+                    InputFailure::DriverUnavailable,
+                );
+                return;
+            }
         };
-        // `set_read_timeout(Some(ZERO))` is an error in std, so never pass zero.
-        let mut dt = effective.saturating_duration_since(now);
-        if dt.is_zero() {
-            dt = Duration::from_millis(1);
+        if wake.failed() {
+            report_input_failure(
+                conn,
+                events.as_ref(),
+                &stop,
+                InputFailure::DriverUnavailable,
+            );
+            return;
         }
-        let _ = socket.set_read_timeout(Some(dt));
-
-        // 3. Receive a packet or a timer firing.
-        let mut out: Vec<Datagram> = Vec::new();
-        // Captured BEFORE the (blocking) recv_from, so `now - recv_started`
-        // measures how long the receive actually spanned -- the same whether
-        // it returns a buffered packet or a read timeout.
-        let recv_started = Instant::now();
-        let recv_result = socket.recv_from(&mut buf);
-        let now = Instant::now();
-        // Doze/freeze wake: the recv spanned an OS freeze of this thread far
-        // longer than the (<= COMMAND_POLL_INTERVAL) read timeout we asked for.
-        // Resume like a rebind -- fresh socket on the current network, restarted
-        // liveness, forced PING -- so a still-alive server session hot-migrates
-        // to us over UDP, instead of the frozen gap being counted as silence and
-        // closing the link (which would force a slow SSH reconnect). Done for
-        // BOTH recv outcomes, before processing, so a stale buffered packet on
-        // wake can't slip past the check.
-        if now.saturating_duration_since(recv_started) > FREEZE_RESUME_AFTER {
+        // A stop wake does not run timers or send anything before its sticky
+        // disposition is processed at the beginning of the next bounded turn.
+        if stop.load(Ordering::SeqCst) != 0 {
+            continue;
+        }
+        let now = clock.now();
+        if freeze_late(effective, wait_started, now) {
             if let Some((new_sock, buffers)) = make_socket(binder.as_ref()) {
-                socket = new_sock;
-                *buffers_out.lock().expect("buffers mutex") = Some(buffers);
+                match socket.replace(new_sock) {
+                    Ok(true) => *buffers_out.lock().expect("buffers mutex") = Some(buffers),
+                    Ok(false) => {}
+                    Err(error) => {
+                        log::error!("cannot replace the resumed client socket safely: {error}");
+                        report_input_failure(
+                            conn,
+                            events.as_ref(),
+                            &stop,
+                            InputFailure::DriverUnavailable,
+                        );
+                        return;
+                    }
+                }
             }
             conn.request_ping(now);
+            readable = false; // A stale old-generation event never reads a replacement.
         }
-        match recv_result {
-            // The real source, not the address originally dialled: the
-            // socket is unconnected (see `make_socket`), so a reply from a
-            // spare road, or from a live road that just moved, arrives with
-            // its own genuine source address rather than the server's --
-            // and `on_datagram` needs that real address both to answer a
-            // `PathProbe` to the right place and to notice a move at all.
-            Ok((len, src)) => {
-                out.extend(conn.on_datagram(now, src, &buf[..len]));
-                // And whatever else has already arrived, up to a bound.
-                out.extend(drain_ready(&socket, conn, &mut buf, READY_DRAIN_MAX));
+        let mut out = if readable {
+            match drain_ready(socket.socket(), conn, &mut buf, READY_DRAIN_MAX, &clock) {
+                Ok(out) => out,
+                Err(error) => {
+                    log::error!("client UDP receive mode transition failed: {error}");
+                    report_input_failure(
+                        conn,
+                        events.as_ref(),
+                        &stop,
+                        InputFailure::DriverUnavailable,
+                    );
+                    return;
+                }
             }
-            // A read timeout needs nothing of its own: the timers below run
-            // after every wake-up.
-            Err(ref e) if is_read_timeout(e) => {}
-            // Other receive errors -- skip, the socket is still alive. An
-            // unconnected socket does not surface an ICMP port-unreachable
-            // the way a `connect`-ed one did; this arm is now mostly
-            // theoretical, kept for whatever transient OS-level failure
-            // `recv_from` can still report.
-            Err(_) => {}
-        }
+        } else {
+            Vec::new()
+        };
         // Timers after EVERY wake-up, not only after a read timeout (spec
         // §4.1): datagrams arriving more often than the read timeout used to
         // starve the PINGs, retransmits, `PathDown`, road checks and the
         // dead-road rule.
-        let now = Instant::now();
+        let now = clock.now();
         out.extend(conn.on_timeout_if_due(now));
         // The msg1 retransmit follows the same rule. Re-send the first msg1
         // as the connection keeps it (`retransmit_handshake`: the same
@@ -1494,10 +1605,10 @@ fn run_driver(
             && conn.state() == LinkState::Connecting
             && now >= handshake_sent_at + HANDSHAKE_RETRANSMIT
         {
-            send_all(&socket, &conn.retransmit_handshake(), &mut sends);
+            send_all(socket.socket(), &conn.retransmit_handshake(), &mut sends);
             handshake_sent_at = now;
         }
-        send_recovery_aware(&socket, &out, &mut sends, conn);
+        send_recovery_aware(socket.socket(), &out, &mut sends, conn);
 
         // The active path is settled by now (roaming re-points `conn`'s peer
         // synchronously inside `on_datagram`, above) -- published BEFORE the
@@ -1517,7 +1628,7 @@ fn run_driver(
             reported_selection = Some(endpoint);
             events.on_recovery_progress(RecoveryProgress::Selected {
                 endpoint,
-                at: Instant::now(),
+                at: clock.now(),
             });
         }
 
@@ -1535,7 +1646,7 @@ fn run_driver(
                     // without opening an application channel. A lost PING is
                     // retried by the existing keepalive schedule.
                     conn.request_ping(now);
-                    send_all(&socket, &conn.on_timeout(now), &mut sends);
+                    send_all(socket.socket(), &conn.on_timeout(now), &mut sends);
                 }
                 resumed_flag.store(conn.resumed(), Ordering::SeqCst);
                 *features_flag.lock().expect("features mutex") = Some(conn.features());
@@ -1546,7 +1657,7 @@ fn run_driver(
                 ));
                 if let Some(signer) = signer.as_ref() {
                     auth_generation += 1;
-                    spawn_auth_signing(
+                    let _ = spawn_auth_signing(
                         auth_generation,
                         conn.handshake_hash(),
                         conn.server_nonce(),
@@ -1642,8 +1753,8 @@ fn spawn_auth_signing(
     handshake_hash: [u8; 32],
     nonce: Option<[u8; AUTH_NONCE_LEN]>,
     signer: Arc<dyn AuthSigner>,
-    auth_tx: Sender<AuthResult>,
-) {
+    auth_tx: wait::WakeSender<AuthResult>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let record = match signer.sign(&handshake_hash, nonce.as_ref()) {
             // Framing can fail too (a field past the record's u16 length),
@@ -1667,7 +1778,7 @@ fn spawn_auth_signing(
             }
         };
         let _ = auth_tx.send(AuthResult { generation, record });
-    });
+    })
 }
 
 #[cfg(test)]
