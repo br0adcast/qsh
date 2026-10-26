@@ -480,7 +480,32 @@ jobs:
             exit 1
           fi
       - name: Portable CLI tests
+        shell: bash
         run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-input-controls.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -m 700 -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qsh --lib --locked input_ -- --color never --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/input.log"
+          for name in \
+            input_wake::tests::input_wake_coalesces_and_retains_owned_endpoints \
+            input_wake::tests::input_wake_hard_failure_closes_writer_and_releases_wait \
+            input_wake::tests::input_wake_writer_custody_and_late_failure_never_touch_foreign_file \
+            input_reader::tests::input_wake_reader_stops_idle_and_reports_hard_failure \
+            input_reader::tests::input_wake_reader_cancels_pressure_with_marker_and_guards_retained \
+            input_reader::tests::input_wake_ack_error_is_terminal_and_keeps_published_prefix_order \
+            input_reader::tests::input_wake_cancellation_after_last_check_releases_both_parks \
+            input_ingress::tests::input_wake_reply_and_last_marker_drop_publish_before_notification \
+            session::tests::input_wake_failure_leaves_with_one_notice_without_replay; do
+            grep -Fx "test $name ... ok" "$runtime/input.log"
+          done
+          if grep -q 'SKIPPED' "$runtime/input.log"; then exit 1; fi
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/input.log"
           cargo test -p qsh --test recovery_port_probe --locked
           cargo test -p qsh --test connection_start --locked
           cargo test -p qsh --test paths --locked
