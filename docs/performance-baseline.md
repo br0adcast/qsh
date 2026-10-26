@@ -40,8 +40,10 @@ Every run is independent and starts from nothing:
 - `qsh` runs as a session leader on its own pseudo-terminal (120x40). One
   reader thread drains, counts and timestamps its output. The terminal's
   descriptors are owned from the moment they are opened, so a failed setup
-  or spawn still closes them, and the reader is stopped and joined before
-  the master is closed.
+  or spawn still closes them. The reader uses them only while it holds
+  custody, and they are closed only after it has given custody back, even
+  when its start was interrupted; a reader that does not stop fails the run
+  and keeps them open.
 - The harness makes itself a child subreaper. At the end it terminates the
   client and daemon sessions (SIGTERM, then SIGKILL), reaps both with
   `wait4`, and then kills and reaps every remaining descendant, such as
@@ -70,7 +72,7 @@ For the session as a whole:
 | `relay.*` | Datagrams and bytes of this session only, per direction. Traffic is encrypted, so frame types (data, acknowledgement, keepalive, path probe) are not distinguished. |
 | `terminal.bytes` | Bytes the client wrote to its terminal. These are rendered screen updates, not the remote output: a fast stream can be presented as fewer bytes than it produced. |
 | `terminal.presented_frames` | Number of cursor-visibility sequences. The renderer ends every presented frame with one, so this counts frames, as a renderer-specific proxy. |
-| `typing.stdin_to_next_datagram_ms` | Time from writing a key to the client's terminal until the relay receives the first client datagram after that write, without prediction. This is an **uncorrelated proxy**: traffic is encrypted, so the datagram is not known to carry the key. A keepalive or acknowledgement sent shortly after the write is attributed to it. |
+| `typing.stdin_to_next_datagram_ms` | Time from a timestamp taken immediately before a key is written to the client's terminal until the first client datagram the relay received at or after that timestamp, without prediction. This is an **uncorrelated proxy**, not the dispatch of the key: traffic is encrypted, so the datagram is not known to carry it. A keepalive or acknowledgement sent shortly after the timestamp is attributed to it. |
 | `typing.echo_ms` | Time from writing a key until the reader thread's read that completed the remote echo returned. It includes the client's input, transport, server, PTY echo, return path and rendering. |
 | `saturation.completion_s` | Wall time for a fixed amount of output to complete end to end, up to when the harness observed the completion marker (it polls every 5 ms). |
 | `reconnect.recovery_s` | Time from restoring the path until the reader thread read the output of a command typed at that moment. |
@@ -79,8 +81,10 @@ For the session as a whole:
 
 Latency times are taken where the event arrives: by the relay thread when
 it receives a datagram and by the PTY reader thread when its read returns,
-not when the measuring loop later polls. The first relevant event after the
-write is used, even when later ones arrived before the loop looked.
+not when the measuring loop later polls. Each key's times are measured from
+one timestamp taken immediately before the key is written, and the first
+relevant event at or after it is used, even when later ones arrived before
+the loop looked.
 
 The harness's PTY reader does not model the rendering cost of a real terminal
 emulator, and the relay adds one local hop. Profilers and tracers are not part
@@ -183,8 +187,13 @@ linkage and toolchain strings of every binary are in each manifest.
   unaffected and remain.
 - Two latency runs then measured `typing` and `reconnect` for the same
   binaries (2 builds x 2 workloads x 5 repetitions, interleaved) with harness
-  version 2, which takes every time at arrival. All 40 runs succeeded with
-  100 of 100 echo and datagram samples each, and left no processes behind.
+  version 2, which takes every time at arrival. All 40 runs succeeded and
+  left no processes behind, and each of the 20 `typing` runs had 100 of 100
+  echo and datagram samples. Version 2 selected the first datagram after a
+  count taken just before each key's timestamp; version 3 selects it by the
+  timestamp itself. In all 2000 version 2 samples the selected datagram
+  arrived at least 0.36 ms after the timestamp, so both rules select the same
+  datagrams and the samples stand.
 
 The tables show medians with interquartile range and run count. The last two
 columns compare the second build with the first: the ratio of medians, and

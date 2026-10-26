@@ -36,7 +36,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 2
+TOOL_VERSION = 3
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -238,7 +238,8 @@ def version_of(path):
         finally:
             if owned:
                 owned.stop()
-            terminal.close()
+            if not terminal.close():
+                raise SetupError(f"the terminal reader of {path.name} --version did not stop")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if owned.status != 0:
         raise SetupError(f"{path.name} --version exited with {owned.status}: {lines[-1:]}")
@@ -475,15 +476,19 @@ class Terminal:
     """The client's pseudo-terminal: output is drained, counted and timestamped.
 
     Every descriptor is owned from openpty on. The drain thread is the only
-    reader of the master; close() stops and joins it before releasing the
-    descriptor, so no read can reach a number reused by a later run.
+    reader of the master, and it touches the descriptors only while it holds
+    custody: it takes custody on entry unless close() has begun, and close()
+    waits for it to give custody back before releasing them. However a start
+    is interrupted, no read can reach a number reused by a later run.
     """
 
     def __init__(self, cols, rows):
         self.master, self.slave = os.openpty()
         self.wake_read = self.wake_write = None
-        self.started = False
         self.released = False
+        self.custody = threading.Condition()
+        self.closing = False
+        self.reading = False
         try:
             fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             self.wake_read, self.wake_write = os.pipe()
@@ -504,9 +509,20 @@ class Terminal:
         os.close(self.slave)
         self.slave = None
         self.thread.start()
-        self.started = True
 
     def drain(self):
+        with self.custody:
+            if self.closing:
+                return
+            self.reading = True
+        try:
+            self.pump()
+        finally:
+            with self.custody:
+                self.reading = False
+                self.custody.notify_all()
+
+    def pump(self):
         poller = select.poll()
         poller.register(self.master, select.POLLIN)
         poller.register(self.wake_read, select.POLLIN)
@@ -579,15 +595,17 @@ class Terminal:
     def close(self, timeout=5):
         """Stop the reader, then release every descriptor; idempotent.
 
-        Returns False, keeping the master open, if the reader did not stop.
+        Returns False, keeping every descriptor open, if the reader still
+        holds custody after `timeout`.
         """
         if self.released:
             return True
-        if self.started:
-            os.write(self.wake_write, b"x")
-            self.thread.join(timeout)
-            if self.thread.is_alive():
-                return False
+        with self.custody:
+            self.closing = True
+            if self.reading:
+                os.write(self.wake_write, b"x")
+                if not self.custody.wait_for(lambda: not self.reading, timeout):
+                    return False
         self.release()
         return True
 
@@ -624,7 +642,7 @@ class Relay:
         self.condition = threading.Condition()
         self.counts = {"c2s_datagrams": 0, "c2s_bytes": 0, "s2c_datagrams": 0, "s2c_bytes": 0,
                        "dropped_datagrams": 0}
-        # (sequence number, monotonic arrival time) of client datagrams
+        # Monotonic arrival times of client datagrams, oldest first.
         self.c2s_arrivals = collections.deque(maxlen=EVENT_HISTORY)
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
@@ -646,7 +664,7 @@ class Relay:
                         self.client = source
                         self.counts["c2s_datagrams"] += 1
                         self.counts["c2s_bytes"] += len(data)
-                        self.c2s_arrivals.append((self.counts["c2s_datagrams"], now))
+                        self.c2s_arrivals.append(now)
                         self.condition.notify_all()
                         target = None
                     else:
@@ -665,20 +683,26 @@ class Relay:
         with self.condition:
             return dict(self.counts)
 
-    def next_client_datagram(self, count, timeout):
-        """Arrival time of the first client datagram after `count` of them,
-        even when more have arrived since; None if none arrives in time."""
+    def first_client_datagram_from(self, boundary, timeout):
+        """Arrival time of the first client datagram received at or after
+        `boundary` (monotonic), even when more have arrived since; None if
+        none arrives in time."""
         deadline = time.monotonic() + timeout
         with self.condition:
-            while self.counts["c2s_datagrams"] <= count:
+            while True:
+                first = None
+                for at in reversed(self.c2s_arrivals):
+                    if at < boundary:
+                        break
+                    first = at
+                if first is not None:
+                    if len(self.c2s_arrivals) == self.c2s_arrivals.maxlen and self.c2s_arrivals[0] == first:
+                        raise SetupError("the first client datagram after the boundary is no longer retained")
+                    return first
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self.condition.wait(remaining)
-            for number, at in self.c2s_arrivals:
-                if number == count + 1:
-                    return at
-        raise SetupError(f"client datagram {count + 1} is no longer retained")
 
     def set_cut(self, cut):
         with self.condition:
@@ -851,10 +875,12 @@ def run_idle(rig, settings):
 
 def run_typing(rig, settings):
     """Per key: when its echo was read from the terminal, and when the next
-    client datagram reached the relay. Both are taken where they arrive.
+    client datagram reached the relay. Both are taken where they arrive and
+    measured from `start`, taken just before the key is written.
 
     The datagram cannot be correlated with the key, because traffic is
-    encrypted: it is the first one after the write, whatever it carries.
+    encrypted: it is the first one the relay received at or after `start`,
+    whatever it carries.
     """
     client = rig.start_client("client", ("--predict", "never", "--status", "off"))
     client.terminal.write(b"stty -icanon; cat > /dev/null\n")
@@ -864,14 +890,13 @@ def run_typing(rig, settings):
     for index in range(settings.keystrokes):
         key = KEYS[index % len(KEYS):index % len(KEYS) + 1]
         offset = client.terminal.counters()[0]
-        datagrams = rig.relay.snapshot()["c2s_datagrams"]
         start = time.monotonic()
         client.terminal.write(key)
         try:
             echo.append((client.terminal.wait_for(key, 2.0, offset) - start) * 1000)
         except SetupError:
             pass
-        sent = rig.relay.next_client_datagram(datagrams, 2.0)
+        sent = rig.relay.first_client_datagram_from(start, 2.0)
         if sent is not None:
             datagram.append((sent - start) * 1000)
         time.sleep(max(0.0, settings.key_interval - (time.monotonic() - start)))

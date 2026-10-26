@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -272,7 +273,7 @@ class RelayAndTerminalTests(unittest.TestCase):
             client.sendto(b'ping', ('127.0.0.1', relay.port))
             data, source = server.recvfrom(100)
             self.assertEqual(data, b'ping')
-            self.assertGreaterEqual(relay.next_client_datagram(0, 2), start)
+            self.assertGreaterEqual(relay.first_client_datagram_from(start, 2), start)
             server.sendto(b'pong!', source)
             self.assertEqual(client.recvfrom(100)[0], b'pong!')
             relay.set_cut(True)
@@ -280,7 +281,7 @@ class RelayAndTerminalTests(unittest.TestCase):
             deadline = time.monotonic() + 2
             while relay.snapshot()['dropped_datagrams'] < 1 and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertIsNone(relay.next_client_datagram(1, 0.1))
+            self.assertIsNone(relay.first_client_datagram_from(time.monotonic(), 0.1))
             self.assertEqual(relay.snapshot(), {'c2s_datagrams': 1, 'c2s_bytes': 4, 's2c_datagrams': 1,
                                                 's2c_bytes': 5, 'dropped_datagrams': 1})
         finally:
@@ -288,19 +289,20 @@ class RelayAndTerminalTests(unittest.TestCase):
             client.close()
             server.close()
 
-    def test_relay_returns_the_first_datagram_after_the_count_when_observed_late(self):
+    def test_relay_returns_the_first_datagram_from_the_boundary_when_observed_late(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server.bind(('127.0.0.1', 0))
         server.settimeout(2)
         relay = perf.Relay(server.getsockname()[1])
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # An unrelated datagram before the count is never attributed.
+            # Received before the boundary: never attributed, although a
+            # count snapshot taken before it would have selected it.
+            snapshot = relay.snapshot()['c2s_datagrams']
             client.sendto(b'earlier', ('127.0.0.1', relay.port))
             server.recvfrom(100)
-            count = relay.snapshot()['c2s_datagrams']
-            self.assertEqual(count, 1)
-            written = time.monotonic()
+            self.assertEqual(relay.snapshot()['c2s_datagrams'], snapshot + 1)
+            boundary = time.monotonic()
             client.sendto(b'first', ('127.0.0.1', relay.port))
             server.recvfrom(100)
             between = time.monotonic()
@@ -309,11 +311,14 @@ class RelayAndTerminalTests(unittest.TestCase):
             # The observer looks only now, after both arrivals.
             time.sleep(0.1)
             observed = time.monotonic()
-            arrival = relay.next_client_datagram(count, 2)
-            self.assertGreaterEqual(arrival, written)
+            arrival = relay.first_client_datagram_from(boundary, 2)
+            self.assertGreaterEqual(arrival, boundary)
             self.assertLess(arrival, between)
             self.assertLess(arrival, observed - 0.09)
-            self.assertLess(relay.next_client_datagram(count + 1, 2), observed - 0.09)
+            second = relay.first_client_datagram_from(between, 2)
+            self.assertGreaterEqual(second, between)
+            self.assertLess(second, observed - 0.09)
+            self.assertIsNone(relay.first_client_datagram_from(observed, 0.1))
         finally:
             relay.close()
             client.close()
@@ -387,16 +392,67 @@ class RelayAndTerminalTests(unittest.TestCase):
         finally:
             os.close(writer)
 
-    def test_reader_that_does_not_stop_keeps_the_master_open(self):
+    def test_reader_that_does_not_give_custody_back_keeps_the_descriptors_open(self):
         terminal = perf.Terminal(80, 24)
-        terminal.start()
+        descriptors = [terminal.master, terminal.slave, terminal.wake_read, terminal.wake_write]
+        # A reader that holds custody and never answers the wake-up.
+        terminal.reading = True
+        self.assertFalse(terminal.close(timeout=0.1))
+        self.assertEqual([is_open(fd) for fd in descriptors], [True] * 4)
+        with terminal.custody:
+            terminal.reading = False
+        self.assertTrue(terminal.close())
+        self.assertEqual([is_open(fd) for fd in descriptors], [False] * 4)
+
+    def interrupted_start(self, terminal, entered):
+        """Start the reader for real, then raise a termination signal before
+        start() returns -- after the reader took custody when `entered`, while
+        it has not run yet otherwise."""
+        start = terminal.thread.start
+
+        def start_then_interrupt():
+            start()
+            deadline = time.monotonic() + 5
+            while entered and not terminal.reading:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            raise perf.Interrupted('SIGTERM')
+
+        terminal.thread.start = start_then_interrupt
+        with self.assertRaises(perf.Interrupted):
+            terminal.start()
+
+    def test_start_interrupted_before_the_reader_runs_never_lets_it_touch_the_descriptors(self):
+        terminal = perf.Terminal(80, 24)
+        gate = threading.Event()
+        drain = terminal.drain
+        terminal.thread = threading.Thread(target=lambda: (gate.wait(5), drain()), daemon=True)
+        pumped = []
+        terminal.pump = lambda: pumped.append(True)
+        master = terminal.master
+        self.interrupted_start(terminal, entered=False)
+        self.assertTrue(terminal.close())
+        self.assertFalse(is_open(master))
+        # The reader runs only now, after the release, and finds close() begun.
+        gate.set()
+        terminal.thread.join(5)
+        self.assertFalse(terminal.thread.is_alive())
+        self.assertEqual(pumped, [])
+
+    def test_start_interrupted_after_the_reader_took_custody_waits_for_it(self):
+        terminal = perf.Terminal(80, 24)
+        writer = os.dup(terminal.slave)
+        master = terminal.master
+        alive_at_release = []
+        release = terminal.release
+        terminal.release = lambda: (alive_at_release.append(terminal.thread.is_alive()), release())
         try:
-            with mock.patch.object(terminal.thread, 'join'), \
-                    mock.patch.object(terminal.thread, 'is_alive', return_value=True):
-                self.assertFalse(terminal.close())
-            self.assertTrue(is_open(terminal.master))
-        finally:
+            self.interrupted_start(terminal, entered=True)
             self.assertTrue(terminal.close())
+            self.assertEqual(alive_at_release, [False])
+            self.assertFalse(is_open(master))
+        finally:
+            os.close(writer)
 
     def test_terminal_setup_failure_closes_both_descriptors(self):
         opened = []
@@ -492,6 +548,24 @@ class OwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(perf.SetupError, r"exited with 2: \['unknown option'\]"):
                 perf.version_of(fake)
 
+    def test_version_fails_when_its_terminal_reader_does_not_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'qsh'
+            fake.write_text('#!/bin/sh\necho "qsh 9.9.9"\n')
+            fake.chmod(0o700)
+            close = perf.Terminal.close
+            kept = []
+
+            def stuck(terminal, timeout=5):
+                kept.append(terminal)
+                return False
+
+            with mock.patch.object(perf.Terminal, 'close', stuck):
+                with self.assertRaisesRegex(perf.SetupError, 'did not stop'):
+                    perf.version_of(fake)
+            for terminal in kept:
+                self.assertTrue(close(terminal))
+
 
 class FakeTerminal:
     def __init__(self, echo):
@@ -520,7 +594,7 @@ class FakeRelay:
     def snapshot(self):
         return {'c2s_datagrams': 0, 'c2s_bytes': 0, 's2c_datagrams': 0, 's2c_bytes': 0, 'dropped_datagrams': 0}
 
-    def next_client_datagram(self, count, timeout):
+    def first_client_datagram_from(self, boundary, timeout):
         return time.monotonic() if self.datagrams else None
 
 
