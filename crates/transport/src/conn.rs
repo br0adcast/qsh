@@ -783,6 +783,9 @@ pub struct Connection {
     /// immediately from the new address -- this measures RTT and migrates the
     /// server).
     ping_forced: bool,
+    /// Scoped positive-fixture precondition; never compiled into release.
+    #[cfg(test)]
+    test_idle_until: Option<Instant>,
     /// PING token counter.
     ping_token: u32,
 
@@ -993,6 +996,8 @@ impl Connection {
             last_ping_sent: None,
             handshake_at: now,
             ping_forced: false,
+            #[cfg(test)]
+            test_idle_until: None,
             ping_token: 0,
             moved_at: None,
             rehomes: 0,
@@ -1753,7 +1758,10 @@ impl Connection {
         if self.keys.is_none() || matches!(self.state, LinkState::Closed) {
             return out;
         }
-        if now.saturating_duration_since(self.death_base()) >= self.death_after() {
+        let death_due = now.saturating_duration_since(self.death_base()) >= self.death_after();
+        #[cfg(test)]
+        let death_due = death_due && self.test_idle_until.is_none_or(|until| now >= until);
+        if death_due {
             self.set_state(LinkState::Closed);
             return out;
         }
@@ -1762,7 +1770,10 @@ impl Connection {
         // it rightly keeps the connection off the death timer above) but says
         // nothing about the road actually carrying traffic.
         let since_road_live = now.saturating_duration_since(self.last_recv_ordinary);
-        if matches!(self.state, LinkState::Live) && since_road_live >= PATH_DOWN_AFTER {
+        let road_down = matches!(self.state, LinkState::Live) && since_road_live >= PATH_DOWN_AFTER;
+        #[cfg(test)]
+        let road_down = road_down && self.test_idle_until.is_none_or(|until| now >= until);
+        if road_down {
             self.set_state(LinkState::PathDown);
         }
         // Checks for the backup roads, and a move if the live one has gone
@@ -1937,10 +1948,19 @@ impl Connection {
             }
         }
         if let Some(deadline) = self.death_base().checked_add(self.death_after()) {
+            #[cfg(test)]
+            let deadline = self
+                .test_idle_until
+                .map_or(deadline, |until| deadline.max(until));
             candidates.push(deadline);
         }
         if matches!(self.state, LinkState::Live) {
-            candidates.push(self.last_recv_ordinary + PATH_DOWN_AFTER);
+            let deadline = self.last_recv_ordinary + PATH_DOWN_AFTER;
+            #[cfg(test)]
+            let deadline = self
+                .test_idle_until
+                .map_or(deadline, |until| deadline.max(until));
+            candidates.push(deadline);
         }
         if matches!(self.role, Role::Client) {
             let urgent = self.probes_are_urgent();
@@ -2410,7 +2430,12 @@ impl Connection {
     /// one.
     fn next_ping_at(&self) -> Instant {
         let base = self.last_ping_sent.unwrap_or(self.handshake_at);
-        base + self.ping_interval(base + PING_INTERVAL)
+        let deadline = base + self.ping_interval(base + PING_INTERVAL);
+        #[cfg(test)]
+        let deadline = self
+            .test_idle_until
+            .map_or(deadline, |until| deadline.max(until));
+        deadline
     }
 
     /// How often to PING right now: the lively rate, or the backed-off one
@@ -3934,6 +3959,39 @@ impl Connection {
             .alive_for_test
             .get_or_insert_with(|| std::sync::Arc::new(()));
         std::sync::Arc::downgrade(alive)
+    }
+
+    /// Positive mailbox fixture only: postpone idle work after real ACK
+    /// quiescence. Never hide reliable/service/credit/probe work, rewrite
+    /// packet timestamps or change congestion state.
+    #[cfg(test)]
+    pub(crate) fn postpone_idle_for_test(&mut self, until: Instant) -> Result<(), &'static str> {
+        if self.state != LinkState::Live
+            || self.service_since.is_some()
+            || !self.acks_due.is_empty()
+            || !self.credits_due.is_empty()
+            || self.ping_forced
+            || !self.outstanding_pings.is_empty()
+            || self.sendable_now()
+            || self.streams.values().any(|stream| {
+                stream.sender.unacked_len() != 0
+                    || stream.sender.has_unsent_reset()
+                    || stream.receiver.credit_resend_deadline(self.rto()).is_some()
+            })
+            || (matches!(self.role, Role::Client)
+                && self
+                    .paths
+                    .next_deadline(self.last_recv_auth, false)
+                    .is_some())
+        {
+            return Err("fixture connection is not quiet");
+        }
+        self.test_idle_until = Some(until);
+        if !self.next_timeout().is_some_and(|at| at >= until) {
+            self.test_idle_until = None;
+            return Err("fixture has an earlier non-idle deadline");
+        }
+        Ok(())
     }
 
     /// Test-only: force a PING that is never cleared, so `next_timeout` stays

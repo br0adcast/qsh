@@ -115,6 +115,11 @@ impl SendGate {
         self.notify_opened(&st, was_open)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(&self) -> u64 {
+        self.state.lock().unwrap().pending
+    }
+
     pub fn kind(&self) -> GateKind {
         self.kind
     }

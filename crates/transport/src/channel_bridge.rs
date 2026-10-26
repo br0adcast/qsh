@@ -113,6 +113,12 @@ impl SnapshotMailbox {
         drop(replacement);
         Ok(published)
     }
+    #[cfg(test)]
+    pub(super) fn positions_for_test(&self) -> (u64, u64) {
+        let slot = self.0.lock().unwrap();
+        (slot.produced, slot.observed)
+    }
+
     // Position assignment and successful queue publication commit under one
     // short lock, so concurrent producers cannot invert a snapshot prefix.
     // Failed messages (and their permits) are destroyed after releasing it.

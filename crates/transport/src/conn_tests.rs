@@ -8691,3 +8691,62 @@ fn epoch305_deferred_new_data_does_not_double_apply_one_timeout() {
     client.flush_senders(due, &mut again);
     assert_eq!(client.rto_backoff, 1);
 }
+
+#[test]
+fn mailbox_idle_horizon_qualifies_quiet_peers_and_leaves_reliable_timers_live() {
+    let (mut client, mut server, caddr, saddr) = established_pair();
+    let now = Instant::now();
+    for packet in client.frames_for_test(vec![StreamFrame::Ping { token: 305 }]) {
+        for response in server.on_datagram(now, caddr, &packet.bytes) {
+            client.on_datagram(now, saddr, &response.bytes);
+        }
+    }
+    let horizon = now + Duration::from_secs(60);
+    client.postpone_idle_for_test(horizon).unwrap();
+    server.postpone_idle_for_test(horizon).unwrap();
+    for peer in [&mut client, &mut server] {
+        assert!(peer.next_timeout().is_some_and(|at| at >= horizon));
+        assert!(peer.on_timeout(now + Duration::from_secs(30)).is_empty());
+        assert_eq!(peer.state(), LinkState::Live);
+    }
+    let send_at = now + Duration::from_secs(30);
+    let data = server.send(send_at, 16, b"reliable");
+    assert!(!data.is_empty());
+    assert!(
+        server.postpone_idle_for_test(horizon).is_err(),
+        "outstanding reliable debt is not idle"
+    );
+    assert!(server.next_timeout().unwrap() < horizon);
+    let before = server.stats(now).retransmits;
+    assert!(
+        server.on_timeout_if_due(send_at).is_empty(),
+        "dispatch time is before the real RTO deadline"
+    );
+    assert!(
+        !server.on_timeout_if_due(send_at + server.rto()).is_empty(),
+        "fresh service time reaches the real RTO deadline"
+    );
+    assert!(server.stats(now).retransmits > before);
+}
+
+#[test]
+fn mailbox_idle_horizon_does_not_mask_new_ack_or_forced_ping() {
+    let (mut client, mut server, caddr, saddr) = established_pair();
+    let now = Instant::now();
+    for packet in client.frames_for_test(vec![StreamFrame::Ping { token: 305 }]) {
+        for response in server.on_datagram(now, caddr, &packet.bytes) {
+            client.on_datagram(now, saddr, &response.bytes);
+        }
+    }
+    let horizon = now + Duration::from_secs(60);
+    server.postpone_idle_for_test(horizon).unwrap();
+    for packet in client.send(now, 16, b"input") {
+        server.on_datagram(now, caddr, &packet.bytes);
+    }
+    assert!(server.postpone_idle_for_test(horizon).is_err());
+    assert!(server.next_timeout().unwrap() < horizon);
+    assert!(!server.on_timeout(now + ACK_DELAY).is_empty());
+    server.request_ping(now);
+    assert!(server.next_timeout().unwrap() <= now);
+    assert!(!server.on_timeout(now).is_empty());
+}
