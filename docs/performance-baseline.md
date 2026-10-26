@@ -39,9 +39,10 @@ Every run is independent and starts from nothing:
   everything to simulate an outage. Each client address gets its own socket
   toward the daemon, so qshd sees every client at an address of its own and
   each reply goes back to the client it was sent to. Before harness version
-  4 the relay had one such socket and sent every reply to the client heard
-  from last, which is correct only while one client is connected at a time,
-  as in every workload of the earlier versions.
+  4, and in the first runtime-worker dataset below, the relay had one such
+  socket and sent every reply to the client heard from last, which is
+  correct only while one client is connected at a time, as in every
+  workload of the earlier versions.
 - `qsh` runs as a session leader on its own pseudo-terminal (120x40). One
   reader thread drains, counts and timestamps its output. The terminal's
   descriptors are owned from the moment they are opened, so a failed setup
@@ -83,8 +84,8 @@ For the session as a whole:
 | `reconnect.recovery_s` | Time from restoring the path until the reader thread read the output of a command typed at that moment. |
 | `busy.echo_ms` | As `typing.echo_ms`, for the typing session among the redrawing ones. |
 | `busy.busy_terminal_bytes_per_s` | Bytes all redrawing clients wrote to their terminals per second during the window. |
-| `busy.busy_overrun_s` | How much longer than its nominal duration each redraw took, median and maximum over the redrawing sessions. A redraw paces itself, so a longer one was held back: by its output, or by the CPUs it shares with qshd, since the redraws are descendants of qshd and run on its CPUs. |
-| `qshd.allowed_cpus`, `qshd.runtime_workers` | Recorded per run: the CPUs the running qshd may use, from `/proc/<pid>/status`, and the async worker count its log reports (`runtime workers N`). A run whose qshd differs from its variant fails. |
+| `busy.busy_overrun_s` | How much later than its nominal duration each redraw's completion marker reached the client's terminal, median and maximum over the redrawing sessions. A redraw paces itself, so this is an end-to-end overrun of a paced producer: it includes the producer's own scheduling on qshd's CPUs (the redraws are descendants of qshd), the shell, qshd, the relay and the terminal drain, not qshd's delay alone. |
+| `qshd.allowed_cpus`, `qshd.runtime_workers`, `qshd.runtime_workers_expected` | Recorded per run: the CPUs the running qshd may use, from `/proc/<pid>/status`; the async worker count its log reports (`runtime workers N`); and the count the run required, or null when it required none. A run whose qshd runs on other CPUs than its variant names fails. How the worker count is checked is described under [Procedure](#procedure). |
 | `lifetime.*` | `wait4` resource usage over a process's whole life, all threads included. `ru_maxrss` is deliberately not recorded: a forked child starts with the harness's resident size as its high-water mark. |
 | `harness_cpu_s` | The harness's own CPU for the run: relay, PTY drain and polling. It shares the host with the measured processes. |
 
@@ -164,6 +165,21 @@ qshd, so Tokio's default worker count follows them. `--harness-cpus` keeps
 the harness, its relay and every client on other CPUs; a variant without
 CPUs of its own then runs qshd on every CPU the harness started with. The
 processes a session starts inherit qshd's CPUs.
+
+A variant that names CPUs or a worker count is a runtime-worker
+experiment, and its run fails unless qshd's log reports the count it
+should run:
+
+- with `threads=N`, N;
+- otherwise Tokio's default for that qshd: `TOKIO_WORKER_THREADS` if the
+  environment the harness gave qshd sets it (it passes on only `PATH`, so
+  normally it does not), else one worker per CPU qshd may run on. A cgroup
+  CPU quota also lowers Tokio's default, so a run under one, or outside a
+  cgroup v2 hierarchy where none can be seen, fails and asks for
+  `threads=N` instead.
+
+A build run without variants, or a variant that names neither, only
+records the count; a build without the log line records none.
 
 A variant with `system` runs `qshd serve --system` instead, which the
 harness does only as root with `QSHD_TEST_DISPOSABLE_HOST=1` set: it runs
@@ -431,12 +447,18 @@ The VM has 4 CPUs; nothing here was measured on a larger host.
   rustc 1.98.1. The system-mode runs used a build of the same commit with
   `--features qshd/system`, in an `ubuntu:24.04` container built from
   `scripts/perf_baseline_system.Dockerfile`, with the worker account
-  `nobody`. Hashes are in each manifest.
+  `nobody`. Hashes are in each manifest. The client is the `qsh` of the
+  same commit, which predates the UI-wait changes of #339; client-side
+  figures here do not describe later clients.
 - **Variants:** qshd confined to CPU 0 (`c1`/`s1`), CPUs 0-1 (`c2`/`s2`)
   or CPUs 0-3 (`c4`/`s4`) with Tokio's default worker count, which then is
   1, 2 or 4; a `t1` or `t2` suffix adds `--runtime-threads 1` or `2`. `c`
-  is personal mode and `s` system mode. Every run checked the CPUs and the
-  worker count of the running qshd. The harness, its relay and every client
+  is personal mode and `s` system mode. Every run checked the CPUs of the
+  running qshd, and the worker count it reported when the variant set
+  `threads=`. Harness version 4, which made these runs, recorded the default
+  count without checking it; version 5 checks it as described under
+  [Procedure](#procedure). All 240 records with the default count match
+  the number of CPUs they record. The harness, its relay and every client
   ran on CPUs 2-3, so in the 4-CPU variants they shared CPUs with qshd.
   Session shells, and with them the redraw scripts, run on qshd's CPUs.
 - **Order:** 5 repetitions, interleaved: the variant order is reversed in
@@ -573,9 +595,10 @@ One session, eight retained, and `busy` with five sessions:
 
 ### What these runs show, for this host only
 
-- **Latency does not depend on the worker count.** The median typing echo
-  is 1.4-1.5 ms and its 90th percentile 1.8-2.0 ms in every variant of both
-  modes; beside four redrawing sessions it is 1.5-1.6 ms and 1.9-2.3 ms.
+- **No latency difference between worker counts was observed.** The
+  median typing echo is 1.4-1.5 ms and its 90th percentile 1.8-2.0 ms in
+  every variant of both modes; beside four redrawing sessions it is
+  1.5-1.6 ms and 1.9-2.3 ms.
   Recovery after an outage is 1.45 s everywhere. Redraw output is delivered
   at the same rate in every variant.
 - **Fewer workers cost less under load.** With two or four CPUs, one worker
@@ -584,19 +607,22 @@ One session, eight retained, and `busy` with five sessions:
   its voluntary switches with active sessions by a fifth to a half. With
   one CPU, the shell producing the output shares it with qshd: qshd used
   56% of it, and saturation took 2.35-2.44 s, against 1.8-2.4 s with more
-  CPUs. A redraw overran its pace the least with four CPUs, whatever the
-  worker count.
-- **The 16-session latency tails come from the harness.** With 15
+  CPUs. The end-to-end redraw overrun was smallest with four CPUs,
+  whatever the worker count; it includes the redraws' own scheduling on
+  qshd's CPUs, not only qshd's delay.
+- **The source of the 16-session latency tails is unresolved.** With 15
   redrawing sessions, some echoes per run took tens to hundreds of
-  milliseconds, at most 670 ms, in bursts of consecutive keys. The
-  harness, one Python process that relays every datagram and drains every
-  terminal, then used 11-25 s of CPU per run of about 31-43 s. The tails
-  followed the relay's load, not qshd's: the one-CPU variants, whose qshd
-  coalesced the output into the fewest datagrams (about 1580 per second
-  against 2140-2870), left the harness the least work and had almost no
-  late echoes. These tails are therefore not attributed to the worker
-  count; latency at this scale needs a lighter relay. CPU and switch
-  counts of these runs stand.
+  milliseconds, at most 670 ms, in bursts of consecutive keys. They
+  correlate with the harness's load: the harness, one Python process that
+  relays every datagram and drains every terminal, used 11-25 s of CPU per
+  run of about 31-43 s, and the one-CPU variants, whose qshd coalesced the
+  output into the fewest datagrams (about 1580 per second against
+  2140-2870), had almost no late echoes. Harness saturation is a plausible
+  confound, but correlation does not establish the cause, and affinity
+  changes contention too: in the four-CPU variants qshd shares CPUs with
+  the harness, and in every variant the redraws run on qshd's CPUs. These
+  runs therefore neither attribute the tails to the worker count nor rule
+  it out. Their CPU and switch counts stand.
 - **The helper is unaffected.** In system mode the privileged helper stays
   single-threaded, at 0-0.1% of a CPU and about 5 voluntary switches per
   second, in every variant and workload.
@@ -620,7 +646,8 @@ One session, eight retained, and `busy` with five sessions:
 
 The default stays one worker per CPU that qshd may use, with
 `--runtime-threads` to set it explicitly (see
-[the service guide](qshd-service.md#runtime-worker-threads)). On this host
-one worker served five active sessions without a latency cost and 16 with
-less CPU, but that does not establish a setting for hosts with many CPUs or
-for the system mode's 128 sessions, which were not measured.
+[the service guide](qshd-service.md#runtime-worker-threads)). These runs
+support keeping that default and report the ranges observed on one 4-CPU
+VM. They do not show that worker counts are equivalent elsewhere, and
+establish no setting for hosts with many CPUs or for the system mode's 128
+sessions, which were not measured.

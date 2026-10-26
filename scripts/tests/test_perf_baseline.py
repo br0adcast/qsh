@@ -836,12 +836,15 @@ FAKE_QSHD = """\
 import os, socket, sys, time
 args = sys.argv[1:]
 port = int(args[args.index("--port") + 1])
-threads = args[args.index("--runtime-threads") + 1] if "--runtime-threads" in args else "4"
+# As Tokio sizes its default: TOKIO_WORKER_THREADS, else one per CPU.
+default = os.environ.get("TOKIO_WORKER_THREADS", str(len(os.sched_getaffinity(0))))
+threads = args[args.index("--runtime-threads") + 1] if "--runtime-threads" in args else default
 reported = os.environ.get("FAKE_WORKERS", threads)
 log = os.path.join(os.environ["XDG_CACHE_HOME"], "qsh", "qshd.log")
 os.makedirs(os.path.dirname(log), exist_ok=True)
 with open(log, "a") as out:
-    out.write(f"INFO qshd: runtime workers {reported}\\n")
+    if reported != "none":
+        out.write(f"INFO qshd: runtime workers {reported}\\n")
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("127.0.0.1", port))
 time.sleep(30)
@@ -850,7 +853,7 @@ time.sleep(30)
 
 @unittest.skipUnless(sys.platform == 'linux' and perf.shutil.which('taskset'), 'needs Linux and taskset')
 class VariantDaemonTests(unittest.TestCase):
-    def rig(self, directory, cpus, threads):
+    def rig(self, directory, cpus, threads, named=True):
         build = Path(directory) / 'build'
         build.mkdir()
         qshd = build / 'qshd'
@@ -858,7 +861,24 @@ class VariantDaemonTests(unittest.TestCase):
         qshd.chmod(0o700)
         root = Path(directory) / 'run'
         root.mkdir()
-        return perf.Rig({'directory': build, 'effective_qshd_cpus': cpus, 'runtime_threads': threads}, root)
+        # `named`: the variant names its CPUs, as a runtime-worker
+        # experiment does, rather than inheriting the harness's.
+        return perf.Rig({'directory': build, 'effective_qshd_cpus': cpus, 'runtime_threads': threads,
+                         'qshd_cpus': cpus if named else None}, root)
+
+    def started(self, rig):
+        try:
+            self.start(rig)
+            return rig.daemon_facts
+        finally:
+            rig.daemon.stop()
+
+    def refused(self, rig, message):
+        try:
+            with self.assertRaisesRegex(perf.SetupError, message):
+                self.start(rig)
+        finally:
+            rig.daemon.stop()
 
     def start(self, rig):
         try:
@@ -874,7 +894,8 @@ class VariantDaemonTests(unittest.TestCase):
             rig = self.rig(directory, [cpu], 2)
             try:
                 self.start(rig)
-                self.assertEqual(rig.daemon_facts, {'allowed_cpus': [cpu], 'runtime_workers': 2})
+                self.assertEqual(rig.daemon_facts, {'allowed_cpus': [cpu], 'runtime_workers': 2,
+                                                    'runtime_workers_expected': 2})
                 self.assertEqual(os.sched_getaffinity(rig.daemon.pid), {cpu})
             finally:
                 rig.daemon.stop()
@@ -888,6 +909,49 @@ class VariantDaemonTests(unittest.TestCase):
                     self.start(rig)
             finally:
                 rig.daemon.stop()
+
+    def test_named_cpus_check_tokios_default(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.started(self.rig(directory, [cpu], None)),
+                             {'allowed_cpus': [cpu], 'runtime_workers': 1, 'runtime_workers_expected': 1})
+
+    def test_the_default_follows_tokio_worker_threads_in_qshds_environment(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TOKIO_WORKER_THREADS': '3'}), \
+                mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'TOKIO_WORKER_THREADS')):
+            self.assertEqual(self.started(self.rig(directory, [cpu], None))['runtime_workers_expected'], 3)
+
+    def test_a_wrong_default_count_fails_the_run(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'FAKE_WORKERS': '3'}), \
+                mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')):
+            self.refused(self.rig(directory, [cpu], None), 'reports 3 runtime workers, expected 1')
+
+    def test_a_missing_count_fails_a_checked_run(self):
+        cpu = min(os.sched_getaffinity(0))
+        for threads, expected in ((None, 1), (2, 2)):
+            with self.subTest(threads=threads), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict(os.environ, {'FAKE_WORKERS': 'none'}), \
+                    mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')), \
+                    mock.patch.object(perf, 'SETUP_TIMEOUT', 1.0):
+                self.refused(self.rig(directory, [cpu], threads), f'reports no runtime worker count, expected {expected}')
+
+    def test_a_cpu_quota_needs_a_named_count(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(perf, 'cpu_quotas', lambda cgroup: ['50000 100000']):
+            self.refused(self.rig(directory, [cpu], None), r'a CPU quota \(50000 100000\) applies')
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(perf, 'cpu_quotas', lambda cgroup: None):
+            self.refused(self.rig(directory, [cpu], None), 'no cgroup v2 hierarchy')
+
+    def test_an_unchecked_build_records_whatever_it_reports(self):
+        for reported, recorded in (('none', None), ('7', 7)):
+            with self.subTest(reported=reported), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict(os.environ, {'FAKE_WORKERS': reported}), \
+                    mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')):
+                facts = self.started(self.rig(directory, None, None, named=False))
+                self.assertEqual((facts['runtime_workers'], facts['runtime_workers_expected']), (recorded, None))
 
     def test_other_cpus_fail_the_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -904,6 +968,26 @@ class VariantDaemonTests(unittest.TestCase):
                     self.start(rig)
             finally:
                 rig.daemon.stop()
+
+
+class CgroupQuotaTests(unittest.TestCase):
+    def test_quotas_from_the_group_up_to_the_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'a' / 'b').mkdir(parents=True)
+            (root / 'cpu.max').write_text('max 100000\n')
+            (root / 'a' / 'cpu.max').write_text('200000 100000\n')
+            (root / 'a' / 'b' / 'cpu.max').write_text('max 100000\n')
+            self.assertEqual(perf.cpu_quotas('0::/a/b\n', root), ['200000 100000'])
+            self.assertEqual(perf.cpu_quotas('0::/\n', root), [])
+            self.assertEqual(perf.cpu_quotas('0::/missing\n', root), [])
+
+    def test_no_cgroup_v2_hierarchy(self):
+        self.assertIsNone(perf.cpu_quotas('4:cpu,cpuacct:/a\n1:name=systemd:/a\n'))
+
+    def test_an_invalid_tokio_worker_threads_is_refused(self):
+        with self.assertRaisesRegex(perf.SetupError, 'is not a worker count'):
+            perf.default_workers({'TOKIO_WORKER_THREADS': '0'}, [0], '0::/\n')
 
 
 if __name__ == '__main__':

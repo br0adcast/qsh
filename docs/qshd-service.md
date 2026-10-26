@@ -684,15 +684,18 @@ Session shells are separate processes. In system mode the setting applies
 to the worker process, which runs the runtime; PAM and session starts
 happen in the privileged helper, which is single-threaded either way.
 
-The default suits most hosts; there is no need to set it. Measurements on a
-4-CPU VM ([performance baseline](performance-baseline.md#runtime-worker-threads-2026-10-26))
-found no latency difference between one worker and one per CPU, with up to
-five active sessions, in personal and system mode. With heavy output, and
+The default is what qshd has always run, and the measurements so far
+support keeping it. They come from one 4-CPU VM ([performance
+baseline](performance-baseline.md#runtime-worker-threads-2026-10-26)) and
+showed no latency difference between one worker and one per CPU with up to
+five active sessions, in personal and system mode; with heavy output, and
 with up to 16 sessions, fewer workers used somewhat less CPU and fewer
-context switches. On a host with many CPUs, where qshd shares the machine
-with other work, a small count such as `--runtime-threads 2` limits how
-many threads qshd spreads its sessions over; hosts with more than 4 CPUs
-have not been measured.
+context switches. They do not show that the counts are equivalent on other
+hosts. Hosts with more than 4 CPUs and more than 16 sessions have not been
+measured. Setting a small count, such as `--runtime-threads 2`, limits how
+many CPUs qshd's async work spreads over, for example where qshd shares a
+large machine with other work; measure the effect there before relying on
+it.
 
 ## Checking it
 

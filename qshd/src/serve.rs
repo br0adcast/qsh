@@ -1447,6 +1447,97 @@ mod tests {
         /// whether it got one.
         type Call = (Instant, Duration, bool);
 
+        /// Runs `send` every [`PROBE_EVERY`] on a thread of its own until
+        /// stopped. Dropping it stops and joins that thread, so a test that
+        /// fails while it runs does not leave the thread, and the client it
+        /// holds, behind.
+        struct Probe {
+            probing: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Probe {
+            fn start(send: impl Fn() + Send + 'static) -> Self {
+                let probing = Arc::new(AtomicBool::new(true));
+                let thread = std::thread::spawn({
+                    let probing = Arc::clone(&probing);
+                    move || {
+                        while probing.load(Ordering::SeqCst) {
+                            send();
+                            std::thread::sleep(PROBE_EVERY);
+                        }
+                    }
+                });
+                Self {
+                    probing,
+                    thread: Some(thread),
+                }
+            }
+
+            /// Sends a byte on stream 0 of `client` to be echoed.
+            fn sending(client: &Arc<StdClient>) -> Self {
+                let client = Arc::clone(client);
+                Self::start(move || {
+                    client
+                        .send_bytes(0, b".".to_vec())
+                        .expect("fixture input admitted");
+                })
+            }
+
+            /// Stops the probe and joins its thread, which must not have
+            /// failed.
+            fn finish(mut self) {
+                assert!(self.stop().is_ok(), "the probe's thread failed");
+            }
+
+            fn stop(&mut self) -> std::thread::Result<()> {
+                self.probing.store(false, Ordering::SeqCst);
+                self.thread.take().map_or(Ok(()), |thread| thread.join())
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                // On a failing test's unwind, or after `finish`: join, and
+                // never panic a second time.
+                let _ = self.stop();
+            }
+        }
+
+        /// A test that fails while its probe runs still stops and joins the
+        /// probe's thread, and the thread gives up the client it held.
+        #[test]
+        fn a_failing_test_stops_and_joins_its_probe() {
+            let client = Arc::new(AtomicUsize::new(0));
+            let unwound = std::panic::catch_unwind({
+                let client = Arc::clone(&client);
+                move || {
+                    let held = Arc::clone(&client);
+                    let _probe = Probe::start(move || {
+                        held.fetch_add(1, Ordering::SeqCst);
+                    });
+                    assert!(
+                        wait_until(TEST_WAIT, || client.load(Ordering::SeqCst) > 0),
+                        "setup: the probe must be running"
+                    );
+                    panic!("a controlled failure while the probe runs");
+                }
+            });
+            assert!(unwound.is_err(), "the controlled failure must unwind");
+            assert_eq!(
+                Arc::strong_count(&client),
+                1,
+                "the probe's thread must have exited and dropped its client"
+            );
+            let sent = client.load(Ordering::SeqCst);
+            std::thread::sleep(PROBE_EVERY * 3);
+            assert_eq!(
+                client.load(Ordering::SeqCst),
+                sent,
+                "nothing may send after the unwind"
+            );
+        }
+
         /// Passes every call on to the source the setup built, and times the
         /// ones the router makes for a nonce.
         struct Timed {
@@ -1624,18 +1715,7 @@ mod tests {
                 "setup: the pool must run dry once the helper is silent"
             );
 
-            let probing = Arc::new(AtomicBool::new(true));
-            let probe = std::thread::spawn({
-                let a = Arc::clone(&a);
-                let probing = Arc::clone(&probing);
-                move || {
-                    while probing.load(Ordering::SeqCst) {
-                        a.send_bytes(0, b".".to_vec())
-                            .expect("fixture input admitted");
-                        std::thread::sleep(PROBE_EVERY);
-                    }
-                }
-            });
+            let probe = Probe::sending(&a);
             // Let the probe's echoes start before B does.
             assert!(
                 wait_until(TEST_WAIT, || a_events.received().bytes.len()
@@ -1656,8 +1736,7 @@ mod tests {
                 .expect("fixture input admitted");
             std::thread::sleep(WATCH);
             let watch_until = Instant::now();
-            probing.store(false, Ordering::SeqCst);
-            probe.join().expect("the probe");
+            probe.finish();
 
             let asked: Vec<Call> = calls
                 .lock()
@@ -1729,8 +1808,7 @@ mod tests {
             );
         }
 
-        /// How long a slow verification takes: twice [`STALL`], as PAM or a
-        /// loaded helper may.
+        /// How long a slow verification takes: twice [`STALL`].
         const SLOW_VERIFY: Duration = Duration::from_secs(2);
 
         /// Delays every verification by [`SLOW_VERIFY`] once `slow` is set,
@@ -1765,8 +1843,11 @@ mod tests {
         /// echoes meanwhile, and the slow login still gets in.
         ///
         /// A stub helper admits everyone. A first client, A, gets in at
-        /// once; then verifications turn slow, and while A sends a byte to
-        /// be echoed every [`PROBE_EVERY`], a second client, B, logs in.
+        /// once; then the test's verifier holds every verification, and
+        /// while A sends a byte to be echoed every [`PROBE_EVERY`], a second
+        /// client, B, logs in. This qualifies routing while a verification
+        /// is delayed, with an echo backend and a stub helper; it exercises
+        /// no PAM, terminal or update cleanup.
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
         async fn a_slow_verification_holds_up_nothing_on_one_runtime_worker() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1847,18 +1928,7 @@ mod tests {
             );
 
             slow.store(true, Ordering::SeqCst);
-            let probing = Arc::new(AtomicBool::new(true));
-            let probe = std::thread::spawn({
-                let a = Arc::clone(&a);
-                let probing = Arc::clone(&probing);
-                move || {
-                    while probing.load(Ordering::SeqCst) {
-                        a.send_bytes(0, b".".to_vec())
-                            .expect("fixture input admitted");
-                        std::thread::sleep(PROBE_EVERY);
-                    }
-                }
-            });
+            let probe = Probe::sending(&a);
             assert!(
                 wait_until(TEST_WAIT, || a_events.received().bytes.len()
                     > b"hello".len()),
@@ -1878,8 +1948,7 @@ mod tests {
                 .expect("fixture input admitted");
             let b_got_in = wait_until(TEST_WAIT, || b_events.received().bytes == b"hello");
             let watch_until = Instant::now();
-            probing.store(false, Ordering::SeqCst);
-            probe.join().expect("the probe");
+            probe.finish();
 
             let echoes: Vec<Instant> = a_events
                 .received()
@@ -2242,18 +2311,7 @@ mod tests {
                     assert!(filled < 1_000_000, "setup: the seam never filled");
                 }
 
-                let probing = Arc::new(AtomicBool::new(true));
-                let probe = std::thread::spawn({
-                    let a = Arc::clone(&a);
-                    let probing = Arc::clone(&probing);
-                    move || {
-                        while probing.load(Ordering::SeqCst) {
-                            a.send_bytes(0, b".".to_vec())
-                                .expect("fixture input admitted");
-                            std::thread::sleep(PROBE_EVERY);
-                        }
-                    }
-                });
+                let probe = Probe::sending(&a);
                 let echoed = a_events.received().bytes.len();
                 assert!(
                     wait_until(TEST_WAIT, || a_events.received().bytes.len() > echoed + 3),
@@ -2287,8 +2345,7 @@ mod tests {
                     .collect();
                 std::thread::sleep(PHASE_R);
                 let r_until = Instant::now();
-                probing.store(false, Ordering::SeqCst);
-                probe.join().expect("the probe");
+                probe.finish();
 
                 let arrivals = a_events.received().arrivals.clone();
                 let silence_l = longest_silence(&arrivals, l_from, l_until);

@@ -38,7 +38,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 4
+TOOL_VERSION = 5
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -56,6 +56,7 @@ ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|
 PR_SET_CHILD_SUBREAPER = 36
 PARENT_ENVIRONMENT = ("PATH",)
 RUNTIME_WORKERS = re.compile(r"runtime workers (\d+)")
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 # The system mode's diagnostic log, a fixed path (qshd's SYSTEM_LOG_DIR).
 SYSTEM_LOG = Path("/var/log/qshd/qshd.log")
 # Set only on a disposable machine, as for qshd's own system-mode suites.
@@ -302,6 +303,49 @@ def cpu_list(text):
 
 def cpu_text(cpus):
     return ",".join(str(cpu) for cpu in cpus)
+
+
+def cpu_quotas(cgroup, root=CGROUP_ROOT):
+    """The cgroup v2 CPU quotas (`cpu.max` other than `max`) over a process
+    whose /proc/<pid>/cgroup reads `cgroup`, from its own group up to the
+    root; None when it is in no cgroup v2 hierarchy."""
+    for line in cgroup.splitlines():
+        hierarchy, controllers, path = (line.split(":", 2) + ["", ""])[:3]
+        if hierarchy == "0" and not controllers:
+            break
+    else:
+        return None
+    group, quotas = root / path.strip().lstrip("/"), []
+    while True:
+        try:
+            limit = (group / "cpu.max").read_text(encoding="ascii").split()
+        except FileNotFoundError:
+            limit = None
+        if limit and limit[0] != "max":
+            quotas.append(" ".join(limit))
+        if group == root or root not in group.parents:
+            return quotas
+        group = group.parent
+
+
+def default_workers(environment, allowed, cgroup):
+    """The async worker count Tokio defaults to for a qshd started with
+    `environment` and running on `allowed` CPUs: TOKIO_WORKER_THREADS if
+    set, otherwise one per CPU. A CPU quota lowers that default in ways the
+    harness does not predict, so a run under one must name its count."""
+    if "TOKIO_WORKER_THREADS" in environment:
+        value = environment["TOKIO_WORKER_THREADS"]
+        if not value.isdigit() or int(value) < 1:
+            raise SetupError(f"TOKIO_WORKER_THREADS={value!r} is not a worker count")
+        return int(value)
+    quotas = cpu_quotas(cgroup)
+    if quotas is None:
+        raise SetupError("qshd is in no cgroup v2 hierarchy, so its default worker count is not "
+                         "predicted; give the variant threads=N")
+    if quotas:
+        raise SetupError(f"a CPU quota ({quotas[0]}) applies to qshd and lowers its default worker "
+                         "count; give the variant threads=N")
+    return len(allowed)
 
 
 def variant_spec(text):
@@ -894,6 +938,7 @@ class Rig:
             command += ["--authorized-keys", str(self.server_home / "authorized_keys")]
         if threads is not None:
             command += ["--runtime-threads", str(threads)]
+        self.daemon_environment = env
         self.daemon = Daemon(command, env, self.root / "qshd.log", self.server_home)
         deadline = time.monotonic() + SETUP_TIMEOUT
         while self.system and self.worker is None:
@@ -938,12 +983,21 @@ class Rig:
 
     def daemon_identity(self, deadline):
         """The CPUs the running qshd may use and the runtime workers its log
-        reports, checked against what the variant asked for."""
-        status = dict(line.partition(":")[::2] for line in read(f"/proc/{self.runtime_pid()}/status").splitlines())
+        reports, checked against what the variant asked for.
+
+        A variant that names CPUs or a worker count is a runtime-worker
+        experiment: the count must be reported and must be the one asked
+        for, or Tokio's default for that qshd. Otherwise the count is only
+        recorded, and a build without the log line records none."""
+        pid = self.runtime_pid()
+        status = dict(line.partition(":")[::2] for line in read(f"/proc/{pid}/status").splitlines())
         allowed = cpu_list(status["Cpus_allowed_list"].strip())
         cpus, threads = self.variant["effective_qshd_cpus"], self.variant["runtime_threads"]
         if cpus and allowed != cpus:
             raise SetupError(f"qshd runs on CPUs {cpu_text(allowed)}, expected {cpu_text(cpus)}")
+        expected = threads
+        if expected is None and self.variant.get("qshd_cpus"):
+            expected = default_workers(self.daemon_environment, allowed, read(f"/proc/{pid}/cgroup"))
         log = SYSTEM_LOG if self.system else self.server_home / ".cache" / "qsh" / "qshd.log"
         workers = None
         while workers is None:
@@ -955,15 +1009,17 @@ class Rig:
                 found = None
             if found:
                 workers = int(found.group(1))
-            elif threads is None or time.monotonic() > deadline:
+            elif expected is None or time.monotonic() > deadline:
                 # Builds without the log line report nothing; that is only
-                # an error when a worker count was asked for.
+                # an error when the count is checked.
                 break
             else:
                 time.sleep(0.05)
-        if threads is not None and workers != threads:
-            raise SetupError(f"qshd reports {workers} runtime workers, expected {threads}")
-        facts = {"allowed_cpus": allowed, "runtime_workers": workers}
+        if expected is not None and workers is None:
+            raise SetupError(f"qshd reports no runtime worker count, expected {expected}")
+        if expected is not None and workers != expected:
+            raise SetupError(f"qshd reports {workers} runtime workers, expected {expected}")
+        facts = {"allowed_cpus": allowed, "runtime_workers": workers, "runtime_workers_expected": expected}
         if self.system:
             facts["mode"] = "system"
         return facts
@@ -1174,8 +1230,10 @@ def run_busy(rig, settings):
     result["busy_terminal_bytes_per_s"] = round(delivered / result["window"]["seconds"])
     result["echo_ms"] = {"p50": percentile(echo, 0.5), "p90": percentile(echo, 0.9),
                          "max": max(echo) if echo else None, "samples": [round(v, 3) for v in echo]}
-    # Each redraw paces itself and runs `seconds` when its output is never
-    # held back; how much longer it took is how far qshd fell behind.
+    # Each redraw paces itself and runs `seconds` when nothing holds it
+    # back. How much longer its marker took to reach the client's terminal
+    # is an end-to-end overrun: the producer's scheduling, the shell, qshd,
+    # the relay and the terminal drain all add to it.
     overrun = [client.terminal.wait_for(b"BUSY-42", seconds + 60, offset) - launched - seconds
                for client, (offset, launched) in zip(busy, launches)]
     result["busy_overrun_s"] = {"median": round(statistics.median(overrun), 3), "max": round(max(overrun), 3)}
