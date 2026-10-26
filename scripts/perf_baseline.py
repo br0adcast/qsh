@@ -15,6 +15,7 @@ import argparse
 import collections
 import ctypes
 import datetime
+import errno
 import fcntl
 import hashlib
 import json
@@ -28,6 +29,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import statistics
 import struct
 import subprocess
@@ -38,7 +40,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 5
+TOOL_VERSION = 6
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -1242,8 +1244,291 @@ def run_busy(rig, settings):
     return result
 
 
+# Opt-in only: preserve the current default WORKLOADS, including busy.
+HISTORY_LINES = 4000
+HISTORY_SCRIPT = r"""import os, sys, time
+from pathlib import Path
+control, checkpoint = map(Path, sys.argv[1:3])
+partial, additional, updates, fps = map(int, sys.argv[3:])
+if not (0 < partial <= 2000 and 0 < additional <= 6000 and 0 < updates <= 200 and 0 < fps <= 20):
+    raise SystemExit('history producer parameter bounds exceeded')
+expected = iter(['partial', 'cap', 'repaint', 'finish'])
+with control.open() as commands:
+    while line := commands.readline(33):
+        if len(line) > 32:
+            raise SystemExit('history control line exceeds bounds')
+        phase = line.rstrip('\n')
+        if phase != next(expected, None):
+            raise SystemExit('invalid history phase')
+        if phase in ('partial', 'cap'):
+            start, count = (1, partial) if phase == 'partial' else (partial + 1, additional)
+            for index in range(start, start + count):
+                print('HROW-%08d ' % index + 'x' * 60)
+            if phase == 'partial':
+                print('HISTORY-PARTIAL-DONE')
+        elif phase == 'repaint':
+            for index in range(updates):
+                sys.stdout.write('\rHISTORY-UPDATE-%08d' % index + ' ' * 50)
+                sys.stdout.flush()
+                time.sleep(1 / fps)
+            print('\nHISTORY-FINAL-DONE')
+        sys.stdout.flush()
+        pending = checkpoint.with_suffix('.next')
+        pending.write_text(phase + '\n')
+        pending.replace(checkpoint)
+        if phase == 'finish':
+            break
+"""
+
+
+def parse_rollup(text):
+    wanted = {'Pss': 'pss_kib', 'Private_Clean': 'private_clean_kib',
+              'Private_Dirty': 'private_dirty_kib'}
+    found = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(':')
+        if key in wanted:
+            match = re.fullmatch(r'\s*(\d+) kB\s*', value)
+            if match is None or key in found:
+                raise SetupError('invalid owned client memory field')
+            found[key] = int(match[1])
+    if found.keys() != wanted.keys():
+        raise SetupError('incomplete owned client memory fields')
+    return {'pss_kib': found['Pss'],
+            'private_kib': found['Private_Clean'] + found['Private_Dirty']}
+
+
+def client_memory(client):
+    if client.wait(0):
+        raise SetupError('history client exited before memory observation')
+    before = sample_process(client.pid)
+    if before['rss_kib'] is None or before['peak_rss_kib'] is None:
+        raise SetupError('missing owned client RSS/HWM')
+    rollup = parse_rollup(read(f'/proc/{client.pid}/smaps_rollup'))
+    after = parse_stat(read(f'/proc/{client.pid}/stat'))
+    if before['start_ticks'] != after['start_ticks']:
+        raise SetupError('history client identity changed')
+    return {'rss_kib': before['rss_kib'], 'lifetime_hwm_kib': before['peak_rss_kib'],
+            **rollup}
+
+
+def latest_full_repaint(data):
+    beginning = data.rfind(b'\x1b[2J')
+    if beginning < 0:
+        raise SetupError('snapshot has no full repaint')
+    endings = [(data.find(marker, beginning), len(marker)) for marker in FRAME_MARKERS]
+    endings = [(at, size) for at, size in endings if at >= 0]
+    if not endings:
+        raise SetupError('snapshot has no complete presentation')
+    at, size = min(endings)
+    return data[beginning:at+size], at+size
+
+
+def parse_repaint_marker(data, marker):
+    frame, _ = latest_full_repaint(data)
+    if marker not in ESCAPE.sub(b'', frame):
+        raise SetupError('full repaint does not contain the phase marker')
+    return True
+
+
+def parse_history_snapshot(data, expected_total=None):
+    # Only used after an explicitly requested full repaint; not a screen emulator.
+    frame, _ = latest_full_repaint(data)
+    plain = ESCAPE.sub(b'', frame)
+    matches = list(re.finditer(rb'scroll: (\d+)/(\d+)', plain))
+    rows = [int(value) for value in re.findall(rb'HROW-(\d{8})(?!\d)', plain)]
+    if not matches or not rows:
+        raise SetupError('missing positive history status/row observation')
+    offset, total = map(int, matches[-1].groups())
+    if not 0 < offset <= total or (expected_total is not None and total != expected_total):
+        raise SetupError('history offset/cap observation differs')
+    return {'offset': offset, 'total': total, 'rows': rows}
+
+
+def require_pinned(before, after):
+    if not after['offset'] or before['rows'] != after['rows']:
+        raise SetupError('selected client history viewport was not retained')
+
+
+class HistoryControl:
+    def __init__(self, path, timeout=SETUP_TIMEOUT):
+        self.fd = None
+        info = path.lstat()
+        if not stat.S_ISFIFO(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+            raise SetupError('history control is not an owned private FIFO')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+                break
+            except OSError as error:
+                if error.errno != errno.ENXIO:  # The finite producer has not opened yet.
+                    raise
+                time.sleep(0.01)
+        if self.fd is None:
+            raise SetupError('history producer did not open control FIFO')
+
+    def send(self, phase):
+        if phase not in ('partial', 'cap', 'repaint', 'finish'):
+            raise ValueError('unknown history control phase')
+        payload = (phase + '\n').encode()
+        if os.write(self.fd, payload) != len(payload):
+            raise SetupError('incomplete history control write')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def read_history_checkpoint(path):
+    try:
+        with path.open('rb') as stream:
+            value = stream.read(33)
+    except FileNotFoundError:
+        return None
+    if len(value) > 32:
+        raise SetupError('oversized history checkpoint')
+    return value.decode('ascii', errors='replace').rstrip('\n') if value.endswith(b'\n') else None
+
+
+def history_checkpoint(path, phase, timeout=SETUP_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if read_history_checkpoint(path) == phase:
+            return
+        time.sleep(0.01)
+    raise SetupError('history producer phase incomplete: ' + phase)
+
+
+def sample_history_phase(path, client, nominal_seconds):
+    start = time.monotonic()
+    samples = []
+    while True:
+        elapsed = time.monotonic()-start
+        if elapsed >= nominal_seconds + SETUP_TIMEOUT:
+            raise SetupError('history repaint producer phase incomplete')
+        phase = read_history_checkpoint(path)
+        observed = time.monotonic()-start
+        if observed >= nominal_seconds + SETUP_TIMEOUT:
+            raise SetupError('history repaint producer phase incomplete')
+        if phase == 'repaint':
+            return samples, observed
+        samples.append({'seconds': round(elapsed, 3), **client_memory(client)})
+        time.sleep(0.05)
+
+
+def observe_full_repaint(client, inspect):
+    if client.wait(0):
+        raise SetupError('history client exited before snapshot')
+    size = fcntl.ioctl(client.terminal.master, termios.TIOCGWINSZ, bytes(8))
+    if struct.unpack('HHHH', size)[:2] != (ROWS, COLS):
+        raise SetupError('history physical extent changed')
+    offset = client.terminal.counters()[0]
+    # Same-size WINCH invalidates/render-full in both accepted revisions.
+    # The unreaped owned child PID cannot be reused; do not steal wait4 via Popen.poll.
+    os.kill(client.pid, signal.SIGWINCH)
+    deadline = time.monotonic() + SETUP_TIMEOUT
+    next_probe = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        base, data, reads = client.terminal.snapshot_since(offset)
+        try:
+            observed = inspect(data)
+            _, end = latest_full_repaint(data)
+            for stream_end, at in reads:
+                if stream_end >= base+end:
+                    return observed, at
+            raise SetupError('full repaint completion read was not retained')
+        except SetupError:
+            if time.monotonic() >= next_probe:
+                if client.wait(0):
+                    raise SetupError('history client exited during snapshot')
+                # Bounded observation probes, outside the CPU window. A producer
+                # checkpoint does not mean the client's queued DATA is ingested.
+                offset = client.terminal.counters()[0]
+                os.kill(client.pid, signal.SIGWINCH)
+                next_probe = time.monotonic() + 1
+            time.sleep(0.01)
+    raise SetupError('no valid positive full-repaint observation')
+
+
+def history_snapshot(client, expected_total=None):
+    return observe_full_repaint(client, lambda data: parse_history_snapshot(data, expected_total))[0]
+
+
+def repaint_marker(client, marker):
+    # A diff can retain part of a visible marker. Require a full repaint, not
+    # a raw substring assembled accidentally from a CSI terminator and payload.
+    return observe_full_repaint(client, lambda data: parse_repaint_marker(data, marker))[1]
+
+
+def run_history(rig, settings):
+    if settings.window != 10 or settings.redraw_fps != 20:
+        raise SetupError('history requires the fixed ten-second/20Hz workload')
+    client = rig.start_client('client', ('--predict', 'never', '--history', str(HISTORY_LINES)))
+    time.sleep(SETTLE)
+    phases = {'empty_live': client_memory(client)}
+    control, checkpoint = rig.server_home / 'history.control', rig.server_home / 'history.checkpoint'
+    os.mkfifo(control, 0o600)
+    (rig.server_home / 'history.py').write_text(HISTORY_SCRIPT)
+    client.terminal.write(b'python3 ~/history.py ~/history.control ~/history.checkpoint 2000 6000 200 20\n')
+    with HistoryControl(control) as producer:
+        producer.send('partial')
+        history_checkpoint(checkpoint, 'partial')
+        repaint_marker(client, b'HISTORY-PARTIAL-DONE')
+        time.sleep(SETTLE)
+        phases['filled_live'] = client_memory(client)
+        client.terminal.write(b'\x1d[\x1b[5~')
+        selected = history_snapshot(client)
+        phases['partial_pinned'] = client_memory(client)
+        producer.send('cap')
+        history_checkpoint(checkpoint, 'cap')
+        capped = history_snapshot(client, HISTORY_LINES)
+        require_pinned(selected, capped)
+        phases['capped_pinned'] = client_memory(client)
+        before = rig.snapshot(client)
+        producer.send('repaint')
+        dispatch_at = time.monotonic()
+        memory_samples, producer_seconds = sample_history_phase(checkpoint, client, settings.window)
+        checkpoint_at = time.monotonic()
+        phase_end = rig.snapshot(client)
+        measured = window(before, phase_end)
+        if not memory_samples:
+            raise SetupError('history phase has no memory observations')
+        if measured['relay']['s2c_bytes'] <= 0:
+            raise SetupError('history phase has no server-to-client relay progress')
+        require_pinned(selected, history_snapshot(client, HISTORY_LINES))
+        phases['after_repaint_pinned'] = client_memory(client)
+        client.terminal.write(b'q')
+        final_observed_at = repaint_marker(client, b'HISTORY-FINAL-DONE')
+        time.sleep(SETTLE)
+        phases['returned_live'] = client_memory(client)
+        client.terminal.write(b'\x1d[g')
+        top = history_snapshot(client, HISTORY_LINES)
+        if min(top['rows']) <= 2000:
+            raise SetupError('old model history rows were not evicted at cap')
+        client.terminal.write(b'q')
+        producer.send('finish')
+        history_checkpoint(checkpoint, 'finish')
+    return {'window': measured, 'history_lines': HISTORY_LINES, 'updates_requested': 200, 'producer_updates_completed': 200,
+            'nominal_producer_seconds': 10, 'observed_producer_seconds': producer_seconds,
+            'phase_times': {'dispatch_s': dispatch_at-before['t'],
+                            'checkpoint_observed_s': checkpoint_at-before['t'],
+                            'window_end_s': phase_end['t']-before['t'],
+                            'final_observed_s': final_observed_at-before['t']},
+            'window_scope': 'dispatch through producer checkpoint; client application tail may complete later',
+            'phases': phases, 'history_observations': {'selected':selected, 'capped':capped, 'top_after_return':top},
+            'memory_samples': memory_samples,
+            'sampled_max_rss_kib': max(sample['rss_kib'] for sample in memory_samples),
+            'memory_scope': 'client endpoint RSS/PSS/private; HWM since exec; sampled max is not true peak'}
+
+
 RUNNERS = {"idle": run_idle, "typing": run_typing, "redraw": run_redraw, "saturation": run_saturation,
-           "reconnect": run_reconnect, "retained": run_retained, "busy": run_busy}
+           "reconnect": run_reconnect, "retained": run_retained, "busy": run_busy, "history": run_history}
+
 
 
 def run_one(variant, workload, settings, root):
@@ -1337,7 +1622,7 @@ def command_run(args):
     become_subreaper()
     install_signal_handlers()
     workloads = args.workloads.split(",")
-    unknown = sorted(set(workloads) - set(WORKLOADS))
+    unknown = sorted(set(workloads) - set(RUNNERS))
     if unknown:
         sys.exit(f"unknown workloads: {', '.join(unknown)}")
     if "busy" in workloads and args.busy_sessions < 1:
