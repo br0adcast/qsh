@@ -45,7 +45,29 @@ pub struct IngressBlocked(Arc<BlockedRead>);
 struct BlockedRead {
     budget: IngressBudget,
     bytes: usize,
-    reply: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
+    reply: Mutex<Option<Reply>>,
+}
+#[derive(Debug)]
+struct Reply {
+    sender: Option<std::sync::mpsc::SyncSender<bool>>,
+    wake: Option<crate::input_wake::WakeSender>,
+}
+impl Reply {
+    fn send(mut self, value: bool) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(value);
+        }
+    }
+}
+impl Drop for Reply {
+    fn drop(&mut self) {
+        // Disconnect must be observable before the wake, including when the
+        // last marker is dropped without ever resolving its pressure fence.
+        drop(self.sender.take());
+        if let Some(wake) = self.wake.take() {
+            let _ = wake.notify();
+        }
+    }
 }
 impl PartialEq for IngressBlocked {
     fn eq(&self, other: &Self) -> bool {
@@ -55,12 +77,32 @@ impl PartialEq for IngressBlocked {
 impl Eq for IngressBlocked {}
 impl IngressBlocked {
     pub fn channel(budget: IngressBudget, bytes: usize) -> (Self, std::sync::mpsc::Receiver<bool>) {
+        Self::channel_inner(budget, bytes, None)
+    }
+
+    #[doc(hidden)]
+    pub fn channel_notified(
+        budget: IngressBudget,
+        bytes: usize,
+        wake: crate::input_wake::WakeSender,
+    ) -> (Self, std::sync::mpsc::Receiver<bool>) {
+        Self::channel_inner(budget, bytes, Some(wake))
+    }
+
+    fn channel_inner(
+        budget: IngressBudget,
+        bytes: usize,
+        wake: Option<crate::input_wake::WakeSender>,
+    ) -> (Self, std::sync::mpsc::Receiver<bool>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         (
             Self(Arc::new(BlockedRead {
                 budget,
                 bytes,
-                reply: Mutex::new(Some(tx)),
+                reply: Mutex::new(Some(Reply {
+                    sender: Some(tx),
+                    wake,
+                })),
             })),
             rx,
         )
@@ -70,8 +112,9 @@ impl IngressBlocked {
     /// No budget mutex is held while acknowledging or waiting for the reader.
     pub fn resolve(&self) -> bool {
         let available = self.0.budget.can_admit(self.0.bytes);
-        if let Some(reply) = self.0.reply.lock().expect("ingress acknowledgement").take() {
-            let _ = reply.send(available);
+        let reply = self.0.reply.lock().expect("ingress acknowledgement").take();
+        if let Some(reply) = reply {
+            reply.send(available);
         }
         available
     }
