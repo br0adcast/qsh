@@ -12,11 +12,27 @@ use transport::shell_frame::{
 pub mod channel;
 pub mod qsh;
 
+/// Clock domains remain explicit: terminal parser time is monotonic, while
+/// prediction time uses the caller's elapsed millisecond clock.
+#[derive(Clone, Copy, Debug)]
+pub struct ShellDeadlines {
+    pub synchronized_output: Option<std::time::Instant>,
+    pub prediction_ms: Option<i64>,
+    pub prediction_refresh: bool,
+}
+impl ShellDeadlines {
+    fn due(self, now: std::time::Instant, now_ms: i64) -> bool {
+        self.synchronized_output.is_some_and(|at| now >= at)
+            || self.prediction_ms.is_some_and(|at| now_ms >= at)
+            || self.prediction_refresh
+    }
+}
+
 /// The "terminal + prediction + deframer" bundle under one lock: all mutable
 /// state of the shell session, accessed both by the platform thread
-/// (input/resize), the driver thread (receive), and the 50ms tick. Every
-/// method returns a frame ready to render: overlaid with active predictions
-/// at the live bottom, authoritative while viewing history.
+/// (input/resize), the driver thread (receive), and the caller's periodic tick.
+/// Frame-producing methods overlay predictions at the live bottom and return
+/// authoritative contents while viewing history.
 ///
 /// Echo numeric contract: the engine stamps `expiration = local_frame_sent`
 /// (no offset). So `on_input` first grows `input_bytes_sent` by the length of
@@ -33,6 +49,8 @@ pub struct ShellState {
     input_bytes_sent: u64,
     /// Explicit history mode suppresses prediction even at offset zero.
     history_view: bool,
+    #[cfg(test)]
+    snapshots: usize,
 }
 
 impl ShellState {
@@ -56,6 +74,8 @@ impl ShellState {
             deframer: ShellDeframer::new(),
             input_bytes_sent: 0,
             history_view: false,
+            #[cfg(test)]
+            snapshots: 0,
         }
     }
 
@@ -64,6 +84,14 @@ impl ShellState {
     /// an unconfirmed size. Resetting the stream establishes a fresh scope.
     pub fn stream_error(&self) -> Option<ShellCodecError> {
         self.deframer.error()
+    }
+
+    fn snapshot(&mut self) -> terminal::Frame {
+        #[cfg(test)]
+        {
+            self.snapshots += 1;
+        }
+        self.terminal.frame()
     }
 
     /// Whether the prediction engine shows anything right now -- for tests
@@ -99,7 +127,7 @@ impl ShellState {
         self.input_bytes_sent += data.len() as u64;
         self.prediction
             .set_local_frame_sent(self.input_bytes_sent as i64);
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         for &b in data {
             self.prediction.new_user_byte(b, &auth, now_ms);
         }
@@ -129,7 +157,7 @@ impl ShellState {
                 }
             }
         }
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         self.prediction.set_send_interval(rtt_ms);
         // In history (offset > 0) we don't overlay prediction -- its
         // coordinates are tied to the live bottom and no longer match in a scrolled frame.
@@ -176,7 +204,7 @@ impl ShellState {
         self.with_history_anchor(terminal::TerminalCore::flush_pending_output);
         self.terminal
             .resize_to(terminal_size::TerminalSize::for_viewport(cols, rows));
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
             self.prediction.apply_owned(auth)
@@ -191,7 +219,7 @@ impl ShellState {
     /// authoritative frame without overlay.
     pub fn scroll_frame(&mut self, delta_lines: i32, now_ms: i64, rtt_ms: i64) -> terminal::Frame {
         self.terminal.scroll(delta_lines);
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         self.prediction.set_send_interval(rtt_ms);
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
@@ -209,7 +237,7 @@ impl ShellState {
     /// history, by the same rule as `on_stream0`/`scroll_frame`. Unlike
     /// `tick` it always returns a frame: the caller asked for one.
     pub fn frame(&mut self, now_ms: i64, rtt_ms: i64) -> terminal::Frame {
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         self.prediction.set_send_interval(rtt_ms);
         if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
@@ -239,7 +267,7 @@ impl ShellState {
         self.prediction.reset();
         self.history_view = false;
         self.terminal.clear_history();
-        self.terminal.frame()
+        self.snapshot()
     }
 
     /// The session came back on a new connection (a warm reattach). The
@@ -252,7 +280,22 @@ impl ShellState {
         self.deframer = ShellDeframer::new();
         self.prediction.reset_connection();
         self.input_bytes_sent = 0;
-        self.terminal.frame()
+        self.snapshot()
+    }
+
+    /// Read-only eligibility for the existing tick; history never masks a
+    /// terminal synchronized-output deadline.
+    pub fn deadlines(&self, rtt_ms: i64) -> ShellDeadlines {
+        let live = !self.history_view && self.terminal.display_offset() == 0;
+        ShellDeadlines {
+            synchronized_output: self.terminal.sync_deadline(),
+            prediction_ms: live
+                .then(|| self.prediction.next_display_deadline_ms())
+                .flatten(),
+            prediction_refresh: live
+                && (self.prediction.display_refresh_pending()
+                    || (self.prediction.active() && self.prediction.send_interval_ms() != rtt_ms)),
+        }
     }
 
     /// Apply due synchronized output and reveal active predictions without new
@@ -261,12 +304,17 @@ impl ShellState {
         self.tick_at(std::time::Instant::now(), now_ms, rtt_ms)
     }
 
-    fn tick_at(
+    /// The caller may share a monotonic observation time with its UI turn.
+    /// now_ms remains on the independent prediction elapsed-time clock.
+    pub fn tick_at(
         &mut self,
         now: std::time::Instant,
         now_ms: i64,
         rtt_ms: i64,
     ) -> Option<terminal::Frame> {
+        if !self.deadlines(rtt_ms).due(now, now_ms) {
+            return None;
+        }
         let flushed = self.with_history_anchor(|terminal| terminal.flush_due_output(now));
         let predict = !self.history_view
             && self.terminal.display_offset() == 0
@@ -278,7 +326,7 @@ impl ShellState {
         if !flushed && !predict {
             return None;
         }
-        let auth = self.terminal.frame();
+        let auth = self.snapshot();
         if predict {
             self.prediction.set_send_interval(rtt_ms);
             self.prediction.cull(&auth, now_ms);
@@ -502,6 +550,127 @@ mod state_tests {
         );
     }
 
+    #[test]
+    fn eligibility_stable_visible_prediction_tick_does_not_construct_frame() {
+        let mut state = established_hidden_adaptive_prediction();
+        assert_eq!(state.frame(1350, 10).cell(0, 1).ch, 'i');
+        state.snapshots = 0;
+        let stable = state.tick(1370, 10);
+        assert_eq!(state.snapshots, 0, "stable tick must not construct a frame");
+        assert!(stable.is_none(), "stable visible prediction needs no frame");
+        let severe = state.tick(6100, 10).expect("severe trigger remains due");
+        assert_eq!(severe.cell(0, 1).flags & terminal::FLAG_UNDERLINE, 0);
+        let flagged = state
+            .tick(6120, 10)
+            .expect("following evaluation applies underline");
+        assert_ne!(flagged.cell(0, 1).flags & terminal::FLAG_UNDERLINE, 0);
+        assert!(state.tick(6140, 10).is_none());
+        assert_eq!(
+            state.snapshots, 2,
+            "only the severe and following evaluations snapshot"
+        );
+    }
+
+    #[test]
+    fn eligibility_quick_repair_clears_underline_on_following_tick() {
+        let mut state = established_hidden_adaptive_prediction();
+        state.tick(6100, 10).unwrap();
+        state.tick(6120, 10).unwrap();
+        let mut echo = encode_record(REC_DATA, b"i");
+        echo.extend(encode_record(REC_ECHO_ACK, &2u64.to_be_bytes()));
+        state.on_stream0(&echo, 6200, 10);
+        // Nine quick confirmations reduce the severe trigger to one above
+        // its repair threshold. The final confirmation leaves a fresh cell
+        // pending, so the next evaluation still has something to display.
+        for index in 0..9 {
+            let now = 6500 + index * 200;
+            state.on_input(b"j", now, 10);
+            let mut echo = encode_record(REC_DATA, b"j");
+            echo.extend(encode_record(
+                REC_ECHO_ACK,
+                &state.input_bytes_sent.to_be_bytes(),
+            ));
+            state.on_stream0(&echo, now + 50, 10);
+        }
+        state.on_input(b"j", 8300, 10);
+        state.on_input(b"k", 8320, 10);
+        let mut echo = encode_record(REC_DATA, b"j");
+        echo.extend(encode_record(
+            REC_ECHO_ACK,
+            &(state.input_bytes_sent - 1).to_be_bytes(),
+        ));
+        let repaired = state.on_stream0(&echo, 8350, 10);
+        assert_eq!(repaired.cell(0, 12).ch, 'k');
+        assert_ne!(repaired.cell(0, 12).flags & terminal::FLAG_UNDERLINE, 0);
+        let cleared = state
+            .tick(8370, 10)
+            .expect("repair's following evaluation must clear underline");
+        assert_eq!(cleared.cell(0, 12).ch, 'k');
+        assert_eq!(cleared.cell(0, 12).flags & terminal::FLAG_UNDERLINE, 0);
+        assert!(state.tick(8390, 10).is_none());
+    }
+
+    #[test]
+    fn eligibility_rtt_uses_engine_state_across_all_frame_paths() {
+        let mut state = established_hidden_adaptive_prediction();
+        state.frame(1350, 10);
+        assert!(state.deadlines(100).prediction_refresh);
+        assert!(state.tick(1370, 100).is_some());
+        assert_eq!(state.prediction.send_interval_ms(), 100);
+        assert!(!state.deadlines(100).prediction_refresh);
+        assert!(state.tick(1390, 100).is_none());
+        state.on_stream0(&[], 1400, 50);
+        assert_eq!(state.prediction.send_interval_ms(), 50);
+        assert!(state.tick(1420, 50).is_none());
+        state.scroll_frame(0, 1440, 40);
+        assert_eq!(state.prediction.send_interval_ms(), 40);
+        assert!(state.tick(1460, 40).is_none());
+        state.resize_frame(20, 1, 1480);
+        assert_eq!(
+            state.prediction.send_interval_ms(),
+            40,
+            "resize has no RTT input"
+        );
+        state.on_input(b"j", 1500, 30);
+        assert_eq!(state.prediction.send_interval_ms(), 30);
+        state.frame(1520, 20);
+        assert_eq!(state.prediction.send_interval_ms(), 20);
+    }
+
+    #[test]
+    fn eligibility_due_snapshot_preserves_complete_metadata_and_cells() {
+        let make = || {
+            let mut state = ShellState::new(20, 3, prediction::DisplayPreference::Adaptive, false);
+            let content = "\x1b]4;1;rgb:12/34/56\x07\x1b[?1h\x1b=\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[8mH\x1b[0me\u{301}界\r\n";
+            state.on_stream0(&encode_record(REC_DATA, content.as_bytes()), 0, 10);
+            state.on_input(b"h", 1000, 10);
+            let mut echoed = encode_record(REC_DATA, b"h");
+            echoed.extend(encode_record(REC_ECHO_ACK, &1u64.to_be_bytes()));
+            state.on_stream0(&echoed, 1050, 10);
+            state.frame(1060, 10);
+            state.on_input(b"i", 1100, 10);
+            state
+        };
+        let mut explicit = make();
+        let expected = explicit.frame(1350, 10);
+        assert!(
+            expected.app_cursor
+                && expected.app_keypad
+                && expected.mouse_sgr
+                && expected.bracketed_paste
+        );
+        assert_ne!(
+            expected.palette.entries[1],
+            terminal::Frame::blank(20, 3).palette.entries[1]
+        );
+        assert_ne!(expected.cell(0, 0).flags & terminal::FLAG_HIDDEN, 0);
+        assert!(!expected.cell(0, 1).combining.as_slice().is_empty());
+        assert_ne!(expected.cell(0, 2).flags & terminal::FLAG_WIDE, 0);
+        assert_eq!(expected.cell(1, 1).ch, 'i');
+        let mut ticked = make();
+        assert_eq!(ticked.tick(1350, 10), Some(expected));
+    }
+
     /// `on_input` overlays echo instantly, receiving framed output with
     /// ECHO_ACK confirms the prediction.
     ///
@@ -718,12 +887,11 @@ mod state_tests {
         );
     }
 
-    /// `tick` is the 50ms timer: it pushes a frame only while a prediction
-    /// is outstanding. Nothing predicted -- nothing to push; a fresh
-    /// prediction -- the overlaid frame with it visible; once the server has
-    /// echoed it -- nothing again.
+    /// The caller tick pushes a frame for due prediction work, while stable
+    /// visible predictions need no replacement snapshot. ACK retirement still
+    /// leaves nothing to push.
     #[test]
-    fn tick_returns_a_frame_only_while_a_prediction_is_active() {
+    fn tick_returns_a_frame_only_when_prediction_work_is_due() {
         let mut st = ShellState::new(20, 1, prediction::DisplayPreference::Always, false);
         assert!(
             st.tick(900, 100).is_none(),
@@ -744,9 +912,13 @@ mod state_tests {
         );
 
         let _ = st.on_input(b"i", 1100, 100);
+        assert!(
+            st.tick(1150, 100).is_none(),
+            "stable prediction needs no new frame"
+        );
         let ticked = st
-            .tick(1150, 100)
-            .expect("an outstanding prediction is pushed by the tick");
+            .tick(1350, 100)
+            .expect("an outstanding prediction's display transition is evaluated");
         assert_eq!(ticked.cell(0, 1).ch, 'i', "with the prediction visible");
         assert_ne!(
             st.terminal.frame().cell(0, 1).ch,
@@ -760,9 +932,9 @@ mod state_tests {
             REC_ECHO_ACK,
             &st.input_bytes_sent.to_be_bytes(),
         ));
-        st.on_stream0(&ack, 1200, 100);
+        st.on_stream0(&ack, 1400, 100);
         assert!(
-            st.tick(1250, 100).is_none(),
+            st.tick(1450, 100).is_none(),
             "once echoed there is nothing left to push"
         );
     }

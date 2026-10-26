@@ -216,8 +216,20 @@ fn history_repaint_has_no_transient_retained_frame_copy() {
     assert!(actions
         .iter()
         .all(|action| !matches!(action, qsh::session::Action::Write(_))));
+    // The idle tick has no due work and deliberately constructs no frames.
+    assert_eq!(GRID_CALLS.get(), 0);
+
+    // Real live output still requires presentation against the pinned history
+    // frame. No newline means history size and its status label stay unchanged.
+    let output = transport::shell_frame::encode_record(transport::shell_frame::REC_DATA, b"X");
+    GRID_CALLS.set(0);
+    GRID_SIZES.set((40 * 5 * size_of::<Cell>(), 40 * 6 * size_of::<Cell>()));
+    let (actions, _) = measured(|| session.handle(UiEvent::Stream0(output), 1004));
+    assert!(actions
+        .iter()
+        .all(|action| !matches!(action, qsh::session::Action::Write(_))));
     // Authoritative snapshot, padded projection and status-row insertion.
-    // An idle presentation never reaches Renderer retention.
+    // The unchanged retained view does not reach Renderer retention.
     assert_eq!(GRID_CALLS.get(), 3);
     session.handle(
         UiEvent::Stats(transport::Stats {
