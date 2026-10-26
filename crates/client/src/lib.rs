@@ -268,8 +268,13 @@ impl ShellState {
         rtt_ms: i64,
     ) -> Option<terminal::Frame> {
         let flushed = self.with_history_anchor(|terminal| terminal.flush_due_output(now));
-        let predict =
-            !self.history_view && self.terminal.display_offset() == 0 && self.prediction.active();
+        let predict = !self.history_view
+            && self.terminal.display_offset() == 0
+            && (self.prediction.active()
+                || self
+                    .prediction
+                    .next_display_deadline_ms()
+                    .is_some_and(|deadline| now_ms >= deadline));
         if !flushed && !predict {
             return None;
         }
@@ -427,6 +432,76 @@ mod state_tests {
     }
 
     /// The "terminal + prediction + deframer" bundle without a network:
+    fn established_hidden_adaptive_prediction() -> ShellState {
+        let mut state = ShellState::new(20, 1, prediction::DisplayPreference::Adaptive, false);
+        state.on_input(b"h", 1000, 10);
+        let mut echoed = encode_record(REC_DATA, b"h");
+        echoed.extend(encode_record(REC_ECHO_ACK, &1u64.to_be_bytes()));
+        state.on_stream0(&echoed, 1050, 10);
+        // Clear RTT hysteresis with no remaining predictions before starting
+        // the established (already confirmed) epoch's next prediction.
+        state.frame(1060, 10);
+        let hidden = state.on_input(b"i", 1100, 10);
+        assert_ne!(hidden.cell(0, 1).ch, 'i');
+        assert!(!state.prediction_active());
+        state
+    }
+
+    #[test]
+    fn hidden_adaptive_tick_matches_explicit_frame_at_display_deadline() {
+        let mut explicit = established_hidden_adaptive_prediction();
+        let mut ticked = established_hidden_adaptive_prediction();
+        assert_ne!(explicit.frame(1349, 10).cell(0, 1).ch, 'i');
+        let due = explicit.frame(1350, 10);
+        assert_eq!(
+            due.cell(0, 1).ch,
+            'i',
+            "confirmed epoch permits timed visibility"
+        );
+        assert_eq!(ticked.tick(1350, 10), Some(due));
+    }
+
+    #[test]
+    fn hidden_adaptive_tick_matches_explicit_frame_at_flag_deadline() {
+        let mut explicit = established_hidden_adaptive_prediction();
+        let mut ticked = established_hidden_adaptive_prediction();
+        let before = explicit.frame(6099, 10);
+        assert_eq!(before.cell(0, 1).ch, 'i');
+        assert_eq!(before.cell(0, 1).flags & terminal::FLAG_UNDERLINE, 0);
+        // The existing cull arms flagging on the next evaluation after the
+        // severe-glitch transition; characterize that order without changing it.
+        let severe = explicit.frame(6100, 10);
+        assert_eq!(severe.cell(0, 1).flags & terminal::FLAG_UNDERLINE, 0);
+        let due = explicit.frame(6120, 10);
+        assert_ne!(due.cell(0, 1).flags & terminal::FLAG_UNDERLINE, 0);
+        assert_eq!(ticked.tick(6100, 10), Some(severe));
+        assert_eq!(ticked.tick(6120, 10), Some(due));
+    }
+
+    #[test]
+    fn hidden_prediction_tick_preserves_tentative_and_history_policy() {
+        let mut first = ShellState::new(20, 1, prediction::DisplayPreference::Adaptive, false);
+        first.on_input(b"i", 1000, 10);
+        if let Some(frame) = first.tick(1250, 10) {
+            assert_ne!(frame.cell(0, 0).ch, 'i', "first epoch remains tentative");
+        }
+        assert_ne!(first.frame(1250, 10).cell(0, 0).ch, 'i');
+
+        let mut hidden = established_hidden_adaptive_prediction();
+        assert!(hidden.tick(1349, 10).is_none());
+        hidden.set_history_view(true);
+        assert!(hidden.tick(1350, 10).is_none());
+        hidden.set_history_view(false);
+        assert_eq!(hidden.tick(1350, 10).unwrap().cell(0, 1).ch, 'i');
+        let mut echo = encode_record(REC_DATA, b"i");
+        echo.extend(encode_record(REC_ECHO_ACK, &2u64.to_be_bytes()));
+        hidden.on_stream0(&echo, 1400, 10);
+        assert!(
+            hidden.tick(7000, 10).is_none(),
+            "ACK retires pending prediction"
+        );
+    }
+
     /// `on_input` overlays echo instantly, receiving framed output with
     /// ECHO_ACK confirms the prediction.
     ///
