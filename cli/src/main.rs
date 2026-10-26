@@ -1664,7 +1664,7 @@ fn interactive(
             .chain(links.next_deadline(&sess, started, now))
             .min();
         let mut events = Vec::new();
-        let mut queue = collect_ui_turn(rx, &mut events, session_due, now);
+        let (mut queue, mut external_taken) = collect_ui_turn(rx, &mut events, session_due, now);
         if events.is_empty()
             && queue == QueueState::Empty
             && !signals::has_pending()
@@ -1680,7 +1680,7 @@ fn interactive(
                 }
                 rx.mark_failed();
             }
-            queue = collect_ui_turn(rx, &mut events, session_due, Instant::now());
+            (queue, external_taken) = collect_ui_turn(rx, &mut events, session_due, Instant::now());
         }
         if let Err(error) = rx.drain().and_then(|()| signals::drain_notifications()) {
             if !wait_fault_reported {
@@ -1691,12 +1691,13 @@ fn interactive(
         }
         // Seal before the authoritative post-fault read. A failure published
         // later cannot authorize an exit using this turn's earlier Empty.
-        let sealed_fault = if let Some(state) = collect_failed_ui_turn(rx, &mut events) {
-            queue = state;
-            true
-        } else {
-            false
-        };
+        let sealed_fault =
+            if let Some(state) = collect_failed_ui_turn(rx, &mut events, external_taken) {
+                queue = state;
+                true
+            } else {
+                false
+            };
         // Even empty notification turns reach Links::turn below. Never drain
         // Round/DNS publication and then park without observing its owner.
         let mut pending = signals::take_pending();
@@ -1947,20 +1948,26 @@ fn collect_ui_turn(
     events: &mut Vec<UiEvent>,
     due: Option<Instant>,
     now: Instant,
-) -> QueueState {
+) -> (QueueState, usize) {
+    let before = events.len();
     let state = rx.collect_into(events);
+    let external_taken = events.len() - before;
     if due.is_some_and(|deadline| deadline <= now) {
         events.push(UiEvent::Tick);
     }
-    state
+    (state, external_taken)
 }
 
-fn collect_failed_ui_turn(rx: &UiInbox, events: &mut Vec<UiEvent>) -> Option<QueueState> {
+fn collect_failed_ui_turn(
+    rx: &UiInbox,
+    events: &mut Vec<UiEvent>,
+    external_taken: usize,
+) -> Option<QueueState> {
     if !rx.failed() {
         return None;
     }
     rx.mark_failed();
-    Some(rx.collect_into(events))
+    Some(rx.collect_up_to(events, 16usize.saturating_sub(external_taken)))
 }
 
 fn discard_terminal_input() {
@@ -2534,7 +2541,8 @@ mod tests {
                 &mut events,
                 due,
                 origin + Duration::from_millis(140)
-            ),
+            )
+            .0,
             QueueState::BudgetReached
         );
         assert_eq!(events.len(), 17);
@@ -2549,7 +2557,7 @@ mod tests {
             rows: 6
         }));
         assert_eq!(
-            collect_ui_turn(&inbox, &mut events, None, origin),
+            collect_ui_turn(&inbox, &mut events, None, origin).0,
             QueueState::Empty
         );
         assert_eq!(events, vec![UiEvent::Stats(transport::Stats::default())]);
@@ -2580,7 +2588,7 @@ mod tests {
             inbox.mark_failed();
             if initial == 16 {
                 assert_eq!(
-                    collect_failed_ui_turn(&inbox, &mut events),
+                    collect_failed_ui_turn(&inbox, &mut events, initial),
                     Some(QueueState::BudgetReached)
                 );
                 assert_eq!(
@@ -2591,11 +2599,43 @@ mod tests {
                 events.clear(); // The owner's first prefix has been serviced.
             }
             assert_eq!(
-                collect_failed_ui_turn(&inbox, &mut events),
+                collect_failed_ui_turn(&inbox, &mut events, 0),
                 Some(QueueState::Disconnected)
             );
             assert_eq!(events, vec![UiEvent::Resumed]);
         }
+    }
+
+    #[test]
+    fn ui_wait_raw_fault_counts_external_capacity_separately_from_signal_and_tick() {
+        let mut inbox = UiInbox::new().unwrap();
+        let sender = inbox.renew();
+        for _ in 0..15 {
+            sender.send(UiEvent::Resumed).unwrap();
+        }
+        let now = Instant::now();
+        let prefix = UiEvent::Resized { cols: 80, rows: 24 };
+        let mut events = vec![prefix];
+        let (_, external_taken) = collect_ui_turn(&inbox, &mut events, Some(now), now);
+        assert_eq!(external_taken, 15);
+        assert_eq!(events.len(), 17); // Signal +15 external +local Tick.
+        sender.send(UiEvent::Resumed).unwrap();
+        inbox.mark_failed();
+        assert_eq!(
+            collect_failed_ui_turn(&inbox, &mut events, external_taken),
+            Some(QueueState::BudgetReached)
+        );
+        assert_eq!(
+            events.len(),
+            18,
+            "one external slot remains despite the signal and Tick"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&UiEvent::Resized { cols: 80, rows: 24 })
+        );
+        assert_eq!(events[16], UiEvent::Tick);
+        assert_eq!(events[17], UiEvent::Resumed);
     }
 
     #[test]

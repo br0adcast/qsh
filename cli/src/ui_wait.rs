@@ -190,7 +190,12 @@ impl UiInbox {
         result
     }
     pub fn collect_into(&self, events: &mut Vec<UiEvent>) -> QueueState {
-        for _ in events.len()..16 {
+        self.collect_up_to(events, 16)
+    }
+    /// A second collection in the same owner turn uses only its remaining
+    /// external-event capacity. Signal prefixes do not change collect_into.
+    pub fn collect_up_to(&self, events: &mut Vec<UiEvent>, remaining: usize) -> QueueState {
+        for _ in 0..remaining.min(16) {
             match self.try_recv() {
                 Ok(event) => events.push(event),
                 Err(mpsc::TryRecvError::Empty) => return QueueState::Empty,

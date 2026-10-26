@@ -560,6 +560,7 @@ jobs:
           for name in \
             tests::ui_wait_raw_turn_keeps_bounded_prefix_and_due_tick \
             tests::ui_wait_raw_fault_recollects_after_initial_empty_before_termination \
+            tests::ui_wait_raw_fault_counts_external_capacity_separately_from_signal_and_tick \
             tests::ui_wait_cooked_replacement_observes_completion_without_stdin; do
             # --nocapture diagnostics may split a test's name and bare ok.
             awk -v expected="test $name ... " '
