@@ -2649,3 +2649,143 @@ fn deadlines302_pipe_gate_open_emits_scoped_ready_without_new_output() {
     rig.bridge.refresh(&rig.server, false);
     assert!(rig.bridge.notifications().is_empty());
 }
+
+#[test]
+fn scratch305_blocked_live_drain_allocates_no_traversal_scratch() {
+    let mut rig = Rig::new();
+    rig.client.set_default_consumption(Consumption::Explicit);
+    let payload = vec![9; crate::reliability::STREAM_WINDOW as usize - 5];
+    let encoded = crate::shell_frame::encode_record(crate::shell_frame::REC_DATA, &payload);
+    let packets = rig.server.send(rig.now, STREAM, &encoded);
+    rig.pump(packets);
+    assert_eq!(
+        rig.server
+            .stream_write_room(STREAM, crate::send_gate::PIPE_HIGH as usize),
+        0
+    );
+    rig.geometry(80, 0);
+    rig.data(b"blocked");
+    let mut out = Vec::new();
+    // Warm the actual live bridge: one-time declarations and bootstrap state
+    // are outside the gate, as are encoding, pumping and all assertions.
+    assert!(!rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery
+    ));
+    let before = rig.server.stream_progress(STREAM);
+    let cursor = rig.bridge.cursor;
+    let charge = rig.bridge.streams[&STREAM]
+        .fifo
+        .iter()
+        .map(|entry| entry.charge.as_ref().map_or(0, |charge| charge.bytes))
+        .sum::<u64>();
+    let ordinary = rig.budget.usage(EntryClass::Ordinary);
+    let lifecycle = rig.budget.usage(EntryClass::Lifecycle);
+    let mut more = true;
+    let allocated = crate::conn::tests::allocation_probe::measure(|| {
+        more = rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
+    });
+    let extra = crate::conn::tests::allocation_probe::measure(|| {
+        let allocation = std::hint::black_box(vec![0u8; 16]);
+        more |= rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery,
+        );
+        std::hint::black_box(allocation);
+    });
+    assert_eq!(
+        extra,
+        allocated + 1,
+        "the probe must see a deliberate extra allocation"
+    );
+    assert!(!more, "a wholly blocked turn must not rearm an idle spin");
+    assert!(out.is_empty());
+    assert_eq!(rig.server.stream_progress(STREAM), before);
+    assert_eq!(rig.bridge.cursor, cursor);
+    assert_eq!(rig.budget.usage(EntryClass::Ordinary), ordinary);
+    assert_eq!(rig.budget.usage(EntryClass::Lifecycle), lifecycle);
+    assert_eq!(
+        rig.bridge.streams[&STREAM]
+            .fifo
+            .iter()
+            .map(|entry| entry.charge.as_ref().map_or(0, |charge| charge.bytes))
+            .sum::<u64>(),
+        charge
+    );
+    assert_eq!(
+        allocated, 0,
+        "real blocked bridge traversal allocation requests"
+    );
+}
+
+#[test]
+fn scratch305_real_drain_freezes_cyclic_order_across_cursor_updates_and_high_ids() {
+    let keys = [16u8, 17, 254, 255];
+    for cursor in [0, 16, 17, 18, 253, 254, 255] {
+        let mut rig = Rig::new();
+        for stream in keys {
+            let instance = ChannelInstance::new(u64::from(stream)).unwrap();
+            let budget = TimelineBudget::new(instance, 0, |_| {});
+            rig.io.send_channel_output(
+                stream,
+                instance,
+                rig.origin(),
+                rig.io.send_gate(stream, crate::send_gate::GateKind::Pipe),
+                ChannelOutput::Geometry(
+                    GeometryRecord {
+                        instance,
+                        request_id: 0,
+                        outcome: GeometryOutcome::Established,
+                        cols: 0,
+                        rows: 0,
+                    },
+                    budget.try_reserve(EntryClass::Ordinary, 27).unwrap(),
+                ),
+                budget.try_reserve(EntryClass::Lifecycle, BRIDGE_LIFECYCLE_BYTES),
+            );
+            rig.bridge.push(rig.outbound.try_recv().unwrap());
+        }
+        rig.bridge.cursor = cursor;
+        let mut out = Vec::new();
+        assert!(!rig.bridge.drain(
+            &mut rig.server,
+            rig.now,
+            false,
+            &mut out,
+            &mut rig.control_delivery
+        ));
+        let mut order = Vec::new();
+        for packet in out {
+            rig.client.on_datagram(rig.now, rig.peer, &packet.bytes);
+            order.extend(
+                rig.client
+                    .poll_events()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::StreamData { stream_id, .. } => Some(stream_id),
+                        _ => None,
+                    }),
+            );
+        }
+        let expected: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| *key > cursor)
+            .chain(keys.iter().copied().filter(|key| *key <= cursor))
+            .collect();
+        assert_eq!(order, expected, "frozen round order at cursor {cursor}");
+        assert_eq!(rig.bridge.cursor, *expected.last().unwrap());
+    }
+}
