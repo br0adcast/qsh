@@ -30,6 +30,7 @@ use transport::LinkState;
 
 use qsh::background::Round;
 use qsh::climb::{Climb, Climbed, Connected, Mode, Setup, Sink, Trial};
+use qsh::input_reader::InputReader;
 use qsh::session::{self as session, Action, Chrome, Session, UiEvent};
 use qsh::ticker::Ticker;
 use qsh::{
@@ -1522,7 +1523,21 @@ fn interactive(
         sess.assume_channel_opening();
     }
 
-    let input = InputReader::start(tx.clone());
+    let input = match InputReader::start(tx.clone()) {
+        Ok(input) => input,
+        Err(error) => {
+            // Restore before displaying an initialization failure, as on the
+            // normal exit path. No reader thread survived a failed start.
+            let restored = raw.restore();
+            eprintln!("qsh: could not start keyboard input: {error}");
+            if let Err(error) = restored {
+                eprintln!("qsh: could not restore terminal: {error}");
+            }
+            display.physical = sess.physical_size();
+            display.logical = sess.size();
+            return (1, links);
+        }
+    };
 
     let started = std::time::Instant::now();
     // The one clock of the run: `Session`'s, and the reconnect automaton's
@@ -1770,96 +1785,6 @@ fn collect_ui_turn(rx: &Receiver<UiEvent>, events: &mut Vec<UiEvent>) {
     for _ in external..EXTERNAL_EVENTS {
         let Ok(ev) = rx.try_recv() else { break };
         events.push(ev);
-    }
-}
-
-/// The input reader has one owner per interactive shell. Joining before cooked
-/// mode prevents it from stealing a prompt reply or feeding a later session.
-struct InputReader {
-    cancel: knock::Cancel,
-    thread: std::thread::JoinHandle<()>,
-}
-impl InputReader {
-    fn start(tx: Sender<UiEvent>) -> Self {
-        Self::start_fd(
-            tx,
-            std::io::stdin().as_raw_fd(),
-            qsh::input_ingress::IngressBudget::default(),
-        )
-    }
-
-    fn start_fd(
-        tx: Sender<UiEvent>,
-        stdin_fd: std::os::fd::RawFd,
-        budget: qsh::input_ingress::IngressBudget,
-    ) -> Self {
-        let cancel = knock::Cancel::new();
-        let stopped = cancel.clone();
-        let thread = std::thread::spawn(move || {
-            let mut buf = [0u8; qsh::input_ingress::READ_BYTES];
-            'reading: while !stopped.is_cancelled() {
-                let mut fd = libc::pollfd {
-                    fd: stdin_fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: stdin remains open and fd points to one valid pollfd.
-                if unsafe { libc::poll(&mut fd, 1, 20) } <= 0 {
-                    continue;
-                }
-                if stopped.is_cancelled() {
-                    break;
-                }
-                // Read the descriptor directly: Rust's buffered stdin can retain
-                // keystrokes beyond a terminal flush between sessions.
-                // SAFETY: stdin_fd is live and buf is writable for its full length.
-                let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast(), buf.len()) };
-                if n == 0 {
-                    break;
-                }
-                if n < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                let input = loop {
-                    if stopped.is_cancelled() {
-                        break 'reading;
-                    }
-                    if let Ok(input) = budget.admit_slice(&buf[..n as usize]) {
-                        break input;
-                    }
-                    // Published after the complete preceding input prefix. No
-                    // read-ahead or newer Stdin publication can pass this fence.
-                    let (blocked, reply) =
-                        qsh::input_ingress::IngressBlocked::channel(budget.clone(), n as usize);
-                    if tx.send(UiEvent::IngressBlocked(blocked)).is_err() {
-                        break 'reading;
-                    }
-                    loop {
-                        if stopped.is_cancelled() {
-                            break 'reading;
-                        }
-                        // Keep the existing cancellation polling bound even
-                        // when the UI/Session still owns every ingress guard.
-                        match reply.recv_timeout(Duration::from_millis(20)) {
-                            Ok(true) => break,
-                            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => break 'reading,
-                            Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        }
-                    }
-                };
-                if tx.send(UiEvent::Stdin(input)).is_err() {
-                    break;
-                }
-            }
-        });
-        Self { cancel, thread }
-    }
-    fn stop(self) {
-        self.cancel.cancel();
-        let _ = self.thread.join();
     }
 }
 

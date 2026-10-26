@@ -171,3 +171,25 @@ fn recovery206_pending_append_is_whole_and_never_grows_past_byte_capacity() {
         .unwrap();
     assert_eq!(pending.bytes.len(), INGRESS_BYTES);
 }
+
+#[test]
+fn input_wake_reply_and_last_marker_drop_publish_before_notification() {
+    for resolve in [true, false] {
+        let (mut wake, sender) = crate::input_wake::pair().unwrap();
+        let (blocked, reply) = IngressBlocked::channel_notified(IngressBudget::default(), 1, sender);
+        let clone = IngressBlocked(blocked.0.clone());
+        drop(blocked);
+        assert!(matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        if resolve {
+            assert!(clone.resolve());
+        }
+        drop(clone);
+        assert!(wake.ready_now(), "completed reply must already have notified");
+        wake.drain().unwrap();
+        if resolve {
+            assert!(reply.try_recv().unwrap());
+        } else {
+            assert!(matches!(reply.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+        }
+    }
+}

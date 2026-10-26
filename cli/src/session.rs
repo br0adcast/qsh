@@ -50,6 +50,7 @@ pub enum LocalInputFailure {
     Channel(client::channel::ChannelSendError),
     Rejected(transport::driver_std::SendBlocked),
     Accepted(transport::driver_std::InputFailure),
+    ReaderUnavailable,
     IngressFull,
     PendingFull,
     NotReady,
@@ -440,6 +441,7 @@ impl Session {
                         "qsh: accepted input on stream {stream_id} exceeded transport offset space; input was not replayed"
                     ),
                     LocalInputFailure::Rejected(reason) => format!("qsh: local input was not accepted ({reason:?})"),
+                    LocalInputFailure::ReaderUnavailable => "qsh: keyboard input wait failed".into(),
                     LocalInputFailure::IngressFull => "qsh: keyboard input buffer limit reached".into(),
                     LocalInputFailure::PendingFull => "qsh: pending shell input buffer limit reached".into(),
                     LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
@@ -1716,6 +1718,27 @@ mod tests {
                 UiEvent::InputFailure(LocalInputFailure::Accepted(
                     transport::driver_std::InputFailure::DriverUnavailable
                 )),
+                1
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn input_wake_failure_leaves_with_one_notice_without_replay() {
+        let mut session = session();
+        let actions = session.handle(
+            UiEvent::InputFailure(LocalInputFailure::ReaderUnavailable),
+            0,
+        );
+        assert!(actions.contains(&Action::Keep));
+        assert!(actions.contains(&Action::Exit(1)));
+        assert!(actions.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("keyboard input wait failed"))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::SendChannel { .. })));
+        assert!(session
+            .handle(
+                UiEvent::InputFailure(LocalInputFailure::ReaderUnavailable),
                 1
             )
             .is_empty());
