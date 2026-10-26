@@ -2789,3 +2789,379 @@ fn scratch305_real_drain_freezes_cyclic_order_across_cursor_updates_and_high_ids
         assert_eq!(rig.bridge.cursor, *expected.last().unwrap());
     }
 }
+
+fn epoch305_live_rig() -> Rig {
+    let mut rig = Rig::new();
+    rig.geometry(80, 0);
+    rig.drain(false);
+    assert_eq!(rig.server.stream_progress(STREAM).unacked, 0);
+    rig.records.clear();
+    rig
+}
+
+fn epoch305_direct_drain(rig: &mut Rig) -> (usize, Vec<Datagram>) {
+    let before = rig.server.flush_calls_for_test();
+    let mut out = Vec::new();
+    let again = rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery,
+    );
+    assert!(!again || rig.server.state() == LinkState::Closed);
+    (rig.server.flush_calls_for_test() - before, out)
+}
+
+#[test]
+fn epoch305_four_ready_data_records_share_one_flush_and_datagram() {
+    let mut rig = epoch305_live_rig();
+    for bytes in [b"a", b"b", b"c", b"d"] {
+        rig.data(bytes);
+    }
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    let datagrams = out.len();
+    rig.pump(out);
+    assert_eq!(
+        rig.records,
+        vec![
+            ShellRecord::Data(b"a".to_vec()),
+            ShellRecord::Data(b"b".to_vec()),
+            ShellRecord::Data(b"c".to_vec()),
+            ShellRecord::Data(b"d".to_vec()),
+        ]
+    );
+    assert_eq!((flushes, datagrams), (1, 1), "one bounded Data epoch");
+}
+
+#[test]
+fn epoch305_singleton_flushes_before_return_without_another_wakeup() {
+    let mut rig = epoch305_live_rig();
+    rig.data(b"single");
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    assert_eq!((flushes, out.len()), (1, 1));
+    rig.pump(out);
+    assert_eq!(rig.records, vec![ShellRecord::Data(b"single".to_vec())]);
+}
+
+#[test]
+fn epoch305_explicit_drain_boundary_separates_two_flushes() {
+    let mut rig = epoch305_live_rig();
+    rig.data(b"first");
+    let (first_flushes, first) = epoch305_direct_drain(&mut rig);
+    rig.data(b"second");
+    let (second_flushes, second) = epoch305_direct_drain(&mut rig);
+    assert_eq!(
+        (first_flushes + second_flushes, first.len() + second.len()),
+        (2, 2)
+    );
+    rig.pump(first.into_iter().chain(second).collect());
+    assert_eq!(
+        rig.records,
+        vec![
+            ShellRecord::Data(b"first".to_vec()),
+            ShellRecord::Data(b"second".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn epoch305_geometry_is_a_flush_fence_between_data_groups() {
+    let mut rig = epoch305_live_rig();
+    rig.data(b"a");
+    rig.data(b"b");
+    rig.geometry(100, 1);
+    rig.data(b"c");
+    rig.data(b"d");
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    let datagrams = out.len();
+    rig.pump(out);
+    assert_eq!(rig.records.len(), 5);
+    assert_eq!(rig.records[0], ShellRecord::Data(b"a".to_vec()));
+    assert_eq!(rig.records[1], ShellRecord::Data(b"b".to_vec()));
+    assert!(matches!(rig.records[2], ShellRecord::Geometry(_)));
+    assert_eq!(rig.records[3], ShellRecord::Data(b"c".to_vec()));
+    assert_eq!(rig.records[4], ShellRecord::Data(b"d".to_vec()));
+    assert_eq!((flushes, datagrams), (3, 3));
+}
+
+#[test]
+fn epoch305_accepted_prefix_is_emitted_before_later_offset_abandonment() {
+    let mut rig = epoch305_live_rig();
+    rig.server.limit_channel_offset_for_test(STREAM, 7);
+    rig.data(b"a");
+    rig.data(b"too large");
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    assert_eq!((flushes, out.len()), (1, 1));
+    assert_eq!(rig.server.state(), LinkState::Closed);
+    assert_eq!(
+        rig.server.last_flush_state_for_test(),
+        Some(LinkState::Live)
+    );
+    let payload: Vec<u8> = out
+        .iter()
+        .flat_map(|dg| {
+            rig.client
+                .peek_frames(&dg.bytes)
+                .unwrap()
+                .into_iter()
+                .filter_map(|f| match f {
+                    crate::reliability::StreamFrame::Data {
+                        stream_id, data, ..
+                    } if stream_id == STREAM => Some(data),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect();
+    assert_eq!(
+        payload,
+        crate::shell_frame::encode_record(crate::shell_frame::REC_DATA, b"a")
+    );
+    let state = &rig.bridge.streams[&STREAM];
+    assert_eq!(state.fifo.len(), 1);
+    assert!(
+        matches!(&state.fifo[0].output, Item::Record(ChannelOutput::Data(bytes)) if bytes == b"too large")
+    );
+    assert_eq!(state.fifo[0].offset, 0);
+    assert_eq!(state.fifo[0].charge.as_ref().unwrap().bytes, 14);
+}
+
+#[test]
+fn epoch305_empty_neighbor_does_not_break_ready_data_epoch() {
+    let mut rig = epoch305_live_rig();
+    let instance = ChannelInstance::new(2).unwrap();
+    let budget = TimelineBudget::new(instance, 0, |_| {});
+    rig.io.send_channel_output(
+        17,
+        instance,
+        rig.origin(),
+        rig.io.send_gate(17, crate::send_gate::GateKind::Pipe),
+        ChannelOutput::Geometry(
+            GeometryRecord {
+                instance,
+                request_id: 0,
+                outcome: GeometryOutcome::Established,
+                cols: 80,
+                rows: 24,
+            },
+            budget.try_reserve(EntryClass::Ordinary, 27).unwrap(),
+        ),
+        budget.try_reserve(EntryClass::Lifecycle, BRIDGE_LIFECYCLE_BYTES),
+    );
+    rig.bridge.push(rig.outbound.try_recv().unwrap());
+    rig.drain(false);
+    assert!(rig.bridge.streams[&17].fifo.is_empty());
+    rig.records.clear();
+    for key in [b"a", b"b", b"c", b"d"] {
+        rig.data(key);
+    }
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    assert_eq!(
+        (flushes, out.len()),
+        (1, 1),
+        "an empty neighboring stream has no fence operation"
+    );
+    rig.pump(out);
+    assert_eq!(rig.records.len(), 4);
+}
+
+#[test]
+fn epoch305_bulk_cutoff_keeps_core_deadline_when_bridge_fifo_is_empty() {
+    let mut rig = epoch305_live_rig();
+    rig.server
+        .set_stream_class(STREAM, crate::conn::StreamClass::Bulk);
+    rig.server.open_congestion_window_for_test();
+    for _ in 0..7 {
+        rig.data(&[7; 8192]);
+    }
+    let (flushes, out) = epoch305_direct_drain(&mut rig);
+    let frames = out
+        .iter()
+        .flat_map(|dg| rig.client.peek_frames(&dg.bytes).unwrap())
+        .filter(|frame| matches!(frame, crate::reliability::StreamFrame::Data { .. }))
+        .count();
+    assert_eq!(flushes, 1);
+    assert_eq!(
+        frames, 32,
+        "the fixture must actually reach the bulk allowance"
+    );
+    assert!(rig.bridge.streams[&STREAM].fifo.is_empty());
+    assert!(rig
+        .server
+        .next_timeout()
+        .is_some_and(|deadline| deadline <= rig.now));
+    let next = rig.server.on_timeout_if_due(rig.now);
+    assert!(
+        !next.is_empty(),
+        "the core owns the continuation without a bridge FIFO wake"
+    );
+    rig.pump(out.into_iter().chain(next).collect());
+    assert_eq!(rig.records.len(), 7);
+    assert!(rig
+        .records
+        .iter()
+        .all(|r| matches!(r, ShellRecord::Data(bytes) if bytes == &[7;8192])));
+}
+
+fn epoch305_six_bytes_credit_rig() -> Rig {
+    let mut rig = epoch305_live_rig();
+    rig.client.set_default_consumption(Consumption::Explicit);
+    let credit_room = rig.server.stream_write_room(STREAM, usize::MAX);
+    let payload = vec![9; credit_room - 11];
+    let encoded = crate::shell_frame::encode_record(crate::shell_frame::REC_DATA, &payload);
+    let fill = rig.server.send(rig.now, STREAM, &encoded);
+    rig.pump(fill);
+    assert_eq!(
+        rig.server
+            .stream_write_room(STREAM, crate::send_gate::PIPE_HIGH as usize),
+        6
+    );
+    rig.records.clear();
+    rig
+}
+
+#[test]
+fn epoch305_later_credit_block_retains_only_the_unaccepted_source() {
+    let mut rig = epoch305_six_bytes_credit_rig();
+    rig.data(b"a");
+    rig.data(b"b");
+    let before = rig.server.stream_progress(STREAM).queued;
+    let mut out = Vec::new();
+    assert!(rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery
+    ));
+    assert_eq!(rig.server.stream_progress(STREAM).queued, before + 6);
+    assert_eq!(rig.server.stream_progress(STREAM).unacked, 6);
+    let state = &rig.bridge.streams[&STREAM];
+    assert_eq!(state.fifo.len(), 1);
+    assert_eq!(state.fifo[0].offset, 0);
+    assert_eq!(state.fifo[0].charge.as_ref().unwrap().bytes, 6);
+    assert!(
+        matches!(&state.fifo[0].output, Item::Record(ChannelOutput::Data(bytes)) if bytes == b"b")
+    );
+    rig.pump(out);
+    assert_eq!(rig.records, vec![ShellRecord::Data(b"a".to_vec())]);
+    let updates =
+        rig.client
+            .on_consumed(rig.now, STREAM, crate::reliability::STREAM_WINDOW as usize);
+    for dg in updates {
+        rig.server.on_datagram(rig.now, rig.peer, &dg.bytes);
+    }
+    rig.drain(false);
+    assert_eq!(
+        rig.records,
+        vec![
+            ShellRecord::Data(b"a".to_vec()),
+            ShellRecord::Data(b"b".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn epoch305_dirty_data_flushes_before_blocked_geometry_without_idle_spin() {
+    let mut rig = epoch305_six_bytes_credit_rig();
+    rig.data(b"a");
+    rig.geometry(100, 1);
+    rig.data(b"b");
+    let before = rig.server.flush_calls_for_test();
+    let mut out = Vec::new();
+    assert!(rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery
+    ));
+    assert_eq!(
+        (rig.server.flush_calls_for_test() - before, out.len()),
+        (1, 1)
+    );
+    assert_eq!(rig.budget.usage(EntryClass::Ordinary), (1, 27));
+    assert_eq!(rig.bridge.streams[&STREAM].fifo.len(), 2);
+    rig.pump(out);
+    let (flushes, blocked) = epoch305_direct_drain(&mut rig);
+    assert_eq!((flushes, blocked.len()), (0, 0));
+    assert_eq!(rig.records, vec![ShellRecord::Data(b"a".to_vec())]);
+    let updates =
+        rig.client
+            .on_consumed(rig.now, STREAM, crate::reliability::STREAM_WINDOW as usize);
+    for dg in updates {
+        rig.server.on_datagram(rig.now, rig.peer, &dg.bytes);
+    }
+    rig.drain(false);
+    assert_eq!(rig.records.len(), 3);
+    assert!(matches!(rig.records[1], ShellRecord::Geometry(_)));
+    assert_eq!(rig.records[2], ShellRecord::Data(b"b".to_vec()));
+    assert_eq!(rig.budget.usage(EntryClass::Ordinary), (0, 0));
+}
+
+#[test]
+fn epoch305_record_limit_flushes_accepted_prefix_before_continuation() {
+    let mut rig = epoch305_live_rig();
+    for _ in 0..32 {
+        rig.data(b"a");
+    }
+    rig.data(b"b");
+    let before = rig.server.flush_calls_for_test();
+    let mut out = Vec::new();
+    assert!(rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery
+    ));
+    assert_eq!(
+        (rig.server.flush_calls_for_test() - before, out.len()),
+        (1, 1)
+    );
+    assert_eq!(rig.bridge.streams[&STREAM].fifo.len(), 1);
+    rig.pump(out);
+    assert_eq!(rig.records.len(), 32);
+    assert!(rig
+        .records
+        .iter()
+        .all(|record| *record == ShellRecord::Data(b"a".to_vec())));
+    let (_, next) = epoch305_direct_drain(&mut rig);
+    rig.pump(next);
+    assert_eq!(rig.records.len(), 33);
+    assert_eq!(rig.records[32], ShellRecord::Data(b"b".to_vec()));
+}
+
+#[test]
+fn epoch305_byte_limit_keeps_screen_slice_and_next_header_charge() {
+    let mut rig = epoch305_live_rig();
+    rig.bridge.declare(STREAM, true);
+    rig.data(&vec![7; 2 * TURN_BYTES]);
+    let before = rig.server.stream_progress(STREAM).queued;
+    let flushes = rig.server.flush_calls_for_test();
+    let mut out = Vec::new();
+    assert!(rig.bridge.drain(
+        &mut rig.server,
+        rig.now,
+        false,
+        &mut out,
+        &mut rig.control_delivery
+    ));
+    assert_eq!(rig.server.flush_calls_for_test() - flushes, 1);
+    assert!(
+        !out.is_empty(),
+        "accepted prefix is flushed before the byte-limit return"
+    );
+    assert_eq!(
+        rig.server.stream_progress(STREAM).queued - before,
+        TURN_BYTES as u64
+    );
+    let state = &rig.bridge.streams[&STREAM];
+    assert_eq!(state.fifo.len(), 1);
+    assert_eq!(state.fifo[0].offset, TURN_BYTES - 5);
+    assert_eq!(
+        state.fifo[0].charge.as_ref().unwrap().bytes,
+        (TURN_BYTES + 10) as u64
+    );
+}
