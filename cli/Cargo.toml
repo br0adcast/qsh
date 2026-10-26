@@ -43,6 +43,9 @@ terminal-size = { path = "../crates/terminal-size" }
 terminal = { path = "../crates/terminal" }
 transport = { path = "../crates/transport" }
 unicode-width = "0.2.2"
+# Unicode properties for showing identity names in trust questions
+# (`identity.rs`); already in the graph through reqwest's URL handling.
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 
 [dev-dependencies]
 # Safe FIFO creation on both Linux and Apple; do not rely on feature union.

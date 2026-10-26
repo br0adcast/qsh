@@ -84,12 +84,18 @@ pub fn judge_host_key(
 }
 
 fn changed_text(name: &str, info: &ssh::HostKeyInfo, store: &KnownHosts) -> String {
-    format!(
-        "WARNING: the ssh host key of {name} has changed (now {}); not using ssh there. \
+    let mut text = format!(
+        "WARNING: the ssh host key of {} has changed (now {}); not using ssh there. \
          If this is expected, find and remove the old key in the configured known-hosts files: {}",
-        info.fingerprint,
+        crate::identity::show(name),
+        crate::identity::show(&info.fingerprint),
         store_paths(store)
-    )
+    );
+    if let Some(note) = crate::identity::note(&[name, &info.fingerprint]) {
+        text.push('\n');
+        text.push_str(note);
+    }
+    text
 }
 
 fn store_paths(store: &KnownHosts) -> String {
@@ -106,11 +112,16 @@ fn unknown_key_question(name: &str, info: &ssh::HostKeyInfo) -> String {
         .strip_prefix("ssh-")
         .unwrap_or(&info.key_type)
         .to_ascii_uppercase();
-    format!(
-        "The authenticity of host '{name}' can't be established.\n\
-         {kind} key fingerprint is {}.\n\
-         Are you sure you want to continue connecting",
-        info.fingerprint
+    crate::identity::with_note(
+        format!(
+            "The authenticity of host '{}' can't be established.\n\
+             {} key fingerprint is {}.\n\
+             Are you sure you want to continue connecting",
+            crate::identity::show(name),
+            crate::identity::show(&kind),
+            crate::identity::show(&info.fingerprint)
+        ),
+        &[name, &kind, &info.fingerprint],
     )
 }
 
@@ -494,20 +505,29 @@ impl bringup::InstallApproval for InstallQuestion {
         offer: &bringup::InstallOffer,
         cancel: &knock::Cancel,
     ) -> Result<bool, bringup::BringUpError> {
-        let question = format!(
+        let question = install_question(offer);
+        self.0
+            .confirm_install(&question, cancel)
+            .map_err(bringup::BringUpError::Ssh)
+    }
+}
+
+/// The installation question: the account and host shown by `identity`'s
+/// rules, the remote path by the general text policy.
+fn install_question(offer: &bringup::InstallOffer) -> String {
+    crate::identity::with_note(
+        format!(
             "\nqshd is not installed on {}@{}:{}.\n\n  Version   {}\n  Platform  {}\n  Location  {}\n  Source    GitHub Releases\n\nInstall qshd {}?",
-            crate::report::printable(&offer.username),
-            crate::report::printable(&offer.host),
+            crate::identity::show(&offer.username),
+            crate::identity::show(&offer.host),
             offer.ssh_port,
             offer.image.version,
             offer.image.platform.target(),
             crate::report::printable(&offer.remote_path),
             offer.image.version,
-        );
-        self.0
-            .confirm_install(&question, cancel)
-            .map_err(bringup::BringUpError::Ssh)
-    }
+        ),
+        &[&offer.username, &offer.host],
+    )
 }
 
 /// How one `bring_up` did not work.
@@ -862,6 +882,76 @@ mod tests {
         assert!(
             matches!(unknown_host_key(false, "h", &info), UnknownHostKey::Ask(q) if q.contains("SHA256:abc"))
         );
+    }
+
+    #[test]
+    fn ssh_host_key_questions_show_invisible_characters_in_the_name() {
+        let info = ssh::HostKeyInfo {
+            key_type: "ssh-ed25519".into(),
+            key: b"k".to_vec(),
+            fingerprint: "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU".into(),
+        };
+        let name = crate::known_hosts::entry_name("exa\u{200B}mple.org", 2222);
+        let UnknownHostKey::Ask(question) = unknown_host_key(false, &name, &info) else {
+            panic!("a foreground question");
+        };
+        assert_eq!(
+            question,
+            format!(
+                "The authenticity of host '[exa\\u{{200B}}mple.org]:2222' can't be established.\n\
+                 ED25519 key fingerprint is SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU.\n\
+                 {}\nAre you sure you want to continue connecting",
+                crate::identity::NOTE
+            )
+        );
+        // A real fingerprint is shown exactly, and a plain name needs no note.
+        let UnknownHostKey::Ask(plain) = unknown_host_key(false, "example.org", &info) else {
+            panic!("a foreground question");
+        };
+        assert!(
+            plain.contains("fingerprint is SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU.")
+        );
+        assert!(!plain.contains(crate::identity::NOTE));
+
+        let changed = changed_text(&name, &info, &KnownHosts::standard());
+        assert!(changed
+            .starts_with("WARNING: the ssh host key of [exa\\u{200B}mple.org]:2222 has changed"));
+        assert!(changed.ends_with(&format!("\n{}", crate::identity::NOTE)));
+    }
+
+    #[test]
+    fn the_install_question_shows_identity_names_and_keeps_the_offer() {
+        let offer = bringup::InstallOffer {
+            username: "ali\u{3164}ce".into(),
+            host: "host\u{202E}.example".into(),
+            ssh_port: 22,
+            image: bringup::ImageRequest::new(
+                bringup::Platform::from_uname("Linux", "x86_64").unwrap(),
+                "0.5.0",
+            )
+            .unwrap(),
+            remote_path: "/home/ali\u{3164}ce/.local/bin/qshd".into(),
+        };
+        let question = install_question(&offer);
+        assert!(
+            question.starts_with(
+                "\nqshd is not installed on ali\\u{3164}ce@host\\u{202E}.example:22.\n"
+            ),
+            "{question}"
+        );
+        assert!(question.ends_with(&format!("\n{}\nInstall qshd 0.5.0?", crate::identity::NOTE)));
+        assert_eq!(
+            offer.username, "ali\u{3164}ce",
+            "only the presentation is escaped"
+        );
+        let plain = bringup::InstallOffer {
+            username: "алиса".into(),
+            host: "пример.рф".into(),
+            ..offer
+        };
+        let question = install_question(&plain);
+        assert!(question.contains("not installed on алиса@пример.рф:22."));
+        assert!(!question.contains(crate::identity::NOTE));
     }
 
     #[test]

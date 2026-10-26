@@ -8,6 +8,7 @@ pub mod background;
 pub mod climb;
 pub mod connect;
 pub mod escape;
+pub mod identity;
 pub mod input_ingress;
 #[doc(hidden)]
 pub mod input_reader;
