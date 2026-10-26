@@ -533,7 +533,23 @@ jobs:
             road_catalog::tests::ui_wait_catalog_completion_is_enqueued_before_notification \
             road_catalog::tests::ui_wait_catalog_timed_out_address_parks_despite_another_free_slot_until_capacity_wake \
             road_catalog::tests::ui_wait_catalog_cancelled_completion_still_wakes_real_capacity_release; do
-            grep -Fx "test $name ... ok" "$runtime/ui-wait-lib.log"
+            # --nocapture diagnostics may split a test's name and bare ok.
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                if ($0 == expected "FAILED" || $0 == expected "ignored") {
+                  failed = 1; pending = 0
+                }
+                next
+              }
+              /^test / { pending = 0 }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              pending && ($0 == "FAILED" || $0 == "ignored") {
+                failed = 1; pending = 0
+              }
+              END { exit !(seen == 1 && passed == 1 && !failed) }
+            ' "$runtime/ui-wait-lib.log"
           done
           if grep -q 'SKIPPED' "$runtime/ui-wait-lib.log"; then exit 1; fi
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/ui-wait-lib.log"
@@ -542,7 +558,23 @@ jobs:
           for name in \
             tests::ui_wait_raw_turn_keeps_bounded_prefix_and_due_tick \
             tests::ui_wait_cooked_replacement_observes_completion_without_stdin; do
-            grep -Fx "test $name ... ok" "$runtime/ui-wait-bin.log"
+            # --nocapture diagnostics may split a test's name and bare ok.
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                if ($0 == expected "FAILED" || $0 == expected "ignored") {
+                  failed = 1; pending = 0
+                }
+                next
+              }
+              /^test / { pending = 0 }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              pending && ($0 == "FAILED" || $0 == "ignored") {
+                failed = 1; pending = 0
+              }
+              END { exit !(seen == 1 && passed == 1 && !failed) }
+            ' "$runtime/ui-wait-bin.log"
           done
           if grep -q 'SKIPPED' "$runtime/ui-wait-bin.log"; then exit 1; fi
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/ui-wait-bin.log"
