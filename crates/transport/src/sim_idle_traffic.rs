@@ -170,9 +170,10 @@ fn an_idle_session_on_one_road_sends_only_the_two_ping_exchanges() {
 /// client's own is due. The client then sends its PONG and its PING at one
 /// instant, in two datagrams: the PONG while handling the datagram, the
 /// PING from the timer service right after. The server's PING and its PONG
-/// stay a round trip apart, so only the client could pack them. With delay
-/// variation the two still fall within that variation of each other, not
-/// at one instant.
+/// stay a round trip apart here, so only the client's pair is close enough
+/// to pack without deferring anything. With delay variation, in the traces
+/// below, the client's two fall within twice that variation of each other,
+/// never at one instant.
 #[test]
 fn the_client_answers_and_pings_at_one_instant_in_two_datagrams() {
     let mut sim = idle(1, vec![twenty_ms()]);
@@ -190,25 +191,30 @@ fn the_client_answers_and_pings_at_one_instant_in_two_datagrams() {
         "{server:?}"
     );
 
-    let jitter = Duration::from_millis(5);
-    let road = RoadSpec::symmetric(LinkSpec::new(Duration::from_millis(20)).with_jitter(jitter));
-    let mut sim = idle(7, vec![road]);
-    sim.run_for(Duration::from_secs(3600));
-    let client = ping_to_nearest_pong(&sim, Side::Client);
-    assert_eq!(client.len(), 2400);
-    assert!(
-        client
-            .iter()
-            .all(|&gap| !gap.is_zero() && gap <= 2 * jitter),
-        "{client:?}"
-    );
-    let server = ping_to_nearest_pong(&sim, Side::Server);
-    assert!(
-        server
-            .iter()
-            .all(|&gap| gap >= Duration::from_millis(40) - 2 * jitter),
-        "{server:?}"
-    );
+    // Seed 7, one hour each: these traces, not every road. Delay variation
+    // separates the two deadlines, so packing only what is already due
+    // finds no pair here.
+    for jitter in [Duration::from_millis(1), Duration::from_millis(5)] {
+        let road =
+            RoadSpec::symmetric(LinkSpec::new(Duration::from_millis(20)).with_jitter(jitter));
+        let mut sim = idle(7, vec![road]);
+        sim.run_for(Duration::from_secs(3600));
+        let client = ping_to_nearest_pong(&sim, Side::Client);
+        assert_eq!(client.len(), 2400, "{jitter:?}");
+        assert!(
+            client
+                .iter()
+                .all(|&gap| !gap.is_zero() && gap <= 2 * jitter),
+            "{jitter:?}: {client:?}"
+        );
+        let server = ping_to_nearest_pong(&sim, Side::Server);
+        assert!(
+            server
+                .iter()
+                .all(|&gap| gap >= Duration::from_millis(40) - 2 * jitter),
+            "{jitter:?}: {server:?}"
+        );
+    }
 }
 
 /// Protocol §5.3 and §6: with a spare road, checks go out on every road every

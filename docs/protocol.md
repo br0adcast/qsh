@@ -1409,26 +1409,34 @@ cannot regenerate a lost one.
 `sim_idle_traffic.rs` measures this in virtual time. Every datagram is
 decrypted as its addressee reads it and is classified by frame type, road,
 and what sent it: a timer service, the handling of a received datagram, or a
-write. Nothing is inferred from datagram sizes or global counters.
+write. Nothing is inferred from datagram sizes or global counters. Sizes
+below are qsh UDP payload — the qsh header, the encrypted frames and the
+authentication tag — without UDP, IP or link-layer headers; they are not
+total wire traffic and not an energy measurement. The findings hold for the
+simulated scenarios named here, not for every road.
 
 **One road.** Each side PINGs on its own clock every `PING_INTERVAL`
 (§5.1) and answers the other side's PING with a PONG. That makes four
 datagrams per interval, two in each direction, each carrying one frame:
-39 bytes, the 18-byte header, a 5-byte frame and the 16-byte tag. Over 600
-idle seconds each side sends 400 PINGs from its timer and 400 PONGs while
-handling the peer's PING, and nothing else: no ACK, no CREDIT, no road
-check. That is 1.33 datagrams and 52 bytes per second each way.
+39 bytes of UDP payload, the 18-byte header, a 5-byte frame and the 16-byte
+tag. Over 600 idle seconds on a 20 ms road each side sends 400 PINGs from
+its timer and 400 PONGs while handling the peer's PING, and nothing else: no
+ACK, no CREDIT, no road check. That is 1.33 datagrams and 52 bytes of UDP
+payload per second each way.
 
 The two clocks are phase-locked. Both start at the handshake, and the
 server's starts one one-way delay earlier, when it sends msg2. The server's
 PING therefore reaches the client just as the client's own PING is due. The
 client sends its PONG while handling that datagram and its PING from the
 timer service right after: two datagrams at one instant on a road with a
-fixed delay, and within the delay variation of each other on a road
-without. The server's PING and its PONG stay a round trip apart, so only
-the client could pack its pair into one datagram. A move or a rebind
-forces a PING (§6, §5.1), which re-anchors the client's clock; after that
-the two pairs no longer coincide.
+fixed delay. On a 20 ms road with 1 ms or 5 ms of uniform delay variation
+(seed 7, one hour each), no client pair fell at one instant, and every
+client PING was within twice the variation of a PONG. In these traces the
+server's PING and its PONG stayed about a round trip apart, so only the
+client's pair was close enough to share a datagram without deferring
+either. A move or a rebind forces a PING (§6, §5.1), which re-anchors the
+client's clock; in the measured dying-road scenario, no client PING after
+the move fell within 100 ms of one of its PONGs.
 
 **Spare roads.** With `set_paths`, the client's timer checks every road,
 the one in use included, every `PROBE_IDLE` (30 s). Each check travels
@@ -1455,30 +1463,35 @@ since that client's last authenticated packet, then every
 **Before changing packing or cadence.**
 
 - *Packing the client's PONG with its PING* would save one datagram in four,
-  half of the client's idle datagrams, and 34 bytes per interval. PING and
-  PONG are ordinary frames, so they may share a datagram: a receiver decodes
-  several frames, and a road check stays alone either way (§1.4). Packing
-  only when the PING is already due at that instant changes nothing on a
-  real road: in the simulator, 1 ms of delay variation already leaves no
-  pair at one instant. The client would have to send its PING when the
-  PONG goes out, up to the delay variation early. `mint_ping` counts an
-  earlier PING as unanswered only once that PING is older than both the
-  interval and the retransmit timeout. A PING sent early would find its
-  predecessor younger than that and take the evidence one interval later,
-  delaying urgent checks and the dead-road move by up to `PING_INTERVAL`,
-  unless that rule allows the same advance.
+  half of the client's idle datagrams, and 34 bytes of UDP payload per
+  interval. PING and PONG are ordinary frames, so they may share a datagram:
+  a receiver decodes several frames, and a road check stays alone either way
+  (§1.4). Delay variation can separate the two deadlines, so packing only
+  what is already due cannot guarantee that saving: in the traces above it
+  found no pair to pack. A driver that serves two obligations already due
+  together would pack some pairs; getting the rest needs a deliberate
+  mechanism, such as sending the PING early or deferring the PONG for a
+  bounded time. Each has its own cost, and neither was measured. For an
+  early PING, the source suggests one: `mint_ping` counts an earlier PING
+  as unanswered only once that PING is older than both the interval and the
+  retransmit timeout, so a PING sent early would find its predecessor
+  younger than that and take the evidence up to one interval later,
+  delaying urgent checks and the dead-road move, unless that rule allows the
+  same advance. A deferred PONG would lengthen the peer's round-trip
+  samples by the deferral.
 - *A longer live interval* trades failure detection for traffic.
   `PATH_DOWN_AFTER` (3 s) is two intervals, so one lost liveness datagram
   does not mark a road down; a longer interval with the same threshold would
   mark an idle road down between PINGs, and a longer threshold delays
   `PathDown`, failover to a spare and the dead-road rule. A NAT drops an
-  idle UDP mapping after its own timeout, which in practice can be far shorter than
-  the two minutes RFC 4787 asks for, and the server can reach the client
-  only through that mapping. The round trip and the retransmit timeout are
+  idle UDP mapping after its own timeout, which in practice can be far
+  shorter than the two minutes RFC 4787 asks for, and the server can reach
+  the client only through that mapping. The round trip and the retransmit timeout are
   refreshed by PONGs, so an idle session that sends fewer PINGs resumes
-  with an older estimate. On cellular links every datagram keeps the radio
-  in a high-power state for some seconds after it, so the interval, not the
-  bytes, decides the energy cost.
+  with an older estimate. On cellular links a datagram can keep the radio in
+  a high-power state for some seconds after it, so for energy the number
+  and spacing of datagrams matter more than their bytes; this section
+  measures neither power nor radio state.
 - An adaptive interval, for example a slower one after a long idle period,
   is a product decision. It has to state what it keeps from §5.1 and §6 for
   roaming, NAT bindings and failure detection, and be measured with the
