@@ -148,6 +148,7 @@ mod tests {
             worker_user: "nobody".to_string(),
             permit_root: true,
             authorized_keys_template: "/etc/qshd/keys/%u".to_string(),
+            runtime_threads: None,
         }
     }
 

@@ -2582,6 +2582,7 @@ pub(crate) mod tests {
             worker_user: "qshd".to_string(),
             permit_root: false,
             authorized_keys_template: "%h/.ssh/authorized_keys".to_string(),
+            runtime_threads: None,
         })
     }
 

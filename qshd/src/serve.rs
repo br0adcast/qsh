@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::num::NonZeroUsize;
 #[cfg(feature = "system")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,6 +27,10 @@ use crate::{log, transport_daemon};
 
 /// The UDP port `serve` listens on unless told otherwise.
 pub const DEFAULT_SERVE_PORT: u16 = 60022;
+
+/// The most async worker threads `--runtime-threads` accepts. Far above any
+/// useful value, it only stops a typo from starting thousands of threads.
+pub const MAX_RUNTIME_THREADS: usize = 256;
 
 /// What `serve` was asked to do.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -58,6 +63,12 @@ pub struct ServeArgs {
     /// Where an account's authorized keys live. `%h` expands to the home
     /// directory from `passwd`, `%u` to the login name.
     pub authorized_keys_template: String,
+    /// How many async worker threads the runtime runs, from
+    /// `--runtime-threads`. `None` keeps Tokio's default:
+    /// `TOKIO_WORKER_THREADS` when that is set, otherwise one per CPU this
+    /// process may run on. The blocking pool, where PTY I/O, signature
+    /// checks and channel spawns run, is sized separately and unaffected.
+    pub runtime_threads: Option<NonZeroUsize>,
 }
 
 /// `$HOME`, required. The default `authorized_keys`/host-key paths are
@@ -104,6 +115,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
     let mut permit_root = false;
     #[cfg_attr(not(feature = "system"), allow(unused_mut))]
     let mut authorized_keys_template = None;
+    let mut runtime_threads = None;
     let mut rest = args.iter().enumerate().skip(1);
     while let Some(flag) = rest.next() {
         let flag = argument_text(flag)?;
@@ -123,6 +135,17 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
             }
             "--authorized-keys" => authorized_keys = Some(PathBuf::from(value()?.1)),
             "--host-key" => host_key = Some(PathBuf::from(value()?.1)),
+            "--runtime-threads" => {
+                let threads: usize = argument_text(value()?)?.parse().with_context(|| {
+                    format!("runtime threads must be a number 1..{MAX_RUNTIME_THREADS}")
+                })?;
+                if !(1..=MAX_RUNTIME_THREADS).contains(&threads) {
+                    bail!(
+                        "runtime threads must be a number 1..{MAX_RUNTIME_THREADS}, got {threads}"
+                    );
+                }
+                runtime_threads = NonZeroUsize::new(threads);
+            }
             "--system" => {
                 #[cfg(feature = "system")]
                 {
@@ -223,7 +246,27 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         worker_user,
         permit_root,
         authorized_keys_template,
+        runtime_threads,
     })
+}
+
+/// The async runtime both modes serve from: Tokio's multi-thread runtime,
+/// with `threads` workers when given and Tokio's default otherwise. The
+/// count it runs with goes to the log.
+fn serve_runtime(threads: Option<NonZeroUsize>) -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = threads {
+        builder.worker_threads(threads.get());
+    }
+    let runtime = builder
+        .enable_all()
+        .build()
+        .context("creating the tokio runtime")?;
+    log::info(
+        "qshd",
+        &format!("runtime workers {}", runtime.metrics().num_workers()),
+    );
+    Ok(runtime)
 }
 
 /// Where the system mode's diagnostic file log lives -- see [`cache_dir`]
@@ -476,6 +519,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // on every channel a client asks for.
         let helper_config = crate::helper::HelperConfig::resolve(&parsed);
         let worker_user = parsed.worker_user.clone();
+        let runtime_threads = parsed.runtime_threads;
 
         // `utf8_locale_env` runs `locale -a`, through a `PATH` search, the
         // first time it is asked -- and that must never happen in the
@@ -520,10 +564,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                     &worker_user,
                     Arc::new(Mutex::new(Vec::new())),
                 )?;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .context("creating the tokio runtime")?;
+                let runtime = serve_runtime(runtime_threads)?;
                 let shutdown = stop.shutdown();
                 let manager = context.drive(transport_daemon::run_serve_loop_until_shutdown(
                     socket,
@@ -591,10 +632,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         logins: Arc::new(crate::ForgetNothing),
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("creating the tokio runtime")?;
+    let runtime = serve_runtime(parsed.runtime_threads)?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
         transport_daemon::run_serve_loop_until_stop(
@@ -832,6 +870,55 @@ mod tests {
     #[test]
     fn port_zero_is_refused() {
         assert!(parse_serve_args(&args(&["serve", "--port", "0"])).is_err());
+    }
+
+    /// Without the flag the runtime keeps Tokio's own default; with it, any
+    /// count from one to the cap is taken as given and nothing else is.
+    #[test]
+    fn runtime_threads_default_to_tokio_and_are_bounded() {
+        let parsed = parse_serve_args(&args(&["serve"])).expect("parse");
+        assert_eq!(parsed.runtime_threads, None);
+        for threads in [1, 2, MAX_RUNTIME_THREADS] {
+            let parsed =
+                parse_serve_args(&args(&["serve", "--runtime-threads", &threads.to_string()]))
+                    .expect("parse");
+            assert_eq!(parsed.runtime_threads, NonZeroUsize::new(threads));
+        }
+        let over = (MAX_RUNTIME_THREADS + 1).to_string();
+        for value in ["0", over.as_str(), "-1", "two", ""] {
+            let error = parse_serve_args(&args(&["serve", "--runtime-threads", value]))
+                .expect_err("must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("runtime threads must be a number 1.."),
+                "{value:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_serve_args(&args(&["serve", "--runtime-threads"]))
+                .unwrap_err()
+                .to_string(),
+            "flag --runtime-threads needs a value"
+        );
+    }
+
+    /// The runtime runs exactly the workers asked for, so a measured or
+    /// configured count is the one serving.
+    #[test]
+    fn the_serve_runtime_runs_the_requested_workers() {
+        for threads in [1, 3] {
+            let runtime = serve_runtime(NonZeroUsize::new(threads)).expect("runtime");
+            assert_eq!(runtime.metrics().num_workers(), threads);
+        }
+        // Tokio's default also reads this variable; this test does not set it.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            let default = serve_runtime(None).expect("runtime");
+            assert_eq!(
+                default.metrics().num_workers(),
+                std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
+            );
+        }
     }
 
     /// The personal mode refuses to start as root. Its whole shape is "serve
@@ -1425,6 +1512,18 @@ mod tests {
         /// Every call the router makes for a nonce is timed.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_silent_helper_holds_up_neither_live_sessions_nor_refusals() {
+            silent_helper_case().await;
+        }
+
+        /// The same, with the whole router and every session on one runtime
+        /// worker (`--runtime-threads 1`): nothing the helper withholds may
+        /// occupy that worker either.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_silent_helper_holds_up_nothing_on_one_runtime_worker() {
+            silent_helper_case().await;
+        }
+
+        async fn silent_helper_case() {
             let dir = tempfile::tempdir().expect("tempdir");
             let key_path = dir.path().join("key");
             let key = ssh_key::PrivateKey::random(
@@ -1813,6 +1912,16 @@ mod tests {
 
             #[tokio::test(flavor = "multi_thread")]
             async fn a_stuck_helper_with_a_full_seam_does_not_hold_up_the_router() {
+                stuck_helper_case().await;
+            }
+
+            /// The same on one runtime worker (`--runtime-threads 1`).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+            async fn a_stuck_helper_holds_up_nothing_on_one_runtime_worker() {
+                stuck_helper_case().await;
+            }
+
+            async fn stuck_helper_case() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let key_path = dir.path().join("key");
                 let key = ssh_key::PrivateKey::random(
