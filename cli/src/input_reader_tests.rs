@@ -15,7 +15,7 @@ fn client179_actual_reader_fences_pressure_and_resumes_or_stops_with_guards_held
         }
         let (tx, rx) = mpsc::channel();
         let budget = qsh::input_ingress::IngressBudget::default();
-        let reader = InputReader::start_fd(tx, read.as_raw_fd(), budget.clone());
+        let reader = InputReader::start_fd(tx, read.as_raw_fd(), budget.clone()).unwrap();
         let writer = std::thread::spawn(move || {
             for _ in 0..16 {
                 write.write_all(&[b'a'; 4096])?;
@@ -134,7 +134,7 @@ fn recovery206_actual_reader_thousand_one_byte_reads_share_budget() {
     let mut write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
     let (tx, rx) = mpsc::channel();
     let budget = qsh::input_ingress::IngressBudget::default();
-    let reader = InputReader::start_fd(tx, read.as_raw_fd(), budget.clone());
+    let reader = InputReader::start_fd(tx, read.as_raw_fd(), budget.clone()).unwrap();
     let result = (|| -> Result<(), String> {
         let mut session = geometry_session();
         session.assume_channel_opening();

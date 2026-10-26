@@ -8614,3 +8614,80 @@ fn capacity_wire_authenticated_abort_is_terminal_without_control_credit() {
         "abort must not trigger warm reconnect"
     );
 }
+
+#[test]
+fn epoch305_public_empty_send_keeps_error_order_and_never_flushes() {
+    let (mut client, _, _, _) = established_pair();
+    let now = client.handshake_at;
+    let before = client.flush_calls_for_test();
+    assert!(client.try_send_bounded(now, 16, &[], 0).unwrap().is_empty());
+    assert_eq!(client.flush_calls_for_test(), before);
+    client.state = LinkState::Closed;
+    assert!(matches!(
+        client.try_send_bounded(now, 16, &[], 0),
+        Err(SendBlocked::NotLive)
+    ));
+    assert_eq!(client.flush_calls_for_test(), before);
+}
+
+#[test]
+fn epoch305_public_nonempty_calls_each_flush_immediately() {
+    let (mut client, server, _, _) = established_pair();
+    let now = client.handshake_at;
+    let before = client.flush_calls_for_test();
+    for bytes in [b"a", b"b"] {
+        let out = client.try_send_bounded(now, 16, bytes, 100).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(server
+            .peek_frames(&out[0].bytes)
+            .unwrap()
+            .iter()
+            .any(|f| matches!(f, StreamFrame::Data { data, .. } if data == bytes)));
+    }
+    assert_eq!(client.flush_calls_for_test() - before, 2);
+}
+
+#[test]
+fn epoch305_private_append_counts_unsent_bytes_against_local_room() {
+    let (mut client, server, _, _) = established_pair();
+    let now = client.handshake_at;
+    let before = client.flush_calls_for_test();
+    client.enqueue_bounded(16, b"four", 4).unwrap();
+    assert_eq!(client.flush_calls_for_test(), before);
+    assert_eq!(client.stream_progress(16).queued, 4);
+    assert_eq!(client.stream_progress(16).unacked, 4);
+    assert_eq!(client.stream_write_room(16, 4), 0);
+    assert!(matches!(
+        client.enqueue_bounded(16, b"x", 4),
+        Err(SendBlocked::WouldBlock)
+    ));
+    assert_eq!(client.stream_progress(16).queued, 4);
+    let mut out = Vec::new();
+    client.flush_senders(now, &mut out);
+    assert_eq!(client.flush_calls_for_test() - before, 1);
+    assert_eq!(out.len(), 1);
+    assert!(server
+        .peek_frames(&out[0].bytes)
+        .unwrap()
+        .iter()
+        .any(|f| matches!(f, StreamFrame::Data { data, .. } if data == b"four")));
+}
+
+#[test]
+fn epoch305_deferred_new_data_does_not_double_apply_one_timeout() {
+    let (mut client, server, _, _) = established_pair();
+    let now = client.handshake_at;
+    client.try_send_bounded(now, 16, b"old", 100).unwrap();
+    let due = now + client.rto();
+    client.enqueue_bounded(16, b"new", 100).unwrap();
+    let mut out = Vec::new();
+    client.flush_senders(due, &mut out);
+    assert_eq!(client.rto_backoff, 1);
+    assert!(out
+        .iter()
+        .flat_map(|dg| server.peek_frames(&dg.bytes).unwrap())
+        .any(|f| matches!(f, StreamFrame::Data { offset: 0, data, .. } if data == b"old")));
+    let mut again = Vec::new();
+    client.flush_senders(due, &mut again);
+    assert_eq!(client.rto_backoff, 1);
+}

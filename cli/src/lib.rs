@@ -9,6 +9,10 @@ pub mod climb;
 pub mod connect;
 pub mod escape;
 pub mod input_ingress;
+#[doc(hidden)]
+pub mod input_reader;
+#[doc(hidden)]
+pub mod input_wake;
 mod install_ui;
 pub mod keys;
 pub mod knock_spec;

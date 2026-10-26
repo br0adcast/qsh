@@ -739,10 +739,24 @@ impl ChannelBridge {
         out: &mut Vec<Datagram>,
         control_delivery: &mut crate::control_budget::ControlLedger,
     ) -> bool {
+        let mut epoch = DataEpoch { out, dirty: false };
+        let again = self.drain_epoch(conn, now, parked, &mut epoch, control_delivery);
+        epoch.flush(conn, now);
+        again
+    }
+
+    fn drain_epoch(
+        &mut self,
+        conn: &mut Connection,
+        now: Instant,
+        parked: bool,
+        epoch: &mut DataEpoch<'_>,
+        control_delivery: &mut crate::control_budget::ControlLedger,
+    ) -> bool {
         synchronize_control_delivery(conn, self.generation, control_delivery);
         self.seal_ended(conn);
         if self.snapshot_failed {
-            out.extend(conn.close(now));
+            epoch.out.extend(conn.close(now));
             return false;
         }
         if parked || conn.state() != LinkState::Live {
@@ -752,7 +766,7 @@ impl ChannelBridge {
         let mut bytes = 0;
         if let Some(snapshot) = &mut self.pending_snapshot {
             let n = snapshot.payload_len() + 5;
-            if !Self::offset_fits(conn, crate::channel::CONTROL_STREAM, n)
+            if !Self::offset_fits(conn, crate::channel::CONTROL_STREAM, n, now, epoch)
                 || conn.stream_write_room(
                     crate::channel::CONTROL_STREAM,
                     crate::send_gate::PIPE_HIGH as usize,
@@ -789,7 +803,7 @@ impl ChannelBridge {
                     .is_ok(),
                 "whole snapshot enqueue and reservation length diverged"
             );
-            out.extend(datagrams);
+            epoch.out.extend(datagrams);
             self.pending_snapshot = None;
             self.release_barrier(self.generation);
             records = 1;
@@ -798,16 +812,19 @@ impl ChannelBridge {
         if self.target.is_some() {
             return false;
         }
+        // The map's u8 key bounds the full namespace, including draining
+        // streams. Refresh each round after removals without heap scratch.
+        let mut keys = [0u8; u8::MAX as usize + 1];
         loop {
-            let keys: Vec<_> = self.streams.keys().copied().collect();
+            let count = self.streams.len();
+            for (index, &stream) in self.streams.keys().enumerate() {
+                keys[index] = stream;
+            }
+            // Freeze the round's order before Step updates self.cursor.
+            let cursor = self.cursor;
+            let pivot = keys[..count].partition_point(|&stream| stream <= cursor);
             let mut progressed = false;
-            for stream in keys
-                .iter()
-                .copied()
-                .filter(|s| *s > self.cursor)
-                .chain(keys.iter().copied().filter(|s| *s <= self.cursor))
-                .collect::<Vec<_>>()
-            {
+            for stream in keys[pivot..count].iter().chain(&keys[..pivot]).copied() {
                 if records == TURN_RECORDS || bytes == TURN_BYTES {
                     return true;
                 }
@@ -821,7 +838,7 @@ impl ChannelBridge {
                     conn,
                     now,
                     TURN_BYTES - bytes,
-                    out,
+                    epoch,
                     (self.generation, &mut *control_delivery),
                 ) {
                     Step::Blocked => {}
@@ -860,10 +877,19 @@ impl ChannelBridge {
             }
         }
     }
-    fn offset_fits(conn: &mut Connection, stream: u8, bytes: usize) -> bool {
+    fn offset_fits(
+        conn: &mut Connection,
+        stream: u8,
+        bytes: usize,
+        now: Instant,
+        epoch: &mut DataEpoch<'_>,
+    ) -> bool {
         if conn.stream_offset_room(stream) < bytes as u64 {
             // Same retained-session recovery as the legacy offset exhaustion event.
             // Ownership stays here until Attach or explicit teardown.
+            // Earlier records were accepted, not part of this refusal. Emit
+            // that prefix while Live before entering retained recovery.
+            epoch.flush(conn, now);
             conn.abandon();
             false
         } else {
@@ -876,10 +902,23 @@ impl ChannelBridge {
         conn: &mut Connection,
         now: Instant,
         remaining: usize,
-        out: &mut Vec<Datagram>,
+        epoch: &mut DataEpoch<'_>,
         delivery: (u64, &mut crate::control_budget::ControlLedger),
     ) -> Step {
         let (generation, control_delivery) = delivery;
+        let data_only = !state.bootstrap
+            && !state.abandoned_data
+            && matches!(
+                state.fifo.front().map(|q| &q.output),
+                Some(Item::Record(ChannelOutput::Data(_)))
+            );
+        let has_operation = state.bootstrap || state.abandoned_data || !state.fifo.is_empty();
+        if has_operation && !data_only {
+            epoch.flush(conn, now);
+        }
+        if conn.state() != LinkState::Live {
+            return Step::Blocked;
+        }
         conn.declare_channel_output(stream, state.instance);
         if state.bootstrap {
             if matches!(
@@ -889,7 +928,7 @@ impl ChannelBridge {
                 state.bootstrap = false;
                 state.bootstrap_charge = None;
             } else if let Some(geometry) = state.frontier {
-                if !Self::offset_fits(conn, stream, GEOMETRY_BYTES) {
+                if !Self::offset_fits(conn, stream, GEOMETRY_BYTES, now, epoch) {
                     return Step::Blocked;
                 }
                 if remaining < GEOMETRY_BYTES {
@@ -907,7 +946,7 @@ impl ChannelBridge {
                 ) else {
                     return Step::Blocked;
                 };
-                out.extend(datagrams);
+                epoch.out.extend(datagrams);
                 state
                     .bootstrap_charge
                     .take()
@@ -925,7 +964,7 @@ impl ChannelBridge {
             Some(Item::Record(ChannelOutput::Geometry(..)))
         );
         if state.abandoned_data && !front_geometry {
-            if !Self::offset_fits(conn, stream, 14) {
+            if !Self::offset_fits(conn, stream, 14, now, epoch) {
                 return Step::Blocked;
             }
             if remaining < 14 {
@@ -941,7 +980,7 @@ impl ChannelBridge {
                 .get_or_insert_with(|| charge(&state.gate, 14));
             match conn.try_send_bounded(now, stream, &bytes, crate::send_gate::PIPE_HIGH as usize) {
                 Ok(datagrams) => {
-                    out.extend(datagrams);
+                    epoch.out.extend(datagrams);
                     let _ = pending;
                     state
                         .gap_charge
@@ -992,7 +1031,7 @@ impl ChannelBridge {
             Item::Exit(..) => 10,
             Item::Record(ChannelOutput::DeliveryMarker(..)) => unreachable!(),
         };
-        if !Self::offset_fits(conn, target, minimum) {
+        if !Self::offset_fits(conn, target, minimum, now, epoch) {
             return Step::Blocked;
         }
         let room = conn
@@ -1069,6 +1108,12 @@ impl ChannelBridge {
                 crate::send_gate::PIPE_HIGH as usize,
             )
             .map_err(|(reason, _)| reason)
+        } else if matches!(front.output, Item::Record(ChannelOutput::Data(_))) {
+            conn.enqueue_bounded(target, &encoded, crate::send_gate::PIPE_HIGH as usize)
+                .map(|()| {
+                    epoch.dirty = true;
+                    Vec::new()
+                })
         } else {
             conn.try_send_bounded(now, target, &encoded, crate::send_gate::PIPE_HIGH as usize)
         };
@@ -1088,7 +1133,7 @@ impl ChannelBridge {
                 "whole terminal control enqueue and reserved length diverged"
             );
         }
-        out.extend(datagrams);
+        epoch.out.extend(datagrams);
         let tail = conn.stream_progress(stream).unacked;
         match &front.output {
             Item::Record(ChannelOutput::Geometry(g, _)) => state.frontier = Some(*g),
@@ -1135,6 +1180,23 @@ impl ChannelBridge {
         }
     }
 }
+/// One synchronous, bounded Data epoch. This borrows the caller's output;
+/// it owns no payload queue and never flushes implicitly from Drop.
+struct DataEpoch<'a> {
+    out: &'a mut Vec<Datagram>,
+    dirty: bool,
+}
+impl DataEpoch<'_> {
+    fn flush(&mut self, conn: &mut Connection, now: Instant) {
+        if std::mem::take(&mut self.dirty) {
+            debug_assert_eq!(conn.state(), LinkState::Live);
+            if conn.state() == LinkState::Live {
+                conn.flush_queued(now, self.out);
+            }
+        }
+    }
+}
+
 enum Step {
     Blocked,
     Sent(usize),

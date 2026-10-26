@@ -1141,6 +1141,7 @@ dependencies = [
  "terminal",
  "terminal-size",
  "transport",
+ "vte",
 ]
 
 [[package]]

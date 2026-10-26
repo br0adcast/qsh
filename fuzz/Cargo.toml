@@ -18,6 +18,8 @@ vte = { path = "../vendor/vte" }
 alacritty_terminal = { path = "../vendor/alacritty_terminal" }
 
 [dependencies]
+# Observe OSC dispatch at the exact shipped parser boundary.
+vte = { version = "=0.15.0", default-features = false, features = ["std"] }
 libfuzzer-sys = "=0.4.13"
 transport = { path = "../crates/transport", default-features = false }
 sshauth = { path = "../crates/sshauth" }

@@ -174,6 +174,28 @@ impl PredictionEngine {
         self.send_interval = ms;
     }
 
+    /// The interval most recently supplied by any evaluation path.
+    pub fn send_interval_ms(&self) -> i64 {
+        self.send_interval
+    }
+
+    /// Glitch activation and quick repair happen after flagging in `cull`.
+    /// Both can require a following evaluation, even without another timer.
+    pub fn display_refresh_pending(&self) -> bool {
+        self.active() && self.flagging_decision() != self.flagging
+    }
+
+    fn flagging_decision(&self) -> bool {
+        let interval_flag = if self.send_interval > FLAG_TRIGGER_HIGH {
+            true
+        } else if self.send_interval <= FLAG_TRIGGER_LOW {
+            false
+        } else {
+            self.flagging
+        };
+        interval_flag || self.glitch_trigger > GLITCH_REPAIR_COUNT
+    }
+
     // Topmost (latest) cursor prediction. Only called once `init_cursor` has
     // already guaranteed a non-empty list (a port of mosh's `cursor()`).
     fn cursor(&self) -> &ConditionalCursorMove {
@@ -205,6 +227,30 @@ impl PredictionEngine {
     /// the display -- the display gate plus the presence of active predictions).
     pub fn active(&self) -> bool {
         self.suppressed_until.is_none() && self.showing() && self.has_active_overlays()
+    }
+
+    /// Earliest existing time-driven display transition for pending cells.
+    /// Hidden adaptive predictions participate; ACK/frame validity and tentative
+    /// epochs are still evaluated by `cull`, not changed by this query.
+    pub fn next_display_deadline_ms(&self) -> Option<i64> {
+        if self.display_preference == DisplayPreference::Never || self.suppressed_until.is_some() {
+            return None;
+        }
+        let delay = if self.glitch_trigger < GLITCH_REPAIR_COUNT {
+            GLITCH_THRESHOLD
+        } else if self.glitch_trigger == GLITCH_REPAIR_COUNT {
+            GLITCH_FLAG_THRESHOLD
+        } else {
+            return None;
+        };
+        self.overlays
+            .iter()
+            .flat_map(|row| &row.overlay_cells)
+            .filter(|cell| {
+                cell.base.active && self.local_frame_late_acked < cell.base.expiration_frame
+            })
+            .map(|cell| cell.base.prediction_time.saturating_add(delay))
+            .min()
     }
 
     /// Overlay the active predictions onto a COPY of frame `fb` and return it.
@@ -433,17 +479,8 @@ impl PredictionEngine {
             self.srtt_trigger = false;
         }
 
-        // Underline with hysteresis.
-        if self.send_interval > FLAG_TRIGGER_HIGH {
-            self.flagging = true;
-        } else if self.send_interval <= FLAG_TRIGGER_LOW {
-            self.flagging = false;
-        }
-
-        // Very severe glitches also turn the underline on.
-        if self.glitch_trigger > GLITCH_REPAIR_COUNT {
-            self.flagging = true;
-        }
+        // Keep the display query and evaluation on the same hysteresis rule.
+        self.flagging = self.flagging_decision();
 
         let early = self.local_frame_acked;
         let late = self.local_frame_late_acked;
@@ -1036,6 +1073,103 @@ mod tests {
         e.new_user_byte(b'h', &fb, 1000);
         let shown = e.apply(&fb);
         assert_eq!(shown.cell(0, 0).ch, ' ');
+    }
+
+    #[test]
+    fn eligibility_flagging_refresh_preserves_mid_interval_hysteresis() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        engine.set_local_frame_sent(1);
+        engine.set_send_interval(60);
+        engine.new_user_byte(b'h', &frame(20, 1), 1000);
+        assert!(!engine.flagging);
+        assert!(!engine.display_refresh_pending());
+        engine.flagging = true;
+        assert!(
+            !engine.display_refresh_pending(),
+            "mid interval retains underline"
+        );
+        engine.set_send_interval(50);
+        assert!(
+            engine.display_refresh_pending(),
+            "low interval clears underline"
+        );
+        engine.set_send_interval(80);
+        assert!(
+            !engine.display_refresh_pending(),
+            "upper boundary retains prior state"
+        );
+        engine.flagging = false;
+        assert!(!engine.display_refresh_pending());
+        engine.set_send_interval(81);
+        assert!(
+            engine.display_refresh_pending(),
+            "above upper boundary enables underline"
+        );
+        engine.set_display_preference(DisplayPreference::Never);
+        assert!(!engine.display_refresh_pending());
+    }
+
+    #[test]
+    fn eligibility_severe_flagging_has_one_following_evaluation() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        let fb = frame(20, 1);
+        engine.set_send_interval(10);
+        assert_eq!(engine.send_interval_ms(), 10);
+        engine.set_local_frame_sent(1);
+        engine.new_user_byte(b'h', &fb, 1000);
+        assert!(!engine.display_refresh_pending());
+        engine.cull(&fb, 6000);
+        assert!(engine.display_refresh_pending());
+        let work = engine.observed_work;
+        assert!(engine.display_refresh_pending());
+        assert_eq!(engine.next_display_deadline_ms(), None);
+        assert_eq!(
+            (work.culls, work.cells, work.cursors),
+            (
+                engine.observed_work.culls,
+                engine.observed_work.cells,
+                engine.observed_work.cursors
+            )
+        );
+        engine.cull(&fb, 6020);
+        assert!(!engine.display_refresh_pending());
+        engine.suppress();
+        assert!(!engine.display_refresh_pending());
+    }
+
+    #[test]
+    fn hidden_display_deadlines_follow_pending_cells_and_policy() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        let fb = frame(20, 1);
+        engine.set_send_interval(10);
+        engine.set_local_frame_sent(1);
+        engine.new_user_byte(b'h', &fb, 1000);
+        assert!(!engine.active());
+        assert_eq!(engine.next_display_deadline_ms(), Some(1250));
+        engine.cull(&fb, 1249);
+        assert_eq!(engine.next_display_deadline_ms(), Some(1250));
+        engine.cull(&fb, 1250);
+        assert_eq!(engine.next_display_deadline_ms(), Some(6000));
+        engine.cull(&fb, 6000);
+        assert_eq!(engine.next_display_deadline_ms(), None);
+        let mut acknowledged = PredictionEngine::new(DisplayPreference::Adaptive);
+        acknowledged.set_local_frame_sent(2);
+        acknowledged.new_user_byte(b'h', &fb, 1000);
+        assert_eq!(acknowledged.next_display_deadline_ms(), Some(1250));
+        acknowledged.set_echo_ack(1);
+        assert_eq!(acknowledged.next_display_deadline_ms(), Some(1250));
+        acknowledged.set_echo_ack(2);
+        assert_eq!(acknowledged.next_display_deadline_ms(), None);
+
+        let mut suppressed = PredictionEngine::new(DisplayPreference::Adaptive);
+        suppressed.set_local_frame_sent(1);
+        suppressed.new_user_byte(b'h', &fb, 1000);
+        suppressed.suppress();
+        assert_eq!(suppressed.next_display_deadline_ms(), None);
+        let mut never = PredictionEngine::new(DisplayPreference::Never);
+        never.set_local_frame_sent(1);
+        never.new_user_byte(b'h', &fb, 1000);
+        assert_eq!(never.next_display_deadline_ms(), None);
     }
 
     // Adaptive: on a fast link (small send_interval) we don't show the prediction.

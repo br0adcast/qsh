@@ -50,6 +50,7 @@ pub enum LocalInputFailure {
     Channel(client::channel::ChannelSendError),
     Rejected(transport::driver_std::SendBlocked),
     Accepted(transport::driver_std::InputFailure),
+    ReaderUnavailable,
     IngressFull,
     PendingFull,
     NotReady,
@@ -220,6 +221,26 @@ enum ShellChannel {
     },
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TemporalChromeKey {
+    alarm: Option<AlarmClock>,
+    details: Option<AgeClock>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlarmClock {
+    Waiting(u64),
+    Lost(u64),
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgeClock {
+    Seconds(u64),
+    Minutes(u64),
+}
+struct SessionDeadlines {
+    resize_ms: Option<i64>,
+    status_ms: i64,
+}
+
 pub struct Session {
     shell: ShellState,
     renderer: Renderer,
@@ -242,6 +263,11 @@ pub struct Session {
     /// renderer's own cache too, and puts the real terminal into a state
     /// (SGR reset, mirrored modes off, `\r\n`) this cache does not describe.
     last_frame: Option<terminal::Frame>,
+    painted_clock: Option<TemporalChromeKey>,
+    #[cfg(test)]
+    projections: usize,
+    #[cfg(test)]
+    repaints: usize,
     /// The TERMINAL's current size; the shell's is [`Session::size`].
     cols: u16,
     rows: u16,
@@ -350,6 +376,11 @@ impl Session {
             renderer: Renderer::new(caps),
             rtt_ms: 0,
             last_frame: None,
+            painted_clock: None,
+            #[cfg(test)]
+            projections: 0,
+            #[cfg(test)]
+            repaints: 0,
             cols: terminal_size::ViewportSize::new(cols, rows).cols(),
             rows: terminal_size::ViewportSize::new(cols, rows).rows(),
             raw_cols: cols,
@@ -440,6 +471,7 @@ impl Session {
                         "qsh: accepted input on stream {stream_id} exceeded transport offset space; input was not replayed"
                     ),
                     LocalInputFailure::Rejected(reason) => format!("qsh: local input was not accepted ({reason:?})"),
+                    LocalInputFailure::ReaderUnavailable => "qsh: keyboard input wait failed".into(),
                     LocalInputFailure::IngressFull => "qsh: keyboard input buffer limit reached".into(),
                     LocalInputFailure::PendingFull => "qsh: pending shell input buffer limit reached".into(),
                     LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
@@ -556,15 +588,66 @@ impl Session {
         self.line_shown && self.rows >= 2
     }
 
-    fn on_tick(&mut self, now_ms: i64) -> Vec<Action> {
-        let mut actions = self.due_resize(now_ms);
-        let line_changed =
-            now_ms - self.line_refreshed_ms >= LINE_REFRESH_MS && self.refresh_line(now_ms);
-        if line_changed || self.lost_since_ms.is_some() || self.plate.is_some() {
-            actions.extend(self.repaint(now_ms));
+    fn deadlines(&self) -> SessionDeadlines {
+        SessionDeadlines {
+            resize_ms: (self.pending_size.is_some()
+                && matches!(self.shell_channel, ShellChannel::Ready(_)))
+            .then_some(self.resize_due_ms),
+            status_ms: self.line_refreshed_ms.saturating_add(LINE_REFRESH_MS),
         }
-        if let Some(frame) = self.shell.tick(now_ms, self.rtt_ms) {
+    }
+
+    fn temporal_chrome_key(&self) -> TemporalChromeKey {
+        let alarm = if !self.line_on() && self.outage() && self.recovery_view.is_none() {
+            match (&self.plate, self.lost_since_ms) {
+                (Some(Plate::Waiting { until_ms, .. }), _) => Some(AlarmClock::Waiting(
+                    seconds_until(*until_ms, self.line_refreshed_ms),
+                )),
+                (None, Some(since)) => Some(AlarmClock::Lost(
+                    ((self.line_refreshed_ms - since).max(0) / 1000) as u64,
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let details = if self.recovery_view.is_some() && matches!(self.window, Some(Open::Roads(_)))
+        {
+            let age = self
+                .lost_since_ms
+                .map_or(0, |since| {
+                    ((self.line_refreshed_ms - since).max(0) / 1000) as u64
+                })
+                .max(self.silent_secs);
+            Some(if age < 60 {
+                AgeClock::Seconds(age)
+            } else {
+                AgeClock::Minutes(age / 60)
+            })
+        } else {
+            None
+        };
+        TemporalChromeKey { alarm, details }
+    }
+
+    fn on_tick(&mut self, now_ms: i64) -> Vec<Action> {
+        self.on_tick_at(std::time::Instant::now(), now_ms)
+    }
+
+    fn on_tick_at(&mut self, now: std::time::Instant, now_ms: i64) -> Vec<Action> {
+        let deadlines = self.deadlines();
+        let mut actions = if deadlines.resize_ms.is_some_and(|at| now_ms >= at) {
+            self.due_resize(now_ms)
+        } else {
+            Vec::new()
+        };
+        let line_changed = now_ms >= deadlines.status_ms && self.refresh_line(now_ms);
+        let chrome_changed =
+            line_changed || self.temporal_chrome_key() != self.painted_clock.unwrap_or_default();
+        if let Some(frame) = self.shell.tick_at(now, now_ms, self.rtt_ms) {
             actions.extend(self.paint_at(&frame, now_ms));
+        } else if self.raw_cols != 0 && self.raw_rows != 0 && chrome_changed {
+            actions.extend(self.repaint(now_ms));
         }
         actions
     }
@@ -610,6 +693,10 @@ impl Session {
 
     /// Paints the shell's frame as it stands.
     fn repaint(&mut self, now_ms: i64) -> Vec<Action> {
+        #[cfg(test)]
+        {
+            self.repaints += 1;
+        }
         let frame = self.shell.frame(now_ms, self.rtt_ms);
         self.paint_at(&frame, now_ms)
     }
@@ -1540,6 +1627,10 @@ impl Session {
             }
         }
         let frame = self.history_frame.as_ref().unwrap_or(frame);
+        #[cfg(test)]
+        {
+            self.projections += 1;
+        }
         let mut projected = crate::viewport::project_padded(
             frame,
             terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on())),
@@ -1587,6 +1678,7 @@ impl Session {
                 cell.flags &= !terminal::FLAG_DIM;
             }
         }
+        self.painted_clock = Some(self.temporal_chrome_key());
         if self.last_frame.as_ref() == Some(&shown) {
             return Vec::new();
         }
@@ -1699,6 +1791,164 @@ mod tests {
     }
 
     #[test]
+    fn eligibility_static_reconnect_and_zero_extent_skip_chrome_frames() {
+        let mut state = session();
+        state.on_link_gone(0);
+        state.repaints = 0;
+        state.projections = 0;
+        for now in [20, 40, 1000, 1020, 2000] {
+            state.on_tick(now);
+        }
+        assert_eq!(
+            state.repaints, 0,
+            "static reconnect text does not require a shell snapshot"
+        );
+        assert_eq!(state.projections, 0);
+        state.set_plate(
+            Plate::Waiting {
+                until_ms: 8000,
+                hint: None,
+            },
+            2000,
+        );
+        state.handle(UiEvent::Resized { cols: 0, rows: 0 }, 2020);
+        state.repaints = 0;
+        state.projections = 0;
+        for now in [2040, 3000, 4000] {
+            state.on_tick(now);
+        }
+        assert_eq!(state.repaints, 0, "zero extent defers chrome-only work");
+        assert_eq!(state.projections, 0);
+        let restored = state.handle(UiEvent::Resized { cols: 20, rows: 5 }, 4020);
+        assert!(restored
+            .iter()
+            .any(|action| matches!(action, Action::Write(bytes) if !bytes.is_empty())));
+        assert_eq!(state.projections, 1);
+    }
+
+    #[test]
+    fn eligibility_chrome_uses_cached_status_phase_for_waiting_and_lost() {
+        let mut state = session();
+        state.on_link_gone(100);
+        state.set_plate(
+            Plate::Waiting {
+                until_ms: 2500,
+                hint: None,
+            },
+            100,
+        );
+        state.repaints = 0;
+        state.on_tick(500);
+        state.on_tick(1000);
+        assert_eq!(
+            state.repaints, 0,
+            "raw ceil boundary must not advance cached chrome"
+        );
+        assert_eq!(state.line_refreshed_ms, 100);
+        state.on_tick(1100);
+        assert_eq!(state.repaints, 1);
+        state.on_tick(1500);
+        assert_eq!(state.repaints, 1);
+        state.on_tick(2100);
+        assert_eq!(state.repaints, 2);
+
+        state.plate = None;
+        state.refresh_line(2100);
+        state.repaint(2100);
+        state.repaints = 0;
+        state.on_tick(3099);
+        assert_eq!(state.repaints, 0);
+        state.on_tick(3100);
+        assert_eq!(
+            state.repaints, 1,
+            "lost seconds change despite equal line_view"
+        );
+    }
+
+    #[test]
+    fn eligibility_recovery_details_age_changes_only_at_visible_bucket() {
+        let mut state = Session::new(80, 12, TermCaps::truecolor(), PredictMode::Never, plain());
+        state.on_link_gone(0);
+        state.handle(
+            UiEvent::RecoveryStatus {
+                view: Some(recovery_view()),
+            },
+            0,
+        );
+        state.set_window(Some(Open::Roads(window::Roads::new())), 0);
+        assert!(matches!(state.window, Some(Open::Roads(_))));
+        state.repaints = 0;
+        state.on_tick(59_000);
+        assert_eq!(state.repaints, 1);
+        state.on_tick(60_000);
+        assert_eq!(state.repaints, 2);
+        state.on_tick(61_000);
+        state.on_tick(119_000);
+        assert_eq!(state.repaints, 2, "one-minute text stays unchanged");
+        state.on_tick(120_000);
+        assert_eq!(state.repaints, 3);
+    }
+
+    #[test]
+    fn eligibility_sync_and_chrome_share_one_projection_and_zero_extent_still_flushes() {
+        use transport::shell_frame::{encode_record, REC_DATA};
+        for zero in [false, true] {
+            let mut state = session();
+            state.on_link_gone(0);
+            state.set_plate(
+                Plate::Waiting {
+                    until_ms: 2500,
+                    hint: None,
+                },
+                0,
+            );
+            let pending = encode_record(REC_DATA, b"\x1b[?2026hQUIET");
+            state.shell.on_stream0(&pending, 0, 0);
+            let due = state.shell.deadlines(0).synchronized_output.unwrap();
+            if zero {
+                state.handle(UiEvent::Resized { cols: 0, rows: 0 }, 1);
+            }
+            let clock = state.painted_clock;
+            state.repaints = 0;
+            state.projections = 0;
+            state.on_tick_at(due, 1000);
+            assert_eq!(state.projections, usize::from(!zero));
+            assert_eq!(state.repaints, 0, "the due model frame supplies chrome too");
+            assert!(state.shell.deadlines(0).synchronized_output.is_none());
+            assert!(state
+                .shell
+                .frame(1000, 0)
+                .cells
+                .iter()
+                .any(|cell| cell.ch == 'Q'));
+            if zero {
+                assert!(
+                    state.painted_clock == clock,
+                    "zero extent retains clock state"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eligibility_short_notice_does_not_hide_remaining_alarm_clock() {
+        let mut state = session();
+        state.handle(UiEvent::Link(LinkState::PathDown), 100);
+        state.handle(UiEvent::DiagnosticWarning("x".into()), 100);
+        let before = state.last_frame.clone().unwrap();
+        state.repaints = 0;
+        let actions = state.on_tick(1100);
+        assert_eq!(
+            state.repaints, 1,
+            "short notice leaves alarm digits visible"
+        );
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, Action::Write(bytes) if !bytes.is_empty())));
+        assert_ne!(state.last_frame.as_ref(), Some(&before));
+    }
+
+    #[test]
     fn wake300_driver_unavailable_is_a_terminal_local_notice_without_replay() {
         let mut s = session();
         let event = UiEvent::InputFailure(LocalInputFailure::Accepted(
@@ -1716,6 +1966,27 @@ mod tests {
                 UiEvent::InputFailure(LocalInputFailure::Accepted(
                     transport::driver_std::InputFailure::DriverUnavailable
                 )),
+                1
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn input_wake_failure_leaves_with_one_notice_without_replay() {
+        let mut session = session();
+        let actions = session.handle(
+            UiEvent::InputFailure(LocalInputFailure::ReaderUnavailable),
+            0,
+        );
+        assert!(actions.contains(&Action::Keep));
+        assert!(actions.contains(&Action::Exit(1)));
+        assert!(actions.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("keyboard input wait failed"))));
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::SendChannel { .. })));
+        assert!(session
+            .handle(
+                UiEvent::InputFailure(LocalInputFailure::ReaderUnavailable),
                 1
             )
             .is_empty());

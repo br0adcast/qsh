@@ -838,6 +838,10 @@ pub struct Connection {
     /// The retransmit timer's back-off before the latest timeout, given back
     /// if that timeout turns out spurious.
     backoff_before_timeout: u32,
+    #[cfg(test)]
+    flush_calls_for_test: usize,
+    #[cfg(test)]
+    last_flush_state_for_test: Option<LinkState>,
 }
 
 /// What one received datagram draws besides the ACKs and CREDITs queued in
@@ -1005,6 +1009,10 @@ impl Connection {
             cc: CongestionWindow::new(),
             window_limited: false,
             backoff_before_timeout: 0,
+            #[cfg(test)]
+            flush_calls_for_test: 0,
+            #[cfg(test)]
+            last_flush_state_for_test: None,
         }
     }
 
@@ -1634,6 +1642,25 @@ impl Connection {
         bytes: &[u8],
         max_unacked: usize,
     ) -> Result<Vec<Datagram>, SendBlocked> {
+        self.enqueue_bounded(stream, bytes, max_unacked)?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        self.flush_senders(now, &mut out);
+        Ok(out)
+    }
+
+    /// Copy a complete record into reliable custody without flushing. On Err,
+    /// the caller retains every byte; no stream, event or partial append is
+    /// created. Queued-unsent bytes count against credit and the local cap.
+    /// The bridge must flush its bounded Data epoch before returning or fencing.
+    pub(crate) fn enqueue_bounded(
+        &mut self,
+        stream: u8,
+        bytes: &[u8],
+        max_unacked: usize,
+    ) -> Result<(), SendBlocked> {
         if self.state != LinkState::Live {
             return Err(SendBlocked::NotLive);
         }
@@ -1649,15 +1676,19 @@ impl Connection {
             return Err(SendBlocked::WouldBlock);
         }
         if bytes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         self.stream_mut(stream)
             .sender
             .push(bytes)
             .map_err(|_| SendBlocked::OffsetSpaceExhausted)?;
-        let mut out = Vec::new();
-        self.flush_senders(now, &mut out);
-        Ok(out)
+        Ok(())
+    }
+
+    #[cfg(feature = "tokio-driver")]
+    pub(crate) fn flush_queued(&mut self, now: Instant, out: &mut Vec<Datagram>) {
+        debug_assert_eq!(self.state, LinkState::Live);
+        self.flush_senders(now, out);
     }
 
     /// Consume a whole source Vec after copying into the reliable sender. A
@@ -3337,6 +3368,16 @@ impl Connection {
         self.flush_after(now, Vec::new(), out);
     }
 
+    #[cfg(test)]
+    pub(crate) fn flush_calls_for_test(&self) -> usize {
+        self.flush_calls_for_test
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_flush_state_for_test(&self) -> Option<LinkState> {
+        self.last_flush_state_for_test
+    }
+
     /// Put out what the streams have to send (spec §4.8): every armed
     /// `Reset` first (tiny, and each opens its stream), then the interactive
     /// streams round-robin, then the bulk streams round-robin, at most
@@ -3345,6 +3386,11 @@ impl Connection {
     /// §4.8), and in the same datagrams (spec §4.11). Counts retransmits for
     /// the statistics.
     fn flush_after(&mut self, now: Instant, lead: Vec<StreamFrame>, out: &mut Vec<Datagram>) {
+        #[cfg(test)]
+        {
+            self.flush_calls_for_test += 1;
+            self.last_flush_state_for_test = Some(self.state);
+        }
         let rto = self.rto();
         let mut frames = lead;
         for st in self.streams.values_mut() {
@@ -3786,7 +3832,7 @@ impl Connection {
 
     /// Test-only: a window that never limits, for tests about something else.
     #[cfg(test)]
-    fn open_congestion_window_for_test(&mut self) {
+    pub(crate) fn open_congestion_window_for_test(&mut self) {
         self.cc.open_for_test();
     }
 
