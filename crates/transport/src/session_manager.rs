@@ -4159,6 +4159,26 @@ fn spawn_committed_bridge(spawn: BridgeSpawn) {
     lifecycle.spawn(run_backend_bridge(spawn));
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct MailboxTurn {
+    backend_data: bool,
+    write_room: usize,
+    flushes: usize,
+    datagrams: usize,
+}
+#[cfg(test)]
+struct MailboxObservation {
+    token: LoginId,
+    turns: Arc<Mutex<Vec<MailboxTurn>>>,
+}
+#[cfg(test)]
+thread_local! {
+    // Current-thread fixture, scoped to one authenticated login. Observation
+    // neither pauses nor changes selection, admission, draining or flushing.
+    static MAILBOX_TURNS: std::cell::RefCell<Option<MailboxObservation>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The PERSISTENT per-backend bridge task: it owns ONE backend's io channels
 /// for the backend's whole life and drives a SWAPPABLE `Connection`. A cold
 /// create starts it with the first accepted connection; a warm reattach sends
@@ -4386,6 +4406,14 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             } => w,
         };
 
+        #[cfg(test)]
+        let mailbox_backend_data = matches!(
+            &wakeup,
+            Wakeup::Backend(Some(SessionOutbound::ChannelOutput {
+                output: ChannelOutput::Data(_),
+                ..
+            }))
+        );
         let now = Instant::now();
         let mut out: Vec<Datagram> = Vec::new();
         // Screen streams whose gate opened on this turn before the refresh
@@ -4708,9 +4736,30 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         let mut closed = drain_events(&mut conn, &mut link, &mut first_live_sent, now, &mut out);
         // A hot Reset changes framing before any queued channel bytes may be
         // admitted. Its event must reach the typed owner before this drain.
+        #[cfg(test)]
+        let mailbox_before = (
+            conn.flush_calls_for_test(),
+            conn.stream_write_room(16, 64 * 1024),
+            out.len(),
+        );
         drain_pending =
             link.channel_output
                 .drain(&mut conn, now, parked, &mut out, &mut link.control_delivery);
+        #[cfg(test)]
+        MAILBOX_TURNS.with(|slot| {
+            if let Some(observer) = slot
+                .borrow()
+                .as_ref()
+                .filter(|observer| observer.token == token)
+            {
+                observer.turns.lock().unwrap().push(MailboxTurn {
+                    backend_data: mailbox_backend_data,
+                    write_room: mailbox_before.1,
+                    flushes: conn.flush_calls_for_test() - mailbox_before.0,
+                    datagrams: out.len() - mailbox_before.2,
+                });
+            }
+        });
         // Typed admission can discover permanent offset exhaustion. Observe its
         // abandonment in this turn so parking never waits for another event.
         if matches!(closed, CloseKind::None) && conn.state() == LinkState::Closed {
