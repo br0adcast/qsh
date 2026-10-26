@@ -40,7 +40,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 6
+TOOL_VERSION = 7
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -1350,6 +1350,24 @@ def require_pinned(before, after):
         raise SetupError('selected client history viewport was not retained')
 
 
+def require_oldest(view, expected_total=None):
+    if not 0 < view['total'] <= HISTORY_LINES or view['offset'] != view['total']:
+        raise SetupError('history observation is not the actual oldest view')
+    if expected_total is not None and view['total'] != expected_total:
+        raise SetupError('oldest history cap differs')
+    rows = view['rows']
+    if not rows or rows[0] <= 0 or any(a >= b for a, b in zip(rows, rows[1:])):
+        raise SetupError('oldest history has no ordered numbered witness')
+
+
+def require_oldest_advance(before, after):
+    require_oldest(before)
+    require_oldest(after, HISTORY_LINES)
+    if after['rows'][0] <= before['rows'][0]:
+        raise SetupError('no observed oldest history advancement')
+    return {'before': before['rows'][0], 'after': after['rows'][0]}
+
+
 class HistoryControl:
     def __init__(self, path, timeout=SETUP_TIMEOUT):
         self.fd = None
@@ -1404,9 +1422,9 @@ def history_checkpoint(path, phase, timeout=SETUP_TIMEOUT):
     raise SetupError('history producer phase incomplete: ' + phase)
 
 
-def sample_history_phase(path, client, nominal_seconds):
+def sample_history_phase(path, client, nominal_seconds, *, sample_sink=None):
     start = time.monotonic()
-    samples = []
+    samples = sample_sink if sample_sink is not None else []
     while True:
         elapsed = time.monotonic()-start
         if elapsed >= nominal_seconds + SETUP_TIMEOUT:
@@ -1455,8 +1473,20 @@ def observe_full_repaint(client, inspect):
     raise SetupError('no valid positive full-repaint observation')
 
 
-def history_snapshot(client, expected_total=None):
-    return observe_full_repaint(client, lambda data: parse_history_snapshot(data, expected_total))[0]
+def history_snapshot(client, expected_total=None, *, oldest=False, expected_view=None, observed=None):
+    def inspect(data):
+        view = parse_history_snapshot(data)
+        if observed is not None:
+            observed(view)
+        if expected_total is not None and view['total'] != expected_total:
+            raise SetupError('history cap observation differs')
+        if oldest:
+            require_oldest(view, expected_total)
+        if expected_view is not None and any(view[key] != expected_view[key]
+                                             for key in ('offset', 'total', 'rows')):
+            raise SetupError('chosen history viewport has not been restored')
+        return view
+    return observe_full_repaint(client, inspect)[0]
 
 
 def repaint_marker(client, marker):
@@ -1466,64 +1496,95 @@ def repaint_marker(client, marker):
 
 
 def run_history(rig, settings):
+    result = {'history_lines': HISTORY_LINES, 'updates_requested': 200,
+              'phases': {}, 'history_observations': {}, 'memory_samples': [],
+              'history_complete': False, 'stage': 'setup',
+              'window_scope': 'dispatch through producer checkpoint; client application tail may complete later',
+              'memory_scope': 'client endpoint RSS/PSS/private; HWM since exec; sampled max is not true peak'}
+    try:
+        _run_history(rig, settings, result)
+    except (SetupError, OSError, subprocess.SubprocessError) as error:
+        # Keep observations/samples already owned here, including evidence of
+        # a rejected observation. ok and native cleanup remain run_one's duty.
+        raise Incomplete(str(error), result) from error
+    result.update(history_complete=True, stage='complete')
+    return result
+
+
+def _run_history(rig, settings, result):
     if settings.window != 10 or settings.redraw_fps != 20:
         raise SetupError('history requires the fixed ten-second/20Hz workload')
     client = rig.start_client('client', ('--predict', 'never', '--history', str(HISTORY_LINES)))
     time.sleep(SETTLE)
-    phases = {'empty_live': client_memory(client)}
+    phases, views = result['phases'], result['history_observations']
+    phases['empty_live'] = client_memory(client)
+    def snapshot(name, expected_total=None, **requirements):
+        def capture(view):
+            views[name] = view
+        view = history_snapshot(client, expected_total, observed=capture, **requirements)
+        views[name] = view
+        return view
     control, checkpoint = rig.server_home / 'history.control', rig.server_home / 'history.checkpoint'
     os.mkfifo(control, 0o600)
     (rig.server_home / 'history.py').write_text(HISTORY_SCRIPT)
     client.terminal.write(b'python3 ~/history.py ~/history.control ~/history.checkpoint 2000 6000 200 20\n')
     with HistoryControl(control) as producer:
+        result['stage'] = 'partial_fill'
         producer.send('partial')
         history_checkpoint(checkpoint, 'partial')
         repaint_marker(client, b'HISTORY-PARTIAL-DONE')
         time.sleep(SETTLE)
         phases['filled_live'] = client_memory(client)
         client.terminal.write(b'\x1d[\x1b[5~')
-        selected = history_snapshot(client)
+        selected = snapshot('selected')
+        result['stage'] = 'initial_oldest'
+        client.terminal.write(b'g')
+        initial_oldest = snapshot('initial_oldest', oldest=True)
+        result['stage'] = 'restore_selected'
+        client.terminal.write(b'G\x1b[5~')
+        snapshot('restored', expected_view=selected)
         phases['partial_pinned'] = client_memory(client)
+        result['stage'] = 'capped_pinned'
         producer.send('cap')
         history_checkpoint(checkpoint, 'cap')
-        capped = history_snapshot(client, HISTORY_LINES)
+        capped = snapshot('capped', HISTORY_LINES)
         require_pinned(selected, capped)
         phases['capped_pinned'] = client_memory(client)
+        result['stage'] = 'repaint'
         before = rig.snapshot(client)
         producer.send('repaint')
         dispatch_at = time.monotonic()
-        memory_samples, producer_seconds = sample_history_phase(checkpoint, client, settings.window)
+        result['phase_times'] = {'dispatch_s': dispatch_at-before['t']}
+        samples = result['memory_samples']
+        _, producer_seconds = sample_history_phase(checkpoint, client, settings.window, sample_sink=samples)
         checkpoint_at = time.monotonic()
         phase_end = rig.snapshot(client)
         measured = window(before, phase_end)
-        if not memory_samples:
+        result.update(window=measured, producer_updates_completed=200,
+                      nominal_producer_seconds=10, observed_producer_seconds=producer_seconds)
+        result['phase_times'].update(checkpoint_observed_s=checkpoint_at-before['t'],
+                                     window_end_s=phase_end['t']-before['t'])
+        if not samples:
             raise SetupError('history phase has no memory observations')
+        result['sampled_max_rss_kib'] = max(sample['rss_kib'] for sample in samples)
         if measured['relay']['s2c_bytes'] <= 0:
             raise SetupError('history phase has no server-to-client relay progress')
-        require_pinned(selected, history_snapshot(client, HISTORY_LINES))
+        require_pinned(selected, snapshot('after_repaint_pinned', HISTORY_LINES))
         phases['after_repaint_pinned'] = client_memory(client)
+        result['stage'] = 'return_live'
         client.terminal.write(b'q')
         final_observed_at = repaint_marker(client, b'HISTORY-FINAL-DONE')
+        result['phase_times']['final_observed_s'] = final_observed_at-before['t']
         time.sleep(SETTLE)
         phases['returned_live'] = client_memory(client)
+        result['stage'] = 'final_oldest'
         client.terminal.write(b'\x1d[g')
-        top = history_snapshot(client, HISTORY_LINES)
-        if min(top['rows']) <= 2000:
-            raise SetupError('old model history rows were not evicted at cap')
+        top = snapshot('top_after_return', HISTORY_LINES, oldest=True)
+        result['oldest_advancement'] = require_oldest_advance(initial_oldest, top)
         client.terminal.write(b'q')
+        result['stage'] = 'finish'
         producer.send('finish')
         history_checkpoint(checkpoint, 'finish')
-    return {'window': measured, 'history_lines': HISTORY_LINES, 'updates_requested': 200, 'producer_updates_completed': 200,
-            'nominal_producer_seconds': 10, 'observed_producer_seconds': producer_seconds,
-            'phase_times': {'dispatch_s': dispatch_at-before['t'],
-                            'checkpoint_observed_s': checkpoint_at-before['t'],
-                            'window_end_s': phase_end['t']-before['t'],
-                            'final_observed_s': final_observed_at-before['t']},
-            'window_scope': 'dispatch through producer checkpoint; client application tail may complete later',
-            'phases': phases, 'history_observations': {'selected':selected, 'capped':capped, 'top_after_return':top},
-            'memory_samples': memory_samples,
-            'sampled_max_rss_kib': max(sample['rss_kib'] for sample in memory_samples),
-            'memory_scope': 'client endpoint RSS/PSS/private; HWM since exec; sampled max is not true peak'}
 
 
 RUNNERS = {"idle": run_idle, "typing": run_typing, "redraw": run_redraw, "saturation": run_saturation,
