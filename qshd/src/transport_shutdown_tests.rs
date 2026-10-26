@@ -103,6 +103,23 @@ async fn personal39_signal_preserves_a_failed_manager_outcome_after_all_joins() 
     stop_with_held_cleanup(false, true, true, None).await;
 }
 
+// The same stop and signal drains with every task on one runtime worker, as
+// `qshd serve --runtime-threads 1` runs them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stop_waits_for_held_cleanup_on_one_runtime_worker() {
+    stop_with_held_cleanup(false, false, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stop_keeps_a_replaced_backend_on_one_runtime_worker() {
+    stop_with_held_cleanup(true, false, false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn signal_drain_retains_a_silent_control_on_one_runtime_worker() {
+    stop_with_held_cleanup(false, true, false, None).await;
+}
+
 struct InjectedAcceptor {
     listener: tokio::net::UnixListener,
     errors: tokio::sync::mpsc::UnboundedReceiver<i32>,

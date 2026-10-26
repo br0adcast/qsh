@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::num::NonZeroUsize;
 #[cfg(feature = "system")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -26,6 +27,10 @@ use crate::{log, transport_daemon};
 
 /// The UDP port `serve` listens on unless told otherwise.
 pub const DEFAULT_SERVE_PORT: u16 = 60022;
+
+/// The most async worker threads `--runtime-threads` accepts. Far above any
+/// useful value, it only stops a typo from starting thousands of threads.
+pub const MAX_RUNTIME_THREADS: usize = 256;
 
 /// What `serve` was asked to do.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -58,6 +63,12 @@ pub struct ServeArgs {
     /// Where an account's authorized keys live. `%h` expands to the home
     /// directory from `passwd`, `%u` to the login name.
     pub authorized_keys_template: String,
+    /// How many async worker threads the runtime runs, from
+    /// `--runtime-threads`. `None` keeps Tokio's default:
+    /// `TOKIO_WORKER_THREADS` when that is set, otherwise one per CPU this
+    /// process may run on. The blocking pool, where PTY I/O, signature
+    /// checks and channel spawns run, is sized separately and unaffected.
+    pub runtime_threads: Option<NonZeroUsize>,
 }
 
 /// `$HOME`, required. The default `authorized_keys`/host-key paths are
@@ -104,6 +115,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
     let mut permit_root = false;
     #[cfg_attr(not(feature = "system"), allow(unused_mut))]
     let mut authorized_keys_template = None;
+    let mut runtime_threads = None;
     let mut rest = args.iter().enumerate().skip(1);
     while let Some(flag) = rest.next() {
         let flag = argument_text(flag)?;
@@ -123,6 +135,17 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
             }
             "--authorized-keys" => authorized_keys = Some(PathBuf::from(value()?.1)),
             "--host-key" => host_key = Some(PathBuf::from(value()?.1)),
+            "--runtime-threads" => {
+                let threads: usize = argument_text(value()?)?.parse().with_context(|| {
+                    format!("runtime threads must be a number 1..{MAX_RUNTIME_THREADS}")
+                })?;
+                if !(1..=MAX_RUNTIME_THREADS).contains(&threads) {
+                    bail!(
+                        "runtime threads must be a number 1..{MAX_RUNTIME_THREADS}, got {threads}"
+                    );
+                }
+                runtime_threads = NonZeroUsize::new(threads);
+            }
             "--system" => {
                 #[cfg(feature = "system")]
                 {
@@ -223,7 +246,27 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         worker_user,
         permit_root,
         authorized_keys_template,
+        runtime_threads,
     })
+}
+
+/// The async runtime both modes serve from: Tokio's multi-thread runtime,
+/// with `threads` workers when given and Tokio's default otherwise. The
+/// count it runs with goes to the log.
+fn serve_runtime(threads: Option<NonZeroUsize>) -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = threads {
+        builder.worker_threads(threads.get());
+    }
+    let runtime = builder
+        .enable_all()
+        .build()
+        .context("creating the tokio runtime")?;
+    log::info(
+        "qshd",
+        &format!("runtime workers {}", runtime.metrics().num_workers()),
+    );
+    Ok(runtime)
 }
 
 /// Where the system mode's diagnostic file log lives -- see [`cache_dir`]
@@ -476,6 +519,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // on every channel a client asks for.
         let helper_config = crate::helper::HelperConfig::resolve(&parsed);
         let worker_user = parsed.worker_user.clone();
+        let runtime_threads = parsed.runtime_threads;
 
         // `utf8_locale_env` runs `locale -a`, through a `PATH` search, the
         // first time it is asked -- and that must never happen in the
@@ -520,10 +564,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
                     &worker_user,
                     Arc::new(Mutex::new(Vec::new())),
                 )?;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .context("creating the tokio runtime")?;
+                let runtime = serve_runtime(runtime_threads)?;
                 let shutdown = stop.shutdown();
                 let manager = context.drive(transport_daemon::run_serve_loop_until_shutdown(
                     socket,
@@ -591,10 +632,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         logins: Arc::new(crate::ForgetNothing),
     };
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("creating the tokio runtime")?;
+    let runtime = serve_runtime(parsed.runtime_threads)?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
         transport_daemon::run_serve_loop_until_stop(
@@ -832,6 +870,55 @@ mod tests {
     #[test]
     fn port_zero_is_refused() {
         assert!(parse_serve_args(&args(&["serve", "--port", "0"])).is_err());
+    }
+
+    /// Without the flag the runtime keeps Tokio's own default; with it, any
+    /// count from one to the cap is taken as given and nothing else is.
+    #[test]
+    fn runtime_threads_default_to_tokio_and_are_bounded() {
+        let parsed = parse_serve_args(&args(&["serve"])).expect("parse");
+        assert_eq!(parsed.runtime_threads, None);
+        for threads in [1, 2, MAX_RUNTIME_THREADS] {
+            let parsed =
+                parse_serve_args(&args(&["serve", "--runtime-threads", &threads.to_string()]))
+                    .expect("parse");
+            assert_eq!(parsed.runtime_threads, NonZeroUsize::new(threads));
+        }
+        let over = (MAX_RUNTIME_THREADS + 1).to_string();
+        for value in ["0", over.as_str(), "-1", "two", ""] {
+            let error = parse_serve_args(&args(&["serve", "--runtime-threads", value]))
+                .expect_err("must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("runtime threads must be a number 1.."),
+                "{value:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_serve_args(&args(&["serve", "--runtime-threads"]))
+                .unwrap_err()
+                .to_string(),
+            "flag --runtime-threads needs a value"
+        );
+    }
+
+    /// The runtime runs exactly the workers asked for, so a measured or
+    /// configured count is the one serving.
+    #[test]
+    fn the_serve_runtime_runs_the_requested_workers() {
+        for threads in [1, 3] {
+            let runtime = serve_runtime(NonZeroUsize::new(threads)).expect("runtime");
+            assert_eq!(runtime.metrics().num_workers(), threads);
+        }
+        // Tokio's default also reads this variable; this test does not set it.
+        if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+            let default = serve_runtime(None).expect("runtime");
+            assert_eq!(
+                default.metrics().num_workers(),
+                std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
+            );
+        }
     }
 
     /// The personal mode refuses to start as root. Its whole shape is "serve
@@ -1360,6 +1447,97 @@ mod tests {
         /// whether it got one.
         type Call = (Instant, Duration, bool);
 
+        /// Runs `send` every [`PROBE_EVERY`] on a thread of its own until
+        /// stopped. Dropping it stops and joins that thread, so a test that
+        /// fails while it runs does not leave the thread, and the client it
+        /// holds, behind.
+        struct Probe {
+            probing: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Probe {
+            fn start(send: impl Fn() + Send + 'static) -> Self {
+                let probing = Arc::new(AtomicBool::new(true));
+                let thread = std::thread::spawn({
+                    let probing = Arc::clone(&probing);
+                    move || {
+                        while probing.load(Ordering::SeqCst) {
+                            send();
+                            std::thread::sleep(PROBE_EVERY);
+                        }
+                    }
+                });
+                Self {
+                    probing,
+                    thread: Some(thread),
+                }
+            }
+
+            /// Sends a byte on stream 0 of `client` to be echoed.
+            fn sending(client: &Arc<StdClient>) -> Self {
+                let client = Arc::clone(client);
+                Self::start(move || {
+                    client
+                        .send_bytes(0, b".".to_vec())
+                        .expect("fixture input admitted");
+                })
+            }
+
+            /// Stops the probe and joins its thread, which must not have
+            /// failed.
+            fn finish(mut self) {
+                assert!(self.stop().is_ok(), "the probe's thread failed");
+            }
+
+            fn stop(&mut self) -> std::thread::Result<()> {
+                self.probing.store(false, Ordering::SeqCst);
+                self.thread.take().map_or(Ok(()), |thread| thread.join())
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                // On a failing test's unwind, or after `finish`: join, and
+                // never panic a second time.
+                let _ = self.stop();
+            }
+        }
+
+        /// A test that fails while its probe runs still stops and joins the
+        /// probe's thread, and the thread gives up the client it held.
+        #[test]
+        fn a_failing_test_stops_and_joins_its_probe() {
+            let client = Arc::new(AtomicUsize::new(0));
+            let unwound = std::panic::catch_unwind({
+                let client = Arc::clone(&client);
+                move || {
+                    let held = Arc::clone(&client);
+                    let _probe = Probe::start(move || {
+                        held.fetch_add(1, Ordering::SeqCst);
+                    });
+                    assert!(
+                        wait_until(TEST_WAIT, || client.load(Ordering::SeqCst) > 0),
+                        "setup: the probe must be running"
+                    );
+                    panic!("a controlled failure while the probe runs");
+                }
+            });
+            assert!(unwound.is_err(), "the controlled failure must unwind");
+            assert_eq!(
+                Arc::strong_count(&client),
+                1,
+                "the probe's thread must have exited and dropped its client"
+            );
+            let sent = client.load(Ordering::SeqCst);
+            std::thread::sleep(PROBE_EVERY * 3);
+            assert_eq!(
+                client.load(Ordering::SeqCst),
+                sent,
+                "nothing may send after the unwind"
+            );
+        }
+
         /// Passes every call on to the source the setup built, and times the
         /// ones the router makes for a nonce.
         struct Timed {
@@ -1425,6 +1603,18 @@ mod tests {
         /// Every call the router makes for a nonce is timed.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_silent_helper_holds_up_neither_live_sessions_nor_refusals() {
+            silent_helper_case().await;
+        }
+
+        /// The same, with the whole router and every session on one runtime
+        /// worker (`--runtime-threads 1`): nothing the helper withholds may
+        /// occupy that worker either.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_silent_helper_holds_up_nothing_on_one_runtime_worker() {
+            silent_helper_case().await;
+        }
+
+        async fn silent_helper_case() {
             let dir = tempfile::tempdir().expect("tempdir");
             let key_path = dir.path().join("key");
             let key = ssh_key::PrivateKey::random(
@@ -1525,18 +1715,7 @@ mod tests {
                 "setup: the pool must run dry once the helper is silent"
             );
 
-            let probing = Arc::new(AtomicBool::new(true));
-            let probe = std::thread::spawn({
-                let a = Arc::clone(&a);
-                let probing = Arc::clone(&probing);
-                move || {
-                    while probing.load(Ordering::SeqCst) {
-                        a.send_bytes(0, b".".to_vec())
-                            .expect("fixture input admitted");
-                        std::thread::sleep(PROBE_EVERY);
-                    }
-                }
-            });
+            let probe = Probe::sending(&a);
             // Let the probe's echoes start before B does.
             assert!(
                 wait_until(TEST_WAIT, || a_events.received().bytes.len()
@@ -1557,8 +1736,7 @@ mod tests {
                 .expect("fixture input admitted");
             std::thread::sleep(WATCH);
             let watch_until = Instant::now();
-            probing.store(false, Ordering::SeqCst);
-            probe.join().expect("the probe");
+            probe.finish();
 
             let asked: Vec<Call> = calls
                 .lock()
@@ -1629,6 +1807,192 @@ mod tests {
                 "only the first client may ever have reached the helper with a proof"
             );
         }
+
+        /// How long a slow verification takes: twice [`STALL`].
+        const SLOW_VERIFY: Duration = Duration::from_secs(2);
+
+        /// Delays every verification by [`SLOW_VERIFY`] once `slow` is set,
+        /// and records how long each one took.
+        struct SlowVerifier {
+            inner: Arc<dyn transport::auth::AuthVerifier>,
+            slow: Arc<AtomicBool>,
+            took: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl transport::auth::AuthVerifier for SlowVerifier {
+            fn verify(
+                &self,
+                handshake_hash: &[u8; 32],
+                record: &transport::auth::AuthRecord,
+                login: transport::session_manager::LoginId,
+                rhost: &str,
+            ) -> Result<Principal, transport::auth::AuthError> {
+                let started = Instant::now();
+                if self.slow.load(Ordering::SeqCst) {
+                    std::thread::sleep(SLOW_VERIFY);
+                }
+                let verdict = self.inner.verify(handshake_hash, record, login, rhost);
+                self.took.lock().expect("took").push(started.elapsed());
+                verdict
+            }
+        }
+
+        /// With the router and every session on one runtime worker
+        /// (`--runtime-threads 1`), a verification that takes
+        /// [`SLOW_VERIFY`] waits off that worker: a live session keeps its
+        /// echoes meanwhile, and the slow login still gets in.
+        ///
+        /// A stub helper admits everyone. A first client, A, gets in at
+        /// once; then the test's verifier holds every verification, and
+        /// while A sends a byte to be echoed every [`PROBE_EVERY`], a second
+        /// client, B, logs in. This qualifies routing while a verification
+        /// is delayed, with an echo backend and a stub helper; it exercises
+        /// no PAM, terminal or update cleanup.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+        async fn a_slow_verification_holds_up_nothing_on_one_runtime_worker() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let key_path = dir.path().join("key");
+            let key = ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                ssh_key::Algorithm::Ed25519,
+            )
+            .expect("keygen");
+            std::fs::write(
+                &key_path,
+                key.to_openssh(ssh_key::LineEnding::LF)
+                    .expect("encode")
+                    .as_bytes(),
+            )
+            .expect("write the key");
+
+            let (worker, stub) = stub_helper(
+                |_| Pace::After(Duration::ZERO),
+                Some(Response::Verified {
+                    uid: 4242,
+                    name: "anyone".to_string(),
+                    identity: "SHA256:anyone".to_string(),
+                    incarnation: 0,
+                }),
+            );
+            let helper = client(worker);
+            let pool = PooledNonces::with_max_age(Arc::clone(&helper), Duration::from_secs(600))
+                .expect("the nonce pool");
+            let server_kp = generate_keypair();
+            let mut auth = system_server_auth(
+                server_kp.public,
+                helper,
+                Arc::clone(&pool),
+                "qshd",
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .expect("the system mode's setup");
+            let slow = Arc::new(AtomicBool::new(false));
+            let took = Arc::new(Mutex::new(Vec::new()));
+            auth.verifier = Some(Arc::new(SlowVerifier {
+                inner: auth.verifier.expect("the system mode verifies"),
+                slow: Arc::clone(&slow),
+                took: Arc::clone(&took),
+            }));
+
+            let socket = Arc::new(
+                tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind"),
+            );
+            let addr = socket.local_addr().expect("addr");
+            let granted = Arc::new(AtomicUsize::new(0));
+            let server = tokio::spawn(SessionManager::serve(
+                socket,
+                server_kp.private,
+                auth,
+                BackendFactory(Arc::new(Echo {
+                    granted: Arc::clone(&granted),
+                })),
+                Arc::new(AtomicUsize::new(0)),
+                LoginEndedReports::none(),
+            ));
+
+            let a_events = Arc::new(Events::default());
+            let a = Arc::new(connect(
+                addr,
+                server_kp.public,
+                [1u8; 16],
+                &key_path,
+                Arc::clone(&a_events),
+            ));
+            a.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
+            assert!(
+                wait_until(TEST_WAIT, || a_events.received().bytes == b"hello"),
+                "setup: the first client must get its session"
+            );
+
+            slow.store(true, Ordering::SeqCst);
+            let probe = Probe::sending(&a);
+            assert!(
+                wait_until(TEST_WAIT, || a_events.received().bytes.len()
+                    > b"hello".len()),
+                "setup: the probe's bytes must come back"
+            );
+
+            let b_events = Arc::new(Events::default());
+            let watch_from = Instant::now();
+            let b = connect(
+                addr,
+                server_kp.public,
+                [2u8; 16],
+                &key_path,
+                Arc::clone(&b_events),
+            );
+            b.send_bytes(0, b"hello".to_vec())
+                .expect("fixture input admitted");
+            let b_got_in = wait_until(TEST_WAIT, || b_events.received().bytes == b"hello");
+            let watch_until = Instant::now();
+            probe.finish();
+
+            let echoes: Vec<Instant> = a_events
+                .received()
+                .arrivals
+                .iter()
+                .copied()
+                .filter(|at| *at >= watch_from && *at <= watch_until)
+                .collect();
+            let took: Vec<Duration> = took.lock().expect("took").clone();
+            b.close();
+            a.close();
+            server.abort();
+
+            let mut edges = vec![watch_from];
+            edges.extend(echoes);
+            edges.push(watch_until);
+            let longest_silence = edges
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .max()
+                .unwrap_or_default();
+            println!(
+                "slow verification: took {took:?}; {} echoes, longest silence \
+                 {longest_silence:?}",
+                edges.len() - 2
+            );
+            assert!(b_got_in, "the slow login must still get in");
+            assert!(
+                took.iter().any(|took| *took >= SLOW_VERIFY),
+                "setup: B's verification must have been slow: {took:?}"
+            );
+            assert!(
+                longest_silence < STALL,
+                "the live session went {longest_silence:?} without an echo while a login \
+                 was being verified: the verification held the runtime's only worker"
+            );
+            assert_eq!(
+                granted.load(Ordering::SeqCst),
+                2,
+                "both clients get a session"
+            );
+            assert_eq!(stub.verifies(), 2, "both proofs reach the helper");
+        }
+
         /// A helper that is alive but has stopped reading, its seam full. The
         /// router still ends logins (a graceful close) and releases nonces (a
         /// probation that ends unproven) on its own task; neither may wait on
@@ -1813,6 +2177,16 @@ mod tests {
 
             #[tokio::test(flavor = "multi_thread")]
             async fn a_stuck_helper_with_a_full_seam_does_not_hold_up_the_router() {
+                stuck_helper_case().await;
+            }
+
+            /// The same on one runtime worker (`--runtime-threads 1`).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+            async fn a_stuck_helper_holds_up_nothing_on_one_runtime_worker() {
+                stuck_helper_case().await;
+            }
+
+            async fn stuck_helper_case() {
                 let dir = tempfile::tempdir().expect("tempdir");
                 let key_path = dir.path().join("key");
                 let key = ssh_key::PrivateKey::random(
@@ -1937,18 +2311,7 @@ mod tests {
                     assert!(filled < 1_000_000, "setup: the seam never filled");
                 }
 
-                let probing = Arc::new(AtomicBool::new(true));
-                let probe = std::thread::spawn({
-                    let a = Arc::clone(&a);
-                    let probing = Arc::clone(&probing);
-                    move || {
-                        while probing.load(Ordering::SeqCst) {
-                            a.send_bytes(0, b".".to_vec())
-                                .expect("fixture input admitted");
-                            std::thread::sleep(PROBE_EVERY);
-                        }
-                    }
-                });
+                let probe = Probe::sending(&a);
                 let echoed = a_events.received().bytes.len();
                 assert!(
                     wait_until(TEST_WAIT, || a_events.received().bytes.len() > echoed + 3),
@@ -1982,8 +2345,7 @@ mod tests {
                     .collect();
                 std::thread::sleep(PHASE_R);
                 let r_until = Instant::now();
-                probing.store(false, Ordering::SeqCst);
-                probe.join().expect("the probe");
+                probe.finish();
 
                 let arrivals = a_events.received().arrivals.clone();
                 let silence_l = longest_silence(&arrivals, l_from, l_until);

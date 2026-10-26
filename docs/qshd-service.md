@@ -62,7 +62,7 @@ daemon" below means the personal one.
 ## Command line
 
 ```
-qshd serve [--port N] [--authorized-keys PATH] [--host-key PATH]
+qshd serve [--port N] [--authorized-keys PATH] [--host-key PATH] [--runtime-threads N]
 ```
 
 | Flag | Default | Meaning |
@@ -70,6 +70,7 @@ qshd serve [--port N] [--authorized-keys PATH] [--host-key PATH]
 | `--port` | `60022` | UDP port the daemon listens on for connections. |
 | `--authorized-keys` | `~/.ssh/authorized_keys` | File with the public keys of clients allowed to log in. |
 | `--host-key` | `~/.config/qshd/host_key` | The daemon's persistent host key (created on first run, mode `0600`). |
+| `--runtime-threads` | one per CPU | Async worker threads of the daemon's runtime, 1 to 256 — see "Runtime worker threads" below. |
 
 An unknown flag, or a port that isn't a number, makes the daemon exit with
 an error right away, without starting anything.
@@ -145,7 +146,8 @@ personal mode above already serves without any of what follows.
 
 ```
 qshd serve --system [--port N] [--host-key PATH] \
-    [--authorized-keys-template TEMPLATE] [--worker-user NAME] [--permit-root]
+    [--authorized-keys-template TEMPLATE] [--worker-user NAME] [--permit-root] \
+    [--runtime-threads N]
 ```
 
 | Flag | Default | Meaning |
@@ -156,6 +158,7 @@ qshd serve --system [--port N] [--host-key PATH] \
 | `--authorized-keys-template` | `%h/.ssh/authorized_keys` | where an account's own keys live; `%h` expands to its home directory, `%u` to its login name |
 | `--worker-user` | `qshd` | the unprivileged account the daemon's network-facing half drops to once it has split off from its root-privileged half; the `qshd` package creates this account if absent |
 | `--permit-root` | off | allow logging in as `uid 0`; refused otherwise |
+| `--runtime-threads` | one per CPU | same as the personal mode; the count applies to the worker's runtime |
 
 `--system` only exists in a binary built with the `system` Cargo feature
 (the `qshd` package's binary is; the portable release binary is not) — asking for it on a binary without the feature fails with an
@@ -663,6 +666,36 @@ a retransmit. To give qshd what it asks for:
     sudo sysctl --system
 
 and restart qshd.
+
+## Runtime worker threads
+
+qshd runs its sessions on an asynchronous runtime. By default the runtime
+starts one worker thread per CPU that qshd may run on: its CPU affinity is
+respected, so `taskset`, a cgroup cpuset or systemd's `CPUAffinity=` lower
+the count. The `TOKIO_WORKER_THREADS` environment variable, if set, takes
+the place of that default. `--runtime-threads N` (1 to 256) sets the count
+explicitly. qshd logs the count it started with (`runtime workers N`).
+
+The setting covers only these async workers, not every thread of qshd.
+Work that may block runs on a separate pool of blocking threads that the
+setting does not change: each session's terminal reads and writes, opening
+a channel, and the update and about helpers with their verification.
+Session shells are separate processes. In system mode the setting applies
+to the worker process, which runs the runtime; PAM and session starts
+happen in the privileged helper, which is single-threaded either way.
+
+The default is what qshd has always run, and the measurements so far
+support keeping it. They come from one 4-CPU VM ([performance
+baseline](performance-baseline.md#runtime-worker-threads-2026-10-26)) and
+showed no latency difference between one worker and one per CPU with up to
+five active sessions, in personal and system mode; with heavy output, and
+with up to 16 sessions, fewer workers used somewhat less CPU and fewer
+context switches. They do not show that the counts are equivalent on other
+hosts. Hosts with more than 4 CPUs and more than 16 sessions have not been
+measured. Setting a small count, such as `--runtime-threads 2`, limits how
+many CPUs qshd's async work spreads over, for example where qshd shares a
+large machine with other work; measure the effect there before relying on
+it.
 
 ## Checking it
 

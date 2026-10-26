@@ -1,0 +1,123 @@
+{
+ "workload": "retained",
+ "started_utc": "2026-10-26T12:48:34.409554+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0,
+   1
+  ],
+  "runtime_workers": 1,
+  "mode": "system"
+ },
+ "result": {
+  "window": {
+   "seconds": 10.003,
+   "qshd": {
+    "cpu_s": 0.01,
+    "cpu_percent": 0.1,
+    "run_s_live_threads": 0.015,
+    "runqueue_wait_s_live_threads": 0.0,
+    "timeslices_per_s": 14.3,
+    "voluntary_switches_per_s": 14.3,
+    "involuntary_switches_per_s": 0.0,
+    "threads_start": 23,
+    "threads_end": 22,
+    "threads_exited": 1,
+    "threads_created": 0,
+    "peak_rss_kib": 9984,
+    "rss_kib": 8028
+   },
+   "qshd_helper": {
+    "cpu_s": 0.02,
+    "cpu_percent": 0.2,
+    "run_s_live_threads": 0.0058,
+    "runqueue_wait_s_live_threads": 0.0,
+    "timeslices_per_s": 5.0,
+    "voluntary_switches_per_s": 5.0,
+    "involuntary_switches_per_s": 0.0,
+    "threads_start": 1,
+    "threads_end": 1,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 5808,
+    "rss_kib": 5808
+   },
+   "relay": {
+    "c2s_datagrams": 0,
+    "c2s_bytes": 0,
+    "s2c_datagrams": 68,
+    "s2c_bytes": 3422,
+    "dropped_datagrams": 0,
+    "c2s_datagrams_per_s": 0.0,
+    "c2s_bytes_per_s": 0.0,
+    "s2c_datagrams_per_s": 6.8,
+    "s2c_bytes_per_s": 342.11,
+    "dropped_datagrams_per_s": 0.0
+   }
+  },
+  "sessions": 8
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 0.102,
+   "system_s": 0.107,
+   "voluntary_switches": 1664,
+   "involuntary_switches": 118
+  },
+  "clients": [
+   {
+    "user_s": 0.016,
+    "system_s": 0.01,
+    "voluntary_switches": 52,
+    "involuntary_switches": 9
+   },
+   {
+    "user_s": 0.019,
+    "system_s": 0.007,
+    "voluntary_switches": 58,
+    "involuntary_switches": 18
+   },
+   {
+    "user_s": 0.016,
+    "system_s": 0.012,
+    "voluntary_switches": 85,
+    "involuntary_switches": 33
+   },
+   {
+    "user_s": 0.011,
+    "system_s": 0.014,
+    "voluntary_switches": 70,
+    "involuntary_switches": 25
+   },
+   {
+    "user_s": 0.009,
+    "system_s": 0.018,
+    "voluntary_switches": 42,
+    "involuntary_switches": 9
+   },
+   {
+    "user_s": 0.01,
+    "system_s": 0.02,
+    "voluntary_switches": 66,
+    "involuntary_switches": 20
+   },
+   {
+    "user_s": 0.026,
+    "system_s": 0.005,
+    "voluntary_switches": 57,
+    "involuntary_switches": 18
+   },
+   {
+    "user_s": 0.016,
+    "system_s": 0.016,
+    "voluntary_switches": 58,
+    "involuntary_switches": 12
+   }
+  ]
+ },
+ "harness_cpu_s": 0.09,
+ "index": 170,
+ "repetition": 4,
+ "build": "s2t1"
+}

@@ -26,7 +26,8 @@
 //!   against the same `~/.ssh/authorized_keys` `serve` uses -- otherwise
 //!   reaching one shell from a phone and a terminal would take two daemons
 //!   on two ports.
-//! - `serve [--port N] [--authorized-keys PATH] [--host-key PATH]` -- the
+//! - `serve [--port N] [--authorized-keys PATH] [--host-key PATH]
+//!   [--runtime-threads N]` -- the
 //!   standing-service path (`serve.rs`): a long-lived
 //!   daemon on a fixed port, reached only by an SSH signature -- it has no
 //!   allowlist, because nothing bootstraps one over SSH here.
@@ -111,6 +112,7 @@ fn help_text() -> String {
             .to_string(),
         "  serve             [--port <P>] [--authorized-keys <path>] [--host-key <path>]"
             .to_string(),
+        "                    [--runtime-threads <N>]".to_string(),
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),

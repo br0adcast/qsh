@@ -34,9 +34,15 @@ Every run is independent and starts from nothing:
   that exited, fails the run before a client starts or any traffic is
   forwarded. The check is repeated before every client starts.
 - A UDP relay owned by the harness sits between `qsh` and `qshd`. It counts
-  the datagrams and bytes of this one session in each direction, timestamps
-  each client datagram when it is received, and can drop everything to
-  simulate an outage.
+  the datagrams and bytes of the run's sessions in each direction,
+  timestamps each client datagram when it is received, and can drop
+  everything to simulate an outage. Each client address gets its own socket
+  toward the daemon, so qshd sees every client at an address of its own and
+  each reply goes back to the client it was sent to. Before harness version
+  4, and in the first runtime-worker dataset below, the relay had one such
+  socket and sent every reply to the client heard from last, which is
+  correct only while one client is connected at a time, as in every
+  workload of the earlier versions.
 - `qsh` runs as a session leader on its own pseudo-terminal (120x40). One
   reader thread drains, counts and timestamps its output. The terminal's
   descriptors are owned from the moment they are opened, so a failed setup
@@ -69,13 +75,17 @@ For the session as a whole:
 
 | Metric | Meaning and limits |
 |---|---|
-| `relay.*` | Datagrams and bytes of this session only, per direction. Traffic is encrypted, so frame types (data, acknowledgement, keepalive, path probe) are not distinguished. |
+| `relay.*` | Datagrams and bytes of the run's sessions, per direction. Traffic is encrypted, so frame types (data, acknowledgement, keepalive, path probe) are not distinguished. |
 | `terminal.bytes` | Bytes the client wrote to its terminal. These are rendered screen updates, not the remote output: a fast stream can be presented as fewer bytes than it produced. |
 | `terminal.presented_frames` | Number of cursor-visibility sequences. The renderer ends every presented frame with one, so this counts frames, as a renderer-specific proxy. |
 | `typing.stdin_to_next_datagram_ms` | Time from a timestamp taken immediately before a key is written to the client's terminal until the first client datagram the relay received at or after that timestamp, without prediction. This is an **uncorrelated proxy**, not the dispatch of the key: traffic is encrypted, so the datagram is not known to carry it. A keepalive or acknowledgement sent shortly after the timestamp is attributed to it. |
 | `typing.echo_ms` | Time from writing a key until the reader thread's read that completed the remote echo returned. It includes the client's input, transport, server, PTY echo, return path and rendering. |
 | `saturation.completion_s` | Wall time for a fixed amount of output to complete end to end, up to when the harness observed the completion marker (it polls every 5 ms). |
 | `reconnect.recovery_s` | Time from restoring the path until the reader thread read the output of a command typed at that moment. |
+| `busy.echo_ms` | As `typing.echo_ms`, for the typing session among the redrawing ones. |
+| `busy.busy_terminal_bytes_per_s` | Bytes all redrawing clients wrote to their terminals per second during the window. |
+| `busy.busy_overrun_s` | How much later than its nominal duration each redraw's completion marker reached the client's terminal, median and maximum over the redrawing sessions. A redraw paces itself, so this is an end-to-end overrun of a paced producer: it includes the producer's own scheduling on qshd's CPUs (the redraws are descendants of qshd), the shell, qshd, the relay and the terminal drain, not qshd's delay alone. |
+| `qshd.allowed_cpus`, `qshd.runtime_workers`, `qshd.runtime_workers_expected` | Recorded per run: the CPUs the running qshd may use, from `/proc/<pid>/status`; the async worker count its log reports (`runtime workers N`); and the count the run required, or null when it required none. A run whose qshd runs on other CPUs than its variant names fails. How the worker count is checked is described under [Procedure](#procedure). |
 | `lifetime.*` | `wait4` resource usage over a process's whole life, all threads included. `ru_maxrss` is deliberately not recorded: a forked child starts with the harness's resident size as its high-water mark. |
 | `harness_cpu_s` | The harness's own CPU for the run: relay, PTY drain and polling. It shares the host with the measured processes. |
 
@@ -101,6 +111,7 @@ baseline.
 | `saturation` | `seq 1 2000000` on the remote side, followed by a completion marker. The window is the whole fixed amount of work. |
 | `reconnect` | The relay drops all traffic for the window; the outage CPU and traffic are measured, and then recovery time. |
 | `retained` | Eight clients each start their own session (separate client homes) and leave with `Ctrl-] .`. The run checks that eight session processes remain under qshd, then measures qshd with no client attached. |
+| `busy` | One typing session as in `typing`, beside four other sessions (`--busy-sessions`) that each redraw their full screen at 20 frames per second, all through the same qshd. The window covers the keys. Only the echo is measured: with several clients behind the relay, the next client datagram need not be the typing client's. A run in which any key lacks its echo fails. With many sessions the harness itself, one Python process relaying every datagram, can delay echoes; compare `harness_cpu_s` with the run's length before attributing a latency tail to qshd. |
 
 Each run settles for 2 seconds after connecting before its window starts.
 
@@ -137,10 +148,67 @@ python3 scripts/perf_baseline.py run \
 python3 scripts/perf_baseline.py summarize "$OWNED/baseline"
 ```
 
+To compare runtime configurations of one build, name variants. Each variant
+runs one `--build` with qshd confined to a CPU list and, optionally, with
+`--runtime-threads N`; the runs and summary columns are named after the
+variants:
+
+```sh
+python3 scripts/perf_baseline.py run --build cur="$OWNED/bin" \
+  --variant c1=cur,cpus=0 --variant c2=cur,cpus=0-1 \
+  --variant c2t1=cur,cpus=0-1,threads=1 \
+  --harness-cpus 2-3 --out "$OWNED/workers" ...
+```
+
+qshd is started through `taskset`, which sets its CPUs before it executes
+qshd, so Tokio's default worker count follows them. `--harness-cpus` keeps
+the harness, its relay and every client on other CPUs; a variant without
+CPUs of its own then runs qshd on every CPU the harness started with. The
+processes a session starts inherit qshd's CPUs.
+
+A variant that names CPUs or a worker count is a runtime-worker
+experiment, and its run fails unless qshd's log reports the count it
+should run:
+
+- with `threads=N`, N;
+- otherwise Tokio's default for that qshd: `TOKIO_WORKER_THREADS` if the
+  environment the harness gave qshd sets it (it passes on only `PATH`, so
+  normally it does not), else one worker per CPU qshd may run on. A cgroup
+  CPU quota also lowers Tokio's default, so a run under one, or outside a
+  cgroup v2 hierarchy where none can be seen, fails and asks for
+  `threads=N` instead.
+
+A build run without variants, or a variant that names neither, only
+records the count; a build without the log line records none.
+
+A variant with `system` runs `qshd serve --system` instead, which the
+harness does only as root with `QSHD_TEST_DISPOSABLE_HOST=1` set: it runs
+qshd as root and writes the benchmark account's `authorized_keys`. Run it in
+a disposable container that has the PAM service file, an account to log in
+as (`--system-account`) with empty shell startup files, and a worker account
+(`--worker-user`, default `nobody`).
+`scripts/perf_baseline_system.Dockerfile` builds one, with the account
+`qshbench`. The container needs `CAP_SYS_PTRACE`:
+the worker drops its privileges, and without that capability root cannot
+read the worker's `/proc` descriptors and counters. In these runs `qshd` is
+the worker, which runs the async runtime, and `qshd_helper` is the
+privileged helper:
+
+```sh
+docker run --rm --init --cap-add SYS_PTRACE -e QSHD_TEST_DISPOSABLE_HOST=1 \
+  -v "$OWNED/bin-system:/bench/bin:ro" -v "$PWD/scripts/perf_baseline.py:/bench/perf_baseline.py:ro" \
+  -v "$OWNED/out:/bench/out" qsh-bench-system \
+  python3 -I /bench/perf_baseline.py run --build cur=/bench/bin \
+    --variant s1=cur,system,cpus=0 --system-account qshbench ... --out /bench/out/system
+```
+
 `--out` must not exist yet. It receives `manifest.json` and one JSON file per
 run under `runs/`, written as soon as the run ends. SIGTERM, SIGINT or SIGHUP
 stop the harness after cleaning up the current run's processes and private
-directory; the runs already written are kept.
+directory; the runs already written are kept. A failed run's file includes
+the tails of the daemon's log and of each client's terminal; in personal
+mode the log names the account the harness ran as, so check failed runs
+before publishing a dataset.
 
 The manifest records:
 
@@ -149,9 +217,11 @@ The manifest records:
   name and the toolchain strings from its `.comment` section;
 - the kernel, CPU model and online CPUs. The host name and absolute paths are
   not recorded.
-- the settings and the complete run order.
+- the settings, the variants and the CPUs each one gave qshd, and the
+  complete run order.
 
-`summarize` reads only these files. For each workload, metric and build it
+`summarize` reads only these files. For each workload, metric and build (or
+variant) it
 prints the median, interquartile range and run count. With two builds it adds
 the ratio of medians and how many repetition pairs had the second build lower,
 with ties counted separately.
@@ -365,3 +435,219 @@ kept.
 
 These numbers are a reference for later comparisons on the same host, not
 performance promises for other platforms.
+
+## Runtime worker threads: 2026-10-26
+
+These runs compare the async worker count of one qshd build (#308). They
+were made on the same 4-vCPU VM as the baselines above, with the same
+unrelated personal qshd running, so they are not quiet-host runs either.
+The VM has 4 CPUs; nothing here was measured on a larger host.
+
+- **Build:** `583cc51`, glibc release build (`x86_64-unknown-linux-gnu`),
+  rustc 1.98.1. The system-mode runs used a build of the same commit with
+  `--features qshd/system`, in an `ubuntu:24.04` container built from
+  `scripts/perf_baseline_system.Dockerfile`, with the worker account
+  `nobody`. Hashes are in each manifest. The client is the `qsh` of the
+  same commit, which predates the UI-wait changes of #339; client-side
+  figures here do not describe later clients.
+- **Variants:** qshd confined to CPU 0 (`c1`/`s1`), CPUs 0-1 (`c2`/`s2`)
+  or CPUs 0-3 (`c4`/`s4`) with Tokio's default worker count, which then is
+  1, 2 or 4; a `t1` or `t2` suffix adds `--runtime-threads 1` or `2`. `c`
+  is personal mode and `s` system mode. Every run checked the CPUs of the
+  running qshd, and the worker count it reported when the variant set
+  `threads=`. Harness version 4, which made these runs, recorded the default
+  count without checking it; version 5 checks it as described under
+  [Procedure](#procedure). All 240 records with the default count match
+  the number of CPUs they record. The harness, its relay and every client
+  ran on CPUs 2-3, so in the 4-CPU variants they shared CPUs with qshd.
+  Session shells, and with them the redraw scripts, run on qshd's CPUs.
+- **Order:** 5 repetitions, interleaved: the variant order is reversed in
+  every other repetition. All 480 runs kept here succeeded and left no
+  processes behind.
+- **Harness:** version 4. The first personal-mode dataset was recorded
+  before the relay change described under [What one run does](#what-one-run-does),
+  which is correct for its idle, typing, saturation, reconnect and retained
+  runs: each had one client connected at a time. Its 30 `busy` runs did
+  not; replies reached the wrong client, which delayed echoes by up to
+  about 200 ms and failed one run. They are withdrawn and omitted from the
+  raw data, and `busy` was measured again with the per-client relay.
+- **Many sessions:** 16 sessions per daemon, the per-owner limit, as one
+  typing session beside 15 redrawing ones (`--busy-sessions 15`) and as 16
+  retained sessions. The system-wide limit of 128 sessions was not
+  measured.
+
+In system mode, `qshd` is the worker process, which runs the async runtime,
+and `qshd_helper` the privileged helper.
+
+### Personal mode
+
+Raw data: [`performance/2026-10-26-runtime-workers-personal/`](performance/2026-10-26-runtime-workers-personal/)
+(one session, and eight retained),
+[`-personal-busy/`](performance/2026-10-26-runtime-workers-personal-busy/)
+(`busy`, five sessions) and
+[`-personal-16/`](performance/2026-10-26-runtime-workers-personal-16/)
+(16 sessions).
+
+One session, and eight retained:
+
+| Workload | Metric | c1 median (p25-p75, n) | c2 median (p25-p75, n) | c2t1 median (p25-p75, n) | c4 median (p25-p75, n) | c4t1 median (p25-p75, n) | c4t2 median (p25-p75, n) |
+|---|---|---|---|---|---|---|---|
+| idle | window.qshd.cpu_percent | 0.7 (0.7-0.7, 5) | 0.8 (0.7-0.8, 5) | 0.8 (0.8-0.8, 5) | 0.7 (0.7-0.7, 5) | 0.8 (0.8-0.8, 5) | 0.8 (0.7-0.8, 5) |
+| idle | window.qshd.voluntary_switches_per_s | 113 (112-113, 5) | 116 (116-116, 5) | 114 (113-114, 5) | 116 (116-117, 5) | 114 (114-114, 5) | 116 (116-116, 5) |
+| typing | echo_ms.p50 | 1.43 (1.43-1.46, 5) | 1.48 (1.47-1.49, 5) | 1.48 (1.46-1.48, 5) | 1.49 (1.48-1.52, 5) | 1.43 (1.42-1.47, 5) | 1.49 (1.46-1.53, 5) |
+| typing | echo_ms.p90 | 1.91 (1.73-1.93, 5) | 1.88 (1.78-1.93, 5) | 1.93 (1.84-1.95, 5) | 1.96 (1.86-1.98, 5) | 1.89 (1.82-1.9, 5) | 1.81 (1.8-1.88, 5) |
+| typing | window.qshd.cpu_percent | 1.1 (1.1-1.1, 5) | 1.3 (1.3-1.3, 5) | 1.2 (1.2-1.3, 5) | 1.4 (1.3-1.5, 5) | 1.3 (1.3-1.3, 5) | 1.4 (1.4-1.4, 5) |
+| typing | window.qshd.involuntary_switches_per_s | 84 (81.2-84.6, 5) | 5.29 (3.19-5.99, 5) | 2.8 (2.7-3.3, 5) | 2.1 (2.1-2.5, 5) | 1.3 (0.8-1.5, 5) | 2.1 (1.2-2.2, 5) |
+| typing | window.qshd.voluntary_switches_per_s | 175 (175-176, 5) | 262 (262-263, 5) | 207 (206-207, 5) | 271 (267-272, 5) | 207 (206-208, 5) | 265 (265-265, 5) |
+| saturation | completion_s | 2.35 (2.23-2.44, 5) | 2 (1.96-2.15, 5) | 1.99 (1.92-2.13, 5) | 2.2 (2.15-2.32, 5) | 2.16 (2.1-2.31, 5) | 2.38 (2.02-2.47, 5) |
+| saturation | window.qshd.cpu_percent | 55.8 (55.6-56.4, 5) | 92.7 (73.7-93.8, 5) | 73.5 (58.7-82.3, 5) | 95.3 (94.4-97.4, 5) | 78.9 (77.1-81.8, 5) | 85.3 (85-92.2, 5) |
+| saturation | window.qshd.involuntary_switches_per_s | 4076 (3927-4100, 5) | 56563 (53632-58802, 5) | 71276 (70648-77584, 5) | 49155 (41189-49423, 5) | 43476 (37955-48370, 5) | 58818 (55690-60063, 5) |
+| saturation | window.qshd.threads_end | 6 (6-6, 5) | 7 (7-7, 5) | 6 (6-6, 5) | 8 (8-8, 5) | 5 (5-5, 5) | 6 (6-6, 5) |
+| saturation | window.qshd.voluntary_switches_per_s | 19190 (19093-21725, 5) | 52774 (50459-60781, 5) | 46969 (39356-57452, 5) | 52702 (48537-55782, 5) | 37130 (32061-37863, 5) | 51244 (44249-54438, 5) |
+| reconnect | recovery_s | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) |
+| retained | window.qshd.cpu_percent | 2.4 (2.3-2.4, 5) | 3.2 (3.2-3.3, 5) | 3.2 (2.9-3.2, 5) | 3.6 (3.3-3.6, 5) | 3.4 (3.2-3.4, 5) | 3.4 (3.3-3.4, 5) |
+| retained | window.qshd.involuntary_switches_per_s | 373 (362-378, 5) | 190 (188-198, 5) | 34.1 (21.8-40.8, 5) | 55.5 (49.2-64.6, 5) | 2.8 (2.8-4.2, 5) | 17.5 (15.4-19.5, 5) |
+| retained | window.qshd.voluntary_switches_per_s | 533 (490-551, 5) | 595 (561-639, 5) | 654 (642-682, 5) | 770 (691-796, 5) | 589 (574-676, 5) | 653 (649-670, 5) |
+
+`busy`, one typing session beside four redrawing ones:
+
+| Workload | Metric | c1 median (p25-p75, n) | c2 median (p25-p75, n) | c2t1 median (p25-p75, n) | c4 median (p25-p75, n) | c4t1 median (p25-p75, n) | c4t2 median (p25-p75, n) |
+|---|---|---|---|---|---|---|---|
+| busy | busy_overrun_s.median | 0.128 (0.127-0.133, 5) | 0.093 (0.091-0.095, 5) | 0.089 (0.088-0.091, 5) | 0.077 (0.077-0.081, 5) | 0.072 (0.072-0.073, 5) | 0.075 (0.072-0.075, 5) |
+| busy | echo_ms.max | 4.37 (3.15-5.26, 5) | 4.22 (3.3-4.25, 5) | 5.7 (4.26-5.76, 5) | 3.43 (3.18-3.57, 5) | 3.34 (2.87-3.78, 5) | 2.68 (2.58-3.8, 5) |
+| busy | echo_ms.p50 | 1.52 (1.49-1.53, 5) | 1.58 (1.57-1.6, 5) | 1.57 (1.54-1.6, 5) | 1.56 (1.52-1.62, 5) | 1.64 (1.57-1.64, 5) | 1.58 (1.54-1.61, 5) |
+| busy | echo_ms.p90 | 1.95 (1.9-1.99, 5) | 2.14 (2.13-2.59, 5) | 2.27 (2.08-2.31, 5) | 2 (1.89-2.03, 5) | 2.32 (1.96-2.48, 5) | 2.02 (1.98-2.04, 5) |
+| busy | window.qshd.cpu_percent | 6.39 (6.09-6.39, 5) | 7.79 (7.69-8.19, 5) | 7.09 (6.99-7.19, 5) | 8.39 (8.39-8.39, 5) | 7.29 (6.99-7.49, 5) | 8.59 (8.39-8.59, 5) |
+| busy | window.qshd.involuntary_switches_per_s | 442 (440-442, 5) | 143 (129-168, 5) | 76.5 (74.2-82.6, 5) | 107 (74.2-146, 5) | 63.2 (61.8-70.2, 5) | 50.7 (42.3-56.7, 5) |
+| busy | window.qshd.voluntary_switches_per_s | 915 (892-932, 5) | 1519 (1515-1542, 5) | 1186 (1118-1242, 5) | 1801 (1789-2010, 5) | 1167 (1133-1219, 5) | 1763 (1723-1768, 5) |
+
+16 sessions:
+
+| Workload | Metric | c1 median (p25-p75, n) | c2 median (p25-p75, n) | c2t1 median (p25-p75, n) | c4 median (p25-p75, n) | c4t1 median (p25-p75, n) | c4t2 median (p25-p75, n) |
+|---|---|---|---|---|---|---|---|
+| busy | busy_overrun_s.median | 0.363 (0.36-0.369, 5) | 0.231 (0.197-0.243, 5) | 0.199 (0.189-0.203, 5) | 0.134 (0.133-0.17, 5) | 0.135 (0.13-0.145, 5) | 0.153 (0.134-0.155, 5) |
+| busy | busy_terminal_bytes_per_s | 1382297 (1381493-1382843, 5) | 1375484 (1372587-1381690, 5) | 1362510 (1359629-1364388, 5) | 1380327 (1379778-1382866, 5) | 1377523 (1374809-1381932, 5) | 1379770 (1378756-1390830, 5) |
+| busy | echo_ms.max | 87 (9.21-131, 5) | 253 (242-332, 5) | 614 (457-666, 5) | 148 (16.3-194, 5) | 260 (224-263, 5) | 227 (211-402, 5) |
+| busy | echo_ms.p50 | 1.62 (1.53-1.72, 5) | 2.03 (1.68-2.36, 5) | 2.43 (1.95-4.19, 5) | 1.99 (1.98-2.09, 5) | 2.16 (1.88-3.17, 5) | 1.95 (1.77-1.98, 5) |
+| busy | echo_ms.p90 | 2.53 (2.48-3.45, 5) | 59.7 (19.8-70.6, 5) | 130 (45.7-147, 5) | 4.54 (4.4-59.7, 5) | 58.3 (5.98-90.7, 5) | 13.1 (12.9-19.3, 5) |
+| busy | window.qshd.cpu_percent | 15.3 (15.2-16.3, 5) | 22 (21.7-22.8, 5) | 21 (20.3-22.4, 5) | 23.9 (23.6-25.2, 5) | 20.1 (19.8-20.3, 5) | 23.5 (23.3-24, 5) |
+| busy | window.qshd.involuntary_switches_per_s | 1439 (1424-1442, 5) | 1226 (1205-1317, 5) | 882 (775-1161, 5) | 828 (671-1077, 5) | 556 (445-676, 5) | 819 (813-837, 5) |
+| busy | window.qshd.threads_end | 39 (38-39, 5) | 40 (40-41, 5) | 42 (40-43, 5) | 45 (44-45, 5) | 40 (40-40, 5) | 42 (42-42, 5) |
+| busy | window.qshd.voluntary_switches_per_s | 2629 (2617-2710, 5) | 6080 (6076-6237, 5) | 4792 (4635-5723, 5) | 6619 (6342-6624, 5) | 4306 (3711-4871, 5) | 6207 (6055-6271, 5) |
+| busy | window.relay.s2c_datagrams_per_s | 1577 (1569-1582, 5) | 2714 (2573-2760, 5) | 2872 (2758-3719, 5) | 2347 (2196-2538, 5) | 2644 (2427-3117, 5) | 2479 (2408-2559, 5) |
+| retained | window.qshd.cpu_percent | 3.7 (3.6-3.8, 5) | 5.1 (5-5.2, 5) | 4.7 (4.6-5.2, 5) | 6.1 (5.6-6.2, 5) | 4.9 (4.9-5, 5) | 5.4 (5.3-5.5, 5) |
+| retained | window.qshd.involuntary_switches_per_s | 755 (750-756, 5) | 464 (453-464, 5) | 54.3 (34.2-54.6, 5) | 178 (178-210, 5) | 8.4 (7.2-8.8, 5) | 64.5 (60.6-67.3, 5) |
+| retained | window.qshd.threads_end | 40 (38-42, 5) | 41 (40-42, 5) | 42 (42-43, 5) | 48 (46-49, 5) | 42 (42-42, 5) | 46 (46-47, 5) |
+| retained | window.qshd.voluntary_switches_per_s | 1031 (1029-1031, 5) | 1212 (1202-1217, 5) | 1073 (1058-1207, 5) | 1507 (1362-1510, 5) | 1016 (987-1025, 5) | 1160 (1089-1179, 5) |
+
+### System mode
+
+Raw data: [`performance/2026-10-26-runtime-workers-system/`](performance/2026-10-26-runtime-workers-system/)
+and [`-system-16/`](performance/2026-10-26-runtime-workers-system-16/)
+(16 sessions).
+
+One session, eight retained, and `busy` with five sessions:
+
+| Workload | Metric | s1 median (p25-p75, n) | s2 median (p25-p75, n) | s2t1 median (p25-p75, n) | s4 median (p25-p75, n) | s4t1 median (p25-p75, n) | s4t2 median (p25-p75, n) |
+|---|---|---|---|---|---|---|---|
+| idle | window.qshd.cpu_percent | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0.1, 5) | 0 (0-0, 5) | 0 (0-0.1, 5) |
+| idle | window.qshd.voluntary_switches_per_s | 5.1 (5.1-5.2, 5) | 8 (8-8.3, 5) | 5.6 (5.3-5.6, 5) | 8.8 (8.6-8.9, 5) | 5.4 (5.2-5.4, 5) | 9 (8.9-9, 5) |
+| idle | window.qshd_helper.cpu_percent | 0 (0-0.1, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0.1 (0-0.1, 5) | 0 (0-0, 5) |
+| typing | echo_ms.p50 | 1.43 (1.42-1.45, 5) | 1.43 (1.42-1.49, 5) | 1.43 (1.42-1.46, 5) | 1.5 (1.5-1.51, 5) | 1.47 (1.45-1.48, 5) | 1.49 (1.47-1.5, 5) |
+| typing | echo_ms.p90 | 1.78 (1.73-1.79, 5) | 1.82 (1.77-1.88, 5) | 1.77 (1.77-1.8, 5) | 1.89 (1.86-1.94, 5) | 1.89 (1.85-1.9, 5) | 1.84 (1.77-1.88, 5) |
+| typing | window.qshd.cpu_percent | 0.499 (0.399-0.499, 5) | 0.699 (0.599-0.699, 5) | 0.599 (0.599-0.599, 5) | 0.699 (0.699-0.699, 5) | 0.599 (0.599-0.599, 5) | 0.699 (0.699-0.699, 5) |
+| typing | window.qshd.involuntary_switches_per_s | 35.1 (35-35.5, 5) | 4.09 (3.89-4.19, 5) | 1.3 (1.1-1.4, 5) | 1.2 (1.1-1.3, 5) | 0.5 (0.5-0.6, 5) | 1.3 (1.3-1.8, 5) |
+| typing | window.qshd.voluntary_switches_per_s | 69.7 (69.5-69.9, 5) | 171 (170-171, 5) | 102 (101-102, 5) | 185 (185-187, 5) | 102 (102-102, 5) | 185 (185-185, 5) |
+| typing | window.qshd_helper.cpu_percent | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0.1, 5) | 0 (0-0, 5) | 0 (0-0, 5) |
+| saturation | completion_s | 2.44 (2.39-2.52, 5) | 1.8 (1.74-2.07, 5) | 1.87 (1.84-2.04, 5) | 2.04 (1.89-2.23, 5) | 2.16 (2.13-2.47, 5) | 2.11 (2.09-2.22, 5) |
+| saturation | window.qshd.cpu_percent | 55.6 (55.6-55.8, 5) | 80.3 (78.1-82.4, 5) | 73.1 (72.6-83.9, 5) | 85.8 (85.6-96.5, 5) | 74.9 (71.6-75.4, 5) | 78.8 (70-85, 5) |
+| saturation | window.qshd.involuntary_switches_per_s | 3899 (3838-3970, 5) | 74339 (62516-74369, 5) | 78337 (76029-80705, 5) | 43433 (41828-50179, 5) | 51957 (45491-57364, 5) | 51870 (50229-56471, 5) |
+| saturation | window.qshd.voluntary_switches_per_s | 21441 (20862-21649, 5) | 60016 (55637-64884, 5) | 62341 (57632-66159, 5) | 58809 (57513-62544, 5) | 36676 (33257-37256, 5) | 42281 (41620-45305, 5) |
+| saturation | window.qshd_helper.cpu_percent | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0 (0-0, 5) |
+| reconnect | recovery_s | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) | 1.45 (1.45-1.45, 5) |
+| retained | window.qshd.cpu_percent | 0.2 (0.1-0.2, 5) | 0.1 (0.1-0.2, 5) | 0.1 (0.1-0.1, 5) | 0.1 (0.1-0.2, 5) | 0.2 (0.1-0.2, 5) | 0.2 (0.2-0.2, 5) |
+| retained | window.qshd.voluntary_switches_per_s | 14.7 (14.6-14.7, 5) | 14.3 (14.1-14.3, 5) | 14.3 (14.3-14.6, 5) | 13.9 (13.8-14, 5) | 14.2 (13.9-14.3, 5) | 14.2 (13.9-14.3, 5) |
+| retained | window.qshd_helper.cpu_percent | 0 (0-0.1, 5) | 0 (0-0.1, 5) | 0.1 (0-0.2, 5) | 0 (0-0.1, 5) | 0 (0-0.1, 5) | 0 (0-0.1, 5) |
+| busy | busy_overrun_s.median | 0.106 (0.103-0.108, 5) | 0.083 (0.076-0.087, 5) | 0.078 (0.078-0.084, 5) | 0.066 (0.063-0.067, 5) | 0.069 (0.065-0.069, 5) | 0.066 (0.065-0.07, 5) |
+| busy | echo_ms.p50 | 1.64 (1.61-1.68, 5) | 1.6 (1.57-1.63, 5) | 1.54 (1.53-1.65, 5) | 1.59 (1.55-1.61, 5) | 1.6 (1.52-1.62, 5) | 1.58 (1.57-1.59, 5) |
+| busy | echo_ms.p90 | 2.2 (2.19-2.68, 5) | 2.15 (1.95-2.38, 5) | 1.98 (1.97-2.01, 5) | 2.2 (2.01-2.21, 5) | 1.98 (1.97-2.05, 5) | 2.23 (2.17-2.23, 5) |
+| busy | window.qshd.cpu_percent | 4.59 (4.19-4.59, 5) | 5.99 (5.69-6.09, 5) | 5.39 (5.29-5.39, 5) | 6.39 (6.39-6.49, 5) | 4.99 (4.99-5.09, 5) | 6.39 (5.99-6.49, 5) |
+| busy | window.qshd.involuntary_switches_per_s | 200 (198-201, 5) | 51.1 (37-67.8, 5) | 37.6 (34-44.1, 5) | 148 (69.8-160, 5) | 47.7 (34.5-49.2, 5) | 50.5 (44.3-78.2, 5) |
+| busy | window.qshd.voluntary_switches_per_s | 497 (482-510, 5) | 1211 (1149-1292, 5) | 791 (756-833, 5) | 1652 (1456-1830, 5) | 713 (707-715, 5) | 1226 (1221-1301, 5) |
+| busy | window.qshd_helper.cpu_percent | 0 (0-0.1, 5) | 0 (0-0, 5) | 0 (0-0, 5) | 0.1 (0.1-0.1, 5) | 0.1 (0-0.1, 5) | 0 (0-0.1, 5) |
+
+16 sessions:
+
+| Workload | Metric | s1 median (p25-p75, n) | s2 median (p25-p75, n) | s2t1 median (p25-p75, n) | s4 median (p25-p75, n) | s4t1 median (p25-p75, n) | s4t2 median (p25-p75, n) |
+|---|---|---|---|---|---|---|---|
+| busy | busy_overrun_s.median | 0.243 (0.238-0.263, 5) | 0.158 (0.15-0.16, 5) | 0.18 (0.174-0.19, 5) | 0.113 (0.111-0.131, 5) | 0.124 (0.122-0.124, 5) | 0.122 (0.121-0.125, 5) |
+| busy | echo_ms.max | 15.7 (6.77-52, 5) | 300 (261-328, 5) | 210 (180-403, 5) | 184 (53.8-198, 5) | 266 (11-434, 5) | 158 (98-192, 5) |
+| busy | echo_ms.p50 | 1.8 (1.77-1.98, 5) | 2.15 (1.87-2.58, 5) | 2.06 (1.79-2.17, 5) | 1.9 (1.62-1.96, 5) | 2.03 (1.84-2.23, 5) | 2.12 (1.67-3.22, 5) |
+| busy | echo_ms.p90 | 4 (2.88-5.94, 5) | 58.9 (39-75.3, 5) | 5.37 (5.1-7.94, 5) | 3.62 (3.17-13, 5) | 4.31 (3.39-4.88, 5) | 4.99 (4.32-5.25, 5) |
+| busy | window.qshd.cpu_percent | 13.4 (12.6-13.7, 5) | 19.4 (18.8-19.8, 5) | 17.5 (16.6-17.6, 5) | 18.7 (18.6-20.5, 5) | 16.2 (16.1-16.8, 5) | 19.5 (19.4-19.8, 5) |
+| busy | window.qshd.involuntary_switches_per_s | 683 (677-684, 5) | 721 (590-864, 5) | 406 (307-406, 5) | 540 (495-684, 5) | 295 (243-440, 5) | 585 (573-590, 5) |
+| busy | window.qshd.voluntary_switches_per_s | 1574 (1569-1589, 5) | 5365 (4984-5810, 5) | 3075 (2964-3348, 5) | 5456 (5318-5648, 5) | 2859 (2803-3386, 5) | 5150 (5008-5289, 5) |
+| busy | window.qshd_helper.cpu_percent | 0.1 (0-0.1, 5) | 0.095 (0-0.096, 5) | 0.092 (0-0.097, 5) | 0.092 (0-0.099, 5) | 0.095 (0.089-0.097, 5) | 0.091 (0-0.099, 5) |
+| busy | window.relay.s2c_datagrams_per_s | 1578 (1568-1604, 5) | 2568 (2444-3090, 5) | 2307 (2087-2523, 5) | 2290 (2192-2386, 5) | 2137 (2062-2716, 5) | 2532 (2486-2536, 5) |
+| retained | window.qshd.cpu_percent | 0.2 (0.2-0.3, 5) | 0.3 (0.2-0.3, 5) | 0.2 (0.2-0.3, 5) | 0.3 (0.3-0.3, 5) | 0.3 (0.3-0.3, 5) | 0.2 (0.2-0.3, 5) |
+| retained | window.qshd.voluntary_switches_per_s | 26.2 (25.9-26.2, 5) | 25.7 (25.3-25.7, 5) | 25.4 (25.3-25.4, 5) | 24.6 (24.6-25.5, 5) | 25 (24.9-25.6, 5) | 25.5 (25.4-25.9, 5) |
+| retained | window.qshd_helper.cpu_percent | 0.1 (0.1-0.1, 5) | 0.1 (0.1-0.1, 5) | 0 (0-0.1, 5) | 0.1 (0.1-0.1, 5) | 0 (0-0.1, 5) | 0.1 (0.1-0.2, 5) |
+
+### What these runs show, for this host only
+
+- **No latency difference between worker counts was observed.** The
+  median typing echo is 1.4-1.5 ms and its 90th percentile 1.8-2.0 ms in
+  every variant of both modes; beside four redrawing sessions it is
+  1.5-1.6 ms and 1.9-2.3 ms.
+  Recovery after an outage is 1.45 s everywhere. Redraw output is delivered
+  at the same rate in every variant.
+- **Fewer workers cost less under load.** With two or four CPUs, one worker
+  instead of one per CPU lowered qshd's CPU during saturation from 80-95%
+  to 73-79%, with completion times within each other's spread, and lowered
+  its voluntary switches with active sessions by a fifth to a half. With
+  one CPU, the shell producing the output shares it with qshd: qshd used
+  56% of it, and saturation took 2.35-2.44 s, against 1.8-2.4 s with more
+  CPUs. The end-to-end redraw overrun was smallest with four CPUs,
+  whatever the worker count; it includes the redraws' own scheduling on
+  qshd's CPUs, not only qshd's delay.
+- **The source of the 16-session latency tails is unresolved.** With 15
+  redrawing sessions, some echoes per run took tens to hundreds of
+  milliseconds, at most 670 ms, in bursts of consecutive keys. They
+  correlate with the harness's load: the harness, one Python process that
+  relays every datagram and drains every terminal, used 11-25 s of CPU per
+  run of about 31-43 s, and the one-CPU variants, whose qshd coalesced the
+  output into the fewest datagrams (about 1580 per second against
+  2140-2870), had almost no late echoes. Harness saturation is a plausible
+  confound, but correlation does not establish the cause, and affinity
+  changes contention too: in the four-CPU variants qshd shares CPUs with
+  the harness, and in every variant the redraws run on qshd's CPUs. These
+  runs therefore neither attribute the tails to the worker count nor rule
+  it out. Their CPU and switch counts stand.
+- **The helper is unaffected.** In system mode the privileged helper stays
+  single-threaded, at 0-0.1% of a CPU and about 5 voluntary switches per
+  second, in every variant and workload.
+- **Personal and system mode differ when idle, independent of workers.**
+  An idle personal qshd uses 0.7% of a CPU and switches about 115 times per
+  second; with 8 or 16 retained sessions, 2.4-6.1% and 530-1510 switches.
+  The system-mode worker uses 0-0.3% and 5-26 switches in the same
+  workloads. The difference grows by about 60-90 switches per second for
+  each session, which matches a poll every 20 ms: in personal mode the
+  session shell is qshd's own child, and its exit is observed by polling
+  (`ActiveObservation::Poll`, the default of `ChannelWait` in
+  `crates/transport/src/channel_server.rs`, which `NativeWait` keeps),
+  while in system mode the helper owns the shell and notifies the worker
+  of its exit (`ActiveObservation::Notification`). A per-thread sample of
+  one idle personal session showed about 110 voluntary switches per second
+  on three threads. No profiler confirmed the attribution.
+- **Threads.** qshd's thread count is the async workers plus the blocking
+  pool, which grows with the sessions: each terminal's reader and writer
+  are blocking threads. With 16 sessions qshd had 38-48 threads in every
+  variant.
+
+The default stays one worker per CPU that qshd may use, with
+`--runtime-threads` to set it explicitly (see
+[the service guide](qshd-service.md#runtime-worker-threads)). These runs
+support keeping that default and report the ranges observed on one 4-CPU
+VM. They do not show that worker counts are equivalent elsewhere, and
+establish no setting for hosts with many CPUs or for the system mode's 128
+sessions, which were not measured.

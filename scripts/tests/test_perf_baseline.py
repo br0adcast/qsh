@@ -123,6 +123,34 @@ class OrderingAndStatisticsTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(Exception):
                 perf.build_spec(bad)
 
+    def test_variant_specification(self):
+        self.assertEqual(perf.variant_spec('one=main,cpus=0-1,3,threads=2'),
+                         ('one', {'build': 'main', 'mode': 'personal', 'qshd_cpus': [0, 1, 3], 'runtime_threads': 2}))
+        self.assertEqual(perf.variant_spec('plain=main'),
+                         ('plain', {'build': 'main', 'mode': 'personal', 'qshd_cpus': None, 'runtime_threads': None}))
+        self.assertEqual(perf.variant_spec('t=main,threads=1')[1]['runtime_threads'], 1)
+        self.assertEqual(perf.variant_spec('s=main,system,cpus=0')[1],
+                         {'build': 'main', 'mode': 'system', 'qshd_cpus': [0], 'runtime_threads': None})
+        self.assertEqual(perf.cpu_text(perf.cpu_list('3,0-1')), '0,1,3')
+        for bad in ['main', 'a=', 'a=main,threads=0', 'a=main,cpus=', 'a=main,cpus=x', 'a=main,other=1',
+                    'a=main,threads=2,cpus=0', 'a=main,cpus=0,system']:
+            with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
+                perf.variant_spec(bad)
+
+    def test_summary_columns_are_variants_or_older_builds(self):
+        runs = [{'ok': True, 'workload': 'idle', 'build': name, 'repetition': 0,
+                 'result': {'window': {'qshd': {'cpu_percent': value}}}}
+                for name, value in [('one', 1.0), ('two', 2.0), ('three', 4.0)]]
+        manifest = {'builds': {'main': {}}, 'workloads': ['idle'],
+                    'variants': {'one': {}, 'two': {}, 'three': {}}}
+        row = perf.summary(manifest, runs)['rows'][0]
+        self.assertEqual({name: stats['median'] for name, stats in row['builds'].items()},
+                         {'one': 1.0, 'two': 2.0, 'three': 4.0})
+        self.assertIn('| idle | window.qshd.cpu_percent | 1 (1-1, 1) | 2 (2-2, 1) | 4 (4-4, 1) |',
+                      perf.markdown(manifest, perf.summary(manifest, runs)))
+        older = {'builds': {'one': {}, 'two': {}}, 'workloads': ['idle']}
+        self.assertEqual(perf.columns(older), ['one', 'two'])
+
 
 class IdentityTests(unittest.TestCase):
     def elf(self, interpreter=None, comment=b''):
@@ -287,6 +315,32 @@ class RelayAndTerminalTests(unittest.TestCase):
         finally:
             relay.close()
             client.close()
+            server.close()
+
+    def test_relay_keeps_each_client_apart_toward_the_daemon_and_back(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(('127.0.0.1', 0))
+        server.settimeout(2)
+        relay = perf.Relay(server.getsockname()[1])
+        clients = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(2)]
+        try:
+            sources = []
+            for index, client in enumerate(clients):
+                client.settimeout(2)
+                client.sendto(b'from %d' % index, ('127.0.0.1', relay.port))
+                data, source = server.recvfrom(100)
+                self.assertEqual(data, b'from %d' % index)
+                sources.append(source)
+            self.assertNotEqual(sources[0], sources[1])
+            # Replies in the opposite order still reach their own clients.
+            for index in (1, 0):
+                server.sendto(b'to %d' % index, sources[index])
+            for index, client in enumerate(clients):
+                self.assertEqual(client.recvfrom(100)[0], b'to %d' % index)
+        finally:
+            relay.close()
+            for client in clients:
+                client.close()
             server.close()
 
     def test_relay_returns_the_first_datagram_from_the_boundary_when_observed_late(self):
@@ -572,10 +626,49 @@ class OwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(perf.SetupError, 'exited with 3'):
                 perf.holds_port(daemon, foreign.getsockname()[1])
 
+    def test_a_named_worker_may_hold_the_port_and_nothing_else_may(self):
+        port = perf.free_udp_port()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = self.daemon(directory, 'import time; time.sleep(30)')
+            worker = self.daemon(directory, BIND_AND_SLEEP, str(port))
+            try:
+                deadline = time.monotonic() + 10
+                while not perf.udp_inodes(port):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.02)
+                self.assertTrue(perf.holds_port(daemon, port, [worker.pid]))
+                with self.assertRaisesRegex(perf.SetupError, 'other than the owned qshd'):
+                    perf.holds_port(daemon, port)
+            finally:
+                worker.stop()
+                daemon.stop()
+
+    def test_system_variants_need_root_on_a_disposable_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / 'build'
+            build.mkdir()
+            for binary in ('qsh', 'qshd'):
+                (build / binary).write_text('#!/bin/sh\n')
+                (build / binary).chmod(0o700)
+            args = argparse.Namespace(out=Path(directory) / 'out', build=[('main', build)],
+                                      variant=[perf.variant_spec('s=main,system')], harness_cpus=None,
+                                      system_account='bench', worker_user='nobody', workloads='idle')
+            for euid, disposable in ((1000, '1'), (0, None)):
+                environment = {} if disposable is None else {perf.DISPOSABLE_HOST_VAR: disposable}
+                with self.subTest(euid=euid), mock.patch.object(perf.os, 'geteuid', return_value=euid), \
+                        mock.patch.dict(os.environ, environment), \
+                        self.assertRaisesRegex(SystemExit, 'only as root on a disposable host'):
+                    if disposable is None:
+                        os.environ.pop(perf.DISPOSABLE_HOST_VAR, None)
+                    perf.command_run(args)
+                (Path(directory) / 'out' / 'runs').rmdir()
+                (Path(directory) / 'out').rmdir()
+
     def test_rig_owns_a_terminal_whose_client_never_started(self):
         rig = perf.Rig.__new__(perf.Rig)
         rig.build, rig.daemon, rig.relay, rig.port = Path('/nonexistent'), None, None, 1
         rig.root, rig.key, rig.terminals, rig.clients = None, Path('/nonexistent/key'), [], []
+        rig.system, rig.worker = False, None
         rig.relay = argparse.Namespace(port=1, close=lambda: None)
         opened = []
         real_openpty = os.openpty
@@ -638,7 +731,8 @@ class FakeTerminal:
         self.total += len(data)
 
     def wait_for(self, needle, timeout, offset=0):
-        if not self.echo:
+        # Only key echoes go missing; command markers still arrive.
+        if not self.echo and len(needle) == 1:
             raise perf.SetupError(f'timed out waiting for {needle!r}')
         return time.monotonic()
 
@@ -662,6 +756,7 @@ class FakeRig:
         self.client = argparse.Namespace(terminal=FakeTerminal(echo), rusage=None)
         self.relay = FakeRelay(datagrams)
         self.daemon = None
+        self.daemon_facts = {'allowed_cpus': [0], 'runtime_workers': 1}
         self.clients = [self.client]
 
     def start_daemon(self):
@@ -704,6 +799,9 @@ class TypingQualificationTests(unittest.TestCase):
         self.assertIn('0 of 4 datagrams', record['error'])
         self.assertEqual(record['result']['missing_datagrams'], 4)
 
+    def test_the_record_names_the_running_qshd(self):
+        self.assertEqual(self.run_one(FakeRig())['qshd'], {'allowed_cpus': [0], 'runtime_workers': 1})
+
     def test_incomplete_runs_never_reach_a_summary(self):
         manifest = {'builds': {'a': {}}, 'workloads': ['typing']}
         record = self.run_one(FakeRig(echo=False))
@@ -711,6 +809,185 @@ class TypingQualificationTests(unittest.TestCase):
         result = perf.summary(manifest, [record])
         self.assertEqual(result['rows'], [])
         self.assertEqual(result['failed_runs'], [{'workload': 'typing', 'build': 'a', 'count': 1}])
+
+
+class BusyQualificationTests(unittest.TestCase):
+    settings = argparse.Namespace(keystrokes=4, key_interval=0, busy_sessions=2, redraw_fps=1)
+
+    def run_one(self, rig):
+        with mock.patch.object(perf, 'SETTLE', 0), mock.patch.object(perf, 'Rig', lambda build, root: rig):
+            return perf.run_one(None, 'busy', self.settings, None)
+
+    def test_complete_busy_run_succeeds(self):
+        record = self.run_one(FakeRig())
+        self.assertTrue(record['ok'], record.get('error'))
+        result = record['result']
+        self.assertEqual((result['sessions'], result['missing_echoes'], len(result['echo_ms']['samples'])), (3, 0, 4))
+        self.assertEqual(set(result['busy_overrun_s']), {'median', 'max'})
+        self.assertIn('busy_terminal_bytes_per_s', result)
+
+    def test_absent_echoes_fail_the_busy_run(self):
+        record = self.run_one(FakeRig(echo=False))
+        self.assertFalse(record['ok'])
+        self.assertIn('0 of 4 echoes', record['error'])
+
+
+FAKE_QSHD = """\
+import os, socket, sys, time
+args = sys.argv[1:]
+port = int(args[args.index("--port") + 1])
+# As Tokio sizes its default: TOKIO_WORKER_THREADS, else one per CPU.
+default = os.environ.get("TOKIO_WORKER_THREADS", str(len(os.sched_getaffinity(0))))
+threads = args[args.index("--runtime-threads") + 1] if "--runtime-threads" in args else default
+reported = os.environ.get("FAKE_WORKERS", threads)
+log = os.path.join(os.environ["XDG_CACHE_HOME"], "qsh", "qshd.log")
+os.makedirs(os.path.dirname(log), exist_ok=True)
+with open(log, "a") as out:
+    if reported != "none":
+        out.write(f"INFO qshd: runtime workers {reported}\\n")
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("127.0.0.1", port))
+time.sleep(30)
+"""
+
+
+@unittest.skipUnless(sys.platform == 'linux' and perf.shutil.which('taskset'), 'needs Linux and taskset')
+class VariantDaemonTests(unittest.TestCase):
+    def rig(self, directory, cpus, threads, named=True):
+        build = Path(directory) / 'build'
+        build.mkdir()
+        qshd = build / 'qshd'
+        qshd.write_text(f'#!{sys.executable} -I\n' + FAKE_QSHD, encoding='utf-8')
+        qshd.chmod(0o700)
+        root = Path(directory) / 'run'
+        root.mkdir()
+        # `named`: the variant names its CPUs, as a runtime-worker
+        # experiment does, rather than inheriting the harness's.
+        return perf.Rig({'directory': build, 'effective_qshd_cpus': cpus, 'runtime_threads': threads,
+                         'qshd_cpus': cpus if named else None}, root)
+
+    def started(self, rig):
+        try:
+            self.start(rig)
+            return rig.daemon_facts
+        finally:
+            rig.daemon.stop()
+
+    def refused(self, rig, message):
+        try:
+            with self.assertRaisesRegex(perf.SetupError, message):
+                self.start(rig)
+        finally:
+            rig.daemon.stop()
+
+    def start(self, rig):
+        try:
+            rig.start_daemon()
+        finally:
+            if rig.relay:
+                rig.relay.close()
+                rig.relay = None
+
+    def test_qshd_runs_on_the_variant_cpus_with_the_requested_workers(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory:
+            rig = self.rig(directory, [cpu], 2)
+            try:
+                self.start(rig)
+                self.assertEqual(rig.daemon_facts, {'allowed_cpus': [cpu], 'runtime_workers': 2,
+                                                    'runtime_workers_expected': 2})
+                self.assertEqual(os.sched_getaffinity(rig.daemon.pid), {cpu})
+            finally:
+                rig.daemon.stop()
+
+    def test_a_different_worker_count_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'FAKE_WORKERS': '3'}), \
+                mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')):
+            rig = self.rig(directory, None, 2)
+            try:
+                with self.assertRaisesRegex(perf.SetupError, 'reports 3 runtime workers, expected 2'):
+                    self.start(rig)
+            finally:
+                rig.daemon.stop()
+
+    def test_named_cpus_check_tokios_default(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.started(self.rig(directory, [cpu], None)),
+                             {'allowed_cpus': [cpu], 'runtime_workers': 1, 'runtime_workers_expected': 1})
+
+    def test_the_default_follows_tokio_worker_threads_in_qshds_environment(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'TOKIO_WORKER_THREADS': '3'}), \
+                mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'TOKIO_WORKER_THREADS')):
+            self.assertEqual(self.started(self.rig(directory, [cpu], None))['runtime_workers_expected'], 3)
+
+    def test_a_wrong_default_count_fails_the_run(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {'FAKE_WORKERS': '3'}), \
+                mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')):
+            self.refused(self.rig(directory, [cpu], None), 'reports 3 runtime workers, expected 1')
+
+    def test_a_missing_count_fails_a_checked_run(self):
+        cpu = min(os.sched_getaffinity(0))
+        for threads, expected in ((None, 1), (2, 2)):
+            with self.subTest(threads=threads), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict(os.environ, {'FAKE_WORKERS': 'none'}), \
+                    mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')), \
+                    mock.patch.object(perf, 'SETUP_TIMEOUT', 1.0):
+                self.refused(self.rig(directory, [cpu], threads), f'reports no runtime worker count, expected {expected}')
+
+    def test_a_cpu_quota_needs_a_named_count(self):
+        cpu = min(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(perf, 'cpu_quotas', lambda cgroup: ['50000 100000']):
+            self.refused(self.rig(directory, [cpu], None), r'a CPU quota \(50000 100000\) applies')
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(perf, 'cpu_quotas', lambda cgroup: None):
+            self.refused(self.rig(directory, [cpu], None), 'no cgroup v2 hierarchy')
+
+    def test_an_unchecked_build_records_whatever_it_reports(self):
+        for reported, recorded in (('none', None), ('7', 7)):
+            with self.subTest(reported=reported), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict(os.environ, {'FAKE_WORKERS': reported}), \
+                    mock.patch.object(perf, 'PARENT_ENVIRONMENT', ('PATH', 'FAKE_WORKERS')):
+                facts = self.started(self.rig(directory, None, None, named=False))
+                self.assertEqual((facts['runtime_workers'], facts['runtime_workers_expected']), (recorded, None))
+
+    def test_other_cpus_fail_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rig = self.rig(directory, [min(os.sched_getaffinity(0))], None)
+            real_read = perf.read
+
+            def read(path):
+                text = real_read(path)
+                return text + 'Cpus_allowed_list:\t0-1\n' if path.endswith('/status') else text
+
+            try:
+                with mock.patch.object(perf, 'read', read), \
+                        self.assertRaisesRegex(perf.SetupError, 'qshd runs on CPUs 0,1, expected'):
+                    self.start(rig)
+            finally:
+                rig.daemon.stop()
+
+
+class CgroupQuotaTests(unittest.TestCase):
+    def test_quotas_from_the_group_up_to_the_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'a' / 'b').mkdir(parents=True)
+            (root / 'cpu.max').write_text('max 100000\n')
+            (root / 'a' / 'cpu.max').write_text('200000 100000\n')
+            (root / 'a' / 'b' / 'cpu.max').write_text('max 100000\n')
+            self.assertEqual(perf.cpu_quotas('0::/a/b\n', root), ['200000 100000'])
+            self.assertEqual(perf.cpu_quotas('0::/\n', root), [])
+            self.assertEqual(perf.cpu_quotas('0::/missing\n', root), [])
+
+    def test_no_cgroup_v2_hierarchy(self):
+        self.assertIsNone(perf.cpu_quotas('4:cpu,cpuacct:/a\n1:name=systemd:/a\n'))
+
+    def test_an_invalid_tokio_worker_threads_is_refused(self):
+        with self.assertRaisesRegex(perf.SetupError, 'is not a worker count'):
+            perf.default_workers({'TOKIO_WORKER_THREADS': '0'}, [0], '0::/\n')
 
 
 if __name__ == '__main__':

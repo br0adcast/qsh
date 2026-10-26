@@ -1,0 +1,101 @@
+{
+ "workload": "saturation",
+ "started_utc": "2026-10-26T12:13:35.220741+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0
+  ],
+  "runtime_workers": 1,
+  "mode": "system"
+ },
+ "result": {
+  "window": {
+   "seconds": 2.518,
+   "qshd": {
+    "cpu_s": 1.41,
+    "cpu_percent": 55.992,
+    "run_s_live_threads": 1.4148,
+    "runqueue_wait_s_live_threads": 1.1631,
+    "timeslices_per_s": 26022.41,
+    "voluntary_switches_per_s": 22052.54,
+    "involuntary_switches_per_s": 3969.88,
+    "threads_start": 10,
+    "threads_end": 10,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 6132,
+    "rss_kib": 6132
+   },
+   "qshd_helper": {
+    "cpu_s": 0.0,
+    "cpu_percent": 0.0,
+    "run_s_live_threads": 0.0004,
+    "runqueue_wait_s_live_threads": 0.0003,
+    "timeslices_per_s": 4.77,
+    "voluntary_switches_per_s": 4.77,
+    "involuntary_switches_per_s": 0.0,
+    "threads_start": 1,
+    "threads_end": 1,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 5648,
+    "rss_kib": 5648
+   },
+   "relay": {
+    "c2s_datagrams": 11637,
+    "c2s_bytes": 466267,
+    "s2c_datagrams": 44605,
+    "s2c_bytes": 18879527,
+    "dropped_datagrams": 0,
+    "c2s_datagrams_per_s": 4621.13,
+    "c2s_bytes_per_s": 185157.84,
+    "s2c_datagrams_per_s": 17712.95,
+    "s2c_bytes_per_s": 7497190.29,
+    "dropped_datagrams_per_s": 0.0
+   },
+   "qsh": {
+    "cpu_s": 2.94,
+    "cpu_percent": 116.749,
+    "run_s_live_threads": 2.9362,
+    "runqueue_wait_s_live_threads": 0.8926,
+    "timeslices_per_s": 72393.38,
+    "voluntary_switches_per_s": 38540.02,
+    "involuntary_switches_per_s": 33853.36,
+    "threads_start": 9,
+    "threads_end": 9,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 38156,
+    "rss_kib": 38156
+   },
+   "terminal": {
+    "bytes": 1285288,
+    "presented_frames": 3133,
+    "presented_frames_per_s": 1244.14
+   }
+  },
+  "lines": 2000000,
+  "completion_s": 2.518
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 0.972,
+   "system_s": 1.533,
+   "voluntary_switches": 56307,
+   "involuntary_switches": 40237
+  },
+  "clients": [
+   {
+    "user_s": 2.234,
+    "system_s": 0.748,
+    "voluntary_switches": 97223,
+    "involuntary_switches": 85265
+   }
+  ]
+ },
+ "harness_cpu_s": 1.08,
+ "index": 12,
+ "repetition": 0,
+ "build": "s1"
+}
