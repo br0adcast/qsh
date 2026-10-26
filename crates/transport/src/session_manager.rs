@@ -698,6 +698,12 @@ impl SessionControl {
             .map_or(true, |state| state.retiring.is_some())
     }
 
+    fn has_priority_abort(&self) -> bool {
+        self.origin
+            .lock()
+            .map_or(true, |state| state.requested_abort.is_some())
+    }
+
     fn take_priority_abort(&self) -> Option<TerminalRequest> {
         // The ordinary queued alias may remain behind a snapshot fence.
         // Keep its latch until that alias is actually consumed: generation
@@ -4082,6 +4088,112 @@ fn apply_terminal_request(
     });
 }
 
+const INTAKE_RECORDS: usize = 32;
+const INTAKE_BYTES: usize = 64 * 1024;
+
+/// One original queue owner, never a reconstructed/rebound message. EOF is
+/// deferred too: the accepted prefix gets its normal service turn first.
+enum PendingBackend {
+    Item(SessionOutbound),
+    Eof,
+}
+
+struct DataIntake {
+    origin: AttachmentContext,
+    stream: u8,
+    instance: crate::channel_geometry::ChannelInstance,
+    records: usize,
+    bytes: usize,
+}
+impl DataIntake {
+    fn new(message: &SessionOutbound) -> Option<Self> {
+        let SessionOutbound::ChannelOutput {
+            origin,
+            stream,
+            instance,
+            output: ChannelOutput::Data(data),
+            ..
+        } = message
+        else {
+            return None;
+        };
+        Some(Self {
+            origin: *origin,
+            stream: *stream,
+            instance: *instance,
+            records: 1,
+            bytes: data.len().checked_add(5)?,
+        })
+    }
+    fn take_next(
+        &mut self,
+        receiver: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+        held: &mut Option<PendingBackend>,
+    ) -> Option<SessionOutbound> {
+        // In particular an oversized original first item retains its existing
+        // one-message path, with no speculative read of a successor.
+        if held.is_some() || self.records >= INTAKE_RECORDS || self.bytes >= INTAKE_BYTES {
+            return None;
+        }
+        let message = match receiver.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::error::TryRecvError::Empty) => return None,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *held = Some(PendingBackend::Eof);
+                return None;
+            }
+        };
+        let cost = match &message {
+            SessionOutbound::ChannelOutput {
+                origin,
+                stream,
+                instance,
+                output: ChannelOutput::Data(data),
+                ..
+            } if *origin == self.origin && *stream == self.stream && *instance == self.instance => {
+                data.len()
+                    .checked_add(5)
+                    .and_then(|cost| self.bytes.checked_add(cost))
+            }
+            _ => None,
+        };
+        if let Some(bytes) = cost.filter(|bytes| *bytes <= INTAKE_BYTES) {
+            self.bytes = bytes;
+            self.records += 1;
+            Some(message)
+        } else {
+            *held = Some(PendingBackend::Item(message));
+            None
+        }
+    }
+}
+
+#[derive(Default)]
+struct IntakeReadiness {
+    shutdown: bool,
+    control: bool,
+    retiring: bool,
+    terminal: bool,
+    datagram: bool,
+    drain: bool,
+    inbound: bool,
+    fenced: bool,
+    deadline: Option<Instant>,
+}
+impl IntakeReadiness {
+    fn allows(&self, now: Instant) -> bool {
+        !(self.shutdown
+            || self.control
+            || self.retiring
+            || self.terminal
+            || self.datagram
+            || self.drain
+            || self.inbound
+            || self.fenced
+            || self.deadline.is_some_and(|deadline| now >= deadline))
+    }
+}
+
 /// What woke the persistent bridge loop.
 enum Wakeup {
     /// An incoming datagram routed from the manager (`None` = router gone).
@@ -4095,10 +4207,25 @@ enum Wakeup {
     /// The backend produced an outbound message -- data or a declaration
     /// (`None` = backend finished).
     Backend(Option<SessionOutbound>),
+    /// A held item is taken only after this existing inner-select arm wins.
+    DeferredBackend,
     /// A control message from the manager (`None` = the entry was dropped).
     Control(Option<BridgeControl>),
     /// The backend took what waited for it.
     Room(Vec<Handed>),
+}
+
+/// Readiness only for a held owner: cancellation cannot take it. Receiver
+/// admission remains cancel-safe when no lookahead exists.
+async fn backend_wakeup(
+    held: bool,
+    receiver: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+) -> Wakeup {
+    if held {
+        Wakeup::DeferredBackend
+    } else {
+        Wakeup::Backend(receiver.recv().await)
+    }
 }
 
 /// The channels joining a bridge to the manager and to its backend, for the
@@ -4163,6 +4290,10 @@ fn spawn_committed_bridge(spawn: BridgeSpawn) {
 #[derive(Clone, Debug)]
 struct MailboxTurn {
     backend_data: bool,
+    backend_eof: bool,
+    setup_barrier: bool,
+    setup_error: Option<&'static str>,
+    setup_deadline: Option<Instant>,
     write_room: usize,
     flushes: usize,
     datagrams: usize,
@@ -4170,6 +4301,7 @@ struct MailboxTurn {
 #[cfg(test)]
 struct MailboxObservation {
     token: LoginId,
+    idle_until: Instant,
     turns: Arc<Mutex<Vec<MailboxTurn>>>,
 }
 #[cfg(test)]
@@ -4353,6 +4485,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         }
     }
 
+    let mut held_backend = None;
     loop {
         if control.retiring() {
             link.inbound.revoke();
@@ -4397,7 +4530,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 tokio::select! {
                     d = dgram_rx.recv() => Wakeup::Dgram(d),
                     _ = timer => Wakeup::Timeout,
-                    o = backend_out_rx.recv(), if !backend_finished && !link.channel_output.receive_fenced() => Wakeup::Backend(o),
+                    w = backend_wakeup(held_backend.is_some(), &mut backend_out_rx), if !backend_finished && !link.channel_output.receive_fenced() => w,
                     _ = std::future::ready(()), if drain_pending => Wakeup::Drain,
                     // Room in the backend's queue for what waits (spec
                     // §4.10.2): the bridge never stands on its backend.
@@ -4406,6 +4539,14 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             } => w,
         };
 
+        let wakeup = match wakeup {
+            Wakeup::DeferredBackend => Wakeup::Backend(match held_backend.take() {
+                Some(PendingBackend::Item(message)) => Some(message),
+                Some(PendingBackend::Eof) => None,
+                None => unreachable!("held readiness selected without its owner"),
+            }),
+            other => other,
+        };
         #[cfg(test)]
         let mailbox_backend_data = matches!(
             &wakeup,
@@ -4414,6 +4555,17 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 ..
             }))
         );
+        #[cfg(test)]
+        let mailbox_backend_eof = matches!(&wakeup, Wakeup::Backend(None));
+        #[cfg(test)]
+        let mailbox_setup_barrier = match &wakeup {
+            Wakeup::Dgram(Some((_, bytes))) => conn.peek_frames(bytes).is_some_and(|frames| {
+                frames.iter().any(|frame| {
+                    matches!(frame, crate::reliability::StreamFrame::Ping { token: 305 })
+                })
+            }),
+            _ => false,
+        };
         let now = Instant::now();
         let mut out: Vec<Datagram> = Vec::new();
         // Screen streams whose gate opened on this turn before the refresh
@@ -4428,6 +4580,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             break;
         }
         match wakeup {
+            Wakeup::DeferredBackend => unreachable!("held owner normalized before dispatch"),
             Wakeup::Backend(Some(SessionOutbound::RetirementReady {
                 origin,
                 decisions_complete,
@@ -4556,8 +4709,38 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 | SessionOutbound::RepaintBarrier { .. }),
             )) => {
                 if conn.features().contains(crate::Features::CHANNEL_GEOMETRY) {
+                    let mut intake = DataIntake::new(&message);
                     link.channel_output.push(message);
                     link.channel_output.seal_ended(&mut conn);
+                    if let Some(intake) = intake.as_mut() {
+                        loop {
+                            let readiness = IntakeReadiness {
+                                shutdown: lifecycle.shutdown.is_requested(),
+                                control: !control_rx.is_empty()
+                                    || (control_open && control_rx.is_closed()),
+                                retiring: control.retiring(),
+                                terminal: control.has_priority_abort(),
+                                datagram: dgram_rx.has_ready(),
+                                drain: drain_pending,
+                                inbound: link.inbound.has_pending(),
+                                fenced: link.channel_output.receive_fenced(),
+                                deadline: conn.next_timeout(),
+                            };
+                            if !readiness.allows(Instant::now()) {
+                                break;
+                            }
+                            let Some(message) =
+                                intake.take_next(&mut backend_out_rx, &mut held_backend)
+                            else {
+                                break;
+                            };
+                            // Preserve the original position, origin, charge and
+                            // permits. push also advances snapshot-prefix custody;
+                            // the next iteration must recheck receive_fenced.
+                            link.channel_output.push(message);
+                            link.channel_output.seal_ended(&mut conn);
+                        }
+                    }
                 } else {
                     log::error!("typed channel output without negotiated geometry profile");
                     out.extend(conn.close(now));
@@ -4716,6 +4899,9 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             }
         }
 
+        // Intake can cross a real deadline. Dispatch used its original time;
+        // timer, event, output-drain and gate service use the actual fresh time.
+        let now = Instant::now();
         drain_reserved_control(
             &mut conn,
             link.ledger.generation(),
@@ -4752,8 +4938,17 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 .as_ref()
                 .filter(|observer| observer.token == token)
             {
+                let setup_error = if mailbox_setup_barrier {
+                    conn.postpone_idle_for_test(observer.idle_until).err()
+                } else {
+                    None
+                };
                 observer.turns.lock().unwrap().push(MailboxTurn {
                     backend_data: mailbox_backend_data,
+                    backend_eof: mailbox_backend_eof,
+                    setup_barrier: mailbox_setup_barrier,
+                    setup_error,
+                    setup_deadline: mailbox_setup_barrier.then(|| conn.next_timeout()).flatten(),
                     write_room: mailbox_before.1,
                     flushes: conn.flush_calls_for_test() - mailbox_before.0,
                     datagrams: out.len() - mailbox_before.2,

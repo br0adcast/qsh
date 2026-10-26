@@ -12522,3 +12522,5 @@ include!("session_manager_repaint_bounds_tests.rs");
 include!("session_manager_refusal_retirement_tests.rs");
 
 include!("session_manager_mailbox_tests.rs");
+
+include!("session_manager_intake_tests.rs");

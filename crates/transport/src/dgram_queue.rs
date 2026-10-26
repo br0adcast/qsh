@@ -116,6 +116,11 @@ impl DgramRx {
         self.counters.bound.fetch_max(bound, Ordering::AcqRel);
     }
 
+    /// Read-only readiness: never remove a packet or change queued-byte debt.
+    pub(crate) fn has_ready(&self) -> bool {
+        !self.rx.is_empty() || self.rx.is_closed()
+    }
+
     /// The next datagram; `None` once every sender is gone. Cancel-safe.
     pub(crate) async fn recv(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let (src, bytes) = self.rx.recv().await?;

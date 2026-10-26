@@ -6,6 +6,7 @@ use crate::shell_frame::{ShellDeframer, ShellRecord};
 #[derive(Clone, Copy)]
 enum MailboxCohort {
     Four,
+    FourEof,
     Singleton,
     Fence,
 }
@@ -66,7 +67,7 @@ impl SessionBackend for MailboxBackend {
                         // publications. The current-thread manager cannot dequeue
                         // any cohort member until this task yields below.
                         let outputs = match command {
-                            MailboxCohort::Four => (0..4).map(|n| ChannelOutput::Data(vec![b'A'+n])).collect(),
+                            MailboxCohort::Four | MailboxCohort::FourEof => (0..4).map(|n| ChannelOutput::Data(vec![b'A'+n])).collect(),
                             MailboxCohort::Singleton => vec![ChannelOutput::Data(vec![b'S'])],
                             MailboxCohort::Fence => vec![ChannelOutput::Data(vec![b'L']), geometry(81, 1), ChannelOutput::Data(vec![b'R'])],
                         };
@@ -81,6 +82,7 @@ impl SessionBackend for MailboxBackend {
                             count
                         });
                         published.send((count, prior_data_turns)).unwrap();
+                        if matches!(command, MailboxCohort::FourEof) { break; }
                     }
                     inbound = io.recv() => if inbound.is_none() { break },
                 }
@@ -156,9 +158,11 @@ async fn manager_mailbox_case(cohort: MailboxCohort) {
     }));
     let mut router = Router::new();
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let idle_until = Instant::now() + Duration::from_secs(60);
     MAILBOX_TURNS.with(|slot| {
         *slot.borrow_mut() = Some(MailboxObservation {
             token,
+            idle_until,
             turns: observed.clone(),
         })
     });
@@ -192,21 +196,44 @@ async fn manager_mailbox_case(cohort: MailboxCohort) {
         SessionManager::on_probation_ended(&wiring.ctx(), &mut router, verdict).await;
         let mut client = MailboxClient { socket, conn, frames: ShellDeframer::new(), records: Vec::new(), data_datagrams: 0 };
         client.receive_until(&wiring, &mut router, |records| records.iter().any(|r| matches!(r, ShellRecord::Geometry(_)))).await?;
+        // Route all setup ACKs before a distinct encrypted Ping. Its observed
+        // manager turn is a FIFO receipt, not a sleep or guessed quiet interval.
+        let mut setup = client.conn.answer_now();
+        client.conn.postpone_idle_for_test(idle_until).map_err(str::to_string)?;
+        setup.extend(client.conn.frames_for_test(vec![StreamFrame::Ping { token: 305 }]));
+        for datagram in setup {
+            SessionManager::handle_datagram(&wiring.ctx(), &mut router, datagram.bytes.len(), source, &datagram.bytes).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observed.lock().unwrap().iter().any(|turn| turn.setup_barrier) {
+                tokio::task::yield_now().await;
+            }
+        }).await.map_err(|_| "processed setup datagram watchdog")?;
+        let setup_turn = observed.lock().unwrap().iter().find(|turn| turn.setup_barrier).cloned().ok_or("missing processed setup receipt")?;
+        if setup_turn.setup_error.is_some() || !setup_turn.setup_deadline.is_some_and(|at| at >= idle_until)
+            || !client.conn.next_timeout().is_some_and(|at| at >= idle_until) {
+            return Err(format!("positive fixture not idle beyond whole-case watchdog: {setup_turn:?}"));
+        }
         client.records.clear(); client.data_datagrams = 0;
         observed.lock().unwrap().clear();
         commands.send(cohort).map_err(|_| "backend ended")?;
         let count = tokio::time::timeout(Duration::from_secs(5), publications.recv()).await.map_err(|_| "publication watchdog")?.ok_or("publication closed")?;
-        let target = match cohort { MailboxCohort::Four => 4, MailboxCohort::Singleton => 1, MailboxCohort::Fence => 3 };
+        let target = match cohort { MailboxCohort::Four | MailboxCohort::FourEof => 4, MailboxCohort::Singleton => 1, MailboxCohort::Fence => 3 };
         if count != (target, 0) { return Err(format!("cohort publication was not before its first dequeue: {count:?}")); }
         client.receive_until(&wiring, &mut router, |records| records.len() >= target).await?;
+        if matches!(cohort, MailboxCohort::FourEof) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !observed.lock().unwrap().iter().any(|turn| turn.backend_eof) { tokio::task::yield_now().await; }
+            }).await.map_err(|_| "backend EOF receipt watchdog")?;
+        }
         let initial_data_datagrams = client.data_datagrams;
         let turns = observed.lock().unwrap().clone();
         let data: Vec<_> = client.records.iter().filter_map(|record| if let ShellRecord::Data(bytes) = record { Some(bytes.clone()) } else { None }).collect();
         match cohort {
-            MailboxCohort::Four => {
+            MailboxCohort::Four | MailboxCohort::FourEof => {
                 if data != vec![vec![b'A'], vec![b'B'], vec![b'C'], vec![b'D']]
-                    || turns.iter().filter(|t| t.backend_data).count() != 4
-                    || client.data_datagrams != 4 {
+                    || turns.iter().filter(|t| t.backend_data).count() != 1
+                    || client.data_datagrams != 1 {
                     return Err(format!("four ready records: {data:?}, turns={turns:?}, datagrams={}", client.data_datagrams));
                 }
             }
@@ -229,8 +256,14 @@ async fn manager_mailbox_case(cohort: MailboxCohort) {
                 }
             }
         }
+        if matches!(cohort, MailboxCohort::FourEof) {
+            let data_at = turns.iter().position(|turn| turn.backend_data).ok_or("missing prefix turn")?;
+            let eof_at = turns.iter().position(|turn| turn.backend_eof).ok_or("missing EOF turn")?;
+            if data_at >= eof_at || turns[data_at].flushes != 1 { return Err("EOF preceded prefix service".into()); }
+        }
         let flushes: usize = turns.iter().map(|turn| turn.flushes).sum();
-        if flushes != target || initial_data_datagrams != target || !turns.iter().all(|turn| !turn.backend_data || turn.write_room >= 24 && turn.datagrams == 1 && turn.flushes == 1) {
+        let expected_turns = if matches!(cohort, MailboxCohort::Four | MailboxCohort::FourEof) { 1 } else { target };
+        if flushes != expected_turns || initial_data_datagrams != expected_turns || !turns.iter().all(|turn| !turn.backend_data || turn.write_room >= 24 && turn.datagrams == 1 && turn.flushes == 1) {
             return Err(format!("unqualified admission/flush room: {turns:?}"));
         }
         println!("manager-mailbox initial_records={} initial_data_datagrams={} total_data_datagrams={} backend_data_turns={} drain_turns={} core_flush_calls={}", target, initial_data_datagrams, client.data_datagrams, turns.iter().filter(|t|t.backend_data).count(), turns.len(), flushes);
@@ -259,4 +292,9 @@ async fn manager_ready_mailbox_singleton_before_second_exists() {
 #[tokio::test(flavor = "current_thread")]
 async fn manager_ready_mailbox_data_geometry_data_fence() {
     manager_mailbox_case(MailboxCohort::Fence).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manager_ready_mailbox_services_prefix_before_held_eof() {
+    manager_mailbox_case(MailboxCohort::FourEof).await;
 }
