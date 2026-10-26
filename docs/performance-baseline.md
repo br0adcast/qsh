@@ -104,7 +104,7 @@ baseline.
 ## Opt-in client-history qualification
 
 The current default workloads, including busy-session qualification, remain
-unchanged. Tool version 6 additionally accepts
+unchanged. Tool version 7 additionally accepts
 `--workloads history` for a controlled **client** history experiment; this is
 separate from `retained`, which keeps eight detached server sessions. Use the
 same nominal ten-second producer duration and 20 Hz redraw settings. The
@@ -112,9 +112,16 @@ actual CPU window covers dispatch through the producer completion checkpoint,
 including scheduling delay; it is not truncated at ten seconds. Client
 application may finish a tail after that checkpoint. Relay progress and the
 later positive return-to-live marker are required separately. One functional GNU pilot against each of the matched `90261ab` and `f9ff3a7`
-binary pairs passed the history, phase-completion and cleanup oracles. This
-qualifies the controlled oracle path, not CPU/memory performance, musl or system
-mode. Deterministic parser/ownership tests alone are not a performance result.
+binary pairs passed the earlier history, phase-completion and cleanup oracles.
+A later musl trial exposed an unsupported producer-row eviction threshold in
+that fixture (#343); those pilots do not qualify the corrected oldest-view
+contract or CPU/memory performance, musl or system mode. After correcting the
+oldest-view oracle, one fresh functional run with each GNU binary pair passed:
+both observed oldest row 1 advancing to 3,965 at the 4,000-line cap, restored the
+selected viewport exactly, retained its pinned rows, and completed owned cleanup.
+These runs qualify the corrected fixture's functional path only. The fresh
+20-trial GNU/musl history set remains pending. Deterministic parser/ownership
+tests alone are not a performance result.
 
 The client requests 4,000 history lines at 120×40. This is below the logical-cell
 cap in both compared revisions; requesting the default 10,000 at 120 columns
@@ -124,7 +131,14 @@ produces 200 carriage-return updates. Fresh full-repaint probes using same-size
 SIGWINCH observe positive scroll offset/total and numbered rows outside the CPU
 window. They do not change the PTY extent. A producer checkpoint alone is not
 proof the client ingested all output, so bounded observation probes wait for the
-positive cap. Final return-to-live and top-of-history observations are required;
+positive cap. Before the capped load, the fixture observes actual oldest numbered
+rows at offset equal to total, then restores the original selected PageUp view.
+After proving that view stayed pinned and returning live, a fresh actual top
+observation must have total 4,000 and a first numbered row greater than the
+initial oldest witness. This proves oldest advancement, not eviction of the
+entire selected frame or delivery of all 8,000 producer rows. Navigation
+requirements are checked inside the bounded repaint probe, so a repaint before
+the navigation is applied is not accepted. Final return-to-live and top-of-history observations are required;
 missing or changed oracles fail the run, and existing owned cleanup still runs.
 Partial-fill and return-to-live markers also require a complete full-repaint
 observation after producer completion. A diff may retain a visible marker's
@@ -145,7 +159,12 @@ frame-equivalence controls supply different evidence from these resident values.
 Each phase uses owned private state and finite deadlines. A failed or truncated
 producer, incomplete observation, missing memory field, client exit or cleanup
 error cannot qualify as a successful history result. Preserve raw phase samples,
-all errors and binary/build provenance. This opt-in schema needs a corresponding
+all errors and binary/build provenance. Failed runs retain completed phases,
+the latest parsed navigation candidates and memory samples collected before a
+failure, with `history_complete=false`. Even `history_complete=true` cannot
+override a cleanup failure in the outer `ok` verdict. Fresh history measurements
+await review of the corrected fixture and bounded run plan; old trials remain
+preserved and are not pooled with the corrected history set. This opt-in schema needs a corresponding
 completeness gate; the previous local fixed 60-record six-workload gate is not applicable.
 The first functional pilot was preserved as a failed harness-oracle control:
 a changed-span repaint retained the visible H from an earlier HROW row and
