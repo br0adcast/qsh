@@ -85,7 +85,7 @@ pub enum Mode {
     /// no questions, and where it is trying goes to `progress`, stamped
     /// with the round's number.
     Background {
-        progress: Sender<UiEvent>,
+        progress: crate::ui_wait::UiSender,
         round: u64,
     },
 }
@@ -1852,7 +1852,7 @@ mod tests {
             setup.args.addresses.clone(),
             0,
             Mode::Background {
-                progress: tx.clone(),
+                progress: tx.clone().into(),
                 round: 1,
             },
             80,

@@ -100,6 +100,20 @@ fn action(handler: SigHandler) -> SigAction {
     SigAction::new(handler, SaFlags::empty(), SigSet::empty())
 }
 
+#[cfg(test)]
+pub(crate) static INSTALL_FAILURE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(0);
+fn install_common(signal: Signal, handler: SigHandler) -> Result<SigAction, nix::Error> {
+    #[cfg(test)]
+    if INSTALL_FAILURE
+        .compare_exchange(signal as i32, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        return Err(nix::Error::EIO);
+    }
+    unsafe { signal::sigaction(signal, &action(handler)) }
+}
+
 /// Installs the handlers. Idempotent -- installing twice is the same as once.
 pub fn install() -> Result<(), nix::Error> {
     if SUSPEND.load(Ordering::SeqCst) & FLAGS != 0 {
@@ -108,25 +122,24 @@ pub fn install() -> Result<(), nix::Error> {
     crate::signal_wake::initialize()?;
     // SAFETY: handlers use lock-free atomics; late TSTP callbacks forward
     // only with signal-safe libc calls and preserve errno.
-    unsafe {
-        signal::sigaction(Signal::SIGWINCH, &action(SigHandler::Handler(on_winch)))?;
-        signal::sigaction(Signal::SIGCONT, &action(SigHandler::Handler(on_cont)))?;
-        signal::sigaction(Signal::SIGTERM, &action(SigHandler::Handler(on_terminate)))?;
-        signal::sigaction(Signal::SIGHUP, &action(SigHandler::Handler(on_terminate)))?;
-        // SIGINT and SIGQUIT belong here for one reason: their DEFAULT
-        // disposition ends the process on the spot, running neither `Drop`,
-        // nor the panic hook, nor `restore()` -- leaving exactly the broken
-        // shell `tty.rs` exists to prevent. Raw mode has `ISIG` off, so
-        // neither can arrive from the keyboard while the client is running;
-        // routing them here therefore shadows no keystroke and costs
-        // nothing, while covering `kill -INT` and a Ctrl-C that lands in the
-        // window before raw mode is on.
-        signal::sigaction(Signal::SIGINT, &action(SigHandler::Handler(on_terminate)))?;
-        signal::sigaction(Signal::SIGQUIT, &action(SigHandler::Handler(on_terminate)))?;
-        // Cooked foreground phases may block in DNS/SSH without a polling
-        // loop. RawMode installs the narrower deferred policy before raw mode.
-        set_tstp(SigHandler::SigDfl)?;
-    }
+    install_common(Signal::SIGWINCH, SigHandler::Handler(on_winch))?;
+    install_common(Signal::SIGCONT, SigHandler::Handler(on_cont))?;
+    install_common(Signal::SIGTERM, SigHandler::Handler(on_terminate))?;
+    install_common(Signal::SIGHUP, SigHandler::Handler(on_terminate))?;
+    // SIGINT and SIGQUIT belong here for one reason: their DEFAULT
+    // disposition ends the process on the spot, running neither `Drop`,
+    // nor the panic hook, nor `restore()` -- leaving exactly the broken
+    // shell `tty.rs` exists to prevent. Raw mode has `ISIG` off, so
+    // neither can arrive from the keyboard while the client is running;
+    // routing them here therefore shadows no keystroke and costs
+    // nothing, while covering `kill -INT` and a Ctrl-C that lands in the
+    // window before raw mode is on.
+    install_common(Signal::SIGINT, SigHandler::Handler(on_terminate))?;
+    install_common(Signal::SIGQUIT, SigHandler::Handler(on_terminate))?;
+    // Cooked foreground phases may block in DNS/SSH without a polling
+    // loop. RawMode installs the narrower deferred policy before raw mode.
+    set_tstp(SigHandler::SigDfl)?;
+
     Ok(())
 }
 
@@ -141,6 +154,14 @@ pub fn drain_notifications() -> std::io::Result<()> {
 /// Raw fixed failure codes, formatted only by the ordinary terminal owner.
 pub fn notification_failure() -> Option<(i32, i32)> {
     crate::signal_wake::failure()
+}
+
+/// Read-only park recheck; only the UI owner consumes these flags.
+pub fn has_pending() -> bool {
+    RESIZED.load(Ordering::SeqCst)
+        || RESUMED.load(Ordering::SeqCst)
+        || TERMINATE.load(Ordering::SeqCst)
+        || SUSPEND.load(Ordering::SeqCst) & PENDING != 0
 }
 
 /// Replay only TSTP, even if the terminal owner originally blocked it.

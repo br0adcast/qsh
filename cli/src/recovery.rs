@@ -1,7 +1,7 @@
 //! One UDP owner and independent SSH fallback, with generation-bound publication.
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::climb::Setup;
@@ -58,6 +58,7 @@ pub struct Recovery {
     state: Mutex<State>,
     retry_now: AtomicBool,
     diagnostics: Vec<crate::trust::BackgroundDiscovery>,
+    notification: OnceLock<crate::input_wake::WakeSender>,
 }
 
 impl State {
@@ -78,6 +79,14 @@ impl State {
 }
 
 impl Recovery {
+    pub(crate) fn set_notification(&self, wake: crate::input_wake::WakeSender) {
+        let _ = self.notification.set(wake);
+    }
+    fn notify(&self) {
+        if let Some(wake) = self.notification.get() {
+            let _ = wake.notify();
+        }
+    }
     pub fn new(epoch: RecoveryEpoch, addresses: usize) -> Self {
         Self {
             cancel: knock::Cancel::new(),
@@ -98,6 +107,7 @@ impl Recovery {
                 last_warnings: vec![None; addresses],
             }),
             retry_now: AtomicBool::new(false),
+            notification: OnceLock::new(),
             diagnostics: (0..addresses)
                 .map(|_| crate::trust::BackgroundDiscovery::default())
                 .collect(),
@@ -139,6 +149,8 @@ impl Recovery {
                 diagnostic.invalidate();
             }
             state.endpoints = Some(updated);
+            drop(state);
+            self.notify();
         }
     }
 
@@ -170,6 +182,8 @@ impl Recovery {
         for diagnostic in &self.diagnostics {
             diagnostic.invalidate();
         }
+        drop(state);
+        self.notify();
     }
 
     /// Stop fallback for a current local admission refusal without invalidating
@@ -183,6 +197,8 @@ impl Recovery {
         state.qsh_activity.clear();
         state.ssh_retry_at = None;
         state.cancel_ssh();
+        drop(state);
+        self.notify();
         true
     }
 
@@ -203,6 +219,8 @@ impl Recovery {
         state.gate.begin_sweep(sweep);
         state.observed_sweep = Some(sweep);
         state.qsh_activity.clear();
+        drop(state);
+        self.notify();
     }
 
     pub fn finish(
@@ -230,6 +248,8 @@ impl Recovery {
             GateDecision::Recovered => state.cancel_ssh(),
             _ => {}
         }
+        drop(state);
+        self.notify();
     }
 
     pub fn activity(&self) -> Activity {
@@ -275,6 +295,8 @@ impl Recovery {
             address,
             (revision, sweep, QshActivity { address, endpoint }),
         );
+        drop(state);
+        self.notify();
     }
 
     /// Retiring one shared initiator makes its paths queued again. Logical
@@ -283,6 +305,8 @@ impl Recovery {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.revision == revision && state.observed_sweep == Some(sweep) {
             state.qsh_activity.clear();
+            drop(state);
+            self.notify();
         }
     }
 
@@ -299,6 +323,8 @@ impl Recovery {
         {
             state.ssh_activity = Some((attempt.attempt, address));
             state.ssh_retry_at = None;
+            drop(state);
+            self.notify();
         }
     }
 
@@ -309,6 +335,8 @@ impl Recovery {
             .is_some_and(|(id, _)| id == attempt.attempt)
         {
             state.ssh_activity = None;
+            drop(state);
+            self.notify();
         }
     }
 
@@ -352,12 +380,15 @@ impl Recovery {
         let attempt = state.next_ssh;
         let cancel = knock::Cancel::new();
         state.ssh = Some((attempt, cancel.clone()));
-        Some(SshAttempt {
+        let result = SshAttempt {
             epoch: self.epoch,
             revision: state.revision,
             attempt,
             cancel,
-        })
+        };
+        drop(state);
+        self.notify();
+        Some(result)
     }
 
     /// A single pending owner-polled diagnostic, never a worker event queue.
@@ -410,6 +441,8 @@ impl Recovery {
                 state.last_warnings[addr] = Some(warning);
             }
         }
+        drop(state);
+        self.notify();
         true
     }
 
@@ -424,21 +457,22 @@ impl Recovery {
     }
     fn wait_ssh(&self, failed: u32) -> bool {
         let until = Instant::now() + ::connect::reconnect::pause_after(failed);
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ssh_retry_at = Some(until);
+        self.set_ssh_retry(Some(until));
         while Instant::now() < until && !self.stopped() {
             if self.retry_now.swap(false, Ordering::SeqCst) {
                 break;
             }
             std::thread::sleep(POLL);
         }
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ssh_retry_at = None;
+        self.set_ssh_retry(None);
         !self.cancel.is_cancelled()
+    }
+
+    fn set_ssh_retry(&self, until: Option<Instant>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.ssh_retry_at = until;
+        drop(state);
+        self.notify();
     }
 
     pub fn spawn_ssh(
@@ -1026,5 +1060,30 @@ mod tests {
         let started = Instant::now();
         assert!(r.wait_udp(started - Duration::from_secs(10), r.revision()));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+    #[test]
+    fn ui_wait_recovery_observation_publishes_before_notification() {
+        use std::os::fd::AsRawFd;
+        let (reader, sender) = crate::input_wake::pair().unwrap();
+        let recovery = Recovery::new(EPOCH, 1);
+        recovery.set_notification(sender);
+        recovery.begin_sweep(SweepId(1));
+        recovery.observe_qsh(
+            recovery.revision(),
+            SweepId(1),
+            AddressId(0),
+            Some("192.0.2.1:60000".parse().unwrap()),
+        );
+        assert_eq!(recovery.activity().qsh.len(), 1);
+        let mut p = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut p, 1, 0) },
+            1,
+            "shared recovery state cannot depend on UI polling"
+        );
     }
 }

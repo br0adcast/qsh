@@ -1,6 +1,8 @@
 #[test]
 fn client179_ui_turn_caps_external_fifo_and_preserves_due_tick_signal_opportunity() {
-    let (tx, rx) = mpsc::channel();
+    let mut rx = UiInbox::new().unwrap();
+    let tx = rx.renew();
+    let start = Instant::now();
     for index in 0..64 {
         tx.send(UiEvent::Resized {
             cols: index,
@@ -9,7 +11,7 @@ fn client179_ui_turn_caps_external_fifo_and_preserves_due_tick_signal_opportunit
         .unwrap();
     }
     let mut first = Vec::new();
-    collect_ui_turn(&rx, &mut first);
+    collect_ui_turn(&rx, &mut first, None, start);
     let count = first.len();
     let order: Vec<_> = first
         .iter()
@@ -20,12 +22,7 @@ fn client179_ui_turn_caps_external_fifo_and_preserves_due_tick_signal_opportunit
         .collect();
     // A new signal prefix is considered before still-queued external events.
     let mut second = vec![UiEvent::Terminate];
-    collect_ui_turn(&rx, &mut second);
-    let start = Instant::now();
-    let mut ticker = Ticker::new(TICK, start);
-    if ticker.due(start + TICK) {
-        second.push(UiEvent::Tick);
-    }
+    collect_ui_turn(&rx, &mut second, Some(start), start);
     let remaining = rx.try_recv().ok();
     let (_home, mut links) = input_executor_links();
     let mut session = geometry_session();
@@ -57,7 +54,9 @@ fn client179_ui_turn_caps_external_fifo_and_preserves_due_tick_signal_opportunit
 
 #[test]
 fn client179_ui_turn_keeps_unprocessed_ingress_owners_until_actual_drop() {
-    let (tx, rx) = mpsc::channel();
+    let mut rx = UiInbox::new().unwrap();
+    let tx = rx.renew();
+    let start = Instant::now();
     let budget = qsh::input_ingress::IngressBudget::default();
     for index in 0..16 {
         tx.send(UiEvent::Stdin(budget.admit_slice(&[index as u8]).unwrap()))
@@ -69,7 +68,7 @@ fn client179_ui_turn_keeps_unprocessed_ingress_owners_until_actual_drop() {
         .unwrap();
     }
     let mut first = Vec::new();
-    collect_ui_turn(&rx, &mut first);
+    collect_ui_turn(&rx, &mut first, None, start);
     let owners_collected = first
         .iter()
         .filter(|event| matches!(event, UiEvent::Stdin(_)))

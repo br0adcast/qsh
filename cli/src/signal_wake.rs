@@ -134,8 +134,12 @@ pub(crate) fn drain() -> io::Result<()> {
     Ok(())
 }
 fn drain_fd(fd: RawFd) -> io::Result<()> {
+    drain_fd_with(fd, || {})
+}
+fn drain_fd_with(fd: RawFd, mut before_read: impl FnMut()) -> io::Result<()> {
     let mut bytes = [0u8; 256];
-    loop {
+    for _ in 0..8 {
+        before_read();
         let n = unsafe { libc::recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) };
         if n > 0 {
             continue;
@@ -148,11 +152,12 @@ fn drain_fd(fd: RawFd) -> io::Result<()> {
         }
         let error = io::Error::last_os_error();
         match error.kind() {
-            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::Interrupted => return Ok(()),
             io::ErrorKind::WouldBlock => return Ok(()),
             _ => return Err(error),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -299,5 +304,123 @@ mod tests {
         assert!(ready(fd));
         assert!(crate::signals::take_pending().resumed);
         drain().unwrap();
+    }
+    #[test]
+    fn ui_wait_signal_continuously_replenished_notifications_have_bounded_drain() {
+        let pair = Pair::new().unwrap();
+        let mut reads = 0;
+        drain_fd_with(pair.read.as_raw_fd(), || {
+            reads += 1;
+            assert!(
+                reads <= 8,
+                "signal bytes starved authoritative flag service"
+            );
+            #[cfg(target_vendor = "apple")]
+            let flags = 0;
+            #[cfg(not(target_vendor = "apple"))]
+            let flags = libc::MSG_NOSIGNAL;
+            assert_eq!(
+                unsafe {
+                    libc::send(
+                        pair.write.as_raw_fd(),
+                        [b'x'; 512].as_ptr().cast(),
+                        512,
+                        flags,
+                    )
+                },
+                512
+            );
+        })
+        .unwrap();
+        assert_eq!(reads, 8);
+        assert!(ready(pair.read.as_raw_fd()));
+    }
+    fn owned_child(name: &str, body: impl FnOnce()) {
+        const FLAG: &str = "QSH_UI_WAIT_SIGNAL_CHILD";
+        if std::env::var(FLAG).as_deref() == Ok(name) {
+            body();
+            return;
+        }
+        struct OwnedChild {
+            child: std::process::Child,
+            reaped: bool,
+        }
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                }
+                let _ = self.child.wait();
+            }
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(FLAG, name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedChild {
+            child,
+            reaped: false,
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = owned.child.try_wait().unwrap() {
+                owned.reaped = true;
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "owned signal child exceeded watchdog"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut stderr = String::new();
+        use std::io::Read;
+        owned
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "owned signal child failed: {stderr}");
+    }
+
+    #[test]
+    fn ui_wait_signal_global_failure_survives_reinstall_in_subprocess() {
+        owned_child(
+            "signal_wake::tests::ui_wait_signal_global_failure_survives_reinstall_in_subprocess",
+            || {
+                crate::signals::install().unwrap();
+                let fd = read_fd().unwrap();
+                drain().unwrap();
+                notify_raw(
+                    WRITER.load(Ordering::Acquire),
+                    &FAILURE,
+                    &SHUTDOWN_ERROR,
+                    libc::ENOMEM,
+                );
+                assert!(ready(fd));
+                assert!(drain().is_err());
+                crate::signals::install().unwrap();
+                assert_eq!(read_fd().unwrap(), fd);
+                assert_eq!(failure(), Some((libc::ENOMEM, 0)));
+                assert!(drain().is_err());
+            },
+        );
+    }
+    #[test]
+    fn ui_wait_signal_partial_install_retains_published_endpoints_in_subprocess() {
+        owned_child("signal_wake::tests::ui_wait_signal_partial_install_retains_published_endpoints_in_subprocess", || {
+            crate::signals::INSTALL_FAILURE.store(libc::SIGCONT, Ordering::Release);
+            assert!(crate::signals::install().is_err());
+            let fd = read_fd().unwrap(); assert!(!ready(fd));
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGWINCH).unwrap();
+            assert!(ready(fd)); assert!(crate::signals::take_pending().resized);
+            drain().unwrap(); crate::signals::install().unwrap(); assert_eq!(read_fd().unwrap(), fd);
+        });
     }
 }
