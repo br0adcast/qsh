@@ -73,40 +73,49 @@ interface-based equivalence is inferred. Stored spelling is not migrated.
 
 ### Names in trust questions
 
-Two different names must not look the same where you decide whether to trust
-them. The QSH first-use question and changed-key refusal, the SSH unknown and
+Two different names must not be shown as the same text where you decide
+whether to trust them. The QSH first-use question and changed-key refusal, the SSH unknown and
 changed host-key messages, the SSH recovery authorization and the qshd
 installation question therefore show account names, host names, key types and
 fingerprints by a stricter rule than other text. Only the presentation changes:
 the connection, the known-hosts lookup and the stored pins use the name exactly
 as given.
 
-A character that a terminal would draw as nothing, or that rearranges the text
-around it, is shown as `\u{XXXX}` with its code point, and a backslash as `\\`,
-so the shown text maps back to exactly one name. That covers terminal controls,
-line separators, direction controls, format characters such as the zero-width
-space, the word joiner, the soft hyphen and the interlinear annotation controls
-U+FFF9 to U+FFFB, spaces other than the ordinary space (and an ordinary space at
-either end), default-ignorable characters such as the Hangul fillers, and
-unassigned, private-use and noncharacter code points. Joiners, variation
-selectors and tag characters are shown as they are only where they have a
-visible effect, and escaped elsewhere:
+A character that is invisible on its own, or that rearranges the text around
+it, is shown as `\u{XXXX}` with its code point, and a backslash as `\\`, so the
+shown text maps back to exactly one name. That covers terminal controls, line
+separators, direction controls, format characters such as the zero-width space,
+the word joiner, the soft hyphen and the interlinear annotation controls U+FFF9
+to U+FFFB, spaces other than the ordinary space (and an ordinary space at either
+end), default-ignorable characters such as the Hangul fillers, and unassigned,
+private-use and noncharacter code points. Joiners, variation selectors and tag
+characters are shown as they are only in the sequences below, and escaped
+elsewhere:
 
 - ZWJ and ZWNJ after a virama, ZWNJ between joining letters (the contexts
   RFC 5892 allows), and ZWJ inside an emoji ZWJ sequence;
-- the text and emoji selectors U+FE0E and U+FE0F after a non-ASCII emoji
-  character or in a keycap such as `1️⃣`; ideographic variation selectors after
-  an ideograph; Mongolian free variation selectors after a Mongolian character;
-  U+FE00 to U+FE0D after a non-ASCII letter, number or symbol;
-- tag characters only in an emoji tag sequence such as the flag of Scotland.
+- a variation selector that forms a variation sequence registered in Unicode
+  17.0 (`StandardizedVariants.txt` or `emoji-variation-sequences.txt`) with
+  the character before it, where an emoji or text selector on `0`-`9`, `#` or
+  `*` counts only in a keycap such as `1️⃣`. Ideographic variation sequences
+  are registered separately, in the Ideographic Variation Database, and are
+  escaped;
+- tag characters only in the RGI emoji tag sequences, the flags of England,
+  Scotland and Wales.
+
+Whether a sequence is drawn as intended still depends on the terminal and its
+fonts; the rule decides only which text is written.
 
 Every script, combining mark and emoji is otherwise shown as it is. When a
 question shows an escape it adds a line saying so. A name whose presentation
-would exceed 512 bytes is cut and ends with the number of characters left out
-and a SHA-256 prefix of the whole name. Look-alike letters from different
-scripts, such as Cyrillic `а` and Latin `a`, are not marked. Error messages,
-server text and the status line keep the general rule, which replaces controls
-with `?` or a space and leaves other characters unchanged.
+would exceed 512 bytes is cut and ends with `\[+N more characters, sha256 H]`:
+the number of characters left out and the first 64 bits of the SHA-256 of the
+whole name. No name is shown as such a marker, since its backslashes are
+doubled; H tells apart long names that agree in the part shown, barring a
+collision of those 64 bits. Look-alike letters from different scripts, such as
+Cyrillic `а` and Latin `a`, are not marked. Error messages, server text and the
+status line keep the general rule, which replaces controls with `?` or a space
+and leaves other characters unchanged.
 
 Every equivalent record must agree on one key. Conflicting keys, including
 duplicate rows with the exact same spelling, make that endpoint ambiguous and

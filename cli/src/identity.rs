@@ -2,34 +2,39 @@
 //! trust it: the first-use and changed-key questions for QSH and SSH, the
 //! SSH recovery authorization and the qshd installation question.
 //!
-//! Two different names must never look the same there, so a character that
-//! a terminal would draw as nothing, or that would rearrange what is drawn
+//! Two different names must not be shown as the same text there. A
+//! character that is invisible on its own, or that rearranges the text
 //! around it, is shown as `\u{XXXX}` (its code point in hex, at least four
-//! digits), and a backslash as `\\`. Every other character is shown as it
-//! is: all scripts, combining marks and emoji. Only the presentation
-//! changes; the name itself is used unchanged for the connection, the
-//! known-hosts lookup and everything that is stored.
+//! digits), and a backslash as `\\`, so the shown text decodes to exactly
+//! one name. Every other character is shown as it is: all scripts,
+//! combining marks and emoji. This is a property of the text written to the
+//! terminal; how it is drawn still depends on the terminal and its fonts.
+//! Only the presentation changes; the name itself is used unchanged for the
+//! connection, the known-hosts lookup and everything that is stored.
 //!
 //! A character is escaped when it is (rules apply in order):
 //!
 //! 1. a backslash, as `\\`;
-//! 2. a joiner (Join_Control: ZWNJ, ZWJ), unless it joins: after a virama
-//!    (Canonical_Combining_Class 9), as RFC 5892 appendix A allows both; a
-//!    ZWNJ between a left- or dual-joining and a right- or dual-joining
-//!    letter, transparent letters in between (also RFC 5892); or a ZWJ
-//!    between two Extended_Pictographic characters, the first optionally
-//!    followed by an emoji modifier or U+FE0F (an emoji ZWJ sequence);
-//! 3. a variation selector (Variation_Selector), unless it selects a form
-//!    of the character before it: U+FE0E or U+FE0F after a non-ASCII
-//!    Emoji character, or after `0`-`9`, `#` or `*` in a keycap
-//!    (U+20E3 follows); U+E0100..U+E01EF after a Unified_Ideograph;
-//!    a Mongolian free variation selector after a Mongolian character;
-//!    U+FE00..U+FE0D after a non-ASCII letter, number or symbol;
-//! 4. a tag character (U+E0020..U+E007F), unless it is part of an emoji tag
-//!    sequence: U+1F3F4, tags U+E0020..U+E007E, then U+E007F;
+//! 2. a joiner (Join_Control: ZWNJ, ZWJ), unless it is in a joining
+//!    context: after a virama (Canonical_Combining_Class 9), as RFC 5892
+//!    appendix A allows both; a ZWNJ between a left- or dual-joining and a
+//!    right- or dual-joining letter, transparent letters in between (also
+//!    RFC 5892); or a ZWJ between two Extended_Pictographic characters, the
+//!    first optionally followed by an emoji modifier or U+FE0F (an emoji
+//!    ZWJ sequence);
+//! 3. a variation selector (Variation_Selector), unless it forms a
+//!    registered variation sequence with the character before it: one of
+//!    StandardizedVariants.txt or emoji-variation-sequences.txt, where an
+//!    emoji sequence on `0`-`9`, `#` or `*` counts only in a keycap
+//!    (U+20E3 follows). Ideographic variation sequences (U+E0100..U+E01EF)
+//!    are registered in the Ideographic Variation Database, which is not
+//!    included, so they are escaped;
+//! 4. a tag character (U+E0020..U+E007F), unless it is part of an RGI
+//!    emoji tag sequence (emoji-sequences.txt: the flags of England,
+//!    Scotland and Wales);
 //! 5. a space (U+0020) at either end of the name;
 //! 6. any other character that is a control (Cc), a line or paragraph
-//!    separator (Zl, Zp), a format character (Cf) other than a visible
+//!    separator (Zl, Zp), a format character (Cf) other than a
 //!    Prepended_Concatenation_Mark, unassigned (Cn), private use (Co), a
 //!    noncharacter, Bidi_Control, White_Space other than U+0020, or
 //!    Default_Ignorable_Code_Point.
@@ -38,22 +43,29 @@
 //! operators, the byte order mark, the soft hyphen, the interlinear
 //! annotation controls U+FFF9..U+FFFB (format characters that are not
 //! Default_Ignorable), the Hangul fillers and the combining grapheme joiner,
-//! and every terminal and direction control.
+//! and every terminal and direction control. The sequence tables are
+//! generated from Unicode 17.0.0 by `scripts/generate_identity_sequences.py`
+//! into `identity_sequences.rs`.
 //!
 //! The output is bounded: a name whose presentation would exceed
-//! [`MAX_SHOWN`] bytes is cut at a character boundary and ends with how
-//! many characters were left out and a SHA-256 prefix of the whole name, so
-//! two long names that differ only in the part not shown still look
-//! different. At most [`MAX_EXAMINED`] characters are examined.
+//! [`MAX_SHOWN`] bytes is cut between characters and ends with
+//! `\[+N more characters, sha256 H]`, where H is the first 64 bits of the
+//! SHA-256 of the whole name. A backslash followed by `[` cannot come from
+//! a name, since its backslashes are doubled, so a cut presentation never
+//! equals the presentation of another name that was not cut; H is a digest
+//! discriminator between long names that agree in the part shown, not a
+//! guarantee that they look different. At most [`MAX_EXAMINED`] characters
+//! are examined.
 
 use icu_properties::props::{
-    BidiControl, CanonicalCombiningClass, DefaultIgnorableCodePoint, Emoji, EmojiModifier,
+    BidiControl, CanonicalCombiningClass, DefaultIgnorableCodePoint, EmojiModifier,
     ExtendedPictographic, GeneralCategory, GeneralCategoryGroup, JoinControl, JoiningType,
-    NoncharacterCodePoint, PrependedConcatenationMark, Script, UnifiedIdeograph, VariationSelector,
-    WhiteSpace,
+    NoncharacterCodePoint, PrependedConcatenationMark, VariationSelector, WhiteSpace,
 };
 use icu_properties::{CodePointMapData, CodePointSetData};
 use sha2::{Digest, Sha256};
+
+use crate::identity_sequences::{TAG_SEQUENCES, VARIATION_SEQUENCES};
 
 /// The most bytes one name's presentation takes, its truncation note
 /// included.
@@ -72,7 +84,6 @@ const ZWNJ: char = '\u{200C}';
 const ZWJ: char = '\u{200D}';
 const VS16: char = '\u{FE0F}';
 const KEYCAP: char = '\u{20E3}';
-const BLACK_FLAG: char = '\u{1F3F4}';
 const CANCEL_TAG: char = '\u{E007F}';
 
 /// A name as shown in a trust question.
@@ -135,7 +146,7 @@ pub fn shown(name: &str) -> Shown {
     let mut text = String::new();
     let mut kept = 0;
     loop {
-        let suffix = format!("...[+{} characters, sha256 {hash}]", total - kept);
+        let suffix = format!("\\[+{} more characters, sha256 {hash}]", total - kept);
         match pieces.get(kept) {
             Some(piece) if text.len() + piece.len() + suffix.len() <= MAX_SHOWN => {
                 text.push_str(piece);
@@ -159,7 +170,7 @@ fn hidden(chars: &[char], index: usize) -> bool {
         return !selects(chars, index);
     }
     if is_tag(c) {
-        return !in_flag_tag_sequence(chars, index);
+        return !in_tag_sequence(chars, index);
     }
     if c == ' ' {
         return index == 0 || index + 1 == chars.len();
@@ -230,58 +241,44 @@ fn joins(chars: &[char], index: usize) -> bool {
     }
 }
 
-/// Whether the variation selector at `index` selects a form of the
-/// character before it (rule 3).
+/// Whether the variation selector at `index` forms a registered variation
+/// sequence with the character before it (rule 3).
 fn selects(chars: &[char], index: usize) -> bool {
     let Some(&base) = index.checked_sub(1).and_then(|i| chars.get(i)) else {
         return false;
     };
     let selector = chars[index];
-    match u32::from(selector) {
-        0xFE0E | 0xFE0F => {
-            (!base.is_ascii() && CodePointSetData::new::<Emoji>().contains(base))
-                || (matches!(base, '0'..='9' | '#' | '*') && chars.get(index + 1) == Some(&KEYCAP))
-        }
-        0xE0100..=0xE01EF => CodePointSetData::new::<UnifiedIdeograph>().contains(base),
-        0x180B..=0x180D | 0x180F => {
-            CodePointMapData::<Script>::new().get(base) == Script::Mongolian
-        }
-        0xFE00..=0xFE0D => {
-            let category = CodePointMapData::<GeneralCategory>::new().get(base);
-            !base.is_ascii()
-                && GeneralCategoryGroup::Letter
-                    .union(GeneralCategoryGroup::Number)
-                    .union(GeneralCategoryGroup::Symbol)
-                    .contains(category)
-        }
-        _ => false,
+    if VARIATION_SEQUENCES
+        .binary_search(&(u32::from(base), u32::from(selector)))
+        .is_err()
+    {
+        return false;
     }
+    // On an ASCII base, an emoji or text presentation selector draws like
+    // the base itself outside a keycap.
+    !(matches!(selector, '\u{FE0E}' | VS16) && base.is_ascii())
+        || chars.get(index + 1) == Some(&KEYCAP)
 }
 
 fn is_tag(c: char) -> bool {
     ('\u{E0020}'..=CANCEL_TAG).contains(&c)
 }
 
-/// Whether the tag character at `index` is part of an emoji tag sequence
-/// (rule 4).
-fn in_flag_tag_sequence(chars: &[char], index: usize) -> bool {
-    let spec = |c: &char| ('\u{E0020}'..='\u{E007E}').contains(c);
-    let mut start = index;
-    if chars[index] == CANCEL_TAG {
-        // The cancel tag ends a sequence of at least one tag specification.
-        if index == 0 || !spec(&chars[index - 1]) {
-            return false;
-        }
-        start -= 1;
-    }
-    while start > 0 && spec(&chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = index;
-    while end < chars.len() && spec(&chars[end]) {
-        end += 1;
-    }
-    start > 0 && chars[start - 1] == BLACK_FLAG && chars.get(end) == Some(&CANCEL_TAG)
+/// Whether the tag character at `index` is inside an RGI emoji tag
+/// sequence (rule 4).
+fn in_tag_sequence(chars: &[char], index: usize) -> bool {
+    TAG_SEQUENCES.iter().any(|sequence| {
+        (index.saturating_sub(sequence.len() - 1)..=index).any(|start| {
+            chars
+                .get(start..start + sequence.len())
+                .is_some_and(|window| {
+                    window
+                        .iter()
+                        .zip(sequence.iter())
+                        .all(|(c, point)| u32::from(*c) == *point)
+                })
+        })
+    })
 }
 
 #[cfg(test)]
@@ -461,9 +458,13 @@ mod tests {
             "#\u{FE0F}\u{20E3}",
             "🇺🇦",
             "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
-            "葛\u{E0100}",
+            "🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+            "🏴\u{E0067}\u{E0062}\u{E0077}\u{E006C}\u{E0073}\u{E007F}x",
             "ᠠ\u{180B}",
             "∩\u{FE00}",
+            "0\u{FE00}",
+            "≨\u{FE00}",
+            "丽\u{FE00}",
             "\u{0600}١٢٣",
             "a b",
             "alice.o'neil",
@@ -518,9 +519,16 @@ mod tests {
             ("❤\u{FE0F}\u{FE0F}", '\u{FE0F}'),
             ("a\u{E0100}", '\u{E0100}'),
             ("a\u{180B}", '\u{180B}'),
-            ("0\u{FE00}", '\u{FE00}'),
             (" \u{FE00}x", '\u{FE00}'),
             ("中\u{FE0E}", '\u{FE0E}'),
+            // Not registered: a selector with no defined sequence.
+            ("é\u{FE00}", '\u{FE00}'),
+            ("∩\u{FE01}", '\u{FE01}'),
+            ("ᠠ\u{180F}", '\u{180F}'),
+            ("≤\u{FE00}", '\u{FE00}'),
+            // Ideographic variation sequences are registered in the IVD,
+            // which is not included.
+            ("葛\u{E0100}", '\u{E0100}'),
         ] {
             assert_escaped_at(name, selector);
         }
@@ -538,12 +546,57 @@ mod tests {
             "🏴\u{E007F}",
             "\u{E007F}",
             "a\u{E0041}b",
+            // TAG SPACE is no part of a tag specification.
+            "🏴\u{E0020}\u{E007F}",
+            // Well formed but not RGI: California, and capital letters.
+            "🏴\u{E0075}\u{E0073}\u{E0063}\u{E0061}\u{E007F}",
+            "🏴\u{E0047}\u{E0042}\u{E0053}\u{E0043}\u{E0054}\u{E007F}",
+            // Overlong, doubled and cut short.
+            "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E0074}\u{E007F}",
+            "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}\u{E007F}",
+            "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E007F}",
+            "\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
         ] {
             let shown = shown(name);
             assert!(shown.escaped, "{name:?} -> {:?}", shown.text);
             assert_eq!(decode(&shown.text), name);
-            assert!(!shown.text.chars().any(is_tag), "{:?}", shown.text);
+            // A doubled cancel tag leaves the flag itself intact.
+            if !name.ends_with("\u{E007F}\u{E007F}") {
+                assert!(!shown.text.chars().any(is_tag), "{:?}", shown.text);
+            }
         }
+        assert_eq!(
+            show("🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}\u{E007F}"),
+            format!(
+                "🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}{}",
+                escaped(CANCEL_TAG)
+            )
+        );
+    }
+
+    #[test]
+    fn the_sequence_tables_are_sorted_and_hold_the_registered_entries() {
+        assert!(VARIATION_SEQUENCES.windows(2).all(|pair| pair[0] < pair[1]));
+        for registered in [
+            (0x0030, 0xFE00),
+            (0x2229, 0xFE00),
+            (0x1820, 0x180B),
+            (0x2764, 0xFE0F),
+            (0x263A, 0xFE0E),
+            (0x0023, 0xFE0F),
+        ] {
+            assert!(
+                VARIATION_SEQUENCES.binary_search(&registered).is_ok(),
+                "{registered:X?}"
+            );
+        }
+        for unregistered in [(0x00E9, 0xFE00), (0x0061, 0xFE0F), (0x845B, 0xE0100)] {
+            assert!(VARIATION_SEQUENCES.binary_search(&unregistered).is_err());
+        }
+        assert_eq!(TAG_SEQUENCES.len(), 3);
+        assert!(TAG_SEQUENCES.iter().all(
+            |sequence| sequence.first() == Some(&0x1F3F4) && sequence.last() == Some(&0xE007F)
+        ));
     }
 
     #[test]
@@ -555,6 +608,8 @@ mod tests {
         assert_eq!(show("a\\u{200B}b"), "a\\\\u{200B}b");
     }
 
+    /// Distinct names give distinct text: this is about the encoded
+    /// strings, not about how a terminal draws them.
     #[test]
     fn the_presentation_is_unambiguous_and_keeps_the_terminal_safe() {
         let alphabet = [
@@ -640,23 +695,40 @@ mod tests {
         ] {
             let shown = show(&long);
             assert!(shown.len() <= MAX_SHOWN, "{} bytes", shown.len());
-            assert!(shown.contains(" characters, sha256 "), "{shown:?}");
-            assert!(!shown.ends_with('\\') || shown.ends_with(']'));
+            assert!(shown.contains(" more characters, sha256 "), "{shown:?}");
+            assert!(shown.ends_with(']'));
         }
         let one = format!("{}x", "a".repeat(5000));
         let other = format!("{}y", "a".repeat(5000));
         assert_ne!(show(&one), show(&other));
         let cut = show(&"a".repeat(MAX_SHOWN + 1));
-        let omitted: usize = cut
-            .split("...[+")
-            .nth(1)
-            .and_then(|tail| tail.split(' ').next())
+        let (kept, marker) = cut.split_once("\\[+").expect("a marker");
+        let omitted: usize = marker
+            .split(' ')
+            .next()
             .and_then(|count| count.parse().ok())
             .expect("a count");
-        assert_eq!(
-            cut.split("...[+").next().unwrap().len() + omitted,
-            MAX_SHOWN + 1
-        );
+        assert_eq!(kept.len() + omitted, MAX_SHOWN + 1);
+    }
+
+    /// The review's example: a name written as a cut presentation is not
+    /// shown as that presentation.
+    #[test]
+    fn a_name_cannot_look_like_a_cut_name() {
+        for long in [
+            "a".repeat(MAX_SHOWN + 1),
+            "\u{200B}".repeat(4000),
+            "ш".repeat(MAX_SHOWN),
+        ] {
+            let cut = show(&long);
+            assert!(cut.len() <= MAX_SHOWN);
+            assert_ne!(show(&cut), cut);
+            // Nor is a name whose shown part decodes to the same text,
+            // followed by the marker written literally.
+            let (kept, marker) = cut.split_once("\\[+").expect("a marker");
+            let forged = format!("{}\\[+{marker}", decode(kept));
+            assert_ne!(show(&forged), cut, "{forged:?}");
+        }
     }
 
     #[test]

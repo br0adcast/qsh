@@ -9,6 +9,7 @@ pub mod climb;
 pub mod connect;
 pub mod escape;
 pub mod identity;
+mod identity_sequences;
 pub mod input_ingress;
 #[doc(hidden)]
 pub mod input_reader;
