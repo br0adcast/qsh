@@ -410,6 +410,178 @@ mod worker_parent {
         ));
     }
 
+    const PHYSICAL_PHASE: &str = "QSH_TEST_PARENT_PHYSICAL_PHASE";
+    const PHYSICAL_REPORT_LIMIT: usize = 512;
+    const PHYSICAL_CHECKPOINT_LIMIT: usize = 128;
+    const PHYSICAL_PHASES: &[&str] = &[
+        "unavailable",
+        "body-exec",
+        "identity",
+        "prepare",
+        "control-pair",
+        "spawn",
+        "worker-owner",
+        "held-body",
+        "pump",
+        "outcome",
+        "assertions",
+        "complete",
+    ];
+    const PHYSICAL_ASSERTIONS: &[&str] = &[
+        "none",
+        "parent",
+        "physical-wait",
+        "required-failure",
+        "no-receipt",
+        "no-signal-failure",
+        "deliberate",
+    ];
+
+    // Only closed codes and bounded numeric facts cross the body boundary.
+    // Never copy panic payloads, stdout/stderr, process identities or environment.
+    #[derive(Clone, Copy, Default)]
+    struct PhysicalDiagnostic {
+        phase: usize,
+        assertion: usize,
+        elapsed_ms: u64,
+        observations: u8,
+        native_exit: i32,
+    }
+    impl PhysicalDiagnostic {
+        fn checkpoint(&mut self, phase: &str, assertion: &str, started: Instant) {
+            self.phase = PHYSICAL_PHASES
+                .iter()
+                .position(|code| *code == phase)
+                .unwrap();
+            self.assertion = PHYSICAL_ASSERTIONS
+                .iter()
+                .position(|code| *code == assertion)
+                .unwrap();
+            self.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let record = format!(
+                "{} {} {} {} {}",
+                self.phase, self.assertion, self.elapsed_ms, self.observations, self.native_exit
+            );
+            assert!(record.len() <= PHYSICAL_CHECKPOINT_LIMIT);
+            let path = PathBuf::from(std::env::var_os(PHYSICAL_PHASE).unwrap());
+            let next = path.with_extension("next");
+            // A killed write must leave the preceding complete checkpoint intact.
+            // Both files are overwritten, never appended or allowed to grow.
+            std::fs::write(&next, record).unwrap();
+            std::fs::rename(next, path).unwrap();
+        }
+        fn decode(record: &str) -> Option<Self> {
+            let mut fields = record.split_whitespace();
+            let diagnostic = Self {
+                phase: fields.next()?.parse().ok()?,
+                assertion: fields.next()?.parse().ok()?,
+                elapsed_ms: fields.next()?.parse().ok()?,
+                observations: fields.next()?.parse().ok()?,
+                native_exit: fields.next()?.parse().ok()?,
+            };
+            (fields.next().is_none()
+                && diagnostic.phase < PHYSICAL_PHASES.len()
+                && diagnostic.assertion < PHYSICAL_ASSERTIONS.len()
+                && diagnostic.observations <= 31)
+                .then_some(diagnostic)
+        }
+        fn read() -> Self {
+            use std::io::Read;
+            let read = || {
+                let mut record = String::new();
+                std::fs::File::open(std::env::var_os(PHYSICAL_PHASE)?)
+                    .ok()?
+                    .take(PHYSICAL_CHECKPOINT_LIMIT as u64 + 1)
+                    .read_to_string(&mut record)
+                    .ok()?;
+                (record.len() <= PHYSICAL_CHECKPOINT_LIMIT).then_some(record)
+            };
+            read()
+                .and_then(|record| Self::decode(&record))
+                .unwrap_or_default()
+        }
+        fn report(self) -> String {
+            format!("phase={}, assertion={}, checkpoint_elapsed_ms={}, outcome_observed={}, physical_wait={}, first_failure={}, terminal_received={}, signal_failure={}, native_exit={:?}",
+                PHYSICAL_PHASES[self.phase], PHYSICAL_ASSERTIONS[self.assertion], self.elapsed_ms,
+                self.observations & 1 != 0, self.observations & 2 != 0,
+                self.observations & 4 != 0, self.observations & 8 != 0,
+                self.observations & 16 != 0,
+                (self.observations & 1 != 0).then_some(self.native_exit))
+        }
+    }
+
+    #[test]
+    fn worker40_parent_diagnostic_codes_and_storage_are_bounded() {
+        assert!(PhysicalDiagnostic::decode("99 0 0 0 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 99 0 0 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 0 0 32 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 0 0 0 0 private-payload").is_none());
+        let diagnostic = PhysicalDiagnostic {
+            phase: PHYSICAL_PHASES.len() - 1,
+            assertion: PHYSICAL_ASSERTIONS.len() - 1,
+            elapsed_ms: u64::MAX,
+            observations: 31,
+            native_exit: i32::MIN,
+        };
+        assert!(diagnostic.report().len() + 100 <= PHYSICAL_REPORT_LIMIT);
+    }
+
+    fn failed_physical_fixture(control: &str) -> String {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "helper::server::tests::worker_parent::worker40_parent_missing_receipt_returns_failed_physical_outcome_after_actual_wait",
+                "--test-threads=1",
+            ])
+            .env_remove("QSH_TEST_PARENT_PHYSICAL_STAGE")
+            .env_remove("QSH_TEST_PARENT_PHYSICAL_HOLD")
+            .env_remove("QSH_TEST_PARENT_PHYSICAL_ASSERT")
+            .env("QSH_TEST_PARENT_PHYSICAL_CAPTURE", &path)
+            .env(control, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut fixture = ChildOwner(command.spawn().unwrap());
+        let status = fixture.0.wait().unwrap();
+        drop(fixture);
+        let mut report = String::new();
+        std::fs::File::open(path)
+            .unwrap()
+            .take(PHYSICAL_REPORT_LIMIT as u64 + 1)
+            .read_to_string(&mut report)
+            .unwrap();
+        assert!(
+            report.len() <= PHYSICAL_REPORT_LIMIT,
+            "bounded owned fixture report"
+        );
+        assert!(!status.success(), "controlled fixture must fail");
+        report
+    }
+
+    #[test]
+    fn worker40_parent_held_body_reports_phase_after_owned_cleanup() {
+        let report = failed_physical_fixture("QSH_TEST_PARENT_PHYSICAL_HOLD");
+        assert!(report.contains("timed_out=true"), "{report}");
+        assert!(report.contains("adopted_reaped=1"), "{report}");
+        assert!(report.contains("no_children=true"), "{report}");
+        assert!(report.contains("phase=held-body"), "{report}");
+    }
+
+    #[test]
+    fn worker40_parent_child_assertion_reports_observed_physical_outcome() {
+        let report = failed_physical_fixture("QSH_TEST_PARENT_PHYSICAL_ASSERT");
+        assert!(report.contains("timed_out=false"), "{report}");
+        assert!(report.contains("adopted_reaped=0"), "{report}");
+        assert!(report.contains("no_children=true"), "{report}");
+        assert!(report.contains("assertion=deliberate"), "{report}");
+        assert!(report.contains("physical_wait=true"), "{report}");
+        assert!(report.contains("outcome_observed=true"), "{report}");
+    }
+
     #[test]
     fn worker40_parent_missing_receipt_returns_failed_physical_outcome_after_actual_wait() {
         const STAGE: &str = "QSH_TEST_PARENT_PHYSICAL_STAGE";
@@ -427,6 +599,8 @@ mod worker_parent {
                 .stderr(Stdio::null());
             command
         };
+        let started = Instant::now();
+        let mut diagnostic = PhysicalDiagnostic::default();
         match std::env::var(STAGE).ok().as_deref() {
             Some("supervisor") => {
                 assert_eq!(
@@ -439,6 +613,7 @@ mod worker_parent {
                     unsafe { nix::libc::prctl(nix::libc::PR_SET_CHILD_SUBREAPER, 1) },
                     0
                 );
+                diagnostic.checkpoint("body-exec", "none", started);
                 let mut body = ChildOwner(reexec("body").spawn().unwrap());
                 let deadline = Instant::now() + Duration::from_secs(2);
                 let status = loop {
@@ -471,13 +646,15 @@ mod worker_parent {
                 }
                 // The body can create only /bin/true. Actual wait of that finite
                 // child is cleanup; elapsed time never supplies exit evidence.
-                let report = format!("timed_out={}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true",
-                    status.is_none(), status.is_some_and(|s| s.success()));
+                let report = format!("timed_out={}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true, {}",
+                    status.is_none(), status.is_some_and(|s| s.success()), PhysicalDiagnostic::read().report());
+                assert!(report.len() <= PHYSICAL_REPORT_LIMIT, "bounded owned fixture report");
                 std::fs::write(std::env::var_os(REPORT).unwrap(), &report).unwrap();
                 assert!(status.is_some_and(|s| s.success()), "{report}");
                 return;
             }
             Some("body") => {
+                diagnostic.checkpoint("identity", "parent", started);
                 assert_eq!(
                     std::env::var(PARENT).unwrap().parse::<i32>().unwrap(),
                     unsafe { nix::libc::getppid() }
@@ -489,18 +666,32 @@ mod worker_parent {
                 let mut supervisor = ChildOwner(
                     reexec("supervisor")
                         .env(REPORT, &report_path)
+                        .env(PHYSICAL_PHASE, fixture.path().join("phase"))
                         .spawn()
                         .unwrap(),
                 );
                 let status = supervisor.0.wait().unwrap();
-                let report = std::fs::read_to_string(&report_path).unwrap();
+                use std::io::Read;
+                let mut report = String::new();
+                std::fs::File::open(&report_path)
+                    .unwrap()
+                    .take(PHYSICAL_REPORT_LIMIT as u64 + 1)
+                    .read_to_string(&mut report)
+                    .unwrap();
+                assert!(report.len() <= PHYSICAL_REPORT_LIMIT, "bounded owned fixture report");
+                if let Some(path) = std::env::var_os("QSH_TEST_PARENT_PHYSICAL_CAPTURE") {
+                    std::fs::write(path, &report).unwrap();
+                }
                 assert!(status.success(), "owned pump supervisor failed: {report:?}");
                 return;
             }
             other => panic!("unknown owned pump fixture stage: {other:?}"),
         }
+        diagnostic.checkpoint("prepare", "none", started);
         let view = crate::process_scope::prepare().unwrap();
+        diagnostic.checkpoint("control-pair", "none", started);
         let (private, peer) = worker_control::pair().unwrap();
+        diagnostic.checkpoint("spawn", "none", started);
         let process = Command::new("/bin/true").spawn().unwrap();
         let owner = WorkerOwner::new(
             NonZeroU32::new(process.id()).unwrap(),
@@ -509,9 +700,11 @@ mod worker_parent {
             Instant::now() + Duration::from_secs(2),
         );
         let mut child = ChildOwner(process);
+        diagnostic.checkpoint("worker-owner", "none", started);
         if std::env::var_os("QSH_TEST_PARENT_PHYSICAL_HOLD").is_some() {
             // Controlled supervisor failure mutation: child and /bin/true remain
             // owned until the supervisor performs actual cleanup, never success.
+            diagnostic.checkpoint("held-body", "none", started);
             loop {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -521,6 +714,7 @@ mod worker_parent {
         let (auth, worker_auth) = channel::pair().unwrap();
         drop(worker_channels);
         drop(worker_auth);
+        diagnostic.checkpoint("pump", "none", started);
         let outcome = serve_owned(
             channels,
             auth,
@@ -530,12 +724,27 @@ mod worker_parent {
             None,
             owner,
         );
+        diagnostic.observations = 1 | (u8::from(outcome.first_failure.is_some()) << 2)
+            | (u8::from(outcome.terminal_received) << 3)
+            | (u8::from(outcome.signal_failure.is_some()) << 4);
+        diagnostic.native_exit = outcome.native_exit;
+        diagnostic.checkpoint("outcome", "none", started);
         let reaped = matches!(child.0.try_wait(), Err(error)
             if error.raw_os_error() == Some(nix::libc::ECHILD));
         drop(child);
+        diagnostic.observations |= u8::from(reaped) << 1;
+        diagnostic.checkpoint("assertions", "physical-wait", started);
         assert!(reaped, "return must follow the product's actual final wait");
+        diagnostic.checkpoint("assertions", "required-failure", started);
         assert!(outcome.first_failure.is_some());
+        diagnostic.checkpoint("assertions", "no-receipt", started);
         assert!(!outcome.terminal_received);
+        diagnostic.checkpoint("assertions", "no-signal-failure", started);
         assert!(outcome.signal_failure.is_none());
+        if std::env::var_os("QSH_TEST_PARENT_PHYSICAL_ASSERT").is_some() {
+            diagnostic.checkpoint("assertions", "deliberate", started);
+            panic!("controlled physical fixture assertion");
+        }
+        diagnostic.checkpoint("complete", "none", started);
     }
 }
