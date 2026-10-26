@@ -207,6 +207,30 @@ impl PredictionEngine {
         self.suppressed_until.is_none() && self.showing() && self.has_active_overlays()
     }
 
+    /// Earliest existing time-driven display transition for pending cells.
+    /// Hidden adaptive predictions participate; ACK/frame validity and tentative
+    /// epochs are still evaluated by `cull`, not changed by this query.
+    pub fn next_display_deadline_ms(&self) -> Option<i64> {
+        if self.display_preference == DisplayPreference::Never || self.suppressed_until.is_some() {
+            return None;
+        }
+        let delay = if self.glitch_trigger < GLITCH_REPAIR_COUNT {
+            GLITCH_THRESHOLD
+        } else if self.glitch_trigger == GLITCH_REPAIR_COUNT {
+            GLITCH_FLAG_THRESHOLD
+        } else {
+            return None;
+        };
+        self.overlays
+            .iter()
+            .flat_map(|row| &row.overlay_cells)
+            .filter(|cell| {
+                cell.base.active && self.local_frame_late_acked < cell.base.expiration_frame
+            })
+            .map(|cell| cell.base.prediction_time.saturating_add(delay))
+            .min()
+    }
+
     /// Overlay the active predictions onto a COPY of frame `fb` and return it.
     /// If there is nothing to show (`!active()`), return an unmodified copy
     /// (a port of mosh's display condition: `apply` is a no-op when prediction
@@ -1036,6 +1060,41 @@ mod tests {
         e.new_user_byte(b'h', &fb, 1000);
         let shown = e.apply(&fb);
         assert_eq!(shown.cell(0, 0).ch, ' ');
+    }
+
+    #[test]
+    fn hidden_display_deadlines_follow_pending_cells_and_policy() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        let fb = frame(20, 1);
+        engine.set_send_interval(10);
+        engine.set_local_frame_sent(1);
+        engine.new_user_byte(b'h', &fb, 1000);
+        assert!(!engine.active());
+        assert_eq!(engine.next_display_deadline_ms(), Some(1250));
+        engine.cull(&fb, 1249);
+        assert_eq!(engine.next_display_deadline_ms(), Some(1250));
+        engine.cull(&fb, 1250);
+        assert_eq!(engine.next_display_deadline_ms(), Some(6000));
+        engine.cull(&fb, 6000);
+        assert_eq!(engine.next_display_deadline_ms(), None);
+        let mut acknowledged = PredictionEngine::new(DisplayPreference::Adaptive);
+        acknowledged.set_local_frame_sent(2);
+        acknowledged.new_user_byte(b'h', &fb, 1000);
+        assert_eq!(acknowledged.next_display_deadline_ms(), Some(1250));
+        acknowledged.set_echo_ack(1);
+        assert_eq!(acknowledged.next_display_deadline_ms(), Some(1250));
+        acknowledged.set_echo_ack(2);
+        assert_eq!(acknowledged.next_display_deadline_ms(), None);
+
+        let mut suppressed = PredictionEngine::new(DisplayPreference::Adaptive);
+        suppressed.set_local_frame_sent(1);
+        suppressed.new_user_byte(b'h', &fb, 1000);
+        suppressed.suppress();
+        assert_eq!(suppressed.next_display_deadline_ms(), None);
+        let mut never = PredictionEngine::new(DisplayPreference::Never);
+        never.set_local_frame_sent(1);
+        never.new_user_byte(b'h', &fb, 1000);
+        assert_eq!(never.next_display_deadline_ms(), None);
     }
 
     // Adaptive: on a fast link (small send_interval) we don't show the prediction.
