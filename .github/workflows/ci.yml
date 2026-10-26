@@ -669,6 +669,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
           # Harness accounting only; benchmark runs and thresholds stay out of CI.
           python3 -m unittest discover -s scripts/tests -p 'test_perf_baseline.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_perf_history.py'
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
 
       - name: Install native build prerequisites

@@ -101,6 +101,64 @@ emulator, and the relay adds one local hop. Profilers and tracers are not part
 of these runs; profile separately, never in the same runs as the absolute
 baseline.
 
+## Opt-in client-history qualification
+
+The current default workloads, including busy-session qualification, remain
+unchanged. Tool version 6 additionally accepts
+`--workloads history` for a controlled **client** history experiment; this is
+separate from `retained`, which keeps eight detached server sessions. Use the
+same nominal ten-second producer duration and 20 Hz redraw settings. The
+actual CPU window covers dispatch through the producer completion checkpoint,
+including scheduling delay; it is not truncated at ten seconds. Client
+application may finish a tail after that checkpoint. Relay progress and the
+later positive return-to-live marker are required separately. One functional GNU pilot against each of the matched `90261ab` and `f9ff3a7`
+binary pairs passed the history, phase-completion and cleanup oracles. This
+qualifies the controlled oracle path, not CPU/memory performance, musl or system
+mode. Deterministic parser/ownership tests alone are not a performance result.
+
+The client requests 4,000 history lines at 120×40. This is below the logical-cell
+cap in both compared revisions; requesting the default 10,000 at 120 columns
+would actually permit only 8,738. A finite FIFO-controlled producer fills 2,000
+rows, then 6,000 more while a locally selected history viewport is pinned, then
+produces 200 carriage-return updates. Fresh full-repaint probes using same-size
+SIGWINCH observe positive scroll offset/total and numbered rows outside the CPU
+window. They do not change the PTY extent. A producer checkpoint alone is not
+proof the client ingested all output, so bounded observation probes wait for the
+positive cap. Final return-to-live and top-of-history observations are required;
+missing or changed oracles fail the run, and existing owned cleanup still runs.
+Partial-fill and return-to-live markers also require a complete full-repaint
+observation after producer completion. A diff may retain a visible marker's
+leading cells, so escape-stripped raw substring matching is insufficient; a
+captured cursor-position/common-prefix regression qualifies this boundary.
+These selected text/status observations are not a complete framebuffer emulator.
+
+Named memory phases record the measured client, not its server sessions:
+endpoint VmRSS, smaps-rollup PSS and private clean plus dirty, and lifetime VmHWM.
+Twenty-Hz RSS samples during the repaint window yield only a sampled maximum,
+not an instantaneous peak. VmHWM is since exec, not reset per phase; PSS/private
+are residency accounting, not pure heap allocation. Leaving history mode keeps
+the configured terminal history, so memory need not return to startup levels.
+No allocator trimming or kernel high-water reset is performed. Keep unfavorable
+values and the sampler's whole-run harness overhead. Existing allocation and
+frame-equivalence controls supply different evidence from these resident values.
+
+Each phase uses owned private state and finite deadlines. A failed or truncated
+producer, incomplete observation, missing memory field, client exit or cleanup
+error cannot qualify as a successful history result. Preserve raw phase samples,
+all errors and binary/build provenance. This opt-in schema needs a corresponding
+completeness gate; the previous local fixed 60-record six-workload gate is not applicable.
+The first functional pilot was preserved as a failed harness-oracle control:
+a changed-span repaint retained the visible H from an earlier HROW row and
+emitted `CSI 39;2 H` plus `ISTORY-PARTIAL-DONE`. Escape stripping therefore did
+not reconstruct the complete visible marker. The corrected producer-checkpoint
+plus full-repaint observation passed once per GNU revision, with positive
+4,000-line caps, retained numbered view rows and final live markers; both owned
+process trees were reaped. No timeout or product renderer change was needed.
+Final-marker observation includes the forced repaint and possibly its bounded
+reprobe; it is not unperturbed client-tail latency. The observations do not
+prove every numbered row was delivered or supply an output-loss metric.
+No runtime measurement is part of ordinary CI.
+
 ## Workloads
 
 | Workload | What happens in the window |
