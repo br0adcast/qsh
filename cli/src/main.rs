@@ -1689,6 +1689,14 @@ fn interactive(
             }
             rx.mark_failed();
         }
+        // Seal before the authoritative post-fault read. A failure published
+        // later cannot authorize an exit using this turn's earlier Empty.
+        let sealed_fault = if let Some(state) = collect_failed_ui_turn(rx, &mut events) {
+            queue = state;
+            true
+        } else {
+            false
+        };
         // Even empty notification turns reach Links::turn below. Never drain
         // Round/DNS publication and then park without observing its owner.
         let mut pending = signals::take_pending();
@@ -1744,7 +1752,7 @@ fn interactive(
             events.insert(signal_prefix, UiEvent::Terminate);
         }
         if queue != QueueState::BudgetReached {
-            if rx.failed() {
+            if sealed_fault {
                 events.push(UiEvent::InputFailure(
                     session::LocalInputFailure::UiWaitUnavailable,
                 ));
@@ -1945,6 +1953,14 @@ fn collect_ui_turn(
         events.push(UiEvent::Tick);
     }
     state
+}
+
+fn collect_failed_ui_turn(rx: &UiInbox, events: &mut Vec<UiEvent>) -> Option<QueueState> {
+    if !rx.failed() {
+        return None;
+    }
+    rx.mark_failed();
+    Some(rx.collect_into(events))
 }
 
 fn discard_terminal_input() {
@@ -2538,6 +2554,50 @@ mod tests {
         );
         assert_eq!(events, vec![UiEvent::Stats(transport::Stats::default())]);
     }
+    #[test]
+    fn ui_wait_raw_fault_recollects_after_initial_empty_before_termination() {
+        for initial in [0, 16] {
+            let mut inbox = UiInbox::new().unwrap();
+            let sender = inbox.renew();
+            for _ in 0..initial {
+                sender.send(UiEvent::Tick).unwrap();
+            }
+            let mut events = Vec::new();
+            assert_eq!(
+                inbox.collect_into(&mut events),
+                if initial == 0 {
+                    QueueState::Empty
+                } else {
+                    QueueState::BudgetReached
+                }
+            );
+            // Publication occurs after the owner's first bounded collection.
+            let worker = std::thread::spawn(move || {
+                sender.send(UiEvent::Resumed).unwrap();
+            });
+            worker.join().unwrap();
+            // Inject owner fault discovery only after the accepted publication.
+            inbox.mark_failed();
+            if initial == 16 {
+                assert_eq!(
+                    collect_failed_ui_turn(&inbox, &mut events),
+                    Some(QueueState::BudgetReached)
+                );
+                assert_eq!(
+                    events.len(),
+                    16,
+                    "fault recollection must not extend the external budget"
+                );
+                events.clear(); // The owner's first prefix has been serviced.
+            }
+            assert_eq!(
+                collect_failed_ui_turn(&inbox, &mut events),
+                Some(QueueState::Disconnected)
+            );
+            assert_eq!(events, vec![UiEvent::Resumed]);
+        }
+    }
+
     #[test]
     fn ui_wait_cooked_replacement_observes_completion_without_stdin() {
         let mut inbox = UiInbox::new().unwrap();

@@ -525,6 +525,8 @@ jobs:
             ui_wait::tests::ui_wait_inbox_continuously_replenished_notifications_have_bounded_drain \
             ui_wait::tests::ui_wait_inbox_last_drop_notification_fault_is_sticky \
             ui_wait::tests::ui_wait_inbox_retirement_rejects_old_producers_without_replacing_wake \
+            ui_wait::tests::ui_wait_inbox_seal_rejects_sender_paused_before_admission \
+            ui_wait::tests::ui_wait_inbox_actual_notify_fault_after_empty_requires_fresh_collection \
             background::tests::ui_wait_round_completion_and_panic_drop_wake_after_publication \
             recovery::tests::ui_wait_recovery_observation_publishes_before_notification \
             recovery_status::tests::ui_wait_recovery_backoff_keeps_its_fractional_ceil_phase \
@@ -557,6 +559,7 @@ jobs:
             2>&1 | tee "$runtime/ui-wait-bin.log"
           for name in \
             tests::ui_wait_raw_turn_keeps_bounded_prefix_and_due_tick \
+            tests::ui_wait_raw_fault_recollects_after_initial_empty_before_termination \
             tests::ui_wait_cooked_replacement_observes_completion_without_stdin; do
             # --nocapture diagnostics may split a test's name and bare ok.
             awk -v expected="test $name ... " '

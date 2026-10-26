@@ -4,11 +4,12 @@ use crate::session::UiEvent;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 struct SendSide {
     tx: Option<mpsc::Sender<UiEvent>>,
     wake: Option<WakeSender>,
     failed: Arc<AtomicBool>,
+    admission: Arc<Mutex<()>>,
 }
 impl Drop for SendSide {
     fn drop(&mut self) {
@@ -29,6 +30,7 @@ pub struct UiInbox {
     wake: WakeReader,
     notify: WakeSender,
     failed: Arc<AtomicBool>,
+    admission: Arc<Mutex<()>>,
 }
 #[cfg(test)]
 fn channel() -> io::Result<(UiSender, UiInbox)> {
@@ -43,6 +45,7 @@ impl From<mpsc::Sender<UiEvent>> for UiSender {
                 tx: Some(tx),
                 wake: None,
                 failed: Arc::new(AtomicBool::new(false)),
+                admission: Arc::new(Mutex::new(())),
             }),
         }
     }
@@ -54,6 +57,7 @@ impl UiSender {
                 tx: Some(tx),
                 wake: Some(wake),
                 failed: Arc::new(AtomicBool::new(false)),
+                admission: Arc::new(Mutex::new(())),
             }),
         }
     }
@@ -61,10 +65,30 @@ impl UiSender {
         self.inner.wake.clone()
     }
     pub fn send(&self, event: UiEvent) -> Result<(), mpsc::SendError<UiEvent>> {
+        self.send_after_precheck(event, || {})
+    }
+    fn send_after_precheck(
+        &self,
+        event: UiEvent,
+        before_admission: impl FnOnce(),
+    ) -> Result<(), mpsc::SendError<UiEvent>> {
         if self.inner.failed.load(Ordering::Acquire) {
             return Err(mpsc::SendError(event));
         }
-        self.inner.tx.as_ref().unwrap().send(event)?;
+        before_admission();
+        // Seal and admission share this short custody section. Never notify,
+        // process an event, or join a worker while holding it.
+        let admission = self
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.inner.failed.load(Ordering::Acquire) {
+            return Err(mpsc::SendError(event));
+        }
+        let accepted = self.inner.tx.as_ref().unwrap().send(event);
+        drop(admission);
+        accepted?;
         // Acceptance has happened. Notification failure must never invite a retry.
         if self
             .inner
@@ -85,9 +109,13 @@ impl UiInbox {
             wake,
             notify,
             failed: Arc::new(AtomicBool::new(false)),
+            admission: Arc::new(Mutex::new(())),
         })
     }
     pub fn mark_failed(&self) {
+        // On return every admitted event is already in the queue, and senders
+        // paused before admission must return their original event as rejected.
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
         self.failed.store(true, Ordering::Release);
     }
     /// Never drains before parking: after this returns, the caller commits one
@@ -147,6 +175,7 @@ impl UiInbox {
                 tx: Some(tx),
                 wake: Some(self.notify.clone()),
                 failed: self.failed.clone(),
+                admission: self.admission.clone(),
             }),
         }
     }
@@ -161,7 +190,7 @@ impl UiInbox {
         result
     }
     pub fn collect_into(&self, events: &mut Vec<UiEvent>) -> QueueState {
-        for _ in 0..16 {
+        for _ in events.len()..16 {
             match self.try_recv() {
                 Ok(event) => events.push(event),
                 Err(mpsc::TryRecvError::Empty) => return QueueState::Empty,
@@ -371,6 +400,47 @@ mod tests {
         };
         assert!(marker.resolve());
         assert_eq!(reply.try_recv(), Ok(true));
+    }
+    #[test]
+    fn ui_wait_inbox_seal_rejects_sender_paused_before_admission() {
+        let (tx, rx) = channel().unwrap();
+        let (arrived, at_admission) = mpsc::channel();
+        let (release, proceed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send_after_precheck(UiEvent::Resumed, || {
+                arrived.send(()).unwrap();
+                proceed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            })
+        });
+        at_admission
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        rx.mark_failed();
+        release.send(()).unwrap();
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(mpsc::SendError(UiEvent::Resumed))));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+    #[test]
+    fn ui_wait_inbox_actual_notify_fault_after_empty_requires_fresh_collection() {
+        let (tx, mut rx) = channel().unwrap();
+        let mut events = Vec::new();
+        assert_eq!(rx.collect_into(&mut events), QueueState::Empty);
+        let worker = std::thread::spawn(move || {
+            tx.inner.wake.as_ref().unwrap().fail_next_notify();
+            tx.send(UiEvent::Resumed).unwrap();
+        });
+        worker.join().unwrap();
+        assert!(rx.drain().is_err());
+        assert!(rx.failed());
+        rx.mark_failed();
+        assert_eq!(rx.collect_into(&mut events), QueueState::Disconnected);
+        assert_eq!(events, vec![UiEvent::Resumed]);
     }
     #[test]
     fn ui_wait_timeout_uses_real_deadline_and_rounds_up() {
