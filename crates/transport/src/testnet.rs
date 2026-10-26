@@ -316,12 +316,31 @@ impl Side {
     }
 }
 
+/// What made a side send a datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SendOrigin {
+    /// A timer service (`Connection::on_timeout_if_due`) or a handshake
+    /// retransmit.
+    Timer,
+    /// Handling a datagram from the peer (`Connection::on_datagram`).
+    Received,
+    /// A scripted action or a write: anything else.
+    Action,
+}
+
 /// One datagram a side put on the wire, as its peer would decrypt it (empty
 /// for a handshake or a datagram the peer cannot read yet).
 #[derive(Clone, Debug)]
 pub struct SentDatagram {
     pub at: Duration,
     pub frames: Vec<StreamFrame>,
+    /// The address it was sent to, and the road that address belongs to
+    /// (`None`: misaddressed).
+    pub to: SocketAddr,
+    pub road: Option<usize>,
+    /// Its length on the wire.
+    pub len: usize,
+    pub origin: SendOrigin,
 }
 
 /// Datagrams one side put on the wire, by what was in them.
@@ -441,6 +460,8 @@ pub struct Sim {
     steps_at: (Duration, usize),
     /// Every datagram each side sent, once [`Sim::record_sends`] asked.
     recorded: Option<[Vec<SentDatagram>; 2]>,
+    /// What the sends being transmitted come from (see [`SendOrigin`]).
+    origin: SendOrigin,
     /// `[client, server]`: plays a build from before negotiation (see
     /// [`Sim::play_legacy`]).
     legacy: [bool; 2],
@@ -539,6 +560,7 @@ impl Sim {
             peak_exempt_services: [0, 0],
             steps_at: (Duration::ZERO, 0),
             recorded: None,
+            origin: SendOrigin::Action,
             legacy: [false, false],
             consumers: BTreeMap::new(),
             consume_carry: BTreeMap::new(),
@@ -942,7 +964,6 @@ impl Sim {
     /// Put `dgrams` from `from` on the roads they are addressed to.
     pub fn transmit(&mut self, from: Side, dgrams: Vec<Datagram>) {
         for dg in dgrams {
-            self.count_frames(from, &dg.bytes);
             let road = match from {
                 Side::Client => self.roads.iter().position(|r| r.server_addr == dg.to),
                 Side::Server => self
@@ -950,6 +971,7 @@ impl Sim {
                     .iter()
                     .position(|r| r.client_addr == dg.to || r.old_client_addrs.contains(&dg.to)),
             };
+            self.count_frames(from, &dg, road);
             let Some(i) = road else {
                 self.misaddressed += 1;
                 self.misaddressed_bytes += dg.bytes.len() as u64;
@@ -1067,6 +1089,12 @@ impl Sim {
     }
 
     fn deliver(&mut self, d: Delivery) {
+        let origin = std::mem::replace(&mut self.origin, SendOrigin::Received);
+        self.deliver_received(d);
+        self.origin = origin;
+    }
+
+    fn deliver_received(&mut self, d: Delivery) {
         let Delivery { to, src, bytes, .. } = d;
         let Some(bytes) = self.through_guard(to, src, bytes) else {
             return;
@@ -1174,7 +1202,9 @@ impl Sim {
         }
         self.handshake_sent_at = Some(self.now);
         let out = self.conns[0].retransmit_handshake();
+        let origin = std::mem::replace(&mut self.origin, SendOrigin::Timer);
         self.transmit(Side::Client, out);
+        self.origin = origin;
     }
 
     /// The timer rule of every driver (spec §4.1), one service per side per
@@ -1220,7 +1250,9 @@ impl Sim {
             } else {
                 self.idle_services[i] = 0;
             }
+            let origin = std::mem::replace(&mut self.origin, SendOrigin::Timer);
             self.transmit(side, out);
+            self.origin = origin;
             assert!(
                 self.idle_services[i] < TIMER_SERVICES_PER_INSTANT
                     || !self.conns[i].next_timeout().is_some_and(|d| d <= now),
@@ -1263,7 +1295,8 @@ impl Sim {
         }
     }
 
-    fn count_frames(&mut self, from: Side, bytes: &[u8]) {
+    fn count_frames(&mut self, from: Side, dg: &Datagram, road: Option<usize>) {
+        let bytes = &dg.bytes[..];
         let i = from.index();
         self.frames[i].datagrams += 1;
         let frames = if let Ok(Frame::Handshake { .. }) = parse(bytes) {
@@ -1325,7 +1358,14 @@ impl Sim {
         };
         let at = self.now;
         if let Some(recorded) = self.recorded.as_mut() {
-            recorded[i].push(SentDatagram { at, frames });
+            recorded[i].push(SentDatagram {
+                at,
+                frames,
+                to: dg.to,
+                road,
+                len: bytes.len(),
+                origin: self.origin,
+            });
         }
     }
 }
