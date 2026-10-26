@@ -12520,3 +12520,5 @@ include!("session_manager_snapshot_bounds_tests.rs");
 include!("session_manager_restart_bounds_tests.rs");
 include!("session_manager_repaint_bounds_tests.rs");
 include!("session_manager_refusal_retirement_tests.rs");
+
+include!("session_manager_mailbox_tests.rs");
