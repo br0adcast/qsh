@@ -798,16 +798,19 @@ impl ChannelBridge {
         if self.target.is_some() {
             return false;
         }
+        // The map's u8 key bounds the full namespace, including draining
+        // streams. Refresh each round after removals without heap scratch.
+        let mut keys = [0u8; u8::MAX as usize + 1];
         loop {
-            let keys: Vec<_> = self.streams.keys().copied().collect();
+            let count = self.streams.len();
+            for (index, &stream) in self.streams.keys().enumerate() {
+                keys[index] = stream;
+            }
+            // Freeze the round's order before Step updates self.cursor.
+            let cursor = self.cursor;
+            let pivot = keys[..count].partition_point(|&stream| stream <= cursor);
             let mut progressed = false;
-            for stream in keys
-                .iter()
-                .copied()
-                .filter(|s| *s > self.cursor)
-                .chain(keys.iter().copied().filter(|s| *s <= self.cursor))
-                .collect::<Vec<_>>()
-            {
+            for stream in keys[pivot..count].iter().chain(&keys[..pivot]).copied() {
                 if records == TURN_RECORDS || bytes == TURN_BYTES {
                     return true;
                 }
