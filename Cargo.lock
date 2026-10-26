@@ -2055,6 +2055,7 @@ dependencies = [
  "flate2",
  "hmac 0.12.1",
  "http",
+ "icu_properties",
  "knock",
  "libc",
  "log",

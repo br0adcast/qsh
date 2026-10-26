@@ -230,26 +230,38 @@ impl fmt::Display for TrustError {
                 pinned,
                 offered,
                 store,
-            } => write!(
-                f,
-                "the server key for {host}:{port} has changed!\n  \
-                 was: {}\n  now: {}\n\
-                 If the server was reinstalled, or switched between qshd's personal and \
-                 system mode (each keeps its own separate host key, so switching between \
-                 them changes the fingerprint -- see docs/qshd-service.md), remove the \
-                 line for {host} from \"{}\" and reconnect. If neither \
-                 happened, someone is between you and the server.",
-                key_fingerprint(pinned),
-                key_fingerprint(offered),
-                store.display()
-            ),
-            TrustError::BootstrapMismatch { host, port, expected, offered } => write!(
-                f,
-                "the daemon key for {host}:{port} does not match the expected key!\n  \
-                 expected: {}\n  offered: {}\n\n\
-                 SSH bootstrap, QSH discovery, and the current session must identify the same daemon.",
-                key_fingerprint(expected), key_fingerprint(offered)
-            ),
+            } => {
+                let shown = crate::identity::show(host);
+                let text = format!(
+                    "the server key for {shown}:{port} has changed!\n  \
+                     was: {}\n  now: {}\n\
+                     If the server was reinstalled, or switched between qshd's personal and \
+                     system mode (each keeps its own separate host key, so switching between \
+                     them changes the fingerprint -- see docs/qshd-service.md), remove the \
+                     line for {shown} from \"{}\" and reconnect. If neither \
+                     happened, someone is between you and the server.",
+                    key_fingerprint(pinned),
+                    key_fingerprint(offered),
+                    store.display()
+                );
+                f.write_str(&crate::identity::with_note(text, &[host]))
+            }
+            TrustError::BootstrapMismatch {
+                host,
+                port,
+                expected,
+                offered,
+            } => {
+                let text = format!(
+                    "the daemon key for {}:{port} does not match the expected key!\n  \
+                     expected: {}\n  offered: {}\n\n\
+                     SSH bootstrap, QSH discovery, and the current session must identify the same daemon.",
+                    crate::identity::show(host),
+                    key_fingerprint(expected),
+                    key_fingerprint(offered)
+                );
+                f.write_str(&crate::identity::with_note(text, &[host]))
+            }
             TrustError::Refused => write!(f, "server key not confirmed -- connection canceled"),
             TrustError::Store(why) => write!(f, "known-hosts file unavailable: {why}"),
         }
@@ -645,12 +657,16 @@ fn server_key_with_discovered(
             store: hosts.path().to_owned(),
         }),
         HostVerdict::Unknown => {
-            let prompt = format!(
-                "First time seeing server {host}:{port}.\n  Key fingerprint: {}\n\
-                 Compare it with the fingerprint `qshd serve` prints at startup \
-                 (a qshd started over ssh prints none: accepting it is trust on first use).\n\
-                 Continue and remember this key?",
-                key_fingerprint(&offered)
+            let prompt = crate::identity::with_note(
+                format!(
+                    "First time seeing server {}:{port}.\n  Key fingerprint: {}\n\
+                     Compare it with the fingerprint `qshd serve` prints at startup \
+                     (a qshd started over ssh prints none: accepting it is trust on first use).\n\
+                     Continue and remember this key?",
+                    crate::identity::show(host),
+                    key_fingerprint(&offered)
+                ),
+                &[host],
             );
             if !ask.ask(&prompt) {
                 return Err(TrustError::Refused);
@@ -928,6 +944,70 @@ mod tests {
 
     fn any_addr() -> SocketAddr {
         "127.0.0.1:9".parse().expect("addr")
+    }
+
+    /// A host name with an invisible character is shown escaped, with the
+    /// note, while the name pinned and looked up is the one given: the
+    /// look-alike without it stays a different, unknown host.
+    #[test]
+    fn a_first_contact_shows_an_invisible_character_and_pins_the_exact_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = hosts(dir.path());
+        let ask = recorder(true);
+        let host = "exa\u{200B}mple.org";
+        let found = server_key(
+            host,
+            60022,
+            any_addr(),
+            &store,
+            &[],
+            &ask,
+            &FakeDiscovery::answering([3u8; 32]),
+        )
+        .expect("an approved key is accepted");
+        assert_eq!(found.key, [3u8; 32]);
+        let asked = ask.asked.lock().expect("asked").clone();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].starts_with("First time seeing server exa\\u{200B}mple.org:60022.\n"),
+            "{}",
+            asked[0]
+        );
+        assert!(asked[0].ends_with(&format!(
+            "\n{}\nContinue and remember this key?",
+            crate::identity::NOTE
+        )));
+        assert_eq!(
+            store.check(host, 60022, &[3u8; 32]).expect("check"),
+            HostVerdict::Known
+        );
+        assert_eq!(
+            store
+                .check("example.org", 60022, &[3u8; 32])
+                .expect("check"),
+            HostVerdict::Unknown
+        );
+
+        let changed = TrustError::KeyChanged {
+            host: host.to_string(),
+            port: 60022,
+            pinned: [3u8; 32],
+            offered: [4u8; 32],
+            store: dir.path().join("known_hosts"),
+        }
+        .to_string();
+        assert!(changed.starts_with("the server key for exa\\u{200B}mple.org:60022 has changed!"));
+        assert!(changed.contains("remove the line for exa\\u{200B}mple.org from"));
+        assert!(changed.contains(crate::identity::NOTE));
+        let plain = TrustError::KeyChanged {
+            host: "example.org".into(),
+            port: 60022,
+            pinned: [3u8; 32],
+            offered: [4u8; 32],
+            store: dir.path().join("known_hosts"),
+        }
+        .to_string();
+        assert!(!plain.contains(crate::identity::NOTE), "{plain}");
     }
 
     /// A pinned key is used as it stands, and -- the point of pinning -- the
