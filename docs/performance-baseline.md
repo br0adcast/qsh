@@ -28,11 +28,20 @@ Every run is independent and starts from nothing:
   empty startup files (the same isolation as the integration fixtures), and
   `HTTPS_PROXY` points at a closed port so no release check reaches the
   network. `SSH_AUTH_SOCK` and every other inherited variable are absent.
+- The daemon counts as ready only when the UDP port it was given is held by
+  that owned `qshd` process: every socket bound to the port must be in its
+  descriptor table. A socket of any other process on that port, or a daemon
+  that exited, fails the run before a client starts or any traffic is
+  forwarded. The check is repeated before every client starts.
 - A UDP relay owned by the harness sits between `qsh` and `qshd`. It counts
   the datagrams and bytes of this one session in each direction, timestamps
-  client datagrams, and can drop everything to simulate an outage.
-- `qsh` runs as a session leader on its own pseudo-terminal (120x40) whose
-  output the harness drains and counts.
+  each client datagram when it is received, and can drop everything to
+  simulate an outage.
+- `qsh` runs as a session leader on its own pseudo-terminal (120x40). One
+  reader thread drains, counts and timestamps its output. The terminal's
+  descriptors are owned from the moment they are opened, so a failed setup
+  or spawn still closes them, and the reader is stopped and joined before
+  the master is closed.
 - The harness makes itself a child subreaper. At the end it terminates the
   client and daemon sessions (SIGTERM, then SIGKILL), reaps both with
   `wait4`, and then kills and reaps every remaining descendant, such as
@@ -51,7 +60,7 @@ Per measured process, over the workload's window:
 | `timeslices_per_s` | Field 3 of `schedstat`: timeslices run, **not wakeups**. Under load it includes preemption and depends on the worker count. Live threads only. |
 | `voluntary_switches_per_s` | Voluntary context switches: the thread blocked and was later woken. This is the closest available measure of sleep/wake cycles. Live threads only. |
 | `involuntary_switches_per_s` | Preemptions. |
-| `threads_*` | Thread counts at both ends, plus threads that exited or were created. When either churn count is nonzero, the live-thread counters are partial; `cpu_s` is not. |
+| `threads_*` | Thread counts at both ends, plus threads that exited or were created between them. When either churn count is nonzero, the live-thread counters are partial. A thread that starts and exits between the two samples appears in neither count, so zero churn does not prove that the live-thread counters are complete. `cpu_s` includes such threads. |
 | `peak_rss_kib`, `rss_kib` | `VmHWM` and `VmRSS` at the end of the window. |
 
 For the session as a whole:
@@ -61,12 +70,17 @@ For the session as a whole:
 | `relay.*` | Datagrams and bytes of this session only, per direction. Traffic is encrypted, so frame types (data, acknowledgement, keepalive, path probe) are not distinguished. |
 | `terminal.bytes` | Bytes the client wrote to its terminal. These are rendered screen updates, not the remote output: a fast stream can be presented as fewer bytes than it produced. |
 | `terminal.presented_frames` | Number of cursor-visibility sequences. The renderer ends every presented frame with one, so this counts frames, as a renderer-specific proxy. |
-| `typing.stdin_to_datagram_ms` | Time from writing a key to the client's terminal until the relay receives the client's next datagram, without prediction. A keepalive that coincides with a key is attributed to it, so read the median, not the minimum. |
-| `typing.echo_ms` | Time from writing a key until the remote echo is presented. It includes the client's input, transport, server, PTY echo, return path and rendering. |
-| `saturation.completion_s` | Wall time for a fixed amount of output to complete end to end. |
-| `reconnect.recovery_s` | Time from restoring the path until a command typed at that moment round-trips. |
+| `typing.stdin_to_next_datagram_ms` | Time from writing a key to the client's terminal until the relay receives the first client datagram after that write, without prediction. This is an **uncorrelated proxy**: traffic is encrypted, so the datagram is not known to carry the key. A keepalive or acknowledgement sent shortly after the write is attributed to it. |
+| `typing.echo_ms` | Time from writing a key until the reader thread's read that completed the remote echo returned. It includes the client's input, transport, server, PTY echo, return path and rendering. |
+| `saturation.completion_s` | Wall time for a fixed amount of output to complete end to end, up to when the harness observed the completion marker (it polls every 5 ms). |
+| `reconnect.recovery_s` | Time from restoring the path until the reader thread read the output of a command typed at that moment. |
 | `lifetime.*` | `wait4` resource usage over a process's whole life, all threads included. `ru_maxrss` is deliberately not recorded: a forked child starts with the harness's resident size as its high-water mark. |
 | `harness_cpu_s` | The harness's own CPU for the run: relay, PTY drain and polling. It shares the host with the measured processes. |
+
+Latency times are taken where the event arrives: by the relay thread when
+it receives a datagram and by the PTY reader thread when its read returns,
+not when the measuring loop later polls. The first relevant event after the
+write is used, even when later ones arrived before the loop looked.
 
 The harness's PTY reader does not model the rendering cost of a real terminal
 emulator, and the relay adds one local hop. Profilers and tracers are not part
@@ -78,7 +92,7 @@ baseline.
 | Workload | What happens in the window |
 |---|---|
 | `idle` | A connected session with no input or output. |
-| `typing` | `--predict never --status off`; the remote side runs `cat > /dev/null` in non-canonical mode. One key is sent every 100 ms (100 keys by default), and each key's dispatch and echo times are recorded. |
+| `typing` | `--predict never --status off`; the remote side runs `cat > /dev/null` in non-canonical mode. One key is sent every 100 ms (100 keys by default), and each key's next-datagram and echo times are recorded. A run in which any key lacks either sample fails; its partial result is kept in the run file but never summarized. |
 | `redraw` | A remote script redraws the full screen with distinct content at 20 frames per second for the window. |
 | `saturation` | `seq 1 2000000` on the remote side, followed by a completion marker. The window is the whole fixed amount of work. |
 | `reconnect` | The relay drops all traffic for the window; the outage CPU and traffic are measured, and then recovery time. |
@@ -126,8 +140,9 @@ directory; the runs already written are kept.
 
 The manifest records:
 
-- each binary's SHA-256, size, `--version` output, linkage, interpreter name
-  and the toolchain strings from its `.comment` section;
+- each binary's SHA-256, size, `--version` output (run on an owned
+  pseudo-terminal, like every other qsh invocation), linkage, interpreter
+  name and the toolchain strings from its `.comment` section;
 - the kernel, CPU model and online CPUs. The host name and absolute paths are
   not recorded.
 - the settings and the complete run order.
@@ -154,12 +169,22 @@ Guidance for comparisons:
 
 ## Recorded baselines: 2026-10-26
 
-Both runs were made on one host: a 4-vCPU KVM VM (Intel Xeon W-2295),
+All runs were made on one host: a 4-vCPU KVM VM (Intel Xeon W-2295),
 Debian 12, kernel 6.1. The host was not otherwise idle; an unrelated personal
-qshd was running. Each run measured 2 builds x 6 workloads x 5 repetitions in
-interleaved order. All 120 runs succeeded and left no processes behind.
-SHA-256 hashes, linkage and toolchain strings of every binary are in each
-manifest.
+qshd was running. These are not quiet-host acceptance runs. SHA-256 hashes,
+linkage and toolchain strings of every binary are in each manifest.
+
+- The two full runs measured 2 builds x 6 workloads x 5 repetitions in
+  interleaved order with harness version 1. All 120 runs succeeded and left
+  no processes behind. That version timed latencies when its 5 ms polling
+  loop noticed an event, and took the latest client datagram rather than the
+  first. Its `typing` latencies and `reconnect` recovery times are withdrawn
+  and omitted below. Their CPU, scheduling, traffic and memory records are
+  unaffected and remain.
+- Two latency runs then measured `typing` and `reconnect` for the same
+  binaries (2 builds x 2 workloads x 5 repetitions, interleaved) with harness
+  version 2, which takes every time at arrival. All 40 runs succeeded with
+  100 of 100 echo and datagram samples each, and left no processes behind.
 
 The tables show medians with interquartile range and run count. The last two
 columns compare the second build with the first: the ratio of medians, and
@@ -184,10 +209,6 @@ Raw data: [`performance/2026-10-26-e044d08-glibc-musl/`](performance/2026-10-26-
 | idle | window.qshd.voluntary_switches_per_s | 120 (119-120, 5) | 117 (117-120, 5) | 0.977 | 3/5 (0) |
 | idle | window.relay.c2s_datagrams_per_s | 1.4 (1.4-1.4, 5) | 1.4 (1.4-1.4, 5) | 1 | 0/5 (5) |
 | idle | window.relay.s2c_datagrams_per_s | 1.4 (1.4-1.4, 5) | 1.4 (1.4-1.4, 5) | 1 | 0/5 (5) |
-| typing | echo_ms.p50 | 32.5 (31.6-34.5, 5) | 33.9 (31.2-34.2, 5) | 1.05 | 4/5 (0) |
-| typing | echo_ms.p90 | 55.9 (55.6-56.5, 5) | 56.3 (56-56.7, 5) | 1.01 | 2/5 (0) |
-| typing | stdin_to_datagram_ms.p50 | 27.2 (26.3-29.3, 5) | 28.7 (25.9-29, 5) | 1.06 | 4/5 (0) |
-| typing | stdin_to_datagram_ms.p90 | 50.7 (50.3-51.2, 5) | 51.1 (50.6-51.4, 5) | 1.01 | 3/5 (0) |
 | typing | window.qsh.cpu_percent | 2.2 (2.2-2.2, 5) | 5.89 (5.79-5.89, 5) | 2.68 | 0/5 (0) |
 | typing | window.qsh.voluntary_switches_per_s | 155 (155-156, 5) | 155 (154-155, 5) | 0.996 | 4/5 (0) |
 | typing | window.qshd.cpu_percent | 1.3 (1.3-1.4, 5) | 1.2 (1.2-1.3, 5) | 0.923 | 3/5 (1) |
@@ -215,10 +236,19 @@ Raw data: [`performance/2026-10-26-e044d08-glibc-musl/`](performance/2026-10-26-
 | reconnect | outage.qshd.cpu_percent | 0.7 (0.7-0.8, 5) | 0.7 (0.6-0.7, 5) | 1 | 3/5 (2) |
 | reconnect | outage.qshd.voluntary_switches_per_s | 114 (113-115, 5) | 116 (113-116, 5) | 1.02 | 2/5 (0) |
 | reconnect | outage.terminal.presented_frames_per_s | 0.1 (0.1-0.2, 5) | 0.2 (0.2-0.2, 5) | 2 | 1/5 (1) |
-| reconnect | recovery_s | 1.47 (1.47-1.48, 5) | 1.48 (1.48-1.49, 5) | 1.01 | 0/5 (0) |
 | retained | window.qshd.cpu_percent | 3.8 (3.7-4.1, 5) | 3.9 (3.9-4, 5) | 1.03 | 2/5 (1) |
 | retained | window.qshd.voluntary_switches_per_s | 873 (868-881, 5) | 921 (882-930, 5) | 1.05 | 1/5 (0) |
 | retained | window.relay.s2c_datagrams_per_s | 5.4 (5.4-5.4, 5) | 5.3 (5.3-5.4, 5) | 0.982 | 3/5 (1) |
+
+Latency, from [`performance/2026-10-26-e044d08-glibc-musl-latency/`](performance/2026-10-26-e044d08-glibc-musl-latency/):
+
+| Workload | Metric | glibc median (p25-p75, n) | musl median (p25-p75, n) | musl/glibc | pairs with musl lower (tied) |
+|---|---|---|---|---|---|
+| typing | echo_ms.p50 | 28.1 (27.7-29.5, 5) | 31.9 (31.7-31.9, 5) | 1.14 | 1/5 (0) |
+| typing | echo_ms.p90 | 50.8 (49.8-51.9, 5) | 53.7 (53.5-54.5, 5) | 1.06 | 0/5 (0) |
+| typing | stdin_to_next_datagram_ms.p50 | 26.7 (26.3-27.8, 5) | 28 (28-28.4, 5) | 1.05 | 1/5 (0) |
+| typing | stdin_to_next_datagram_ms.p90 | 49.2 (48.3-50.7, 5) | 50 (49.3-50.8, 5) | 1.02 | 1/5 (0) |
+| reconnect | recovery_s | 1.46 (1.46-1.47, 5) | 1.48 (1.47-1.48, 5) | 1.01 | 1/5 (0) |
 
 ### Published v0.5.0 and the musl build of `e044d08`
 
@@ -238,10 +268,6 @@ Raw data: [`performance/2026-10-26-v0.5.0-vs-e044d08-musl/`](performance/2026-10
 | idle | window.qshd.voluntary_switches_per_s | 69.8 (69.8-69.9, 5) | 117 (117-120, 5) | 1.67 | 0/5 (0) |
 | idle | window.relay.c2s_datagrams_per_s | 1.4 (1.4-1.4, 5) | 1.4 (1.4-1.4, 5) | 1 | 0/5 (5) |
 | idle | window.relay.s2c_datagrams_per_s | 1.4 (1.4-1.4, 5) | 1.4 (1.4-1.4, 5) | 1 | 0/5 (5) |
-| typing | echo_ms.p50 | 31.7 (30.1-33.3, 5) | 33.2 (33-33.3, 5) | 1.05 | 1/5 (0) |
-| typing | echo_ms.p90 | 55.2 (55.2-55.9, 5) | 55.6 (53.9-56.7, 5) | 1.01 | 2/5 (0) |
-| typing | stdin_to_datagram_ms.p50 | 26.5 (24.9-28.1, 5) | 27.9 (27.8-28.1, 5) | 1.06 | 1/5 (0) |
-| typing | stdin_to_datagram_ms.p90 | 50 (49.9-50.7, 5) | 50.3 (48.7-51.4, 5) | 1.01 | 2/5 (0) |
 | typing | window.qsh.cpu_percent | 1.5 (1.4-1.5, 5) | 5.79 (5.79-5.89, 5) | 3.87 | 0/5 (0) |
 | typing | window.qsh.voluntary_switches_per_s | 118 (117-118, 5) | 155 (154-155, 5) | 1.31 | 0/5 (0) |
 | typing | window.qshd.cpu_percent | 0.899 (0.899-0.899, 5) | 1.2 (1.2-1.3, 5) | 1.33 | 0/5 (0) |
@@ -269,10 +295,19 @@ Raw data: [`performance/2026-10-26-v0.5.0-vs-e044d08-musl/`](performance/2026-10
 | reconnect | outage.qshd.cpu_percent | 0.3 (0.3-0.4, 5) | 0.7 (0.7-0.7, 5) | 2.33 | 0/5 (0) |
 | reconnect | outage.qshd.voluntary_switches_per_s | 66.4 (66.3-66.5, 5) | 116 (113-116, 5) | 1.74 | 0/5 (0) |
 | reconnect | outage.terminal.presented_frames_per_s | 0.7 (0.7-0.8, 5) | 0.2 (0.1-0.2, 5) | 0.286 | 5/5 (0) |
-| reconnect | recovery_s | 1.46 (1.46-1.46, 5) | 1.47 (1.47-1.47, 5) | 1.01 | 1/5 (0) |
 | retained | window.qshd.cpu_percent | 1.6 (1.6-1.7, 5) | 3.7 (3.6-3.8, 5) | 2.31 | 0/5 (0) |
 | retained | window.qshd.voluntary_switches_per_s | 413 (412-417, 5) | 859 (856-877, 5) | 2.08 | 0/5 (0) |
 | retained | window.relay.s2c_datagrams_per_s | 5.6 (5.6-5.6, 5) | 5.3 (5.3-5.3, 5) | 0.946 | 5/5 (0) |
+
+Latency, from [`performance/2026-10-26-v0.5.0-vs-e044d08-musl-latency/`](performance/2026-10-26-v0.5.0-vs-e044d08-musl-latency/):
+
+| Workload | Metric | release-0.5.0 median (p25-p75, n) | musl-e044d08 median (p25-p75, n) | musl-e044d08/release-0.5.0 | pairs with musl-e044d08 lower (tied) |
+|---|---|---|---|---|---|
+| typing | echo_ms.p50 | 29 (28.8-30, 5) | 33.1 (31.6-33.7, 5) | 1.14 | 0/5 (0) |
+| typing | echo_ms.p90 | 51.5 (51.1-53.2, 5) | 55.5 (55.4-55.6, 5) | 1.08 | 0/5 (0) |
+| typing | stdin_to_next_datagram_ms.p50 | 27.9 (27.7-29, 5) | 29.2 (27.8-29.7, 5) | 1.04 | 2/5 (0) |
+| typing | stdin_to_next_datagram_ms.p90 | 50.5 (49.6-52, 5) | 51.4 (51.4-51.7, 5) | 1.02 | 3/5 (0) |
+| reconnect | recovery_s | 1.45 (1.45-1.46, 5) | 1.49 (1.49-1.5, 5) | 1.02 | 0/5 (0) |
 
 ### What these baselines show, for this host only
 
@@ -280,29 +315,23 @@ Raw data: [`performance/2026-10-26-v0.5.0-vs-e044d08-musl/`](performance/2026-10
   connected client uses 0.3% of a CPU in v0.5.0 and 9.8% in the musl build of
   `e044d08`; the glibc build of `e044d08` uses 3.6%. Its voluntary switches
   rose from about 71 to about 116 per second, and the server's from about 70
-  to about 117. Typing, redraw and outage CPU grew similarly. A profile of an
-  idle `e044d08` client is dominated by building and projecting unchanged
-  frames: `TerminalCore::frame`, `viewport::project`, libc memory copies and
-  `Cell` comparison. With eight retained sessions, qshd uses 1.6% of a CPU in
-  v0.5.0 and 3.7-3.9% now.
-
-  A bisection with this harness (idle, two 5 s repetitions per glibc build,
-  threshold 1.5%) places the client CPU increase first in `2aafa49` (#112):
-  0.5-0.6% before it, 5.5% from it on. On `e044d08`, the idle client uses
-  0.6% with `--predict never` and 3.4-3.8% with the default or `always`
-  modes; v0.5.0 uses 0.2-0.4% in all three modes. While prediction is
-  active, every 20 ms tick now builds, predicts and paints a complete frame
-  (`ShellState::tick`, `Session::paint_at`). The higher voluntary-switch rate
-  does not depend on the prediction mode and was not bisected.
+  to about 117. Typing, redraw and outage CPU grew similarly. With eight
+  retained sessions, qshd uses 1.6% of a CPU in v0.5.0 and 3.7-3.9% now.
+  These datasets do not establish a cause.
 - **The musl client costs 1.8-2.8 times the glibc client's CPU** at the same
   activity: equal voluntary switches, presented frames and datagrams. The
   released Linux binaries are musl builds. Server CPU differs little between
   the two builds (#307).
-- **Typing latency has not changed since v0.5.0 and does not depend on the
-  build.** The median time from a key to the client's datagram is 26-29 ms,
-  and its 90th percentile is about 50 ms. This is consistent with the client
-  driver's 50 ms command polling (#300). The echo adds about 5 ms on
-  loopback.
+- **Typing.** The median time from a key to the next client datagram is
+  27-29 ms in every build, and its 90th percentile is 49-51 ms. This
+  uncorrelated proxy does not show that the datagram carried the key; the
+  spread is consistent with, but does not prove, the client driver's 50 ms
+  command polling (#300). The median echo is 28-29 ms for glibc `e044d08`
+  and v0.5.0 and 32-33 ms for musl `e044d08`, which was later than glibc in
+  4 of 5 pairs and later than v0.5.0 in all 5. Within a run, the per-key
+  difference between the echo and the next datagram has a median of about
+  1.1-1.4 ms for v0.5.0 and glibc and about 3.6 ms for musl `e044d08`; these
+  runs do not show where that time is spent.
 - **Saturation.** `seq 1 2000000` completes in 2.2 s with glibc, 2.8 s with
   musl and 2.6 s with v0.5.0. musl was slower than glibc in 4 of 5 pairs.
   qshd uses most of a CPU while the output runs: 113% in v0.5.0 and 83-88%
@@ -314,6 +343,16 @@ Raw data: [`performance/2026-10-26-v0.5.0-vs-e044d08-musl/`](performance/2026-10
   left.
 - A few `retained` runs created threads during the window. Their live-thread
   counters are partial; `cpu_percent` is complete.
+
+### Provisional observations, not part of this baseline
+
+An informal bisection and profiles, made outside these runs and not
+retained, pointed at the idle work of the client's prediction tick, which
+was added with #112, and at full-frame building and copying. They are leads,
+not evidence, and none of the numbers above depends on them. That work is
+tracked in #303, with frame copies in #301 and presentation cadence in #304;
+a change to it should be measured with this procedure, with the raw results
+kept.
 
 These numbers are a reference for later comparisons on the same host, not
 performance promises for other platforms.

@@ -12,6 +12,7 @@ not belong in ordinary CI. See docs/performance-baseline.md.
 """
 
 import argparse
+import collections
 import ctypes
 import datetime
 import fcntl
@@ -35,13 +36,15 @@ import threading
 import time
 
 
-TOOL_VERSION = 1
+TOOL_VERSION = 2
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
 SETTLE = 2.0
 SETUP_TIMEOUT = 20.0
 LOG_TAIL = 4096
+# Timestamped terminal reads and client datagrams kept for latency lookups.
+EVENT_HISTORY = 65536
 # Rendered text may be interleaved with cursor and attribute sequences.
 SCAN_OVERLAP = 4096
 KEYS = b"qwertyuiop"
@@ -69,6 +72,14 @@ for frame in range(fps * seconds):
 
 class SetupError(Exception):
     """The run could not be prepared or a process misbehaved."""
+
+
+class Incomplete(SetupError):
+    """The workload ran but did not produce every intended sample."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
 
 
 class Interrupted(BaseException):
@@ -203,15 +214,35 @@ def binary_identity(path):
     with open(path, "rb") as source:
         for block in iter(lambda: source.read(1 << 20), b""):
             digest.update(block)
-    with tempfile.TemporaryDirectory(prefix="qsh-perf-version-") as home:
-        version = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=10,
-                                 cwd=home, env=minimal_environment(home))
     return {
         "sha256": digest.hexdigest(),
         "bytes": os.path.getsize(path),
-        "version": (version.stdout or version.stderr).strip().splitlines()[:1],
+        "version": version_of(path),
         **elf_identity(path),
     }
+
+
+def version_of(path):
+    """First line of `path --version`, run on an owned pseudo-terminal."""
+    with tempfile.TemporaryDirectory(prefix="qsh-perf-version-") as home:
+        terminal = Terminal(COLS, ROWS)
+        owned = None
+        try:
+            owned = Owned(spawn_on(terminal, [str(path), "--version"], minimal_environment(home), home))
+            terminal.start()
+            if not owned.wait(10):
+                raise SetupError(f"{path.name} --version did not exit")
+            # The read side ends once the last holder of the slave is gone.
+            terminal.thread.join(5)
+            text = ESCAPE.sub(b"", terminal.text_since(0)).decode("utf-8", "backslashreplace")
+        finally:
+            if owned:
+                owned.stop()
+            terminal.close()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if owned.status != 0:
+        raise SetupError(f"{path.name} --version exited with {owned.status}: {lines[-1:]}")
+    return lines[:1]
 
 
 def host_identity():
@@ -441,44 +472,68 @@ class Daemon(Owned):
 
 
 class Terminal:
-    """The client's pseudo-terminal: output is drained and counted."""
+    """The client's pseudo-terminal: output is drained, counted and timestamped.
+
+    Every descriptor is owned from openpty on. The drain thread is the only
+    reader of the master; close() stops and joins it before releasing the
+    descriptor, so no read can reach a number reused by a later run.
+    """
 
     def __init__(self, cols, rows):
         self.master, self.slave = os.openpty()
-        fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.wake_read = self.wake_write = None
+        self.started = False
+        self.released = False
+        try:
+            fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            self.wake_read, self.wake_write = os.pipe()
+        except BaseException:
+            self.release()
+            raise
         self.lock = threading.Lock()
         self.buffer = bytearray()
         self.total = 0
         self.frames = 0
+        # (stream offset after a read, monotonic time the read returned)
+        self.reads = collections.deque(maxlen=EVENT_HISTORY)
         self.closed = False
         self.thread = threading.Thread(target=self.drain, daemon=True)
 
     def start(self):
+        """Drop this process's slave descriptor, then start draining."""
         os.close(self.slave)
         self.slave = None
         self.thread.start()
+        self.started = True
 
     def drain(self):
+        poller = select.poll()
+        poller.register(self.master, select.POLLIN)
+        poller.register(self.wake_read, select.POLLIN)
         carry = b""
         while True:
+            if any(fd == self.wake_read for fd, _ in poller.poll()):
+                break
             try:
                 data = os.read(self.master, 65536)
             except OSError:
                 data = b""
+            now = time.monotonic()
             if not data:
-                with self.lock:
-                    self.closed = True
-                return
+                break
             window = carry + data
             frames = sum(window.count(marker) for marker in FRAME_MARKERS)
             frames -= sum(carry.count(marker) for marker in FRAME_MARKERS)
             carry = window[-5:]
             with self.lock:
                 self.total += len(data)
+                self.reads.append((self.total, now))
                 self.frames += frames
                 self.buffer += data
                 if len(self.buffer) > 1 << 20:
                     del self.buffer[:len(self.buffer) - (1 << 19)]
+        with self.lock:
+            self.closed = True
 
     def counters(self):
         with self.lock:
@@ -488,32 +543,70 @@ class Terminal:
         return self.snapshot_since(offset)[1]
 
     def snapshot_since(self, offset):
-        """(total bytes so far, retained bytes from `offset` on)."""
+        """(stream offset of the first retained byte, bytes from there on,
+        the reads that ended after it)."""
         with self.lock:
             start = max(0, len(self.buffer) - (self.total - offset))
-            return self.total, bytes(self.buffer[start:])
+            base = self.total - (len(self.buffer) - start)
+            reads = [read for read in self.reads if read[0] > base]
+            return base, bytes(self.buffer[start:]), reads
 
     def write(self, data):
         os.write(self.master, data)
 
     def wait_for(self, needle, timeout, offset=0):
-        """Time `needle` appears in the escape-free output after `offset`.
+        """When the read completing `needle` in escape-free output after
+        `offset` returned in the drain thread.
 
-        Each poll scans only new output plus an overlap, so the harness's own
-        CPU stays small while a workload streams output.
+        The time is taken where the bytes arrive, so it does not depend on
+        when this poll observes them. Each poll scans only new output plus an
+        overlap, so the harness's own CPU stays small while a workload
+        streams output.
         """
         deadline = time.monotonic() + timeout
         start = offset
         while time.monotonic() < deadline:
-            total, data = self.snapshot_since(start)
+            base, data, reads = self.snapshot_since(start)
             if needle in ESCAPE.sub(b"", data):
-                return time.monotonic()
-            start = max(start, total - SCAN_OVERLAP)
+                for end, at in reads:
+                    if needle in ESCAPE.sub(b"", data[:end - base]):
+                        return at
+                raise SetupError(f"the read that completed {needle!r} is no longer retained")
+            start = max(start, base + len(data) - SCAN_OVERLAP)
             time.sleep(0.005)
         raise SetupError(f"timed out waiting for {needle!r}")
 
-    def close(self):
-        os.close(self.master)
+    def close(self, timeout=5):
+        """Stop the reader, then release every descriptor; idempotent.
+
+        Returns False, keeping the master open, if the reader did not stop.
+        """
+        if self.released:
+            return True
+        if self.started:
+            os.write(self.wake_write, b"x")
+            self.thread.join(timeout)
+            if self.thread.is_alive():
+                return False
+        self.release()
+        return True
+
+    def release(self):
+        self.released = True
+        for name in ("slave", "master", "wake_read", "wake_write"):
+            descriptor = getattr(self, name)
+            if descriptor is not None:
+                setattr(self, name, None)
+                os.close(descriptor)
+
+
+def spawn_on(terminal, command, env, cwd):
+    """Start `command` as a session leader with `terminal` as its controlling
+    terminal, without a preexec hook in this threaded process."""
+    launcher = ("import fcntl, os, sys, termios; os.setsid(); "
+                "fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])")
+    return subprocess.Popen([sys.executable, "-I", "-c", launcher, *command], env=env, cwd=cwd,
+                            stdin=terminal.slave, stdout=terminal.slave, stderr=terminal.slave)
 
 
 class Relay:
@@ -531,7 +624,8 @@ class Relay:
         self.condition = threading.Condition()
         self.counts = {"c2s_datagrams": 0, "c2s_bytes": 0, "s2c_datagrams": 0, "s2c_bytes": 0,
                        "dropped_datagrams": 0}
-        self.last_c2s = 0.0
+        # (sequence number, monotonic arrival time) of client datagrams
+        self.c2s_arrivals = collections.deque(maxlen=EVENT_HISTORY)
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
 
@@ -552,7 +646,7 @@ class Relay:
                         self.client = source
                         self.counts["c2s_datagrams"] += 1
                         self.counts["c2s_bytes"] += len(data)
-                        self.last_c2s = now
+                        self.c2s_arrivals.append((self.counts["c2s_datagrams"], now))
                         self.condition.notify_all()
                         target = None
                     else:
@@ -572,7 +666,8 @@ class Relay:
             return dict(self.counts)
 
     def next_client_datagram(self, count, timeout):
-        """Arrival time of the first client datagram after `count` of them."""
+        """Arrival time of the first client datagram after `count` of them,
+        even when more have arrived since; None if none arrives in time."""
         deadline = time.monotonic() + timeout
         with self.condition:
             while self.counts["c2s_datagrams"] <= count:
@@ -580,7 +675,10 @@ class Relay:
                 if remaining <= 0:
                     return None
                 self.condition.wait(remaining)
-            return self.last_c2s
+            for number, at in self.c2s_arrivals:
+                if number == count + 1:
+                    return at
+        raise SetupError(f"client datagram {count + 1} is no longer retained")
 
     def set_cut(self, cut):
         with self.condition:
@@ -593,15 +691,49 @@ class Relay:
         self.back.close()
 
 
-def udp_bound(port):
-    needle = f":{port:04X} "
+def udp_inodes(port):
+    """Inodes of every IPv4 and IPv6 UDP socket bound to local `port`."""
+    found = set()
     for table in ("/proc/net/udp", "/proc/net/udp6"):
         try:
-            if any(needle in line.split(None, 2)[1] + " " for line in read(table).splitlines()[1:]):
-                return True
-        except (OSError, IndexError):
+            lines = read(table).splitlines()[1:]
+        except OSError:
             continue
-    return False
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 9 and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                found.add(int(fields[9]))
+    return found
+
+
+def socket_inodes(pid):
+    found = set()
+    for descriptor in os.listdir(f"/proc/{pid}/fd"):
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{descriptor}")
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            found.add(int(target[8:-1]))
+    return found
+
+
+def holds_port(owned, port):
+    """Whether the owned, still running process holds `port`.
+
+    Fails when the process has exited, or when any socket bound to the port
+    belongs to another process: traffic must never reach a foreign listener.
+    The process is unreaped while its descriptors are read, so its PID
+    cannot have been reused.
+    """
+    if owned.wait(0):
+        raise SetupError(f"qshd exited with {owned.status}")
+    bound = udp_inodes(port)
+    if not bound:
+        return False
+    if bound - socket_inodes(owned.pid):
+        raise SetupError(f"UDP port {port} is bound by a process other than the owned qshd")
+    return True
 
 
 def free_udp_port():
@@ -618,6 +750,8 @@ class Rig:
         self.root = root
         self.daemon = None
         self.relay = None
+        self.port = None
+        self.terminals = []
         self.clients = []
         self.server_home = private_home(root / "server")
         self.key = self.server_home / "id_ed25519"
@@ -636,28 +770,24 @@ class Rig:
                               "--host-key", str(self.server_home / "host_key")],
                              env, self.root / "qshd.log", self.server_home)
         deadline = time.monotonic() + SETUP_TIMEOUT
-        while not udp_bound(port):
-            if self.daemon.wait(0):
-                raise SetupError(f"qshd exited with {self.daemon.status} before binding")
+        while not holds_port(self.daemon, port):
             if time.monotonic() > deadline:
                 raise SetupError("qshd did not bind its port")
             time.sleep(0.05)
+        self.port = port
         self.relay = Relay(port)
 
     def start_client(self, name, options=()):
+        if not holds_port(self.daemon, self.port):
+            raise SetupError("qshd no longer holds its port")
         home = private_home(self.root / name)
         terminal = Terminal(COLS, ROWS)
+        self.terminals.append(terminal)
         env = minimal_environment(home, {"TERM": "xterm-256color", "HTTPS_PROXY": "http://127.0.0.1:1",
                                          "https_proxy": "http://127.0.0.1:1", "NO_PROXY": "", "no_proxy": ""})
-        # Become a session leader with this terminal as the controlling one,
-        # without a preexec hook in this threaded process.
-        launcher = ("import fcntl, os, sys, termios; os.setsid(); "
-                    "fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])")
-        command = [sys.executable, "-I", "-c", launcher, str(self.build / "qsh"), "--port", str(self.relay.port),
-                   "-i", str(self.key), *options, "127.0.0.1"]
-        process = subprocess.Popen(command, env=env, cwd=home, stdin=terminal.slave, stdout=terminal.slave,
-                                   stderr=terminal.slave)
-        client = Client(process, terminal)
+        command = [str(self.build / "qsh"), "--port", str(self.relay.port), "-i", str(self.key), *options,
+                   "127.0.0.1"]
+        client = Client(spawn_on(terminal, command, env, home), terminal)
         self.clients.append(client)
         terminal.start()
         terminal.wait_for(b"Key fingerprint", SETUP_TIMEOUT)
@@ -685,8 +815,9 @@ class Rig:
         leftovers = reap_owned(time.monotonic() + 10)
         if leftovers:
             failures.append(f"could not reap {len(leftovers)} owned processes")
-        for client in self.clients:
-            client.terminal.close()
+        stuck = sum(not terminal.close() for terminal in self.terminals)
+        if stuck:
+            failures.append(f"{stuck} terminal readers did not stop; their descriptors were kept open")
         return failures
 
 
@@ -719,11 +850,16 @@ def run_idle(rig, settings):
 
 
 def run_typing(rig, settings):
+    """Per key: when its echo was read from the terminal, and when the next
+    client datagram reached the relay. Both are taken where they arrive.
+
+    The datagram cannot be correlated with the key, because traffic is
+    encrypted: it is the first one after the write, whatever it carries.
+    """
     client = rig.start_client("client", ("--predict", "never", "--status", "off"))
-    offset = client.terminal.counters()[0]
     client.terminal.write(b"stty -icanon; cat > /dev/null\n")
     time.sleep(SETTLE)
-    dispatch, echo, missing = [], [], 0
+    datagram, echo = [], []
     before = rig.snapshot(client)
     for index in range(settings.keystrokes):
         key = KEYS[index % len(KEYS):index % len(KEYS) + 1]
@@ -731,22 +867,23 @@ def run_typing(rig, settings):
         datagrams = rig.relay.snapshot()["c2s_datagrams"]
         start = time.monotonic()
         client.terminal.write(key)
-        sent = rig.relay.next_client_datagram(datagrams, 2.0)
         try:
-            seen = client.terminal.wait_for(key, 2.0, offset)
+            echo.append((client.terminal.wait_for(key, 2.0, offset) - start) * 1000)
         except SetupError:
-            seen = None
-            missing += 1
+            pass
+        sent = rig.relay.next_client_datagram(datagrams, 2.0)
         if sent is not None:
-            dispatch.append((sent - start) * 1000)
-        if seen is not None:
-            echo.append((seen - start) * 1000)
+            datagram.append((sent - start) * 1000)
         time.sleep(max(0.0, settings.key_interval - (time.monotonic() - start)))
     result = {"window": window(before, rig.snapshot(client)), "keystrokes": settings.keystrokes,
-              "missing_echoes": missing}
-    for name, values in (("stdin_to_datagram_ms", dispatch), ("echo_ms", echo)):
+              "missing_echoes": settings.keystrokes - len(echo),
+              "missing_datagrams": settings.keystrokes - len(datagram)}
+    for name, values in (("stdin_to_next_datagram_ms", datagram), ("echo_ms", echo)):
         result[name] = {"p50": percentile(values, 0.5), "p90": percentile(values, 0.9),
                         "max": max(values) if values else None, "samples": [round(v, 3) for v in values]}
+    if result["missing_echoes"] or result["missing_datagrams"]:
+        raise Incomplete(f"{len(echo)} of {settings.keystrokes} echoes and {len(datagram)} of "
+                         f"{settings.keystrokes} datagrams observed", result)
     return result
 
 
@@ -818,6 +955,10 @@ def run_one(build, workload, settings, root):
         rig.start_daemon()
         record["result"] = RUNNERS[workload](rig, settings)
         record["ok"] = True
+    except Incomplete as error:
+        # Kept for diagnosis; a failed run never contributes to a summary.
+        record["result"] = error.result
+        record["error"] = str(error)
     except (SetupError, OSError, subprocess.SubprocessError) as error:
         record["error"] = str(error)
     finally:
@@ -848,7 +989,8 @@ def command_run(args):
     out = args.out
     out.mkdir(parents=True, exist_ok=False)
     (out / "runs").mkdir()
-    builds = dict(args.build)
+    # Children run in private directories, so relative paths would not resolve.
+    builds = {name: directory.resolve() for name, directory in args.build}
     if len(builds) != len(args.build):
         sys.exit("build names must be unique")
     for name, directory in builds.items():
@@ -872,8 +1014,7 @@ def command_run(args):
                                                          "retained_sessions")},
         "terminal": {"cols": COLS, "rows": ROWS},
         "workloads": workloads,
-        "builds": {name: {"label": name, "qsh": binary_identity(directory / "qsh"),
-                          "qshd": binary_identity(directory / "qshd")} for name, directory in builds.items()},
+        "builds": identify(builds),
         "order": [{"index": index, "repetition": rep, "workload": workload, "build": name}
                   for index, (rep, workload, name) in enumerate(order)],
     }
@@ -889,6 +1030,14 @@ def command_run(args):
         return 130
     print(f"{len(order) - failed} of {len(order)} runs succeeded; raw results in {out}")
     return 1 if failed else 0
+
+
+def identify(builds):
+    try:
+        return {name: {"label": name, "qsh": binary_identity(directory / "qsh"),
+                       "qshd": binary_identity(directory / "qshd")} for name, directory in builds.items()}
+    except (SetupError, OSError, subprocess.SubprocessError) as error:
+        sys.exit(f"cannot identify the builds: {error}")
 
 
 def run_all(order, builds, args, scratch, out):

@@ -1,4 +1,5 @@
 """Benchmark-harness accounting, ordering and isolation controls; no qsh binaries required."""
+import argparse
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts/perf_baseline.py'
@@ -29,6 +31,18 @@ def stat_line(pid, comm, ppid=1, utime=0, stime=0, threads=1, start=100):
 def sample(cpu_ticks, threads, start=100):
     return {'cpu_ticks': cpu_ticks, 'start_ticks': start, 'threads': threads, 'peak_rss_kib': 900,
             'rss_kib': 800}
+
+
+def is_open(descriptor):
+    try:
+        os.fstat(descriptor)
+        return True
+    except OSError:
+        return False
+
+
+BIND_AND_SLEEP = ('import socket, sys, time; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); '
+                  's.bind(("127.0.0.1", int(sys.argv[1]))); time.sleep(30)')
 
 
 class ProcAccountingTests(unittest.TestCase):
@@ -274,10 +288,36 @@ class RelayAndTerminalTests(unittest.TestCase):
             client.close()
             server.close()
 
-    def test_udp_bound(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.bind(('127.0.0.1', 0))
-            self.assertTrue(perf.udp_bound(sock.getsockname()[1]))
+    def test_relay_returns_the_first_datagram_after_the_count_when_observed_late(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server.bind(('127.0.0.1', 0))
+        server.settimeout(2)
+        relay = perf.Relay(server.getsockname()[1])
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # An unrelated datagram before the count is never attributed.
+            client.sendto(b'earlier', ('127.0.0.1', relay.port))
+            server.recvfrom(100)
+            count = relay.snapshot()['c2s_datagrams']
+            self.assertEqual(count, 1)
+            written = time.monotonic()
+            client.sendto(b'first', ('127.0.0.1', relay.port))
+            server.recvfrom(100)
+            between = time.monotonic()
+            client.sendto(b'second', ('127.0.0.1', relay.port))
+            server.recvfrom(100)
+            # The observer looks only now, after both arrivals.
+            time.sleep(0.1)
+            observed = time.monotonic()
+            arrival = relay.next_client_datagram(count, 2)
+            self.assertGreaterEqual(arrival, written)
+            self.assertLess(arrival, between)
+            self.assertLess(arrival, observed - 0.09)
+            self.assertLess(relay.next_client_datagram(count + 1, 2), observed - 0.09)
+        finally:
+            relay.close()
+            client.close()
+            server.close()
 
     def test_terminal_counts_frames_split_across_reads_and_strips_escapes(self):
         terminal = perf.Terminal(80, 24)
@@ -298,6 +338,246 @@ class RelayAndTerminalTests(unittest.TestCase):
         finally:
             os.close(writer)
             terminal.close()
+
+    def test_echo_time_is_when_the_completing_read_arrived(self):
+        terminal = perf.Terminal(80, 24)
+        writer = os.dup(terminal.slave)
+        terminal.start()
+        try:
+            os.write(writer, b'unrelated ')
+            time.sleep(0.05)
+            after_unrelated = time.monotonic()
+            os.write(writer, b'NEE')
+            time.sleep(0.05)
+            after_prefix = time.monotonic()
+            os.write(writer, b'\x1b[0mDLE')
+            time.sleep(0.2)
+            # The observer polls late; the recorded time is still the arrival.
+            observed = time.monotonic()
+            needle = terminal.wait_for(b'NEEDLE', 2)
+            self.assertGreaterEqual(needle, after_prefix)
+            self.assertLess(needle, observed - 0.15)
+            # An earlier needle in the same output keeps its own, earlier read.
+            self.assertLess(terminal.wait_for(b'unrelated', 2), after_unrelated)
+            # The offset excludes output that was already there.
+            offset = terminal.counters()[0]
+            with self.assertRaises(perf.SetupError):
+                terminal.wait_for(b'unrelated', 0.1, offset)
+        finally:
+            os.close(writer)
+            terminal.close()
+
+    def test_close_stops_a_blocked_reader_before_releasing_the_master(self):
+        terminal = perf.Terminal(80, 24)
+        # Another holder of the slave: the reader never sees end of file.
+        writer = os.dup(terminal.slave)
+        terminal.start()
+        master = terminal.master
+        alive_at_release = []
+        release = terminal.release
+        terminal.release = lambda: (alive_at_release.append(terminal.thread.is_alive()), release())
+        try:
+            os.write(writer, b'x')
+            terminal.wait_for(b'x', 2)
+            self.assertTrue(terminal.close())
+            self.assertEqual(alive_at_release, [False])
+            self.assertFalse(is_open(master))
+            self.assertTrue(terminal.close())
+            self.assertEqual(alive_at_release, [False])
+        finally:
+            os.close(writer)
+
+    def test_reader_that_does_not_stop_keeps_the_master_open(self):
+        terminal = perf.Terminal(80, 24)
+        terminal.start()
+        try:
+            with mock.patch.object(terminal.thread, 'join'), \
+                    mock.patch.object(terminal.thread, 'is_alive', return_value=True):
+                self.assertFalse(terminal.close())
+            self.assertTrue(is_open(terminal.master))
+        finally:
+            self.assertTrue(terminal.close())
+
+    def test_terminal_setup_failure_closes_both_descriptors(self):
+        opened = []
+        real_openpty = os.openpty
+
+        def openpty():
+            opened.extend(real_openpty())
+            return tuple(opened)
+
+        with mock.patch.object(perf.os, 'openpty', openpty), \
+                mock.patch.object(perf.fcntl, 'ioctl', side_effect=OSError('ioctl')):
+            with self.assertRaises(OSError):
+                perf.Terminal(80, 24)
+        self.assertEqual(len(opened), 2)
+        self.assertEqual([is_open(fd) for fd in opened], [False, False])
+
+    def test_reader_start_failure_releases_every_descriptor(self):
+        terminal = perf.Terminal(80, 24)
+        descriptors = [terminal.master, terminal.slave, terminal.wake_read, terminal.wake_write]
+        with mock.patch.object(terminal.thread, 'start', side_effect=RuntimeError('no thread')):
+            with self.assertRaises(RuntimeError):
+                terminal.start()
+        self.assertTrue(terminal.close())
+        self.assertEqual([is_open(fd) for fd in descriptors], [False] * 4)
+
+
+class OwnershipTests(unittest.TestCase):
+    def daemon(self, directory, code, *args):
+        return perf.Daemon([sys.executable, '-I', '-c', code, *args], {}, Path(directory) / 'log', directory)
+
+    def test_port_is_ready_only_when_held_by_the_owned_process(self):
+        port = perf.free_udp_port()
+        with tempfile.TemporaryDirectory() as directory:
+            daemon = self.daemon(directory, BIND_AND_SLEEP, str(port))
+            try:
+                deadline = time.monotonic() + 10
+                while not perf.holds_port(daemon, port):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.02)
+            finally:
+                daemon.stop()
+
+    def test_competing_bind_fails_closed(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as foreign, tempfile.TemporaryDirectory() as directory:
+            foreign.bind(('127.0.0.1', 0))
+            daemon = self.daemon(directory, 'import time; time.sleep(30)')
+            try:
+                with self.assertRaisesRegex(perf.SetupError, 'other than the owned qshd'):
+                    perf.holds_port(daemon, foreign.getsockname()[1])
+            finally:
+                daemon.stop()
+
+    def test_exited_owner_fails_even_when_the_port_is_bound_elsewhere(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as foreign, tempfile.TemporaryDirectory() as directory:
+            foreign.bind(('127.0.0.1', 0))
+            daemon = self.daemon(directory, 'raise SystemExit(3)')
+            self.assertTrue(daemon.wait(10))
+            with self.assertRaisesRegex(perf.SetupError, 'exited with 3'):
+                perf.holds_port(daemon, foreign.getsockname()[1])
+
+    def test_rig_owns_a_terminal_whose_client_never_started(self):
+        rig = perf.Rig.__new__(perf.Rig)
+        rig.build, rig.daemon, rig.relay, rig.port = Path('/nonexistent'), None, None, 1
+        rig.root, rig.key, rig.terminals, rig.clients = None, Path('/nonexistent/key'), [], []
+        rig.relay = argparse.Namespace(port=1, close=lambda: None)
+        opened = []
+        real_openpty = os.openpty
+
+        def openpty():
+            opened.extend(real_openpty())
+            return tuple(opened)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rig.root = Path(directory)
+            with mock.patch.object(perf, 'holds_port', return_value=True), \
+                    mock.patch.object(perf.os, 'openpty', openpty), \
+                    mock.patch.object(perf.subprocess, 'Popen', side_effect=OSError('spawn')):
+                with self.assertRaises(OSError):
+                    rig.start_client('client')
+            self.assertEqual(rig.clients, [])
+            with mock.patch.object(perf, 'reap_owned', return_value=[]):
+                self.assertEqual(rig.close(), [])
+        self.assertEqual([is_open(fd) for fd in opened], [False, False])
+
+    def test_version_is_read_on_an_owned_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'qsh'
+            fake.write_text('#!/bin/sh\nif [ -t 0 ] && [ -t 1 ]; then echo "qsh 9.9.9 on a terminal"; '
+                            'else echo "no terminal"; fi\n')
+            fake.chmod(0o700)
+            self.assertEqual(perf.version_of(fake), ['qsh 9.9.9 on a terminal'])
+            fake.write_text('#!/bin/sh\necho "unknown option"\nexit 2\n')
+            with self.assertRaisesRegex(perf.SetupError, r"exited with 2: \['unknown option'\]"):
+                perf.version_of(fake)
+
+
+class FakeTerminal:
+    def __init__(self, echo):
+        self.echo = echo
+        self.total = 0
+
+    def counters(self):
+        return self.total, 0
+
+    def write(self, data):
+        self.total += len(data)
+
+    def wait_for(self, needle, timeout, offset=0):
+        if not self.echo:
+            raise perf.SetupError(f'timed out waiting for {needle!r}')
+        return time.monotonic()
+
+    def text_since(self, offset):
+        return b''
+
+
+class FakeRelay:
+    def __init__(self, datagrams):
+        self.datagrams = datagrams
+
+    def snapshot(self):
+        return {'c2s_datagrams': 0, 'c2s_bytes': 0, 's2c_datagrams': 0, 's2c_bytes': 0, 'dropped_datagrams': 0}
+
+    def next_client_datagram(self, count, timeout):
+        return time.monotonic() if self.datagrams else None
+
+
+class FakeRig:
+    def __init__(self, echo=True, datagrams=True):
+        self.client = argparse.Namespace(terminal=FakeTerminal(echo), rusage=None)
+        self.relay = FakeRelay(datagrams)
+        self.daemon = None
+        self.clients = [self.client]
+
+    def start_daemon(self):
+        pass
+
+    def start_client(self, name, options=()):
+        return self.client
+
+    def snapshot(self, client=None):
+        time.sleep(0.001)
+        return {'t': time.monotonic(), 'qshd': sample(0, {}), 'relay': self.relay.snapshot(), 'qsh': sample(0, {}),
+                'terminal': (0, 0)}
+
+    def close(self):
+        return []
+
+
+class TypingQualificationTests(unittest.TestCase):
+    settings = argparse.Namespace(keystrokes=4, key_interval=0)
+
+    def run_one(self, rig):
+        with mock.patch.object(perf, 'SETTLE', 0), mock.patch.object(perf, 'Rig', lambda build, root: rig):
+            return perf.run_one(None, 'typing', self.settings, None)
+
+    def test_complete_typing_run_succeeds(self):
+        record = self.run_one(FakeRig())
+        self.assertTrue(record['ok'], record.get('error'))
+        self.assertEqual((record['result']['missing_echoes'], record['result']['missing_datagrams']), (0, 0))
+        self.assertEqual(len(record['result']['echo_ms']['samples']), 4)
+
+    def test_absent_echoes_fail_the_run(self):
+        record = self.run_one(FakeRig(echo=False))
+        self.assertFalse(record['ok'])
+        self.assertIn('0 of 4 echoes', record['error'])
+        self.assertEqual(record['result']['missing_echoes'], 4)
+
+    def test_absent_datagrams_fail_the_run(self):
+        record = self.run_one(FakeRig(datagrams=False))
+        self.assertFalse(record['ok'])
+        self.assertIn('0 of 4 datagrams', record['error'])
+        self.assertEqual(record['result']['missing_datagrams'], 4)
+
+    def test_incomplete_runs_never_reach_a_summary(self):
+        manifest = {'builds': {'a': {}}, 'workloads': ['typing']}
+        record = self.run_one(FakeRig(echo=False))
+        record.update(build='a', repetition=0)
+        result = perf.summary(manifest, [record])
+        self.assertEqual(result['rows'], [])
+        self.assertEqual(result['failed_runs'], [{'workload': 'typing', 'build': 'a', 'count': 1}])
 
 
 if __name__ == '__main__':
