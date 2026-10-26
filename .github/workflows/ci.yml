@@ -506,6 +506,46 @@ jobs:
           done
           if grep -q 'SKIPPED' "$runtime/input.log"; then exit 1; fi
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/input.log"
+          cargo test -p qsh --lib --locked ui_wait_ -- --color never --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/ui-wait-lib.log"
+          for name in \
+            signal_wake::tests::ui_wait_signal_common_handler_publishes_flag_and_readability \
+            signal_wake::tests::ui_wait_signal_other_thread_wakes_owner_and_preserves_errno \
+            signal_wake::tests::ui_wait_signal_eintr_and_full_buffer_preserve_errno_and_coalesce \
+            signal_wake::tests::ui_wait_signal_hard_send_failure_half_closes_without_fd_reuse \
+            signal_wake::tests::ui_wait_signal_buffered_bytes_precede_persistent_eof \
+            signal_wake::tests::ui_wait_signal_reinstall_reuses_fixed_endpoints \
+            signal_wake::tests::ui_wait_signal_continuously_replenished_notifications_have_bounded_drain \
+            signal_wake::tests::ui_wait_signal_global_failure_survives_reinstall_in_subprocess \
+            signal_wake::tests::ui_wait_signal_partial_install_retains_published_endpoints_in_subprocess \
+            ui_wait::tests::ui_wait_inbox_accepted_event_is_readable_before_another_event \
+            ui_wait::tests::ui_wait_inbox_failure_after_acceptance_never_invites_retry \
+            ui_wait::tests::ui_wait_inbox_last_sender_drop_publishes_disconnect_before_wake \
+            ui_wait::tests::ui_wait_inbox_fault_preserves_ingress_fence_beyond_sixteen_events \
+            ui_wait::tests::ui_wait_inbox_continuously_replenished_notifications_have_bounded_drain \
+            ui_wait::tests::ui_wait_inbox_last_drop_notification_fault_is_sticky \
+            ui_wait::tests::ui_wait_inbox_retirement_rejects_old_producers_without_replacing_wake \
+            background::tests::ui_wait_round_completion_and_panic_drop_wake_after_publication \
+            recovery::tests::ui_wait_recovery_observation_publishes_before_notification \
+            recovery_status::tests::ui_wait_recovery_backoff_keeps_its_fractional_ceil_phase \
+            recovery_status::tests::ui_wait_recovery_individual_checking_expiry_precedes_group_maximum \
+            road_catalog::tests::ui_wait_catalog_rotation_uses_last_actual_first_send_not_publication \
+            road_catalog::tests::ui_wait_catalog_completion_is_enqueued_before_notification \
+            road_catalog::tests::ui_wait_catalog_timed_out_address_parks_despite_another_free_slot_until_capacity_wake \
+            road_catalog::tests::ui_wait_catalog_cancelled_completion_still_wakes_real_capacity_release; do
+            grep -Fx "test $name ... ok" "$runtime/ui-wait-lib.log"
+          done
+          if grep -q 'SKIPPED' "$runtime/ui-wait-lib.log"; then exit 1; fi
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/ui-wait-lib.log"
+          cargo test -p qsh --bin qsh --locked ui_wait_ -- --color never --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/ui-wait-bin.log"
+          for name in \
+            tests::ui_wait_raw_turn_keeps_bounded_prefix_and_due_tick \
+            tests::ui_wait_cooked_replacement_observes_completion_without_stdin; do
+            grep -Fx "test $name ... ok" "$runtime/ui-wait-bin.log"
+          done
+          if grep -q 'SKIPPED' "$runtime/ui-wait-bin.log"; then exit 1; fi
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$runtime/ui-wait-bin.log"
           cargo test -p qsh --test recovery_port_probe --locked
           cargo test -p qsh --test connection_start --locked
           cargo test -p qsh --test paths --locked
