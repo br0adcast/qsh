@@ -420,6 +420,8 @@ struct CleanupReceipt {
     cleanup_requested: bool,
     notify: transport::channel_open::CleanupNotifier,
     reap_notify: Option<transport::channel_server::ReapNotifier>,
+    leader_notified: bool,
+    connection_closed: bool,
 }
 
 impl Pending {
@@ -652,6 +654,21 @@ fn read_loop(
             // now-peerless socket fails first and it never reaches the
             // point of waiting; see `spawn`'s cleanup on that path.
             Ok(None) | Err(_) => {
+                let pending = std::mem::take(
+                    &mut *waiting.lock().expect("the waiting map is never poisoned"),
+                );
+                let mut wake = Vec::with_capacity(pending.len());
+                for entry in pending.values() {
+                    let mut receipt = entry.receipt.lock().unwrap_or_else(|e| e.into_inner());
+                    receipt.connection_closed = true;
+                    if let Some(notifier) = &receipt.reap_notify {
+                        wake.push(notifier.clone());
+                    }
+                }
+                drop(pending); // Drop one-shot senders before waking exact owners.
+                for notifier in wake {
+                    notifier.notify();
+                }
                 if disconnected_locally.load(Ordering::SeqCst) {
                     crate::log::warn(
                         "worker",
@@ -663,10 +680,6 @@ fn read_loop(
                     crate::log::error("worker", "the helper is gone");
                     on_helper_gone();
                 }
-                waiting
-                    .lock()
-                    .expect("the waiting map is never poisoned")
-                    .clear();
                 return;
             }
         };
@@ -734,8 +747,17 @@ fn read_loop(
                 if let Some(tx) = pending.exited.take() {
                     let _ = tx.send(code);
                 }
+                let notifier = {
+                    let mut receipt = pending.receipt.lock().unwrap_or_else(|e| e.into_inner());
+                    receipt.leader_notified = true;
+                    receipt.reap_notify.clone()
+                };
                 if pending.finished() {
                     map.remove(&id);
+                }
+                drop(map);
+                if let Some(notifier) = notifier {
+                    notifier.notify();
                 }
             }
             Response::CleanupComplete { id, kind } => {
@@ -978,6 +1000,8 @@ impl HelperChannelSpawner {
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
             reap_notify: None,
+            leader_notified: false,
+            connection_closed: false,
         }));
         let construction = custody.protect(
             Box::new(HelperWait {
@@ -1083,15 +1107,20 @@ struct HelperWait {
 }
 
 impl ChannelWait for HelperWait {
+    fn active_observation(&self) -> transport::channel_server::ActiveObservation {
+        transport::channel_server::ActiveObservation::Notification
+    }
     fn set_reap_notifier(&mut self, notifier: transport::channel_server::ReapNotifier) {
-        let already_reaped = {
+        let evidence_ready = {
             let mut receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
             receipt.reap_notify = Some(notifier.clone());
             receipt.kind == Some(CleanupKind::Reaped)
+                || receipt.leader_notified
+                || receipt.connection_closed
         };
-        // A receipt may precede retirement registration. Never notify while
-        // holding the helper receipt lock: the worker reads the same receipt.
-        if already_reaped {
+        // A receipt or leader/seam event may precede notifier installation.
+        // Never notify under its lock: the observer reads the same receipt.
+        if evidence_ready {
             notifier.notify();
         }
     }
@@ -1107,11 +1136,10 @@ impl ChannelWait for HelperWait {
         if let Some(code) = self.leader_code {
             return Some(LeaderStatus::Exited { code: Some(code) });
         }
-        let reaped = self.receipt.lock().unwrap_or_else(|e| e.into_inner()).kind
-            == Some(CleanupKind::Reaped);
-        Some(if reaped {
+        let receipt = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+        Some(if receipt.kind == Some(CleanupKind::Reaped) {
             LeaderStatus::Exited { code: None }
-        } else if self.exits_closed {
+        } else if self.exits_closed || receipt.connection_closed {
             LeaderStatus::Unknown("helper exit receiver closed without cleanup proof".into())
         } else {
             LeaderStatus::Running
@@ -1125,7 +1153,7 @@ impl ChannelWait for HelperWait {
             ChildStatus::Reaped {
                 code: self.leader_code,
             }
-        } else if self.exits_closed {
+        } else if self.exits_closed || receipt.connection_closed {
             ChildStatus::Unknown("helper exit receiver closed without cleanup proof".into())
         } else {
             ChildStatus::Running
@@ -6936,6 +6964,85 @@ pub(crate) mod tests {
     include!("executor_open_tests.rs");
 
     #[test]
+    fn deadlines302_known_leader_then_disconnect_parks_until_exact_receipt() {
+        use transport::channel_server::{ChildStatus, LeaderStatus};
+        let (tx, peer) = channel::pair().unwrap();
+        let (send, exits) = mpsc::channel();
+        let custody = transport::channel_open::OpenCustody::new();
+        let receipt = Arc::new(Mutex::new(CleanupReceipt {
+            kind: None,
+            cleanup_requested: false,
+            notify: custody.cleanup_notifier(),
+            reap_notify: None,
+            leader_notified: false,
+            connection_closed: false,
+        }));
+        let waiting = Arc::new(Mutex::new(HashMap::from([(
+            302,
+            Pending {
+                opened: None,
+                exited: Some(send.clone()),
+                outcome: OpenOutcome::Opened,
+                receipt: receipt.clone(),
+            },
+        )])));
+        let read_socket = tx.try_clone().unwrap();
+        let local = Arc::new(AtomicBool::new(false));
+        let read_local = local.clone();
+        let reader = std::thread::spawn(move || {
+            read_loop(read_socket, waiting, read_local, || {}, Box::new(|_, _| {}))
+        });
+        let mut wait = HelperWait {
+            id: 302,
+            exits,
+            leader_code: None,
+            exits_closed: false,
+            receipt: receipt.clone(),
+            tx,
+            disconnected_locally: local,
+        };
+        drop(send);
+        channel::send(
+            &peer,
+            &encode(&Response::Exited { id: 302, code: 7 }).unwrap(),
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        loop {
+            if matches!(
+                wait.poll_leader_status(),
+                Some(LeaderStatus::Exited { code: Some(7) })
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "leader notification delivered");
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(wait.poll_exit(), ChildStatus::Running),
+            "normal one-shot exit sender drop is not helper disconnect"
+        );
+        assert!(
+            !receipt.lock().unwrap().connection_closed,
+            "normal Exited delivery is not seam loss"
+        );
+        drop(peer);
+        reader.join().unwrap();
+        assert!(receipt.lock().unwrap().leader_notified);
+        assert!(receipt.lock().unwrap().connection_closed);
+        let disconnected = wait.poll_exit();
+        receipt.lock().unwrap().kind = Some(CleanupKind::Reaped);
+        let recovered = wait.poll_exit();
+        drop(wait);
+        assert!(
+            matches!(disconnected, ChildStatus::Unknown(_)),
+            "disconnect after leader exit is not cleanup proof or a running scope"
+        );
+        assert!(matches!(recovered, ChildStatus::Reaped { code: Some(7) }));
+    }
+
+    #[test]
     fn helper39_leader_exited_without_scope_receipt_remains_owned() {
         use transport::channel_server::ChildStatus;
         let (tx, peer) = channel::pair().unwrap();
@@ -6946,6 +7053,8 @@ pub(crate) mod tests {
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
             reap_notify: None,
+            leader_notified: false,
+            connection_closed: false,
         }));
         let mut wait = HelperWait {
             id: 3902,

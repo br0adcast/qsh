@@ -53,6 +53,7 @@ pub(crate) struct State {
     stop: bool,
     stop_seen: bool,
     signal_allowed: bool,
+    active_poll: bool,
     pub(crate) terminal: Option<Option<i32>>,
     published: bool,
     retiring: bool,
@@ -149,7 +150,8 @@ impl Capsule {
     fn observe_active(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.retiring
+            if !state.active_poll
+                || state.retiring
                 || state.registering
                 || state.terminal.is_some()
                 || !state.signal_allowed
@@ -268,6 +270,16 @@ impl Lease {
     fn observe(&mut self) -> Option<Option<i32>> {
         let resources = self.resources.as_mut().expect("exclusive child lease");
         if !resources.notifier_installed {
+            let policy = resources
+                .child
+                .as_ref()
+                .expect("owned child")
+                .active_observation();
+            self.owner
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_poll = policy == super::ActiveObservation::Poll;
             resources
                 .child
                 .as_mut()
@@ -304,8 +316,9 @@ impl Lease {
                 .unwrap_or_else(|e| e.into_inner())
                 .retiring
             {
-                // Live observation is one shot. The runner's existing timer
-                // schedules its next observation without parking an OS thread.
+                // Live observation is one shot. Only polling backends use the
+                // active observer deadline; notified backends park without a
+                // periodic fallback or a retained blocking worker.
                 return None;
             }
             match resources.child.as_mut().expect("owned child").poll_exit() {
@@ -429,11 +442,28 @@ impl ReapSet {
             reaped: None,
             workers,
         }));
+        // Return exclusive resources before scheduling. This initial one-shot
+        // installs backend/worker notification capabilities even with no timer.
+        drop(lease);
+        owner.observe_active();
     }
     pub fn retire(&self, instance: u64) {
         if let Some(owner) = self.owners.get(&instance) {
             owner.retire(false);
         }
+    }
+    pub fn needs_active_observation(&self) -> bool {
+        self.owners.values().any(|owner| {
+            let state = owner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.active_poll
+                && !state.retiring
+                && !state.registering
+                && state.terminal.is_none()
+                && state.signal_allowed
+        })
     }
     pub fn observe_active(&self) {
         for owner in self.owners.values() {
@@ -479,6 +509,7 @@ impl ReapSet {
                 stop: stop_now,
                 stop_seen: false,
                 signal_allowed: true,
+                active_poll: true,
                 observation: None,
                 terminal: None,
                 published: false,

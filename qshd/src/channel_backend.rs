@@ -264,6 +264,9 @@ struct ChildWait(Box<dyn Child + Send + Sync>);
 
 #[cfg(not(target_os = "linux"))]
 impl ChannelWait for ChildWait {
+    fn active_observation(&self) -> transport::channel_server::ActiveObservation {
+        transport::channel_server::ActiveObservation::Unavailable
+    }
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
         use transport::channel_server::ChildStatus;
         match self.0.try_wait() {

@@ -2627,3 +2627,25 @@ fn reply44_failure_waits_for_a_late_warm_checkpoint_without_bypassing_geometry()
 }
 include!("channel_bridge_control_bounds_tests.rs");
 include!("channel_bridge_snapshot_bounds_tests.rs");
+
+#[test]
+fn deadlines302_pipe_gate_open_emits_scoped_ready_without_new_output() {
+    let mut rig = Rig::new();
+    rig.geometry(80, 0);
+    rig.drain(false);
+    let _ = rig.bridge.notifications();
+    rig.budget
+        .take_notification(ChannelInstance::new(1).unwrap(), 0);
+    assert_eq!(rig.gate.kind(), crate::send_gate::GateKind::Pipe);
+    rig.gate.update(crate::send_gate::PIPE_HIGH);
+    assert!(!rig.gate.is_open());
+    rig.bridge.refresh(&rig.server, false);
+    assert!(rig.gate.is_open());
+    let events = rig.bridge.notifications();
+    assert!(events.iter().any(|event| matches!(event, SessionInbound::OutputReady { stream: STREAM, instance, generation: 0 } if instance.get() == 1)));
+    assert!(rig
+        .budget
+        .take_notification(ChannelInstance::new(1).unwrap(), 0));
+    rig.bridge.refresh(&rig.server, false);
+    assert!(rig.bridge.notifications().is_empty());
+}
