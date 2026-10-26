@@ -222,6 +222,7 @@ mod tests {
         notify_raw(pair.write.as_raw_fd(), &failed, &shutdown, libc::EINTR);
         assert_eq!(nix::errno::Errno::last_raw(), libc::EDOM);
         assert!(ready(pair.read.as_raw_fd()));
+        let mut queued = 1usize; // The first successful notification above.
         let mut full = false;
         for _ in 0..65536 {
             #[cfg(target_vendor = "apple")]
@@ -234,14 +235,33 @@ mod tests {
                 full = true;
                 break;
             }
+            assert_eq!(n, 1);
+            queued += n as usize;
         }
         assert!(full, "the fixture must actually reach socket capacity");
         nix::errno::Errno::set_raw(libc::EDOM);
         notify_raw(pair.write.as_raw_fd(), &failed, &shutdown, libc::EINTR);
         assert_eq!(nix::errno::Errno::last_raw(), libc::EDOM);
         assert_eq!(failed.load(Ordering::Acquire), 0);
-        drain_fd(pair.read.as_raw_fd()).unwrap();
-        assert!(!ready(pair.read.as_raw_fd()));
+        // A full socket need not fit one bounded drain on every platform.
+        // No producer remains; each readable drain consumes at least one of
+        // the finite successfully queued bytes in this owned fixture.
+        for _ in 0..queued {
+            if !ready(pair.read.as_raw_fd()) {
+                break;
+            }
+            drain_fd(pair.read.as_raw_fd()).unwrap();
+        }
+        assert!(
+            !ready(pair.read.as_raw_fd()),
+            "finite queued bytes must drain"
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::recv(pair.read.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
     }
     #[test]
     fn ui_wait_signal_buffered_bytes_precede_persistent_eof() {
@@ -252,6 +272,12 @@ mod tests {
         nix::errno::Errno::set_raw(libc::EDOM);
         notify_raw(pair.write.as_raw_fd(), &failed, &shutdown, libc::ENOMEM);
         assert_eq!(nix::errno::Errno::last_raw(), libc::EDOM);
+        assert_eq!(failed.load(Ordering::Acquire), libc::ENOMEM);
+        assert_eq!(
+            shutdown.load(Ordering::Acquire),
+            0,
+            "the first half-close must succeed"
+        );
         let mut b = [0u8; 1];
         assert_eq!(
             unsafe { libc::recv(pair.read.as_raw_fd(), b.as_mut_ptr().cast(), 1, 0) },
@@ -262,11 +288,26 @@ mod tests {
             unsafe { libc::recv(pair.read.as_raw_fd(), b.as_mut_ptr().cast(), 1, 0) },
             0
         );
-        notify_raw(pair.write.as_raw_fd(), &failed, &shutdown, 0);
-        assert!(ready(pair.read.as_raw_fd()));
-        assert_eq!(shutdown.load(Ordering::Acquire), 0);
-        assert!(drain_fd(pair.read.as_raw_fd()).is_err());
-        assert!(unsafe { libc::fcntl(pair.write.as_raw_fd(), libc::F_GETFD) } >= 0);
+        for _ in 0..3 {
+            nix::errno::Errno::set_raw(libc::EDOM);
+            notify_raw(pair.write.as_raw_fd(), &failed, &shutdown, 0);
+            assert_eq!(nix::errno::Errno::last_raw(), libc::EDOM);
+            assert_eq!(failed.load(Ordering::Acquire), libc::ENOMEM);
+            // Darwin may report ENOTCONN after the first established EOF.
+            assert!(matches!(
+                shutdown.load(Ordering::Acquire),
+                0 | libc::ENOTCONN
+            ));
+            assert!(ready(pair.read.as_raw_fd()));
+            assert_eq!(
+                unsafe { libc::recv(pair.read.as_raw_fd(), b.as_mut_ptr().cast(), 1, 0) },
+                0
+            );
+            assert!(drain_fd(pair.read.as_raw_fd()).is_err());
+            for fd in [&pair.read, &pair.write] {
+                assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+            }
+        }
     }
     #[test]
     fn ui_wait_signal_other_thread_wakes_owner_and_preserves_errno() {
