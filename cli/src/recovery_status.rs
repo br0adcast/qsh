@@ -2,7 +2,10 @@
 //! they resolve to the same socket; a configured route is not an active attempt.
 use crate::recovery::Activity;
 use connect::{recovery_gate::AddressId, Address};
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QshState {
@@ -64,6 +67,18 @@ impl View {
         activity: Option<&Activity>,
         now: Instant,
     ) -> Self {
+        Self::build_with_deadline(addresses, endpoints, resolving, warm, activity, now).0
+    }
+
+    pub fn build_with_deadline(
+        addresses: &[Address],
+        endpoints: &[(AddressId, SocketAddr)],
+        resolving: &[AddressId],
+        warm: &[(SocketAddr, Instant)],
+        activity: Option<&Activity>,
+        now: Instant,
+    ) -> (Self, Option<Instant>) {
+        let mut deadline: Option<Instant> = None;
         let targets = addresses
             .iter()
             .enumerate()
@@ -94,13 +109,27 @@ impl View {
                 } else {
                     QshState::Queued
                 };
+                if qsh == QshState::Checking {
+                    if let Some(expires) = warm
+                        .iter()
+                        .filter(|(probe, _)| Some(*probe) == endpoint)
+                        .filter_map(|(_, sent)| sent.checked_add(transport::paths::PROBE_TIMEOUT))
+                        .filter(|expires| *expires > now)
+                        .max()
+                    {
+                        deadline = Some(deadline.map_or(expires, |previous| previous.min(expires)));
+                    }
+                }
                 let label = target(&addr.host, addr.qsh_port);
                 let ssh = addr.ssh.as_ref().map(|route| {
                     let state = match activity {
                         Some(a) if a.ssh == Some(id) => SshState::Trying,
                         Some(a) if a.ssh_retry_at.is_some_and(|until| until > now) => {
                             let left = a.ssh_retry_at.unwrap().duration_since(now);
-                            SshState::Backoff(left.as_secs() + u64::from(left.subsec_nanos() > 0))
+                            let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+                            let next = a.ssh_retry_at.unwrap() - Duration::from_secs(seconds - 1);
+                            deadline = Some(deadline.map_or(next, |previous| previous.min(next)));
+                            SshState::Backoff(seconds)
                         }
                         Some(a) if a.ssh_allowed => SshState::Queued,
                         _ => SshState::Gated,
@@ -116,7 +145,7 @@ impl View {
                 }
             })
             .collect();
-        Self { targets }
+        (Self { targets }, deadline)
     }
     /// Stable text and positions: only brightness depends on worker activity.
     pub fn header_spans(&self) -> Vec<(String, bool)> {
@@ -168,4 +197,88 @@ fn target(host: &str, port: u16) -> String {
         "{}:{port}",
         crate::status::bracketed(&crate::report::printable(host))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    fn address(host: &str) -> Address {
+        Address {
+            host: host.into(),
+            qsh_port: 60000,
+            ssh: Some(connect::SshRoute {
+                port: 22,
+                knock: Vec::new(),
+            }),
+        }
+    }
+    #[test]
+    fn ui_wait_recovery_backoff_keeps_its_fractional_ceil_phase() {
+        let start = Instant::now();
+        let addresses = [address("example.test")];
+        let activity = Activity {
+            qsh: Vec::new(),
+            ssh: None,
+            ssh_retry_at: Some(start + Duration::from_millis(10250)),
+            ssh_allowed: true,
+        };
+        for (at, secs, next) in [
+            (7000, 4, 7250),
+            (7250, 3, 8250),
+            (8250, 2, 9250),
+            (9250, 1, 10250),
+        ] {
+            let (view, deadline) = View::build_with_deadline(
+                &addresses,
+                &[],
+                &[],
+                &[],
+                Some(&activity),
+                start + Duration::from_millis(at),
+            );
+            assert_eq!(
+                view.targets[0].ssh.as_ref().unwrap().1,
+                SshState::Backoff(secs)
+            );
+            assert_eq!(deadline, Some(start + Duration::from_millis(next)));
+        }
+        let (view, deadline) = View::build_with_deadline(
+            &addresses,
+            &[],
+            &[],
+            &[],
+            Some(&activity),
+            start + Duration::from_millis(10250),
+        );
+        assert_eq!(view.targets[0].ssh.as_ref().unwrap().1, SshState::Queued);
+        assert_eq!(deadline, None);
+    }
+    #[test]
+    fn ui_wait_recovery_individual_checking_expiry_precedes_group_maximum() {
+        let start = Instant::now();
+        let addresses = [address("first.test"), address("second.test")];
+        let a = "192.0.2.1:60000".parse().unwrap();
+        let b = "192.0.2.2:60000".parse().unwrap();
+        let endpoints = [(AddressId(0), a), (AddressId(1), b)];
+        let warm = [(a, start), (b, start + Duration::from_millis(400))];
+        let (view, deadline) =
+            View::build_with_deadline(&addresses, &endpoints, &[], &warm, None, start);
+        assert_eq!(view.targets[0].qsh, QshState::Checking);
+        assert_eq!(deadline, Some(start + transport::paths::PROBE_TIMEOUT));
+        let (view, deadline) = View::build_with_deadline(
+            &addresses,
+            &endpoints,
+            &[],
+            &warm,
+            None,
+            start + transport::paths::PROBE_TIMEOUT,
+        );
+        assert_eq!(view.targets[0].qsh, QshState::Queued);
+        assert_eq!(view.targets[1].qsh, QshState::Checking);
+        assert_eq!(
+            deadline,
+            Some(start + Duration::from_millis(400) + transport::paths::PROBE_TIMEOUT)
+        );
+    }
 }

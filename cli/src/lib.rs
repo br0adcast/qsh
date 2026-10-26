@@ -31,6 +31,7 @@ pub mod road_catalog;
 pub mod session;
 pub mod sessions;
 mod sessions_store;
+mod signal_wake;
 pub mod signals;
 pub mod ssh_authorization;
 pub mod ssh_bindings;
@@ -40,5 +41,7 @@ pub mod statusline;
 pub mod ticker;
 pub mod trust;
 pub mod tty;
+#[doc(hidden)]
+pub mod ui_wait;
 pub mod viewport;
 pub mod window;

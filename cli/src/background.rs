@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use crate::climb::{Climb, Climbed, Connected, Mode, Setup};
 use crate::recovery::Recovery;
 use crate::session::UiEvent;
+use crate::ui_wait::UiSender;
 
 /// How one background round ended.
 // Handed over once per round and taken apart at once: the size of the large
@@ -31,6 +32,29 @@ pub enum Round {
         end: RoundEnd,
         line: Option<String>,
     },
+}
+
+/// The result and disconnection become authoritative before their wake.
+struct Completion<T> {
+    sender: Option<Sender<T>>,
+    wake: Option<crate::input_wake::WakeSender>,
+}
+impl<T> Completion<T> {
+    fn send(&self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        self.sender.as_ref().unwrap().send(value)?;
+        if let Some(wake) = &self.wake {
+            let _ = wake.notify();
+        }
+        Ok(())
+    }
+}
+impl<T> Drop for Completion<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(wake) = &self.wake {
+            let _ = wake.notify();
+        }
+    }
 }
 
 /// Dropping an unfinished recovery cancels both workers. If a success was
@@ -109,8 +133,9 @@ pub fn spawn_round(
     first: usize,
     (cols, rows): (u16, u16),
     round: u64,
-    progress: Sender<UiEvent>,
+    progress: impl Into<UiSender>,
 ) -> RoundTask {
+    let progress = progress.into();
     let epoch = RecoveryEpoch {
         connection: round,
         network: 0,
@@ -137,12 +162,13 @@ pub fn spawn_catalog_round(
     first: usize,
     size: (u16, u16),
     round: u64,
-    progress: Sender<UiEvent>,
+    progress: impl Into<UiSender>,
     epoch: RecoveryEpoch,
     membership: Vec<AddressId>,
     endpoints: Vec<(AddressId, SocketAddr)>,
     fresh_session: bool,
 ) -> RoundTask {
+    let progress = progress.into();
     let recovery = Arc::new(Recovery::with_catalog(epoch, membership, endpoints));
     launch(
         setup,
@@ -164,12 +190,19 @@ fn launch(
     first: usize,
     (cols, rows): (u16, u16),
     round: u64,
-    progress: Sender<UiEvent>,
+    progress: UiSender,
     epoch: RecoveryEpoch,
     recovery: Arc<Recovery>,
     fresh_session: bool,
 ) -> RoundTask {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
+    if let Some(wake) = progress.notifier() {
+        recovery.set_notification(wake);
+    }
+    let done_tx = Completion {
+        sender: Some(done_tx),
+        wake: progress.notifier(),
+    };
     let owner_setup = setup.clone();
     let worker = recovery.clone();
     std::thread::Builder::new()
@@ -262,7 +295,8 @@ fn launch(
 
 /// Moves every event of connection number `link` into the main loop's channel, wrapped
 /// in `UiEvent::FromLink`, until the connection's senders are gone.
-pub fn forward(link: u64, events: Receiver<UiEvent>, to: Sender<UiEvent>) {
+pub fn forward(link: u64, events: Receiver<UiEvent>, to: impl Into<UiSender>) {
+    let to = to.into();
     std::thread::Builder::new()
         .name(format!("qsh-link-{link}"))
         .spawn(move || {
@@ -316,5 +350,46 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Disconnected),
             "the forwarder ends with the connection's senders"
         );
+    }
+    #[test]
+    fn ui_wait_round_completion_and_panic_drop_wake_after_publication() {
+        use std::os::fd::AsRawFd;
+        for publish in [false, true] {
+            let (mut reader, sender) = crate::input_wake::pair().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let completion = Completion {
+                sender: Some(tx),
+                wake: Some(sender),
+            };
+            let worker = std::thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    // Exercise the actual completion owner during worker unwind.
+                    // resume_unwind avoids running the process-global panic hook.
+                    let completion = completion;
+                    if publish {
+                        completion.send(7).unwrap();
+                    } else {
+                        std::panic::resume_unwind(Box::new(()));
+                    }
+                }))
+                .is_err()
+            });
+            assert_eq!(worker.join().unwrap(), !publish);
+            assert_eq!(
+                rx.try_recv(),
+                if publish {
+                    Ok(7)
+                } else {
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)
+                }
+            );
+            let mut p = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 1);
+            reader.drain().unwrap();
+        }
     }
 }

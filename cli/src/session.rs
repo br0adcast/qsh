@@ -51,6 +51,7 @@ pub enum LocalInputFailure {
     Rejected(transport::driver_std::SendBlocked),
     Accepted(transport::driver_std::InputFailure),
     ReaderUnavailable,
+    UiWaitUnavailable,
     IngressFull,
     PendingFull,
     NotReady,
@@ -239,6 +240,14 @@ enum AgeClock {
 struct SessionDeadlines {
     resize_ms: Option<i64>,
     status_ms: i64,
+}
+
+/// The existing model and owner clocks, read without consuming work.
+#[derive(Clone, Copy, Debug)]
+pub struct UiDeadlines {
+    pub resize_ms: Option<i64>,
+    pub status_ms: i64,
+    pub shell: client::ShellDeadlines,
 }
 
 pub struct Session {
@@ -472,6 +481,7 @@ impl Session {
                     ),
                     LocalInputFailure::Rejected(reason) => format!("qsh: local input was not accepted ({reason:?})"),
                     LocalInputFailure::ReaderUnavailable => "qsh: keyboard input wait failed".into(),
+                    LocalInputFailure::UiWaitUnavailable => "qsh: local UI wait failed; input was not replayed".into(),
                     LocalInputFailure::IngressFull => "qsh: keyboard input buffer limit reached".into(),
                     LocalInputFailure::PendingFull => "qsh: pending shell input buffer limit reached".into(),
                     LocalInputFailure::NotReady => "qsh: shell input is not ready".into(),
@@ -594,6 +604,15 @@ impl Session {
                 && matches!(self.shell_channel, ShellChannel::Ready(_)))
             .then_some(self.resize_due_ms),
             status_ms: self.line_refreshed_ms.saturating_add(LINE_REFRESH_MS),
+        }
+    }
+
+    pub fn ui_deadlines(&self) -> UiDeadlines {
+        let local = self.deadlines();
+        UiDeadlines {
+            resize_ms: local.resize_ms,
+            status_ms: local.status_ms,
+            shell: self.shell.deadlines(self.rtt_ms),
         }
     }
 

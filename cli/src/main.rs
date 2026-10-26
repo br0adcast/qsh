@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,15 +32,14 @@ use qsh::background::Round;
 use qsh::climb::{Climb, Climbed, Connected, Mode, Setup, Sink, Trial};
 use qsh::input_reader::InputReader;
 use qsh::session::{self as session, Action, Chrome, Session, UiEvent};
-use qsh::ticker::Ticker;
+use qsh::ui_wait::{ModelFollowup, QueueState, UiInbox, UiSender};
 use qsh::{
     args, background, connect, known_hosts, log, prompt, sessions, signals, status, trust, tty,
     window,
 };
 
-/// How often the loop wakes to expire predictions, advance the "link lost"
-/// counter and let a settled resize out.
-const TICK: Duration = Duration::from_millis(20);
+/// Only outstanding actual probe/refusal evidence uses this active observer.
+const PROBE_OBSERVER: Duration = Duration::from_millis(20);
 
 /// How often the roads are looked at while the connection-state window is
 /// open, and while it is not (the status line names the road in use).
@@ -190,7 +189,14 @@ fn run(a: args::Args) -> i32 {
         connection: 0,
         network: 0,
     };
-    let mut resolver = BoundedResolver::new();
+    let mut inbox = match UiInbox::new() {
+        Ok(inbox) => inbox,
+        Err(error) => {
+            eprintln!("qsh: could not initialize UI waits: {error}");
+            return 1;
+        }
+    };
+    let mut resolver = BoundedResolver::with_notification(inbox.notifier());
     loop {
         let (code, links) = connected_session(
             setup.clone(),
@@ -199,7 +205,7 @@ fn run(a: args::Args) -> i32 {
             &mut display,
             addresses,
             epoch,
-            resolver,
+            (resolver, &mut inbox),
         );
         let lost = links.replacement_at.is_some();
         addresses = links.addresses.clone();
@@ -215,6 +221,9 @@ fn run(a: args::Args) -> i32 {
         }
         // Cancels workers and invalidates their authorization before any question.
         resolver = links.leave();
+        if inbox.failed() || signals::notification_failure().is_some() {
+            return 1;
+        }
         if !lost {
             return code;
         }
@@ -244,8 +253,10 @@ fn run(a: args::Args) -> i32 {
             }
         }
         let shell_size = display.logical;
+        let round_notification = inbox.notifier();
         let start_round = |epoch, catalog: &RoadCatalog| {
             let (progress, _) = mpsc::channel();
+            let progress = UiSender::with_notification(progress, round_notification.clone());
             background::spawn_catalog_round(
                 setup.clone(),
                 addresses.clone(),
@@ -293,7 +304,23 @@ fn run(a: args::Args) -> i32 {
                     catalog.reset(epoch);
                     task = start_round(epoch, &catalog);
                 }
-                Err(TryRecvError::Empty) => std::thread::sleep(TICK),
+                Err(TryRecvError::Empty) => {
+                    let now = started.elapsed();
+                    let due = catalog
+                        .next_deadline(now, |id| resolver.can_submit(id))
+                        .into_iter()
+                        .chain(resolver.next_deadline())
+                        .min()
+                        .and_then(|at| started.checked_add(at));
+                    let waited = inbox.wait_until(due, signals::notification_fd().ok(), None);
+                    let drained = inbox.drain().and_then(|()| signals::drain_notifications());
+                    if let Err(error) = waited.and(drained.map(|()| false)) {
+                        eprintln!("qsh: replacement wait failed: {error}");
+                        return 1;
+                    }
+                    // A drained wake commits the next complete round/catalog
+                    // observation before this cooked owner can park again.
+                }
             }
         }
         // Stop the replacement recovery before the live session takes ownership.
@@ -316,9 +343,9 @@ fn connected_session(
     display: &mut DisplaySize,
     mut addresses: Vec<Address>,
     road_epoch: RecoveryEpoch,
-    resolver: BoundedResolver,
+    (resolver, inbox): (BoundedResolver, &mut UiInbox),
 ) -> (i32, Links) {
-    let (tx, rx) = mpsc::channel::<UiEvent>();
+    let tx = inbox.renew();
     background::forward(0, events, tx.clone());
     let Connected {
         attempt,
@@ -375,6 +402,8 @@ fn connected_session(
         road_active: remote,
         refusal: None,
         probe_attempt: 0,
+        probe_observed_at: None,
+        recovery_view_deadline: None,
         keep: false,
         round: None,
         rounds: 0,
@@ -384,7 +413,11 @@ fn connected_session(
         replacement_at: None,
         tx: tx.clone(),
     };
-    interactive(setup, links, display, tx, rx)
+    let result = interactive(setup, links, display, tx, inbox);
+    // InputReader is joined (or was never started) before old producers lose
+    // their receiver. The same wake/pool survive the cooked replacement phase.
+    inbox.retire();
+    result
 }
 
 /// Keep the same bounded resolver pool across shell lifetimes, including the
@@ -583,6 +616,8 @@ struct Links {
     road_active: SocketAddr,
     refusal: Option<(RefusalWindow, Option<PortProbe>, Duration)>,
     probe_attempt: u64,
+    probe_observed_at: Option<Instant>,
+    recovery_view_deadline: Option<Instant>,
     /// The person left with `Ctrl-] .`: the live link is let go quietly, so
     /// the session stays on the server.
     keep: bool,
@@ -606,7 +641,7 @@ struct Links {
     replacement_at: Option<usize>,
     /// The main loop's own channel: where rounds say how they go, and where
     /// every connection's forwarder delivers.
-    tx: Sender<UiEvent>,
+    tx: UiSender,
 }
 
 impl Links {
@@ -870,6 +905,7 @@ impl Links {
     /// publication and background SSH rounds. No resolver call runs here.
     fn refresh_catalog(&mut self) {
         let now = self.road_origin.elapsed();
+        self.probe_observed_at = Some(Instant::now());
         let urgent = if let Some(live) = &self.live {
             let client = &live.attempt.client;
             self.road_active = client.active_path().unwrap_or(self.road_active);
@@ -1002,13 +1038,14 @@ impl Links {
 
     /// Observe current work only; the complete catalog remains the source of
     /// logical names even when transport probes rotate through eight sockets.
-    fn refresh_recovery_status(&self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
+    fn refresh_recovery_status(&mut self, sess: &mut Session, now_ms: i64) -> Vec<Action> {
         let outage = self.round.is_some()
             || self.live.is_none()
             || self.live.as_ref().is_some_and(|l| {
                 u64::from(l.attempt.client.stats().silent_secs)
                     >= transport::PATH_DOWN_AFTER.as_secs()
             });
+        let mut next_transition = None;
         let view = outage.then(|| {
             let activity = self.round.as_ref().map(background::RoundTask::activity);
             let warm: Vec<_> = self
@@ -1024,15 +1061,18 @@ impl Links {
                         .collect()
                 })
                 .unwrap_or_default();
-            qsh::recovery_status::View::build(
+            let (view, deadline) = qsh::recovery_status::View::build_with_deadline(
                 &self.addresses,
                 &self.catalog.endpoints(),
                 &self.catalog.resolving(),
                 &warm,
                 activity.as_ref(),
                 Instant::now(),
-            )
+            );
+            next_transition = deadline;
+            view
         });
+        self.recovery_view_deadline = next_transition;
         let mut actions = sess.handle(UiEvent::RecoveryStatus { view }, now_ms);
         if let Some(warning) = self
             .round
@@ -1080,6 +1120,65 @@ impl Links {
             self.reconnect.in_use(i);
         }
         sess.handle(UiEvent::Roads { roads }, now_ms)
+    }
+
+    fn probe_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.refusal
+            .as_ref()
+            .and_then(|(_, probe, _)| probe.as_ref())
+            .and_then(PortProbe::raw_fd)
+    }
+    fn next_deadline(&self, sess: &Session, origin: Instant, now: Instant) -> Option<Instant> {
+        let road_now = now.saturating_duration_since(self.road_origin);
+        let endpoints = self.catalog.endpoints();
+        let mut due = Vec::with_capacity(8);
+        due.extend(
+            self.catalog
+                .next_deadline(road_now, |id| self.resolver.can_submit(id))
+                .and_then(|at| self.road_origin.checked_add(at)),
+        );
+        due.extend(
+            self.resolver
+                .next_deadline()
+                .and_then(|at| self.road_origin.checked_add(at)),
+        );
+        due.extend(self.recovery_view_deadline);
+        if let Phase::Waiting { until } = self.reconnect.phase() {
+            due.extend(origin.checked_add(until));
+        }
+        if self.live.is_some() {
+            let every = if sess.window_open() {
+                ROADS_WINDOW_MS
+            } else {
+                ROADS_LINE_MS
+            };
+            due.push(
+                self.roads_at
+                    .and_then(|at| elapsed_deadline(origin, at.saturating_add(every)))
+                    .unwrap_or(now),
+            );
+            let observe = self.catalog.needs_probe_observation()
+                || self
+                    .refusal
+                    .as_ref()
+                    .is_some_and(|(window, _, _)| window.needs_probe_observation(&endpoints));
+            if observe {
+                due.extend(
+                    self.probe_observed_at
+                        .unwrap_or(now)
+                        .checked_add(PROBE_OBSERVER),
+                );
+            }
+        }
+        if let Some((window, _, retry_at)) = &self.refusal {
+            due.extend(self.road_origin.checked_add(*retry_at));
+            due.extend(
+                window
+                    .next_deadline(road_now, &endpoints)
+                    .and_then(|at| self.road_origin.checked_add(at)),
+            );
+        }
+        due.into_iter().min()
     }
 
     /// Moves the traffic to road `addr`, as the window asked. The transport
@@ -1448,8 +1547,8 @@ fn interactive(
     setup: Arc<Setup>,
     mut links: Links,
     display: &mut DisplaySize,
-    tx: mpsc::Sender<UiEvent>,
-    rx: mpsc::Receiver<UiEvent>,
+    tx: UiSender,
+    rx: &mut UiInbox,
 ) -> (i32, Links) {
     let out_fd = std::io::stdout().as_raw_fd();
 
@@ -1544,13 +1643,63 @@ fn interactive(
     // (through `at`).
     let now_ms = move || started.elapsed().as_millis() as i64;
     let mut stdout = std::io::stdout();
-    let mut ticker = Ticker::new(TICK, started);
+    let mut followup = ModelFollowup::default();
+    let mut tick_serviced = false;
+    let mut wait_fault_reported = false;
 
     // A `loop { ... break value; }` rather than a pre-initialized `mut code`:
     // the loop's only way out sets the real code right before leaving, so a
     // placeholder initial value would never be read.
     let mut notices: Vec<String> = Vec::new();
     let code = loop {
+        let now = Instant::now();
+        followup.observe(
+            sess.ui_deadlines().shell.prediction_refresh,
+            std::mem::take(&mut tick_serviced),
+            now,
+        );
+        let session_due = session_deadline(&sess, started, followup.deadline());
+        let wait_due = session_due
+            .into_iter()
+            .chain(links.next_deadline(&sess, started, now))
+            .min();
+        let mut events = Vec::new();
+        let (mut queue, mut external_taken) = collect_ui_turn(rx, &mut events, session_due, now);
+        if events.is_empty()
+            && queue == QueueState::Empty
+            && !signals::has_pending()
+            && !rx.failed()
+            && wait_due.is_none_or(|deadline| deadline > now)
+        {
+            if let Err(error) =
+                rx.wait_until(wait_due, signals::notification_fd().ok(), links.probe_fd())
+            {
+                if !wait_fault_reported {
+                    log::error(&format!("UI wait failed: {error}"));
+                    wait_fault_reported = true;
+                }
+                rx.mark_failed();
+            }
+            (queue, external_taken) = collect_ui_turn(rx, &mut events, session_due, Instant::now());
+        }
+        if let Err(error) = rx.drain().and_then(|()| signals::drain_notifications()) {
+            if !wait_fault_reported {
+                log::error(&format!("UI notification failed: {error}"));
+                wait_fault_reported = true;
+            }
+            rx.mark_failed();
+        }
+        // Seal before the authoritative post-fault read. A failure published
+        // later cannot authorize an exit using this turn's earlier Empty.
+        let sealed_fault =
+            if let Some(state) = collect_failed_ui_turn(rx, &mut events, external_taken) {
+                queue = state;
+                true
+            } else {
+                false
+            };
+        // Even empty notification turns reach Links::turn below. Never drain
+        // Round/DNS publication and then park without observing its owner.
         let mut pending = signals::take_pending();
         if pending.suspend {
             // SIGTSTP: the terminal goes back to the shell the way it would
@@ -1579,10 +1728,11 @@ fn interactive(
             pending.terminate |= later.terminate;
             pending.resumed = true;
         }
-        let mut events = Vec::new();
+        let mut signal_prefix = 0;
         if pending.resized {
             let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
-            events.push(UiEvent::Resized { cols: c, rows: r });
+            events.insert(signal_prefix, UiEvent::Resized { cols: c, rows: r });
+            signal_prefix += 1;
         }
         if pending.resumed {
             // Whatever had this terminal while we were stopped left it
@@ -1596,19 +1746,20 @@ fn interactive(
                 log::error(&format!("could not restore raw mode: {e}"));
                 break 1;
             }
-            events.push(UiEvent::Resumed);
+            events.insert(signal_prefix, UiEvent::Resumed);
+            signal_prefix += 1;
         }
         if pending.terminate {
-            events.push(UiEvent::Terminate);
+            events.insert(signal_prefix, UiEvent::Terminate);
         }
-        collect_ui_turn(&rx, &mut events);
-        // A tick is due because time passed, not because the channel went
-        // quiet. During a sustained burst of output (`yes`, a large `cat`, a
-        // compile) `recv_timeout` never times out, and a tick derived from
-        // that timeout would never fire at all -- leaving a settled resize
-        // unsent and expired predictions on screen for the whole burst.
-        if ticker.due(std::time::Instant::now()) {
-            events.push(UiEvent::Tick);
+        if queue != QueueState::BudgetReached {
+            if sealed_fault {
+                events.push(UiEvent::InputFailure(
+                    session::LocalInputFailure::UiWaitUnavailable,
+                ));
+            } else if queue == QueueState::Disconnected {
+                events.push(UiEvent::Terminate);
+            }
         }
 
         let mut leaving = None;
@@ -1643,6 +1794,9 @@ fn interactive(
             // one that knows what a stream number means, so it decodes them
             // here into the channel protocol, or into the `Stream0`/
             // `StreamReset` `Session` already understands.
+            if matches!(ev, UiEvent::Tick) {
+                tick_serviced = true;
+            }
             let actions = match ev {
                 UiEvent::Wire { stream, bytes } => {
                     taken.add(stream, bytes.len());
@@ -1767,25 +1921,53 @@ fn interactive(
     (code, links)
 }
 
-/// Collect receiver events in FIFO order after the current signal prefix.
-fn collect_ui_turn(rx: &Receiver<UiEvent>, events: &mut Vec<UiEvent>) {
-    const EXTERNAL_EVENTS: usize = 16;
-    let mut external = 0;
-    match rx.recv_timeout(TICK) {
-        Ok(ev) => {
-            events.push(ev);
-            external = 1;
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Err(mpsc::RecvTimeoutError::Disconnected) => events.push(UiEvent::Terminate),
+fn elapsed_deadline(origin: Instant, milliseconds: i64) -> Option<Instant> {
+    origin.checked_add(Duration::from_millis(milliseconds.max(0) as u64))
+}
+fn session_deadline(sess: &Session, origin: Instant, followup: Option<Instant>) -> Option<Instant> {
+    let deadlines = sess.ui_deadlines();
+    [
+        elapsed_deadline(origin, deadlines.status_ms),
+        deadlines
+            .resize_ms
+            .and_then(|at| elapsed_deadline(origin, at)),
+        deadlines.shell.synchronized_output,
+        deadlines
+            .shell
+            .prediction_ms
+            .and_then(|at| elapsed_deadline(origin, at)),
+        followup,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+/// External ownership stays FIFO/bounded even when a due clock shares this turn.
+fn collect_ui_turn(
+    rx: &UiInbox,
+    events: &mut Vec<UiEvent>,
+    due: Option<Instant>,
+    now: Instant,
+) -> (QueueState, usize) {
+    let before = events.len();
+    let state = rx.collect_into(events);
+    let external_taken = events.len() - before;
+    if due.is_some_and(|deadline| deadline <= now) {
+        events.push(UiEvent::Tick);
     }
-    // Keep consecutive output batched, with a finite turn even when producers
-    // keep filling the receiver. Signals and clock-derived Tick remain outside
-    // this external-event budget. Uncollected events retain their FIFO/custody.
-    for _ in external..EXTERNAL_EVENTS {
-        let Ok(ev) = rx.try_recv() else { break };
-        events.push(ev);
+    (state, external_taken)
+}
+
+fn collect_failed_ui_turn(
+    rx: &UiInbox,
+    events: &mut Vec<UiEvent>,
+    external_taken: usize,
+) -> Option<QueueState> {
+    if !rx.failed() {
+        return None;
     }
+    rx.mark_failed();
+    Some(rx.collect_up_to(events, 16usize.saturating_sub(external_taken)))
 }
 
 fn discard_terminal_input() {
@@ -2210,6 +2392,8 @@ mod tests {
             road_active: "127.0.0.1:60022".parse().unwrap(),
             refusal: None,
             probe_attempt: 0,
+            probe_observed_at: None,
+            recovery_view_deadline: None,
             keep: false,
             round: None,
             rounds: 0,
@@ -2217,7 +2401,7 @@ mod tests {
             farewell: None,
             stopped: false,
             replacement_at: None,
-            tx,
+            tx: tx.into(),
         };
         for reason in [
             transport::SessionAbortReason::ResourceExhausted,
@@ -2333,5 +2517,144 @@ mod tests {
                 transport::SessionAbortReason::ResourceExhausted
             ))
         ));
+    }
+    #[test]
+    fn ui_wait_raw_turn_keeps_bounded_prefix_and_due_tick() {
+        let mut inbox = UiInbox::new().unwrap();
+        let tx = inbox.renew();
+        for _ in 0..17 {
+            tx.send(UiEvent::Stats(transport::Stats::default()))
+                .unwrap();
+        }
+        let mut sess = geometry_session();
+        let mut channels = ChannelSession::new(QshSubstrate::new(|_, _| Ok(())));
+        let channel = channels.open_shell(20, 5).unwrap();
+        sess.on_channel_ready(channel, 0);
+        sess.handle(UiEvent::Resized { cols: 40, rows: 6 }, 10);
+        let origin = Instant::now();
+        let due = session_deadline(&sess, origin, None);
+        assert_eq!(due, Some(origin + Duration::from_millis(140)));
+        let mut events = Vec::new();
+        assert_eq!(
+            collect_ui_turn(
+                &inbox,
+                &mut events,
+                due,
+                origin + Duration::from_millis(140)
+            )
+            .0,
+            QueueState::BudgetReached
+        );
+        assert_eq!(events.len(), 17);
+        assert_eq!(events.last(), Some(&UiEvent::Tick));
+        let mut actions = Vec::new();
+        for event in events.drain(..) {
+            actions.extend(sess.handle(event, 140));
+        }
+        assert!(actions.contains(&Action::ResizeChannel {
+            ch: channel,
+            cols: 40,
+            rows: 6
+        }));
+        assert_eq!(
+            collect_ui_turn(&inbox, &mut events, None, origin).0,
+            QueueState::Empty
+        );
+        assert_eq!(events, vec![UiEvent::Stats(transport::Stats::default())]);
+    }
+    #[test]
+    fn ui_wait_raw_fault_recollects_after_initial_empty_before_termination() {
+        for initial in [0, 16] {
+            let mut inbox = UiInbox::new().unwrap();
+            let sender = inbox.renew();
+            for _ in 0..initial {
+                sender.send(UiEvent::Tick).unwrap();
+            }
+            let mut events = Vec::new();
+            assert_eq!(
+                inbox.collect_into(&mut events),
+                if initial == 0 {
+                    QueueState::Empty
+                } else {
+                    QueueState::BudgetReached
+                }
+            );
+            // Publication occurs after the owner's first bounded collection.
+            let worker = std::thread::spawn(move || {
+                sender.send(UiEvent::Resumed).unwrap();
+            });
+            worker.join().unwrap();
+            // Inject owner fault discovery only after the accepted publication.
+            inbox.mark_failed();
+            if initial == 16 {
+                assert_eq!(
+                    collect_failed_ui_turn(&inbox, &mut events, initial),
+                    Some(QueueState::BudgetReached)
+                );
+                assert_eq!(
+                    events.len(),
+                    16,
+                    "fault recollection must not extend the external budget"
+                );
+                events.clear(); // The owner's first prefix has been serviced.
+            }
+            assert_eq!(
+                collect_failed_ui_turn(&inbox, &mut events, 0),
+                Some(QueueState::Disconnected)
+            );
+            assert_eq!(events, vec![UiEvent::Resumed]);
+        }
+    }
+
+    #[test]
+    fn ui_wait_raw_fault_counts_external_capacity_separately_from_signal_and_tick() {
+        let mut inbox = UiInbox::new().unwrap();
+        let sender = inbox.renew();
+        for _ in 0..15 {
+            sender.send(UiEvent::Resumed).unwrap();
+        }
+        let now = Instant::now();
+        let prefix = UiEvent::Resized { cols: 80, rows: 24 };
+        let mut events = vec![prefix];
+        let (_, external_taken) = collect_ui_turn(&inbox, &mut events, Some(now), now);
+        assert_eq!(external_taken, 15);
+        assert_eq!(events.len(), 17); // Signal +15 external +local Tick.
+        sender.send(UiEvent::Resumed).unwrap();
+        inbox.mark_failed();
+        assert_eq!(
+            collect_failed_ui_turn(&inbox, &mut events, external_taken),
+            Some(QueueState::BudgetReached)
+        );
+        assert_eq!(
+            events.len(),
+            18,
+            "one external slot remains despite the signal and Tick"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&UiEvent::Resized { cols: 80, rows: 24 })
+        );
+        assert_eq!(events[16], UiEvent::Tick);
+        assert_eq!(events[17], UiEvent::Resumed);
+    }
+
+    #[test]
+    fn ui_wait_cooked_replacement_observes_completion_without_stdin() {
+        let mut inbox = UiInbox::new().unwrap();
+        inbox.retire();
+        inbox.drain().unwrap();
+        let notify = inbox.notifier();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(7).unwrap();
+            notify.notify().unwrap();
+        });
+        let ready = inbox
+            .wait_until(Some(Instant::now() + Duration::from_secs(2)), None, None)
+            .unwrap();
+        worker.join().unwrap();
+        assert!(ready, "completion must wake the poll, not wait for timeout");
+        inbox.drain().unwrap();
+        assert_eq!(rx.try_recv(), Ok(7));
     }
 }

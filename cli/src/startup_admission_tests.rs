@@ -294,7 +294,7 @@ fn client179_shared_authenticated_startup_refusal_is_terminal_not_a_failed_sweep
         setup.args.addresses.clone(),
         0,
         Mode::Background {
-            progress: tx.clone(),
+            progress: tx.clone().into(),
             round: 1,
         },
         80,
@@ -362,7 +362,7 @@ fn client179_direct_wrapper_local_refusal_does_not_grant_ssh_credit() {
         setup.args.addresses.clone(),
         0,
         Mode::Background {
-            progress: tx.clone(),
+            progress: tx.clone().into(),
             round: 1,
         },
         80,

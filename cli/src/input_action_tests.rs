@@ -38,6 +38,8 @@ fn input_executor_links() -> (tempfile::TempDir, Links) {
         road_active: "127.0.0.1:60022".parse().unwrap(),
         refusal: None,
         probe_attempt: 0,
+        probe_observed_at: None,
+        recovery_view_deadline: None,
         keep: false,
         round: None,
         rounds: 0,
@@ -45,7 +47,7 @@ fn input_executor_links() -> (tempfile::TempDir, Links) {
         farewell: None,
         stopped: false,
         replacement_at: None,
-        tx,
+        tx: tx.into(),
     };
     (home, links)
 }

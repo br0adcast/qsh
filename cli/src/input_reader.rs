@@ -3,10 +3,11 @@
 use crate::input_ingress::{IngressBlocked, IngressBudget, READ_BYTES};
 use crate::input_wake::{self, WakeReader, WakeSender};
 use crate::session::{LocalInputFailure, UiEvent};
+use crate::ui_wait::UiSender;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 struct InputControl {
@@ -22,16 +23,17 @@ pub struct InputReader {
 }
 
 impl InputReader {
-    pub fn start(tx: Sender<UiEvent>) -> io::Result<Self> {
+    pub fn start(tx: impl Into<UiSender>) -> io::Result<Self> {
         Self::start_fd(tx, std::io::stdin().as_raw_fd(), IngressBudget::default())
     }
 
     /// The caller keeps stdin_fd open and exclusively readable until stop/Drop.
     pub fn start_fd(
-        tx: Sender<UiEvent>,
+        tx: impl Into<UiSender>,
         stdin_fd: RawFd,
         budget: IngressBudget,
     ) -> io::Result<Self> {
+        let tx = tx.into();
         let (wake, sender) = input_wake::pair()?;
         let control = Arc::new(InputControl {
             cancelled: AtomicBool::new(false),
@@ -105,7 +107,7 @@ fn wait_reply(
 }
 
 fn read_input(
-    tx: &Sender<UiEvent>,
+    tx: &UiSender,
     stdin_fd: RawFd,
     budget: IngressBudget,
     control: &InputControl,
