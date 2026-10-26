@@ -51,6 +51,8 @@ mod sim_cookie;
 #[cfg(test)]
 mod sim_credits;
 #[cfg(test)]
+mod sim_idle_traffic;
+#[cfg(test)]
 mod sim_negotiation;
 #[cfg(test)]
 mod sim_regressions;
