@@ -14,6 +14,7 @@ thread_local! {
     static MEASURED: LocalCell<Option<Allocations>> = const { LocalCell::new(None) };
     static GRID_SIZES: LocalCell<(usize, usize)> = const { LocalCell::new((0, 0)) };
     static GRID_CALLS: LocalCell<usize> = const { LocalCell::new(0) };
+    static LARGEST: LocalCell<usize> = const { LocalCell::new(0) };
 }
 fn note(bytes: usize) {
     let _ = MEASURED.try_with(|slot| {
@@ -25,6 +26,7 @@ fn note(bytes: usize) {
             count.calls += 1;
             count.bytes += bytes;
             slot.set(Some(count));
+            LARGEST.set(LARGEST.get().max(bytes));
         }
     });
 }
@@ -224,13 +226,15 @@ fn history_repaint_has_no_transient_retained_frame_copy() {
     let output = transport::shell_frame::encode_record(transport::shell_frame::REC_DATA, b"X");
     GRID_CALLS.set(0);
     GRID_SIZES.set((40 * 5 * size_of::<Cell>(), 40 * 6 * size_of::<Cell>()));
-    let (actions, _) = measured(|| session.handle(UiEvent::Stream0(output), 1004));
+    let (actions, cost) = measured(|| session.handle(UiEvent::Stream0(output), 1004));
     assert!(actions
         .iter()
         .all(|action| !matches!(action, qsh::session::Action::Write(_))));
-    // Authoritative snapshot, padded projection and status-row insertion.
-    // The unchanged retained view does not reach Renderer retention.
-    assert_eq!(GRID_CALLS.get(), 3);
+    // The authoritative snapshot, the padded projection of the pinned view
+    // and the status-row insertion all reuse storage of earlier frames, and
+    // the unchanged view does not reach Renderer retention.
+    assert_eq!(GRID_CALLS.get(), 0);
+    assert!(cost.bytes < 40 * 5 * size_of::<Cell>(), "{cost:?}");
     session.handle(
         UiEvent::Stats(transport::Stats {
             silent_secs: 4,
@@ -240,12 +244,13 @@ fn history_repaint_has_no_transient_retained_frame_copy() {
     );
     GRID_CALLS.set(0);
     GRID_SIZES.set((40 * 5 * size_of::<Cell>(), 40 * 6 * size_of::<Cell>()));
-    let (actions, _) = measured(|| session.handle(UiEvent::Tick, 2004));
+    let (actions, cost) = measured(|| session.handle(UiEvent::Tick, 2004));
     assert!(actions
         .iter()
         .any(|action| matches!(action, qsh::session::Action::Write(bytes) if !bytes.is_empty())));
-    // A dirty presentation additionally retains Renderer's previous frame.
-    assert_eq!(GRID_CALLS.get(), 4);
+    // A dirty presentation also updates Renderer's retained frame, in place.
+    assert_eq!(GRID_CALLS.get(), 0);
+    assert!(cost.bytes < 40 * 5 * size_of::<Cell>(), "{cost:?}");
 }
 
 #[test]
@@ -310,6 +315,122 @@ fn owned_presentation_matches_explicit_complete_frames_and_rendered_bytes() {
             assert_eq!(hidden.ch, '🦀');
             assert_eq!(hidden.combining, source.cell(0, 3).combining);
             assert_eq!(source, saved);
+        }
+    }
+}
+
+/// After a warm-up, a presented step reuses the storage of earlier frames:
+/// no allocation in a step is as large as one grid, whether the primary screen
+/// scrolls under the status line, a full-screen application redraws
+/// combining-heavy content on the alternate screen, the history view pages,
+/// or the status line is off.
+#[test]
+fn steady_presentation_allocates_no_grid() {
+    use qsh::session::{Action, Chrome, Session, UiEvent};
+    let data = |bytes: &[u8]| {
+        UiEvent::Stream0(transport::shell_frame::encode_record(
+            transport::shell_frame::REC_DATA,
+            bytes,
+        ))
+    };
+    let keys = |bytes: &[u8]| {
+        UiEvent::Stdin(
+            qsh::input_ingress::IngressBudget::default()
+                .admit_slice(bytes)
+                .unwrap(),
+        )
+    };
+    let redraw = |n: usize| {
+        let mut text = String::from("\x1b[H");
+        for row in 0..11 {
+            text.push_str(&format!("\x1b[{};1H\x1b[3{}m", row + 1, (row + n) % 8));
+            for col in 0..40 {
+                text.push(char::from(b'a' + ((row + col + n) % 26) as u8));
+                text.push_str("\u{301}\u{302}");
+            }
+        }
+        text
+    };
+    for (name, line, prepare, step) in [
+        (
+            "primary scroll",
+            true,
+            Vec::new(),
+            Box::new(move |n: usize| vec![data(format!("line {n} 界\r\n").as_bytes())])
+                as Box<dyn Fn(usize) -> Vec<UiEvent>>,
+        ),
+        (
+            "alternate combining",
+            true,
+            vec![data(b"\x1b[?1049h")],
+            Box::new(move |n| vec![data(redraw(n).as_bytes())]),
+        ),
+        (
+            "history paging",
+            true,
+            vec![
+                data(
+                    (0..200)
+                        .map(|n| format!("old {n}\r\n"))
+                        .collect::<String>()
+                        .as_bytes(),
+                ),
+                keys(b"\x1d["),
+            ],
+            Box::new(move |n| {
+                vec![keys(if n.is_multiple_of(2) {
+                    b"\x1b[5~"
+                } else {
+                    b"\x1b[6~"
+                })]
+            }),
+        ),
+        (
+            "no status line",
+            false,
+            Vec::new(),
+            Box::new(move |n| vec![data(format!("line {n}\r\n").as_bytes())]),
+        ),
+    ] {
+        let mut session = Session::new(
+            40,
+            12,
+            render::TermCaps::truecolor(),
+            qsh::args::PredictMode::Never,
+            Chrome {
+                prefix: qsh::escape::DEFAULT_PREFIX,
+                line,
+                glyphs: qsh::window::Glyphs {
+                    utf8: true,
+                    colour: true,
+                },
+            },
+        );
+        session.handle(UiEvent::Link(transport::LinkState::Live), 0);
+        session.on_channel_ready(16, 0);
+        let mut now = 1;
+        for event in prepare {
+            session.handle(event, now);
+            now += 1;
+        }
+        let grid = 40 * 11 * size_of::<Cell>();
+        for n in 0..24 {
+            for event in step(n) {
+                now += 1;
+                LARGEST.set(0);
+                let (actions, cost) = measured(|| session.handle(event, now));
+                assert!(
+                    actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Write(bytes) if !bytes.is_empty())),
+                    "{name} step {n} presented nothing"
+                );
+                // The emulator's own per-cell storage for combining marks is
+                // many small allocations; only a grid-sized one is a frame.
+                if n >= 4 {
+                    assert!(LARGEST.get() < grid, "{name} step {n}: {cost:?}");
+                }
+            }
         }
     }
 }

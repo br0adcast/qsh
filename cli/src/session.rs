@@ -274,6 +274,8 @@ pub struct Session {
     last_frame: Option<terminal::Frame>,
     painted_clock: Option<TemporalChromeKey>,
     #[cfg(test)]
+    recycling: tests::Recycling,
+    #[cfg(test)]
     projections: usize,
     #[cfg(test)]
     repaints: usize,
@@ -387,6 +389,8 @@ impl Session {
             last_frame: None,
             painted_clock: None,
             #[cfg(test)]
+            recycling: tests::Recycling::Keep,
+            #[cfg(test)]
             projections: 0,
             #[cfg(test)]
             repaints: 0,
@@ -497,7 +501,7 @@ impl Session {
             UiEvent::Stdin(bytes) => self.on_stdin(bytes, now_ms),
             UiEvent::Stream0(bytes) => {
                 let frame = self.shell.on_stream0(&bytes, now_ms, self.rtt_ms);
-                self.paint_at(&frame, now_ms)
+                self.paint_at(frame, now_ms)
             }
             UiEvent::StreamReset => {
                 self.close_history();
@@ -505,8 +509,8 @@ impl Session {
                 // Our idea of the screen came from a backlog the peer has
                 // thrown away: diffing against it would paint nonsense.
                 self.renderer.invalidate();
-                self.last_frame = None;
-                self.paint_at(&frame, now_ms)
+                self.forget_shown();
+                self.paint_at(frame, now_ms)
             }
             UiEvent::Link(state) => self.on_link(state, now_ms),
             UiEvent::Stats(stats) => {
@@ -520,7 +524,7 @@ impl Session {
                 // tracking, and something else has been drawing on this
                 // terminal while we were stopped.
                 self.renderer.invalidate();
-                self.last_frame = None;
+                self.forget_shown();
                 self.repaint(now_ms)
             }
             UiEvent::Terminate => self.leave(0),
@@ -664,7 +668,7 @@ impl Session {
         let chrome_changed =
             line_changed || self.temporal_chrome_key() != self.painted_clock.unwrap_or_default();
         if let Some(frame) = self.shell.tick_at(now, now_ms, self.rtt_ms) {
-            actions.extend(self.paint_at(&frame, now_ms));
+            actions.extend(self.paint_at(frame, now_ms));
         } else if self.raw_cols != 0 && self.raw_rows != 0 && chrome_changed {
             actions.extend(self.repaint(now_ms));
         }
@@ -717,7 +721,7 @@ impl Session {
             self.repaints += 1;
         }
         let frame = self.shell.frame(now_ms, self.rtt_ms);
-        self.paint_at(&frame, now_ms)
+        self.paint_at(frame, now_ms)
     }
 
     /// The link is gone; retain only input not yet admitted to the driver.
@@ -739,7 +743,7 @@ impl Session {
     pub fn on_reattached(&mut self, now_ms: i64) -> Vec<Action> {
         let frame = self.shell.on_reattach();
         self.renderer.invalidate();
-        self.last_frame = None;
+        self.forget_shown();
         self.plate = None;
         self.clear_recovery_view();
         self.lost_since_ms = None;
@@ -756,7 +760,7 @@ impl Session {
         };
         let queued = self.take_pending_input();
         self.shell_channel = ShellChannel::Reattaching { ch, queued };
-        self.paint_at(&frame, now_ms)
+        self.paint_at(frame, now_ms)
     }
 
     /// The server listed what it is running (a warm reattach).
@@ -842,12 +846,14 @@ impl Session {
         }
         if self.logical_size != size {
             self.logical_size = size;
-            self.history_frame = None;
+            if let Some(old) = self.history_frame.take() {
+                self.recycle(old);
+            }
         }
         let frame = self.shell.geometry_frame(record.cols, record.rows, now_ms);
         self.renderer.invalidate();
-        self.last_frame = None;
-        self.paint_at(&frame, now_ms)
+        self.forget_shown();
+        self.paint_at(frame, now_ms)
     }
 
     pub fn on_resize_refused(&mut self, reason: ResizeRefusal, now_ms: i64) -> Vec<Action> {
@@ -1045,7 +1051,8 @@ impl Session {
                 Piece::Command(Command::Scroll) => {
                     self.close_window();
                     self.shell.set_history_view(true);
-                    self.history_frame = Some(self.shell.frame(now_ms, self.rtt_ms));
+                    let frame = self.shell.frame(now_ms, self.rtt_ms);
+                    self.hold_history(frame);
                     actions.extend(self.repaint(now_ms));
                 }
             }
@@ -1087,8 +1094,17 @@ impl Session {
         self.queue_or_send(input, now_ms)
     }
 
+    /// Pin `frame` as the history view, recycling the one it replaces.
+    fn hold_history(&mut self, frame: terminal::Frame) {
+        if let Some(old) = self.history_frame.replace(frame) {
+            self.recycle(old);
+        }
+    }
+
     fn close_history(&mut self) {
-        self.history_frame = None;
+        if let Some(old) = self.history_frame.take() {
+            self.recycle(old);
+        }
         self.history_held.clear();
         self.mouse
             .hand_back_owned(std::mem::take(&mut self.history_tail));
@@ -1128,7 +1144,8 @@ impl Session {
                 _ => 0,
             };
             if delta != 0 {
-                self.history_frame = Some(self.shell.scroll_frame(delta, now_ms, self.rtt_ms));
+                let frame = self.shell.scroll_frame(delta, now_ms, self.rtt_ms);
+                self.hold_history(frame);
             }
             i += len;
         }
@@ -1368,7 +1385,7 @@ impl Session {
             return Vec::new();
         }
         let frame = self.shell.on_input(bytes, now_ms, self.rtt_ms);
-        self.paint_at(&frame, now_ms)
+        self.paint_at(frame, now_ms)
     }
 
     fn on_link(&mut self, state: LinkState, now_ms: i64) -> Vec<Action> {
@@ -1406,7 +1423,7 @@ impl Session {
                     // renderer must not diff the row it is about to uncover
                     // against the plate it painted there.
                     self.renderer.invalidate();
-                    self.last_frame = None;
+                    self.forget_shown();
                     self.repaint(now_ms)
                 } else if line_changed {
                     self.repaint(now_ms)
@@ -1460,7 +1477,7 @@ impl Session {
         if self.raw_cols == 0 || self.raw_rows == 0 {
             self.pending_size = None;
             self.renderer.invalidate();
-            self.last_frame = None;
+            self.forget_shown();
             return vec![Action::DeferResize { cols: 0, rows: 0 }];
         }
         let (cols, rows) = shell_size(self.cols, self.rows, self.line_shown);
@@ -1476,8 +1493,8 @@ impl Session {
         // The size changed, so the renderer's idea of the screen is the wrong
         // shape: a diff against it would be meaningless.
         self.renderer.invalidate();
-        self.last_frame = None;
-        let mut actions = self.paint_at(&frame, now_ms);
+        self.forget_shown();
+        let mut actions = self.paint_at(frame, now_ms);
         if changed {
             actions.insert(0, Action::DeferResize { cols, rows });
         }
@@ -1636,24 +1653,51 @@ impl Session {
     /// cursor-placement bytes on every call even when there is nothing to
     /// draw. `last_frame` is `None` right after `renderer.invalidate()`, so
     /// an invalidated renderer always goes through regardless of content.
-    fn paint_at(&mut self, frame: &terminal::Frame, now_ms: i64) -> Vec<Action> {
+    ///
+    /// `frame` is consumed: its storage, the replaced `last_frame` and any
+    /// copy that turns out unneeded go back to the shell for the next
+    /// snapshot, so a steady presentation allocates no new grid.
+    fn paint_at(&mut self, frame: terminal::Frame, now_ms: i64) -> Vec<Action> {
         if self.raw_cols == 0 || self.raw_rows == 0 {
+            self.recycle(frame);
             return Vec::new();
         }
         if let Some(history) = &mut self.history_frame {
             if history.cols != frame.cols || history.rows != frame.rows {
-                *history = frame.clone();
+                history.clone_from(&frame);
             }
         }
-        let frame = self.history_frame.as_ref().unwrap_or(frame);
         #[cfg(test)]
         {
             self.projections += 1;
         }
-        let mut projected = crate::viewport::project_padded(
-            frame,
-            terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on())),
-        );
+        let size =
+            terminal_size::ViewportSize::new(self.cols, self.rows - u16::from(self.line_on()));
+        let mut projected = match &self.history_frame {
+            // The live frame is not shown while history is: its storage
+            // takes the projection of the pinned view.
+            Some(history) => {
+                let mut out = frame;
+                crate::viewport::project_padded_into(history, size, &mut out);
+                out
+            }
+            // No padding needed: cropping in place gives what
+            // `project_padded` would, without a second grid.
+            None if frame.cols >= size.cols() && frame.rows >= size.rows() => {
+                crate::viewport::project_owned(frame, size)
+            }
+            None => {
+                let out = match self.shell.spare_frame() {
+                    Some(mut out) => {
+                        crate::viewport::project_padded_into(&frame, size, &mut out);
+                        out
+                    }
+                    None => crate::viewport::project_padded(&frame, size),
+                };
+                self.recycle(frame);
+                out
+            }
+        };
         if self.history_frame.is_some() {
             projected.cursor_visible = false;
             projected.mouse_tracking = MouseTracking::Off;
@@ -1699,12 +1743,15 @@ impl Session {
         }
         self.painted_clock = Some(self.temporal_chrome_key());
         if self.last_frame.as_ref() == Some(&shown) {
+            self.recycle(shown);
             return Vec::new();
         }
         self.renderer
             .set_physical_scroll_eligible(shown.rows == self.raw_rows);
         let bytes = self.renderer.render(&shown);
-        self.last_frame = Some(shown);
+        if let Some(old) = self.last_frame.replace(shown) {
+            self.recycle(old);
+        }
         if bytes.is_empty() {
             Vec::new()
         } else {
@@ -1712,11 +1759,31 @@ impl Session {
         }
     }
 
+    /// Hand a frame no longer needed back to the shell, whose next snapshot
+    /// writes into its storage.
+    fn recycle(&mut self, frame: terminal::Frame) {
+        #[cfg(test)]
+        let frame = match self.recycling {
+            tests::Recycling::Keep => frame,
+            tests::Recycling::Drop => return,
+            tests::Recycling::Poison => tests::poisoned(frame),
+        };
+        self.shell.recycle(frame);
+    }
+
+    /// Forget what was painted, so the next paint goes to the renderer
+    /// whatever it shows; the frame's storage is kept for reuse.
+    fn forget_shown(&mut self) {
+        if let Some(old) = self.last_frame.take() {
+            self.recycle(old);
+        }
+    }
+
     /// Bytes that hand the terminal back ahead of a stop (SIGTSTP): what
     /// `leave` writes, without leaving. The next paint after `Resumed` is a
     /// full one, the mirrored modes with it.
     pub fn suspend(&mut self) -> Vec<u8> {
-        self.last_frame = None;
+        self.forget_shown();
         self.renderer.finish()
     }
 
@@ -1737,7 +1804,7 @@ impl Session {
         // the pre-exit one and conclude there is nothing left to paint --
         // even though `finish` just put the real terminal into a different
         // state than that frame describes.
-        self.last_frame = None;
+        self.forget_shown();
         actions.push(Action::Write(bytes));
         actions.push(Action::Exit(
             if self.session_abort.is_some() || self.input_failed {
@@ -1764,6 +1831,166 @@ fn seconds_until(until_ms: i64, now_ms: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// What [`Session::recycle`] does with storage, for tests that compare
+    /// reused storage against none.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Recycling {
+        Keep,
+        /// Fill every field with garbage first, so a field that a later
+        /// frame forgot to write would show.
+        Poison,
+        Drop,
+    }
+
+    pub(super) fn poisoned(mut frame: terminal::Frame) -> terminal::Frame {
+        let garbage = terminal::Cell {
+            ch: 'Z',
+            combining: terminal::CombiningMarks::from_slice(
+                &['\u{301}'; terminal::MAX_COMBINING_MARKS],
+            ),
+            fg: terminal::Color::Rgb(0x010203),
+            bg: terminal::Color::Indexed(9),
+            // Width flags would be repaired to blanks by the projection and
+            // hide the garbage; these survive it.
+            flags: terminal::FLAG_BOLD | terminal::FLAG_ITALIC | terminal::FLAG_REVERSE,
+        };
+        frame.cells.fill(garbage);
+        frame.cells.extend([garbage; 3]);
+        frame.cols = frame.cols.wrapping_add(1);
+        frame.rows = frame.rows.wrapping_sub(1);
+        frame.cursor_col = u16::MAX;
+        frame.cursor_row = u16::MAX;
+        frame.cursor_visible = !frame.cursor_visible;
+        frame.app_cursor = !frame.app_cursor;
+        frame.app_keypad = !frame.app_keypad;
+        frame.origin_mode = !frame.origin_mode;
+        frame.mouse_tracking = MouseTracking::Drag;
+        frame.mouse_sgr = !frame.mouse_sgr;
+        frame.bracketed_paste = !frame.bracketed_paste;
+        frame.alt_screen = !frame.alt_screen;
+        std::sync::Arc::make_mut(&mut frame.palette).entries[0] ^= 0x00ff_ffff;
+        frame
+    }
+
+    /// The same events give the same terminal output and the same frames
+    /// whether presentation storage is reused (here filled with garbage
+    /// before every reuse) or never reused at all, across live output,
+    /// prediction, history, the status line, a window, an outage, the
+    /// alternate screen, combining marks, resizes, a resume and a reset.
+    #[test]
+    fn reused_presentation_storage_changes_no_output_or_frame() {
+        fn run(recycling: Recycling) -> Vec<(Vec<Action>, Option<terminal::Frame>)> {
+            let mut chrome = plain();
+            chrome.line = true;
+            let mut s = Session::new(40, 8, TermCaps::truecolor(), PredictMode::Always, chrome);
+            s.recycling = recycling;
+            let mut seen = Vec::new();
+            let mut t = 0;
+            let mut step = |s: &mut Session, event: &dyn Fn(&mut Session, i64) -> Vec<Action>| {
+                t += 100;
+                let actions = event(s, t);
+                seen.push((actions, s.last_frame.clone()));
+                seen.push((Vec::new(), s.history_frame.clone()));
+            };
+            let input = |bytes: &'static [u8]| {
+                move |s: &mut Session, t: i64| {
+                    s.handle(UiEvent::Stdin(ingress_input(bytes.to_vec())), t)
+                }
+            };
+            let output = |text: String| {
+                move |s: &mut Session, t: i64| {
+                    s.handle(UiEvent::Stream0(record(text.as_bytes())), t)
+                }
+            };
+            step(&mut s, &|s, t| s.on_link(LinkState::Live, t));
+            step(&mut s, &|s, t| s.on_channel_ready(16, t));
+            let lines: String = (0..30)
+                .map(|n| format!("{n:02} e\u{301}\u{302} 界 x\u{20dd}\r\n"))
+                .collect();
+            step(&mut s, &output(lines));
+            for typed in [b"l".as_slice(), b"s", b" -"] {
+                step(&mut s, &|s, t| s.input_admitted(16, typed, t));
+                step(&mut s, &|s, t| s.handle(UiEvent::Tick, t));
+            }
+            step(&mut s, &output("ls -\r\nout o\u{308}\r\n".into()));
+            step(&mut s, &input(b"\x1d["));
+            for key in [b"\x1b[5~".as_slice(), b"\x1b[A", b"\x1b[6~", b"g"] {
+                step(&mut s, &|s, t| {
+                    s.handle(UiEvent::Stdin(ingress_input(key.to_vec())), t)
+                });
+            }
+            step(&mut s, &output("live while in history\r\n".into()));
+            step(&mut s, &|s, t| {
+                s.handle(UiEvent::Resized { cols: 30, rows: 6 }, t)
+            });
+            step(&mut s, &input(b"q"));
+            step(&mut s, &input(b"\x1dh"));
+            step(&mut s, &output("no line 界\r\n".into()));
+            step(&mut s, &input(b"\x1dh"));
+            step(&mut s, &input(b"\x1d?"));
+            step(&mut s, &output("under the window\r\n".into()));
+            step(&mut s, &input(b"\x1b"));
+            step(&mut s, &|s, t| s.on_link(LinkState::PathDown, t));
+            for _ in 0..12 {
+                step(&mut s, &|s, t| s.handle(UiEvent::Tick, t));
+            }
+            step(&mut s, &|s, t| s.on_link(LinkState::Live, t));
+            let app: String = (1..=6)
+                .map(|row| {
+                    let cells: String = (0..30)
+                        .map(|c| format!("{}\u{301}\u{302}", (b'a' + c % 26) as char))
+                        .collect();
+                    format!("\x1b[{row};1H\x1b[3{}m{cells}", row % 8)
+                })
+                .collect();
+            step(
+                &mut s,
+                &output(format!("\x1b[?1049h\x1b[?1h\x1b[?1002h{app}")),
+            );
+            step(&mut s, &|s, t| {
+                s.handle(UiEvent::Resized { cols: 50, rows: 12 }, t)
+            });
+            // Until the new geometry applies, the shell is padded to the
+            // display: projections then go into storage of their own.
+            for n in 0..4 {
+                step(&mut s, &output(format!("\x1b[{};1Hpadded {n}", n + 1)));
+            }
+            step(&mut s, &|s, t| {
+                let record = GeometryRecord {
+                    instance: ChannelInstance::new(1).unwrap(),
+                    request_id: 0,
+                    outcome: GeometryOutcome::Established,
+                    cols: 50,
+                    rows: 11,
+                };
+                s.on_geometry(record, t)
+            });
+            step(
+                &mut s,
+                &output("\x1b[?1049l\x1b[?1l\x1b[?1002lback\r\n".into()),
+            );
+            step(&mut s, &|s, t| s.handle(UiEvent::Resumed, t));
+            step(&mut s, &|s, t| s.handle(UiEvent::StreamReset, t));
+            step(&mut s, &output("after reset\r\n".into()));
+            seen
+        }
+        let fresh = run(Recycling::Drop);
+        assert_eq!(fresh.len(), run(Recycling::Keep).len());
+        for (n, (actual, expected)) in run(Recycling::Poison).iter().zip(&fresh).enumerate() {
+            assert_eq!(actual, expected, "observation {n}");
+        }
+        assert!(fresh
+            .iter()
+            .any(|(_, frame)| frame.as_ref().is_some_and(|f| f.alt_screen)));
+        assert!(
+            fresh
+                .iter()
+                .filter(|(actions, _)| !written(actions).is_empty())
+                .count()
+                > 20
+        );
+    }
+
     fn ingress_input(bytes: Vec<u8>) -> InputBytes {
         crate::input_ingress::IngressBudget::default()
             .admit_owned(bytes)
@@ -2195,7 +2422,7 @@ mod tests {
             f.cells[0].flags = terminal::FLAG_WIDE;
             f.cells[1].flags = terminal::FLAG_WIDE_SPACER;
             f.cursor_col = 1;
-            s.paint_at(&f, 0);
+            s.paint_at(f, 0);
             let shown = s.last_frame.unwrap();
             assert_eq!((shown.cols, shown.rows), (1, 2));
             assert_eq!(shown.cells[0], terminal::Cell::blank());
@@ -2367,7 +2594,7 @@ mod tests {
                         f.cursor_col = 1;
                         s.renderer.invalidate();
                         s.last_frame = None;
-                        for action in s.paint_at(&f, mode) {
+                        for action in s.paint_at(f.clone(), mode) {
                             if let Action::Write(bytes) = action {
                                 assert_physical_output(&bytes, 1, height as usize);
                             }
@@ -2677,7 +2904,7 @@ mod tests {
         let pointer = history.cells.as_ptr();
         for now in [3, 1003] {
             let incoming = s.shell.frame(now, 0);
-            s.paint_at(&incoming, now);
+            s.paint_at(incoming, now);
             assert_eq!(s.history_frame.as_ref(), Some(&saved));
             assert_eq!(s.history_frame.as_ref().unwrap().cells.as_ptr(), pointer);
             let shown = s.last_frame.as_ref().unwrap();
@@ -2691,10 +2918,10 @@ mod tests {
         }
         let mut replacement = terminal::Frame::blank(39, 5);
         replacement.cells[0].ch = 'R';
-        s.paint_at(&replacement, 1004);
+        s.paint_at(replacement.clone(), 1004);
         assert_eq!(s.history_frame.as_ref(), Some(&replacement));
         let retained = s.history_frame.as_ref().unwrap().cells.as_ptr();
-        s.paint_at(&replacement, 1005);
+        s.paint_at(replacement.clone(), 1005);
         assert_eq!(s.history_frame.as_ref().unwrap().cells.as_ptr(), retained);
     }
 
