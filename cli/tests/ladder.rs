@@ -142,9 +142,27 @@ fn answer_yes(client: &mut Client) {
     client.master.write_all(b"yes\n").expect("answer");
 }
 
-fn decline_recovery_binding(client: &mut Client, screen: &mut Screen) {
-    assert!(screen.next("Authorize SSH recovery"), "{}", screen.text());
-    client.master.write_all(b"no\n").unwrap();
+fn wait_for_bootstrap_ready(home: &Path) {
+    let log = || std::fs::read_to_string(home.join("qsh/log")).unwrap_or_default();
+    assert!(
+        wait_until(|| log()
+            .lines()
+            .any(|line| line.contains("shell channel ") && line.ends_with(" ready"))),
+        "SSH bootstrap did not deliver the current shell Ready: {}",
+        log()
+    );
+}
+
+fn assert_no_bootstrap_recovery_offer(home: &Path, screen: &Screen) {
+    assert!(
+        !screen.text().contains("Authorize SSH recovery"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        !home.join("qsh/ssh_bindings.json").exists(),
+        "SSH-first bootstrap must retain trust without a persistent grant"
+    );
 }
 
 /// The shell is live and runs what is typed, then leaves with code 0. The
@@ -747,7 +765,7 @@ fn ssh_host_authority_bootstrap(readonly: bool) {
         screen.text(),
         sshd_log()
     );
-    decline_recovery_binding(&mut client.client, &mut screen);
+    wait_for_bootstrap_ready(home.path());
     assert!(
         !screen.text().contains("Key fingerprint"),
         "the verified SSH result establishes the daemon key without another trust question: {}",
@@ -762,6 +780,7 @@ fn ssh_host_authority_bootstrap(readonly: bool) {
     client.client.type_line("exit");
     let status = client.result();
     assert_eq!(status.unwrap().code(), Some(0), "{}", screen.text());
+    assert_no_bootstrap_recovery_offer(home.path(), &screen);
 
     assert!(
         !screen.text().contains("Install qshd"),
@@ -849,8 +868,9 @@ fn a_daemon_on_another_port_is_reached_on_its_own_port() {
             sb.sshd.log()
         );
     }
-    decline_recovery_binding(&mut client, &mut screen);
+    wait_for_bootstrap_ready(home.path());
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
+    assert_no_bootstrap_recovery_offer(home.path(), &screen);
     assert!(
         !screen.text().contains("Key fingerprint"),
         "{}",
@@ -1032,7 +1052,7 @@ fn a_refusal_over_qsh_goes_to_ssh_and_the_process_key_logs_in() {
         screen.text(),
         sb.sshd.log()
     );
-    decline_recovery_binding(&mut client, &mut screen);
+    wait_for_bootstrap_ready(home.path());
     client.type_line("export WARM_MARK=retained");
     client.type_line("echo WARM'READY'");
     assert!(screen.next("WARMREADY"));
@@ -1075,6 +1095,7 @@ fn a_refusal_over_qsh_goes_to_ssh_and_the_process_key_logs_in() {
         "the remembered process key must avoid a second SSH login"
     );
     a_shell_answers_and_exits_cleanly(&mut client, &mut screen, "");
+    assert_no_bootstrap_recovery_offer(home.path(), &screen);
     assert_eq!(
         screen.text().matches("Key fingerprint").count(),
         1,
