@@ -40,7 +40,7 @@ impl Budget {
         if n == 0
             || self
                 .used
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(n).filter(|next| *next <= self.limit)
                 })
                 .is_err()
