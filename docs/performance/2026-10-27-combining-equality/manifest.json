@@ -191,6 +191,8 @@
     "instructions.jsonl": "user-space instructions of one --time process with the workload steps and with --steps 0, per libc, variant and workload",
     "instructions-rust-1.98.1.jsonl": "the same counts for builds made with rustc 1.98.1 from the same sources; aschunks is the change",
     "probe.jsonl": "cell_equality: instructions for 0 and 200 rounds (200 twice), memcmp/bcmp calls and bytes for 200 rounds under a counting preload (glibc only), and the probe output",
-    "variant_names": "runs.jsonl names the change new; instructions.jsonl, instructions-rust-1.98.1.jsonl and probe.jsonl name it aschunks. gated is the full-array variant and chunks the chunks_exact variant."
+    "variant_names": "runs.jsonl names the change new; instructions.jsonl, instructions-rust-1.98.1.jsonl and probe.jsonl name it aschunks. gated is the full-array variant and chunks the chunks_exact variant.",
+    "instructions-repeat.jsonl": "a second complete series of instructions.jsonl, taken later on the same day with the same binaries (sha256 as listed), for repeatability",
+    "probe-repeat.jsonl": "a second complete series of probe.jsonl with the same binaries, for repeatability"
   }
 }

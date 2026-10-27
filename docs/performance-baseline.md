@@ -784,8 +784,9 @@ The recorder allocates its result storage before the live-heap baseline and
 never grows it. Each step's counters are read before anything is recorded.
 The `idle` workload measures the recorder itself.
 
-Both modes hash everything written to the terminal, so two builds can be
-checked for identical output.
+Both modes hash everything written to the terminal with 64-bit FNV-1a and
+count the bytes and writes, so two builds can be checked for matching output.
+The records keep these fingerprints, not the output itself.
 
 | Workload | Each step |
 |---|---|
@@ -816,7 +817,8 @@ The runs used the same host as above, which was not idle. Raw data and binary
 hashes are in
 [`performance/2026-10-27-frame-storage/`](performance/2026-10-27-frame-storage/).
 All 440 runs completed. For every workload and libc, every run of both builds
-in both modes wrote byte-identical terminal output.
+in both modes recorded the same output fingerprint, byte count and write
+count.
 
 ### Allocations and memory
 
@@ -1032,30 +1034,51 @@ Three kinds of measurement were taken:
   `perf stat -e instructions:u` in `--time` mode, once with its steps and
   once with `--steps 0`, which does only the preparation and warm-up. The
   difference divided by the steps is the cost of one presented step.
-  Instruction counts do not depend on timing noise. Repeated runs differed
-  by at most 0.0001%.
+  Instruction counts do not depend on timing noise. A second complete series
+  of the same counts with the same binaries, `instructions-repeat.jsonl`,
+  differed from the first by at most 0.0003% per step outside `idle`. The
+  `idle` step, about 500 instructions, varied by up to 1.5 instructions.
+  A repeat of the probe, `probe-repeat.jsonl`, differed by at most 0.003% per
+  comparison.
 - **Time per presented step**, as in the frame storage runs: 5 interleaved
   pairs, now with three builds whose order rotates from pair to pair. Every
   workload runs in both modes, one process each.
 
 The harness gains three workloads for this. Each prepares a full 200x50
-alternate screen whose every cell holds 0, 4 or 16 combining marks. Each step
-then rewrites one row, so most cells are compared equal.
+alternate screen from input that gives every cell 0, 4 or 16 combining
+marks. Each step then rewrites one row the same way, so most cells are
+compared equal.
 
 | Workload | Each step |
 |---|---|
 | `row-marks0-200x50` | One row of a full screen rewritten; no marks. |
-| `row-marks4-200x50` | The same, with 4 marks on every cell. |
-| `row-marks16-200x50` | The same, with 16 marks on every cell. |
+| `row-marks4-200x50` | The same, with input of 4 marks per cell. |
+| `row-marks16-200x50` | The same, with input of 16 marks per cell. |
 
-A row with 16 marks per cell is 6,600 bytes. Written as one output, it can
-cross a 4,096-byte chunk boundary inside a UTF-8 sequence, where vte 0.15.0
-dropped a character (#354). That changes the screen, identically in every
-build. Every run of every build wrote byte-identical terminal output.
+These builds predate the vte fix for #354 (#356). On that baseline, an
+output of multi-byte text longer than 4,096 bytes can lose a character
+where a chunk boundary splits a UTF-8 sequence, and the marks of the lost
+character join the previous cell. This applies to:
+
+- the preparation of `row-marks4-200x50` and `row-marks16-200x50`, each
+  one write of the whole screen;
+- every step of `row-marks16-200x50`, whose row is about 6,600 bytes;
+- every step of `combining-200x50`.
+
+Their mark counts are therefore nominal: the input gives every cell that
+many marks, but the screen need not hold exactly that. The input is the same
+for every build, and so is any such loss. The probe feeds each cell on its
+own and asserts that every cell holds the stated marks, so the comparison
+work below does measure full 16-mark suffixes.
+
+For every workload and libc, all runs of every build recorded the same
+64-bit FNV-1a fingerprint of the terminal output, the same byte count and
+the same write count. The records keep these fingerprints, not the output
+itself.
 
 Raw data, binary hashes and `memcmp` addresses are in
 [`performance/2026-10-27-combining-equality/`](performance/2026-10-27-combining-equality/).
-All 840 timing runs completed.
+All 840 runs completed: 420 in timed mode and 420 in counting mode.
 
 ### Comparison work
 
@@ -1188,7 +1211,8 @@ The change is adopted:
   in every workload whose comparisons mostly find equal cells without marks:
   streaming, echo, one-row updates, history paging and resize.
 
-The cost is with glibc and 16 marks on every cell: 2.1% more instructions.
+The cost is with glibc in `row-marks16-200x50`, nominally 16 marks on every
+cell: 2.1% more instructions.
 
 The full-array alternative saves about as much for cells with no marks. It
 keeps a `memcmp` call, and so nearly all of the musl cost, for cells with
