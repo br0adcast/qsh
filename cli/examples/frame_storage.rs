@@ -2,16 +2,18 @@
 //!
 //! Drives a `Session` through fixed workloads and reports, per presented
 //! step, heap allocations (calls, bytes and grid-sized ones), the live heap
-//! retained between steps and its peak inside a step, and CPU time. It is a
-//! measurement procedure, not a test: it sets no thresholds. The method and
-//! recorded results are in docs/performance-baseline.md, under "Frame
-//! storage reuse".
+//! retained between steps and its peak inside a step, and the elapsed and
+//! thread CPU time of each step. It is a measurement procedure, not a test:
+//! it sets no thresholds. The method and recorded results are in
+//! docs/performance-baseline.md, under "Frame storage reuse".
 //!
 //!   cargo run --release -p qsh --example frame_storage -- [--time] [WORKLOAD...]
 //!
 //! Without `--time` every allocation is counted and steps are not timed.
-//! With it, counting is off and only CPU time per step is reported. Output is
-//! one JSON object per workload on stdout.
+//! With it, counting is off and only time per step is reported: elapsed
+//! (monotonic clock, descheduled time included) and CPU time of the thread
+//! running the session. Output is one JSON object per workload on stdout.
+//! The `idle` workload presents nothing and measures the recorder itself.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -228,6 +230,12 @@ fn screen(bench: &Bench, step: usize, combining: bool) -> Vec<u8> {
 
 fn prepare_nothing(_: &mut Bench) {}
 
+/// The bookkeeping control: a step that does no work, so every figure it
+/// reports is the recorder's own.
+fn step_idle(_: &mut Bench, _: usize) -> Vec<Action> {
+    Vec::new()
+}
+
 /// Fill the screen, so every measured line scrolls it.
 fn prepare_full(bench: &mut Bench) {
     let (width, rows) = (bench.shell_cols(), bench.shell_rows());
@@ -298,6 +306,14 @@ fn step_resize(bench: &mut Bench, step: usize) -> Vec<Action> {
 }
 
 const WORKLOADS: &[Workload] = &[
+    Workload {
+        name: "idle",
+        cols: 200,
+        rows: 50,
+        steps: 400,
+        prepare: prepare_nothing,
+        step: step_idle,
+    },
     Workload {
         name: "stream-80x24",
         cols: 80,
@@ -400,6 +416,18 @@ fn fnv(hash: &mut u64, actions: &[Action]) -> (usize, usize) {
     (writes, bytes)
 }
 
+/// CPU time consumed by the calling thread, which runs the whole session.
+fn thread_cpu() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the call.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    assert_eq!(status, 0, "thread CPU clock");
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
 /// `VmRSS` and `VmHWM` of this process in KiB, where `/proc` has them. Run
 /// one workload per process for the high-water mark to be that workload's.
 fn process_memory() -> (Option<u64>, Option<u64>) {
@@ -413,6 +441,17 @@ fn process_memory() -> (Option<u64>, Option<u64>) {
     (field("VmRSS:"), field("VmHWM:"))
 }
 
+/// What one measured step allocated and left live, read from the counters
+/// as soon as the step returned.
+#[derive(Clone, Copy)]
+struct Sample {
+    calls: usize,
+    bytes: usize,
+    grids: usize,
+    peak_above: usize,
+    retained: usize,
+}
+
 fn run(workload: &Workload, timed: bool) -> serde_json::Value {
     let cell = size_of::<terminal::Cell>();
     let (shell_cols, shell_rows) = qsh::session::shell_size(workload.cols, workload.rows, true);
@@ -424,6 +463,9 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
     };
     GRID_BYTES.store(smallest_grid * cell, Ordering::Relaxed);
     COUNTING.store(!timed, Ordering::Relaxed);
+    // The recorder's storage exists before the baseline and never grows, so
+    // no step's counts and no retained figure include it.
+    let mut samples = Vec::with_capacity(workload.steps);
     let base = LIVE.load(Ordering::Relaxed);
 
     let mut bench = Bench::new(workload.cols, workload.rows);
@@ -434,35 +476,42 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
         fnv(&mut hash, &actions);
     }
 
-    let (mut calls, mut bytes, mut grids) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut retained, mut peak_above) = (Vec::new(), 0usize);
     let (mut writes, mut written) = (0usize, 0usize);
-    let mut cpu = Duration::ZERO;
+    let (mut elapsed, mut cpu) = (Duration::ZERO, Duration::ZERO);
     for step in WARMUP..WARMUP + workload.steps {
         CALLS.store(0, Ordering::Relaxed);
         BYTES.store(0, Ordering::Relaxed);
         GRID_CALLS.store(0, Ordering::Relaxed);
         let before = LIVE.load(Ordering::Relaxed);
         PEAK.store(before, Ordering::Relaxed);
-        let started = Instant::now();
+        let (wall, thread) = (Instant::now(), thread_cpu());
         let actions = (workload.step)(&mut bench, step);
-        cpu += started.elapsed();
-        calls.push(CALLS.load(Ordering::Relaxed));
-        bytes.push(BYTES.load(Ordering::Relaxed));
-        grids.push(GRID_CALLS.load(Ordering::Relaxed));
-        peak_above = peak_above.max(PEAK.load(Ordering::Relaxed).saturating_sub(before));
+        let spent = thread_cpu() - thread;
+        let passed = wall.elapsed();
+        // Every counter is read before anything is recorded.
+        let sample = Sample {
+            calls: CALLS.load(Ordering::Relaxed),
+            bytes: BYTES.load(Ordering::Relaxed),
+            grids: GRID_CALLS.load(Ordering::Relaxed),
+            peak_above: PEAK.load(Ordering::Relaxed).saturating_sub(before),
+            retained: 0,
+        };
+        elapsed += passed;
+        cpu += spent;
         let (w, b) = fnv(&mut hash, &actions);
         writes += w;
         written += b;
         drop(actions);
-        retained.push(LIVE.load(Ordering::Relaxed).saturating_sub(base));
+        let retained = LIVE.load(Ordering::Relaxed).saturating_sub(base);
+        samples.push(Sample { retained, ..sample });
     }
     let (rss_kib, hwm_kib) = process_memory();
     drop(bench);
     COUNTING.store(false, Ordering::Relaxed);
 
     let steps = workload.steps as f64;
-    let mean = |values: &[usize]| values.iter().sum::<usize>() as f64 / steps;
+    let mean = |pick: fn(&Sample) -> usize| samples.iter().map(pick).sum::<usize>() as f64 / steps;
+    let max = |pick: fn(&Sample) -> usize| samples.iter().map(pick).max().unwrap_or(0);
     let mut result = serde_json::json!({
         "workload": workload.name,
         "cols": workload.cols,
@@ -479,26 +528,25 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
     let fields = result.as_object_mut().expect("object");
     if timed {
         fields.insert(
-            "cpu_us_per_step".into(),
+            "elapsed_us_per_step".into(),
+            (elapsed.as_secs_f64() * 1e6 / steps).into(),
+        );
+        fields.insert(
+            "thread_cpu_us_per_step".into(),
             (cpu.as_secs_f64() * 1e6 / steps).into(),
         );
     } else {
-        fields.insert("alloc_calls_per_step".into(), mean(&calls).into());
-        fields.insert("alloc_bytes_per_step".into(), mean(&bytes).into());
-        fields.insert("grid_allocs_per_step".into(), mean(&grids).into());
+        fields.insert("alloc_calls_per_step".into(), mean(|s| s.calls).into());
+        fields.insert("alloc_bytes_per_step".into(), mean(|s| s.bytes).into());
+        fields.insert("grid_allocs_per_step".into(), mean(|s| s.grids).into());
+        fields.insert("grid_allocs_max_step".into(), max(|s| s.grids).into());
+        let last = samples.last().map_or(0, |s| s.retained);
+        fields.insert("retained_bytes_last".into(), last.into());
+        fields.insert("retained_bytes_max".into(), max(|s| s.retained).into());
         fields.insert(
-            "grid_allocs_max_step".into(),
-            (*grids.iter().max().unwrap_or(&0)).into(),
+            "step_peak_above_live_bytes".into(),
+            max(|s| s.peak_above).into(),
         );
-        fields.insert(
-            "retained_bytes_last".into(),
-            (*retained.last().unwrap_or(&0)).into(),
-        );
-        fields.insert(
-            "retained_bytes_max".into(),
-            (*retained.iter().max().unwrap_or(&0)).into(),
-        );
-        fields.insert("step_peak_above_live_bytes".into(), peak_above.into());
     }
     result
 }

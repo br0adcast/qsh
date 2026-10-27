@@ -119,10 +119,25 @@ impl ShellState {
         }
     }
 
+    /// Drop every frame held for reuse whose storage is more than twice
+    /// `cells`, the most a presentation now needs. [`terminal::fit_cells`]
+    /// bounds the spare a frame is written into; this bounds the others,
+    /// so a display that shrank keeps no storage of its old size.
+    pub fn trim_spares(&mut self, cells: usize) {
+        self.spare
+            .retain(|frame| frame.cells.capacity() <= cells.saturating_mul(2));
+    }
+
     /// A frame handed back with [`ShellState::recycle`], for a caller that
     /// needs storage of its own to write a frame into.
     pub fn spare_frame(&mut self) -> Option<terminal::Frame> {
         self.spare.pop()
+    }
+
+    /// The cell capacity of each frame held for reuse, for tests and
+    /// measurements of retained storage.
+    pub fn spare_capacities(&self) -> impl Iterator<Item = usize> + '_ {
+        self.spare.iter().map(|frame| frame.cells.capacity())
     }
 
     /// Whether the prediction engine shows anything right now -- for tests
@@ -1095,6 +1110,17 @@ mod state_tests {
         frame.alt_screen = !frame.alt_screen;
         std::sync::Arc::make_mut(&mut frame.palette).entries[0] ^= 0x00ff_ffff;
         frame
+    }
+
+    #[test]
+    fn trim_spares_drops_storage_beyond_twice_the_need() {
+        let mut state = ShellState::new(20, 4, prediction::DisplayPreference::Always, false);
+        state.recycle(terminal::Frame::blank(40, 4));
+        state.recycle(terminal::Frame::blank(20, 4));
+        state.trim_spares(80);
+        assert_eq!(state.spare_capacities().collect::<Vec<_>>(), [160, 80]);
+        state.trim_spares(79);
+        assert_eq!(state.spare_capacities().collect::<Vec<_>>(), [80]);
     }
 
     /// Every frame-producing method gives the same frame whether its storage

@@ -1656,8 +1656,23 @@ impl Session {
     ///
     /// `frame` is consumed: its storage, the replaced `last_frame` and any
     /// copy that turns out unneeded go back to the shell for the next
-    /// snapshot, so a steady presentation allocates no new grid.
+    /// snapshot, so a steady presentation allocates no new grid. Spares
+    /// holding more than twice what the shell or the display needs are
+    /// dropped, so a shrink releases the storage of the larger size.
     fn paint_at(&mut self, frame: terminal::Frame, now_ms: i64) -> Vec<Action> {
+        // The spares serve snapshots of the shell and padded projections
+        // onto the display: none needs more than the larger of the two.
+        let needed = frame
+            .cells
+            .len()
+            .max(usize::from(self.cols) * usize::from(self.rows));
+        let actions = self.present(frame, now_ms);
+        self.shell.trim_spares(needed);
+        actions
+    }
+
+    /// [`Session::paint_at`] before the spares are bounded.
+    fn present(&mut self, frame: terminal::Frame, now_ms: i64) -> Vec<Action> {
         if self.raw_cols == 0 || self.raw_rows == 0 {
             self.recycle(frame);
             return Vec::new();
@@ -1989,6 +2004,52 @@ mod tests {
                 .count()
                 > 20
         );
+    }
+
+    /// A display that shrank keeps no spare grid of its old size: padded
+    /// projections onto a large display fill the spare pool with large
+    /// frames, and after the shrink every spare is within twice what the
+    /// small screen needs, not only the one reused most recently.
+    #[test]
+    fn spares_from_a_larger_padded_display_are_released_after_a_shrink() {
+        let mut s = Session::new(200, 50, TermCaps::truecolor(), PredictMode::Never, plain());
+        let geometry = |cols, rows| GeometryRecord {
+            instance: ChannelInstance::new(1).unwrap(),
+            request_id: 0,
+            outcome: GeometryOutcome::Established,
+            cols,
+            rows,
+        };
+        s.on_link(LinkState::Live, 0);
+        s.on_channel_ready(16, 0);
+        s.on_geometry(geometry(200, 50), 0);
+        let mut t = 0;
+        let mut output = |s: &mut Session, text: String| {
+            t += 100;
+            s.handle(UiEvent::Stream0(record(text.as_bytes())), t)
+        };
+        output(&mut s, "wide screen\r\n".into());
+        s.handle(
+            UiEvent::Resized {
+                cols: 512,
+                rows: 257,
+            },
+            0,
+        );
+        for n in 0..4 {
+            output(&mut s, format!("padded {n}\r\n"));
+        }
+        let large = 200 * 50;
+        assert!(s.shell.spare_capacities().filter(|&c| c >= large).count() >= 2);
+
+        s.handle(UiEvent::Resized { cols: 10, rows: 3 }, 0);
+        s.on_geometry(geometry(10, 3), 0);
+        for n in 0..20 {
+            output(&mut s, format!("small {n}\r\n"));
+        }
+        let held: Vec<usize> = s.shell.spare_capacities().collect();
+        assert!(!held.is_empty());
+        assert!(held.iter().all(|&c| c <= 2 * 10 * 3), "{held:?}");
     }
 
     fn ingress_input(bytes: Vec<u8>) -> InputBytes {
