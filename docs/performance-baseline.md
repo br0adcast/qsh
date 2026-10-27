@@ -939,7 +939,8 @@ comparison measured elapsed time, under the caveats below.
     In the profile of `main`, 60% of the samples fall in
     `Renderer::render`. By the code, on a screen whose top rows do not
     change, `scrolled_by` compares the unchanged rows again for every
-    candidate shift. This is tracked in #348.
+    candidate shift. This is tracked in #348 and changed by #349, which
+    was merged after these builds.
   - **Remaining full-grid passes.** In the glibc profiles of `echo-200x50`,
     rendering, model extraction and projection lead. Each is a full pass
     over the grid.
