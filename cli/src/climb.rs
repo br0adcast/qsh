@@ -139,6 +139,15 @@ pub struct Setup {
     trust_write: Mutex<Option<crate::ssh_bindings::TrustWritePermit>>,
     /// A consented replacement is still recovery within this client connection.
     recovery_only: bool,
+    bootstrap_recovery: Mutex<Option<SshRecoveryEvidence>>,
+}
+
+/// Verified initial SSH evidence, retained only by this client connection.
+#[derive(Clone, PartialEq, Eq)]
+struct SshRecoveryEvidence {
+    server: ::connect::server_identity::ServerIdentity,
+    origin: ::connect::server_identity::SshEndpoint,
+    host_key: Vec<u8>,
 }
 
 impl Setup {
@@ -171,6 +180,7 @@ impl Setup {
             allowlisted: Mutex::new(HashSet::new()),
             trust_write: Mutex::new(None),
             recovery_only: false,
+            bootstrap_recovery: Mutex::new(None),
         }
     }
 
@@ -205,6 +215,13 @@ impl Setup {
             // Only fresh SSH enrollment can restore this authentication path.
             allowlisted: Mutex::new(HashSet::new()),
             trust_write: Mutex::new(None),
+            bootstrap_recovery: Mutex::new(
+                self.bootstrap_recovery
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .filter(|e| Some(&e.server) == self.server_identity().as_ref()),
+            ),
         }
     }
 
@@ -217,6 +234,62 @@ impl Setup {
 
     pub fn args(&self) -> &Args {
         &self.args
+    }
+
+    /// Whether this connection has authenticated initial-SSH recovery evidence.
+    /// Also suppresses legacy explicit authorization after an SSH-first login.
+    pub fn has_bootstrap_recovery_trust(&self) -> bool {
+        self.bootstrap_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|e| Some(&e.server) == self.server_identity().as_ref())
+    }
+
+    fn remember_bootstrap(
+        &self,
+        bootstrap: SshBootstrap,
+        addr: usize,
+        port: u16,
+        origin: ::connect::server_identity::SshEndpoint,
+        cancel: &knock::Cancel,
+    ) -> bool {
+        if cancel.is_cancelled()
+            || crate::signals::termination_requested()
+            || bootstrap.addr != addr
+            || bootstrap.port != port
+        {
+            return false;
+        }
+        let Some(server) = self.server_identity() else {
+            return false;
+        };
+        if server.qsh_key != bootstrap.key
+            || !self.args.addresses.get(addr).is_some_and(|a| {
+                a.host == origin.host && a.ssh.as_ref().is_some_and(|r| r.port == origin.port)
+            })
+        {
+            return false;
+        }
+        let evidence = SshRecoveryEvidence {
+            server,
+            origin,
+            host_key: bootstrap.ssh_host_key.key,
+        };
+        let mut stored = self
+            .bootstrap_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cancel.is_cancelled() || crate::signals::termination_requested() {
+            return false;
+        }
+        match stored.as_ref() {
+            Some(old) => old == &evidence,
+            None => {
+                *stored = Some(evidence);
+                true
+            }
+        }
     }
 
     pub fn bring_up(
@@ -244,13 +317,40 @@ impl Setup {
             host: address.host.clone(),
             port: route.port,
         };
-        let keys = self
-            .ssh_bindings()
-            .allowed(&server, &endpoint)
-            .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
-        let ready = self
-            .ssh_step(true, bringup::InstallPolicy::RestartOnly)
-            .run_bound_observed(address, route, self.keypair.public, &keys, cancel, started)?;
+        let evidence = self
+            .bootstrap_recovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let ready = if let Some(evidence) = evidence {
+            if evidence.server != server {
+                return Err(SshStepError::Failed(::connect::SshFailure::plain(
+                    "SSH bootstrap recovery identity no longer matches this connection",
+                )));
+            }
+            self.ssh_step(true, bringup::InstallPolicy::RestartOnly).run_bootstrap_observed(
+                address,
+                route,
+                self.keypair.public,
+                &evidence.origin,
+                &evidence.host_key,
+                cancel,
+                started,
+            )?
+        } else {
+            let keys = self
+                .ssh_bindings()
+                .allowed(&server, &endpoint)
+                .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
+            self.ssh_step(true, bringup::InstallPolicy::RestartOnly).run_bound_observed(
+                address,
+                route,
+                self.keypair.public,
+                &keys,
+                cancel,
+                started,
+            )?
+        };
         let port = ready.port_for(address.qsh_port);
         trust::check_bootstrap_key(&address.host, port, server.qsh_key, ready.server_pubkey)
             .and_then(|()| {
@@ -695,34 +795,20 @@ impl<'a> Climb<'a> {
                         .expect("a Connected action follows a login");
                     if !self.background() {
                         if let Some(bootstrap) = self.bootstrap.take() {
-                            if bootstrap.addr == addr && bootstrap.port == port {
-                                if let Some(server) = self.setup.server_identity() {
-                                    let endpoint = ::connect::server_identity::SshEndpoint {
-                                        host: addrs[addr].host.clone(),
-                                        port: addrs[addr]
-                                            .ssh
-                                            .as_ref()
-                                            .expect("bootstrap used SSH")
-                                            .port,
-                                    };
-                                    let permit = self.setup.begin_ssh_authorization(
-                                        ::connect::recovery_gate::RecoveryEpoch {
-                                            connection: 0,
-                                            network: 0,
-                                        },
-                                    );
-                                    if let Err(error) = crate::ssh_authorization::offer_binding(
-                                        &server,
-                                        &endpoint,
-                                        &bootstrap.ssh_host_key,
-                                        self.setup,
-                                        &permit,
-                                        cancel,
-                                    ) {
-                                        eprintln!("qsh: {error}; QSH session remains connected");
-                                    }
-                                    self.setup.invalidate_ssh_authorization();
-                                }
+                            if bootstrap.addr == addr
+                                && bootstrap.port == port
+                                && self.setup.server_identity().is_some()
+                            {
+                                let endpoint = ::connect::server_identity::SshEndpoint {
+                                    host: addrs[addr].host.clone(),
+                                    port: addrs[addr]
+                                        .ssh
+                                        .as_ref()
+                                        .expect("bootstrap used SSH")
+                                        .port,
+                                };
+                                self.setup
+                                    .remember_bootstrap(bootstrap, addr, port, endpoint, cancel);
                             }
                         }
                     }
@@ -2169,7 +2255,7 @@ mod tests {
 
 #[cfg(test)]
 #[path = "../tests/support/recovery_ssh.rs"]
-mod authorization_server;
+pub(crate) mod authorization_server;
 
 #[cfg(test)]
 mod authorization_tests {

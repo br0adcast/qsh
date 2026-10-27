@@ -147,7 +147,7 @@ fn run(a: args::Args) -> i32 {
         Climbed::Failed { .. } => unreachable!("only a background round ends as Failed"),
     };
     drop(climb);
-    if setup.args().authorize_ssh {
+    if setup.args().authorize_ssh && !setup.has_bootstrap_recovery_trust() {
         let server = setup
             .server_identity()
             .expect("successful QSH login establishes identity");

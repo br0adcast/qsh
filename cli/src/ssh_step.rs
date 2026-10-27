@@ -379,7 +379,8 @@ impl SshStep<'_> {
     }
 
     /// Foreground bootstrap, retaining the key checked by its actual login.
-    /// A background caller must supply explicit bindings through `run_bound`.
+    /// A background caller must supply authorized keys through a restricted
+    /// recovery entry point.
     pub fn run_identified(
         &self,
         addr: &::connect::Address,
@@ -393,6 +394,49 @@ impl SshStep<'_> {
         crate::signals::with_termination_cancel(cancel, || {
             self.run_inner(addr, route, client_pubkey, cancel)
         })
+    }
+
+    /// Connection-local evidence permits an unknown alias, but fresh origin
+    /// and target revocations or explicit conflicts still refuse this path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_bootstrap_observed(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        origin: &::connect::server_identity::SshEndpoint,
+        host_key: &[u8],
+        cancel: &knock::Cancel,
+        started: impl FnOnce(),
+    ) -> Result<bringup::Ready, SshStepError> {
+        if !self.background || cancel.is_cancelled() {
+            return Err(SshStepError::NeedsPrompt);
+        }
+        for (host, port) in [
+            (origin.host.as_str(), origin.port),
+            (addr.host.as_str(), route.port),
+        ] {
+            let keys = self
+                .known_hosts
+                .lookup(host, port)
+                .map_err(|e| plain(e.to_string()))?;
+            if keys.revoked.iter().any(|k| k.as_slice() == host_key)
+                || (!keys.known.is_empty() && !keys.known.iter().any(|k| k.as_slice() == host_key))
+            {
+                return Err(SshStepError::NeedsPrompt);
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(SshStepError::NeedsPrompt);
+        }
+        let keys = HostKeys {
+            known: vec![host_key.to_vec()],
+            revoked: Vec::new(),
+        };
+        started();
+        self.attempt(addr, route, client_pubkey, &keys, cancel)
+            .map(|identified| identified.ready)
+            .map_err(Attempted::into_error)
     }
 
     /// Background bringup permits only the intersection of explicit binding
@@ -1015,3 +1059,7 @@ mod tests {
         assert!(!ssh_failure(&other, true).local_network_hint);
     }
 }
+
+#[cfg(test)]
+#[path = "ssh_step_recovery_tests.rs"]
+mod memory_tests;

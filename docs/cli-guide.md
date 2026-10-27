@@ -194,25 +194,38 @@ partial write. When that verified SSH login starts qshd, its returned daemon
 key binds only the same address and the UDP port it reports. qsh compares discovery
 with that key and atomically remembers it without another QSH trust question.
 Conflicting existing pins, discovery keys, or session identities are refused;
-Noise still proves the daemon holds the private key. Other endpoints receive no
-SSH bootstrap trust grant.
+Noise still proves the daemon holds the private key. Other QSH endpoints do not
+inherit this daemon-key grant; the SSH recovery key has the separate scope below.
 
-Background SSH recovery additionally needs an explicit association between the
-QSH server key, account, SSH endpoint, and SSH host key. After an initial SSH
-bootstrap succeeds over QSH, a separate question offers to save that association.
-Its default is No; declining leaves the current shell usable. An ordinary direct
-QSH login does not probe SSH or create associations. To configure recovery after
-a direct login, run `qsh --authorize-ssh user@server.example.org,ssh`. At least one
+After an initial verified SSH bootstrap and successful QSH authentication,
+SSH recovery automatically retains that SSH host key in memory for this client
+connection, bound to the authenticated QSH server and account. There is no
+separate association question, persistent recovery grant, extra SSH setup or
+server-key query. A same-connection shell replacement retains this evidence; a
+new client connection starts afresh. `--authorize-ssh` performs no extra setup
+when this connection already has that bootstrap evidence.
+
+Recovery may use that key through another explicitly SSH-enabled address,
+including an address absent from ordinary SSH `known_hosts`. Before each attempt,
+the configured user/system stores are reread for both the original SSH
+hostname/port and the attempted hostname/port. A matching `@revoked` entry or an
+explicit conflicting known-key set at either context refuses that attempt;
+unreadable stores also fail closed. This never overwrites an entry or imports
+unrelated known keys. These are per-attempt, pattern-matched checks, not a
+continuous or global revocation service. Initial SSH host verification is unchanged.
+
+Direct QSH connections still use the existing explicit recovery opt-in in this
+intermediate version; automatic authenticated SSH service-key discovery is not
+implemented. Such a login does not probe SSH or create associations. Run
+`qsh --authorize-ssh user@server.example.org,ssh` to configure it; at least one
 SSH-enabled address is required. Setup shows both fingerprints and the endpoint
-before asking for consent, and verifies SSH host keys without authenticating a
-user or starting a daemon. Each endpoint is authorized separately.
-
-Associations are stored in `ssh_bindings.json` beside QSH `known_hosts`. Existing
-QSH pins and SSH known-host entries are never imported as recovery grants. A
-missing grant or an unreadable/corrupt binding store disables SSH recovery;
-a setup or storage error leaves an established QSH session usable. Recovery
-intersects explicit grants with the current SSH `known_hosts` keys before login.
-Removed or revoked SSH keys cannot authenticate, even when an association remains.
+before consent, which defaults to No; declining leaves the live QSH session usable.
+It verifies host keys without user authentication or daemon startup.
+Each endpoint is authorized separately. These direct-QSH grants remain in
+`ssh_bindings.json` beside QSH `known_hosts`; recovery intersects them with
+current ordinary SSH trust. Missing grants or unreadable/corrupt grant stores
+disable that recovery path while leaving QSH usable. SSH-first memory trust
+never reads or falls back to this grant store.
 
 Encryption does not conceal network addresses, volume, or timing. It cannot
 protect either endpoint after that machine is compromised. The full threat model
@@ -450,12 +463,12 @@ Successful QSH recovery cancels further SSH authentication and commands; late
 results cannot change the active path or server key. `Ctrl-] r` removes a pending
 SSH delay without starting a duplicate login already in flight.
 
-Background SSH requires an explicit binding between the expected QSH server,
-account, SSH hostname/port, and SSH host key. An entry in ordinary OpenSSH
-`known_hosts` alone does not grant that permission. The bound key must also
-remain trusted there, and `@revoked` entries still block it. A direct QSH login
-creates no SSH binding automatically. Use `--authorize-ssh` during a foreground
-login to review both fingerprints and grant the selected pair.
+Background SSH uses either this connection's authenticated bootstrap evidence
+or, for a direct-QSH login, an explicit legacy binding as described above.
+Ordinary OpenSSH `known_hosts` alone grants neither kind of recovery authority.
+Fresh revocation/conflict checks apply before credentials or commands. A foreign
+key refuses only that attempt; it does not erase evidence or permanently ban an
+address, so returning to the expected service remains retryable.
 
 Background recovery asks no questions and never installs or updates qshd. It only
 reuses or restarts an installed daemon with its existing identity; a missing
@@ -556,7 +569,7 @@ configured roads if needed.
 | `-p, --port N` | Default qsh UDP port; an explicit `host:port` takes precedence. |
 | `-i, --identity PATH` | The only identity for direct qsh authentication; first choice for SSH. |
 | `--ssh[=N]` | Enable SSH for addresses without their own override. |
-| `--authorize-ssh` | After QSH login, explicitly configure SSH recovery for the authenticated QSH server. |
+| `--authorize-ssh` | After direct QSH login, explicitly configure SSH recovery. SSH-first connections already retain bootstrap trust without extra setup. |
 | `--knock STEPS` | Shared pre-SSH knock sequence. |
 | `--no-password` | Do not ask for passwords or passphrases. |
 | `--predict adaptive\|always\|never` | Local input prediction; default `adaptive`. |

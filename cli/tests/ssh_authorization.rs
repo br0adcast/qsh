@@ -279,18 +279,14 @@ fn cancelled_storage_write_waiting_for_lock_never_publishes_trust() {
 #[path = "../../crates/bringup/tests/support_home/mod.rs"]
 mod support_home;
 #[test]
-fn initial_bootstrap_binds_its_checked_key_only_after_qsh_validation() {
-    bootstrap(b"yes\n", true);
+fn ssh_first_initial_bootstrap_needs_no_association_question_or_store() {
+    bootstrap(false);
 }
 #[test]
-fn initial_bootstrap_binding_decline_preserves_the_live_shell() {
-    bootstrap(b"no\n", false);
+fn ssh_first_initial_bootstrap_with_authorize_flag_does_no_extra_setup() {
+    bootstrap(true);
 }
-#[test]
-fn cancelling_initial_bootstrap_consent_writes_no_binding() {
-    bootstrap(b"\x03", false);
-}
-fn bootstrap(answer: &[u8], accept: bool) {
+fn bootstrap(explicit_flag: bool) {
     let _serial = serialised();
     let home = tempfile::tempdir().unwrap();
     let key = ssh_key::PrivateKey::random(
@@ -308,43 +304,20 @@ fn bootstrap(answer: &[u8], accept: bool) {
     sb.cache_real_qshd(qshd::state::QSHD_VERSION);
     let port = free_udp_port();
     let address = format!("127.0.0.1:{port},ssh={}", sb.sshd.port);
-    let mut client = spawn_qsh(&["-i", identity.to_str().unwrap(), &address], home.path());
+    let mut args = vec!["-i", identity.to_str().unwrap(), &address];
+    if explicit_flag {
+        args.push("--authorize-ssh");
+    }
+    let mut client = spawn_qsh(&args, home.path());
     let output = screen(&client);
     wait(&output, "The authenticity of host");
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
     client.master.write_all(b"yes\n").unwrap();
-    wait(&output, "Authorize SSH recovery");
-    assert!(
-        !text(&output).contains("Key fingerprint"),
-        "{}",
-        text(&output)
-    );
-    assert!(!home.path().join("qsh/ssh_bindings.json").exists());
-    client.master.write_all(answer).unwrap();
-    if answer == b"\x03" {
-        assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(130));
-        assert!(!home.path().join("qsh/ssh_bindings.json").exists());
-        return;
-    }
     live(&mut client, &output);
-    let qsh_key = sshauth::discover::discover(
-        ([127, 0, 0, 1], port).into(),
-        std::time::Duration::from_secs(1),
-    )
-    .unwrap();
-    let server = connect::server_identity::ServerIdentity {
-        qsh_key,
-        username: std::env::var("USER").unwrap(),
-    };
-    let endpoint = connect::server_identity::SshEndpoint {
-        host: "127.0.0.1".into(),
-        port: sb.sshd.port,
-    };
-    let expected = support_home::ssh_support::wire_of(&sb.sshd.host_public_key_line());
-    let allowed = qsh::ssh_bindings::SshBindings::open(home.path().join("qsh/ssh_bindings.json"))
-        .allowed(&server, &endpoint)
-        .unwrap();
-    assert_eq!(allowed, if accept { vec![expected] } else { vec![] });
+    let shown = text(&output);
+    assert!(!shown.contains("Authorize SSH recovery"), "{shown}");
+    assert!(!shown.contains("Key fingerprint"), "{shown}");
+    assert!(!home.path().join("qsh/ssh_bindings.json").exists());
 }
 
 #[test]
