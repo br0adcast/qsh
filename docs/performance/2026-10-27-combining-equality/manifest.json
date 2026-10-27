@@ -1,0 +1,196 @@
+{
+  "procedure": "cli/examples/frame_storage.rs (one workload per process, alloc and --time mode each; --steps 0 for instruction baselines) and crates/terminal/examples/cell_equality.rs",
+  "harness_sha256": "2d32fb66f6417f7906d82ea16b2a1f291c4594b6cf668e1cdf12176b29cc2dbd",
+  "probe_sha256": "f932504f6e6e76e4143abbef3376fd208610e10dc1e439700772e4812f039059",
+  "timing_started_utc": "2026-10-27T08:46:29Z",
+  "timing_finished_utc": "2026-10-27T08:55:42Z",
+  "host": {
+    "cpu_model": "Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz",
+    "online_cpus": 4,
+    "kernel": "6.1.0-52-amd64",
+    "os": "Debian 12.15",
+    "note": "4-vCPU KVM VM, not idle: an unrelated personal qshd and other services were running"
+  },
+  "toolchain": {
+    "rustc": "1.99.1 (58cf8f9c3 2026-10-13), the release and ordinary Linux CI toolchain",
+    "profile": "release",
+    "musl_cc": "musl-gcc wrapping Debian gcc 12.2.0-14+deb12u1",
+    "openssl": "static, built by scripts/build-openssl.sh",
+    "perf": "6.1.187, instructions:u"
+  },
+  "settings": {
+    "pairs": 5,
+    "order": "per pair and libc the three builds in rotating order: base new gated, new gated base, gated base new; within a build every workload in alloc mode then --time mode",
+    "warmup_steps": 16,
+    "cell_bytes": 92
+  },
+  "builds": {
+    "base-frame_storage-glibc": {
+      "variant": "base",
+      "example": "frame_storage",
+      "source": "7a15274 (main) with the harness and probe files of fccf179 added",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "3606921984a14a979dab8fb524aa3561cd847e7d0357990c1d328dace64762f0",
+      "bytes": 2211208
+    },
+    "base-cell_equality-glibc": {
+      "variant": "base",
+      "example": "cell_equality",
+      "source": "7a15274 (main) with the harness and probe files of fccf179 added",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "564e36f27af510f04e6ef3aa8787bea320d4fc06bfd182fe0d7580929c32a980",
+      "bytes": 840896
+    },
+    "base-frame_storage-musl": {
+      "variant": "base",
+      "example": "frame_storage",
+      "source": "7a15274 (main) with the harness and probe files of fccf179 added",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "b6c1d7bf8d18ac962f0ff3c76ba4811e65f5223e5295c324121c255f5a5523d9",
+      "bytes": 1337128,
+      "memcmp_address": "0xb239b",
+      "memcmp_offset_mod_64": 27
+    },
+    "base-cell_equality-musl": {
+      "variant": "base",
+      "example": "cell_equality",
+      "source": "7a15274 (main) with the harness and probe files of fccf179 added",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "02f2b1f437b55d6afcef64152892b2616a09e45de07631d7f82e7c7cb5704502",
+      "bytes": 858072,
+      "memcmp_address": "0x76c2f",
+      "memcmp_offset_mod_64": 47
+    },
+    "new-frame_storage-glibc": {
+      "variant": "new",
+      "example": "frame_storage",
+      "source": "fccf179",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "694f4126459fde8b3ca09e4124d2938ec7df5c20c8a98483ef236bb86d1da891",
+      "bytes": 2212240
+    },
+    "new-cell_equality-glibc": {
+      "variant": "new",
+      "example": "cell_equality",
+      "source": "fccf179",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "2e6afe99bb8259be2a4865ce7ed98d83be424d92102c246bd5c915706eba2d4b",
+      "bytes": 841112
+    },
+    "new-frame_storage-musl": {
+      "variant": "new",
+      "example": "frame_storage",
+      "source": "fccf179",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "18e0bed854be1839086bb0b61970e609f927e63635630c36b5ca139cbf588ef5",
+      "bytes": 1336680,
+      "memcmp_address": "0xb28cb",
+      "memcmp_offset_mod_64": 11
+    },
+    "new-cell_equality-musl": {
+      "variant": "new",
+      "example": "cell_equality",
+      "source": "fccf179",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "ef5a8bd15a02d61d600383f909ae286a1bbb7eecc104559488404ea28737da83",
+      "bytes": 858056,
+      "memcmp_address": "0x76d3f",
+      "memcmp_offset_mod_64": 63
+    },
+    "gated-frame_storage-glibc": {
+      "variant": "gated",
+      "example": "frame_storage",
+      "source": "fccf179 with variant-full-array.patch applied",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "e5d5f679e48d24a6dac3cf12ff8a349930be43ad9fed7c883c920ad02caee5f4",
+      "bytes": 2211080
+    },
+    "gated-cell_equality-glibc": {
+      "variant": "gated",
+      "example": "cell_equality",
+      "source": "fccf179 with variant-full-array.patch applied",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "09fb7b40dd2153d8cfb7178dc2a6c6071ab18b72d4c0ad8c227568f79fd2a0c9",
+      "bytes": 840912
+    },
+    "gated-frame_storage-musl": {
+      "variant": "gated",
+      "example": "frame_storage",
+      "source": "fccf179 with variant-full-array.patch applied",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "a747597afb3b71339d9839e00f1f37ac41ad9f5cd54f1b2027e289d962535ab3",
+      "bytes": 1337016,
+      "memcmp_address": "0xb23cb",
+      "memcmp_offset_mod_64": 11
+    },
+    "gated-cell_equality-musl": {
+      "variant": "gated",
+      "example": "cell_equality",
+      "source": "fccf179 with variant-full-array.patch applied",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "0d30415438b126ddc414c222c8675f88b63bf27b74dec5bb1cb8406a59c7a913",
+      "bytes": 858112,
+      "memcmp_address": "0x76c3f",
+      "memcmp_offset_mod_64": 63
+    },
+    "chunks-frame_storage-glibc": {
+      "variant": "chunks",
+      "example": "frame_storage",
+      "source": "fccf179 with variant-chunks-exact.patch applied (instruction counts only)",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "434c35c72694877925e812ec90d16714fafbe8f6d503c0cbb7a0530c10ec2cfa",
+      "bytes": 2211960
+    },
+    "chunks-cell_equality-glibc": {
+      "variant": "chunks",
+      "example": "cell_equality",
+      "source": "fccf179 with variant-chunks-exact.patch applied (instruction counts only)",
+      "target": "x86_64-unknown-linux-gnu",
+      "linkage": "dynamic",
+      "sha256": "8693374ed8df31141583c27d1a7a791c048cebf725344369102030586b1ccc2a",
+      "bytes": 840992
+    },
+    "chunks-frame_storage-musl": {
+      "variant": "chunks",
+      "example": "frame_storage",
+      "source": "fccf179 with variant-chunks-exact.patch applied (instruction counts only)",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "e4cd81bce70d3a73cebfdac92f8b2e6613fe8698a6467045cb1ef79298a255c5",
+      "bytes": 1336680,
+      "memcmp_address": "0xb2b5b",
+      "memcmp_offset_mod_64": 27
+    },
+    "chunks-cell_equality-musl": {
+      "variant": "chunks",
+      "example": "cell_equality",
+      "source": "fccf179 with variant-chunks-exact.patch applied (instruction counts only)",
+      "target": "x86_64-unknown-linux-musl",
+      "linkage": "static-pie",
+      "sha256": "dd68aa38636a23ec488631ecfe00beb848ba4873115cd12632bd3918d14d0c8c",
+      "bytes": 858024,
+      "memcmp_address": "0x76d5f",
+      "memcmp_offset_mod_64": 31
+    }
+  },
+  "records": {
+    "runs.jsonl": "timing and allocation runs: pair, libc, variant, mode and the harness JSON result",
+    "instructions.jsonl": "user-space instructions of one --time process with the workload steps and with --steps 0, per libc, variant and workload",
+    "instructions-rust-1.98.1.jsonl": "the same counts for builds made with rustc 1.98.1 from the same sources; aschunks is the change",
+    "probe.jsonl": "cell_equality: instructions for 0 and 200 rounds (200 twice), memcmp/bcmp calls and bytes for 200 rounds under a counting preload (glibc only), and the probe output",
+    "variant_names": "runs.jsonl names the change new; instructions.jsonl, instructions-rust-1.98.1.jsonl and probe.jsonl name it aschunks. gated is the full-array variant and chunks the chunks_exact variant."
+  }
+}
