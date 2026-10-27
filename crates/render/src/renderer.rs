@@ -122,12 +122,14 @@ impl Renderer {
     /// is already there when possible, a full repaint otherwise.
     pub fn render(&mut self, frame: &Frame) -> Vec<u8> {
         let mut out = Vec::new();
-        let same_size = self
-            .last
-            .as_ref()
-            .is_some_and(|p| p.cols == frame.cols && p.rows == frame.rows);
-        if same_size {
-            let mut previous = self.last.take().expect("checked by same_size");
+        // The retained frame is diffed against, shifted in place, and then
+        // overwritten with `frame`: its storage is reused rather than a new
+        // copy made per render.
+        let mut retained = self.last.take();
+        let same_size = retained
+            .as_mut()
+            .filter(|p| p.cols == frame.cols && p.rows == frame.rows);
+        if let Some(previous) = same_size {
             // The shortcut is only for the primary screen. The alternate one
             // has no scrollback to feed, and we do not mirror `?1049` onto
             // the user's terminal -- so a newline here would push the local
@@ -142,18 +144,22 @@ impl Renderer {
             // then `q`), and a newline here would feed that coincidence into
             // the user's scrollback.
             if self.physical_scroll_eligible && !frame.alt_screen && !previous.alt_screen {
-                if let Some(lines) = scrolled_by(&previous, frame) {
+                if let Some(lines) = scrolled_by(previous, frame) {
                     self.scroll_up(&mut out, lines, frame);
-                    previous = shift_up(&previous, lines);
+                    shift_up(previous, lines);
                 }
             }
-            self.diff_rows(&mut out, &previous, frame);
+            self.diff_rows(&mut out, previous, frame);
         } else {
             self.full_repaint(&mut out, frame);
         }
         self.write_modes(&mut out, frame);
         self.place_cursor(&mut out, frame);
-        self.last = Some(frame.clone());
+        match &mut retained {
+            Some(last) => last.clone_from(frame),
+            None => retained = Some(frame.clone()),
+        }
+        self.last = retained;
         out
     }
 
@@ -596,18 +602,15 @@ fn rows_equal(a: &Frame, b: &Frame, a_row: u16, b_row: u16) -> bool {
     })
 }
 
-/// The previous frame as it looks after scrolling `lines` rows off the top:
-/// the vacated rows at the bottom become blank, which is exactly what the
-/// terminal shows after the newlines.
-fn shift_up(previous: &Frame, lines: u16) -> Frame {
-    let mut shifted = Frame::blank(previous.cols, previous.rows);
-    shifted.palette = std::sync::Arc::clone(&previous.palette);
-    for row in 0..shifted.rows.saturating_sub(lines) {
-        for col in 0..shifted.cols {
-            *shifted.cell_mut(row, col) = *previous.cell(row + lines, col);
-        }
-    }
-    shifted
+/// The previous frame's cells as they look after scrolling `lines` rows off
+/// the top: the vacated rows at the bottom become blank, which is exactly
+/// what the terminal shows after the newlines. Only the cells change; the
+/// diff that follows reads nothing else of the previous frame.
+fn shift_up(previous: &mut Frame, lines: u16) {
+    let start = usize::from(lines.min(previous.rows)) * usize::from(previous.cols);
+    previous.cells.copy_within(start.., 0);
+    let kept = previous.cells.len() - start;
+    previous.cells[kept..].fill(Cell::blank());
 }
 
 /// Every tracking level turned off -- what to send when the level currently

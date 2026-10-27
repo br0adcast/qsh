@@ -62,11 +62,22 @@ pub fn project(frame: &Frame, size: ViewportSize) -> Frame {
 /// Fill the bounded physical presentation area without reflowing the shell.
 /// Cursor clipping uses the cropped grid, so padding never reveals a cursor.
 pub fn project_padded(frame: &Frame, size: ViewportSize) -> Frame {
+    let mut out = metadata(frame, size.cols(), size.rows(), Vec::new());
+    project_padded_into(frame, size, &mut out);
+    out
+}
+
+/// [`project_padded`] written into `out`, reusing its cell storage. Every
+/// field of `out` is replaced, so nothing it held before survives.
+pub fn project_padded_into(frame: &Frame, size: ViewportSize, out: &mut Frame) {
     let cols = frame.cols.min(size.cols());
     let rows = frame.rows.min(size.rows());
-    let cells = vec![Cell::blank(); usize::from(size.cols()) * usize::from(size.rows())];
-    let mut out = metadata(frame, size.cols(), size.rows(), cells);
-    clip_cursor(&mut out, cols, rows);
+    let needed = usize::from(size.cols()) * usize::from(size.rows());
+    let mut cells = std::mem::take(&mut out.cells);
+    terminal::fit_cells(&mut cells, needed);
+    cells.resize(needed, Cell::blank());
+    *out = metadata(frame, size.cols(), size.rows(), cells);
+    clip_cursor(out, cols, rows);
     for row in 0..rows {
         let mut previous_flags = 0;
         for col in 0..cols {
@@ -75,7 +86,6 @@ pub fn project_padded(frame: &Frame, size: ViewportSize) -> Frame {
             previous_flags = cell.flags;
         }
     }
-    out
 }
 
 /// Apply the same crop/repair pass to storage already owned by presentation.

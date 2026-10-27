@@ -1168,3 +1168,70 @@ fn complete_cell_normalized_spacers_and_clipped_glyphs_emit_no_marks() {
         }
     }
 }
+
+/// The renderer keeps one frame and rewrites it on every render, shifting
+/// it in place for the scroll shortcut. Over a long script mixing scrolls of
+/// several sizes, combining marks, wide characters, the alternate screen and
+/// resizes, every step must still reproduce the source, and rendering the
+/// same frame again must draw nothing: the kept frame is exactly what the
+/// terminal shows, not a stale or shifted leftover.
+#[test]
+fn reused_renderer_storage_tracks_a_long_mixed_script() {
+    fn check(r: &mut Renderer, src: &mut TerminalCore, dst: &mut TerminalCore, chunk: &[u8]) {
+        src.feed(chunk);
+        let frame = src.frame();
+        let bytes = r.render(&frame);
+        assert_only_escapes_and_newlines(&bytes);
+        dst.feed(&bytes);
+        assert_same_screen(&dst.frame(), &frame);
+        let again = r.render(&frame);
+        let cursor = format!(
+            "\x1b[{};{}H\x1b[?25{}",
+            frame.cursor_row + 1,
+            frame.cursor_col + 1,
+            if frame.cursor_visible { 'h' } else { 'l' }
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&again),
+            cursor,
+            "an unchanged frame drew more than the cursor after {chunk:?}"
+        );
+        dst.feed(&again);
+        assert_same_screen(&dst.frame(), &frame);
+    }
+    let mut src = TerminalCore::new(24, 6);
+    let mut dst = TerminalCore::new(24, 6);
+    let mut r = Renderer::new(TermCaps::truecolor());
+    for n in 0..30 {
+        let lines = 1 + n % 3;
+        let text: String = (0..lines)
+            .map(|k| format!("{n:02}.{k} e\u{301}\u{302} 界 x\u{20dd}\r\n"))
+            .collect();
+        check(&mut r, &mut src, &mut dst, text.as_bytes());
+    }
+    check(
+        &mut r,
+        &mut src,
+        &mut dst,
+        b"\x1b[?1049h\x1b[2J\x1b[H\x1b[33mfull screen",
+    );
+    for n in 0..5 {
+        let row = format!("\x1b[{};1H\x1b[4{}m界 a\u{301} {n}", 1 + n, n % 8);
+        check(&mut r, &mut src, &mut dst, row.as_bytes());
+    }
+    check(&mut r, &mut src, &mut dst, b"\x1b[0m\x1b[?1049l");
+    for n in 0..8 {
+        let line = format!("after {n} o\u{308}\r\n");
+        check(&mut r, &mut src, &mut dst, line.as_bytes());
+    }
+    for (cols, rows) in [(10, 3), (30, 8), (24, 6)] {
+        src.resize(cols, rows);
+        dst = TerminalCore::new(cols, rows);
+        r.invalidate();
+        check(&mut r, &mut src, &mut dst, b"");
+        for n in 0..4 {
+            let line = format!("{cols}x{rows} {n} 界\r\n");
+            check(&mut r, &mut src, &mut dst, line.as_bytes());
+        }
+    }
+}

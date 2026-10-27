@@ -49,9 +49,17 @@ pub struct ShellState {
     input_bytes_sent: u64,
     /// Explicit history mode suppresses prediction even at offset zero.
     history_view: bool,
+    /// Frames the caller handed back with [`ShellState::recycle`]: the
+    /// storage the next snapshot is written into.
+    spare: Vec<terminal::Frame>,
     #[cfg(test)]
     snapshots: usize,
 }
+
+/// How many returned frames [`ShellState`] keeps for reuse. A presentation
+/// holds at most two grids in flight beyond the frames it retains (the
+/// snapshot and a separate projection), so a third would only hold memory.
+pub const SPARE_FRAMES: usize = 2;
 
 impl ShellState {
     /// New bundle: terminal at `cols`/`rows`, prediction engine in mode
@@ -74,6 +82,7 @@ impl ShellState {
             deframer: ShellDeframer::new(),
             input_bytes_sent: 0,
             history_view: false,
+            spare: Vec::new(),
             #[cfg(test)]
             snapshots: 0,
         }
@@ -91,7 +100,44 @@ impl ShellState {
         {
             self.snapshots += 1;
         }
-        self.terminal.frame()
+        match self.spare.pop() {
+            Some(mut frame) => {
+                self.terminal.frame_into(&mut frame);
+                frame
+            }
+            None => self.terminal.frame(),
+        }
+    }
+
+    /// Hand back a frame this state returned, or any frame the caller no
+    /// longer needs, so a later snapshot reuses its storage. The frame is
+    /// owned, so nothing else can still see it; every field is overwritten
+    /// before it is returned again. Beyond [`SPARE_FRAMES`] it is dropped.
+    pub fn recycle(&mut self, frame: terminal::Frame) {
+        if self.spare.len() < SPARE_FRAMES {
+            self.spare.push(frame);
+        }
+    }
+
+    /// Drop every frame held for reuse whose storage is more than twice
+    /// `cells`, the most a presentation now needs. [`terminal::fit_cells`]
+    /// bounds the spare a frame is written into; this bounds the others,
+    /// so a display that shrank keeps no storage of its old size.
+    pub fn trim_spares(&mut self, cells: usize) {
+        self.spare
+            .retain(|frame| frame.cells.capacity() <= cells.saturating_mul(2));
+    }
+
+    /// A frame handed back with [`ShellState::recycle`], for a caller that
+    /// needs storage of its own to write a frame into.
+    pub fn spare_frame(&mut self) -> Option<terminal::Frame> {
+        self.spare.pop()
+    }
+
+    /// The cell capacity of each frame held for reuse, for tests and
+    /// measurements of retained storage.
+    pub fn spare_capacities(&self) -> impl Iterator<Item = usize> + '_ {
+        self.spare.iter().map(|frame| frame.cells.capacity())
     }
 
     /// Whether the prediction engine shows anything right now -- for tests
@@ -1032,5 +1078,121 @@ mod state_tests {
             assert_eq!(pending.display_offset(), immediate.display_offset());
             assert_eq!(pending.history_size(), immediate.history_size());
         }
+    }
+
+    /// Storage handed back with garbage in every field, so a field a
+    /// snapshot forgot to write would show.
+    fn poison(mut frame: terminal::Frame, cols: u16, rows: u16) -> terminal::Frame {
+        let garbage = terminal::Cell {
+            ch: 'Z',
+            combining: terminal::CombiningMarks::from_slice(
+                &['\u{301}'; terminal::MAX_COMBINING_MARKS],
+            ),
+            fg: terminal::Color::Rgb(0x010203),
+            bg: terminal::Color::Indexed(9),
+            flags: u16::MAX,
+        };
+        frame.cells.clear();
+        frame
+            .cells
+            .resize(usize::from(cols) * usize::from(rows), garbage);
+        frame.cols = cols;
+        frame.rows = rows;
+        frame.cursor_col = cols;
+        frame.cursor_row = rows;
+        frame.cursor_visible = !frame.cursor_visible;
+        frame.app_cursor = !frame.app_cursor;
+        frame.app_keypad = !frame.app_keypad;
+        frame.origin_mode = !frame.origin_mode;
+        frame.mouse_tracking = terminal::MouseTracking::Drag;
+        frame.mouse_sgr = !frame.mouse_sgr;
+        frame.bracketed_paste = !frame.bracketed_paste;
+        frame.alt_screen = !frame.alt_screen;
+        std::sync::Arc::make_mut(&mut frame.palette).entries[0] ^= 0x00ff_ffff;
+        frame
+    }
+
+    #[test]
+    fn trim_spares_drops_storage_beyond_twice_the_need() {
+        let mut state = ShellState::new(20, 4, prediction::DisplayPreference::Always, false);
+        state.recycle(terminal::Frame::blank(40, 4));
+        state.recycle(terminal::Frame::blank(20, 4));
+        state.trim_spares(80);
+        assert_eq!(state.spare_capacities().collect::<Vec<_>>(), [160, 80]);
+        state.trim_spares(79);
+        assert_eq!(state.spare_capacities().collect::<Vec<_>>(), [80]);
+    }
+
+    /// Every frame-producing method gives the same frame whether its storage
+    /// is fresh or recycled from earlier frames, through prediction, history,
+    /// the alternate screen, combining marks, resizes and resets.
+    #[test]
+    fn recycled_storage_gives_the_frames_fresh_storage_gives() {
+        let pref = prediction::DisplayPreference::Always;
+        let mut fresh = ShellState::new(20, 4, pref, false);
+        let mut reused = ShellState::new(20, 4, pref, false);
+        let mut sizes = [(1, 1), (20, 5), (64, 30), (7, 3)].into_iter().cycle();
+        let mut step = 0;
+        let mut both = |name: &str, op: &dyn Fn(&mut ShellState) -> Option<terminal::Frame>| {
+            for _ in 0..SPARE_FRAMES {
+                let (cols, rows) = sizes.next().unwrap();
+                let spare = reused
+                    .spare_frame()
+                    .unwrap_or_else(|| terminal::Frame::blank(cols, rows));
+                reused.recycle(poison(spare, cols, rows));
+            }
+            let expected = op(&mut fresh);
+            let actual = op(&mut reused);
+            assert_eq!(actual, expected, "step {step}: {name}");
+            if let Some(frame) = actual {
+                let (cols, rows) = sizes.next().unwrap();
+                reused.recycle(poison(frame, cols, rows));
+            }
+            step += 1;
+        };
+        let data = |bytes: &[u8]| encode_record(REC_DATA, bytes);
+        for (n, input) in [b"ab".as_slice(), b"c", b"\x7f", b"de"]
+            .into_iter()
+            .enumerate()
+        {
+            let now = 1000 + 100 * n as i64;
+            both("input", &|st| Some(st.on_input(input, now, 50)));
+            let mut echo = data(input);
+            echo.extend(encode_record(
+                REC_ECHO_ACK,
+                &(2 * (n as u64 + 1)).to_be_bytes(),
+            ));
+            both("echo", &|st| Some(st.on_stream0(&echo, now + 50, 50)));
+        }
+        let lines: String = (0..12)
+            .map(|n| format!("{n} e\u{301}\u{302} 界 x\u{20dd}\r\n"))
+            .collect();
+        both("output", &|st| {
+            Some(st.on_stream0(&data(lines.as_bytes()), 2000, 50))
+        });
+        both("enter history", &|st| {
+            st.set_history_view(true);
+            Some(st.scroll_frame(3, 2001, 50))
+        });
+        both("history output", &|st| {
+            Some(st.on_stream0(&data("more o\u{308}\r\n".as_bytes()), 2002, 50))
+        });
+        both("history resize", &|st| Some(st.resize_frame(12, 3, 2003)));
+        both("leave history", &|st| {
+            st.set_history_view(false);
+            Some(st.frame(2004, 50))
+        });
+        both("alternate screen", &|st| {
+            let app = b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?1003h\x1b[?2004h\x1b[2;2H\x1b[35mapp";
+            Some(st.on_stream0(&data(app), 2005, 50))
+        });
+        both("palette", &|st| {
+            Some(st.on_stream0(&data(b"\x1b]4;5;rgb:10/20/30\x07"), 2006, 50))
+        });
+        both("grow", &|st| Some(st.geometry_frame(40, 10, 2007)));
+        both("tick", &|st| st.tick(2008, 50));
+        both("reattach", &|st| Some(st.on_reattach()));
+        both("reset", &|st| Some(st.on_reset()));
+        both("after reset", &|st| Some(st.frame(2010, 50)));
     }
 }

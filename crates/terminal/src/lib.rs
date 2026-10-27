@@ -12,6 +12,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+mod frame_storage_tests;
 mod limits;
 mod replay;
 mod replies;
@@ -244,7 +246,11 @@ impl Cell {
 
 /// A snapshot of the terminal's visible grid: cells in row-major order (row
 /// by row, left to right within a row) plus cursor position and visibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Every frame owns its cells: a copy never shares them with its source, so
+/// changing the model or another frame leaves it as it was. Only the palette
+/// is shared, and it is changed by copy-on-write (`Arc::make_mut`).
+#[derive(Debug, PartialEq, Eq)]
 pub struct Frame {
     pub cols: u16,
     pub rows: u16,
@@ -277,6 +283,96 @@ pub struct Frame {
     pub alt_screen: bool,
     /// Palette snapshot for consumers that need concrete RGB.
     pub palette: Arc<Palette>,
+}
+
+/// `clone_from` copies into the destination's own cell storage, so a frame
+/// kept from one presentation to the next takes the new picture without
+/// allocating (see [`fit_cells`] for when the storage is replaced instead).
+/// Both methods list every field: a field added to `Frame` fails to compile
+/// here until it is copied.
+impl Clone for Frame {
+    fn clone(&self) -> Frame {
+        let Frame {
+            cols,
+            rows,
+            cells,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
+            app_cursor,
+            app_keypad,
+            origin_mode,
+            mouse_tracking,
+            mouse_sgr,
+            bracketed_paste,
+            alt_screen,
+            palette,
+        } = self;
+        Frame {
+            cols: *cols,
+            rows: *rows,
+            cells: cells.clone(),
+            cursor_col: *cursor_col,
+            cursor_row: *cursor_row,
+            cursor_visible: *cursor_visible,
+            app_cursor: *app_cursor,
+            app_keypad: *app_keypad,
+            origin_mode: *origin_mode,
+            mouse_tracking: *mouse_tracking,
+            mouse_sgr: *mouse_sgr,
+            bracketed_paste: *bracketed_paste,
+            alt_screen: *alt_screen,
+            palette: Arc::clone(palette),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Frame) {
+        let Frame {
+            cols,
+            rows,
+            cells,
+            cursor_col,
+            cursor_row,
+            cursor_visible,
+            app_cursor,
+            app_keypad,
+            origin_mode,
+            mouse_tracking,
+            mouse_sgr,
+            bracketed_paste,
+            alt_screen,
+            palette,
+        } = source;
+        fit_cells(&mut self.cells, cells.len());
+        self.cells.extend_from_slice(cells);
+        self.cols = *cols;
+        self.rows = *rows;
+        self.cursor_col = *cursor_col;
+        self.cursor_row = *cursor_row;
+        self.cursor_visible = *cursor_visible;
+        self.app_cursor = *app_cursor;
+        self.app_keypad = *app_keypad;
+        self.origin_mode = *origin_mode;
+        self.mouse_tracking = *mouse_tracking;
+        self.mouse_sgr = *mouse_sgr;
+        self.bracketed_paste = *bracketed_paste;
+        self.alt_screen = *alt_screen;
+        if !Arc::ptr_eq(&self.palette, palette) {
+            self.palette = Arc::clone(palette);
+        }
+    }
+}
+
+/// Empty `cells` for reuse with room for `needed` cells. Storage more than
+/// twice as large as needed is replaced rather than kept, so a frame reused
+/// after the screen shrank does not hold the larger grid indefinitely.
+pub fn fit_cells(cells: &mut Vec<Cell>, needed: usize) {
+    if cells.capacity() > needed.saturating_mul(2) {
+        *cells = Vec::with_capacity(needed);
+    } else {
+        cells.clear();
+        cells.reserve_exact(needed);
+    }
 }
 
 /// The emulator core: the `Term` screen grid plus the `Processor` control
@@ -571,12 +667,50 @@ impl TerminalCore {
     /// hidden, since it makes no sense in a historical frame (the cursor
     /// always lives at the live bottom).
     pub fn frame(&self) -> Frame {
+        let mut frame = Frame {
+            cols: 0,
+            rows: 0,
+            cells: Vec::new(),
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: false,
+            app_cursor: false,
+            app_keypad: false,
+            origin_mode: false,
+            mouse_tracking: MouseTracking::Off,
+            mouse_sgr: false,
+            bracketed_paste: false,
+            alt_screen: false,
+            palette: Arc::new(snapshot_palette(self.term.colors())),
+        };
+        self.fill(&mut frame);
+        frame
+    }
+
+    /// [`TerminalCore::frame`] written over `frame`, reusing its cell storage
+    /// and, when the colors did not change, its palette. Every field is
+    /// replaced: nothing of what `frame` held before survives, whatever its
+    /// size or content was. The result equals what `frame()` returns.
+    pub fn frame_into(&self, frame: &mut Frame) {
+        let palette = snapshot_palette(self.term.colors());
+        if *frame.palette != palette {
+            match Arc::get_mut(&mut frame.palette) {
+                Some(owned) => *owned = palette,
+                None => frame.palette = Arc::new(palette),
+            }
+        }
+        self.fill(frame);
+    }
+
+    /// Every field of `frame` but the palette, from the current state.
+    fn fill(&self, frame: &mut Frame) {
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
         let colors = self.term.colors();
         let offset = self.term.grid().display_offset();
 
-        let mut cells = Vec::with_capacity(cols as usize * rows as usize);
+        let cells = &mut frame.cells;
+        fit_cells(cells, cols as usize * rows as usize);
         for row in 0..rows {
             for col in 0..cols {
                 let point = Point::new(Line(row as i32 - offset as i32), Column(col as usize));
@@ -638,22 +772,18 @@ impl TerminalCore {
         let mouse_sgr = mode.contains(TermMode::SGR_MOUSE);
         let alt_screen = mode.contains(TermMode::ALT_SCREEN);
 
-        Frame {
-            cols,
-            rows,
-            cells,
-            cursor_col,
-            cursor_row,
-            cursor_visible,
-            app_cursor,
-            app_keypad,
-            origin_mode,
-            mouse_tracking,
-            mouse_sgr,
-            bracketed_paste,
-            alt_screen,
-            palette: Arc::new(snapshot_palette(colors)),
-        }
+        frame.cols = cols;
+        frame.rows = rows;
+        frame.cursor_col = cursor_col;
+        frame.cursor_row = cursor_row;
+        frame.cursor_visible = cursor_visible;
+        frame.app_cursor = app_cursor;
+        frame.app_keypad = app_keypad;
+        frame.origin_mode = origin_mode;
+        frame.mouse_tracking = mouse_tracking;
+        frame.mouse_sgr = mouse_sgr;
+        frame.bracketed_paste = bracketed_paste;
+        frame.alt_screen = alt_screen;
     }
 }
 

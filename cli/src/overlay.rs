@@ -55,12 +55,18 @@ fn finish_compose(
         None => shell,
     };
     if let Some(line) = line {
+        // Shift the shell's rows down by one in place: storage reused from
+        // an earlier presentation already has room for the line.
         let cols = usize::from(out.cols);
-        let mut cells = Vec::with_capacity(cols + out.cells.len());
-        cells.extend(line.iter().take(cols).cloned());
-        cells.resize(cols, Cell::blank());
-        cells.append(&mut out.cells);
-        out.cells = cells;
+        let shell = out.cells.len();
+        out.cells.reserve_exact(cols);
+        out.cells.resize(shell + cols, Cell::blank());
+        out.cells.copy_within(..shell, cols);
+        let row = &mut out.cells[..cols];
+        row.fill(Cell::blank());
+        for (cell, chrome) in row.iter_mut().zip(line) {
+            *cell = *chrome;
+        }
         out.rows += 1;
         out.cursor_row += 1;
     }
@@ -225,5 +231,37 @@ mod tests {
             assert_eq!(actual.cells[3], source.cells[3]);
         }
         assert_eq!(source, saved);
+    }
+
+    /// The status row is written into storage that may hold anything from an
+    /// earlier frame, with room to spare: a line shorter than the screen
+    /// still leaves the rest of the row blank, and the shell's rows below are
+    /// exactly the shell's.
+    #[test]
+    fn line_insertion_into_reused_storage_matches_a_fresh_compose() {
+        let mut shell = Frame::blank(6, 3);
+        for (i, cell) in shell.cells.iter_mut().enumerate() {
+            cell.ch = char::from(b'a' + i as u8);
+        }
+        let line = [Cell {
+            ch: '>',
+            flags: terminal::FLAG_REVERSE,
+            ..Cell::blank()
+        }; 2];
+        let expected = compose(&shell, Some(&line), None, None);
+        let mut reused = shell.clone();
+        let garbage = Cell {
+            ch: 'Z',
+            flags: u16::MAX,
+            ..Cell::blank()
+        };
+        reused.cells.extend([garbage; 6]);
+        reused.cells.truncate(18);
+        reused.cells.reserve(64);
+        let pointer = reused.cells.as_ptr();
+        let actual = compose_owned(reused, Some(&line), None, None);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.cells.as_ptr(), pointer);
+        assert!(actual.cells[2..6].iter().all(|cell| *cell == Cell::blank()));
     }
 }
