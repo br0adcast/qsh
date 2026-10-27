@@ -1118,6 +1118,41 @@ fn complete_cell_suffix_changes_and_removal_repaint_the_cluster() {
     }
 }
 
+/// A change in any one slot of a full suffix, the last included, repaints
+/// the cluster through the incremental path, on a wide glyph with colors
+/// and concealment, and leaves the attributes as they were.
+#[test]
+fn complete_cell_change_in_any_slot_of_a_full_suffix_repaints_it() {
+    use alacritty_terminal::{
+        index::{Column, Line},
+        term::cell::Flags,
+    };
+    let full: Vec<char> = (0..terminal::MAX_COMBINING_MARKS)
+        .map(|n| char::from_u32(0x300 + n as u32).unwrap())
+        .collect();
+    let mut source = TerminalCore::new(12, 3);
+    let mut renderer = Renderer::new(TermCaps::truecolor());
+    let mut output = Vec::new();
+    for slot in 0..=full.len() {
+        let mut marks = full.clone();
+        if slot < full.len() {
+            marks[slot] = '\u{20dd}';
+        }
+        let text: String = marks.iter().collect();
+        source.feed(format!("\x1b[H\x1b[8;31;44m界{text}\x1b[0mz").as_bytes());
+        output.extend(renderer.render(&source.frame()));
+        let actual = parse_complete_cells(&output);
+        let cell = &actual.grid()[Line(0)][Column(0)];
+        assert_eq!(cell.c, '界');
+        assert_eq!(cell.zerowidth().unwrap_or_default(), marks, "slot {slot}");
+        assert!(cell.flags.contains(Flags::HIDDEN | Flags::WIDE_CHAR));
+        assert_eq!(actual.grid()[Line(0)][Column(2)].c, 'z');
+        assert!(!actual.grid()[Line(0)][Column(2)]
+            .flags
+            .contains(Flags::HIDDEN));
+    }
+}
+
 #[test]
 fn complete_cell_replay_keeps_saturated_marks_and_concealment() {
     use alacritty_terminal::{
