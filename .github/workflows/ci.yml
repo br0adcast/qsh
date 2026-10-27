@@ -670,6 +670,8 @@ jobs:
           # Harness accounting only; benchmark runs and thresholds stay out of CI.
           python3 -m unittest discover -s scripts/tests -p 'test_perf_baseline.py'
           python3 -m unittest discover -s scripts/tests -p 'test_perf_history.py'
+          # Functional wrapper controls only; no native three-channel run.
+          python3 -I -B scripts/test_three_channel_functional.py
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
 
       - name: Install native build prerequisites
@@ -704,7 +706,7 @@ jobs:
           QSH_REQUIRE_TEST_SHELLS: "1"
         run: >-
           python3 scripts/run-nextest-ci.py --
-          cargo nextest run --profile ci --workspace --lib --bins --tests
+          cargo nextest run --profile ci --workspace --lib --bins --tests --example three_channel305
           --locked --features qshd/system
 
       # nextest does not run doctests.

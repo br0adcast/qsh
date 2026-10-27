@@ -691,6 +691,50 @@ impl ChannelBridge {
             }
         }
     }
+    #[cfg(any(test, feature = "testnet"))]
+    pub(super) fn qualification_snapshot(
+        &self,
+        conn: &Connection,
+        target: crate::qualification305::Registration,
+    ) -> Option<crate::qualification305::Snapshot> {
+        let state = self.streams.get(&target.stream)?;
+        if state.instance != target.instance
+            || state.gate.kind() != crate::send_gate::GateKind::Screen
+        {
+            return None;
+        }
+        let (gate_byte_open, gate_closed, gate_metadata_blocked, source_pending) =
+            state.gate.qualification_state();
+        let progress = conn.stream_progress(target.stream);
+        let pending_data = match state.fifo.front() {
+            Some(Queued {
+                output: Item::Record(ChannelOutput::Data(bytes)),
+                offset,
+                ..
+            }) => bytes.len().saturating_sub(*offset) as u64,
+            _ => 0,
+        };
+        Some(crate::qualification305::Snapshot {
+            valid: conn.state() == LinkState::Live
+                && !state.bootstrap
+                && !state.abandoned_data
+                && !state.hot_blocked
+                && !state.waiting_geometry
+                && !state.ended,
+            credit_remaining: conn
+                .credit_limit_for_test(target.stream)
+                .map(|limit| limit.saturating_sub(progress.queued)),
+            pending_data,
+            source_pending,
+            reliable_tail: progress.unacked,
+            offset_room: conn.stream_offset_room(target.stream),
+            gate_byte_open,
+            gate_closed,
+            gate_metadata_blocked,
+            ..crate::qualification305::Snapshot::default()
+        })
+    }
+
     pub(super) fn refresh(&mut self, conn: &Connection, parked: bool) {
         for (&stream, state) in &mut self.streams {
             let progress = conn.stream_progress(stream);

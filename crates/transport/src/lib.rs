@@ -105,3 +105,6 @@ mod tests {
 
 #[cfg(feature = "tokio-driver")]
 mod session_deadline;
+
+#[cfg(all(feature = "tokio-driver", any(test, feature = "testnet")))]
+pub mod qualification305;

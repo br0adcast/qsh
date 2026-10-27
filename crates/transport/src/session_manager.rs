@@ -651,12 +651,122 @@ struct TerminalRequest {
 #[derive(Default)]
 struct ControlOrigin {
     attachment: AttachmentContext,
+    #[cfg(any(test, feature = "testnet"))]
+    qualification_processed: Option<AttachmentContext>,
     aborting: bool,
     /// Irreversible revocation; callbacks admitted earlier retain their owners.
     retiring: Option<Instant>,
     requested_abort: Option<TerminalRequest>,
     abort_notification_queued: bool,
 }
+#[cfg(any(test, feature = "testnet"))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum QualificationOwnerError {
+    Missing,
+    Retired,
+    NotProcessed,
+    SessionMismatch,
+    AttachmentChanged,
+    Observer(&'static str),
+}
+
+#[cfg(any(test, feature = "testnet"))]
+/// Testnet-only read handle. Weak control custody cannot retain a backend,
+/// lifecycle task, source byte, permit or process after its real owner drops.
+pub struct QualificationOwner {
+    login: LoginId,
+    control: std::sync::Weak<SessionControl>,
+}
+#[cfg(any(test, feature = "testnet"))]
+impl QualificationOwner {
+    pub fn register(
+        &self,
+        authenticated_session: u64,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+    ) -> Result<
+        (
+            crate::qualification305::Scope,
+            crate::qualification305::Reports,
+        ),
+        QualificationOwnerError,
+    > {
+        self.register_checked(authenticated_session, stream, instance, || {})
+    }
+    fn register_checked(
+        &self,
+        authenticated_session: u64,
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        after_registration: impl FnOnce(),
+    ) -> Result<
+        (
+            crate::qualification305::Scope,
+            crate::qualification305::Reports,
+        ),
+        QualificationOwnerError,
+    > {
+        let control = self
+            .control
+            .upgrade()
+            .ok_or(QualificationOwnerError::Missing)?;
+        if control.budget.qualification_retired() {
+            return Err(QualificationOwnerError::Retired);
+        }
+        let state = control
+            .origin
+            .lock()
+            .map_err(|_| QualificationOwnerError::Retired)?;
+        if state.retiring.is_some() {
+            return Err(QualificationOwnerError::Retired);
+        }
+        let attachment = state
+            .qualification_processed
+            .filter(|processed| *processed == state.attachment)
+            .ok_or(QualificationOwnerError::NotProcessed)?;
+        drop(state);
+        if !attachment
+            .features
+            .contains(crate::Features::CHANNEL_GEOMETRY | crate::Features::AUTH_ACCEPTED)
+        {
+            return Err(QualificationOwnerError::NotProcessed);
+        }
+        if attachment.session_id != authenticated_session {
+            return Err(QualificationOwnerError::SessionMismatch);
+        }
+        let registration =
+            crate::qualification305::Scope::register(crate::qualification305::Registration {
+                login: self.login,
+                attachment,
+                stream,
+                instance,
+            })
+            .map_err(QualificationOwnerError::Observer)?;
+        after_registration();
+        let state = control
+            .origin
+            .lock()
+            .map_err(|_| QualificationOwnerError::Retired)?;
+        let changed =
+            state.attachment != attachment || state.qualification_processed != Some(attachment);
+        let retired = state.retiring.is_some();
+        drop(state);
+        if retired {
+            drop(registration);
+            return Err(QualificationOwnerError::Retired);
+        }
+        if changed {
+            drop(registration);
+            return Err(QualificationOwnerError::AttachmentChanged);
+        }
+        if control.budget.qualification_retired() {
+            drop(registration);
+            return Err(QualificationOwnerError::Retired);
+        }
+        Ok(registration)
+    }
+}
+
 struct SessionControl {
     retire_backend: tokio::sync::Notify,
     retire_bridge: tokio::sync::Notify,
@@ -791,6 +901,14 @@ impl SessionIo {
         self.lifecycle.spawn_callback(lease, work)
     }
 
+    #[cfg(any(test, feature = "testnet"))]
+    pub fn qualification_owner(&self) -> QualificationOwner {
+        QualificationOwner {
+            login: self.login,
+            control: Arc::downgrade(self.control()),
+        }
+    }
+
     pub(crate) fn processed_attachment(&self) -> AttachmentContext {
         self.control().origin.lock().unwrap().attachment
     }
@@ -799,6 +917,10 @@ impl SessionIo {
         let mut state = self.control().origin.lock().unwrap();
         if state.attachment != attachment {
             state.attachment = attachment;
+            #[cfg(any(test, feature = "testnet"))]
+            {
+                state.qualification_processed = None;
+            }
             state.aborting = false;
         }
     }
@@ -1056,6 +1178,14 @@ impl SessionIo {
         if let Some(SessionInbound::Live(origin) | SessionInbound::ResumeReset(origin)) = &received
         {
             self.set_control_origin(*origin);
+            #[cfg(any(test, feature = "testnet"))]
+            {
+                self.control()
+                    .origin
+                    .lock()
+                    .unwrap()
+                    .qualification_processed = Some(*origin);
+            }
         }
         received
     }
@@ -4384,6 +4514,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         active_count,
         gates,
     } = spawn;
+    #[cfg(any(test, feature = "testnet"))]
+    let mut qualification_probe = crate::qualification305::Probe::new(token);
     let BridgeChannels {
         mut dgram_rx,
         io_inbound_tx,
@@ -5073,6 +5205,11 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         } else {
             writable.extend(refresh_gates(&gates, &conn, parked));
         }
+        #[cfg(any(test, feature = "testnet"))]
+        qualification_probe.observe(
+            AttachmentContext::for_connection(&conn, link.ledger.generation()),
+            |target| link.channel_output.qualification_snapshot(&conn, target),
+        );
         for event in link.channel_output.notifications() {
             link.hand_over(&mut conn, now, event, &mut out);
         }
@@ -5992,3 +6129,7 @@ mod key_erasure_tests {
         assert!(wiped.load(Ordering::SeqCst));
     }
 }
+
+#[cfg(test)]
+#[path = "session_manager_qualification_owner_tests.rs"]
+mod qualification_owner_tests;
