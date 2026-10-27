@@ -1,0 +1,625 @@
+{
+  "tool_version": 8,
+  "created_utc": "2026-10-27T10:49:51.521490+00:00",
+  "source": {
+    "commit": "2570c05+allocator-features",
+    "note": "rustc 1.99.1 release; mimalloc v3 and v2"
+  },
+  "host": {
+    "system": "Linux",
+    "kernel": "6.1.0-52-amd64",
+    "machine": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) W-2295 CPU @ 3.00GHz",
+    "online_cpus": 4,
+    "scaling_governor": null,
+    "clock_ticks": 100,
+    "python": "3.11.2",
+    "allowed_cpus": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "settings": {
+    "repetitions": 5,
+    "order": "interleaved",
+    "seed": 1,
+    "window": 10,
+    "keystrokes": 100,
+    "key_interval": 0.1,
+    "redraw_fps": 20,
+    "saturation_lines": 2000000,
+    "retained_sessions": 8,
+    "retained_output_lines": 20000,
+    "busy_sessions": 4,
+    "harness_cpus": null
+  },
+  "terminal": {
+    "cols": 120,
+    "rows": 40
+  },
+  "workloads": [
+    "idle",
+    "redraw",
+    "saturation",
+    "retained",
+    "busy"
+  ],
+  "builds": {
+    "musl-system": {
+      "label": "musl-system",
+      "qsh": {
+        "sha256": "fff5001f9578f00a0f4991b4e0374147f66f7e4f39a2612bbf7cd851a0989248",
+        "bytes": 22707640,
+        "version": [
+          "qsh 0.5.0"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      },
+      "qshd": {
+        "sha256": "20be66b6145cf652aa280b6baae2d05d0a9252ab632a1a1647cb5cc9a8038d36",
+        "bytes": 6492720,
+        "version": [
+          "qshd 0.5.0 (build 1793095299)"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      }
+    },
+    "musl-mimalloc": {
+      "label": "musl-mimalloc",
+      "qsh": {
+        "sha256": "8cb1c4c0d4e855647988426a718d5f1fd7336310954843916b7bafc78458dd8f",
+        "bytes": 22864296,
+        "version": [
+          "qsh 0.5.0"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      },
+      "qshd": {
+        "sha256": "0613d03a925bd790af2f045436080287b143b4642dd5dea3d1e5577c5f2a91d2",
+        "bytes": 6637832,
+        "version": [
+          "qshd 0.5.0 (build 1793095299)"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      }
+    },
+    "musl-mimalloc-v2": {
+      "label": "musl-mimalloc-v2",
+      "qsh": {
+        "sha256": "544718dcf1c8c9d1d1ad75715b1a058dd658850dea314aa96b2587d94404802b",
+        "bytes": 22837624,
+        "version": [
+          "qsh 0.5.0"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      },
+      "qshd": {
+        "sha256": "8d70cf7545491c6754f244f251d31179e0c7f1fe0d4f12e65d28667aba39fd6e",
+        "bytes": 6608856,
+        "version": [
+          "qshd 0.5.0 (build 1793095299)"
+        ],
+        "elf": true,
+        "linkage": "static",
+        "interpreter": null,
+        "comment": [
+          "GCC: (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "GCC: (GNU) 9.4.0",
+          "rustc version 1.99.1 (58cf8f9c3 2026-10-13)"
+        ]
+      }
+    }
+  },
+  "variants": {
+    "musl-system": {
+      "build": "musl-system",
+      "mode": "personal",
+      "qshd_cpus": null,
+      "runtime_threads": null,
+      "effective_qshd_cpus": null
+    },
+    "musl-mimalloc": {
+      "build": "musl-mimalloc",
+      "mode": "personal",
+      "qshd_cpus": null,
+      "runtime_threads": null,
+      "effective_qshd_cpus": null
+    },
+    "musl-mimalloc-v2": {
+      "build": "musl-mimalloc-v2",
+      "mode": "personal",
+      "qshd_cpus": null,
+      "runtime_threads": null,
+      "effective_qshd_cpus": null
+    }
+  },
+  "order": [
+    {
+      "index": 0,
+      "repetition": 0,
+      "workload": "idle",
+      "build": "musl-system"
+    },
+    {
+      "index": 1,
+      "repetition": 0,
+      "workload": "idle",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 2,
+      "repetition": 0,
+      "workload": "idle",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 3,
+      "repetition": 0,
+      "workload": "redraw",
+      "build": "musl-system"
+    },
+    {
+      "index": 4,
+      "repetition": 0,
+      "workload": "redraw",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 5,
+      "repetition": 0,
+      "workload": "redraw",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 6,
+      "repetition": 0,
+      "workload": "saturation",
+      "build": "musl-system"
+    },
+    {
+      "index": 7,
+      "repetition": 0,
+      "workload": "saturation",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 8,
+      "repetition": 0,
+      "workload": "saturation",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 9,
+      "repetition": 0,
+      "workload": "retained",
+      "build": "musl-system"
+    },
+    {
+      "index": 10,
+      "repetition": 0,
+      "workload": "retained",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 11,
+      "repetition": 0,
+      "workload": "retained",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 12,
+      "repetition": 0,
+      "workload": "busy",
+      "build": "musl-system"
+    },
+    {
+      "index": 13,
+      "repetition": 0,
+      "workload": "busy",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 14,
+      "repetition": 0,
+      "workload": "busy",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 15,
+      "repetition": 1,
+      "workload": "idle",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 16,
+      "repetition": 1,
+      "workload": "idle",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 17,
+      "repetition": 1,
+      "workload": "idle",
+      "build": "musl-system"
+    },
+    {
+      "index": 18,
+      "repetition": 1,
+      "workload": "redraw",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 19,
+      "repetition": 1,
+      "workload": "redraw",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 20,
+      "repetition": 1,
+      "workload": "redraw",
+      "build": "musl-system"
+    },
+    {
+      "index": 21,
+      "repetition": 1,
+      "workload": "saturation",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 22,
+      "repetition": 1,
+      "workload": "saturation",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 23,
+      "repetition": 1,
+      "workload": "saturation",
+      "build": "musl-system"
+    },
+    {
+      "index": 24,
+      "repetition": 1,
+      "workload": "retained",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 25,
+      "repetition": 1,
+      "workload": "retained",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 26,
+      "repetition": 1,
+      "workload": "retained",
+      "build": "musl-system"
+    },
+    {
+      "index": 27,
+      "repetition": 1,
+      "workload": "busy",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 28,
+      "repetition": 1,
+      "workload": "busy",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 29,
+      "repetition": 1,
+      "workload": "busy",
+      "build": "musl-system"
+    },
+    {
+      "index": 30,
+      "repetition": 2,
+      "workload": "idle",
+      "build": "musl-system"
+    },
+    {
+      "index": 31,
+      "repetition": 2,
+      "workload": "idle",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 32,
+      "repetition": 2,
+      "workload": "idle",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 33,
+      "repetition": 2,
+      "workload": "redraw",
+      "build": "musl-system"
+    },
+    {
+      "index": 34,
+      "repetition": 2,
+      "workload": "redraw",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 35,
+      "repetition": 2,
+      "workload": "redraw",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 36,
+      "repetition": 2,
+      "workload": "saturation",
+      "build": "musl-system"
+    },
+    {
+      "index": 37,
+      "repetition": 2,
+      "workload": "saturation",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 38,
+      "repetition": 2,
+      "workload": "saturation",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 39,
+      "repetition": 2,
+      "workload": "retained",
+      "build": "musl-system"
+    },
+    {
+      "index": 40,
+      "repetition": 2,
+      "workload": "retained",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 41,
+      "repetition": 2,
+      "workload": "retained",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 42,
+      "repetition": 2,
+      "workload": "busy",
+      "build": "musl-system"
+    },
+    {
+      "index": 43,
+      "repetition": 2,
+      "workload": "busy",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 44,
+      "repetition": 2,
+      "workload": "busy",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 45,
+      "repetition": 3,
+      "workload": "idle",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 46,
+      "repetition": 3,
+      "workload": "idle",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 47,
+      "repetition": 3,
+      "workload": "idle",
+      "build": "musl-system"
+    },
+    {
+      "index": 48,
+      "repetition": 3,
+      "workload": "redraw",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 49,
+      "repetition": 3,
+      "workload": "redraw",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 50,
+      "repetition": 3,
+      "workload": "redraw",
+      "build": "musl-system"
+    },
+    {
+      "index": 51,
+      "repetition": 3,
+      "workload": "saturation",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 52,
+      "repetition": 3,
+      "workload": "saturation",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 53,
+      "repetition": 3,
+      "workload": "saturation",
+      "build": "musl-system"
+    },
+    {
+      "index": 54,
+      "repetition": 3,
+      "workload": "retained",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 55,
+      "repetition": 3,
+      "workload": "retained",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 56,
+      "repetition": 3,
+      "workload": "retained",
+      "build": "musl-system"
+    },
+    {
+      "index": 57,
+      "repetition": 3,
+      "workload": "busy",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 58,
+      "repetition": 3,
+      "workload": "busy",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 59,
+      "repetition": 3,
+      "workload": "busy",
+      "build": "musl-system"
+    },
+    {
+      "index": 60,
+      "repetition": 4,
+      "workload": "idle",
+      "build": "musl-system"
+    },
+    {
+      "index": 61,
+      "repetition": 4,
+      "workload": "idle",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 62,
+      "repetition": 4,
+      "workload": "idle",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 63,
+      "repetition": 4,
+      "workload": "redraw",
+      "build": "musl-system"
+    },
+    {
+      "index": 64,
+      "repetition": 4,
+      "workload": "redraw",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 65,
+      "repetition": 4,
+      "workload": "redraw",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 66,
+      "repetition": 4,
+      "workload": "saturation",
+      "build": "musl-system"
+    },
+    {
+      "index": 67,
+      "repetition": 4,
+      "workload": "saturation",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 68,
+      "repetition": 4,
+      "workload": "saturation",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 69,
+      "repetition": 4,
+      "workload": "retained",
+      "build": "musl-system"
+    },
+    {
+      "index": 70,
+      "repetition": 4,
+      "workload": "retained",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 71,
+      "repetition": 4,
+      "workload": "retained",
+      "build": "musl-mimalloc-v2"
+    },
+    {
+      "index": 72,
+      "repetition": 4,
+      "workload": "busy",
+      "build": "musl-system"
+    },
+    {
+      "index": 73,
+      "repetition": 4,
+      "workload": "busy",
+      "build": "musl-mimalloc"
+    },
+    {
+      "index": 74,
+      "repetition": 4,
+      "workload": "busy",
+      "build": "musl-mimalloc-v2"
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+{
+ "workload": "retained",
+ "started_utc": "2026-10-27T11:04:39.745194+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "runtime_workers": 4,
+  "runtime_workers_expected": null
+ },
+ "result": {
+  "window": {
+   "seconds": 10.003,
+   "qshd": {
+    "cpu_s": 0.28,
+    "cpu_percent": 2.799,
+    "run_s_live_threads": 0.2669,
+    "runqueue_wait_s_live_threads": 0.0426,
+    "timeslices_per_s": 753.0,
+    "voluntary_switches_per_s": 674.52,
+    "involuntary_switches_per_s": 78.48,
+    "threads_start": 26,
+    "threads_end": 28,
+    "threads_exited": 0,
+    "threads_created": 2,
+    "peak_rss_kib": 9832,
+    "rss_kib": 9216
+   },
+   "relay": {
+    "c2s_datagrams": 0,
+    "c2s_bytes": 0,
+    "s2c_datagrams": 54,
+    "s2c_bytes": 2106,
+    "dropped_datagrams": 0,
+    "c2s_datagrams_per_s": 0.0,
+    "c2s_bytes_per_s": 0.0,
+    "s2c_datagrams_per_s": 5.4,
+    "s2c_bytes_per_s": 210.54,
+    "dropped_datagrams_per_s": 0.0
+   }
+  },
+  "sessions": 8,
+  "output_lines": 20000,
+  "qshd_rss_without_sessions_kib": 4272,
+  "qshd_rss_samples_kib": [
+   9804,
+   9804,
+   9804,
+   9804,
+   9804,
+   9804,
+   9804,
+   9376,
+   9216,
+   9216
+  ]
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 0.463,
+   "system_s": 0.54,
+   "voluntary_switches": 23057,
+   "involuntary_switches": 58399
+  },
+  "clients": [
+   {
+    "user_s": 0.036,
+    "system_s": 0.04,
+    "voluntary_switches": 278,
+    "involuntary_switches": 236
+   },
+   {
+    "user_s": 0.061,
+    "system_s": 0.037,
+    "voluntary_switches": 574,
+    "involuntary_switches": 394
+   },
+   {
+    "user_s": 0.055,
+    "system_s": 0.018,
+    "voluntary_switches": 222,
+    "involuntary_switches": 939
+   },
+   {
+    "user_s": 0.039,
+    "system_s": 0.031,
+    "voluntary_switches": 107,
+    "involuntary_switches": 36
+   },
+   {
+    "user_s": 0.045,
+    "system_s": 0.03,
+    "voluntary_switches": 155,
+    "involuntary_switches": 74
+   },
+   {
+    "user_s": 0.059,
+    "system_s": 0.033,
+    "voluntary_switches": 878,
+    "involuntary_switches": 166
+   },
+   {
+    "user_s": 0.041,
+    "system_s": 0.03,
+    "voluntary_switches": 176,
+    "involuntary_switches": 46
+   },
+   {
+    "user_s": 0.047,
+    "system_s": 0.039,
+    "voluntary_switches": 635,
+    "involuntary_switches": 128
+   }
+  ]
+ },
+ "harness_cpu_s": 0.18,
+ "index": 69,
+ "repetition": 4,
+ "build": "musl-system"
+}

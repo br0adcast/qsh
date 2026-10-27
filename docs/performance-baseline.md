@@ -187,7 +187,7 @@ No runtime measurement is part of ordinary CI.
 | `redraw` | A remote script redraws the full screen with distinct content at 20 frames per second for the window. |
 | `saturation` | `seq 1 2000000` on the remote side, followed by a completion marker. The window is the whole fixed amount of work. |
 | `reconnect` | The relay drops all traffic for the window; the outage CPU and traffic are measured, and then recovery time. |
-| `retained` | Eight clients each start their own session (separate client homes) and leave with `Ctrl-] .`. The run checks that eight session processes remain under qshd, then measures qshd with no client attached. |
+| `retained` | Eight clients each start their own session (separate client homes) and leave with `Ctrl-] .`. The run checks that eight session processes remain under qshd, then measures qshd with no client attached. With `--retained-output-lines N` (harness version 8), each session first prints N lines and its client leaves only after they arrived. The run also records qshd's resident size before the first session (`qshd_rss_without_sessions_kib`) and once a second through the window (`qshd_rss_samples_kib`). |
 | `busy` | One typing session as in `typing`, beside four other sessions (`--busy-sessions`) that each redraw their full screen at 20 frames per second, all through the same qshd. The window covers the keys. Only the echo is measured: with several clients behind the relay, the next client datagram need not be the typing client's. A run in which any key lacks its echo fails. With many sessions the harness itself, one Python process relaying every datagram, can delay echoes; compare `harness_cpu_s` with the run's length before attributing a latency tail to qshd. |
 
 Each run settles for 2 seconds after connecting before its window starts.
@@ -1219,3 +1219,279 @@ keeps a `memcmp` call, and so nearly all of the musl cost, for cells with
 marks. Comparing groups with `as_chunks` and with `chunks_exact` gives the
 same code with rustc 1.99.1. The change uses `as_chunks`, which Clippy
 requires.
+
+## Allocators for musl releases: 2026-10-27
+
+These runs evaluate #307: whether the released musl binaries should replace
+musl's allocator. Two reviewed candidates are compared with musl's own
+allocator (mallocng) and with a glibc build of the same source:
+
+- mimalloc, through the `mimalloc` crate;
+- jemalloc, through `tikv-jemallocator`.
+
+The earlier CPU analysis (C8) found the musl client 2-2.8 times costlier than
+glibc and most of that gap closed by mimalloc. That was before #347 and #352
+removed per-frame grid allocations and the `memcmp` of empty combining
+slots. Allocation volume, the C library's memory routines and allocator
+retention are separate effects; these runs measure them on the current code.
+
+**Decision: defer.** No allocator dependency is added. The reasons are in
+[Decision](#decision-1) below.
+
+### Candidates and their provenance
+
+| | mimalloc | jemalloc |
+|---|---|---|
+| Crates | `mimalloc` 0.1.52, `libmimalloc-sys` 0.1.49 | `tikv-jemallocator` 0.7.0, `tikv-jemalloc-sys` 0.7.1 |
+| Bundled C library | mimalloc 3.3.2 by default, 2.3.2 with feature `v2` | jemalloc 5.3.1 |
+| Crate license | MIT | MIT or Apache-2.0 |
+| C library license | MIT | BSD-2-Clause |
+| Build | `cc` compiles one C file (`static.c`) | the build script runs jemalloc's `configure` and `make` |
+| RustSec | RUSTSEC-2022-0094 (unsound alignment) applies only before 0.1.39 | none |
+
+Both crates come from crates.io and vendor their C sources in the crate
+archive. A release would need the following:
+
+- The C library's license notice in the archives and packages. This is
+  done for OpenSSL with `docs/licenses/openssl.txt`. jemalloc's BSD-2-Clause
+  is outside `deny.toml`'s license list, and cargo-deny would not see it,
+  because the crate declares MIT or Apache-2.0.
+- Review of the vendored C sources on every update. These sources are
+  compiled with the release's `musl-gcc`, and nothing qualifies them the
+  way `docs/native-crypto.md` qualifies OpenSSL.
+- For jemalloc on aarch64, an explicit `JEMALLOC_SYS_WITH_LG_PAGE`.
+  jemalloc fixes the page size when it is built, and the release builds
+  aarch64 on a 4 KiB-page runner. Such a binary does not run on 16 KiB or
+  64 KiB page kernels.
+
+Both are safe with qshd's forks. qshd forks only while single-threaded:
+daemonizing in `detach.rs` and the helper's verifying process. The children
+allocate only after that, so no allocator lock can be held by a thread that
+does not exist in the child.
+
+The allocator would be set in the binaries' `main.rs` only. The test
+allocation counters are `#[global_allocator]`s of their own test targets
+(`presentation_allocations`, `allocation_bounds`, `conn_tests`) and of the
+frame storage harness, and are unaffected. The packaged system-mode qshd is
+a glibc build, so the decision concerns `qsh` and personal-mode `qshd`.
+
+### Procedure
+
+Five builds were made with rustc 1.99.1, the release toolchain, in release
+mode, from `2570c05` with
+[`allocator-evaluation.patch`](performance/2026-10-27-allocators/allocator-evaluation.patch)
+applied. The patch adds off-by-default features that set
+`#[global_allocator]` in both binaries and route the frame storage
+harness's counter to the selected allocator. The builds are:
+
+| Build | Target | Allocator |
+|---|---|---|
+| `gnu-system` | x86_64-unknown-linux-gnu | glibc |
+| `musl-system` | x86_64-unknown-linux-musl | musl mallocng (the release) |
+| `musl-mimalloc` | x86_64-unknown-linux-musl | mimalloc 3.3.2, crate defaults |
+| `musl-mimalloc-v2` | x86_64-unknown-linux-musl | mimalloc 2.3.2 |
+| `musl-jemalloc` | x86_64-unknown-linux-musl | jemalloc 5.3.1, crate defaults |
+
+musl builds use `musl-gcc` and static OpenSSL, as the release does
+(`procedure/build.sh`). Every allocator ran with its default configuration.
+No tuning was tried.
+
+Measurements:
+
+- **End to end**, with this harness at version 8, 5 interleaved
+  repetitions. This covers idle, typing, redraw, saturation, busy (five
+  sessions), and eight retained sessions. The retained sessions were
+  measured twice: once after printing 20,000 lines each, once with no
+  output.
+- **mimalloc 2.3.2**, in a separate end-to-end matrix with `musl-system`
+  and `musl-mimalloc`.
+- **The in-process client harness** (`cli/examples/frame_storage.rs`):
+  - user-space instructions per presented step;
+  - thread CPU per step and `VmHWM` over 5 pairs in rotating order.
+- **Startup.** `qsh --help` and `qshd --help` under `perf stat -r 50`, in a
+  PTY, as the invoking user.
+
+All 215 end-to-end runs and 700 in-process runs succeeded. Every in-process
+build recorded the same output fingerprint, byte count and write count for
+each workload.
+
+Raw data, binary hashes and the procedure scripts are in
+[`performance/2026-10-27-allocators/`](performance/2026-10-27-allocators/).
+The host is the one above: a 4-vCPU x86_64 VM, not idle.
+
+### CPU and latency, end to end
+
+Medians with the range over five repetitions, in percent of one CPU:
+
+| Workload | Process | `gnu-system` | `musl-system` | `musl-mimalloc` | `musl-jemalloc` |
+|---|---|---:|---:|---:|---:|
+| `idle` | qsh | 0.0 [0.0-0.2] | 0.0 [0.0-0.1] | 0.1 [0.0-0.2] | 0.1 [0.0-0.2] |
+| `idle` | qshd | 0.8 [0.8-0.9] | 0.7 [0.6-0.8] | 0.7 [0.7-0.8] | 0.8 [0.7-0.8] |
+| `typing` | qsh | 1.2 [1.1-1.3] | 1.3 [1.3-1.6] | 1.1 [1.0-1.3] | 1.2 [1.1-1.2] |
+| `typing` | qshd | 1.3 [1.3-1.4] | 1.3 [1.2-1.4] | 1.4 [1.2-1.5] | 1.4 [1.3-1.4] |
+| `redraw` | qsh | 1.9 [1.9-2.0] | 2.8 [2.7-2.9] | 2.3 [2.3-2.4] | 2.5 [2.4-2.5] |
+| `redraw` | qshd | 2.2 [2.1-2.2] | 2.3 [2.2-2.4] | 2.2 [2.1-2.3] | 2.3 [2.1-2.4] |
+| `saturation` | qsh | 73.3 [59.0-77.3] | 89.4 [81.5-90.2] | 77.7 [69.2-82.1] | 77.8 [61.8-88.7] |
+| `saturation` | qshd | 93.8 [87.3-94.7] | 92.4 [81.9-98.4] | 92.2 [84.6-100.1] | 98.1 [83.8-105.6] |
+| `busy` | qsh | 1.1 [1.1-1.2] | 1.3 [1.2-1.4] | 1.1 [1.0-1.2] | 1.2 [1.0-1.2] |
+| `busy` | qshd | 7.2 [6.9-7.9] | 7.8 [7.6-8.5] | 7.1 [6.8-7.9] | 7.5 [7.2-8.0] |
+| `retained` | qshd | 3.5 [3.4-3.7] | 3.2 [3.0-3.3] | 3.3 [3.0-3.5] | 3.5 [3.2-3.6] |
+
+The other end-to-end measures, as medians with ranges:
+
+- **Echo.** p50 between 1.2 and 1.4 ms in every build, alone and beside
+  four redrawing sessions; the ranges overlap.
+- **Saturation completion** (`seq 1 2000000`):
+  - `gnu-system`: 2.32 s [2.17-3.22];
+  - `musl-system`: 3.04 s [2.48-3.98];
+  - `musl-mimalloc`: 2.79 s [2.15-3.39];
+  - `musl-jemalloc`: 2.96 s [2.07-3.66].
+
+  In the second matrix, `musl-system` took 3.15 s and `musl-mimalloc` 2.51 s.
+- **mimalloc 2.3.2**, against 3.3.2:
+  - redraw: the same client CPU, 2.4%;
+  - saturation: 3.13 s and 80.7% client CPU, against 2.51 s and 74.8%.
+
+### Memory, end to end
+
+Resident size at the end of the window, MiB, medians with ranges:
+
+| Workload | Process | `gnu-system` | `musl-system` | `musl-mimalloc` | `musl-jemalloc` |
+|---|---|---:|---:|---:|---:|
+| `idle` | qsh | 9.7 [9.6-11.8] | 10.1 [10.1-12.1] | 22.3 [17.5-22.3] | 48.9 [48.0-52.9] |
+| `idle` | qshd | 7.9 [6.3-8.4] | 6.4 [6.4-8.4] | 17.4 [17.2-17.4] | 41.9 [40.0-46.0] |
+| `typing` | qsh | 9.4 [9.3-11.2] | 10.2 [8.2-10.2] | 17.4 [17.4-17.5] | 48.0 [46.0-50.0] |
+| `redraw` | qsh | 12.3 [12.2-14.5] | 13.3 [13.3-13.4] | 24.1 [23.7-24.3] | 53.6 [49.5-53.7] |
+| `redraw` | qshd | 8.2 [6.2-8.5] | 6.4 [6.4-6.5] | 19.9 [19.3-19.9] | 42.0 [42.0-44.0] |
+| `saturation` | qsh | 36.1 [35.4-36.3] | 38.8 [38.7-38.8] | 56.9 [53.8-66.8] | 76.9 [76.0-78.5] |
+| `saturation` | qshd | 8.6 [8.2-10.2] | 6.9 [5.2-7.2] | 27.0 [26.5-36.8] | 42.6 [41.9-43.8] |
+| `busy` | qshd | 10.2 [9.9-14.0] | 8.0 [7.6-17.9] | 35.8 [35.5-40.0] | 46.6 [44.7-57.8] |
+
+The client's peak during saturation was:
+
+- `gnu-system`: 36.1 MiB;
+- `musl-system`: 39.4 MiB;
+- `musl-mimalloc`: 70.2 MiB;
+- `musl-jemalloc`: 77.1 MiB.
+
+mimalloc 2.3.2 held more than 3.3.2:
+
+- idle: 31.4 MiB in the client and 25.5 MiB in qshd;
+- eight retained sessions after output: 94.7 MiB in qshd.
+
+### Retained sessions and the screen budget
+
+qshd's resident size with eight sessions and no client attached, MiB, and
+the growth per session over the daemon before the first session:
+
+| Build | Daemon before sessions | 8 sessions after 20,000 lines | Per session | 8 sessions, no output | Per session |
+|---|---:|---:|---:|---:|---:|
+| `gnu-system` | 4.4 | 12.0 | 0.95 | 10.9 | 0.59 |
+| `musl-system` | 4.2 | 9.0 | 0.60 | 9.1 | 0.62 |
+| `musl-mimalloc` | 7.1 | 65.0 | 7.25 | 48.0 | 5.11 |
+| `musl-jemalloc` | 23.2 | 81.9 | 7.34 | 90.7 | 8.43 |
+
+Through each 10-second window, the per-second samples moved by at most
+2.1 MiB in any run, and by at most 0.5 MiB in the candidates' runs. None of
+the candidates returned the memory while the sessions sat idle. qshd ran
+about 28 threads with eight sessions. Both candidates keep per-thread
+caches or heaps, and jemalloc also keeps several arenas.
+
+ScreenBudget charges a 120x40 model without height growth 38,400 cell slots
+and 39,200 row slots. At the 24-byte `Cell` and 32-byte `Row<Cell>` of
+[the resource policy](terminal-resources.md), that is about 2.1 MiB of
+backing envelope per session. This is a reservation bound, not resident
+memory. With musl's allocator, a whole session grew qshd by about 0.6 MiB,
+well inside that bound. With either candidate it grew qshd by 5-8.4 MiB,
+2.5-4 times the envelope. That memory is outside the budget's logical
+accounting, so the budget's limits would no longer bound qshd's resident
+memory in proportion.
+
+### In-process client
+
+Thread CPU per presented step, medians over five pairs. Each cell gives the
+time in µs, the ratio to `musl-system`, and the pairs faster than it.
+`VmHWM` is in MiB.
+
+| Workload | `gnu-system` | `musl-system` | `musl-mimalloc` | `musl-jemalloc` | `VmHWM`: musl, mimalloc, jemalloc |
+|---|---:|---:|---:|---:|---:|
+| `stream-200x50` | 663 (0.49, 5/5) | 1,350 | 1,059 (0.78, 5/5) | 1,131 (0.84, 5/5) | 9.5, 18.0, 14.6 |
+| `echo-200x50` | 491 (0.63, 5/5) | 776 | 749 (0.97, 5/5) | 777 (1.00, 3/5) | 4.1, 12.0, 10.4 |
+| `alternate-200x50` | 766 (0.55, 5/5) | 1,382 | 1,220 (0.88, 5/5) | 1,264 (0.91, 4/5) | 4.2, 12.0, 10.5 |
+| `combining-200x50` | 3,620 (0.57, 5/5) | 6,379 | 4,769 (0.75, 5/5) | 4,438 (0.70, 5/5) | 5.4, 27.0, 10.8 |
+| `history-200x50` | 889 (0.56, 5/5) | 1,584 | 1,311 (0.83, 4/5) | 1,542 (0.97, 4/5) | 15.6, 27.0, 22.1 |
+| `resize-200x50` | 3,335 (0.40, 5/5) | 8,313 | 3,769 (0.45, 5/5) | 4,343 (0.52, 5/5) | 12.8, 18.0, 22.2 |
+| `stream-512x257` | 14,593 (0.69, 5/5) | 21,084 | 20,031 (0.95, 5/5) | 20,275 (0.96, 5/5) | 55.1, 73.0, 64.2 |
+
+Outside `idle`, whose step is about 500 instructions, user-space
+instructions per step changed by less than 4% between the musl builds,
+except in two places:
+
+- the combining-heavy workloads, where the emulator allocates per cell:
+  −30% for `combining-200x50`, and −8 to −9% for `row-marks16-200x50`;
+- jemalloc's `resize-200x50`: +12%.
+
+The time differences therefore come mostly from the allocator's system
+calls and page faults: musl's mallocng maps and unmaps large blocks. The
+glibc build stayed faster than every musl build in every workload but
+`idle`: 21-60% faster than `musl-system`, and still faster than the
+candidates. The rest of that gap is not the allocator.
+
+In the musl harness binaries, `memcmp` sat at offsets 43, 45, 45 and 19
+modulo 64. `main`'s cell comparison no longer calls it (#352).
+
+### Startup
+
+`perf stat -r 50`, minus the same wrapper running `/bin/true`:
+
+| Build | `qsh --help` instructions | task clock | `qshd --help` instructions | task clock |
+|---|---:|---:|---:|---:|
+| `gnu-system` | 851,869 | 1.16 ms | 358,409 | 1.47 ms |
+| `musl-system` | 463,936 | 1.27 ms | 22,862 | 0.16 ms |
+| `musl-mimalloc` | 572,206 | 2.10 ms | 144,438 | 1.84 ms |
+| `musl-mimalloc-v2` | 549,433 | 0.87 ms | 114,171 | 0.11 ms |
+| `musl-jemalloc` | 562,771 | 1.68 ms | 137,383 | 0.66 ms |
+
+Allocator initialization adds about 0.1 million instructions. The task-clock
+differences, a millisecond or two, are within the spread of a 50-run sample
+on this host.
+
+### Limits of these runs
+
+- **aarch64 was not measured.** The release also ships
+  aarch64-unknown-linux-musl. Allocator behavior and page sizes differ
+  there, and no aarch64 host was available.
+- **Only default configurations were measured.** mimalloc options (arena
+  reservation, eager commit, purge delay) and jemalloc options (arena
+  count, thread caches, decay times) can trade CPU for memory. Their effect
+  is not known from these runs.
+- **One non-idle 4-vCPU host, synthetic workloads.** The memory figures are
+  stable and large. The CPU differences are a few percent of a CPU in
+  interactive workloads.
+
+### Decision
+
+Defer: the release keeps musl's allocator for both binaries.
+
+- **qshd gains nothing in CPU.** Its CPU is the same with every allocator in
+  every workload, within the ranges. Its resident memory grows 2.7-6.5 times
+  idle and 5-10 times with eight retained sessions. The per-session growth
+  exceeds the screen budget's envelope, which is the memory a daemon
+  operator plans with.
+- **qsh gains CPU only under heavy output, at a large memory cost.** Client
+  CPU falls by 11-18% under redraw and about 13% under saturation, and
+  saturation completes 0.1-0.6 s sooner. Typing, idle and echo latency do
+  not change. In exchange, the client holds 7-12 MiB more with mimalloc and
+  38 MiB more with jemalloc, and peaks 30-38 MiB higher. glibc remains
+  faster than any musl build, so most of the remaining musl cost lies
+  outside the allocator.
+- **Either candidate adds a vendored C dependency** with its own review,
+  notice and build requirements. jemalloc's page-size limit on aarch64
+  needs explicit configuration.
+
+The decision should be revisited if one of these holds:
+
+- client CPU under heavy output becomes a reported problem;
+- a tuned configuration keeps resident memory close to musl's, measured on
+  both release architectures. A client-only allocator is a possible
+  outcome then, because qshd shows no gain.

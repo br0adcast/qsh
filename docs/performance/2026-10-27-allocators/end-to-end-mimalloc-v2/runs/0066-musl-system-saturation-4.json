@@ -1,0 +1,89 @@
+{
+ "workload": "saturation",
+ "started_utc": "2026-10-27T11:04:24.390856+00:00",
+ "ok": true,
+ "qshd": {
+  "allowed_cpus": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "runtime_workers": 4,
+  "runtime_workers_expected": null
+ },
+ "result": {
+  "window": {
+   "seconds": 2.943,
+   "qshd": {
+    "cpu_s": 2.88,
+    "cpu_percent": 97.864,
+    "run_s_live_threads": 2.8889,
+    "runqueue_wait_s_live_threads": 4.0501,
+    "timeslices_per_s": 118522.77,
+    "voluntary_switches_per_s": 75993.19,
+    "involuntary_switches_per_s": 42529.59,
+    "threads_start": 8,
+    "threads_end": 8,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 7892,
+    "rss_kib": 7212
+   },
+   "relay": {
+    "c2s_datagrams": 7622,
+    "c2s_bytes": 305493,
+    "s2c_datagrams": 28041,
+    "s2c_bytes": 15696368,
+    "dropped_datagrams": 0,
+    "c2s_datagrams_per_s": 2589.99,
+    "c2s_bytes_per_s": 103807.88,
+    "s2c_datagrams_per_s": 9528.46,
+    "s2c_bytes_per_s": 5333695.78,
+    "dropped_datagrams_per_s": 0.0
+   },
+   "qsh": {
+    "cpu_s": 2.61,
+    "cpu_percent": 88.689,
+    "run_s_live_threads": 2.612,
+    "runqueue_wait_s_live_threads": 1.2373,
+    "timeslices_per_s": 26473.83,
+    "voluntary_switches_per_s": 14511.69,
+    "involuntary_switches_per_s": 11962.14,
+    "threads_start": 9,
+    "threads_end": 9,
+    "threads_exited": 0,
+    "threads_created": 0,
+    "peak_rss_kib": 40348,
+    "rss_kib": 39524
+   },
+   "terminal": {
+    "bytes": 938865,
+    "presented_frames": 2274,
+    "presented_frames_per_s": 772.72
+   }
+  },
+  "lines": 2000000,
+  "completion_s": 2.943
+ },
+ "lifetime": {
+  "qshd": {
+   "user_s": 1.559,
+   "system_s": 3.011,
+   "voluntary_switches": 224096,
+   "involuntary_switches": 922047
+  },
+  "clients": [
+   {
+    "user_s": 2.128,
+    "system_s": 0.529,
+    "voluntary_switches": 42774,
+    "involuntary_switches": 35207
+   }
+  ]
+ },
+ "harness_cpu_s": 0.92,
+ "index": 66,
+ "repetition": 4,
+ "build": "musl-system"
+}
