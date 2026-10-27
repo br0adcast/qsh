@@ -551,15 +551,20 @@ fn tail_is_default_blank(frame: &Frame, row: u16, from: u16) -> bool {
 /// `a_genuine_scroll_that_empties_the_screen_is_not_distinguishable_from_an_erase`
 /// for the regression test pinning this trade-off's current shape.
 fn scrolled_by(previous: &Frame, frame: &Frame) -> Option<u16> {
+    // Every candidate's moved predicate examines a prefix of these rows.
+    // Find its first difference once: moved is exactly first_changed <
+    // confirmed. Neither excluded bottom row can establish that evidence.
+    let first_changed =
+        (0..frame.rows.saturating_sub(2)).find(|&row| !rows_equal(previous, frame, row, row))?;
     for lines in 1..frame.rows {
         let kept = frame.rows - lines;
         let confirmed = kept - 1;
-        if confirmed == 0 {
-            continue;
-        }
-        let moved = (0..confirmed).any(|row| !rows_equal(previous, frame, row, row));
-        if !moved {
-            continue;
+        // confirmed only shrinks with ascending lines; no later candidate
+        // can include the difference. Keep this order to choose the same
+        // first accepted shift. Shifted/corroborated work is unchanged and
+        // can still be quadratic on other inputs.
+        if confirmed <= first_changed {
+            break;
         }
         let shifted = (0..confirmed).all(|row| rows_equal(previous, frame, row + lines, row));
         if !shifted {
@@ -582,7 +587,13 @@ fn row_is_blank(frame: &Frame, row: u16) -> bool {
 
 /// Whether row `a_row` of `a` draws the same as row `b_row` of `b`.
 fn rows_equal(a: &Frame, b: &Frame, a_row: u16, b_row: u16) -> bool {
-    (0..b.cols).all(|col| same_cell(a.cell(a_row, col), b.cell(b_row, col)))
+    #[cfg(test)]
+    scroll_detection_tests::note_row();
+    (0..b.cols).all(|col| {
+        #[cfg(test)]
+        scroll_detection_tests::note_cell();
+        same_cell(a.cell(a_row, col), b.cell(b_row, col))
+    })
 }
 
 /// The previous frame as it looks after scrolling `lines` rows off the top:
@@ -622,3 +633,7 @@ fn tracking_on(tracking: MouseTracking) -> Option<&'static [u8]> {
         MouseTracking::Motion => Some(b"\x1b[?1003h"),
     }
 }
+
+#[cfg(test)]
+#[path = "scroll_detection_tests.rs"]
+mod scroll_detection_tests;
