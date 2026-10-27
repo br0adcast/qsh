@@ -69,7 +69,31 @@ impl Schedule {
     }
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Traffic {
+    pub datagrams: u64,
+    pub bytes: u64,
+}
+impl Traffic {
+    fn record(&mut self, bytes: usize) -> Result<(), String> {
+        let datagrams = self
+            .datagrams
+            .checked_add(1)
+            .ok_or("relay datagram count overflow")?;
+        let bytes = self
+            .bytes
+            .checked_add(u64::try_from(bytes).map_err(|_| "relay length overflow")?)
+            .ok_or("relay byte count overflow")?;
+        self.datagrams = datagrams;
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Receipt {
+    pub client_ingress: Traffic,
+    pub client_forwarded: Traffic,
+    pub server_ingress: Traffic,
+    pub server_forwarded: Traffic,
     pub armed: bool,
     pub server_after_arm: u64,
     pub dropped: u64,
@@ -216,15 +240,23 @@ async fn run(
                     let (n,source)=packet.map_err(|_|"relay client receive failed")?;
                     if client.is_some_and(|known|known!=source) {return Err("relay received unrelated client".into());}
                     client=Some(source);
-                    back.send(&front_buffer[..n]).await.map_err(|_|"relay client forwarding failed")?;
+                    receipt.client_ingress.record(n)?;
+                    let sent=back.send(&front_buffer[..n]).await.map_err(|_|"relay client forwarding failed")?;
+                    if sent!=n {return Err("relay short client send".into());}
+                    receipt.client_forwarded.record(sent)?;
                 },
                 packet=back.recv(&mut back_buffer)=>{
                     let n=packet.map_err(|_|"relay server receive failed")?;
+                    receipt.server_ingress.record(n)?;
                     let target=client.ok_or("relay reply without client mapping")?;
                     let decision=schedule.server_packet().map_err(str::to_owned)?;
                     receipt.server_after_arm=schedule.ordinal;
                     match decision {
-                        Decision::Forward=>{front.send_to(&back_buffer[..n],target).await.map_err(|_|"relay server forwarding failed")?;}
+                        Decision::Forward=>{
+                            let sent=front.send_to(&back_buffer[..n],target).await.map_err(|_|"relay server forwarding failed")?;
+                            if sent!=n {return Err("relay short server send".into());}
+                            receipt.server_forwarded.record(sent)?;
+                        }
                         Decision::Drop=>{receipt.dropped+=1;}
                         Decision::Hold=>{
                             store_held(&mut held,&back_buffer[..n])?;
@@ -233,8 +265,12 @@ async fn run(
                         Decision::Swap=>{
                             let earlier=held.take().ok_or("relay missing held packet")?;
                             // Receipt commits only after both actual sends complete.
-                            front.send_to(&back_buffer[..n],target).await.map_err(|_|"relay overtaking send failed")?;
-                            front.send_to(&earlier,target).await.map_err(|_|"relay held send failed")?;
+                            let sent=front.send_to(&back_buffer[..n],target).await.map_err(|_|"relay overtaking send failed")?;
+                            if sent!=n {return Err("relay short overtaking send".into());}
+                            receipt.server_forwarded.record(sent)?;
+                            let sent=front.send_to(&earlier,target).await.map_err(|_|"relay held send failed")?;
+                            if sent!=earlier.len() {return Err("relay short held send".into());}
+                            receipt.server_forwarded.record(sent)?;
                             receipt.held_bytes=0;receipt.reordered+=1;
                         }
                     }
@@ -256,6 +292,20 @@ async fn run(
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[test]
+    fn qualification305_relay_traffic_counters_preserve_bytes_and_reject_overflow() {
+        let mut totals = Traffic::default();
+        totals.record(3).unwrap();
+        totals.record(5).unwrap();
+        assert_eq!((totals.datagrams, totals.bytes), (2, 8));
+        totals.datagrams = u64::MAX;
+        assert!(totals.record(1).is_err());
+        assert_eq!(totals.bytes, 8);
+        totals.datagrams = 2;
+        totals.bytes = u64::MAX;
+        assert!(totals.record(1).is_err());
+        assert_eq!(totals.datagrams, 2);
+    }
     #[test]
     fn qualification305_relay_schedule_is_armed_directional_and_exact() {
         let mut schedule = Schedule::new(Case::LossReorder);
@@ -310,7 +360,7 @@ mod tests {
             .unwrap();
         let exercise = tokio::time::timeout(Duration::from_secs(2), async {
             client
-                .send_to(&[99], relay.address)
+                .send_to(&[99; 3], relay.address)
                 .await
                 .map_err(|e| e.to_string())?;
             let mut buf = [0; MAX_DATAGRAM];
@@ -318,18 +368,18 @@ mod tests {
                 .recv_from(&mut buf)
                 .await
                 .map_err(|e| e.to_string())?;
-            if &buf[..n] != [99] {
+            if &buf[..n] != [99; 3] {
                 return Err("client payload changed".to_owned());
             }
             // More than eight pre-arm replies must remain untouched and cannot
             // spend the later fixed schedule. Receipt arrives before arm ack.
             for _ in 0..9 {
                 server
-                    .send_to(&[42], back)
+                    .send_to(&[42; 2], back)
                     .await
                     .map_err(|e| e.to_string())?;
                 let n = client.recv(&mut buf).await.map_err(|e| e.to_string())?;
-                if &buf[..n] != [42] {
+                if &buf[..n] != [42; 2] {
                     return Err("pre-arm reply changed".to_owned());
                 }
             }
@@ -339,7 +389,7 @@ mod tests {
             }
             for ordinal in 1..=count {
                 server
-                    .send_to(&[ordinal], back)
+                    .send_to(&vec![ordinal; usize::from(ordinal)], back)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -351,7 +401,8 @@ mod tests {
             let mut received = Vec::new();
             for _ in 0..expected {
                 let n = client.recv(&mut buf).await.map_err(|e| e.to_string())?;
-                if n != 1 {
+                if n == 0 || n != usize::from(buf[0]) || buf[..n].iter().any(|byte| *byte != buf[0])
+                {
                     return Err("server payload changed".to_owned());
                 }
                 received.push(buf[0]);
@@ -366,6 +417,45 @@ mod tests {
         .await;
         // Even failed/watchdog controls stop and join the owned relay before asserting.
         let outcome = relay.finish().await.unwrap();
+        // These are actual socket receipts, including nine pre-arm replies;
+        // assertions execute only after the relay owner has joined.
+        let (expected_forwarded, expected_bytes) = match (case, count) {
+            (Case::LossReorder, 7) => (14, 36),
+            (Case::LossReorder, 8) => (16, 51),
+            (Case::NoLoss, 8) => (17, 54),
+            _ => panic!("unqualified test case"),
+        };
+        assert_eq!(
+            (
+                outcome.receipt.client_ingress.datagrams,
+                outcome.receipt.client_ingress.bytes
+            ),
+            (1, 3)
+        );
+        assert_eq!(
+            (
+                outcome.receipt.client_forwarded.datagrams,
+                outcome.receipt.client_forwarded.bytes
+            ),
+            (1, 3)
+        );
+        assert_eq!(
+            (
+                outcome.receipt.server_ingress.datagrams,
+                outcome.receipt.server_ingress.bytes
+            ),
+            (
+                u64::from(count) + 9,
+                18 + (1..=u64::from(count)).sum::<u64>()
+            )
+        );
+        assert_eq!(
+            (
+                outcome.receipt.server_forwarded.datagrams,
+                outcome.receipt.server_forwarded.bytes
+            ),
+            (expected_forwarded, expected_bytes)
+        );
         (
             exercise
                 .expect("owned UDP watchdog")
@@ -387,7 +477,7 @@ mod tests {
             ),
             (1, 1, 1)
         );
-        assert_eq!(outcome.receipt.held_high_water, 1);
+        assert_eq!(outcome.receipt.held_high_water, 7);
         assert_eq!(outcome.receipt.held_bytes, 0);
         assert!(outcome.qualified(Case::LossReorder));
         assert!(!outcome.qualified(Case::NoLoss));
