@@ -1411,6 +1411,38 @@ fn on_wire(
     )
 }
 
+/// Apply a selected stream reset through the same ordered CLI boundary as Wire.
+fn on_wire_reset(
+    stream: u8,
+    links: &mut Links,
+    sess: &mut Session,
+    shell_bytes: &mut Vec<u8>,
+    now_ms: &impl Fn() -> i64,
+) -> Vec<Action> {
+    let mut actions = flush_shell_bytes(shell_bytes, sess, now_ms());
+    if Some(stream) == links.shell_channel {
+        // Whatever partial record the substrate was holding
+        // for THIS channel belongs to a byte offset the peer
+        // has now abandoned: keeping it would splice the
+        // next bytes onto a leftover that no longer means
+        // anything -- the same reasoning
+        // `ShellState::on_reset` already applies to its own
+        // deframer. Only this one channel's stream, not the
+        // whole substrate: recreating it outright would also
+        // discard `CONTROL_STREAM`'s own in-flight state,
+        // for no reason connected to this reset at all.
+        // `ChannelSession::reset_stream` is the generic seam
+        // for this -- qsh implements it, and a substrate
+        // with no framing (SSH) just gets the trait's
+        // no-op default.
+        if let Some(live) = links.live.as_mut() {
+            live.channel_session.reset_stream(stream);
+        }
+        actions.extend(sess.handle(UiEvent::StreamReset, now_ms()));
+    }
+    actions
+}
+
 fn channel_events(
     events: Vec<SessionEvent>,
     shell_channel: &mut Option<ChannelId>,
@@ -1810,28 +1842,7 @@ fn interactive(
                     )
                 }
                 UiEvent::WireReset(stream) => {
-                    let mut actions = flush_shell_bytes(&mut shell_bytes, &mut sess, now_ms());
-                    if Some(stream) == links.shell_channel {
-                        // Whatever partial record the substrate was holding
-                        // for THIS channel belongs to a byte offset the peer
-                        // has now abandoned: keeping it would splice the
-                        // next bytes onto a leftover that no longer means
-                        // anything -- the same reasoning
-                        // `ShellState::on_reset` already applies to its own
-                        // deframer. Only this one channel's stream, not the
-                        // whole substrate: recreating it outright would also
-                        // discard `CONTROL_STREAM`'s own in-flight state,
-                        // for no reason connected to this reset at all.
-                        // `ChannelSession::reset_stream` is the generic seam
-                        // for this -- qsh implements it, and a substrate
-                        // with no framing (SSH) just gets the trait's
-                        // no-op default.
-                        if let Some(live) = links.live.as_mut() {
-                            live.channel_session.reset_stream(stream);
-                        }
-                        actions.extend(sess.handle(UiEvent::StreamReset, now_ms()));
-                    }
-                    actions
+                    on_wire_reset(stream, &mut links, &mut sess, &mut shell_bytes, &now_ms)
                 }
                 // The live link died under the session -- no `Close` from
                 // either side, so the server keeps the session: reconnect
@@ -2002,6 +2013,7 @@ mod tests {
     include!("input_reader_tests.rs");
     include!("input_action_tests.rs");
     include!("input_turn_tests.rs");
+    include!("applied_gap_tests.rs");
 
     fn geometry_session() -> Session {
         geometry_session_with_cols(20)
