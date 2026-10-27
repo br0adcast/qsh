@@ -7,13 +7,16 @@
 //! it sets no thresholds. The method and recorded results are in
 //! docs/performance-baseline.md, under "Frame storage reuse".
 //!
-//!   cargo run --release -p qsh --example frame_storage -- [--time] [WORKLOAD...]
+//!   cargo run --release -p qsh --example frame_storage -- [--time] [--steps N] [WORKLOAD...]
 //!
 //! Without `--time` every allocation is counted and steps are not timed.
 //! With it, counting is off and only time per step is reported: elapsed
 //! (monotonic clock, descheduled time included) and CPU time of the thread
 //! running the session. Output is one JSON object per workload on stdout.
 //! The `idle` workload presents nothing and measures the recorder itself.
+//! `--steps N` measures N steps instead of the workload's own count; with
+//! 0, a run does only the preparation and warm-up, so a whole-process
+//! counter, such as `perf stat`, can subtract them.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -203,29 +206,76 @@ fn line(n: usize, width: usize) -> String {
 }
 
 /// A full-screen redraw, as a full-screen application sends one.
-fn screen(bench: &Bench, step: usize, combining: bool) -> Vec<u8> {
-    let (cols, rows) = (bench.shell_cols(), bench.shell_rows());
+fn screen(bench: &Bench, step: usize, marks: usize) -> Vec<u8> {
     let mut text = String::from("\x1b[H");
-    for row in 0..rows {
-        text.push_str(&format!(
-            "\x1b[{};1H\x1b[38;5;{}m",
-            row + 1,
-            (row + step) % 256
-        ));
-        for col in 0..cols {
-            let base = char::from(b'a' + ((row + col + step) % 26) as u8);
-            text.push(base);
-            if combining {
-                // Four marks per cell, varied so every step changes them.
-                for mark in 0..4 {
-                    let offset = ((col + mark + step) % 0x30) as u32;
-                    text.push(char::from_u32(0x0300 + offset).expect("combining mark"));
-                }
-            }
-        }
+    for row in 0..bench.shell_rows() {
+        push_row(&mut text, bench.shell_cols(), row, step, marks);
     }
     text.push_str("\x1b[0m");
     text.into_bytes()
+}
+
+/// One row of a redraw: text and color that change with `step`, and
+/// `marks` combining marks on every cell, varied so every step changes them.
+fn push_row(text: &mut String, cols: usize, row: usize, step: usize, marks: usize) {
+    text.push_str(&format!(
+        "\x1b[{};1H\x1b[38;5;{}m",
+        row + 1,
+        (row + step) % 256
+    ));
+    for col in 0..cols {
+        let base = char::from(b'a' + ((row + col + step) % 26) as u8);
+        text.push(base);
+        for mark in 0..marks {
+            let offset = ((col + mark + step) % 0x30) as u32;
+            text.push(char::from_u32(0x0300 + offset).expect("combining mark"));
+        }
+    }
+}
+
+/// On the alternate screen, a full screen whose every cell holds `marks`
+/// combining marks; each step then rewrites one row of it.
+fn prepare_marks(bench: &mut Bench, marks: usize) {
+    let mut bytes = b"\x1b[?1049h".to_vec();
+    bytes.extend(screen(bench, 0, marks));
+    bench.output(&bytes);
+}
+
+fn step_marks(bench: &mut Bench, step: usize, marks: usize) -> Vec<Action> {
+    let mut text = String::new();
+    push_row(
+        &mut text,
+        bench.shell_cols(),
+        step % bench.shell_rows(),
+        step + 1,
+        marks,
+    );
+    text.push_str("\x1b[0m");
+    bench.output(text.as_bytes())
+}
+
+fn prepare_marks0(bench: &mut Bench) {
+    prepare_marks(bench, 0);
+}
+
+fn step_marks0(bench: &mut Bench, step: usize) -> Vec<Action> {
+    step_marks(bench, step, 0)
+}
+
+fn prepare_marks4(bench: &mut Bench) {
+    prepare_marks(bench, 4);
+}
+
+fn step_marks4(bench: &mut Bench, step: usize) -> Vec<Action> {
+    step_marks(bench, step, 4)
+}
+
+fn prepare_marks16(bench: &mut Bench) {
+    prepare_marks(bench, 16);
+}
+
+fn step_marks16(bench: &mut Bench, step: usize) -> Vec<Action> {
+    step_marks(bench, step, 16)
 }
 
 fn prepare_nothing(_: &mut Bench) {}
@@ -262,12 +312,12 @@ fn prepare_alternate(bench: &mut Bench) {
 }
 
 fn step_alternate(bench: &mut Bench, step: usize) -> Vec<Action> {
-    let bytes = screen(bench, step, false);
+    let bytes = screen(bench, step, 0);
     bench.output(&bytes)
 }
 
 fn step_combining(bench: &mut Bench, step: usize) -> Vec<Action> {
-    let bytes = screen(bench, step, true);
+    let bytes = screen(bench, step, 4);
     bench.output(&bytes)
 }
 
@@ -379,6 +429,30 @@ const WORKLOADS: &[Workload] = &[
         step: step_combining,
     },
     Workload {
+        name: "row-marks0-200x50",
+        cols: 200,
+        rows: 50,
+        steps: 200,
+        prepare: prepare_marks0,
+        step: step_marks0,
+    },
+    Workload {
+        name: "row-marks4-200x50",
+        cols: 200,
+        rows: 50,
+        steps: 200,
+        prepare: prepare_marks4,
+        step: step_marks4,
+    },
+    Workload {
+        name: "row-marks16-200x50",
+        cols: 200,
+        rows: 50,
+        steps: 200,
+        prepare: prepare_marks16,
+        step: step_marks16,
+    },
+    Workload {
         name: "history-200x50",
         cols: 200,
         rows: 50,
@@ -452,7 +526,7 @@ struct Sample {
     retained: usize,
 }
 
-fn run(workload: &Workload, timed: bool) -> serde_json::Value {
+fn run(workload: &Workload, timed: bool, steps: usize) -> serde_json::Value {
     let cell = size_of::<terminal::Cell>();
     let (shell_cols, shell_rows) = qsh::session::shell_size(workload.cols, workload.rows, true);
     let smallest_grid = if workload.name.starts_with("resize") {
@@ -465,7 +539,7 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
     COUNTING.store(!timed, Ordering::Relaxed);
     // The recorder's storage exists before the baseline and never grows, so
     // no step's counts and no retained figure include it.
-    let mut samples = Vec::with_capacity(workload.steps);
+    let mut samples = Vec::with_capacity(steps);
     let base = LIVE.load(Ordering::Relaxed);
 
     let mut bench = Bench::new(workload.cols, workload.rows);
@@ -478,7 +552,7 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
 
     let (mut writes, mut written) = (0usize, 0usize);
     let (mut elapsed, mut cpu) = (Duration::ZERO, Duration::ZERO);
-    for step in WARMUP..WARMUP + workload.steps {
+    for step in WARMUP..WARMUP + steps {
         CALLS.store(0, Ordering::Relaxed);
         BYTES.store(0, Ordering::Relaxed);
         GRID_CALLS.store(0, Ordering::Relaxed);
@@ -509,14 +583,15 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
     drop(bench);
     COUNTING.store(false, Ordering::Relaxed);
 
-    let steps = workload.steps as f64;
+    let measured = steps;
+    let steps = steps.max(1) as f64;
     let mean = |pick: fn(&Sample) -> usize| samples.iter().map(pick).sum::<usize>() as f64 / steps;
     let max = |pick: fn(&Sample) -> usize| samples.iter().map(pick).max().unwrap_or(0);
     let mut result = serde_json::json!({
         "workload": workload.name,
         "cols": workload.cols,
         "rows": workload.rows,
-        "steps": workload.steps,
+        "steps": measured,
         "cell_bytes": cell,
         "grid_bytes": usize::from(shell_cols) * usize::from(shell_rows) * cell,
         "writes": writes,
@@ -553,17 +628,22 @@ fn run(workload: &Workload, timed: bool) -> serde_json::Value {
 
 fn main() {
     let mut timed = false;
+    let mut steps = None;
     let mut names = Vec::new();
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         if arg == "--time" {
             timed = true;
+        } else if arg == "--steps" {
+            let count = args.next().and_then(|n| n.parse().ok());
+            steps = Some(count.expect("--steps takes a count"));
         } else {
             names.push(arg);
         }
     }
     for workload in WORKLOADS {
         if names.is_empty() || names.iter().any(|name| name == workload.name) {
-            println!("{}", run(workload, timed));
+            println!("{}", run(workload, timed, steps.unwrap_or(workload.steps)));
         }
     }
 }

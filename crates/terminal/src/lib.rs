@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
+mod combining_equality_tests;
+#[cfg(test)]
 mod frame_storage_tests;
 mod limits;
 mod replay;
@@ -78,10 +80,30 @@ pub const FLAG_HIDDEN: u16 = 0b1_0000_0000;
 pub const MAX_COMBINING_MARKS: usize = 16;
 
 /// Bounded inline zero-width suffix. Copying a cell never allocates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Slots past `len` are always `'\0'`: the storage starts zeroed, `push`
+/// writes only the slot at `len`, and nothing removes a mark in place.
+/// Equality relies on this: it compares the length and only the slots that
+/// can hold marks, so an empty suffix, the common case, compares one byte.
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct CombiningMarks {
     chars: [char; MAX_COMBINING_MARKS],
     len: u8,
+}
+
+impl PartialEq for CombiningMarks {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Slots past `len` are zero in both, so the groups of four slots
+        // that hold the marks compare as the marks themselves do. Each group
+        // is a fixed-size comparison, which needs no call to `memcmp`.
+        let groups = usize::from(self.len).div_ceil(4);
+        let (ours, theirs) = (
+            self.chars.as_chunks::<4>().0,
+            other.chars.as_chunks::<4>().0,
+        );
+        self.len == other.len && ours.iter().zip(theirs).take(groups).all(|(a, b)| a == b)
+    }
 }
 
 impl Default for CombiningMarks {

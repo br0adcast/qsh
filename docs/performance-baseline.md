@@ -784,8 +784,9 @@ The recorder allocates its result storage before the live-heap baseline and
 never grows it. Each step's counters are read before anything is recorded.
 The `idle` workload measures the recorder itself.
 
-Both modes hash everything written to the terminal, so two builds can be
-checked for identical output.
+Both modes hash everything written to the terminal with 64-bit FNV-1a and
+count the bytes and writes, so two builds can be checked for matching output.
+The records keep these fingerprints, not the output itself.
 
 | Workload | Each step |
 |---|---|
@@ -816,7 +817,8 @@ The runs used the same host as above, which was not idle. Raw data and binary
 hashes are in
 [`performance/2026-10-27-frame-storage/`](performance/2026-10-27-frame-storage/).
 All 440 runs completed. For every workload and libc, every run of both builds
-in both modes wrote byte-identical terminal output.
+in both modes recorded the same output fingerprint, byte count and write
+count.
 
 ### Allocations and memory
 
@@ -970,3 +972,250 @@ Their allocation figures match these runs except for those kilobytes. Their
 glibc times agree with these runs on direction: in neither set was the
 change's median more than 1% slower in any workload. The size of the gains differs by up to 22
 percentage points, for `alternate-200x50`.
+
+## Combining-mark equality: 2026-10-27
+
+These runs evaluate #352: comparing a cell's combining marks by their
+length and occupied slots, instead of all 16 slots. They follow the frame
+storage runs above and use the same harness, with additions described below.
+The storage, the `Cell` layout and every other compared field are unchanged.
+
+### What a cell comparison did
+
+`CombiningMarks` derived `PartialEq` over its whole `[char; 16]` array and its
+length. Every comparison of two cells with the same base character and
+attributes therefore compared 64 bytes of marks. The compiler emits that as a
+call to `bcmp` or `memcmp`, even for the common cell with no marks. In musl,
+`memcmp` is a loop over single bytes.
+
+Slots past the length are always `'\0'`:
+
+- the storage starts zeroed;
+- `push` writes only the slot at the length;
+- nothing removes a mark in place.
+
+The change compares the length, then only the groups of four slots that can
+hold marks. Each group is a fixed-size comparison that the compiler expands
+inline. An empty suffix compares one byte, and no cell comparison calls
+`memcmp`. Unit tests check the zero-tail invariant from every construction
+and mutation path, and compare the new equality with the old one.
+
+### Procedure
+
+The measurements below were taken with three builds of
+`crates/terminal/examples/cell_equality.rs` and `cli/examples/frame_storage.rs`:
+
+- `main` at `7a15274`, with the harness and probe files of `fccf179` added;
+- the change at `fccf179`;
+- a **full-array** alternative, which skips an empty suffix but otherwise
+  compares the whole array (`variant-full-array.patch`).
+
+A fourth build, with `chunks_exact` instead of `as_chunks`
+(`variant-chunks-exact.patch`), was counted for instructions only.
+
+All builds use rustc 1.99.1, the toolchain of releases and ordinary Linux CI,
+in release mode for glibc and for musl (with `musl-gcc`, as the release is).
+The host is the one above, which was not idle.
+
+Three kinds of measurement were taken:
+
+- **Comparison work.** The probe builds two equal 200x50 frames from emulator
+  input, feeding each cell on its own, and compares them cell by cell 200
+  times. The cases are:
+  - no marks, 4 marks or 16 marks per cell;
+  - a negative control, in which every base character differs, so every
+    comparison stops before the marks.
+
+  It runs under `perf stat -e instructions:u`. The count for 0 rounds is
+  subtracted, and the remainder is divided by the 2,000,000 comparisons. With
+  glibc it also runs under the counting `memcmp`/`bcmp` preload of
+  [`2026-10-27-frame-storage/profiles.md`](performance/2026-10-27-frame-storage/profiles.md).
+- **Instructions per presented step.** Each harness workload runs under
+  `perf stat -e instructions:u` in `--time` mode, once with its steps and
+  once with `--steps 0`, which does only the preparation and warm-up. The
+  difference divided by the steps is the cost of one presented step.
+  Instruction counts do not depend on timing noise. A second complete series
+  of the same counts with the same binaries, `instructions-repeat.jsonl`,
+  differed from the first by at most 0.0003% per step outside `idle`. The
+  `idle` step, about 500 instructions, varied by up to 1.5 instructions.
+  A repeat of the probe, `probe-repeat.jsonl`, differed by at most 0.003% per
+  comparison.
+- **Time per presented step**, as in the frame storage runs: 5 interleaved
+  pairs, now with three builds whose order rotates from pair to pair. Every
+  workload runs in both modes, one process each.
+
+The harness gains three workloads for this. Each prepares a full 200x50
+alternate screen from input that gives every cell 0, 4 or 16 combining
+marks. Each step then rewrites one row the same way, so most cells are
+compared equal.
+
+| Workload | Each step |
+|---|---|
+| `row-marks0-200x50` | One row of a full screen rewritten; no marks. |
+| `row-marks4-200x50` | The same, with input of 4 marks per cell. |
+| `row-marks16-200x50` | The same, with input of 16 marks per cell. |
+
+These builds predate the vte fix for #354 (#356). On that baseline, an
+output of multi-byte text longer than 4,096 bytes can lose a character
+where a chunk boundary splits a UTF-8 sequence, and the marks of the lost
+character join the previous cell. This applies to:
+
+- the preparation of `row-marks4-200x50` and `row-marks16-200x50`, each
+  one write of the whole screen;
+- every step of `row-marks16-200x50`, whose row is about 6,600 bytes;
+- every step of `combining-200x50`.
+
+Their mark counts are therefore nominal: the input gives every cell that
+many marks, but the screen need not hold exactly that. The input is the same
+for every build, and so is any such loss. The probe feeds each cell on its
+own and asserts that every cell holds the stated marks, so the comparison
+work below does measure full 16-mark suffixes.
+
+For every workload and libc, all runs of every build recorded the same
+64-bit FNV-1a fingerprint of the terminal output, the same byte count and
+the same write count. The records keep these fingerprints, not the output
+itself.
+
+Raw data, binary hashes and `memcmp` addresses are in
+[`performance/2026-10-27-combining-equality/`](performance/2026-10-27-combining-equality/).
+All 840 runs completed: 420 in timed mode and 420 in counting mode.
+
+### Comparison work
+
+Instructions per cell comparison, and `memcmp`/`bcmp` calls per comparison
+with glibc:
+
+| Case | `main` | change | full array |
+|---|---:|---:|---:|
+| no marks, glibc | 49 (1 call, 64 bytes) | 29 (none) | 28 (none) |
+| 4 marks, glibc | 49 (1 call, 64 bytes) | 45 (none) | 51 (1 call, 64 bytes) |
+| 16 marks, glibc | 49 (1 call, 64 bytes) | 87 (none) | 51 (1 call, 64 bytes) |
+| base differs, glibc | 9 (none) | 9 (none) | 9 (none) |
+| no marks, musl | 488 | 29 | 28 |
+| 4 marks, musl | 488 | 45 | 490 |
+| 16 marks, musl | 488 | 87 | 490 |
+| base differs, musl | 9 | 9 | 9 |
+
+The negative control costs the same in every build: when the base
+characters differ, no build reads the marks. Every case found the same
+number of equal pairs in every build.
+
+The probe measures one comparison loop in isolation. In optimized code a
+comparison is inlined into its callers. The surrounding code, and how the
+compiler arranges it, also decides what a comparison costs there:
+
+- in `main` the compiler already compares the length before calling `bcmp`
+  for the array;
+- the full-array build calls `bcmp` only for a non-empty suffix;
+- the counting preload sees only calls to the library, not the comparisons
+  the compiler expands inline.
+
+### Instructions per presented step
+
+Thousands of user-space instructions per step, rustc 1.99.1. The ratio
+columns are relative to `main`.
+
+| Workload | glibc `main` | glibc change | ratio | full array | musl `main` | musl change | ratio | full array |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `idle` | 0.5 | 0.5 | 1.000 | 1.001 | 0.5 | 0.5 | 1.000 | 1.000 |
+| `stream-80x24` | 1,066 | 1,004 | 0.942 | 0.951 | 1,972 | 1,005 | 0.509 | 0.514 |
+| `stream-200x50` | 5,502 | 5,186 | 0.943 | 0.952 | 10,124 | 5,271 | 0.521 | 0.525 |
+| `stream-512x257` | 74,031 | 69,953 | 0.945 | 0.954 | 129,470 | 67,522 | 0.522 | 0.527 |
+| `append-512x257` | 52,363 | 47,619 | 0.909 | 0.922 | 122,443 | 45,174 | 0.369 | 0.374 |
+| `echo-200x50` | 3,759 | 3,426 | 0.912 | 0.924 | 8,603 | 3,354 | 0.390 | 0.395 |
+| `alternate-200x50` | 6,630 | 6,590 | 0.994 | 0.999 | 6,798 | 6,585 | 0.969 | 0.973 |
+| `alternate-512x257` | 87,295 | 86,873 | 0.995 | 1.000 | 85,285 | 84,421 | 0.990 | 0.994 |
+| `combining-200x50` | 31,140 | 31,099 | 0.999 | 1.000 | 39,032 | 38,787 | 0.994 | 0.995 |
+| `row-marks0-200x50` | 3,816 | 3,501 | 0.918 | 0.933 | 8,053 | 3,439 | 0.427 | 0.434 |
+| `row-marks4-200x50` | 6,317 | 6,165 | 0.976 | 1.002 | 10,704 | 6,253 | 0.584 | 0.993 |
+| `row-marks16-200x50` | 13,584 | 13,865 | 1.021 | 1.001 | 18,599 | 14,581 | 0.784 | 0.996 |
+| `history-200x50` | 6,966 | 6,654 | 0.955 | 0.962 | 11,353 | 6,561 | 0.578 | 0.582 |
+| `resize-200x50` | 16,536 | 16,303 | 0.986 | 0.988 | 19,830 | 16,085 | 0.811 | 0.813 |
+
+The `chunks_exact` build counted within 0.7% of the change in every workload.
+
+The same sources built with rustc 1.98.1, the floor toolchain, did not
+compile to the same code. With glibc, the change then saved less:
+
+| Workload | 1.98.1 change | 1.98.1 `chunks_exact` | 1.99.1 change |
+|---|---:|---:|---:|
+| `echo-200x50` | 0.961 | 0.910 | 0.912 |
+| `alternate-200x50` | 1.014 | 0.993 | 0.994 |
+| `row-marks16-200x50` | 1.045 | 1.019 | 1.021 |
+
+With musl, both toolchains gave ratios within 0.04 of each other. These
+counts are in `instructions-rust-1.98.1.jsonl`.
+
+### Time per presented step
+
+Thread CPU time: medians, with the range over the five pairs, in
+microseconds. The `faster` columns count the pairs in which the build took
+less than `main`. Elapsed time was within 0.9% of thread CPU time in every
+run outside `idle`.
+
+| Workload | glibc `main` | glibc change | ratio | faster | musl `main` | musl change | ratio | faster |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `stream-80x24` | 118 [110-124] | 107 [102-122] | 0.91 | 4/5 | 309 [299-327] | 183 [177-192] | 0.59 | 5/5 |
+| `stream-200x50` | 657 [652-802] | 670 [631-691] | 1.02 | 4/5 | 1,916 [1,873-1,992] | 1,230 [1,175-1,308] | 0.64 | 5/5 |
+| `stream-512x257` | 14,920 [14,572-15,447] | 14,615 [14,403-15,111] | 0.98 | 4/5 | 27,245 [26,930-27,524] | 21,461 [20,788-21,765] | 0.79 | 5/5 |
+| `append-512x257` | 13,723 [12,960-13,942] | 13,057 [12,563-13,379] | 0.95 | 5/5 | 24,626 [23,980-25,731] | 17,197 [17,038-17,707] | 0.70 | 5/5 |
+| `echo-200x50` | 504 [465-602] | 496 [465-522] | 0.98 | 4/5 | 1,457 [1,325-1,489] | 764 [744-794] | 0.52 | 5/5 |
+| `alternate-200x50` | 812 [744-854] | 837 [756-950] | 1.03 | 1/5 | 1,422 [1,384-1,642] | 1,550 [1,472-1,625] | 1.09 | 2/5 |
+| `alternate-512x257` | 17,058 [16,229-17,650] | 17,289 [16,608-18,126] | 1.01 | 2/5 | 23,872 [23,189-24,508] | 23,358 [23,081-24,893] | 0.98 | 4/5 |
+| `combining-200x50` | 3,581 [3,440-4,266] | 3,535 [3,283-3,643] | 0.99 | 3/5 | 6,692 [6,333-7,018] | 6,936 [6,491-7,281] | 1.04 | 0/5 |
+| `row-marks0-200x50` | 561 [485-622] | 499 [478-553] | 0.89 | 4/5 | 1,315 [1,282-1,465] | 840 [786-1,022] | 0.64 | 5/5 |
+| `row-marks4-200x50` | 691 [659-932] | 751 [695-863] | 1.09 | 2/5 | 1,781 [1,725-2,326] | 1,189 [1,174-1,311] | 0.67 | 5/5 |
+| `row-marks16-200x50` | 1,337 [1,272-1,464] | 1,435 [1,353-1,526] | 1.07 | 1/5 | 2,879 [2,753-3,011] | 2,131 [2,087-2,421] | 0.74 | 5/5 |
+| `history-200x50` | 992 [870-1,116] | 913 [871-959] | 0.92 | 3/5 | 2,068 [2,023-2,300] | 1,537 [1,450-1,583] | 0.74 | 5/5 |
+| `resize-200x50` | 3,535 [3,297-4,465] | 4,080 [3,572-4,528] | 1.15 | 0/5 | 8,350 [8,071-9,048] | 7,883 [7,777-8,419] | 0.94 | 4/5 |
+
+The full-array build's times are in the raw data. Allocation counts and heap
+figures were identical in all three builds.
+
+### Limits of these runs
+
+- **glibc times do not resolve the change.** The medians moved between −11%
+  and +15%, against instruction changes of −9% to +2%. Some workloads moved
+  against their instruction counts. `resize-200x50` took longer in all five
+  pairs, with 1.4% fewer instructions. In two earlier matrices of rustc 1.98.1
+  builds, of the change and of the `chunks_exact` form, the same workload
+  took 2% longer and 4% less. These differences follow the build, not the
+  instruction count. They are not
+  read here as an effect of the change in either direction.
+- **The musl times are confounded by `memcmp` placement.** `main` calls
+  `memcmp` for every cell comparison, the change for none, so the placement
+  of `memcmp` affects the time of `main`'s comparisons only. In all three
+  matrices, the musl builds of `main` had `memcmp` at offset 27 modulo 64.
+  In the frame storage runs, the same
+  `main` code was about 1.5 times slower on `echo-200x50` with `memcmp` at
+  27 than at 11. Part of the musl time difference may therefore come from
+  placement, and the times do not give its size. An attempt to move only
+  `memcmp` in a `main` build did not succeed. A padding object passed to the
+  linker was placed after the C library.
+- **Instruction counts are the layout-independent measure.** They show the
+  reduction under musl, 42-63% for the workloads whose cells mostly have no
+  marks. Under glibc they show 4-9% in those workloads. Instructions are not
+  time: a vectorized `bcmp` executes few instructions per byte.
+- **Workloads.** These are synthetic workloads on one non-idle host. Text
+  with marks on most cells is uncommon. Full-screen redraws whose base
+  characters all change do not reach the marks, and so do not change.
+
+### Decision
+
+The change is adopted:
+
+- the tests establish its correctness against the old equality;
+- it removes the comparison of empty slots;
+- it removes every `memcmp` call from cell comparison;
+- it reduces user-space instructions, with both libcs and both toolchains,
+  in every workload whose comparisons mostly find equal cells without marks:
+  streaming, echo, one-row updates, history paging and resize.
+
+The cost is with glibc in `row-marks16-200x50`, nominally 16 marks on every
+cell: 2.1% more instructions.
+
+The full-array alternative saves about as much for cells with no marks. It
+keeps a `memcmp` call, and so nearly all of the musl cost, for cells with
+marks. Comparing groups with `as_chunks` and with `chunks_exact` gives the
+same code with rustc 1.99.1. The change uses `as_chunks`, which Clippy
+requires.
