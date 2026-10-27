@@ -391,7 +391,13 @@ jobs:
             climb::bootstrap_tests::background_ssh_rejects_a_conflicting_pin_on_the_returned_port \
             climb::bootstrap_tests::background_ssh_cannot_publish_from_an_unreadable_endpoint_pin_store \
             climb::bootstrap_tests::an_ssh_bootstrap_grant_is_bound_to_the_exact_route_port_and_stage \
-            climb::bootstrap_tests::foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key; do
+            climb::bootstrap_tests::foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key \
+            climb::bootstrap_tests::ssh_first_memory_recovery_ignores_corrupt_store_and_rechecks_qsh_identity \
+            climb::bootstrap_tests::ssh_first_mismatched_or_cancelled_bootstrap_never_publishes \
+            climb::bootstrap_tests::ssh_first_new_connection_is_empty_and_foreign_identity_cannot_inherit \
+            climb::bootstrap_tests::ssh_first_origin_uses_ssh_port_and_established_evidence_is_immutable \
+            climb::bootstrap_tests::ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it \
+            climb::bootstrap_tests::ssh_first_wrong_origin_or_unauthenticated_peer_cannot_publish; do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 {
                 seen++; pending = 1
@@ -402,7 +408,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 11 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
