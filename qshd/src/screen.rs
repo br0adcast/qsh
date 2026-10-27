@@ -290,6 +290,26 @@ mod tests {
         assert_frames_match(&screen.frame(), &client.frame(), case);
     }
 
+    /// A PTY read can end inside a UTF-8 sequence. The model, and the
+    /// repaint a reattaching client gets, must be those of the unsplit
+    /// output, the character after the split included (#354).
+    #[test]
+    fn output_split_inside_a_utf8_sequence_models_and_repaints_unsplit() {
+        let text = "д п р e\u{301}h\u{300}z ïcø".as_bytes();
+        let mut whole = screen(30, 3);
+        whole.absorb(text).unwrap();
+        let expected = whole.repaint().unwrap().bytes;
+        for at in 0..=text.len() {
+            let mut split = screen(30, 3);
+            split.absorb(&text[..at]).unwrap();
+            split.absorb(&text[at..]).unwrap();
+            assert_eq!(split.frame(), whole.frame(), "split at {at}");
+            assert_eq!(split.repaint().unwrap().bytes, expected, "split at {at}");
+        }
+        assert_eq!(row_text(&whole.frame(), 0), "д п р ehz ïcø");
+        round_trip("split utf-8", 30, 3, &[&text[..1], &text[1..]]);
+    }
+
     #[test]
     fn zero_history_does_not_restore_scrolled_content_after_growth() {
         let mut screen = screen(8, 2);
