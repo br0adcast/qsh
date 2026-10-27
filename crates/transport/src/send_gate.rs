@@ -115,6 +115,17 @@ impl SendGate {
         self.notify_opened(&st, was_open)
     }
 
+    #[cfg(any(test, feature = "testnet"))]
+    pub(crate) fn qualification_state(&self) -> (bool, bool, bool, u64) {
+        let state = self.state.lock().expect("send gate");
+        (
+            state.open,
+            state.closed,
+            state.metadata_blocked,
+            state.pending,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_for_test(&self) -> u64 {
         self.state.lock().unwrap().pending

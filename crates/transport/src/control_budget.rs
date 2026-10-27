@@ -123,6 +123,10 @@ impl GlobalBudget {
     }
 }
 impl SessionBudget {
+    #[cfg(any(test, feature = "testnet"))]
+    pub(crate) fn qualification_retired(&self) -> bool {
+        self.state.lock().map_or(true, |state| state.retired)
+    }
     pub(crate) fn retire(&self) {
         self.state.lock().unwrap().retired = true;
     }

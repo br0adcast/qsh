@@ -3165,3 +3165,89 @@ fn epoch305_byte_limit_keeps_screen_slice_and_next_header_charge() {
         (TURN_BYTES + 10) as u64
     );
 }
+
+#[test]
+fn qualification305_real_credit_exhaustion_and_release_preserve_source_debt() {
+    let mut rig = Rig::new();
+    rig.gate = std::sync::Arc::new(crate::send_gate::SendGate::new(
+        crate::send_gate::GateKind::Screen,
+    ));
+    rig.client.set_default_consumption(Consumption::Explicit);
+    rig.geometry(80, 0);
+    rig.drain(false);
+    let limit = rig.server.credit_limit_for_test(STREAM).unwrap();
+    let remaining = limit - rig.server.stream_progress(STREAM).queued;
+    let bytes = crate::shell_frame::encode_record(
+        crate::shell_frame::REC_DATA,
+        &vec![9; remaining as usize - 5],
+    );
+    let out = rig.server.send(rig.now, STREAM, &bytes);
+    rig.pump(out);
+    assert_eq!(rig.server.stream_progress(STREAM).unacked, 0);
+    assert_eq!(
+        rig.server
+            .stream_write_room(STREAM, crate::send_gate::PIPE_HIGH as usize),
+        0
+    );
+    rig.data(b"blocked");
+    let registration = crate::qualification305::Registration {
+        login: [1; 16],
+        attachment: rig.origin(),
+        stream: STREAM,
+        instance: ChannelInstance::new(1).unwrap(),
+    };
+    let before = rig.gate.pending_for_test();
+    let snapshot = rig
+        .bridge
+        .qualification_snapshot(&rig.server, registration)
+        .unwrap()
+        .classify();
+    assert!(snapshot.credit_blocked, "{snapshot:?}");
+    assert_eq!(snapshot.credit_remaining, Some(0));
+    assert_eq!(snapshot.reliable_tail, 0, "ACK is not consumption credit");
+    assert_eq!(snapshot.source_pending, before);
+    assert!(snapshot.gate_byte_open, "closure is not a prerequisite");
+    assert_eq!(rig.gate.pending_for_test(), before, "read-only sample");
+    assert!(rig
+        .bridge
+        .qualification_snapshot(
+            &rig.server,
+            crate::qualification305::Registration {
+                instance: ChannelInstance::new(2).unwrap(),
+                ..registration
+            }
+        )
+        .is_none());
+    let out = rig.client.on_consumed(rig.now, STREAM, limit as usize);
+    for d in out {
+        rig.server.on_datagram(rig.now, rig.peer, &d.bytes);
+    }
+    let released = rig
+        .bridge
+        .qualification_snapshot(&rig.server, registration)
+        .unwrap()
+        .classify();
+    assert!(!released.credit_blocked);
+    assert!(released.credit_remaining.unwrap() > 0);
+    assert_eq!(
+        rig.server.stream_write_room(STREAM, 0),
+        0,
+        "local reliable bound can independently close admission"
+    );
+    assert!(
+        !released.credit_blocked,
+        "zero room caused only by a local cap is not exhausted peer credit"
+    );
+    assert!(rig
+        .bridge
+        .qualification_snapshot(
+            &rig.server,
+            crate::qualification305::Registration {
+                stream: 19,
+                ..registration
+            }
+        )
+        .is_none());
+    rig.drain(false);
+    assert_eq!(rig.gate.pending_for_test(), 0);
+}
