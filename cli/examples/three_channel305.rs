@@ -3,6 +3,8 @@
 mod accounting;
 #[path = "three_channel305/pacing.rs"]
 mod pacing;
+#[path = "three_channel305/relay.rs"]
+mod relay;
 use accounting::{Budget, Hold, Ledger, Raw};
 use client::channel::{ChannelSendError, ChannelSession, SessionEvent};
 use client::qsh::QshSubstrate;
@@ -311,6 +313,7 @@ async fn work(
     client_tx: oneshot::Sender<Arc<StdClient>>,
     shared: Arc<Mutex<Summary>>,
     budget: Budget,
+    relay_arm: relay::Arm,
 ) -> Result<Finished, String> {
     let Bootstrap {
         addr,
@@ -434,6 +437,9 @@ async fn work(
             && session.is_ready(echo)
             && session.is_ready(screen)
         {
+            // The relay acknowledges processing the arm request before any grant.
+            // This point follows authenticated admission, channel Ready and model READY.
+            relay_arm.arm().await?;
             let owner = (&mut owner_rx).await.map_err(|_| "backend owner missing")?;
             let instance = session
                 .committed_geometry(screen)
@@ -614,7 +620,7 @@ fn finish_receipts(output: &mut Finished) -> Result<(), String> {
     Ok(())
 }
 
-async fn owned_run() -> Result<(), String> {
+async fn owned_run(selected_case: relay::Case) -> Result<(), String> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).map_err(|_| "TERM setup")?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| "INT setup")?;
@@ -623,7 +629,12 @@ async fn owned_run() -> Result<(), String> {
             .await
             .map_err(|_| "owned UDP bind")?,
     );
-    let addr = socket.local_addr().map_err(|_| "owned UDP address")?;
+    let server_addr = socket.local_addr().map_err(|_| "owned UDP address")?;
+    let relay = relay::Relay::start(server_addr, selected_case)
+        .await
+        .map_err(|_| "owned relay setup")?;
+    let addr = relay.address;
+    let relay_arm = relay.arm_handle();
     let server_key = transport::handshake::generate_keypair();
     let client_key = transport::handshake::generate_keypair();
     let auth = ServerAuth {
@@ -672,6 +683,7 @@ async fn owned_run() -> Result<(), String> {
         client_tx,
         summary.clone(),
         raw_budget.clone(),
+        relay_arm,
     ));
     let result = tokio::select! {
         result=&mut worker=>Some(result),
@@ -737,6 +749,16 @@ async fn owned_run() -> Result<(), String> {
     if !manager_ok {
         failure = Some("manager cleanup task failure".into());
     }
+    let relay_result = relay.finish().await;
+    let relay_joined = relay_result.is_ok();
+    let relay_outcome = relay_result.ok();
+    if !relay_joined
+        || !relay_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.qualified(selected_case))
+    {
+        failure = Some("relay fault schedule or cleanup incomplete".into());
+    }
     let mut snapshot = registry.cleanup_snapshot();
     let settled = |value: Option<transport::channel_open::CleanupSnapshot>| {
         value.is_some_and(|s| {
@@ -767,7 +789,7 @@ async fn owned_run() -> Result<(), String> {
     let summary = summary.lock().unwrap().clone();
     println!(
         "{}",
-        serde_json::json!({"phase":"complete","ok":failure.is_none(),"summary":summary,"raw_bytes_retained":raw_budget.used(),"driver_joined":driver_ok,"manager_joined":manager_ok,"registered_cleanup_settled":settled(snapshot),"producer_completion_before_release":"unobserved","applied_gap_model_qualified":false,"error":failure})
+        serde_json::json!({"phase":"complete","ok":failure.is_none(),"summary":summary,"raw_bytes_retained":raw_budget.used(),"driver_joined":driver_ok,"manager_joined":manager_ok,"registered_cleanup_settled":settled(snapshot),"case":selected_case,"relay_joined":relay_joined,"relay":relay_outcome,"producer_completion_before_release":"unobserved","applied_gap_model_qualified":false,"error":failure})
     );
     if failure.is_some() {
         Err("functional qualification failed; retain complete output".into())
@@ -778,9 +800,18 @@ async fn owned_run() -> Result<(), String> {
 fn entry() -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let args: Vec<_> = std::env::args_os().collect();
-    if args.len() != 3 || args[1] != "--run-owned-functional" {
-        return Err("requires --run-owned-functional OWNED_ROOT; no runtime by default".into());
+    if !matches!(args.len(), 3 | 5) || args[1] != "--run-owned-functional" {
+        return Err("requires --run-owned-functional OWNED_ROOT [--case no-loss|loss-reorder]; no runtime by default".into());
     }
+    let selected_case = if args.len() == 3 {
+        relay::Case::NoLoss
+    } else {
+        if args[3] != "--case" {
+            return Err("unknown functional option".into());
+        }
+        relay::Case::parse(args[4].to_str().ok_or("non-text functional case")?)
+            .map_err(str::to_owned)?
+    };
     let root = std::fs::canonicalize(&args[2]).map_err(|_| "owned root missing")?;
     for path in [
         root.clone(),
@@ -833,7 +864,7 @@ fn entry() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|_| "fixture runtime setup")?
-        .block_on(owned_run())
+        .block_on(owned_run(selected_case))
 }
 fn main() {
     if let Err(error) = entry() {

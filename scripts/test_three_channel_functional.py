@@ -22,6 +22,7 @@ def complete():
     record = dict(phase="complete", ok=True, error=None, driver_joined=True,
                   manager_joined=True, registered_cleanup_settled=True,
                   raw_bytes_retained=0, summary=summary)
+    record.update(case="no-loss", relay_joined=True, relay=dict(error=None, receipt=dict(armed=True, server_after_arm=8, dropped=0, held=0, reordered=0, held_bytes=0, held_high_water=0, canceled_held=0)))
     return dict(exit_code=0, reason=None, cleanup_overrun=False, settled=True,
                 output=json.dumps(record))
 
@@ -114,6 +115,37 @@ class FunctionalControls(unittest.TestCase):
                 self.assertEqual(request, ["evidence cap"])
             finally:
                 functional.EVIDENCE_CAP = old_cap
+
+
+
+
+class RelayReceiptControls(unittest.TestCase):
+    def test_fixed_fault_case_requires_actual_complete_relay_receipts(self):
+        result = complete()
+        record = json.loads(result['output'])
+        record.update(case='loss-reorder', relay_joined=True,
+                      relay=dict(error=None, receipt=dict(armed=True, server_after_arm=8,
+                          dropped=1, held=1, reordered=1, held_bytes=0,
+                          held_high_water=1234, canceled_held=0)))
+        result['output'] = json.dumps(record)
+        self.assertTrue(functional.validate(result, 'loss-reorder')['ok'])
+        for mutation in (lambda r: r.update(case='no-loss'),
+                         lambda r: r.update(relay=None),
+                         lambda r: r['relay'].update(receipt=None),
+                         lambda r: r['relay']['receipt'].update(dropped=True),
+                         lambda r: r.update(relay_joined=False),
+                         lambda r: r['relay'].update(error='send failure'),
+                         lambda r: r['relay']['receipt'].update(armed=False),
+                         lambda r: r['relay']['receipt'].update(dropped=0),
+                         lambda r: r['relay']['receipt'].update(reordered=0),
+                         lambda r: r['relay']['receipt'].update(held_bytes=1),
+                         lambda r: r['relay']['receipt'].update(canceled_held=1)):
+            changed = json.loads(result['output'])
+            mutation(changed)
+            with self.assertRaises(ValueError):
+                functional.validate(dict(result, output=json.dumps(changed)), 'loss-reorder')
+        with self.assertRaises(ValueError):
+            functional.validate(result, 'no-loss')
 
 
 if __name__ == "__main__":

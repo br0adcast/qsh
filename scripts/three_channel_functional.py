@@ -167,7 +167,7 @@ def run_owned(command, env, deadline, request, grace=GRACE, overrun=lambda ids: 
             'output': output.decode('utf-8', 'replace'), 'cleanup_overrun': cleanup_overrun, 'settled': True}
 
 
-def validate(result):
+def validate(result, expected_case="no-loss"):
     if (result["exit_code"] != 0 or result["reason"] is not None
             or result["cleanup_overrun"] or result["settled"] is not True):
         raise ValueError("owned execution failed")
@@ -198,6 +198,28 @@ def validate(result):
         raise ValueError("credit phase ordering")
     if s["raw_processed"] < s["bulk_bytes"]:
         raise ValueError("raw processing incomplete")
+    if x.get("case") != expected_case or x.get("relay_joined") is not True:
+        raise ValueError("missing selected case or relay join")
+    relay = x.get("relay")
+    if not isinstance(relay, dict) or not isinstance(relay.get("receipt"), dict):
+        raise ValueError("missing relay receipt object")
+    receipt = relay["receipt"]
+    for key in ("server_after_arm", "dropped", "held", "reordered", "held_bytes", "held_high_water", "canceled_held"):
+        if type(receipt.get(key)) is not int or receipt[key] < 0:
+            raise ValueError("invalid relay counter " + key)
+    if relay.get("error") is not None or receipt.get("armed") is not True:
+        raise ValueError("relay failed or was not armed")
+    if receipt.get("held_bytes") != 0 or receipt.get("canceled_held") != 0:
+        raise ValueError("incomplete relay custody")
+    if type(receipt.get("server_after_arm")) is not int or receipt["server_after_arm"] <= 0:
+        raise ValueError("no post-arm relay traffic")
+    faults = tuple(receipt.get(key) for key in ("dropped", "held", "reordered"))
+    high = receipt.get("held_high_water")
+    if expected_case == "loss-reorder":
+        if faults != (1, 1, 1) or receipt["server_after_arm"] < 8 or type(high) is not int or not 0 < high <= 65536:
+            raise ValueError("fixed drop/reorder schedule did not complete")
+    elif expected_case != "no-loss" or faults != (0, 0, 0) or high != 0:
+        raise ValueError("unexpected no-loss relay fault")
     return x
 
 
@@ -242,7 +264,7 @@ def source_identity():
                 lock_sha256=sha(source / "Cargo.lock"), script_sha256=sha(Path(__file__).resolve()))
 
 
-def execute(binary, root):
+def execute(binary, root, selected_case="no-loss"):
     if sys.platform != "linux":
         raise ValueError("this owned fixture requires Linux /proc and subreaper support")
     os.umask(0o077)
@@ -265,7 +287,8 @@ def execute(binary, root):
     with os.fdopen(lockfd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         dump(root / "provenance.json", dict(identity=identity,
-             scope="one no-loss functional case; hashes do not attest build provenance",
+             scope="one functional case; hashes do not attest build provenance",
+             case=selected_case,
              limits=dict(hold_seconds=5, internal_work_seconds=30, outer_seconds=40,
                          cleanup_grace_seconds=120, capture_bytes=CAP,
                          sampled_evidence_bytes=EVIDENCE_CAP, free_reserve_bytes=RESERVE)))
@@ -285,7 +308,7 @@ def execute(binary, root):
         watcher.start()
         try:
             os.chdir(root / "tmp")
-            result = run_owned([str(binary), "--run-owned-functional", str(root)], env,
+            result = run_owned([str(binary), "--run-owned-functional", str(root), "--case", selected_case], env,
                                started + 40, request, grace=120,
                                overrun=lambda ids: dump(root / "cleanup-overrun.json",
                                    dict(owned_children=ids, custody_retained=True)))
@@ -300,7 +323,7 @@ def execute(binary, root):
         reasons = list(request)
         record = None
         try:
-            record = validate(result)
+            record = validate(result, selected_case)
         except (ValueError, KeyError, TypeError) as error:
             reasons.append(str(error))
         try:
@@ -332,8 +355,9 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path,
                         help="new state directory below an existing owned 0700 parent")
+    parser.add_argument("--case", choices=("no-loss", "loss-reorder"), default="no-loss")
     args = parser.parse_args()
-    return execute(args.binary, args.root)
+    return execute(args.binary, args.root, args.case)
 
 
 if __name__ == "__main__":
