@@ -1436,6 +1436,7 @@ fn death_deadline_at_instant_limit_is_distinct_from_overflow() {
         conn.last_recv_ordinary = start;
         conn.set_death_after(duration);
         assert_eq!(conn.next_timeout(), Some(start + PING_INTERVAL));
+        assert_eq!(conn.next_timeout(), deadline_storage_reference(&conn));
         assert_eq!(conn.state(), LinkState::Live);
         if duration == Duration::from_secs(60) {
             conn.on_timeout(limit);
@@ -1444,6 +1445,7 @@ fn death_deadline_at_instant_limit_is_distinct_from_overflow() {
             assert!(!conn.on_timeout_if_due(start + PING_INTERVAL).is_empty());
             assert_eq!(conn.state(), LinkState::Live);
             assert!(conn.next_timeout().is_some());
+            assert_eq!(conn.next_timeout(), deadline_storage_reference(&conn));
         }
     }
 }
@@ -8750,3 +8752,5 @@ fn mailbox_idle_horizon_does_not_mask_new_ack_or_forced_ping() {
     assert!(server.next_timeout().unwrap() <= now);
     assert!(!server.on_timeout(now).is_empty());
 }
+
+include!("conn_deadline_storage_tests.rs");

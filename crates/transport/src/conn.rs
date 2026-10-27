@@ -1913,38 +1913,45 @@ impl Connection {
         if self.keys.is_none() || matches!(self.state, LinkState::Closed) {
             return None;
         }
-        let mut candidates: Vec<Instant> = Vec::new();
+        let mut earliest: Option<Instant> = None;
+        let mut include = |deadline: Instant| {
+            earliest = Some(earliest.map_or(deadline, |current| current.min(deadline)));
+        };
         // Retransmits are due per segment (spec §4.2): the oldest
         // unacknowledged segment's last send plus `rto`, on every stream.
         // Sending anything else -- an ACK, a PING -- does not move it.
         let rto = self.rto();
-        candidates.extend(
-            self.streams
-                .values()
-                .filter_map(|s| s.sender.retransmit_deadline(rto)),
-        );
+        for deadline in self
+            .streams
+            .values()
+            .filter_map(|s| s.sender.retransmit_deadline(rto))
+        {
+            include(deadline);
+        }
         // The repeats of a CREDIT (spec §6.4), by the same rto `on_timeout`
         // serves them with.
-        candidates.extend(
-            self.streams
-                .values()
-                .filter_map(|s| s.receiver.credit_resend_deadline(rto)),
-        );
+        for deadline in self
+            .streams
+            .values()
+            .filter_map(|s| s.receiver.credit_resend_deadline(rto))
+        {
+            include(deadline);
+        }
         // Something to send that has no deadline of its own is due at once
         // while `Live`: new bytes, a lost segment, an armed `Reset` -- after a
         // flush this is left only by the bulk budget (spec §4.8), and the
         // driver takes its commands before it comes back for more. Like the
         // forced PING below, "now" is a stored moment already in the past.
         if matches!(self.state, LinkState::Live) && self.sendable_now() {
-            candidates.push(self.last_recv_auth);
+            include(self.last_recv_auth);
         }
         if matches!(self.state, LinkState::Live | LinkState::PathDown) {
             if self.ping_forced {
                 // Forced: wake `on_timeout` now (a moment in the past).
-                candidates.push(self.last_recv_auth);
+                include(self.last_recv_auth);
             } else {
                 // The very moment `on_timeout` judges the PING due by.
-                candidates.push(self.next_ping_at());
+                include(self.next_ping_at());
             }
         }
         if let Some(deadline) = self.death_base().checked_add(self.death_after()) {
@@ -1952,7 +1959,7 @@ impl Connection {
             let deadline = self
                 .test_idle_until
                 .map_or(deadline, |until| deadline.max(until));
-            candidates.push(deadline);
+            include(deadline);
         }
         if matches!(self.state, LinkState::Live) {
             let deadline = self.last_recv_ordinary + PATH_DOWN_AFTER;
@@ -1960,7 +1967,7 @@ impl Connection {
             let deadline = self
                 .test_idle_until
                 .map_or(deadline, |until| deadline.max(until));
-            candidates.push(deadline);
+            include(deadline);
         }
         if matches!(self.role, Role::Client) {
             let urgent = self.probes_are_urgent();
@@ -1970,16 +1977,16 @@ impl Connection {
             // gets `last_recv_auth` as its stand-in: always in the past by
             // the time this is called, so it wakes the caller right away.
             if let Some(deadline) = self.paths.next_deadline(self.last_recv_auth, urgent) {
-                candidates.push(deadline);
+                include(deadline);
             }
         }
         // Service frames nothing carried go alone `ACK_DELAY` after the
         // first of them was owed (spec §4.11); `on_timeout` serves exactly
         // this deadline (`flush_service_if_due`).
         if let Some(since) = self.service_since {
-            candidates.push(since + ACK_DELAY);
+            include(since + ACK_DELAY);
         }
-        candidates.into_iter().min()
+        earliest
     }
 
     /// Run [`Connection::on_timeout`] if one of its deadlines has passed, and
