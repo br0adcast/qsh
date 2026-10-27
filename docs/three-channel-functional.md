@@ -70,3 +70,34 @@ Run the deterministic wrapper controls without qsh or daemon execution:
 ```sh
 python3 -I -B scripts/test_three_channel_functional.py
 ```
+
+## Fixed loss/reorder case
+
+The default `--case no-loss` forwards all packets. The optional
+`--case loss-reorder` uses a fixture-only loopback UDP relay; it changes no
+production protocol or network policy. The relay arms only after authenticated
+admission, all three channels are ready, and the current Screen model contains
+the producer's READY marker, before the first producer grant. Server-to-client
+packets are then numbered in arrival order: packet 3 is dropped, packet 7 is
+held, and packet 8 is sent before packet 7. Client-to-server packets are always
+forwarded. Payloads are neither decrypted nor logged by the relay.
+
+Use the same command with a **new** state root for each case:
+
+```sh
+python3 -I -B scripts/three_channel_functional.py \
+  --binary target/debug/examples/three_channel305 \
+  --root "$state_parent/loss-case" --case loss-reorder
+```
+
+The relay retains at most one datagram and uses fixed receive buffers. Its arm
+acknowledgment comes from its running task; cleanup stops and joins that task
+and releases any held packet. A faulted result requires receipts for the actual
+single drop and completed 8-before-7 forwarding, no canceled held packet, and
+all existing work, credit-recovery and cleanup conditions. A no-loss result
+cannot satisfy that faulted receipt requirement. Missing packet 8 or an
+incomplete injection remains a failure, even if terminal work otherwise ends.
+The existing 5/30/40-second work budgets and retained cleanup are unchanged.
+This is a bounded functional case, not a loss-rate, CPU or fairness benchmark.
+A fixed ordinal schedule does not promise identical logical losses across
+other packetizations, and decoded gaps remain distinct from model-applied gaps.
