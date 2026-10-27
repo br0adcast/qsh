@@ -697,7 +697,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             // If the entire buffer is valid, use the first character and continue parsing.
             Ok(parsed) => {
                 let c = unsafe { parsed.chars().next().unwrap_unchecked() };
-                performer.print(c);
+                // qsh: a C1 control completed here executes, as it does unsplit.
+                Self::ground_dispatch(performer, c.encode_utf8(&mut [0; 4]));
 
                 self.partial_utf8_len = 0;
                 c.len_utf8() - old_bytes
@@ -713,10 +714,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                         parsed.chars().next().unwrap_unchecked()
                     };
 
-                    performer.print(c);
+                    Self::ground_dispatch(performer, c.encode_utf8(&mut [0; 4]));
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    // qsh: consume only the first character. The valid prefix can
+                    // hold more characters, which the caller must still parse.
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -1604,5 +1607,130 @@ mod bounded_osc_tests {
         }
         assert!(sink.osc.is_empty());
         assert!(parser.osc_raw.capacity() <= 8192);
+    }
+}
+
+// qsh: a UTF-8 sequence split between two `advance` calls must not change
+// what is dispatched. Upstream 0.15.0 consumed the whole valid prefix of the
+// partial buffer while printing only its first character, which dropped the
+// character after a split sequence (alacritty/vte#159). It also printed a
+// split C1 control (U+0080..=U+009F) that unsplit is executed
+// (alacritty/vte#156).
+#[cfg(test)]
+mod split_utf8_tests {
+    use std::vec::Vec;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        Print(char),
+        Execute(u8),
+        Esc(Vec<u8>, bool, u8),
+        Csi(Vec<Vec<u16>>, Vec<u8>, bool, char),
+        Osc(Vec<Vec<u8>>, bool),
+    }
+
+    #[derive(Default)]
+    struct Recorder(Vec<Event>);
+
+    impl Perform for Recorder {
+        fn print(&mut self, c: char) {
+            self.0.push(Event::Print(c));
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.0.push(Event::Execute(byte));
+        }
+
+        fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+            self.0.push(Event::Esc(intermediates.to_vec(), ignore, byte));
+        }
+
+        fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            let params = params.iter().map(|param| param.to_vec()).collect();
+            self.0.push(Event::Csi(params, intermediates.to_vec(), ignore, c));
+        }
+
+        fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+            let params = params.iter().map(|param| param.to_vec()).collect();
+            self.0.push(Event::Osc(params, bell_terminated));
+        }
+    }
+
+    fn parse(parts: &[&[u8]]) -> Vec<Event> {
+        let mut parser = Parser::new();
+        let mut recorder = Recorder::default();
+        for part in parts {
+            parser.advance(&mut recorder, part);
+        }
+        recorder.0
+    }
+
+    /// Text in every UTF-8 length, combining marks, controls and escape
+    /// sequences next to multi-byte text, and invalid or truncated input.
+    const SAMPLES: &[&[u8]] = &[
+        "B\u{301}C\u{2500}".as_bytes(),
+        "ïcø".as_bytes(),
+        "д п р".as_bytes(),
+        "Съешь же ещё этих мягких булок, да выпей чаю.".as_bytes(),
+        "e\u{301}h\u{300}z a\u{308}b\u{20dd}c".as_bytes(),
+        "a界b😀c\u{fe0f}dĸ🎉x".as_bytes(),
+        "é\r\né\tü\x07ß".as_bytes(),
+        "д\x1b[31mп\x1b[0mр".as_bytes(),
+        "д\x1b]0;ти тул\x07з\x1b]2;x\x1b\\ж".as_bytes(),
+        "ä\x1b(Bö\x1b7ü".as_bytes(),
+        b"a\xef\xbcb",
+        b"\xe4\xbf\x99\xb5x",
+        b"\xd8\x1b012",
+        b"\xff a \xc3(b \xe2\x82 x \xf0\x9f\x98 y",
+        b"\xc3\xa9 \xc3",
+        "a\u{85}b\u{9b}c\u{80}\u{9f}d".as_bytes(),
+        "ж\u{88}x\u{9c}з".as_bytes(),
+    ];
+
+    #[test]
+    fn every_split_dispatches_what_one_advance_does() {
+        for sample in SAMPLES {
+            let whole = parse(&[sample]);
+            for at in 0..=sample.len() {
+                let (a, b) = sample.split_at(at);
+                assert_eq!(parse(&[a, b]), whole, "{sample:x?} split at {at}");
+            }
+            for first in 0..=sample.len() {
+                for second in first..=sample.len() {
+                    let parts = [&sample[..first], &sample[first..second], &sample[second..]];
+                    assert_eq!(parse(&parts), whole, "{sample:x?} split at {first}, {second}");
+                }
+            }
+            let bytes: Vec<&[u8]> = sample.chunks(1).collect();
+            assert_eq!(parse(&bytes), whole, "{sample:x?} byte by byte");
+        }
+    }
+
+    #[test]
+    fn the_character_after_a_split_sequence_is_dispatched() {
+        // Upstream 0.15.0 dropped the 'h', the space and the 'c'.
+        assert_eq!(
+            parse(&[b"e\xcc", b"\x81h\xcc\x80z"]),
+            ['e', '\u{301}', 'h', '\u{300}', 'z'].map(Event::Print)
+        );
+        assert_eq!(parse(&[b"\xd0", b"\xb4 \xd0\xbf"]), ['д', ' ', 'п'].map(Event::Print));
+        assert_eq!(parse(&[b"\xc3", b"\xafc\xc3\xb8"]), ['ï', 'c', 'ø'].map(Event::Print));
+    }
+
+    #[test]
+    fn a_split_c1_control_is_executed_as_unsplit() {
+        for c1 in 0x80..=0x9f_u8 {
+            let bytes = char::from(c1).encode_utf8(&mut [0; 4]).as_bytes().to_vec();
+            let expected = [Event::Execute(c1)];
+            assert_eq!(parse(&[&bytes]), expected);
+            assert_eq!(parse(&[&bytes[..1], &bytes[1..]]), expected, "{c1:#x}");
+            // Followed by more text, through the arm that sees a valid prefix.
+            let mut more = bytes.clone();
+            more.extend_from_slice("x\u{e9}".as_bytes());
+            let expected = [Event::Execute(c1), Event::Print('x'), Event::Print('\u{e9}')];
+            assert_eq!(parse(&[&more[..1], &more[1..]]), expected, "{c1:#x}");
+        }
     }
 }

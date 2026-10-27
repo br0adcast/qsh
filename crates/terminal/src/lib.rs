@@ -20,6 +20,8 @@ mod replies;
 #[cfg(test)]
 mod reply_tests;
 #[cfg(test)]
+mod split_input_tests;
+#[cfg(test)]
 mod sync_deadline_tests;
 mod tracking;
 

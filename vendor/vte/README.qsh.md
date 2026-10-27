@@ -24,6 +24,26 @@ recovery retain the upstream behavior. Ignored C0 controls do not occupy OSC
 storage. The no-std fixed-buffer behavior is unchanged. Tests cover boundaries,
 split termination, repeated overflows, separators and subsequent commands/text.
 
+The patch also fixes a dropped character after a split UTF-8 sequence
+(qsh #354, upstream alacritty/vte#159). When a sequence is split between two
+`advance` calls, `advance_partial_utf8` completes it from the next bytes. In
+upstream 0.15.0 the arm that finds a valid prefix followed by an incomplete
+sequence printed only the prefix's first character but reported the whole
+prefix as consumed. A split two-byte character, an ASCII character and the
+lead byte of another multi-byte character lost that ASCII character, such as
+the space between two Cyrillic words. The arm now reports only the first
+character's bytes, as the arm for a fully valid buffer already does.
+The same completion printed a C1 control (U+0080 to U+009F) that unsplit
+input executes (upstream alacritty/vte#156). It now goes through the
+dispatch unsplit text uses.
+
+Upstream `master` and the latest release, 0.15.0, still have both bugs.
+Both issues were closed without a change, and the proposed fix for the
+first, alacritty/vte#162, was not merged. Drop these parts of the patch once
+a release contains equivalent fixes. Tests feed sample text split at every
+byte and at every pair of bytes, and require the same dispatched sequence as
+one `advance`.
+
 The workspace root selects this exact source with `[patch.crates-io]`. Cargo
 patches apply only from the consuming workspace root: downstream workspaces
 must explicitly carry the patch during integration. Keep this patch minimal and
