@@ -1,6 +1,8 @@
 //! Opt-in native functional qualification. Tests never launch this entry point.
 #[path = "three_channel305/accounting.rs"]
 mod accounting;
+#[path = "three_channel305/measurement.rs"]
+mod measurement;
 #[path = "three_channel305/pacing.rs"]
 mod pacing;
 #[path = "three_channel305/relay.rs"]
@@ -620,7 +622,10 @@ fn finish_receipts(output: &mut Finished) -> Result<(), String> {
     Ok(())
 }
 
-async fn owned_run(selected_case: relay::Case) -> Result<(), String> {
+async fn owned_run(
+    selected_case: relay::Case,
+    measurement: measurement::Window,
+) -> Result<(), String> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).map_err(|_| "TERM setup")?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| "INT setup")?;
@@ -787,9 +792,16 @@ async fn owned_run(selected_case: relay::Case) -> Result<(), String> {
         failure = Some("raw chunk ownership remains after cleanup".into());
     }
     let summary = summary.lock().unwrap().clone();
+    let (measurement, measurement_error) = match measurement.finish() {
+        Ok(sample) => (Some(sample), None),
+        Err(error) => {
+            failure.get_or_insert_with(|| error.clone());
+            (None, Some(error))
+        }
+    };
     println!(
         "{}",
-        serde_json::json!({"phase":"complete","ok":failure.is_none(),"summary":summary,"raw_bytes_retained":raw_budget.used(),"driver_joined":driver_ok,"manager_joined":manager_ok,"registered_cleanup_settled":settled(snapshot),"case":selected_case,"relay_joined":relay_joined,"relay":relay_outcome,"producer_completion_before_release":"unobserved","applied_gap_model_qualified":false,"error":failure})
+        serde_json::json!({"phase":"complete","ok":failure.is_none(),"measurement":measurement,"measurement_error":measurement_error,"summary":summary,"raw_bytes_retained":raw_budget.used(),"driver_joined":driver_ok,"manager_joined":manager_ok,"registered_cleanup_settled":settled(snapshot),"case":selected_case,"relay_joined":relay_joined,"relay":relay_outcome,"producer_completion_before_release":"unobserved","applied_gap_model_qualified":false,"error":failure})
     );
     if failure.is_some() {
         Err("functional qualification failed; retain complete output".into())
@@ -798,6 +810,7 @@ async fn owned_run(selected_case: relay::Case) -> Result<(), String> {
     }
 }
 fn entry() -> Result<(), String> {
+    let measurement = measurement::Window::start()?;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let args: Vec<_> = std::env::args_os().collect();
     if !matches!(args.len(), 3 | 5) || args[1] != "--run-owned-functional" {
@@ -864,7 +877,7 @@ fn entry() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|_| "fixture runtime setup")?
-        .block_on(owned_run(selected_case))
+        .block_on(owned_run(selected_case, measurement))
 }
 fn main() {
     if let Err(error) = entry() {

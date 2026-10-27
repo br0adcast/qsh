@@ -101,3 +101,27 @@ The existing 5/30/40-second work budgets and retained cleanup are unchanged.
 This is a bounded functional case, not a loss-rate, CPU or fairness benchmark.
 A fixed ordinal schedule does not promise identical logical losses across
 other packetizations, and decoded gaps remain distinct from model-applied gaps.
+
+## Scalar measurement scope
+
+The native record additionally reports `measurement.process_cpu_ns` from
+`CLOCK_PROCESS_CPUTIME_ID` and `measurement.elapsed_ns` from the monotonic clock.
+`measurement.process_cpu_resolution_ns` is the nonzero kernel-reported clock
+resolution, not an accuracy guarantee or error bound; nanosecond units alone do
+not establish nanosecond measurement accuracy.
+The window starts at native entry and ends after client, manager, relay and
+registered cleanup have settled, before final JSON serialization and runtime
+teardown. Wrapper startup, binary/source hashing and wrapper cleanup are outside
+this window. Process CPU covers all fixture threads: client driver, server
+manager, relay and model/fixture work. It excludes producer-process CPU; no child
+CPU estimate or client/daemon attribution is provided. These scalar counters
+prepare later matched release measurements; a debug functional pilot is not a
+performance comparison.
+
+The relay reports client/server ingress and completed-forward datagrams/bytes
+for its whole lifetime, including authentication and teardown traffic. Dropped,
+held and reordered fault receipts remain separate. A successful forward counts
+a completed UDP send; ingress counts a received datagram. These counts are not
+kernel syscall attempts and do not identify endpoint CPU. Screen producer grants
+can vary with the observed credit path; retain their counts and unfavorable
+outcomes rather than filtering runs to manufacture identical work or a gain.
