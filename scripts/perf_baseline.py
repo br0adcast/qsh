@@ -40,7 +40,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 7
+TOOL_VERSION = 8
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -1182,8 +1182,20 @@ def run_reconnect(rig, settings):
 
 
 def run_retained(rig, settings):
+    """qshd holding `retained_sessions` sessions with no client attached.
+
+    With `retained_output_lines` above zero, each session first prints that
+    many lines and leaves only after they arrived, so qshd's model and
+    buffers have carried output. qshd's resident size is recorded before
+    the first session and sampled once a second through the window.
+    """
+    empty = sample_process(rig.runtime_pid())["rss_kib"]
     for index in range(settings.retained_sessions):
         client = rig.start_client(f"client-{index}")
+        if settings.retained_output_lines:
+            offset = client.terminal.counters()[0]
+            client.terminal.write(f"seq 1 {settings.retained_output_lines}; echo PRINTED-$((6*7))\n".encode())
+            client.terminal.wait_for(b"PRINTED-42", 600, offset)
         client.terminal.write(b"\x1d.")
         if not client.wait(SETUP_TIMEOUT):
             raise SetupError(f"client {index} did not leave after Ctrl-] .")
@@ -1192,8 +1204,13 @@ def run_retained(rig, settings):
     if shells != settings.retained_sessions:
         raise SetupError(f"{shells} session processes under qshd, expected {settings.retained_sessions}")
     before = rig.snapshot()
-    time.sleep(settings.window)
-    return {"window": window(before, rig.snapshot()), "sessions": settings.retained_sessions}
+    samples = []
+    for second in range(1, settings.window + 1):
+        time.sleep(max(0.0, before["t"] + second - time.monotonic()))
+        samples.append(sample_process(rig.runtime_pid())["rss_kib"])
+    return {"window": window(before, rig.snapshot()), "sessions": settings.retained_sessions,
+            "output_lines": settings.retained_output_lines, "qshd_rss_without_sessions_kib": empty,
+            "qshd_rss_samples_kib": samples}
 
 
 def run_busy(rig, settings):
@@ -1696,7 +1713,8 @@ def command_run(args):
         "host": dict(host_identity(), allowed_cpus=allowed),
         "settings": {key: getattr(args, key) for key in ("repetitions", "order", "seed", "window", "keystrokes",
                                                          "key_interval", "redraw_fps", "saturation_lines",
-                                                         "retained_sessions", "busy_sessions", "harness_cpus")},
+                                                         "retained_sessions", "retained_output_lines", "busy_sessions",
+                                                         "harness_cpus")},
         "terminal": {"cols": COLS, "rows": ROWS},
         "workloads": workloads,
         "builds": identify(builds),
@@ -1855,6 +1873,8 @@ def main():
     run.add_argument("--redraw-fps", type=int, default=20)
     run.add_argument("--saturation-lines", type=int, default=2_000_000)
     run.add_argument("--retained-sessions", type=int, default=8)
+    run.add_argument("--retained-output-lines", type=int, default=0,
+                     help="lines each retained session prints before its client leaves")
     run.add_argument("--busy-sessions", type=int, default=4, help="redrawing sessions beside the typing one")
     run.add_argument("--variant", action="append", type=variant_spec,
                      metavar="NAME=BUILD[,system][,cpus=LIST][,threads=N]",
