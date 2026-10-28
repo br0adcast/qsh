@@ -52,6 +52,7 @@ mod open24_receipts {
         channel::send(
             peer,
             &encode(&MonitorEvent::SessionClosed {
+                cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             })
             .unwrap(),
@@ -337,6 +338,7 @@ mod open24_receipts {
             },
             // /bin/true never acquired a PAM transaction.
             MonitorEvent::SessionClosed {
+                cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             },
         ] {
@@ -500,6 +502,7 @@ mod open24_receipts {
             },
             // /bin/true never acquired a PAM transaction.
             MonitorEvent::SessionClosed {
+                cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             },
         ] {

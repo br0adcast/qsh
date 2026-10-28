@@ -209,6 +209,12 @@ pub enum Request {
 pub enum Response {
     /// Exact terminal cleanup fact, independent of Open/Exit outcomes.
     CleanupComplete { id: ChannelId, kind: CleanupKind },
+    /// Physical completion with an independent semantic cleanup failure.
+    CleanupFailed {
+        id: ChannelId,
+        kind: CleanupKind,
+        failure: CleanupFailure,
+    },
     /// The channel is open: the account's SHELL has exec'd, which is the
     /// moment the child's close-on-exec startup-report pipe reaches
     /// end-of-file (see `helper::server::read_startup_report`). It does NOT
@@ -349,6 +355,65 @@ pub enum CleanupKind {
     Reaped,
 }
 
+/// Semantic cleanup failure, independent of physical process completion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CleanupFailure {
+    PtyLabelRestore { errno: i32 },
+}
+
+pub fn merge_cleanup_failure(first: &mut Option<CleanupFailure>, later: Option<CleanupFailure>) {
+    if first.is_none() {
+        *first = later;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn selinux57_cleanup_failure_is_sticky_without_changing_physical_kind() {
+    let failure = CleanupFailure::PtyLabelRestore { errno: 5 };
+    let mut first = None;
+    merge_cleanup_failure(&mut first, Some(failure));
+    assert_eq!(first, Some(failure));
+    merge_cleanup_failure(&mut first, None);
+    merge_cleanup_failure(
+        &mut first,
+        Some(CleanupFailure::PtyLabelRestore { errno: 13 }),
+    );
+    assert_eq!(first, Some(failure));
+    for kind in [CleanupKind::NoChild, CleanupKind::Reaped] {
+        assert_eq!(
+            decode::<CleanupKind>(&encode(&kind).unwrap()).unwrap(),
+            kind
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn selinux57_failed_receipts_roundtrip_both_physical_kinds() {
+    let failure = CleanupFailure::PtyLabelRestore { errno: -1 };
+    for kind in [CleanupKind::NoChild, CleanupKind::Reaped] {
+        let event = MonitorEvent::CleanupFailed {
+            id: 57,
+            kind,
+            failure,
+        };
+        assert_eq!(
+            decode::<MonitorEvent>(&encode(&event).unwrap()).unwrap(),
+            event
+        );
+        let response = Response::CleanupFailed {
+            id: 57,
+            kind,
+            failure,
+        };
+        assert_eq!(
+            decode::<Response>(&encode(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+}
+
 /// What a monitor tells the helper about the shells it was asked to fork.
 ///
 /// Each names the channel it is about, because one monitor serves every
@@ -366,6 +431,12 @@ pub enum MonitorEvent {
     SessionEstablished { sid: u32 },
     /// No shell was created, or the monitor completed its owned cleanup scope.
     CleanupComplete { id: ChannelId, kind: CleanupKind },
+    /// Physical completion with an independent semantic cleanup failure.
+    CleanupFailed {
+        id: ChannelId,
+        kind: CleanupKind,
+        failure: CleanupFailure,
+    },
     /// The shell exec'd -- the same moment, and the same evidence (the
     /// startup-report pipe at end-of-file after a valid native session stage), that [`Response::Opened`]
     /// stands for.
@@ -443,6 +514,7 @@ pub enum MonitorEvent {
     /// exit nor a channel receipt substitutes for this monitor-level evidence.
     SessionClosed {
         result: super::pam_completion::PamCompletion,
+        cleanup_failure: Option<CleanupFailure>,
     },
 }
 

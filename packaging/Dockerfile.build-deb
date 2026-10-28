@@ -112,9 +112,9 @@ RUN set -eu; \
 # buys nothing. So arm64 is a second multiarch target of this same Ubuntu,
 # with Ubuntu's own cross compiler.
 #
-# `libpam0g-dev:arm64` is what makes `-lpam` resolvable for the foreign
-# target, and installing it drags in `libpam0g:arm64` and `libc6:arm64` --
-# which is also what lets `dpkg-shlibdeps` (cargo-deb's `$auto`) derive the
+# `libpam0g-dev:arm64` and `libselinux1-dev:arm64` make `-lpam` and
+# `-lselinux` resolvable for the foreign target. Their runtime libraries and
+# `libc6:arm64` let `dpkg-shlibdeps` (cargo-deb's `$auto`) derive the
 # arm64 package's `Depends` line from the arm64 shared libraries rather than
 # refusing for want of them.
 #
@@ -135,6 +135,8 @@ RUN dpkg --add-architecture arm64 \
         python3 \
         libpam0g-dev \
         libpam0g-dev:arm64 \
+        libselinux1-dev \
+        libselinux1-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY bootstrap /tmp/qsh-bootstrap

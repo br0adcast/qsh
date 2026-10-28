@@ -95,8 +95,8 @@ use super::monitor::{self, run_monitor, MonitorPlan};
 use super::pam_completion::PamCompletion;
 use super::pending::{Pending, PendingTable, PendingWhat};
 use super::protocol::{
-    decode, encode, AuthRequest, AuthResponse, ChannelId, MonitorEvent, MonitorRequest, Nonce,
-    Request, Response,
+    decode, encode, merge_cleanup_failure, AuthRequest, AuthResponse, ChannelId, CleanupFailure,
+    MonitorEvent, MonitorRequest, Nonce, Request, Response,
 };
 
 /// How long the loop waits on the socket before looking for dead children.
@@ -667,6 +667,7 @@ struct LoopState {
     next_incarnation: u64,
     /// Fixed aggregate survives retirement of physically joined monitors.
     pam_cleanup: PamCompletion,
+    cleanup_failure: Option<CleanupFailure>,
     required_publication: Option<RequiredPublicationFailure>,
     /// Sticky cooperative teardown policy; never renewed admission.
     stopping: bool,
@@ -936,7 +937,7 @@ enum ChannelSlot {
     Running(MonitorOwner),
     Cleaning(MonitorOwner),
     /// Exact reap arrived before the installed exit verdict; preserve both.
-    ReapedRunning(MonitorOwner),
+    ReapedRunning(MonitorOwner, Option<CleanupFailure>),
 }
 
 impl ChannelSlot {
@@ -945,7 +946,7 @@ impl ChannelSlot {
             Self::Starting(owner)
             | Self::Running(owner)
             | Self::Cleaning(owner)
-            | Self::ReapedRunning(owner) => owner,
+            | Self::ReapedRunning(owner, _) => owner,
         }
     }
     fn login(&self) -> LoginId {
@@ -1182,6 +1183,7 @@ fn serve_inner(
         highest_channel_id: 0,
         next_incarnation: 1 + seeded as u64,
         pam_cleanup: PamCompletion::NotOpened,
+        cleanup_failure: None,
         required_publication: None,
         stopping: false,
     });
@@ -2353,6 +2355,7 @@ struct CapacityCounts {
     wait_outstanding: u16,
     receipt_outstanding: u16,
     pam: PamCompletion,
+    cleanup_failure: Option<CleanupFailure>,
 }
 
 fn capacity_owner_is_charged(state: &LoopState, owner: MonitorOwner) -> bool {
@@ -2463,6 +2466,7 @@ fn capacity_snapshot(state: &LoopState) -> Option<CapacityCounts> {
         wait_outstanding: 0,
         receipt_outstanding: 0,
         pam: state.pam_cleanup,
+        cleanup_failure: state.cleanup_failure,
     };
     // These borrowed bounded walks do not poll native owners or move resources.
     for (&login, entry) in &state.logins {
@@ -2523,6 +2527,11 @@ fn helper_status_snapshot(state: &LoopState) -> Vec<u8> {
         retired_slots: c.retired_slots,
         wait_outstanding: c.wait_outstanding,
         receipt_outstanding: c.receipt_outstanding,
+        cleanup_failure: c.cleanup_failure.map(|failure| match failure {
+            CleanupFailure::PtyLabelRestore { errno } => {
+                crate::helper_status::CleanupFailure::PtyLabelRestore { errno }
+            }
+        }),
         pam: match c.pam {
             PamCompletion::NotOpened => Pam::NotOpened,
             PamCompletion::Finished {
@@ -2537,7 +2546,7 @@ fn helper_status_snapshot(state: &LoopState) -> Vec<u8> {
         },
     });
     serde_json::to_vec(&Snapshot {
-        schema: 1,
+        schema: crate::helper_status::SCHEMA,
         phase: if state.stopping {
             Phase::Stopping
         } else {
@@ -2800,7 +2809,7 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
         .collect();
     for (id, slot) in ids {
         match slot {
-            ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_) => {
+            ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_, _) => {
                 // A reaped monitor may have queued the exact shell exit.
                 // Keep that outcome route until its buffered events or EOF
                 // are consumed; monitor death alone is not an exit verdict.
@@ -3078,8 +3087,13 @@ fn dispatch_monitor_event(
         lose_monitor(seams.channels, state, owner, "unexpected session stage");
         return;
     }
-    if let MonitorEvent::SessionClosed { result } = event {
+    if let MonitorEvent::SessionClosed {
+        result,
+        cleanup_failure,
+    } = event
+    {
         if let Some(monitor) = state.monitors.get_mut(&owner) {
+            merge_cleanup_failure(&mut state.cleanup_failure, cleanup_failure);
             if monitor.completion.is_some() {
                 monitor
                     .failure
@@ -3099,6 +3113,7 @@ fn dispatch_monitor_event(
         | MonitorEvent::Failed { id, .. }
         | MonitorEvent::Exited { id, .. }
         | MonitorEvent::CleanupComplete { id, .. }
+        | MonitorEvent::CleanupFailed { id, .. }
         | MonitorEvent::Refused { id, .. }
         | MonitorEvent::Noted { id, .. }
         | MonitorEvent::SignalFailed { id, .. } => *id,
@@ -3117,6 +3132,7 @@ fn dispatch_monitor_event(
                 StartupReport::Failed(nix::Error::from_raw(errno))),
             MonitorEvent::Exited { id, code } => report_exit(seams.channels, state, id, code),
             MonitorEvent::CleanupComplete { id, kind } => complete_cleanup(seams.channels, state, owner, id, kind),
+            MonitorEvent::CleanupFailed { id, kind, failure } => complete_cleanup_with_failure(seams.channels, state, owner, id, kind, Some(failure)),
             MonitorEvent::Refused { id, why } => {
                 crate::log::warn("helper", &format!("login session setup failed {:02x}{:02x}.. at channel {id}: {why}; refusing the channel and ending the login", owner.login[0], owner.login[1]));
                 refuse_channel_outright(seams.channels, state, id);
@@ -4068,7 +4084,7 @@ fn reap_orphan(pid: Pid) -> bool {
 /// `Open` has not been answered at all yet, and its refusal is on its way
 /// through the pending table.
 fn report_exit(sock: &UnixStream, state: &mut LoopState, id: ChannelId, code: i32) {
-    let Some(slot @ (ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_))) =
+    let Some(slot @ (ChannelSlot::Running(_) | ChannelSlot::ReapedRunning(_, _))) =
         state.live.get(&id).copied()
     else {
         return;
@@ -4086,8 +4102,15 @@ fn report_exit(sock: &UnixStream, state: &mut LoopState, id: ChannelId, code: i3
         RequiredPublication::Exited,
         &Response::Exited { id, code },
     );
-    if matches!(slot, ChannelSlot::ReapedRunning(_)) {
-        complete_cleanup(sock, state, owner, id, super::protocol::CleanupKind::Reaped);
+    if let ChannelSlot::ReapedRunning(_, failure) = slot {
+        complete_cleanup_with_failure(
+            sock,
+            state,
+            owner,
+            id,
+            super::protocol::CleanupKind::Reaped,
+            failure,
+        );
     }
 }
 
@@ -4124,6 +4147,17 @@ fn complete_cleanup(
     id: ChannelId,
     kind: super::protocol::CleanupKind,
 ) {
+    complete_cleanup_with_failure(sock, state, owner, id, kind, None);
+}
+
+fn complete_cleanup_with_failure(
+    sock: &UnixStream,
+    state: &mut LoopState,
+    owner: MonitorOwner,
+    id: ChannelId,
+    kind: super::protocol::CleanupKind,
+    failure: Option<CleanupFailure>,
+) {
     let Some(slot) = state
         .live
         .get(&id)
@@ -4134,12 +4168,22 @@ fn complete_cleanup(
     };
     if matches!(slot, ChannelSlot::Running(_)) {
         if kind == super::protocol::CleanupKind::Reaped {
-            state.live.insert(id, ChannelSlot::ReapedRunning(owner));
+            merge_cleanup_failure(&mut state.cleanup_failure, failure);
+            state
+                .live
+                .insert(id, ChannelSlot::ReapedRunning(owner, failure));
         }
         return;
     }
-    if matches!(slot, ChannelSlot::ReapedRunning(_)) {
+    if matches!(slot, ChannelSlot::ReapedRunning(_, _)) {
         return;
+    }
+    merge_cleanup_failure(&mut state.cleanup_failure, failure);
+    if let Some(failure) = failure {
+        crate::log::warn(
+            "helper",
+            &format!("channel {id} cleanup failed after physical completion: {failure:?}"),
+        );
     }
     if let Some(pending) = state.pending.take_channel(id) {
         drop(pending); // retire startup callback and its descriptor before proof
@@ -4155,12 +4199,11 @@ fn complete_cleanup(
     }
     state.live.remove(&id);
     state.closing.remove(&id);
-    required_reply(
-        sock,
-        state,
-        RequiredPublication::Cleanup,
-        &Response::CleanupComplete { id, kind },
-    );
+    let response = match failure {
+        Some(failure) => Response::CleanupFailed { id, kind, failure },
+        None => Response::CleanupComplete { id, kind },
+    };
+    required_reply(sock, state, RequiredPublication::Cleanup, &response);
     finish_retired(state, owner);
 }
 
@@ -5271,14 +5314,14 @@ pub(super) fn chdir_warning_bytes(home: &[u8]) -> Vec<u8> {
 /// Give the terminal `slave` to the account: mode `0620` FIRST, while root
 /// still owns it, then owner `uid` and group `gid`.
 ///
-/// The order is load-bearing. `chmod(2)` by a process that is not the
-/// file's owner needs `CAP_FOWNER`, which the packaged system unit
-/// (spec §8.3) does NOT grant -- so the `fchmod` has to happen while root is
-/// still the owner, before the `fchown` hands the file to the account.
-/// `fchown` itself needs only `CAP_CHOWN`, which the unit does grant, and it
-/// leaves the mode bits alone (it clears set-user-ID/set-group-ID, neither
-/// of which is set here). Reversed, every channel for a non-root account
-/// would be refused with `EPERM` under that unit.
+/// The order is load-bearing. Doing `fchmod` while root still owns the slave
+/// avoids needing `CAP_FOWNER` for this mode change; after `fchown`, a process
+/// that does not own the slave would need that capability to change its mode.
+/// `fchown` needs `CAP_CHOWN` and leaves these mode bits alone (it clears
+/// set-user-ID/set-group-ID, neither of which is set here). The packaged
+/// system unit does not restrict `CapabilityBoundingSet`, because account
+/// programs would inherit that restriction.
+/// Selected SELinux PTY labeling after `fchown` can still need `CAP_FOWNER`.
 ///
 /// `0620` with group `tty` is what `sshd` and `login` leave behind, and what
 /// `write`/`wall` expect: the account reads and writes its terminal, its
@@ -5652,6 +5695,7 @@ pub(crate) mod tests {
     include!("monitor_scope_tests.rs");
     include!("monitor_retirement_tests.rs");
     include!("monitor_completion_tests.rs");
+    include!("cleanup_failure_tests.rs");
     include!("shutdown_owner_tests.rs");
     include!("monitor_shutdown_tests.rs");
     include!("verification_lifecycle_tests.rs");
@@ -7816,6 +7860,7 @@ pub(crate) mod tests {
             highest_channel_id: 0,
             next_incarnation: 1,
             pam_cleanup: PamCompletion::NotOpened,
+            cleanup_failure: None,
             required_publication: None,
             stopping: false,
         }
@@ -7884,6 +7929,7 @@ pub(crate) mod tests {
             highest_channel_id: 0,
             next_incarnation: 1,
             pam_cleanup: PamCompletion::NotOpened,
+            cleanup_failure: None,
             required_publication: None,
             stopping: false,
         }
@@ -14771,9 +14817,10 @@ pub(crate) mod tests {
     // I2/M7 (the account's shell parses every command) is pinned by
     // `the_shell_mediates_commands_the_sshd_way`, above.
 
-    /// The drop and the exec of the account's shell need no more privilege
-    /// than these five capabilities: `CAP_SETUID CAP_SETGID CAP_CHOWN
-    /// CAP_AUDIT_WRITE CAP_KILL`.
+    /// On the tested path, opening a channel, dropping privilege and execing
+    /// the account's shell work with these five capabilities: `CAP_SETUID
+    /// CAP_SETGID CAP_CHOWN CAP_AUDIT_WRITE CAP_KILL`. Selected SELinux PTY
+    /// labeling and restoration after `fchown` additionally need `CAP_FOWNER`.
     ///
     /// What this pins is the helper's own REQUIREMENT -- measured by
     /// running it with nothing else and watching it still work -- and NOT a

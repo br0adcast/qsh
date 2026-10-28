@@ -31,7 +31,9 @@ tempfile = "3"
 # release binary -- never pulls in
 # anything that loads modules at runtime. The `system` build links Linux-PAM
 # (`#[link(name = "pam")]` in `helper::pam`, no crate), so building it needs
-# `libpam.so` -- `libpam0g-dev` on Debian and Ubuntu.
+# `libpam.so` -- `libpam0g-dev` on Debian and Ubuntu. Linux system builds
+# additionally link libselinux.so.1 for per-terminal context ownership;
+# building needs libselinux1-dev (Debian/Ubuntu) or libselinux-devel (RPM).
 system = ["nix/process", "nix/socket", "nix/signal", "nix/fs", "nix/poll", "nix/ioctl", "nix/uio"]
 # Lets QSHD_TEST_BUILD_LABELS name a build label for an optimized binary, so
 # the image upload can be measured with a release daemon (spec §11.1). OFF by

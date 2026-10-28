@@ -1394,7 +1394,7 @@ fn helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inheri
         );
         let command_snapshot: qshd::helper_status::Snapshot =
             serde_json::from_slice(&cli.stdout).unwrap();
-        assert_eq!(command_snapshot.schema, 1);
+        assert_eq!(command_snapshot.schema, qshd::helper_status::SCHEMA);
         assert_eq!(
             command_snapshot.capacity,
             qshd::helper_status::Capacity::Available

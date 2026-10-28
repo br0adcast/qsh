@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RESPONSE: usize = 4096;
+pub const SCHEMA: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,12 @@ pub struct Counts {
     pub wait_outstanding: u16,
     pub receipt_outstanding: u16,
     pub pam: Pam,
+    pub cleanup_failure: Option<CleanupFailure>,
+}
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CleanupFailure {
+    PtyLabelRestore { errno: i32 },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
@@ -309,7 +316,10 @@ fn decode(bytes: &[u8]) -> anyhow::Result<Snapshot> {
         "helper status response exceeds cap"
     );
     let snapshot: Snapshot = serde_json::from_slice(bytes)?;
-    anyhow::ensure!(snapshot.schema == 1, "unsupported helper status schema");
+    anyhow::ensure!(
+        snapshot.schema == SCHEMA,
+        "unsupported helper status schema"
+    );
     anyhow::ensure!(
         matches!(
             (&snapshot.capacity, &snapshot.counts),
@@ -364,10 +374,10 @@ mod tests {
         drop(gone);
         e.service(|| b"{}".to_vec()).unwrap();
         let mut client = UnixStream::connect(&path).unwrap();
-        e.service(|| b"{\"schema\":1}".to_vec()).unwrap();
+        e.service(|| b"{\"schema\":2}".to_vec()).unwrap();
         let mut bytes = Vec::new();
         client.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"{\"schema\":1}");
+        assert_eq!(bytes, b"{\"schema\":2}");
         e.service(|| b"{}".to_vec()).unwrap();
     }
     #[test]
@@ -388,14 +398,14 @@ mod tests {
     #[test]
     fn helper_status143_query_requires_complete_capped_compatible_response() {
         use std::io::Write;
-        let valid = br#"{"schema":1,"phase":"serving","capacity":"unavailable","limit":256}"#;
+        let valid = br#"{"schema":2,"phase":"serving","capacity":"unavailable","limit":256}"#;
         for (bytes, accepted) in [
             (valid.to_vec(), true),
             (b"{".to_vec(), false),
             (
                 String::from_utf8(valid.to_vec())
                     .unwrap()
-                    .replace("schema\":1", "schema\":2")
+                    .replace("schema\":2", "schema\":1")
                     .into_bytes(),
                 false,
             ),
@@ -471,5 +481,53 @@ mod tests {
         drop(endpoint);
         assert!(!path.exists());
         drop(Endpoint::bind_for(&path, nix::unistd::geteuid().as_raw()).unwrap());
+    }
+    #[test]
+    fn selinux57_status_schema_keeps_semantic_failure_separate_from_custody() {
+        let snapshot = Snapshot {
+            schema: SCHEMA,
+            phase: Phase::Serving,
+            capacity: Capacity::Available,
+            limit: 256,
+            counts: Some(Counts {
+                admitted: 0,
+                provisional: 0,
+                retiring: 0,
+                retiring_pending: 0,
+                charged: 0,
+                unconfirmed: 0,
+                missing_monitor: 0,
+                wait_lost: 0,
+                monitor_failed: 0,
+                receipt_lost: 0,
+                retired_slots: 0,
+                wait_outstanding: 0,
+                receipt_outstanding: 0,
+                pam: Pam::NotOpened,
+                cleanup_failure: Some(CleanupFailure::PtyLabelRestore { errno: 13 }),
+            }),
+        };
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() <= MAX_RESPONSE);
+        let counts = decode(&bytes).unwrap().counts.unwrap();
+        assert_eq!(counts.charged, 0);
+        assert_eq!(counts.unconfirmed, 0);
+        assert_eq!(
+            counts.cleanup_failure,
+            Some(CleanupFailure::PtyLabelRestore { errno: 13 })
+        );
+        value["schema"] = serde_json::json!(1);
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["schema"] = serde_json::json!(SCHEMA);
+        value["counts"]["cleanup_failure"]["operation"] = serde_json::json!("unknown");
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["counts"]["cleanup_failure"] = serde_json::Value::Null;
+        assert!(decode(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .counts
+            .unwrap()
+            .cleanup_failure
+            .is_none());
     }
 }

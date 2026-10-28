@@ -276,6 +276,7 @@ mod worker_parent {
         let outcome = HelperPhysicalOutcome {
             worker: worker.physical_outcome(),
             pam_received: PamCompletion::NotOpened,
+            cleanup_failure: None,
             missing_pam: 0,
             channel_receipts: ChannelReceiptDebt::default(),
             pending_requests: false,

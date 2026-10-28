@@ -98,7 +98,7 @@ impl ChannelReceiptDebt {
                     debt.cleanup = debt.cleanup.saturating_add(1);
                     debt.exit = debt.exit.saturating_add(1);
                 }
-                ChannelSlot::ReapedRunning(_) => {
+                ChannelSlot::ReapedRunning(_, _) => {
                     // This exact cleanup receipt is already held. Only the
                     // missing exit/forwarded outcome remains unreported.
                     debt.exit = debt.exit.saturating_add(1);
@@ -119,6 +119,7 @@ impl ChannelReceiptDebt {
 struct HelperPhysicalOutcome {
     worker: WorkerPhysicalOutcome,
     pam_received: PamCompletion,
+    cleanup_failure: Option<CleanupFailure>,
     missing_pam: usize,
     channel_receipts: ChannelReceiptDebt,
     pending_requests: bool,
@@ -139,6 +140,7 @@ impl HelperPhysicalOutcome {
             || !self.worker.terminal_received
             || self.worker.signal_failure.is_some()
             || !self.pam_received.succeeded()
+            || self.cleanup_failure.is_some()
             || self.missing_pam != 0
             || self.channel_receipts.any()
             || self.pending_requests
@@ -215,6 +217,7 @@ impl HelperShutdown {
         Some(HelperPhysicalOutcome {
             worker: worker.physical_outcome(),
             pam_received,
+            cleanup_failure: self.state.cleanup_failure,
             missing_pam,
             channel_receipts: ChannelReceiptDebt::from_state(&self.state),
             pending_requests: !self.state.pending.is_empty(),

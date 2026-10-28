@@ -163,7 +163,9 @@ fn cleanup143_capacity_classification_deduplicates_exact_owners_and_obligations(
     monitor.wait_lost = true;
     monitor.failure = Some(MonitorFailure::Stream);
     monitor.seam_closed = true;
-    state.live.insert(101, ChannelSlot::ReapedRunning(owner));
+    state
+        .live
+        .insert(101, ChannelSlot::ReapedRunning(owner, None));
     let lost = capacity_snapshot(&state).unwrap();
     assert_eq!(
         (lost.charged, lost.unconfirmed, lost.retiring_pending),
@@ -354,6 +356,7 @@ fn cleanup143_capacity_exact_receipt_wait_settlement_keeps_failed_pam_outcomes()
     channel::send(
         &newer_peer,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),
@@ -384,7 +387,11 @@ fn cleanup143_capacity_exact_receipt_wait_settlement_keeps_failed_pam_outcomes()
     };
     channel::send(
         &peer,
-        &encode(&MonitorEvent::SessionClosed { result: failed }).unwrap(),
+        &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
+            result: failed,
+        })
+        .unwrap(),
         None,
     )
     .unwrap();
@@ -547,7 +554,7 @@ fn helper_status143_serialized_snapshot_preserves_registered_custody() {
     );
     let bytes = helper_status_snapshot(&state);
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(value["schema"], 1);
+    assert_eq!(value["schema"], crate::helper_status::SCHEMA);
     assert_eq!(value["phase"], "serving");
     assert_eq!(value["capacity"], "available");
     assert_eq!(value["counts"]["charged"], 3);
@@ -611,6 +618,7 @@ fn helper_status143_legacy_drain_answers_pending_and_queries_do_not_hold_exit() 
     let sent = channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),

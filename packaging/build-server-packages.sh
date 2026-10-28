@@ -158,7 +158,7 @@ floor=${QSHD_GLIBC_FLOOR:-}
 # step, minutes into a build, as a shell error about a word rather than as
 # "the image is missing cpio" -- and the format-specific half is exactly
 # where an image and this script drift apart.
-tools=(cargo python3 readelf nm file find sort "$root/scripts/check-pam-linkage.sh")
+tools=(cargo python3 readelf nm file find sort "$root/scripts/check-pam-linkage.sh" "$root/scripts/check-selinux-linkage.sh" "$root/packaging/check-runtime-dependencies.sh")
 case $fmt in
   deb) tools+=(cargo-deb dpkg-deb dpkg-shlibdeps) ;;
   rpm) tools+=(cargo-generate-rpm rpm rpm2cpio cpio) ;;
@@ -197,6 +197,7 @@ check_binary() {
     *libpam.so.0*) ;;
     *) die "$what does not need libpam.so.0 -- built without the 'system' feature, or built from the wrong target directory (NEEDED: $needed)" ;;
   esac
+  "$root/scripts/check-selinux-linkage.sh" "$bin"
   ok "$what: $description"
   ok "$what: NEEDED $needed"
 }
@@ -318,6 +319,7 @@ for row in "${targets[@]}"; do
         *libpam0g*) ;;
         *) die "$pkg depends on '$depends', which does not name libpam0g" ;;
       esac
+      "$root/packaging/check-runtime-dependencies.sh" deb <<<"$depends"
       # Every libc6 clause there is, highest wins. This was one greedy
       # `sed 's/.*libc6 (>= \(...\)).*/'`, which takes the LAST match
       # rather than the largest: with one clause on the line the two
@@ -372,6 +374,7 @@ for row in "${targets[@]}"; do
         *libpam.so.0*) ;;
         *) die "$pkg requires no libpam.so.0: $(tr '\n' ' ' <<<"$requires")" ;;
       esac
+      "$root/packaging/check-runtime-dependencies.sh" rpm <<<"$requires"
       # rpm records one requirement per version node per library, so the
       # floor is the highest GLIBC_ node over all of them -- libc.so.6 is
       # not the only library that carries them.

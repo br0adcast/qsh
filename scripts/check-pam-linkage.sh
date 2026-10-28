@@ -2,8 +2,8 @@
 # Checks how Linux-PAM reaches the qshd binary.
 #
 # qshd ships two ways. The featureless build is the statically linked musl
-# portable release binary: Linux-PAM must not
-# reach it at all. The `system` build is the machine-wide daemon: it links
+# portable release binary: Linux-PAM and libselinux must not reach it at all.
+# The `system` build is the machine-wide daemon: it links
 # libpam dynamically and must still start on Linux-PAM 1.3.1 (Ubuntu 20.04,
 # RHEL 8), which has no LIBPAM_1.4 version node and so no
 # pam_start_confdir -- a function only the tests may use.
@@ -14,8 +14,8 @@
 # resolves `-lpam` to the host's static glibc libpam.a. The linker's own
 # command line can answer it, so check 1 reads that.
 #
-#   1. featureless build, host gnu and host musl: no `-lpam` on the link
-#      line; the musl binary has no NEEDED entry and no pam_ symbol.
+#   1. featureless build, host gnu and host musl: no `-lpam` or `-lselinux`
+#      on the link line; the musl binary has no NEEDED entry or system-library symbol.
 #   2. `system` build, dev and release: libpam.so.0 is NEEDED, the only
 #      libpam version required is LIBPAM_1.0, and pam_start_confdir is not
 #      imported.
@@ -236,9 +236,9 @@ link_line() {
     die "rustc printed no link line for qshd ($*); see $file"
 }
 
-# Whether a link line passes `-lpam` to the linker.
-links_pam() {
-  grep -Eq '(^|[[:space:]])"?-lpam"?([[:space:]]|$)' "$1"
+# Whether a featureless link line passes a system-only library to the linker.
+links_system_libs() {
+  grep -Eq '(^|[[:space:]])"?-l(pam|selinux)"?([[:space:]]|$)' "$1"
 }
 
 mkdir -p "$out"
@@ -246,10 +246,10 @@ mkdir -p "$out"
 # --- check 1: the featureless build never links Linux-PAM -------------------
 dir=$out/featureless-gnu
 link_line "$dir" "$out/featureless-gnu.link" --target "$gnu"
-if links_pam "$out/featureless-gnu.link"; then
-  fail "1: the featureless $gnu build passes -lpam to the linker ($out/featureless-gnu.link)"
+if links_system_libs "$out/featureless-gnu.link"; then
+  fail "1: the featureless $gnu build passes -lpam or -lselinux to the linker ($out/featureless-gnu.link)"
 else
-  ok "1: featureless $gnu: no -lpam on the link line"
+  ok "1: featureless $gnu: no -lpam or -lselinux on the link line"
 fi
 
 dir=$out/featureless-musl
@@ -257,15 +257,15 @@ link_line "$dir" "$out/featureless-musl.link" --target "$musl"
 bin=$dir/$musl/debug/qshd
 dynamic=$(readelf -d "$bin")
 needed=$(grep -c '(NEEDED)' <<<"$dynamic" || true)
-symbols=$(nm "$bin" | awk '$NF ~ /^pam_/ { n++ } END { print n + 0 }')
-if links_pam "$out/featureless-musl.link"; then
-  fail "1: the featureless $musl build passes -lpam to the linker ($out/featureless-musl.link)"
+symbols=$(nm "$bin" | awk '$NF ~ /^(pam_|is_selinux_enabled$|getexeccon$|fgetfilecon$|fsetfilecon$|security_compute_relabel$|string_to_security_class$|freecon$)/ { n++ } END { print n + 0 }')
+if links_system_libs "$out/featureless-musl.link"; then
+  fail "1: the featureless $musl build passes -lpam or -lselinux to the linker ($out/featureless-musl.link)"
 elif [[ $needed -ne 0 ]]; then
   fail "1: the featureless $musl binary has $needed NEEDED entries, expected none: $bin"
 elif [[ $symbols -ne 0 ]]; then
-  fail "1: the featureless $musl binary has $symbols pam_ symbols, expected none: $bin"
+  fail "1: the featureless $musl binary has $symbols PAM/libselinux symbols, expected none: $bin"
 else
-  ok "1: featureless $musl: no -lpam on the link line, no NEEDED entry, no pam_ symbol"
+  ok "1: featureless $musl: no -lpam or -lselinux on the link line, no NEEDED entry, no PAM/libselinux symbol"
 fi
 
 if [[ $featureless_only -eq 1 ]]; then

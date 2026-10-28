@@ -70,14 +70,15 @@ RUN dnf -y install epel-release \
         python3 \
         file \
         pam-devel \
+        libselinux-devel \
         rpm-build \
     && dnf clean all
 
 # The foreign target's libraries, taken from Rocky 8's OWN aarch64 packages
-# rather than from anywhere newer: this is what holds the arm64 package to
-# the same libc as the x86_64 one, and to libpam 1.3.1 -- the version
-# checked against QSHD_GLIBC_FLOOR by the self-test below, not restated
-# here. `--forcearch` tells dnf to
+# rather than from anywhere newer: this holds the arm64 package to the same
+# libc floor and Rocky PAM/libselinux libraries as x86_64. The libc floor is
+# checked against QSHD_GLIBC_FLOOR by the self-test below, not restated here.
+# `--forcearch` tells dnf to
 # resolve $basearch as aarch64; nothing here is ever executed on this
 # machine, it is only linked against.
 #
@@ -92,15 +93,16 @@ RUN dnf -y install epel-release \
 # name ordinarily lives in the native gcc package, outside this sysroot.
 COPY bootstrap /tmp/qsh-bootstrap
 RUN python3 /tmp/qsh-bootstrap/install-sysroot.py \
-    && for f in libc.so libc.so.6 libpam.so libpam.so.0 libgcc_s.so.1 crt1.o crti.o crtn.o; do \
+    && for f in libc.so libc.so.6 libpam.so libpam.so.0 libselinux.so libselinux.so.1 libgcc_s.so.1 crt1.o crti.o crtn.o; do \
         [ -e "/usr/aarch64-linux-gnu/sys-root/usr/lib64/$f" ] \
             || { echo "the aarch64 sysroot is missing usr/lib64/$f" >&2; exit 1; }; \
-       done
+       done \
+    && test -f /usr/aarch64-linux-gnu/sys-root/usr/include/selinux/selinux.h
 
 # The image asserts its own cross toolchain rather than leaving a broken one
 # to be discovered three minutes into a release build: the sysroot must be
 # where the compiler looks for it, and a link that asks for both libraries
-# rustc asks for must produce an aarch64 ELF that needs libpam.
+# rustc asks for must produce an aarch64 ELF that needs libpam and libselinux.
 RUN set -eu; \
     sysroot=$(aarch64-linux-gnu-gcc -print-sysroot); \
     [ "$sysroot" = /usr/aarch64-linux-gnu/sys-root ] \
@@ -112,10 +114,12 @@ RUN set -eu; \
         | aarch64-linux-gnu-gcc -E -P -x c - | tr -d '[:space:]'); \
     [ "$headerglibc" = "$QSHD_GLIBC_FLOOR" ] \
         || { echo "the aarch64 headers carry glibc $headerglibc, not $QSHD_GLIBC_FLOOR" >&2; exit 1; }; \
-    printf '#include <features.h>\n#include <stdio.h>\n#include <security/pam_appl.h>\n#ifndef __aarch64__\n#error not an aarch64 compiler\n#endif\nint main(void){return 0;}\n' > /tmp/probe.c; \
-    aarch64-linux-gnu-gcc -o /tmp/probe /tmp/probe.c -lpam -lgcc_s; \
+    printf '#include <features.h>\n#include <stdio.h>\n#include <security/pam_appl.h>\n#include <selinux/selinux.h>\n#ifndef __aarch64__\n#error not an aarch64 compiler\n#endif\nint main(void){pam_handle_t *handle=0; return is_selinux_enabled()+pam_start("qshd","nobody",0,&handle);}\n' > /tmp/probe.c; \
+    aarch64-linux-gnu-gcc -o /tmp/probe /tmp/probe.c -lpam -lselinux -lgcc_s; \
     readelf -d /tmp/probe | grep -q 'NEEDED.*libpam\.so\.0' \
         || { echo "the cross link produced no libpam.so.0 dependency" >&2; exit 1; }; \
+    readelf -d /tmp/probe | grep -q 'NEEDED.*libselinux\.so\.1' \
+        || { echo "the cross link produced no libselinux.so.1 dependency" >&2; exit 1; }; \
     file /tmp/probe | grep -q 'ARM aarch64' \
         || { echo "the cross link produced something other than an aarch64 ELF" >&2; exit 1; }; \
     rm -f /tmp/probe /tmp/probe.c

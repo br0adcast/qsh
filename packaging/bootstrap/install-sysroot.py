@@ -130,7 +130,8 @@ def main():
                             '--setopt=install_weak_deps=False', '--setopt=gpgcheck=True',
                             '--setopt=localpkg_gpgcheck=True', '--downloadonly',
                             '--downloaddir=' + str(packages), 'install',
-                            'glibc-devel', 'libgcc', 'pam-devel', 'glibc-headers'], check=True)
+                            'glibc-devel', 'libgcc', 'pam-devel', 'libselinux-devel',
+                            'glibc-headers'], check=True)
         install_packages(sorted(packages.glob('*.rpm')), key, TARGET)
     # The sysroot is link-only; none of its foreign executables were run.
     shutil.rmtree(str(TARGET / 'var/lib/rpm'))

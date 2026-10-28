@@ -153,7 +153,9 @@ mod adoption_parent {
     fn adoption40_reaped_running_owes_exit_outcome_but_has_real_cleanup() {
         let mut state = state();
         let owner = owner_for(&state, [40; 16]);
-        state.live.insert(1, ChannelSlot::ReapedRunning(owner));
+        state
+            .live
+            .insert(1, ChannelSlot::ReapedRunning(owner, None));
         assert_eq!(
             ChannelReceiptDebt::from_state(&state),
             ChannelReceiptDebt {
