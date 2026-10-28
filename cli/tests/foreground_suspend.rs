@@ -930,11 +930,6 @@ fn scenario_fresh(
         "replacement current Ready missing: {}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(
-        fresh.daemon.shell_starts(),
-        1,
-        "one consented shell, no duplicate open on continue"
-    );
     master.write_all(b"echo AFTER'FRESH'\n").unwrap();
     assert!(
         fresh_until(cancel, || {
@@ -942,6 +937,11 @@ fn scenario_fresh(
             String::from_utf8_lossy(&output).contains("AFTERFRESH")
         }),
         "replacement shell did not answer"
+    );
+    assert_eq!(
+        fresh.daemon.shell_starts(),
+        1,
+        "one consented shell, no duplicate open on continue"
     );
     master.write_all(b"exit\n").unwrap();
     assert!(fresh_until(cancel, || child.status().unwrap().is_some()));
