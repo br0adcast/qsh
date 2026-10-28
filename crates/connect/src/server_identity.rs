@@ -14,12 +14,3 @@ pub struct SshEndpoint {
     pub host: String,
     pub port: u16,
 }
-
-/// An explicitly authorized association between QSH and SSH public identities.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SshBinding {
-    pub server: ServerIdentity,
-    pub endpoint: SshEndpoint,
-    /// SSH host public key in wire format.
-    pub host_key: Vec<u8>,
-}
