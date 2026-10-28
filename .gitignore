@@ -11,3 +11,6 @@
 /docs/superpowers/
 /.gstack/
 /graphify-out/
+
+# Local performance runs and one-off experiment evidence
+/docs/performance/
