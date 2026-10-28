@@ -14,6 +14,7 @@ mod native_rsa;
 mod personal_authorized_keys;
 pub mod prepared_key;
 pub mod record;
+pub mod route;
 pub mod sign_file;
 pub mod verify;
 
