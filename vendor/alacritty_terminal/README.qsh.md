@@ -27,6 +27,13 @@ with and without reflow and the unchanged resize controls. Product tests cover
 primary/alternate transitions, save/restore, blank/wide cells and repaint
 continuations, including preservation of prior inactive saved state.
 
+Scrolling a region which starts below the top row leaves the history viewport
+anchored: it does not add history, so it must not advance `display_offset`.
+Top-origin scrolling keeps its existing offset and capacity behavior. Product
+regressions cover partial and whole-region deletion, frame extraction while
+scrolled to the oldest row, an in-range history anchor, and genuine history
+growth through the configured cap.
+
 The product and fuzz workspace roots select this same directory with
 `[patch.crates-io]`. Downstream workspaces must explicitly carry this patch and
 the separate `vte` patch during integration. Keep the patch minimal and review

@@ -263,8 +263,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             return;
         }
 
-        // Update display offset when not pinned to active area.
-        if self.display_offset != 0 {
+        // Only new history moves a view which is not pinned to the active area.
+        if self.display_offset != 0 && region.start == 0 {
             self.display_offset = min(self.display_offset + positions, self.max_scroll_limit);
         }
 

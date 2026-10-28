@@ -65,3 +65,10 @@
 +        assert_eq!((grid.saved_cursor.point.column, grid.saved_cursor.input_needs_wrap), (Column(1), true));
 +    }
 +}
+--- a/src/grid/mod.rs
++++ b/src/grid/mod.rs
+@@ -266,2 +266,2 @@
+-        // Update display offset when not pinned to active area.
+-        if self.display_offset != 0 {
++        // Only new history moves a view which is not pinned to the active area.
++        if self.display_offset != 0 && region.start == 0 {
