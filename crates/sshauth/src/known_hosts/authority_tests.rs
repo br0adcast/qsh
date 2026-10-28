@@ -13,7 +13,12 @@ fn pin_mode(path: &Path, mode: u32) {
 fn pin_authority_unsafe_sources_never_become_unknown() {
     let root = pin_fixture();
     let mut failures = Vec::new();
-    for kind in ["writable-file", "writable-parent", "dangling"] {
+    for kind in [
+        "writable-file",
+        "writable-parent",
+        "group-writable-parent",
+        "dangling",
+    ] {
         let parent = root.path().join(kind);
         fs::create_dir(&parent).unwrap();
         pin_mode(&parent, 0o700);
@@ -35,8 +40,15 @@ fn pin_authority_unsafe_sources_never_become_unknown() {
                 },
             );
         }
-        if kind == "writable-parent" {
-            pin_mode(&parent, 0o777);
+        if kind == "writable-parent" || kind == "group-writable-parent" {
+            pin_mode(
+                &parent,
+                if kind == "group-writable-parent" {
+                    0o775
+                } else {
+                    0o777
+                },
+            );
         }
         let before = fs::symlink_metadata(&path).unwrap();
         let bytes = fs::read(&path).ok();

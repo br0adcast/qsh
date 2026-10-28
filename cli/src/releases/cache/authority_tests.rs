@@ -521,3 +521,42 @@ fn cache_authority_cleanup_never_removes_replacements() {
         b"unrelated replacement"
     );
 }
+
+#[test]
+fn cache_group_write_and_sticky_boundaries_preserve_authority() {
+    for (ancestor_mode, root_mode, allowed) in [
+        (0o775, 0o700, false),
+        (0o777, 0o700, false),
+        (0o1777, 0o700, true),
+        (0o700, 0o1777, false),
+        (0o700, 0o775, false),
+    ] {
+        let root = private_root();
+        let ancestor = root.path().join("ancestor");
+        let cache = ancestor.join("cache");
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(ancestor_mode))
+            .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(root_mode)).unwrap();
+        let cancel = knock::Cancel::new();
+        let budget = Budget::new(Duration::from_secs(5), &cancel);
+        let authority = Authority::open(&cache, &request(), &budget);
+        assert_eq!(
+            authority.is_ok(),
+            allowed,
+            "ancestor={ancestor_mode:o}, root={root_mode:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(&ancestor).unwrap().mode() & 0o7777,
+            ancestor_mode
+        );
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().mode() & 0o7777,
+            root_mode
+        );
+        if !allowed {
+            assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+        }
+    }
+}

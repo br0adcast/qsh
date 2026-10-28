@@ -133,16 +133,19 @@ fn writable_parent_is_refused_before_reading_or_missing_leaf() {
     let unsafe_dir = dir.path().join("unsafe");
     make_dir(&unsafe_dir);
     key(&unsafe_dir.join("key"), 0o600);
-    std::fs::set_permissions(&unsafe_dir, Permissions::from_mode(0o777)).unwrap();
-    let mut io = Observe::default();
-    for leaf in ["key", "missing"] {
-        let error = read(&unsafe_dir.join(leaf), Uid::effective(), &mut io)
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("parent is writable"));
+    for permissions in [0o777, 0o775] {
+        std::fs::set_permissions(&unsafe_dir, Permissions::from_mode(permissions)).unwrap();
+        let mut io = Observe::default();
+        for leaf in ["key", "missing"] {
+            let error = read(&unsafe_dir.join(leaf), Uid::effective(), &mut io)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("parent is writable"));
+        }
+        assert_eq!(io.reads, 0);
+        assert_eq!(io.repairs, 0);
+        assert_eq!(mode(&unsafe_dir), permissions);
     }
-    assert_eq!(io.reads, 0);
-    assert_eq!(io.repairs, 0);
 }
 
 #[test]

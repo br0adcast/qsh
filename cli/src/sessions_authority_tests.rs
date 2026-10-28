@@ -297,3 +297,29 @@ fn path_diagnostics_failed_initial_write_retains_token_and_lock_with_warning() {
     assert_lock_from_subprocess(&path, false);
     assert_eq!(std::fs::read(&path).unwrap(), b"not a token");
 }
+
+#[test]
+fn group_writable_session_authority_is_refused_without_repair() {
+    for final_parent in [false, true] {
+        let root = slot139_fixture();
+        let unsafe_dir = root.path().join("group-writable");
+        std::fs::create_dir(&unsafe_dir).unwrap();
+        slot139_mode(&unsafe_dir, 0o775);
+        let store = if final_parent {
+            unsafe_dir.clone()
+        } else {
+            let store = unsafe_dir.join("sessions");
+            std::fs::create_dir(&store).unwrap();
+            slot139_mode(&store, 0o700);
+            store
+        };
+        let mut owner = claim_in_private_dir(&store, "alice", "example.invalid", 60000);
+        assert!(owner._lock.is_none());
+        assert!(owner.take_warning().is_some());
+        assert_eq!(
+            std::fs::metadata(&unsafe_dir).unwrap().permissions().mode() & 0o7777,
+            0o775
+        );
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 0);
+    }
+}

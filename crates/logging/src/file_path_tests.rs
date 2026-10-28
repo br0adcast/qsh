@@ -65,11 +65,13 @@ fn authority_declared_parent_and_file_are_repaired() {
 
 #[test]
 fn authority_unsafe_ancestor_is_refused_before_mutation() {
-    for final_parent in [false, true] {
+    for (final_parent, permissions) in
+        [(false, 0o777), (true, 0o777), (false, 0o775), (true, 0o775)]
+    {
         let dir = crate::private_test_dir().unwrap();
         let unsafe_dir = dir.path().join("unsafe");
         fs::create_dir(&unsafe_dir).unwrap();
-        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(permissions)).unwrap();
         let parent = if final_parent {
             unsafe_dir.clone()
         } else {

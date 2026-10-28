@@ -128,6 +128,13 @@ host-list syntax; the CLI still owns comma-separated address settings.
 On Unix, QSH pins are read only through validated paths owned by root or the
 current effective account. Ordinary directories and regular pin files must not
 be writable by group or others; trusted sticky directories may be traversed.
+This rule also rejects a nonsticky `0775` ancestor when its group is intended
+for only one user: group membership is not used to establish filesystem
+integrity. A private child does not make an unsafe ancestor trustworthy. An
+administrator can choose a suitable authority route with non-group-writable
+ancestors, such as `0755` or `0700`; do not recursively change a shared project
+or home directory to satisfy this check.
+
 Safe public files such as `0644` pins, trusted aliases, and public-data hardlinks
 are supported. Unsafe, unreadable, dangling, special, or invalid UTF-8 sources
 cause a pin-store error, never an empty-store first-use prompt. A genuinely
