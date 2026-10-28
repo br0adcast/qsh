@@ -203,7 +203,24 @@ pub fn init(cache_dir: &Path) {
     if LOGGER.get().is_some() {
         return;
     }
-    let prepared = prepare(cache_dir);
+    init_prepared(prepare(cache_dir));
+}
+
+/// [`init`] without a cache directory: `why` is reported the way a log that
+/// cannot be opened is, and no file is written.
+pub fn init_unavailable(why: &dyn std::fmt::Display) {
+    if LOGGER.get().is_some() {
+        return;
+    }
+    init_prepared(PreparedLog {
+        logger: None,
+        warning: Some(logging::diagnostic(&format!(
+            "file logging disabled: {why}"
+        ))),
+    });
+}
+
+fn init_prepared(prepared: PreparedLog) {
     if let Some(warning) = prepared.warning() {
         let _ = writeln!(std::io::stderr(), "qshd: {warning}");
     }

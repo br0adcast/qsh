@@ -7,16 +7,10 @@ mod http;
 use bringup::{BringUpObserver, DaemonImage, ImageError, ImageRequest, ImageSource, InstallTiming};
 use knock::Cancel;
 use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-
-/// Release cache location follows XDG on every supported client OS.
-pub fn release_cache_root(xdg_cache_home: Option<&OsStr>, home: &Path) -> PathBuf {
-    crate::paths::unix_root(home, xdg_cache_home, ".cache")
-}
 
 const SUMS_LIMIT: usize = 1024 * 1024;
 const ARCHIVE_LIMIT: usize = 64 * 1024 * 1024;
@@ -64,19 +58,44 @@ pub trait ReleaseTransport: Send + Sync {
 }
 
 pub struct GitHubImages {
-    cache_root: PathBuf,
+    /// The client's cache directory, normally [`crate::paths::cache_dir`];
+    /// releases are kept under its `releases`. Without one, every image is
+    /// downloaded and verified and none is kept.
+    cache_root: Option<PathBuf>,
     transport: Arc<dyn ReleaseTransport>,
 }
 
 impl GitHubImages {
-    pub fn new(cache_root: PathBuf) -> Self {
-        Self::with_transport(cache_root, Arc::new(http::HttpsTransport))
+    pub fn new(cache_root: Option<PathBuf>) -> Self {
+        Self {
+            cache_root,
+            transport: Arc::new(http::HttpsTransport),
+        }
     }
 
     pub fn with_transport(cache_root: PathBuf, transport: Arc<dyn ReleaseTransport>) -> Self {
         Self {
-            cache_root,
+            cache_root: Some(cache_root),
             transport,
+        }
+    }
+
+    pub fn uncached(transport: Arc<dyn ReleaseTransport>) -> Self {
+        Self {
+            cache_root: None,
+            transport,
+        }
+    }
+
+    /// The cache, when there is a directory for it and it can be used.
+    fn cache(
+        &self,
+        request: &ImageRequest,
+        budget: &Budget<'_>,
+    ) -> Result<Option<cache::Cache>, ImageError> {
+        match &self.cache_root {
+            Some(root) => cache::optional(cache::Cache::open(root, request, budget), budget),
+            None => budget.check().map(|()| None),
         }
     }
 }
@@ -146,11 +165,7 @@ impl ImageSource for GitHubImages {
             Ok(sums) => sums,
             Err(FetchError::TemporarilyUnavailable(reason)) => {
                 let check = Budget::new(timing.verify, cancel);
-                let Some(cache) = cache::optional(
-                    cache::Cache::open(&self.cache_root, request, &check),
-                    &check,
-                )?
-                else {
+                let Some(cache) = self.cache(request, &check)? else {
                     return Err(ImageError::Download(reason));
                 };
                 return cache
@@ -167,10 +182,7 @@ impl ImageSource for GitHubImages {
         let archive_sha = archive::expected_hash(&sums, &format!("{}.tar.gz", stem(request)))?;
         metadata_progress(true);
         let check = Budget::new(timing.verify, cancel);
-        if let Some(cache) = cache::optional(
-            cache::Cache::open(&self.cache_root, request, &check),
-            &check,
-        )? {
+        if let Some(cache) = self.cache(request, &check)? {
             if let Some(image) = cache.load(request, Some(&archive_sha), &check, timing.publish)? {
                 return Ok(image);
             }
@@ -195,10 +207,7 @@ impl ImageSource for GitHubImages {
         let check = Budget::new(timing.verify, cancel);
         let image = archive::verified_image(request, &bytes, &archive_sha, &check)?;
         let publication = Budget::new(timing.publish, cancel);
-        if let Some(cache) = cache::optional(
-            cache::Cache::open(&self.cache_root, request, &publication),
-            &publication,
-        )? {
+        if let Some(cache) = self.cache(request, &publication)? {
             cache::optional(
                 cache.publish(request, &bytes, &archive_sha, &image, &publication),
                 &publication,

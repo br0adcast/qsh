@@ -312,13 +312,40 @@ pub const SYSTEM_LOG_DIR: &str = "/var/log/qshd";
 /// own diagnostics, which is what this file is; a service log is not a
 /// per-user cache in the first place, in the personal mode either, but that
 /// mismatch is not this task's to fix.
-pub fn cache_dir(system: bool) -> PathBuf {
+///
+/// A personal mode without a home directory has no cache directory: an
+/// error, never a directory relative to wherever the daemon was started. A
+/// relative `$HOME` is the caller's explicit choice and is kept;
+/// `transport-ensure` captures it before detaching.
+pub fn cache_dir(system: bool) -> Result<PathBuf> {
     if system {
-        return PathBuf::from(SYSTEM_LOG_DIR);
+        return Ok(PathBuf::from(SYSTEM_LOG_DIR));
     }
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("qsh")
+    personal_cache_dir(dirs::cache_dir())
+}
+
+/// The personal cache directory under the platform's cache root, as
+/// `dirs::cache_dir()` found it.
+fn personal_cache_dir(root: Option<PathBuf>) -> Result<PathBuf> {
+    let variables = if cfg!(target_os = "macos") {
+        "HOME"
+    } else {
+        "HOME or XDG_CACHE_HOME"
+    };
+    root.map(|root| root.join("qsh")).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot locate the cache directory: no home directory is known; set {variables}"
+        )
+    })
+}
+
+/// Start the diagnostic file log in the mode's cache directory, or report
+/// once, as a log that cannot be opened is, that there is none.
+pub fn init_log(system: bool) {
+    match cache_dir(system) {
+        Ok(directory) => log::init(&directory),
+        Err(error) => log::init_unavailable(&error),
+    }
 }
 
 /// The personal mode serves the account that starts it. As root that
@@ -451,7 +478,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     // watch for in `journalctl`. Set before `init`, and before the system
     // mode forks, so the helper and the worker mirror their lines too.
     log::mirror_to_stderr();
-    log::init(&cache_dir(parsed.system));
+    init_log(parsed.system);
 
     let keypair = crate::load_or_create_transport_key(&parsed.host_key).with_context(|| {
         format!(
@@ -1049,7 +1076,7 @@ mod tests {
         let _restore = RestoreEnvVars::unset(&["HOME", "XDG_CACHE_HOME"]);
         std::env::set_var("HOME", "/tmp/qshd-test-decoy-home");
         assert_eq!(
-            cache_dir(true),
+            cache_dir(true).unwrap(),
             PathBuf::from("/var/log/qshd"),
             "the system mode's log directory must be fixed, not tied to whichever \
              account's $HOME happens to be set"
@@ -1058,13 +1085,43 @@ mod tests {
 
     /// The personal mode is unchanged: it still follows `$HOME` (through
     /// `dirs::cache_dir()`), exactly as before this task.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_personal_mode_log_directory_still_follows_home() {
         let _restore = RestoreEnvVars::unset(&["HOME", "XDG_CACHE_HOME"]);
         std::env::set_var("HOME", "/tmp/qshd-test-decoy-home");
         assert_eq!(
-            cache_dir(false),
+            cache_dir(false).unwrap(),
             PathBuf::from("/tmp/qshd-test-decoy-home/.cache/qsh")
+        );
+        // An absolute XDG override wins; a relative one is ignored.
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/qshd-test-decoy-cache");
+        assert_eq!(
+            cache_dir(false).unwrap(),
+            PathBuf::from("/tmp/qshd-test-decoy-cache/qsh")
+        );
+        std::env::set_var("XDG_CACHE_HOME", "relative-cache");
+        assert_eq!(
+            cache_dir(false).unwrap(),
+            PathBuf::from("/tmp/qshd-test-decoy-home/.cache/qsh")
+        );
+    }
+
+    /// No cache root at all -- `$HOME` unset or empty and an account the
+    /// database does not know -- is refused on every platform rather than
+    /// replaced by the working directory.
+    #[test]
+    fn the_personal_mode_refuses_a_missing_cache_root() {
+        let error = personal_cache_dir(None).unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "cannot locate the cache directory: no home directory is known; set HOME"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            personal_cache_dir(Some(PathBuf::from("/h/Library/Caches"))).unwrap(),
+            PathBuf::from("/h/Library/Caches/qsh")
         );
     }
 

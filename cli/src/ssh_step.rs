@@ -499,10 +499,10 @@ impl SshStep<'_> {
             .known_hosts
             .add(&addr.host, route.port, &info.key_type, &info.key)
         {
-            eprintln!(
-                "qsh: could not save the key to {}: {err}",
-                self.known_hosts.user_file().display()
-            );
+            match self.known_hosts.user_file() {
+                Some(file) => eprintln!("qsh: could not save the key to {}: {err}", file.display()),
+                None => eprintln!("qsh: could not save the key: {err}"),
+            }
         }
         keys.known.push(info.key);
         // The second connection (and knock) is how `ssh::connect` works.
@@ -648,9 +648,9 @@ mod tests {
                     tty: &tty,
                     background,
                     install_policy: bringup::InstallPolicy::ExistingOnly,
-                    images: Arc::new(crate::releases::GitHubImages::new(
+                    images: Arc::new(crate::releases::GitHubImages::new(Some(
                         home.path().join("cache"),
-                    )),
+                    ))),
                 };
                 let route = ::connect::SshRoute {
                     port: 22,

@@ -377,7 +377,9 @@ impl Setup {
             tty: &self.tty,
             background,
             install_policy,
-            images: Arc::new(crate::releases::GitHubImages::new(crate::paths::cache_dir())),
+            images: Arc::new(crate::releases::GitHubImages::new(
+                crate::paths::cache_dir().ok(),
+            )),
         }
     }
 
@@ -798,7 +800,7 @@ impl<'a> Climb<'a> {
                         &failures,
                         &self.details,
                         &self.setup.args.login,
-                        &log::path(),
+                        log::path().ok().as_deref(),
                     ) {
                         eprintln!("{line}");
                         log::shown(&line);

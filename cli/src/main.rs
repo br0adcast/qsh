@@ -119,7 +119,7 @@ fn run(a: args::Args) -> i32 {
         prompt::Tty::new(),
         known_hosts::KnownHosts::standard(),
         std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
-        dirs::home_dir().map(|h| h.join(".ssh")),
+        qsh::paths::ssh_dir(),
         claim.token,
     ));
 

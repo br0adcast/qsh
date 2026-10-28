@@ -29,7 +29,7 @@ use std::mem::ManuallyDrop;
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// How many slots one login/endpoint may have. Past this the run gives up on
 /// resuming and takes a fresh token that is never written down. An unbounded
@@ -249,11 +249,6 @@ fn claim_locked(
         _lock: Some(slot),
         warning,
     })
-}
-
-/// Default store location: `~/.config/qsh/sessions`, beside `known_hosts`.
-pub fn default_dir() -> PathBuf {
-    crate::paths::config_dir().join("sessions")
 }
 
 /// A versioned, bounded filename for the exact login/host/port tuple.

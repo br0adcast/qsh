@@ -1,7 +1,7 @@
 //! Signing with a private key read from disk -- the fallback for when there
 //! is no agent.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ssh_key::{PrivateKey, PublicKey};
 use transport::auth::{record_challenge, AuthError, AuthRecord, AuthSigner, AUTH_NONCE_LEN};
@@ -58,22 +58,6 @@ impl FileSigner {
     pub fn with_login(mut self, login: String) -> Self {
         self.login = Some(login);
         self
-    }
-
-    /// The usual private key locations, newest-algorithm-first. This is our
-    /// own preference, not OpenSSH's own default `IdentityFile` order (which
-    /// starts with `id_rsa`): our verifier refuses `ssh-rsa` (RSA with
-    /// SHA-1) outright, so leading with an RSA key would often mean leading
-    /// with the one algorithm most likely to be refused.
-    pub fn default_paths() -> Vec<PathBuf> {
-        let home = match std::env::var_os("HOME") {
-            Some(h) => PathBuf::from(h),
-            None => return Vec::new(),
-        };
-        ["id_ed25519", "id_ecdsa", "id_rsa"]
-            .iter()
-            .map(|name| home.join(".ssh").join(name))
-            .collect()
     }
 
     /// The public half, for showing the user which key was offered.

@@ -211,41 +211,42 @@ fn optional_cache_cannot_hide_cancellation_after_metadata() {
     assert!(matches!(result, Err(ImageError::Cancelled)));
 }
 #[test]
-fn release_cache_path_uses_xdg_then_home_independently_of_host_os() {
-    use std::{
-        ffi::OsStr,
-        path::{Path, PathBuf},
-    };
-    assert_eq!(
-        qsh::releases::release_cache_root(
-            Some(OsStr::new("/private/xdg")),
-            Path::new("/private/home")
-        ),
-        PathBuf::from("/private/xdg/qsh")
-    );
-    assert_eq!(
-        qsh::releases::release_cache_root(None, Path::new("/private/home")),
-        PathBuf::from("/private/home/.cache/qsh")
-    );
+fn a_complete_cached_generation_loads_when_github_is_unreachable() {
+    let root = cache_test_dir().unwrap();
+    load(root.path(), Fake::new(archive())).unwrap();
+    let offline = Fake::offline();
+    assert_eq!(&*load(root.path(), offline.clone()).unwrap().bytes, IMAGE);
+    assert_eq!(offline.calls(), 1);
 }
 
 #[test]
-fn selected_release_cache_loads_complete_generation_when_github_is_unreachable() {
-    let home = cache_test_dir().unwrap();
-    let xdg = cache_test_dir().unwrap();
-    for configured in [Some(xdg.path().as_os_str()), None] {
-        let root = qsh::releases::release_cache_root(configured, home.path());
-        let expected = if configured.is_some() {
-            xdg.path().join("qsh")
-        } else {
-            home.path().join(".cache/qsh")
-        };
-        assert_eq!(root, expected);
-        load(&expected, Fake::new(archive())).unwrap();
-        let offline = Fake::offline();
-        assert_eq!(&*load(&root, offline.clone()).unwrap().bytes, IMAGE);
-        assert_eq!(offline.calls(), 1);
+fn without_a_cache_directory_images_are_verified_and_not_kept() {
+    let uncached = |transport: Arc<Fake>| {
+        GitHubImages::uncached(transport).load(
+            &request(),
+            &InstallTiming::default(),
+            &knock::Cancel::new(),
+            &Silent,
+        )
+    };
+    for _ in 0..2 {
+        let online = Fake::new(archive());
+        assert_eq!(&*uncached(online.clone()).unwrap().bytes, IMAGE);
+        assert_eq!(online.calls(), 2, "current sums and a fresh archive");
     }
+    let offline = Fake::offline();
+    assert!(matches!(
+        uncached(offline.clone()),
+        Err(ImageError::Download(_))
+    ));
+    assert_eq!(offline.calls(), 1);
+    let mismatched = Arc::new(Fake {
+        sums: format!("{}  {STEM}.tar.gz\n", "00".repeat(32)).into_bytes(),
+        archive: archive(),
+        calls: AtomicUsize::new(0),
+        offline: false,
+    });
+    assert!(matches!(uncached(mismatched), Err(ImageError::Checksum)));
 }
 
 #[test]
