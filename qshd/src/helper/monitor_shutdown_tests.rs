@@ -8,7 +8,11 @@ fn pam40_shutdown_tail_reads_queued_final_receipt_after_modeled_wait() {
     };
     channel::send(
         &peer,
-        &encode(&MonitorEvent::SessionClosed { result }).unwrap(),
+        &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
+            result,
+        })
+        .unwrap(),
         None,
     )
     .unwrap();

@@ -95,7 +95,12 @@ use super::account::Account;
 use super::channel;
 use super::pam::{Cred, Pam, PamError, PamStartFailure};
 use super::pam_completion::{PamCompletion, PamStep};
-use super::protocol::{decode, encode, ChannelId, MonitorEvent, MonitorRequest};
+use super::protocol::{
+    decode, encode, merge_cleanup_failure, ChannelId, CleanupFailure, CleanupKind, MonitorEvent,
+    MonitorRequest,
+};
+#[cfg(target_os = "linux")]
+use super::selinux_tty::{self, Adapter, Guard, Native, Prepared, Snapshot};
 use super::server::{
     become_account_checks, child_env, close_other_descriptors, login_shell, shell_basename,
     REAP_INTERVAL, STARTUP_REPORT_TIMEOUT,
@@ -277,6 +282,8 @@ struct Shell {
     pid: Pid,
     #[cfg(target_os = "linux")]
     native: Option<native::NativeShell>,
+    #[cfg(target_os = "linux")]
+    tty: Option<Guard<'static, Native>>,
     /// The read end of this shell's startup-report pipe, while it is still
     /// starting: end-of-file with nothing in it means the `execve` took,
     /// four bytes mean it did not (`server::read_startup_report`). `None`
@@ -291,6 +298,34 @@ struct Shell {
     /// afterwards would be a second answer to one request.
     #[cfg(any(test, not(target_os = "linux")))]
     started: bool,
+}
+
+#[derive(Debug)]
+struct CleanupSummary {
+    pam: PamCompletion,
+    failure: Option<CleanupFailure>,
+}
+impl Default for CleanupSummary {
+    fn default() -> Self {
+        Self {
+            pam: PamCompletion::NotOpened,
+            failure: None,
+        }
+    }
+}
+fn report_channel_cleanup(
+    seam: &UnixStream,
+    id: ChannelId,
+    kind: CleanupKind,
+    failure: Option<CleanupFailure>,
+    summary: &mut CleanupSummary,
+) {
+    merge_cleanup_failure(&mut summary.failure, failure);
+    let event = match failure {
+        Some(failure) => MonitorEvent::CleanupFailed { id, kind, failure },
+        None => MonitorEvent::CleanupComplete { id, kind },
+    };
+    tell(seam, &event);
 }
 
 /// One login's PAM transaction: opened at its first channel, closed when
@@ -341,6 +376,8 @@ struct Session {
     env: Vec<CString>,
     /// Exact kernel snapshot after the complete PAM opening sequence.
     groups: Vec<Gid>,
+    #[cfg(target_os = "linux")]
+    selinux: Snapshot,
 }
 
 #[derive(Debug)]
@@ -431,12 +468,28 @@ impl Session {
             session_open: false,
             env: Vec::new(),
             groups: Vec::new(),
+            #[cfg(target_os = "linux")]
+            selinux: Snapshot::Disabled,
         };
         match session.open() {
             Ok(()) => match (plan.session_group_ops.capture)() {
                 Ok(groups) => {
                     session.groups = groups;
                     session.env = session.pam.env_list();
+                    #[cfg(target_os = "linux")]
+                    {
+                        session.selinux = match selinux_tty::capture(&selinux_tty::NATIVE) {
+                            Ok(snapshot) => snapshot,
+                            Err(failure) => {
+                                let why = sanitized_detail(&format!(
+                                    "capture SELinux {:?}: {}",
+                                    failure.operation, failure.error
+                                ));
+                                let cleanup = close(session);
+                                return Err(SessionFailure { why, cleanup });
+                            }
+                        };
+                    }
                     Ok(session)
                 }
                 Err(e) => {
@@ -1124,13 +1177,13 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     }
     let mut shells = Vec::new();
     let mut session = None;
-    let mut cleanup = PamCompletion::NotOpened;
+    let mut cleanup = CleanupSummary::default();
     serve(&plan, &seam, &mut shells, &mut session, &mut cleanup);
     // The shells first, then the session: a session closed under a live
     // shell would be closed while the thing it was opened for is still
     // running, and the modules that count logins (`pam_systemd`,
     // `pam_limits`) would tear down what that shell is still using.
-    end_the_shells(&seam, &mut shells);
+    end_the_shells(&seam, &mut shells, &mut cleanup);
     if let Some(session) = session {
         // The closing half gets a deadline too, and the asymmetry it
         // corrects was an accident rather than a decision: the guard had
@@ -1143,9 +1196,15 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
         // escalation needs a monitor that has a channel to fail to report,
         // and this one has none left.
         let _deadline = SessionDeadline::armed(plan.session_close_budget);
-        cleanup.merge(session.close());
+        cleanup.pam.merge(session.close());
     }
-    tell(&seam, &MonitorEvent::SessionClosed { result: cleanup });
+    tell(
+        &seam,
+        &MonitorEvent::SessionClosed {
+            result: cleanup.pam,
+            cleanup_failure: cleanup.failure,
+        },
+    );
     // SAFETY: `_exit` ends the process immediately, running no atexit
     // handlers and no Rust `Drop` impls -- which is what has to happen
     // here, in a process that shares its parent's image.
@@ -1160,7 +1219,7 @@ fn serve(
     seam: &UnixStream,
     shells: &mut Vec<Shell>,
     session: &mut Option<Session>,
-    cleanup: &mut PamCompletion,
+    cleanup: &mut CleanupSummary,
 ) {
     // Channels a `MonitorRequest::Close` has sent `SIGHUP`, keyed to the
     // deadline by which the escalation to `SIGKILL` follows -- the helper's
@@ -1219,7 +1278,7 @@ fn serve(
         #[cfg(target_os = "linux")]
         {
             let _ = ready;
-            report_owned_shells(seam, shells);
+            report_owned_shells(seam, shells, cleanup);
         }
         #[cfg(not(target_os = "linux"))]
         report_startups(seam, shells, &ready);
@@ -1241,7 +1300,7 @@ fn serve_request(
     seam: &UnixStream,
     shells: &mut Vec<Shell>,
     session: &mut Option<Session>,
-    cleanup: &mut PamCompletion,
+    cleanup: &mut CleanupSummary,
     closing: &mut HashMap<ChannelId, Instant>,
 ) -> bool {
     let (bytes, slave) = match channel::recv(seam) {
@@ -1290,7 +1349,7 @@ fn serve_request(
                         why,
                         cleanup: failed_cleanup,
                     }) => {
-                        cleanup.merge(failed_cleanup);
+                        cleanup.pam.merge(failed_cleanup);
                         // Session::begin attempted every acquired cleanup step;
                         // its result remains independent from the refusal.
                         // This login gets no shell, now or later.
@@ -1305,13 +1364,7 @@ fn serve_request(
                         // because this process may not write to it.
                         drop(slave); // no startup descriptor may outlive the proof
                         tell(seam, &MonitorEvent::Refused { id, why });
-                        tell(
-                            seam,
-                            &MonitorEvent::CleanupComplete {
-                                id,
-                                kind: super::protocol::CleanupKind::NoChild,
-                            },
-                        );
+                        report_channel_cleanup(seam, id, CleanupKind::NoChild, None, cleanup);
                         return false;
                     }
                 }
@@ -1324,6 +1377,34 @@ fn serve_request(
                 // ends the monitor instead of carrying on with a
                 // plausible-looking default.
                 return false;
+            };
+            #[cfg(target_os = "linux")]
+            let (slave, tty) = match prepare_terminal(&open.selinux, slave) {
+                Ok(prepared) => prepared,
+                Err(failure) => {
+                    tell(
+                        seam,
+                        &MonitorEvent::Noted {
+                            id,
+                            what: sanitized_detail(&failure.why),
+                        },
+                    );
+                    tell(
+                        seam,
+                        &MonitorEvent::Failed {
+                            id,
+                            errno: terminal_errno(&failure.error),
+                        },
+                    );
+                    report_channel_cleanup(
+                        seam,
+                        id,
+                        CleanupKind::NoChild,
+                        failure.cleanup,
+                        cleanup,
+                    );
+                    return true;
+                }
             };
             match fork_shell(
                 plan,
@@ -1340,6 +1421,8 @@ fn serve_request(
                     pid: forked.pid,
                     #[cfg(target_os = "linux")]
                     native: Some(forked.native),
+                    #[cfg(target_os = "linux")]
+                    tty,
                     #[cfg(any(test, not(target_os = "linux")))]
                     report: forked.report,
                     #[cfg(any(test, not(target_os = "linux")))]
@@ -1354,13 +1437,10 @@ fn serve_request(
                             errno: errno as i32,
                         },
                     );
-                    tell(
-                        seam,
-                        &MonitorEvent::CleanupComplete {
-                            id,
-                            kind: super::protocol::CleanupKind::NoChild,
-                        },
-                    );
+                    #[cfg(target_os = "linux")]
+                    report_terminal_cleanup(seam, id, CleanupKind::NoChild, tty, cleanup);
+                    #[cfg(not(target_os = "linux"))]
+                    report_channel_cleanup(seam, id, CleanupKind::NoChild, None, cleanup);
                 }
             }
         }
@@ -1567,7 +1647,7 @@ fn signal_shell(seam: &UnixStream, shell: &Shell, signal: Signal) {
 /// half of the same promise, for the case where this process is killed
 /// outright and never reaches here.
 #[cfg(not(target_os = "linux"))]
-fn end_the_shells(_seam: &UnixStream, shells: &mut Vec<Shell>) {
+fn end_the_shells(_seam: &UnixStream, shells: &mut Vec<Shell>, _cleanup: &mut CleanupSummary) {
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 
     // Nothing is reported from here: the seam is what this function runs
@@ -1597,7 +1677,7 @@ fn end_the_shells(_seam: &UnixStream, shells: &mut Vec<Shell>) {
 
 /// Advance Linux startup, leader status and complete cleanup in that order.
 #[cfg(target_os = "linux")]
-fn report_owned_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
+fn report_owned_shells(seam: &UnixStream, shells: &mut Vec<Shell>, cleanup: &mut CleanupSummary) {
     use super::startup::{Failure, Outcome};
     use crate::process_scope::scope::Progress;
     let mut index = 0;
@@ -1650,13 +1730,15 @@ fn report_owned_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
             );
         }
         if matches!(update.progress, Progress::Complete(_)) {
-            let shell = shells.remove(index);
-            tell(
+            let mut shell = shells.remove(index);
+            // Taking the guard is explicit: lexical Shell Drop would run only
+            // after publication and could retain the slave beyond its receipt.
+            report_terminal_cleanup(
                 seam,
-                &MonitorEvent::CleanupComplete {
-                    id: shell.id,
-                    kind: super::protocol::CleanupKind::Reaped,
-                },
+                shell.id,
+                CleanupKind::Reaped,
+                shell.tty.take(),
+                cleanup,
             );
         } else {
             index += 1;
@@ -1665,7 +1747,7 @@ fn report_owned_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
 }
 
 #[cfg(target_os = "linux")]
-fn end_the_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
+fn end_the_shells(seam: &UnixStream, shells: &mut Vec<Shell>, cleanup: &mut CleanupSummary) {
     let now = Instant::now();
     for shell in shells.iter_mut() {
         if let Some(native) = shell.native.as_mut() {
@@ -1675,7 +1757,7 @@ fn end_the_shells(seam: &UnixStream, shells: &mut Vec<Shell>) {
     // Grace controls escalation only. Unknown remains owned; PAM close must
     // never run while a shell scope or its private startup stream is retained.
     while !shells.is_empty() {
-        report_owned_shells(seam, shells);
+        report_owned_shells(seam, shells, cleanup);
         if !shells.is_empty() {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2452,6 +2534,8 @@ mod tests {
         let init = Shell {
             #[cfg(target_os = "linux")]
             native: None,
+            #[cfg(target_os = "linux")]
+            tty: None,
             id: 4,
             pid: Pid::from_raw(1),
             report: None,
@@ -2502,6 +2586,8 @@ mod tests {
         let shell = Shell {
             #[cfg(target_os = "linux")]
             native: None,
+            #[cfg(target_os = "linux")]
+            tty: None,
             id: 5,
             pid: gone,
             report: None,
@@ -2701,6 +2787,8 @@ mod tests {
         let mut shells = vec![Shell {
             #[cfg(target_os = "linux")]
             native: None,
+            #[cfg(target_os = "linux")]
+            tty: None,
             id: 101,
             pid,
             report: Some(report_read),
@@ -2762,6 +2850,8 @@ mod tests {
         let mut shells = vec![Shell {
             #[cfg(target_os = "linux")]
             native: None,
+            #[cfg(target_os = "linux")]
+            tty: None,
             id: 102,
             pid,
             report: None,
@@ -2813,13 +2903,15 @@ mod tests {
                 read,
                 Instant::now() + STARTUP_REPORT_TIMEOUT,
             )),
+            #[cfg(target_os = "linux")]
+            tty: None,
             id: 3901,
             pid,
             report: None,
             started: false,
         }];
         let _ = raw;
-        report_owned_shells(&monitor, &mut shells);
+        report_owned_shells(&monitor, &mut shells, &mut CleanupSummary::default());
         let event = channel::recv(&helper).unwrap().unwrap();
         assert!(event.1.is_none());
         let event: MonitorEvent = decode(&event.0).unwrap();
@@ -2845,3 +2937,138 @@ mod tests {
 #[cfg(target_os = "linux")]
 #[path = "monitor_native.rs"]
 mod native;
+
+#[cfg(test)]
+mod cleanup_receipt_tests {
+    use super::*;
+    #[test]
+    fn selinux57_monitor_failure_receipt_and_final_summary_remain_independent_of_pam() {
+        let (monitor, helper) = channel::pair().unwrap();
+        helper
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut summary = CleanupSummary::default();
+        let failure = CleanupFailure::PtyLabelRestore { errno: 13 };
+        report_channel_cleanup(
+            &monitor,
+            57,
+            CleanupKind::Reaped,
+            Some(failure),
+            &mut summary,
+        );
+        let (bytes, fd) = channel::recv(&helper).unwrap().unwrap();
+        assert!(fd.is_none());
+        assert_eq!(
+            decode::<MonitorEvent>(&bytes).unwrap(),
+            MonitorEvent::CleanupFailed {
+                id: 57,
+                kind: CleanupKind::Reaped,
+                failure
+            }
+        );
+        report_channel_cleanup(&monitor, 58, CleanupKind::NoChild, None, &mut summary);
+        assert_eq!(summary.failure, Some(failure));
+        assert_eq!(summary.pam, PamCompletion::NotOpened);
+        let event = MonitorEvent::SessionClosed {
+            result: summary.pam,
+            cleanup_failure: summary.failure,
+        };
+        assert_eq!(
+            decode::<MonitorEvent>(&encode(&event).unwrap()).unwrap(),
+            event
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "monitor_selinux_tests.rs"]
+mod selinux_tests;
+
+#[cfg(target_os = "linux")]
+fn report_terminal_cleanup<A: super::selinux_tty::Adapter>(
+    seam: &UnixStream,
+    id: ChannelId,
+    kind: CleanupKind,
+    guard: Option<super::selinux_tty::Guard<'_, A>>,
+    summary: &mut CleanupSummary,
+) {
+    let failure = finish_terminal(guard);
+    report_channel_cleanup(seam, id, kind, failure, summary);
+}
+
+#[cfg(target_os = "linux")]
+fn terminal_errno(error: &std::io::Error) -> i32 {
+    error
+        .raw_os_error()
+        .filter(|errno| *errno > 0)
+        .unwrap_or(nix::libc::EIO)
+}
+#[cfg(target_os = "linux")]
+fn finish_terminal<A: Adapter>(guard: Option<Guard<'_, A>>) -> Option<CleanupFailure> {
+    match guard.map(Guard::finish) {
+        Some(selinux_tty::Finish::RestoreFailed(error)) => Some(CleanupFailure::PtyLabelRestore {
+            errno: terminal_errno(&error),
+        }),
+        _ => None,
+    }
+}
+#[cfg(target_os = "linux")]
+struct TerminalPreparationFailure {
+    why: String,
+    error: std::io::Error,
+    cleanup: Option<CleanupFailure>,
+}
+#[cfg(target_os = "linux")]
+fn prepare_terminal(
+    snapshot: &Snapshot,
+    slave: OwnedFd,
+) -> Result<(OwnedFd, Option<Guard<'static, Native>>), TerminalPreparationFailure> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    // SCM_RIGHTS receipt must have set CLOEXEC atomically. OwnedFd and the
+    // sender's flags alone establish neither property.
+    let flags = fcntl(slave.as_raw_fd(), FcntlArg::F_GETFD).map_err(|error| {
+        TerminalPreparationFailure {
+            why: format!("read channel terminal descriptor flags: {error}"),
+            error: error.into(),
+            cleanup: None,
+        }
+    })?;
+    if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
+        return Err(TerminalPreparationFailure {
+            why: "received channel terminal is not close-on-exec".into(),
+            error: std::io::Error::from_raw_os_error(nix::libc::EPROTO),
+            cleanup: None,
+        });
+    }
+    match Prepared::prepare(&selinux_tty::NATIVE, snapshot, slave) {
+        Ok(Prepared::Unchanged(slave)) => Ok((slave, None)),
+        Ok(Prepared::Relabeled(guard)) => match guard.as_fd().try_clone_to_owned() {
+            Ok(fork_input) => Ok((fork_input, Some(guard))),
+            Err(error) => {
+                let why = format!("duplicate channel terminal descriptor: {error}");
+                let cleanup = finish_terminal(Some(guard));
+                Err(TerminalPreparationFailure {
+                    why,
+                    error,
+                    cleanup,
+                })
+            }
+        },
+        Err(failure) => {
+            let cleanup = match failure.rollback {
+                selinux_tty::Rollback::Failed(ref error) => Some(CleanupFailure::PtyLabelRestore {
+                    errno: terminal_errno(error),
+                }),
+                _ => None,
+            };
+            Err(TerminalPreparationFailure {
+                why: format!(
+                    "prepare channel terminal {:?}: {}",
+                    failure.operation, failure.error
+                ),
+                error: failure.error,
+                cleanup,
+            })
+        }
+    }
+}

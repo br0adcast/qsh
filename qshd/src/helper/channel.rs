@@ -205,6 +205,24 @@ mod tests {
         assert_eq!(text, "carried");
     }
 
+    /// SCM_RIGHTS does not inherit sender FD flags. The receive operation
+    /// must set CLOEXEC atomically on the installed descriptor.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn received_descriptor_is_close_on_exec_even_when_sender_is_not() {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use std::os::fd::AsFd;
+
+        let (a, b) = pair().expect("socketpair");
+        let file = tempfile::tempfile().expect("tempfile");
+        fcntl(file.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).expect("clear sender CLOEXEC");
+        send(&a, b"descriptor", Some(file.as_fd())).expect("send");
+        let (_, received) = recv(&b).expect("recv").expect("open peer");
+        let received = received.expect("SCM_RIGHTS descriptor");
+        let flags = fcntl(received.as_raw_fd(), FcntlArg::F_GETFD).expect("get receiver flags");
+        assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
     /// Message boundaries are the kernel's, not ours: two sends are two
     /// receives, never one concatenated read.
     #[test]

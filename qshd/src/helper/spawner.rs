@@ -45,8 +45,8 @@ use crate::screen_budget::{BudgetLimits, ScreenBudget};
 use super::channel;
 use super::config::HelperConfig;
 use super::protocol::{
-    decode, encode, AuthRequest, AuthRequestId, AuthResponse, ChannelId, CleanupKind, Nonce,
-    Request, Response,
+    decode, encode, AuthRequest, AuthRequestId, AuthResponse, ChannelId, CleanupFailure,
+    CleanupKind, Nonce, Request, Response,
 };
 use super::worker_threads::{Role as ThreadRole, WorkerThreads};
 
@@ -417,6 +417,7 @@ enum OpenOutcome {
 
 struct CleanupReceipt {
     kind: Option<CleanupKind>,
+    failure: Option<CleanupFailure>,
     cleanup_requested: bool,
     notify: transport::channel_open::CleanupNotifier,
     reap_notify: Option<transport::channel_server::ReapNotifier>,
@@ -760,7 +761,11 @@ fn read_loop(
                     notifier.notify();
                 }
             }
-            Response::CleanupComplete { id, kind } => {
+            Response::CleanupComplete { id, kind } | Response::CleanupFailed { id, kind, .. } => {
+                let failure = match response {
+                    Response::CleanupFailed { failure, .. } => Some(failure),
+                    _ => None,
+                };
                 // This connection owns this map. A new helper connection can
                 // never satisfy an old ticket, even if its numeric IDs match.
                 if fd.is_some() {
@@ -775,6 +780,13 @@ fn read_loop(
                         continue;
                     }
                     receipt.kind = Some(kind);
+                    receipt.failure = failure;
+                    if let Some(failure) = failure {
+                        crate::log::warn(
+                            "worker",
+                            &format!("channel {id} physical cleanup completed with {failure:?}"),
+                        );
+                    }
                     (
                         receipt.cleanup_requested.then(|| receipt.notify.clone()),
                         receipt.reap_notify.clone(),
@@ -997,6 +1009,7 @@ impl HelperChannelSpawner {
         })?;
         let receipt = Arc::new(Mutex::new(CleanupReceipt {
             kind: None,
+            failure: None,
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
             reap_notify: None,
@@ -2536,6 +2549,7 @@ impl LoginSink for HelperAuth {
 #[cfg(test)]
 pub(crate) mod tests {
     include!("spawner_auxiliary_tests.rs");
+    include!("spawner_cleanup_failure_tests.rs");
     include!("spawner_login_retry_tests.rs");
     use super::*;
     use std::io::{Read, Write};
@@ -6973,6 +6987,7 @@ pub(crate) mod tests {
         let custody = transport::channel_open::OpenCustody::new();
         let receipt = Arc::new(Mutex::new(CleanupReceipt {
             kind: None,
+            failure: None,
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
             reap_notify: None,
@@ -7052,6 +7067,7 @@ pub(crate) mod tests {
         let custody = transport::channel_open::OpenCustody::new();
         let receipt = Arc::new(Mutex::new(CleanupReceipt {
             kind: None,
+            failure: None,
             cleanup_requested: false,
             notify: custody.cleanup_notifier(),
             reap_notify: None,

@@ -680,14 +680,12 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/nextest"
           echo "$RUNNER_TEMP/nextest" >> "$GITHUB_PATH"
 
-      # `libpam0g-dev` is here for `qshd/system`: that build links Linux-PAM
-      # (`#[link(name = "pam")]` in `helper::pam`, no crate), so without
-      # `libpam.so` the feature build below would fail to link, not just to
-      # compile.
+      # `qshd/system` links Linux-PAM and libselinux directly, so both
+      # development linkers are needed for the feature build below.
       # `binutils` is for `strip`: qshd/tests/transport_ensure_update.rs
       # strips its copy of the debug qshd below MAX_UPDATE_SIZE.
       - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev binutils patch zsh
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libselinux1-dev binutils patch zsh
 
       - name: Build and release script controls
         run: |
@@ -700,6 +698,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
           python3 -m unittest discover -s scripts/tests -p 'test_bootstrap_tools.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_linkage.py'
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
           # Harness accounting only; benchmark runs and thresholds stay out of CI.
           python3 -m unittest discover -s scripts/tests -p 'test_perf_baseline.py'
@@ -800,8 +799,9 @@ jobs:
       # v2.9.2, pinned by commit so a mutable tag can't change what CI runs.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      # To LINK the `system` build (see the `check` job). The containers
-      # need libpam too, and already have it: `libpam0g` and the modules
+      # To LINK the `system` build (see the `check` job), install both PAM
+      # and libselinux development linkers. The containers already have
+      # `libpam0g` and the modules
       # this tier's tests name (`pam_permit`, `pam_deny`, `pam_unix`,
       # `pam_exec`) are in the `ubuntu:24.04` base image, as are `useradd`,
       # `userdel` and `chage`. Verified by running these suites in exactly
@@ -809,8 +809,8 @@ jobs:
       # `jq` reads the build's JSON below. GitHub's Ubuntu images ship it,
       # but a one-line insurance against an image that stops doing so is
       # cheaper than a job that fails for want of a JSON parser.
-      - name: Install libpam
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev jq
+      - name: Install system-mode link libraries
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libselinux1-dev jq
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg

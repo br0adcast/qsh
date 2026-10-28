@@ -37,7 +37,11 @@ fn pam40_final_receipt_and_actual_wait_are_independent_obligations() {
     };
     channel::send(
         &peer,
-        &encode(&MonitorEvent::SessionClosed { result }).unwrap(),
+        &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
+            result,
+        })
+        .unwrap(),
         None,
     )
     .unwrap();
@@ -68,6 +72,7 @@ fn pam40_queued_final_receipt_survives_reap_before_socket_read() {
     channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),
@@ -151,6 +156,7 @@ fn pam40_monitor_wait_loss_retires_authentication_and_cannot_be_repaired_by_rece
     channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),
@@ -172,6 +178,7 @@ fn pam40_monitor_duplicate_final_receipt_cannot_release_failed_owner() {
     let (mut state, owner, peer) = pam40_controlled_retiring_monitor(false);
     let seams = DirectSeam::new();
     let bytes = encode(&MonitorEvent::SessionClosed {
+        cleanup_failure: None,
         result: PamCompletion::NotOpened,
     })
     .unwrap();
@@ -257,6 +264,7 @@ fn pam40_ordering_eof_after_final_receipt_keeps_pending_wait_valid() {
     channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),

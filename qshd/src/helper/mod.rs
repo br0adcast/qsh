@@ -43,6 +43,8 @@ mod pending;
 pub mod protocol;
 #[cfg(target_os = "linux")]
 mod scope_ops;
+#[cfg(target_os = "linux")]
+mod selinux_tty;
 pub mod server;
 #[cfg(target_os = "linux")]
 mod shell_owner;

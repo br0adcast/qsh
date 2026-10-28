@@ -123,6 +123,7 @@ fn monitor40_private_producer_body() {
     channel::send(
         &seam,
         &encode(&MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
         .unwrap(),
@@ -193,6 +194,7 @@ fn monitor40_queued_stage_and_pam_receipt_precede_final_wait_after_yield() {
     assert_eq!(
         receipt.event,
         Some(MonitorEvent::SessionClosed {
+            cleanup_failure: None,
             result: PamCompletion::NotOpened
         })
     );

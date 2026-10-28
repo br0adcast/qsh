@@ -35,8 +35,9 @@ verification remain prerequisites.
 ## Rocky cross sysroot
 
 `install-sysroot.py` resolves the complete aarch64 dependency set for
-`glibc-devel`, `libgcc`, `pam-devel`, and `glibc-headers`, using only the existing
-Rocky 8 BaseOS, AppStream, and Extras repositories. It copies the release
+`glibc-devel`, `libgcc`, `pam-devel`, `libselinux-devel`, and
+`glibc-headers`, using only the existing Rocky 8 BaseOS, AppStream, and Extras
+repositories. It copies the release
 certificate from the digest-pinned base and checks its full primary fingerprint
 before repository work. Only the Rocky 8 release certificate is imported into
 its private verification database:
