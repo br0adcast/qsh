@@ -45,8 +45,9 @@ pub(crate) fn judge(offered: &[u8], known: &[Vec<u8>]) -> Verdict {
 }
 
 /// Host-key algorithms to offer: those of the known keys first (in list
-/// order), then the remaining defaults. An RSA key is asked for with SHA-2
-/// only; an unrecognised known key, or one of a type russh does not offer
+/// order), then the remaining defaults. For a known RSA key, SHA-2 host
+/// signatures come first; the default `ssh-rsa` (SHA-1) signature remains
+/// last. An unrecognised known key, or one of a type russh does not offer
 /// by default (`ssh-dss`, security keys), is skipped.
 pub(crate) fn host_key_preference(known: &[Vec<u8>]) -> Vec<russh::keys::Algorithm> {
     use russh::keys::{Algorithm, HashAlg, PublicKey};

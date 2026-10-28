@@ -47,8 +47,11 @@ remain supported; these read checks do not add owner or permission restrictions.
 For a QSH key file, a passphrase unlocks the key selected before the prompt.
 Replacing or editing its path during that attempt does not select another key;
 a later selection attempt can read the changed file normally.
-Supported key types include Ed25519, ECDSA P-256/P-384, and RSA with SHA-2. Legacy
-RSA/SHA-1 (`ssh-rsa`) authentication is refused. A personal daemon checks
+Direct QSH login supports Ed25519, ECDSA P-256/P-384, and RSA with SHA-2
+signatures. It refuses RSA/SHA-1 signatures (`ssh-rsa` as a signature
+algorithm), but accepts RSA public keys whose type is `ssh-rsa` when the
+signature uses SHA-2. SSH login has separate signature negotiation and
+retains legacy RSA/SHA-1 fallback. A personal daemon checks
 `~/.ssh/authorized_keys`; system mode checks the claimed account through a
 privileged helper and PAM.
 
