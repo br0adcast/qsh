@@ -940,3 +940,33 @@ for those versions needs that one edit.
   log out from under the other — short entries aren't split in half
   (rotation is atomic), but a handful of lines around the rotation moment
   can get lost.
+
+### Root-only helper status (Linux system service)
+
+The packaged system service publishes `/run/qshd/helper-status.sock` in its
+root-owned `0700` runtime directory. Query it locally as root:
+
+```sh
+qshd helper-status --socket /run/qshd/helper-status.sock
+```
+
+Standalone system services opt in with `serve --system --status-socket PATH`.
+The absolute socket path must have an existing root-owned `0700` parent. Each
+service needs a distinct path; a retained lifetime lock prevents another service
+from replacing its endpoint. Personal daemons do not publish this endpoint.
+
+The command returns one schema-versioned JSON snapshot of registered helper
+capacity: serving/stopping phase, available/unavailable counts, admitted and
+provisional logins, pending retirement, unconfirmed obligations, overlapping
+reason counts, outstanding waits/receipts/slots, and PAM outcome categories.
+Healthy admitted logins are not cleanup debt. Pending retirement is distinct
+from explicitly lost evidence. Queries neither advance nor refund ownership.
+The snapshot remains queryable while the helper retains stopping custody.
+
+These are point-in-time registered-domain diagnostics, not an admission
+reservation or proof that every operating-system descendant or PAM side effect
+has finished. No global `cleanup_complete` flag is provided. Connection errors,
+timeouts, partial responses and unsupported schemas mean status unavailable,
+never zero capacity or successful cleanup. A helper blocked inside a syscall
+cannot answer. Diagnostic-client errors do not stop sessions or extend cleanup;
+a hard listener failure disables only diagnostics and emits a warning.

@@ -687,6 +687,7 @@ pub(crate) mod tests {
     /// what gives [`HelperAuth`] its production budgets.
     pub(crate) fn helper_config() -> HelperConfig {
         HelperConfig::resolve(&crate::serve::ServeArgs {
+            status_socket: None,
             port: crate::serve::DEFAULT_SERVE_PORT,
             authorized_keys: None, // unread in the system mode -- see its own doc comment
             host_key: "/unused".into(),

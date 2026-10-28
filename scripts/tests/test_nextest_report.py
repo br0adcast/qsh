@@ -63,6 +63,36 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.module.exclusion_filter({key: expected[key]}),
                          "not ((binary_id(=qsh::ssh_known_hosts_authority_privilege) & test(=ssh_known_hosts_real_owner_read_and_append_boundaries)))")
 
+    def test_helper_status_fixture_has_one_exact_disposable_owner(self):
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        binary = "qshd::serve_system_split"
+        name = "helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it"
+        key = (binary, name)
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite test serve_system_split")
+        self.assertEqual([item for item in expected if item[1] == name], [key])
+        self.assertEqual(self.module.exclusion_filter({key: expected[key]}),
+                         f"not ((binary_id(={binary}) & test(={name})))")
+        root = ET.Element("testsuites", tests="2", failures="0", errors="0")
+        suite = ET.SubElement(root, "testsuite", name=binary, tests="2", failures="0", errors="0")
+        case = ET.SubElement(suite, "testcase", classname=binary, name=name)
+        skip = ET.SubElement(case, "skipped", message=self.module.FILTER_REASON)
+        ordinary = ET.SubElement(suite, "testcase", classname=binary, name="ordinary")
+        ET.SubElement(ordinary, "system-out").text = ""
+        ET.SubElement(ordinary, "system-err").text = ""
+        ET.ElementTree(root).write(self.report)
+        selected = {key: expected[key]}
+        self.assertEqual(self.module.check_report(self.report, selected), (1, [key], []))
+        skip.set("message", self.module.IGNORE_REASON)
+        ET.ElementTree(root).write(self.report)
+        with self.assertRaises(ValueError):
+            self.module.check_report(self.report, selected)
+        case.remove(skip)
+        ET.SubElement(case, "system-out").text = "SKIPPED " + name + ": needs disposable root"
+        ET.SubElement(case, "system-err").text = ""
+        ET.ElementTree(root).write(self.report)
+        with self.assertRaisesRegex(ValueError, "unexpected runtime SKIPPED"):
+            self.module.check_report(self.report, selected)
+
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),
                              ("tests::safe", "stdout", "<&> ordinary output"),

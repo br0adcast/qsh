@@ -112,10 +112,12 @@ fn help_text() -> String {
             .to_string(),
         "  serve             [--port <P>] [--authorized-keys <path>] [--host-key <path>]"
             .to_string(),
-        "                    [--runtime-threads <N>]".to_string(),
+        "                    [--runtime-threads <N>] [--status-socket <PATH> (Linux system mode)]"
+            .to_string(),
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),
+        "  helper-status     --socket <PATH>  Root-only local system-helper snapshot.".to_string(),
         "  self-check        Print this binary's build, architecture, protocol and handover \
          versions and transport features as JSON."
             .to_string(),
@@ -150,6 +152,7 @@ fn main() -> Result<()> {
         Some("transport-shell") => run_transport_shell_command(&args),
         Some("transport-ensure") => run_transport_ensure(&args),
         Some("serve") => serve::run_serve_command_os(&args),
+        Some("helper-status") => qshd::helper_status::run_command(&args),
         Some("self-check") => {
             print!("{}", state::SelfCheck::current().to_line());
             Ok(())

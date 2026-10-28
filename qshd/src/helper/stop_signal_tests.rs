@@ -340,6 +340,8 @@ mod owned_signal {
             UNPRIVILEGED,
             None,
             Some(OwnedParent {
+                status_socket: None,
+                status_gate: None,
                 worker,
                 adoption: Some(adoption),
                 stop: Some(stop),
