@@ -15095,6 +15095,170 @@ pub(crate) mod tests {
         Some(module)
     }
 
+    // One request may be preceded by its exact unsolicited login retirement.
+    fn group_refusal_response(
+        channels: &UnixStream,
+        login: LoginId,
+        incarnation: u64,
+        deadline: Instant,
+    ) -> Result<Response, String> {
+        let mut notice_seen = false;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or("group refusal receive budget expired")?;
+            channels
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| e.to_string())?;
+            let packet = match channel::recv_once(channels) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.map_err(|e| e.to_string())?,
+            };
+            if Instant::now() >= deadline {
+                return Err("group refusal receive budget expired".into());
+            }
+            let (bytes, fd) = packet.ok_or("helper closed before group refusal")?;
+            if fd.is_some() {
+                return Err("unexpected group refusal descriptor".into());
+            }
+            let answer = decode::<Response>(&bytes).map_err(|e| e.to_string())?;
+            match answer {
+                Response::Failed { id: 1, .. } => return Ok(answer),
+                Response::LoginEnded {
+                    login: ended,
+                    incarnation: generation,
+                } if !notice_seen && ended == login && generation == incarnation => {
+                    notice_seen = true;
+                }
+                _ => return Err(format!("unexpected group refusal response: {answer:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_accepts_both_valid_orders() {
+        for notice in [false, true] {
+            let (reader, writer) = channel::pair().unwrap();
+            if notice {
+                channel::send(
+                    &writer,
+                    &encode(&Response::LoginEnded {
+                        login: PROOF_LOGIN,
+                        incarnation: 1,
+                    })
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+            }
+            channel::send(
+                &writer,
+                &encode(&Response::Failed {
+                    id: 1,
+                    reason: REFUSED_REASON.into(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+            let answer =
+                group_refusal_response(&reader, PROOF_LOGIN, 1, Instant::now() + TEST_RECV_TIMEOUT);
+            assert!(
+                matches!(answer, Ok(Response::Failed { id: 1, reason })
+                if reason == REFUSED_REASON),
+                "valid notice order must preserve refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_rejects_unrelated_duplicate_and_descriptors() {
+        let ended = |login, incarnation| Response::LoginEnded { login, incarnation };
+        let failed = |id| Response::Failed {
+            id,
+            reason: REFUSED_REASON.into(),
+        };
+        let cases = vec![
+            vec![ended([0; 16], 1)],
+            vec![ended(PROOF_LOGIN, 2)],
+            vec![ended(PROOF_LOGIN, 1), ended(PROOF_LOGIN, 1)],
+            vec![failed(2)],
+            vec![Response::Opened { id: 1 }],
+            vec![Response::Exited { id: 1, code: 0 }],
+        ];
+        for messages in cases {
+            let (reader, writer) = channel::pair().unwrap();
+            for message in messages {
+                channel::send(&writer, &encode(&message).unwrap(), None).unwrap();
+            }
+            assert!(group_refusal_response(
+                &reader,
+                PROOF_LOGIN,
+                1,
+                Instant::now() + TEST_RECV_TIMEOUT
+            )
+            .is_err());
+        }
+        let descriptor = std::fs::File::open("/dev/null").unwrap();
+        for message in [ended(PROOF_LOGIN, 1), failed(1)] {
+            let (reader, writer) = channel::pair().unwrap();
+            channel::send(
+                &writer,
+                &encode(&message).unwrap(),
+                Some(descriptor.as_fd()),
+            )
+            .unwrap();
+            assert!(group_refusal_response(
+                &reader,
+                PROOF_LOGIN,
+                1,
+                Instant::now() + TEST_RECV_TIMEOUT
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_rejects_malformed_closed_and_expired() {
+        let (reader, writer) = channel::pair().unwrap();
+        channel::send(&writer, b"invalid response", None).unwrap();
+        assert!(group_refusal_response(
+            &reader,
+            PROOF_LOGIN,
+            1,
+            Instant::now() + TEST_RECV_TIMEOUT
+        )
+        .is_err());
+        let (reader, writer) = channel::pair().unwrap();
+        drop(writer);
+        assert!(group_refusal_response(
+            &reader,
+            PROOF_LOGIN,
+            1,
+            Instant::now() + TEST_RECV_TIMEOUT
+        )
+        .is_err());
+        let (reader, writer) = channel::pair().unwrap();
+        channel::send(
+            &writer,
+            &encode(&Response::Failed {
+                id: 1,
+                reason: REFUSED_REASON.into(),
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let result = group_refusal_response(&reader, PROOF_LOGIN, 1, Instant::now());
+        assert!(result.unwrap_err().contains("budget expired"));
+        // Expiry must not consume an already queued outcome.
+        assert!(matches!(
+            next_response(&reader),
+            (Response::Failed { id: 1, .. }, None)
+        ));
+    }
+
     /// Only monitors and their children mutate identity, never this libtest process.
     fn refused_group_session(
         module: &str,
@@ -15123,25 +15287,29 @@ pub(crate) mod tests {
         };
         let account = nobody_with_shell("/bin/sh");
         let h = helper_for(account.clone(), config, switches);
-        channel::send(
-            &h.channels,
-            &encode(&open_for(
-                1,
-                &account,
-                &format!("touch {}", marker.display()),
-            ))
-            .unwrap(),
-            None,
-        )
-        .unwrap();
-        let (answer, fd) = next_response(&h.channels);
+        // helper_for seeds exactly one login, assigned incarnation 1 by serve.
+        // Capture every send/receive/decode failure before ending the owned loop.
+        let outcome = (|| -> Result<Response, String> {
+            channel::send(
+                &h.channels,
+                &encode(&open_for(
+                    1,
+                    &account,
+                    &format!("touch {}", marker.display()),
+                ))
+                .map_err(|e| e.to_string())?,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            group_refusal_response(&h.channels, h.login, 1, Instant::now() + TEST_RECV_TIMEOUT)
+        })();
+        h.stop();
+        let answer = outcome.expect("group fixture receives its exact refusal");
         assert!(
             matches!(&answer, Response::Failed { id: 1, reason }
             if if child_failure { reason.contains("EPERM") } else { reason == REFUSED_REASON }),
             "{answer:?}"
         );
-        assert!(fd.is_none());
-        h.stop();
         assert!(
             !marker.exists(),
             "refused session must never execute a shell"
