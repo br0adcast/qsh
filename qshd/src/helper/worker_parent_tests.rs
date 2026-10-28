@@ -446,9 +446,40 @@ mod worker_parent {
         elapsed_ms: u64,
         observations: u8,
         native_exit: i32,
+        body_ns: Option<u64>,
+        pump_ns: Option<u64>,
+        clock_error: i32,
     }
     impl PhysicalDiagnostic {
         fn checkpoint(&mut self, phase: &str, assertion: &str, started: Instant) {
+            self.set_phase(phase, assertion);
+            self.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            if phase == "pump" && self.pump_ns.is_none() {
+                self.capture_clock(false);
+            }
+            let record = self.encode();
+            assert!(record.len() <= PHYSICAL_CHECKPOINT_LIMIT);
+            let path = PathBuf::from(std::env::var_os(PHYSICAL_PHASE).unwrap());
+            let next = path.with_extension("next");
+            // A killed write must leave the preceding complete checkpoint intact.
+            // Both files are overwritten, never appended or allowed to grow.
+            std::fs::write(&next, record).unwrap();
+            std::fs::rename(next, path).unwrap();
+        }
+        fn encode(&self) -> String {
+            format!(
+                "{} {} {} {} {} {} {} {}",
+                self.phase,
+                self.assertion,
+                self.elapsed_ms,
+                self.observations,
+                self.native_exit,
+                stamp(self.body_ns),
+                stamp(self.pump_ns),
+                self.clock_error
+            )
+        }
+        fn set_phase(&mut self, phase: &str, assertion: &str) {
             self.phase = PHYSICAL_PHASES
                 .iter()
                 .position(|code| *code == phase)
@@ -457,18 +488,14 @@ mod worker_parent {
                 .iter()
                 .position(|code| *code == assertion)
                 .unwrap();
-            self.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let record = format!(
-                "{} {} {} {} {}",
-                self.phase, self.assertion, self.elapsed_ms, self.observations, self.native_exit
-            );
-            assert!(record.len() <= PHYSICAL_CHECKPOINT_LIMIT);
-            let path = PathBuf::from(std::env::var_os(PHYSICAL_PHASE).unwrap());
-            let next = path.with_extension("next");
-            // A killed write must leave the preceding complete checkpoint intact.
-            // Both files are overwritten, never appended or allowed to grow.
-            std::fs::write(&next, record).unwrap();
-            std::fs::rename(next, path).unwrap();
+        }
+        fn capture_clock(&mut self, body: bool) {
+            match monotonic_ns() {
+                Ok(now) if body => self.body_ns = Some(now),
+                Ok(now) => self.pump_ns = Some(now),
+                Err(error) if self.clock_error == 0 => self.clock_error = error,
+                Err(_) => {}
+            }
         }
         fn decode(record: &str) -> Option<Self> {
             let mut fields = record.split_whitespace();
@@ -478,12 +505,16 @@ mod worker_parent {
                 elapsed_ms: fields.next()?.parse().ok()?,
                 observations: fields.next()?.parse().ok()?,
                 native_exit: fields.next()?.parse().ok()?,
+                body_ns: parse_stamp(fields.next()?)?,
+                pump_ns: parse_stamp(fields.next()?)?,
+                clock_error: fields.next()?.parse().ok()?,
             };
             (fields.next().is_none()
                 && diagnostic.phase < PHYSICAL_PHASES.len()
                 && diagnostic.assertion < PHYSICAL_ASSERTIONS.len()
-                && diagnostic.observations <= 31)
-                .then_some(diagnostic)
+                && diagnostic.observations <= 31
+                && (-2..=4095).contains(&diagnostic.clock_error))
+            .then_some(diagnostic)
         }
         fn read() -> Self {
             use std::io::Read;
@@ -512,18 +543,152 @@ mod worker_parent {
 
     #[test]
     fn worker40_parent_diagnostic_codes_and_storage_are_bounded() {
-        assert!(PhysicalDiagnostic::decode("99 0 0 0 0").is_none());
-        assert!(PhysicalDiagnostic::decode("0 99 0 0 0").is_none());
-        assert!(PhysicalDiagnostic::decode("0 0 0 32 0").is_none());
-        assert!(PhysicalDiagnostic::decode("0 0 0 0 0 private-payload").is_none());
+        assert!(PhysicalDiagnostic::decode("99 0 0 0 0 - - 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 99 0 0 0 - - 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 0 0 32 0 - - 0").is_none());
+        assert!(PhysicalDiagnostic::decode("0 0 0 0 0 - - 0 private-payload").is_none());
         let diagnostic = PhysicalDiagnostic {
-            phase: PHYSICAL_PHASES.len() - 1,
-            assertion: PHYSICAL_ASSERTIONS.len() - 1,
+            phase: PHYSICAL_PHASES
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, text)| text.len())
+                .unwrap()
+                .0,
+            assertion: PHYSICAL_ASSERTIONS
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, text)| text.len())
+                .unwrap()
+                .0,
             elapsed_ms: u64::MAX,
             observations: 31,
             native_exit: i32::MIN,
+            body_ns: Some(u64::MAX),
+            pump_ns: Some(u64::MAX),
+            clock_error: 4095,
         };
+        assert!(diagnostic.encode().len() <= PHYSICAL_CHECKPOINT_LIMIT);
+        assert!(PhysicalDiagnostic::decode(&diagnostic.encode()).is_some());
         assert!(diagnostic.report().len() + 100 <= PHYSICAL_REPORT_LIMIT);
+        let largest = format!(
+            "timed_out=false, body_success=false, adopted_reaped={}, no_children=true, {}, {}",
+            usize::MAX,
+            diagnostic.report(),
+            timing_report(Ok(0), Ok(u64::MAX), &diagnostic)
+        );
+        assert!(largest.len() <= PHYSICAL_REPORT_LIMIT);
+    }
+
+    // Absolute CLOCK_MONOTONIC stamps share one clock across the private reexecs.
+    // Unknown/error timing is diagnostic only; it never supplies exit evidence.
+    // Negative closed codes distinguish invalid clock fields (-1) and overflow (-2)
+    // from positive OS errno values; zero means no clock error was observed.
+    fn monotonic_ns_from_parts(seconds: i64, nanoseconds: i64) -> Result<u64, i32> {
+        if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+            return Err(-1);
+        }
+        (seconds as u64)
+            .checked_mul(1_000_000_000)
+            .and_then(|n| n.checked_add(nanoseconds as u64))
+            .ok_or(-2)
+    }
+    fn monotonic_ns() -> Result<u64, i32> {
+        let mut value = nix::libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: one initialized writable timespec, no pointers retained.
+        if unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
+        }
+        monotonic_ns_from_parts(value.tv_sec, value.tv_nsec)
+    }
+    fn stamp(value: Option<u64>) -> String {
+        value.map_or_else(|| "-".into(), |n| n.to_string())
+    }
+    fn parse_stamp(value: &str) -> Option<Option<u64>> {
+        if value == "-" {
+            Some(None)
+        } else {
+            value.parse().ok().map(Some)
+        }
+    }
+    fn elapsed_ms(start: Option<u64>, end: Option<u64>) -> Option<u64> {
+        Some(end?.checked_sub(start?)? / 1_000_000)
+    }
+    fn timing_report(
+        origin: Result<u64, i32>,
+        observed: Result<u64, i32>,
+        d: &PhysicalDiagnostic,
+    ) -> String {
+        let error = origin
+            .as_ref()
+            .err()
+            .or(observed.as_ref().err())
+            .copied()
+            .unwrap_or(d.clock_error);
+        let origin = origin.ok();
+        format!(
+            "outer_observed_ms={:?}, body_entry_ms={:?}, pump_entry_ms={:?}, timing_error={error}",
+            elapsed_ms(origin, observed.ok()),
+            elapsed_ms(origin, d.body_ns),
+            elapsed_ms(origin, d.pump_ns)
+        )
+    }
+
+    #[test]
+    fn worker337_monotonic_conversion_is_checked() {
+        assert_eq!(monotonic_ns_from_parts(2, 34), Ok(2_000_000_034));
+        assert!(monotonic_ns_from_parts(-1, 0).is_err());
+        assert!(monotonic_ns_from_parts(0, -1).is_err());
+        assert!(monotonic_ns_from_parts(0, 1_000_000_000).is_err());
+        assert!(monotonic_ns_from_parts(i64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn worker337_timing_records_reject_missing_malformed_and_overflow() {
+        assert_eq!(parse_stamp("-"), Some(None));
+        assert_eq!(parse_stamp("0"), Some(Some(0)));
+        for invalid in ["", "x", "-1", "18446744073709551616"] {
+            assert!(parse_stamp(invalid).is_none());
+        }
+        for invalid in [
+            "0 0 0 0 0",
+            "0 0 0 0 0 - -",
+            "0 0 0 0 0 - - 4096",
+            "0 0 0 0 0 - - -3",
+            "0 0 0 0 0 invalid - 0",
+            "0 0 0 0 0 - - 0 extra",
+        ] {
+            assert!(PhysicalDiagnostic::decode(invalid).is_none(), "{invalid}");
+        }
+        let unknown = PhysicalDiagnostic::decode("0 0 0 0 0 - - 0").unwrap();
+        assert_eq!(unknown.body_ns, None);
+        assert_eq!(unknown.pump_ns, None);
+        let error = PhysicalDiagnostic::decode("1 0 0 0 0 - - 5").unwrap();
+        assert!(timing_report(Ok(0), Ok(1), &error).contains("timing_error=5"));
+    }
+
+    #[test]
+    fn worker337_timing_uses_common_origin_and_keeps_pump_stamp() {
+        let mut diagnostic = PhysicalDiagnostic {
+            body_ns: Some(3_000_000),
+            pump_ns: Some(5_000_000),
+            ..Default::default()
+        };
+        // The actual checkpoint phase transition must not clear first-pump timing.
+        diagnostic.set_phase("outcome", "none");
+        assert_eq!(diagnostic.pump_ns, Some(5_000_000));
+        let report = timing_report(Ok(1_000_000), Ok(9_000_000), &diagnostic);
+        assert!(report.contains("outer_observed_ms=Some(8)"), "{report}");
+        assert!(report.contains("body_entry_ms=Some(2)"), "{report}");
+        assert!(report.contains("pump_entry_ms=Some(4)"), "{report}");
+        assert_eq!(elapsed_ms(Some(20), Some(10)), None);
+        assert_eq!(elapsed_ms(None, Some(10)), None);
+        let failed = timing_report(Err(5), Ok(9), &diagnostic);
+        assert!(failed.contains("outer_observed_ms=None"));
+        assert!(failed.contains("timing_error=5"));
+        assert!(timing_report(Ok(1), Err(22), &diagnostic).contains("timing_error=22"));
     }
 
     fn failed_physical_fixture(control: &str) -> String {
@@ -569,6 +734,9 @@ mod worker_parent {
         assert!(report.contains("adopted_reaped=1"), "{report}");
         assert!(report.contains("no_children=true"), "{report}");
         assert!(report.contains("phase=held-body"), "{report}");
+        assert!(report.contains("outer_observed_ms=Some("), "{report}");
+        assert!(report.contains("body_entry_ms=Some("), "{report}");
+        assert!(report.contains("pump_entry_ms=None"), "{report}");
     }
 
     #[test]
@@ -580,6 +748,9 @@ mod worker_parent {
         assert!(report.contains("assertion=deliberate"), "{report}");
         assert!(report.contains("physical_wait=true"), "{report}");
         assert!(report.contains("outcome_observed=true"), "{report}");
+        assert!(report.contains("outer_observed_ms=Some("), "{report}");
+        assert!(report.contains("body_entry_ms=Some("), "{report}");
+        assert!(report.contains("pump_entry_ms=Some("), "{report}");
     }
 
     #[test]
@@ -614,6 +785,9 @@ mod worker_parent {
                     0
                 );
                 diagnostic.checkpoint("body-exec", "none", started);
+                // Supervisor-relative origin includes spawn time. The watchdog
+                // below starts AFTER spawn: this is not its remaining budget.
+                let origin = monotonic_ns();
                 let mut body = ChildOwner(reexec("body").spawn().unwrap());
                 let deadline = Instant::now() + Duration::from_secs(2);
                 let status = loop {
@@ -627,6 +801,8 @@ mod worker_parent {
                         Err(error) => panic!("owned pump body observation: {error}"),
                     }
                 };
+                // Sample the observation boundary BEFORE any body/adopted waits.
+                let observed = monotonic_ns();
                 // This direct child is exclusively owned; killing it cannot target
                 // a reused PID. Drop performs the actual wait before orphan drain.
                 drop(body);
@@ -646,14 +822,19 @@ mod worker_parent {
                 }
                 // The body can create only /bin/true. Actual wait of that finite
                 // child is cleanup; elapsed time never supplies exit evidence.
-                let report = format!("timed_out={}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true, {}",
-                    status.is_none(), status.is_some_and(|s| s.success()), PhysicalDiagnostic::read().report());
-                assert!(report.len() <= PHYSICAL_REPORT_LIMIT, "bounded owned fixture report");
+                let checkpoint = PhysicalDiagnostic::read();
+                let report = format!("timed_out={}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true, {}, {}",
+                    status.is_none(), status.is_some_and(|s| s.success()), checkpoint.report(), timing_report(origin, observed, &checkpoint));
+                assert!(
+                    report.len() <= PHYSICAL_REPORT_LIMIT,
+                    "bounded owned fixture report"
+                );
                 std::fs::write(std::env::var_os(REPORT).unwrap(), &report).unwrap();
                 assert!(status.is_some_and(|s| s.success()), "{report}");
                 return;
             }
             Some("body") => {
+                diagnostic.capture_clock(true);
                 diagnostic.checkpoint("identity", "parent", started);
                 assert_eq!(
                     std::env::var(PARENT).unwrap().parse::<i32>().unwrap(),
@@ -678,7 +859,10 @@ mod worker_parent {
                     .take(PHYSICAL_REPORT_LIMIT as u64 + 1)
                     .read_to_string(&mut report)
                     .unwrap();
-                assert!(report.len() <= PHYSICAL_REPORT_LIMIT, "bounded owned fixture report");
+                assert!(
+                    report.len() <= PHYSICAL_REPORT_LIMIT,
+                    "bounded owned fixture report"
+                );
                 if let Some(path) = std::env::var_os("QSH_TEST_PARENT_PHYSICAL_CAPTURE") {
                     std::fs::write(path, &report).unwrap();
                 }
@@ -724,7 +908,8 @@ mod worker_parent {
             None,
             owner,
         );
-        diagnostic.observations = 1 | (u8::from(outcome.first_failure.is_some()) << 2)
+        diagnostic.observations = 1
+            | (u8::from(outcome.first_failure.is_some()) << 2)
             | (u8::from(outcome.terminal_received) << 3)
             | (u8::from(outcome.signal_failure.is_some()) << 4);
         diagnostic.native_exit = outcome.native_exit;
