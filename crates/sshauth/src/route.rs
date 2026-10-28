@@ -352,7 +352,9 @@ mod tests {
         binding.validate().unwrap();
 
         // Each observation is repeated: an absent name that appears, a
-        // retargeted alias, a replaced file and a loosened mode all refuse.
+        // retargeted alias and a loosened mode all refuse. The retargeted
+        // alias may or may not reuse its inode, so it does not isolate the
+        // target comparison; the test below does.
         let refuses = |change: &dyn Fn()| {
             change();
             let error = binding.validate().unwrap_err();
@@ -375,5 +377,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(binding.validate().unwrap_err().to_string(), "test refusal");
+    }
+
+    /// The recorded target is compared with the current one on its own.
+    /// Each entry records the symlink's current identity, type and owner,
+    /// so every other check passes and inode reuse cannot matter: only the
+    /// recorded target differs, and only the comparison can refuse it.
+    #[test]
+    fn a_recorded_alias_target_must_equal_the_current_target() {
+        let dir = private_dir();
+        let parent = open_dir(dir.path());
+        symlink("file", dir.path().join("alias")).unwrap();
+        let validate = |recorded: &[u8]| {
+            let mut route = Route::open(REFUSALS).unwrap();
+            route.push(
+                Entry::alias(
+                    &parent,
+                    "alias".into(),
+                    lstat(&parent, "alias"),
+                    recorded.to_vec(),
+                )
+                .unwrap(),
+            );
+            Binding::new(route, None).validate()
+        };
+        validate(b"file").unwrap();
+        // Byte-exact: same-length targets differing in one byte or in case,
+        // a different name, a prefix, an extension, a trailing separator and
+        // an empty target all differ from `file`.
+        for recorded in [
+            &b"filf"[..],
+            b"File",
+            b"other",
+            b"fil",
+            b"file2",
+            b"file/",
+            b"",
+        ] {
+            let error = validate(recorded).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "test refusal",
+                "{:?}",
+                String::from_utf8_lossy(recorded)
+            );
+        }
     }
 }
