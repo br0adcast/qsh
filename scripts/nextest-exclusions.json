@@ -55,6 +55,7 @@
       "binary": "qshd::serve_system_split",
       "tests": [
         "a_monitor_holds_no_seam_and_the_worker_still_sees_the_end",
+        "helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it",
         "the_helper_holds_no_network_descriptor_after_the_split",
         "the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open",
         "the_worker_ends_itself_when_only_its_authentication_seam_is_lost",
