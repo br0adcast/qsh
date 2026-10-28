@@ -170,6 +170,23 @@ No runtime measurement is part of ordinary CI.
 
 Each run settles for 2 seconds after connecting before its window starts.
 
+For `retained`, `--retained-output-lines N` requests N numbered lines in each
+session before detach; N must be nonnegative and defaults to zero, which skips
+the producer. A successful producer command must leave a completion marker
+visible in a full client repaint. This does not prove that every requested line
+was displayed or retained. Each session has up to 600 seconds to reach that
+setup marker, followed by the normal detach timeout. These waits precede the
+CPU measurement window; `--window` must be positive.
+
+Retained runs also record `qshd_rss_without_sessions_kib` before the first
+client and `qshd_rss_samples_kib` after detach and settling, including when
+N is zero. These are `/proc` `VmRSS` readings for the async runtime process:
+the personal daemon or system worker, not the helper or whole process tree.
+The samples follow a nominal one-second schedule; delayed reads can catch up,
+and the array has no individual timestamps. Missing readings remain null.
+Neither the sampled maximum nor `VmRSS` is an exact live-memory peak. Compare
+matching tool versions and settings, including the observer's work.
+
 ## Procedure
 
 Build the binaries to compare into separate directories. For the release
