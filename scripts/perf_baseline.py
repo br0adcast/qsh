@@ -40,7 +40,7 @@ import threading
 import time
 
 
-TOOL_VERSION = 8
+TOOL_VERSION = 9
 WORKLOADS = ("idle", "typing", "redraw", "saturation", "reconnect", "retained", "busy")
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 COLS, ROWS = 120, 40
@@ -1184,18 +1184,18 @@ def run_reconnect(rig, settings):
 def run_retained(rig, settings):
     """qshd holding `retained_sessions` sessions with no client attached.
 
-    With `retained_output_lines` above zero, each session first prints that
-    many lines and leaves only after they arrived, so qshd's model and
-    buffers have carried output. qshd's resident size is recorded before
-    the first session and sampled once a second through the window.
+    With `retained_output_lines` above zero, request that many lines per
+    session and observe the producer's success marker on the client display
+    before detaching. This does not prove every line was applied or retained.
+    Runtime-process RSS is recorded before the first session and sampled at
+    nominal one-second intervals through the window.
     """
     empty = sample_process(rig.runtime_pid())["rss_kib"]
     for index in range(settings.retained_sessions):
         client = rig.start_client(f"client-{index}")
         if settings.retained_output_lines:
-            offset = client.terminal.counters()[0]
-            client.terminal.write(f"seq 1 {settings.retained_output_lines}; echo PRINTED-$((6*7))\n".encode())
-            client.terminal.wait_for(b"PRINTED-42", 600, offset)
+            client.terminal.write(f"seq 1 {settings.retained_output_lines} && echo PRINTED-$((6*7))\n".encode())
+            repaint_marker(client, b"PRINTED-42", timeout=600)
         client.terminal.write(b"\x1d.")
         if not client.wait(SETUP_TIMEOUT):
             raise SetupError(f"client {index} did not leave after Ctrl-] .")
@@ -1456,7 +1456,7 @@ def sample_history_phase(path, client, nominal_seconds, *, sample_sink=None):
         time.sleep(0.05)
 
 
-def observe_full_repaint(client, inspect):
+def observe_full_repaint(client, inspect, timeout=SETUP_TIMEOUT):
     if client.wait(0):
         raise SetupError('history client exited before snapshot')
     size = fcntl.ioctl(client.terminal.master, termios.TIOCGWINSZ, bytes(8))
@@ -1466,7 +1466,7 @@ def observe_full_repaint(client, inspect):
     # Same-size WINCH invalidates/render-full in both accepted revisions.
     # The unreaped owned child PID cannot be reused; do not steal wait4 via Popen.poll.
     os.kill(client.pid, signal.SIGWINCH)
-    deadline = time.monotonic() + SETUP_TIMEOUT
+    deadline = time.monotonic() + timeout
     next_probe = time.monotonic() + 1
     while time.monotonic() < deadline:
         base, data, reads = client.terminal.snapshot_since(offset)
@@ -1506,10 +1506,10 @@ def history_snapshot(client, expected_total=None, *, oldest=False, expected_view
     return observe_full_repaint(client, inspect)[0]
 
 
-def repaint_marker(client, marker):
+def repaint_marker(client, marker, timeout=SETUP_TIMEOUT):
     # A diff can retain part of a visible marker. Require a full repaint, not
     # a raw substring assembled accidentally from a CSI terminator and payload.
-    return observe_full_repaint(client, lambda data: parse_repaint_marker(data, marker))[1]
+    return observe_full_repaint(client, lambda data: parse_repaint_marker(data, marker), timeout)[1]
 
 
 def run_history(rig, settings):
@@ -1651,6 +1651,10 @@ def run_one(variant, workload, settings, root):
 def command_run(args):
     if sys.platform != "linux":
         sys.exit("perf_baseline.py measures through /proc and runs on Linux only")
+    if args.retained_output_lines < 0:
+        sys.exit("retained output lines must be nonnegative")
+    if args.window < 1:
+        sys.exit("window must be positive")
     out = args.out
     out.mkdir(parents=True, exist_ok=False)
     (out / "runs").mkdir()

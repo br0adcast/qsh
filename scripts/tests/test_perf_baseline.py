@@ -652,7 +652,8 @@ class OwnershipTests(unittest.TestCase):
                 (build / binary).chmod(0o700)
             args = argparse.Namespace(out=Path(directory) / 'out', build=[('main', build)],
                                       variant=[perf.variant_spec('s=main,system')], harness_cpus=None,
-                                      system_account='bench', worker_user='nobody', workloads='idle')
+                                      system_account='bench', worker_user='nobody', workloads='idle',
+                                      retained_output_lines=0, window=10)
             for euid, disposable in ((1000, '1'), (0, None)):
                 environment = {} if disposable is None else {perf.DISPOSABLE_HOST_VAR: disposable}
                 with self.subTest(euid=euid), mock.patch.object(perf.os, 'geteuid', return_value=euid), \
@@ -830,6 +831,133 @@ class BusyQualificationTests(unittest.TestCase):
         record = self.run_one(FakeRig(echo=False))
         self.assertFalse(record['ok'])
         self.assertIn('0 of 4 echoes', record['error'])
+
+
+class RetainedQualificationTests(unittest.TestCase):
+    class Terminal:
+        total = 0
+
+        def __init__(self, fail_seq=False):
+            self.fail_seq = fail_seq
+            self.output = b''
+            self.detached = False
+
+        def write(self, data):
+            if data == b'\x1d.':
+                self.detached = True
+                return
+            with tempfile.TemporaryDirectory() as directory:
+                env = os.environ.copy()
+                if self.fail_seq:
+                    seq = Path(directory) / 'seq'
+                    seq.write_text('#!/bin/sh\nexit 7\n')
+                    seq.chmod(0o700)
+                    env['PATH'] = directory + os.pathsep + env['PATH']
+                result = subprocess.run(['/bin/sh', '-c', data.decode()], env=env,
+                                        capture_output=True, check=False)
+                self.output = result.stdout
+
+        def text_since(self, _):
+            return self.output
+
+        def counters(self):
+            return 0, 0
+
+        def wait_for(self, marker, _timeout, _offset):
+            if marker not in self.output:
+                raise perf.SetupError('raw marker absent')
+
+    class Rig:
+        daemon = None
+        daemon_facts = {}
+
+        def __init__(self, fail_seq=False):
+            self.client = argparse.Namespace(terminal=RetainedQualificationTests.Terminal(fail_seq),
+                                             rusage=None, wait=lambda _: True)
+            self.clients = []
+            self.closed = False
+
+        def start_daemon(self):
+            pass
+
+        def runtime_pid(self):
+            return 42
+
+        def start_client(self, _):
+            self.clients.append(self.client)
+            return self.client
+
+        def session_processes(self):
+            return [42]
+
+        def snapshot(self):
+            return {'t': time.monotonic(), 'qshd': sample(0, {}), 'relay': FakeRelay(True).snapshot()}
+
+        def close(self):
+            self.closed = True
+            return []
+
+    def run_case(self, lines, *, fail_seq=False, rss=800):
+        rig = self.Rig(fail_seq)
+        settings = argparse.Namespace(retained_sessions=1, retained_output_lines=lines, window=1)
+
+        def observed_marker(client, marker, *, timeout):
+            if marker not in client.terminal.output:
+                raise perf.SetupError('producer completion marker absent from display')
+            return 0
+
+        with mock.patch.object(perf, 'SETTLE', 0), mock.patch.object(perf, 'Rig', lambda *_: rig), \
+                mock.patch.object(perf, 'sample_process', return_value={'rss_kib': rss}), \
+                mock.patch.object(perf, 'repaint_marker', side_effect=observed_marker) as observe:
+            record = perf.run_one(None, 'retained', settings, None)
+        return record, rig, observe
+
+    def test_requested_output_uses_display_marker_then_detaches_and_samples(self):
+        record, rig, observe = self.run_case(3)
+        self.assertTrue(record['ok'], record.get('error'))
+        observe.assert_called_once_with(rig.client, b'PRINTED-42', timeout=600)
+        self.assertTrue(rig.client.terminal.detached)
+        self.assertTrue(rig.closed)
+        self.assertEqual(record['result']['output_lines'], 3)
+        self.assertEqual(record['result']['qshd_rss_without_sessions_kib'], 800)
+        self.assertEqual(record['result']['qshd_rss_samples_kib'], [800])
+
+    def test_producer_failure_never_marks_success_and_cleans_up(self):
+        record, rig, observe = self.run_case(3, fail_seq=True)
+        self.assertFalse(record['ok'])
+        self.assertIn('producer completion marker absent', record['error'])
+        observe.assert_called_once()
+        self.assertFalse(rig.client.terminal.detached)
+        self.assertTrue(rig.closed)
+
+    def test_zero_output_skips_producer_but_keeps_observer_and_detach(self):
+        record, rig, observe = self.run_case(0, rss=None)
+        self.assertTrue(record['ok'], record.get('error'))
+        observe.assert_not_called()
+        self.assertTrue(rig.client.terminal.detached)
+        self.assertTrue(rig.closed)
+        self.assertEqual(record['result']['qshd_rss_samples_kib'], [None])
+        self.assertIsNone(record['result']['qshd_rss_without_sessions_kib'])
+
+    def test_negative_output_count_fails_before_output_or_child_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / 'runs'
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', '--build', f'x={directory}',
+                                     '--out', str(out), '--retained-output-lines', '-1'],
+                                    capture_output=True, text=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('retained output lines must be nonnegative', result.stderr)
+            self.assertFalse(out.exists())
+
+    def test_nonpositive_window_fails_before_output_or_child_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / 'runs'
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', '--build', f'x={directory}',
+                                     '--out', str(out), '--window', '0'],
+                                    capture_output=True, text=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('window must be positive', result.stderr)
+            self.assertFalse(out.exists())
 
 
 FAKE_QSHD = """\
