@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -63,15 +63,10 @@ fn alias_length(length: usize) -> io::Result<()> {
 // Path::components normalizes away final slash/dot syntax. Keep Unix bytes and
 // an explicit final dot so `regular-file/` and `regular-file/.` remain ENOTDIR.
 fn parts(bytes: &[u8]) -> VecDeque<OsString> {
-    let mut parts: VecDeque<_> = bytes
-        .split(|b| *b == b'/')
-        .filter(|p| !p.is_empty())
-        .map(|p| OsString::from_vec(p.to_vec()))
-        .collect();
-    if bytes.ends_with(b"/") {
-        parts.push_back(OsString::from("."));
-    }
-    parts
+    crate::route::parts(bytes, false)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 fn open_file(path: &Path, euid: u32) -> io::Result<File> {
     if path.as_os_str().is_empty() {
