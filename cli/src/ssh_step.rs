@@ -379,7 +379,8 @@ impl SshStep<'_> {
     }
 
     /// Foreground bootstrap, retaining the key checked by its actual login.
-    /// A background caller must supply explicit bindings through `run_bound`.
+    /// A background caller must supply authorized keys through a restricted
+    /// recovery entry point.
     pub fn run_identified(
         &self,
         addr: &::connect::Address,
@@ -395,47 +396,69 @@ impl SshStep<'_> {
         })
     }
 
-    /// Background bringup permits only the intersection of explicit binding
-    /// keys and freshly read OpenSSH trust, with revocations taking precedence.
-    /// The restricted keys reach the real login's KEX before user authentication.
-    pub fn run_bound(
+    /// Recovery uses applicable ordinary approval or connection-local evidence.
+    pub(crate) fn run_recovery_observed(
         &self,
         addr: &::connect::Address,
         route: &::connect::SshRoute,
         client_pubkey: [u8; 32],
-        bound_keys: &[Vec<u8>],
-        cancel: &knock::Cancel,
-    ) -> Result<bringup::Ready, SshStepError> {
-        self.run_bound_observed(addr, route, client_pubkey, bound_keys, cancel, || {})
-    }
-
-    /// Observation starts only after the existing trust restrictions admit an
-    /// attempt. The callback cannot grant trust or affect the result.
-    pub(crate) fn run_bound_observed(
-        &self,
-        addr: &::connect::Address,
-        route: &::connect::SshRoute,
-        client_pubkey: [u8; 32],
-        bound_keys: &[Vec<u8>],
+        bootstrap: Option<(&::connect::server_identity::SshEndpoint, &[u8])>,
         cancel: &knock::Cancel,
         started: impl FnOnce(),
     ) -> Result<bringup::Ready, SshStepError> {
         if !self.background || cancel.is_cancelled() {
             return Err(SshStepError::NeedsPrompt);
         }
-        let mut keys = self
+        // The target read is authoritative for every source of approval.
+        let target = self
             .known_hosts
             .lookup(&addr.host, route.port)
             .map_err(|error| plain(error.to_string()))?;
-        keys.known
-            .retain(|key| bound_keys.contains(key) && !keys.revoked.contains(key));
-        if keys.known.is_empty() {
+        let mut approved = target.known.clone();
+        if let Some((origin, key)) = bootstrap {
+            // An origin failure removes only memory authority. Independently
+            // approved target keys remain eligible for the actual KEX.
+            let origin_valid = self
+                .known_hosts
+                .lookup(&origin.host, origin.port)
+                .is_ok_and(|keys| {
+                    !keys.revoked.iter().any(|k| k.as_slice() == key)
+                        && (keys.known.is_empty() || keys.known.iter().any(|k| k.as_slice() == key))
+                });
+            if origin_valid && !approved.iter().any(|k| k.as_slice() == key) {
+                approved.push(key.to_vec());
+            }
+        }
+        approved.retain(|key| !target.revoked.contains(key));
+        approved.sort();
+        approved.dedup();
+        if approved.is_empty() {
+            return Err(plain(format!("SSH recovery at {}:{} has no approved host key; unknown, changed or revoked keys are not used during recovery",
+                crate::identity::show(&addr.host), route.port)));
+        }
+        if cancel.is_cancelled() {
             return Err(SshStepError::NeedsPrompt);
         }
+        let keys = HostKeys {
+            known: approved,
+            revoked: Vec::new(),
+        };
         started();
         self.attempt(addr, route, client_pubkey, &keys, cancel)
             .map(|identified| identified.ready)
             .map_err(Attempted::into_error)
+    }
+
+    /// Background recovery using freshly read approval for this SSH endpoint.
+    /// This entry never prompts or changes known-hosts files.
+    pub fn run_recovery(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        cancel: &knock::Cancel,
+    ) -> Result<bringup::Ready, SshStepError> {
+        self.run_recovery_observed(addr, route, client_pubkey, None, cancel, || {})
     }
 
     fn run_inner(
@@ -641,14 +664,9 @@ mod tests {
                 let started = std::cell::Cell::new(false);
                 let cancel = knock::Cancel::new();
                 let error = if background {
-                    step.run_bound_observed(
-                        &addr,
-                        &route,
-                        [7; 32],
-                        &[vec![1, 2, 3]],
-                        &cancel,
-                        || started.set(true),
-                    )
+                    step.run_recovery_observed(&addr, &route, [7; 32], None, &cancel, || {
+                        started.set(true)
+                    })
                     .unwrap_err()
                 } else {
                     step.run_inner(&addr, &route, [7; 32], &cancel).unwrap_err()
@@ -719,24 +737,24 @@ mod tests {
             ssh: Some(route.clone()),
         };
         let observed = std::cell::Cell::new(false);
-        assert_eq!(
-            step.run_bound_observed(&addr, &route, [7; 32], &[], &knock::Cancel::new(), || {
-                observed.set(true)
-            }),
-            Err(SshStepError::NeedsPrompt)
-        );
-        assert!(
-            !observed.get(),
-            "an unbound route is not an active SSH attempt"
-        );
-        let error = step
-            .run_bound(
-                &addr,
+        let unknown = ::connect::Address {
+            host: "unknown.example.test".into(),
+            ..addr.clone()
+        };
+        assert!(matches!(
+            step.run_recovery_observed(
+                &unknown,
                 &route,
                 [7; 32],
-                &known.lookup("127.0.0.1", sb.sshd.port).unwrap().known,
+                None,
                 &knock::Cancel::new(),
-            )
+                || observed.set(true)
+            ),
+            Err(SshStepError::Failed(_))
+        ));
+        assert!(!observed.get(), "an unapproved route must not start SSH");
+        let error = step
+            .run_recovery(&addr, &route, [7; 32], &knock::Cancel::new())
             .unwrap_err();
         assert!(matches!(error, SshStepError::Failed(_)), "{error:?}");
         assert!(format!("{error:?}").contains("qshd is missing; recovery will not install it"));
@@ -1015,3 +1033,7 @@ mod tests {
         assert!(!ssh_failure(&other, true).local_network_hint);
     }
 }
+
+#[cfg(test)]
+#[path = "ssh_step_recovery_tests.rs"]
+mod memory_tests;

@@ -62,7 +62,6 @@ impl<T> Drop for Completion<T> {
 pub struct RoundTask {
     done: Receiver<(u64, Round)>,
     recovery: Arc<Recovery>,
-    setup: Arc<Setup>,
 }
 
 impl RoundTask {
@@ -101,7 +100,7 @@ impl RoundTask {
 
 impl Drop for RoundTask {
     fn drop(&mut self) {
-        self.recovery.stop(&self.setup);
+        self.recovery.stop();
         if let Ok((_, Round::Connected { connected, .. })) = self.done.try_recv() {
             connected.attempt.detach();
         }
@@ -110,13 +109,12 @@ impl Drop for RoundTask {
 
 struct CancelOnDrop {
     recovery: Arc<Recovery>,
-    setup: Arc<Setup>,
     armed: bool,
 }
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.recovery.stop(&self.setup);
+            self.recovery.stop();
         }
     }
 }
@@ -203,14 +201,12 @@ fn launch(
         sender: Some(done_tx),
         wake: progress.notifier(),
     };
-    let owner_setup = setup.clone();
     let worker = recovery.clone();
     std::thread::Builder::new()
         .name("qsh-reconnect".into())
         .spawn(move || {
             let mut cancel = CancelOnDrop {
                 recovery: worker.clone(),
-                setup: setup.clone(),
                 armed: true,
             };
             worker.spawn_ssh(setup.clone(), addresses.clone(), first);
@@ -280,7 +276,7 @@ fn launch(
                     done_tx.send((revision, round))
                 {
                     connected.attempt.detach();
-                    worker.stop(&setup);
+                    worker.stop();
                 }
                 return;
             }
@@ -289,7 +285,6 @@ fn launch(
     RoundTask {
         done: done_rx,
         recovery,
-        setup: owner_setup,
     }
 }
 

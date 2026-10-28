@@ -75,16 +75,7 @@ impl RecoveryNetwork {
             store.pin("127.0.0.1", road.port, &self.qsh_key).unwrap();
         }
     }
-    pub fn grant(&self, home: &Path) {
-        use connect::{
-            recovery_gate::RecoveryEpoch,
-            server_identity::{ServerIdentity, SshBinding, SshEndpoint},
-        };
-        let server = ServerIdentity {
-            qsh_key: self.qsh_key,
-            username: qsh::args::parse_args(&["127.0.0.1".into()]).unwrap().login,
-        };
-        let store = qsh::ssh_bindings::SshBindings::open(home.join("qsh/ssh_bindings.json"));
+    pub fn approve_ssh(&self, home: &Path) {
         for endpoint in &self.ssh {
             qsh::known_hosts::KnownHosts::new(home.join(".ssh/known_hosts"), None)
                 .add(
@@ -92,34 +83,6 @@ impl RecoveryNetwork {
                     endpoint.port,
                     "ssh-ed25519",
                     &self.expected.wire(),
-                )
-                .unwrap();
-            store
-                .grant(
-                    &SshBinding {
-                        server: server.clone(),
-                        endpoint: SshEndpoint {
-                            host: "127.0.0.1".into(),
-                            port: endpoint.port,
-                        },
-                        host_key: self.expected.wire(),
-                    },
-                    &qsh::ssh_bindings::TrustWritePermit::new(RecoveryEpoch {
-                        connection: 0,
-                        network: 0,
-                    }),
-                )
-                .unwrap();
-        }
-    }
-    pub fn trust_foreign_ssh(&self, home: &Path) {
-        for endpoint in &self.ssh {
-            qsh::known_hosts::KnownHosts::new(home.join(".ssh/known_hosts"), None)
-                .add(
-                    "127.0.0.1",
-                    endpoint.port,
-                    "ssh-ed25519",
-                    &self.foreign.wire(),
                 )
                 .unwrap();
         }

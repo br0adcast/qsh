@@ -60,24 +60,6 @@ fn fixture(keys: &[[u8; 32]]) -> (tempfile::TempDir, fake::FakeServer, Setup) {
         [1; 16],
     );
     *setup.session_key.lock().unwrap() = Some([7; 32]);
-    let epoch = ::connect::recovery_gate::RecoveryEpoch {
-        connection: 1,
-        network: 1,
-    };
-    setup
-        .ssh_bindings()
-        .grant(
-            &::connect::server_identity::SshBinding {
-                server: setup.server_identity().unwrap(),
-                endpoint: ::connect::server_identity::SshEndpoint {
-                    host: "127.0.0.1".into(),
-                    port: ssh.port,
-                },
-                host_key: ssh.host_public_key_wire(),
-            },
-            &crate::ssh_bindings::TrustWritePermit::new(epoch),
-        )
-        .unwrap();
     (home, ssh, setup)
 }
 
@@ -232,4 +214,177 @@ fn foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key() {
     assert_eq!(outcome, DirectOutcome::KeyChanged);
     assert_eq!(replacement.server_identity(), setup.server_identity());
     assert!(!setup.pins.path().exists());
+}
+
+fn memory_bootstrap(key: [u8; 32], ssh_key: Vec<u8>) -> SshBootstrap {
+    SshBootstrap {
+        addr: 0,
+        port: 60023,
+        key,
+        ssh_host_key: ssh::HostKeyInfo {
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "synthetic".into(),
+            key: ssh_key,
+        },
+    }
+}
+
+#[test]
+fn ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it() {
+    let (home, ssh, setup) = fixture(&[]);
+    let origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: ssh.port,
+    };
+    assert!(!setup.has_bootstrap_recovery_trust());
+    assert!(setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin,
+        &knock::Cancel::new()
+    ));
+    assert!(setup.has_bootstrap_recovery_trust());
+    assert!(!home.path().join("ssh_bindings.json").exists());
+    let replacement = setup.replacement([8; 16]);
+    assert!(
+        replacement.has_bootstrap_recovery_trust(),
+        "same-client replacement retains evidence"
+    );
+    assert_ne!(replacement.token, setup.token);
+}
+
+#[test]
+fn ssh_first_mismatched_or_cancelled_bootstrap_never_publishes() {
+    let (_home, ssh, setup) = fixture(&[]);
+    let origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: ssh.port,
+    };
+    for (addr, port, key) in [
+        (1, 60023, [7; 32]),
+        (0, 60022, [7; 32]),
+        (0, 60023, [9; 32]),
+    ] {
+        assert!(!setup.remember_bootstrap(
+            memory_bootstrap(key, ssh.host_public_key_wire()),
+            addr,
+            port,
+            origin.clone(),
+            &knock::Cancel::new()
+        ));
+        assert!(!setup.has_bootstrap_recovery_trust());
+    }
+    let cancel = knock::Cancel::new();
+    cancel.cancel();
+    assert!(!setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin,
+        &cancel
+    ));
+    assert!(!setup.has_bootstrap_recovery_trust());
+}
+
+#[test]
+fn ssh_first_new_connection_is_empty_and_foreign_identity_cannot_inherit() {
+    let (_home, ssh, setup) = fixture(&[]);
+    let origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: ssh.port,
+    };
+    assert!(setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin,
+        &knock::Cancel::new()
+    ));
+    *setup.session_key.lock().unwrap() = Some([9; 32]);
+    assert!(!setup.has_bootstrap_recovery_trust());
+    assert!(!setup.replacement([8; 16]).has_bootstrap_recovery_trust());
+    let (_home2, _ssh2, fresh) = fixture(&[]);
+    assert!(!fresh.has_bootstrap_recovery_trust());
+}
+
+#[test]
+fn ssh_first_memory_recovery_ignores_corrupt_store_and_rechecks_qsh_identity() {
+    let (home, ssh, setup) = fixture(&[[7; 32]]);
+    let origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: ssh.port,
+    };
+    assert!(setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin,
+        &knock::Cancel::new()
+    ));
+    let path = home.path().join("ssh_bindings.json");
+    std::fs::write(&path, b"invalid-json").unwrap();
+    let ready = setup
+        .bring_up(&setup.args.addresses[0], &knock::Cancel::new())
+        .expect("memory trust must not read the legacy store");
+    assert_eq!(ready.server_pubkey, [7; 32]);
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid-json");
+}
+
+#[test]
+fn ssh_first_origin_uses_ssh_port_and_established_evidence_is_immutable() {
+    let (_home, ssh, mut setup) = fixture(&[]);
+    setup.args.addresses[0].ssh.as_mut().unwrap().port = 2222;
+    let origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: 2222,
+    };
+    let mut bootstrap = memory_bootstrap([7; 32], ssh.host_public_key_wire());
+    bootstrap.port = 60000;
+    assert!(setup.remember_bootstrap(bootstrap, 0, 60000, origin.clone(), &knock::Cancel::new()));
+    let replacement = setup.replacement([8; 16]);
+    assert_eq!(
+        replacement
+            .bootstrap_recovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .origin
+            .port,
+        2222
+    );
+    let mut other = memory_bootstrap([7; 32], vec![9]);
+    other.port = 60000;
+    assert!(!setup.remember_bootstrap(other, 0, 60000, origin, &knock::Cancel::new()));
+    *setup.bootstrap_recovery.lock().unwrap() = None;
+    assert!(
+        replacement.has_bootstrap_recovery_trust(),
+        "replacement owns a value snapshot"
+    );
+}
+
+#[test]
+fn ssh_first_wrong_origin_or_unauthenticated_peer_cannot_publish() {
+    let (_home, ssh, setup) = fixture(&[]);
+    let mut origin = ::connect::server_identity::SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: 60023,
+    };
+    assert!(!setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin.clone(),
+        &knock::Cancel::new()
+    ));
+    origin.port = ssh.port;
+    *setup.session_key.lock().unwrap() = None;
+    assert!(!setup.remember_bootstrap(
+        memory_bootstrap([7; 32], ssh.host_public_key_wire()),
+        0,
+        60023,
+        origin,
+        &knock::Cancel::new()
+    ));
 }

@@ -4,8 +4,8 @@
 //! step, heap allocations (calls, bytes and grid-sized ones), the live heap
 //! retained between steps and its peak inside a step, and the elapsed and
 //! thread CPU time of each step. It is a measurement procedure, not a test:
-//! it sets no thresholds. The method and recorded results are in
-//! docs/performance-baseline.md, under "Frame storage reuse".
+//! it sets no thresholds. Maintained usage is in
+//! docs/performance-baseline.md, under "Frame storage probe".
 //!
 //!   cargo run --release -p qsh --example frame_storage -- [--time] [--steps N] [WORKLOAD...]
 //!

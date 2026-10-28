@@ -171,9 +171,8 @@ impl Recovery {
         Some(endpoint)
     }
 
-    /// Permit invalidation precedes cancellation, including tasks dropped at exit.
-    pub fn stop(&self, setup: &Setup) {
-        setup.invalidate_ssh_authorization();
+    /// Cancel this generation, including tasks dropped at exit.
+    pub fn stop(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel.cancel();
         state.qsh_activity.clear();
@@ -405,6 +404,32 @@ impl Recovery {
         self.publish_ready_with_warning(attempt, addr, port, None)
     }
 
+    /// Publish a refusal without inventing a ready port or changing recovery.
+    fn publish_ssh_failure(&self, attempt: &SshAttempt, addr: usize, message: &str) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || attempt.cancel.is_cancelled()
+            || attempt.epoch != self.epoch
+            || state.revision != attempt.revision
+            || !state.gate.ssh_allowed()
+            || !state
+                .ssh
+                .as_ref()
+                .is_some_and(|(id, _)| *id == attempt.attempt)
+        {
+            return false;
+        }
+        let warning = logging::diagnostic(message);
+        if state.last_warnings[addr].as_ref() != Some(&warning) {
+            state.warning = Some(warning.clone());
+            state.last_warnings[addr] = Some(warning);
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
     /// Same lock as reset/cancel/recovered: a late worker cannot publish a port.
     fn publish_ready_with_warning(
         &self,
@@ -527,10 +552,17 @@ impl Recovery {
                                     ));
                                 }
                             }
-                            Err(crate::ssh_step::SshStepError::NeedsPrompt) => log::log(&format!(
-                                "recovery: ssh address {i}: NeedsPrompt; UDP keeps trying"
-                            )),
-                            Err(why) => log::log(&format!("recovery: ssh address {i}: {why:?}")),
+                            Err(why) => {
+                                let message = match &why {
+                                    crate::ssh_step::SshStepError::Failed(failure) => report::ssh_failed(&address.host, failure),
+                                    crate::ssh_step::SshStepError::NeedsPrompt => format!(
+                                        "qsh: {}: SSH recovery needs credentials unavailable without a prompt; QSH keeps retrying",
+                                        crate::identity::show(&address.host)),
+                                    crate::ssh_step::SshStepError::InstallDeclined => report::install_declined(),
+                                };
+                                log::log(&format!("recovery: ssh address {i}: {why:?}"));
+                                recovery.publish_ssh_failure(&attempt, i, &message);
+                            }
                         }
                         recovery.finish_ssh(&attempt);
                     }
@@ -636,6 +668,29 @@ mod tests {
         );
         r.update_endpoints(EPOCH, vec![]);
         assert!(!r.publish_ready_with_warning(&attempt, 0, 60000, Some("stale warning".into())));
+        assert!(r.take_warning().is_none());
+    }
+
+    #[test]
+    fn approved_recovery_failure_warning_is_once_and_generation_checked_without_port() {
+        let r = Recovery::new(EPOCH, 1);
+        r.begin_sweep(SweepId(1));
+        r.finish(
+            r.revision(),
+            EPOCH,
+            SweepId(1),
+            AddressId(0),
+            AddressOutcome::Failed,
+        );
+        let attempt = r.begin_ssh().unwrap();
+        let message = "SSH recovery has no approved host key";
+        assert!(r.publish_ssh_failure(&attempt, 0, message));
+        assert_eq!(r.take_warning().as_deref(), Some(message));
+        assert!(r.state.lock().unwrap().ports[0].is_none());
+        assert!(r.publish_ssh_failure(&attempt, 0, message));
+        assert!(r.take_warning().is_none());
+        r.update_endpoints(EPOCH, vec![]);
+        assert!(!r.publish_ssh_failure(&attempt, 0, "stale failure"));
         assert!(r.take_warning().is_none());
     }
 

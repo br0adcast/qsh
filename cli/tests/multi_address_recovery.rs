@@ -189,7 +189,7 @@ fn shared_recovery_sends_to_returning_path_before_blackhole_deadline() {
     let network = RecoveryNetwork::new(daemon.port);
     network.switch_mapping([Some(daemon.port), None]);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
+    network.approve_ssh(session.home.path());
     network.switch_mapping([None, Some(daemon.port)]);
     let started = Instant::now();
     session.reconnect();
@@ -231,7 +231,7 @@ fn returning_path_recovers_during_the_actual_maximum_ssh_backoff() {
     let network = RecoveryNetwork::new(daemon.port);
     network.switch_mapping([Some(daemon.port), None]);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
+    network.approve_ssh(session.home.path());
     network.switch_mapping([None, None]);
     session.reconnect();
     // Use the public manual retry action to skip earlier pauses. The final
@@ -280,7 +280,7 @@ fn selected_without_acceptance_gives_the_other_path_a_fresh_authentication_turn(
     let network = RecoveryNetwork::new(daemon.port);
     network.switch_mapping([Some(daemon.port), None]);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
+    network.approve_ssh(session.home.path());
     let pins = std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap();
     network.handshake_only(0, true);
     network.transport_after_next_initiator(1);
@@ -331,7 +331,7 @@ fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
     network.switch_mapping([Some(daemon.port), None]);
     network.hold_ssh(true);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
+    network.approve_ssh(session.home.path());
     let pins = std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap();
     let before = network.probes();
     network.switch_mapping([None, None]);
@@ -441,15 +441,14 @@ fn a_to_b_to_a_keeps_the_shell_and_cancels_ssh_after_every_path_was_tried() {
 }
 
 #[test]
-fn a_known_foreign_ssh_server_gets_no_auth_and_the_same_endpoint_can_retry() {
+fn an_unapproved_foreign_ssh_server_gets_no_auth_and_the_same_endpoint_can_retry() {
     let _serial = serialised();
     let (daemon, key) = start_daemon();
     let network = RecoveryNetwork::new(daemon.port);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
-    network.trust_foreign_ssh(session.home.path());
+    network.approve_ssh(session.home.path());
     network.switch_ssh(0, true);
-    let bindings = std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap();
+    let approvals = std::fs::read(session.home.path().join(".ssh/known_hosts")).unwrap();
     network.switch_mapping([None, None]);
     session.reconnect();
     session.wait_log("next SSH round in 1 s; UDP keeps trying");
@@ -474,8 +473,8 @@ fn a_known_foreign_ssh_server_gets_no_auth_and_the_same_endpoint_can_retry() {
         session.log()
     );
     assert_eq!(
-        std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap(),
-        bindings
+        std::fs::read(session.home.path().join(".ssh/known_hosts")).unwrap(),
+        approvals
     );
     network.foreign_untouched();
     network.switch_mapping([Some(daemon.port), None]);
@@ -486,12 +485,11 @@ fn a_known_foreign_ssh_server_gets_no_auth_and_the_same_endpoint_can_retry() {
 }
 
 #[test]
-fn direct_qsh_without_binding_keeps_retrying_all_paths_without_background_questions() {
+fn direct_qsh_without_approved_ssh_keeps_retrying_all_paths_without_background_questions() {
     let _serial = serialised();
     let (daemon, key) = start_daemon();
     let network = RecoveryNetwork::new(daemon.port);
     let mut session = Session::start(&network, &key);
-    network.trust_foreign_ssh(session.home.path());
     let before = network.probes();
     network.switch_mapping([None, None]);
     session.reconnect();
@@ -504,10 +502,10 @@ fn direct_qsh_without_binding_keeps_retrying_all_paths_without_background_questi
     assert_eq!(
         network.ssh_connections(),
         0,
-        "known_hosts alone cannot admit TCP"
+        "unknown SSH keys cannot admit TCP"
     );
     network.untouched();
-    assert!(!session.home.path().join("qsh/ssh_bindings.json").exists());
+    assert!(!session.home.path().join(".ssh/known_hosts").exists());
     assert!(!session.text().contains("Authorize SSH recovery"));
     assert!(!session.text().contains("password:"));
     network.switch_mapping([None, Some(daemon.port)]);
@@ -662,10 +660,9 @@ fn replacement_consent_preserves_identity_when_the_network_changes_at_the_questi
     let (foreign, _) = start_daemon();
     let network = RecoveryNetwork::new(daemon.port);
     let mut session = Session::start(&network, &key);
-    network.grant(session.home.path());
-    network.trust_foreign_ssh(session.home.path());
+    network.approve_ssh(session.home.path());
     let pins = std::fs::read(session.home.path().join("qsh/known_hosts")).unwrap();
-    let bindings = std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap();
+    let approvals = std::fs::read(session.home.path().join(".ssh/known_hosts")).unwrap();
     daemon.track_shell_starts();
     daemon.restart();
     session.reconnect();
@@ -691,8 +688,8 @@ fn replacement_consent_preserves_identity_when_the_network_changes_at_the_questi
         pins
     );
     assert_eq!(
-        std::fs::read(session.home.path().join("qsh/ssh_bindings.json")).unwrap(),
-        bindings
+        std::fs::read(session.home.path().join(".ssh/known_hosts")).unwrap(),
+        approvals
     );
     assert_eq!(session.text().matches("Key fingerprint").count(), 0);
     assert!(!session.text().contains("Authorize SSH recovery"));
@@ -715,7 +712,7 @@ fn replacement_consent_preserves_identity_when_the_network_changes_at_the_questi
 }
 
 /// Kill only the sandbox's qshd; its same first SSH target restarts it on
-/// the configured port. Closing the loss probe revokes its SSH enrollment;
+/// the configured port. Closing the loss probe changes its recovery endpoint;
 /// replacement must authenticate again without waiting on that obsolete hint.
 #[test]
 #[cfg(target_os = "linux")]
@@ -765,7 +762,6 @@ fn replacement_after_same_target_ssh_restart_renews_auth_promptly() {
     let client = spawn_qsh(
         &[
             "--verbose",
-            "--authorize-ssh",
             "-i",
             key.to_str().unwrap(),
             &first_address,
@@ -781,12 +777,13 @@ fn replacement_after_same_target_ssh_restart_renews_auth_promptly() {
         home,
     };
     assert!(
-        wait_network(|| session.text().contains("Authorize SSH recovery")),
-        "{}\n{}",
-        session.text(),
+        wait_network(|| session
+            .log()
+            .lines()
+            .any(|line| line.contains("shell channel ") && line.ends_with(" ready"))),
+        "{}",
         session.log()
     );
-    session.client.master.write_all(b"yes\n").unwrap();
     session.client.type_line("export TOPOLOGY_MARK=retained");
     session.shell("INITIAL");
     let socket = sandbox.cache().join("control.sock");
