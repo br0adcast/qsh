@@ -94,7 +94,7 @@ fn client179_draining_input_preserves_remote_exit_and_has_one_notice() {
     let partial = budget.admit_slice(b"\x1b[<").unwrap();
     assert!(sent(&session.handle(UiEvent::Stdin(partial), 0)).is_empty());
     assert_eq!(budget.usage(), (3, 1, 3));
-    session.on_channel_draining(16);
+    session.on_channel_draining(16, 0);
     assert_eq!(
         budget.usage(),
         (0, 0, 0),
@@ -102,7 +102,7 @@ fn client179_draining_input_preserves_remote_exit_and_has_one_notice() {
     );
     let mut notices = 0;
     for now in 1..100 {
-        session.on_channel_draining(16); // repeated snapshots must not rearm it
+        session.on_channel_draining(16, 0); // repeated snapshots must not rearm it
         let actions = session.handle(UiEvent::Stdin(budget.admit_slice(b"no").unwrap()), now);
         assert!(sent(&actions).is_empty());
         assert!(!actions

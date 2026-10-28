@@ -28,6 +28,24 @@ impl ShellDeadlines {
     }
 }
 
+/// Presentation eligibility from parsed output and the unchanged model evaluation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShellEffects {
+    pub complete_data: bool,
+    pub synchronized_output: bool,
+    pub prediction_sensitive: bool,
+}
+impl ShellEffects {
+    pub fn ordinary_data(self) -> bool {
+        self.complete_data && !self.synchronized_output && !self.prediction_sensitive
+    }
+}
+/// An owned snapshot and observations of the operation that produced it.
+pub struct ShellUpdate {
+    pub frame: terminal::Frame,
+    pub effects: ShellEffects,
+}
+
 /// The "terminal + prediction + deframer" bundle under one lock: all mutable
 /// state of the shell session, accessed both by the platform thread
 /// (input/resize), the driver thread (receive), and the caller's periodic tick.
@@ -186,8 +204,16 @@ impl ShellState {
     /// ECHO_ACK advances echo confirmation. Then cull the prediction against
     /// the new authoritative frame and return the overlaid frame.
     pub fn on_stream0(&mut self, data: &[u8], now_ms: i64, rtt_ms: i64) -> terminal::Frame {
-        let records = self.deframer.push(data);
-        for rec in records {
+        self.on_stream0_observed(data, now_ms, rtt_ms).frame
+    }
+
+    /// Ingest and evaluate exactly as `on_stream0`, with typed presentation fences.
+    pub fn on_stream0_observed(&mut self, data: &[u8], now_ms: i64, rtt_ms: i64) -> ShellUpdate {
+        let update = self.deframer.push_observed(data);
+        let complete_data = update.complete_data_only();
+        let sensitive_before = self.prediction.presentation_sensitive();
+        self.terminal.take_sync_boundary();
+        for rec in update.records {
             match rec {
                 ShellRecord::Data(bytes) => {
                     self.with_history_anchor(|terminal| terminal.feed(&bytes));
@@ -207,11 +233,19 @@ impl ShellState {
         self.prediction.set_send_interval(rtt_ms);
         // In history (offset > 0) we don't overlay prediction -- its
         // coordinates are tied to the live bottom and no longer match in a scrolled frame.
-        if !self.history_view && self.terminal.display_offset() == 0 {
+        let frame = if !self.history_view && self.terminal.display_offset() == 0 {
             self.prediction.cull(&auth, now_ms);
             self.prediction.apply_owned(auth)
         } else {
             auth
+        };
+        ShellUpdate {
+            frame,
+            effects: ShellEffects {
+                complete_data: complete_data && self.deframer.error().is_none(),
+                synchronized_output: self.terminal.take_sync_boundary(),
+                prediction_sensitive: sensitive_before || self.prediction.presentation_sensitive(),
+            },
         }
     }
 
@@ -1194,5 +1228,44 @@ mod state_tests {
         both("reattach", &|st| Some(st.on_reattach()));
         both("reset", &|st| Some(st.on_reset()));
         both("after reset", &|st| Some(st.frame(2010, 50)));
+    }
+}
+
+#[cfg(test)]
+mod presentation304_tests {
+    use super::*;
+    use transport::shell_frame::{encode_record, REC_DATA, REC_ECHO_ACK};
+    #[test]
+    fn presentation304_update_effects_distinguish_data_ack_sync_and_hidden_prediction() {
+        let mut shell = ShellState::new(80, 24, prediction::DisplayPreference::Never, false);
+        assert!(shell
+            .on_stream0_observed(&encode_record(REC_DATA, b"ordinary"), 0, 0)
+            .effects
+            .ordinary_data());
+        assert!(!shell
+            .on_stream0_observed(&encode_record(REC_ECHO_ACK, &0u64.to_be_bytes()), 1, 0)
+            .effects
+            .ordinary_data());
+        let update = shell.on_stream0_observed(
+            &encode_record(REC_DATA, b"\x1b[?2026hwhole\x1b[?2026l"),
+            2,
+            0,
+        );
+        assert!(update.effects.synchronized_output);
+        assert!(!update.effects.ordinary_data());
+        let mut predicted = ShellState::new(80, 24, prediction::DisplayPreference::Adaptive, false);
+        predicted.on_input(b"h", 1000, 10);
+        let mut echoed = encode_record(REC_DATA, b"h");
+        echoed.extend(encode_record(REC_ECHO_ACK, &1u64.to_be_bytes()));
+        predicted.on_stream0(&echoed, 1050, 10);
+        predicted.frame(1060, 10);
+        predicted.on_input(b"x", 1100, 10);
+        assert!(!predicted.prediction.active());
+        assert!(
+            predicted
+                .on_stream0_observed(&encode_record(REC_DATA, b"output"), 1101, 10)
+                .effects
+                .prediction_sensitive
+        );
     }
 }
