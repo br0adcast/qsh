@@ -1,6 +1,7 @@
 """Bounded diagnostics for a timed-out fixture's still-owned Linux process tree."""
 import itertools
 import os
+import re
 from pathlib import Path
 import shutil
 
@@ -8,6 +9,13 @@ MAX_PROCESSES = 8
 MAX_DEPTH = 6
 MAX_TASKS = 16
 MAX_CHILDREN = 32
+MAX_FDINFO_ENTRIES = 8
+MAX_FDINFO_BYTES = 512
+MAX_STACK_BYTES = 2048
+MAX_STACK_SYMBOLS = 8
+STACK_ENTRY = re.compile(
+    rb'\s*\[<[0-9a-fA-F]+>\]\s+([A-Za-z_][A-Za-z0-9_.]{0,95})'
+    rb'\+0x[0-9a-fA-F]+/0x[0-9a-fA-F]+(?:\s+\[[^\]\r\n]{1,128}\])?\s*')
 
 
 def _read(path, limit=4096):
@@ -28,18 +36,22 @@ def _same_process(first, second):
     return all(first[key] == second[key] for key in ('pid', 'parent', 'started'))
 
 
+def _fdinfo_fields(text):
+    result = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition(':')
+        if separator and key in ('pos', 'flags', 'mnt_id', 'ino'):
+            try:
+                result[key] = int(value.strip(), 8 if key == 'flags' else 10)
+            except ValueError:
+                pass
+    return result
+
+
 def _fd_metadata(directory, number, clean):
     """Only the selected fd's link and whitelisted numeric fdinfo, never data."""
     def info():
-        result = {}
-        for line in _read(directory / 'fdinfo' / str(number), 512).splitlines():
-            key, separator, value = line.partition(':')
-            if separator and key in ('pos', 'flags', 'mnt_id', 'ino'):
-                try:
-                    result[key] = int(value.strip(), 8 if key == 'flags' else 10)
-                except ValueError:
-                    pass
-        return result
+        return _fdinfo_fields(_read(directory / 'fdinfo' / str(number), 512))
 
     try:
         target = os.readlink(directory / 'fd' / str(number))
@@ -113,6 +125,70 @@ def _syscall(directory, clean):
         return {'status': 'syscall or executable ABI unavailable'}
 
 
+def _kernel_stack(directory):
+    """Only canonical symbol names survive; raw frames never enter a report."""
+    try:
+        with (directory / 'stack').open('rb') as source:
+            data = source.read(MAX_STACK_BYTES + 1)
+    except OSError:
+        return {'status': 'unavailable', 'symbols': []}
+    truncated = len(data) > MAX_STACK_BYTES
+    data = data[:MAX_STACK_BYTES]
+    lines = data.splitlines()
+    if truncated and not data.endswith(b'\n'):
+        lines = lines[:-1]
+    symbols = []
+    for line in lines:
+        match = STACK_ENTRY.fullmatch(line)
+        if match:
+            if len(symbols) == MAX_STACK_SYMBOLS:
+                truncated = True
+                break
+            symbols.append(match[1].decode('ascii'))
+    status = 'truncated' if truncated else 'available' if symbols else 'no recognized symbols'
+    return {'status': status, 'symbols': symbols}
+
+
+def _bounded_fdinfo(directory, number):
+    with (directory / 'fdinfo' / str(number)).open('rb') as source:
+        data = source.read(MAX_FDINFO_BYTES + 1)
+    if len(data) > MAX_FDINFO_BYTES:
+        raise ValueError('fdinfo exceeds diagnostic budget')
+    fields = _fdinfo_fields(data.decode('ascii', errors='replace'))
+    bounded = {key: value for key, value in fields.items() if 0 <= value < 2 ** 64}
+    if not bounded:
+        raise ValueError('no usable numeric fdinfo')
+    return bounded
+
+
+def _open_fdinfo(directory):
+    """Observe numeric metadata only: never follow/readlink/open FD targets."""
+    names, truncated = [], False
+    try:
+        with os.scandir(directory / 'fdinfo') as entries:
+            for index, entry in enumerate(itertools.islice(entries, MAX_FDINFO_ENTRIES + 1)):
+                if index == MAX_FDINFO_ENTRIES:
+                    truncated = True
+                    break
+                if entry.name.isascii() and entry.name.isdigit() and len(entry.name) <= 10:
+                    number = int(entry.name)
+                    if number < 2 ** 31:
+                        names.append(number)
+    except OSError:
+        return {'status': 'unavailable', 'entries': []}
+    result = []
+    for number in sorted(names):
+        try:
+            first = _bounded_fdinfo(directory, number)
+            if first != _bounded_fdinfo(directory, number):
+                result.append({'number': number, 'status': 'changed during snapshot'})
+            else:
+                result.append({'number': number, 'metadata': first})
+        except (OSError, ValueError):
+            result.append({'number': number, 'status': 'unavailable'})
+    return {'status': 'truncated' if truncated else 'available', 'entries': result}
+
+
 def timeout_snapshot(pid, command, env, fixture, checkout, *, proc=Path('/proc')):
     """Read only descendants of an unreaped Popen child; never argv or environ.
 
@@ -156,6 +232,8 @@ def timeout_snapshot(pid, command, env, fixture, checkout, *, proc=Path('/proc')
         tools['path_' + name] = tool(name)
 
     result = {'tools': tools, 'processes': [], 'process_status': 'bounded owned snapshot'}
+    result['waiter'] = {'status': 'no D-state waiter sampled'}
+    waiter_sampled = False
     pending = [(pid, [])]
     limited = False
     while pending and len(result['processes']) < MAX_PROCESSES:
@@ -175,6 +253,16 @@ def timeout_snapshot(pid, command, env, fixture, checkout, *, proc=Path('/proc')
             except OSError:
                 wait = 'unavailable'
             syscall = _syscall(proc / str(current), clean)
+            waiter = None
+            if before['state'] == 'D' and not waiter_sampled:
+                waiter_sampled = True
+                result['waiter'] = {'status': 'candidate changed or unavailable'}
+                if (not _same_process(before, _stat(proc, current)) or
+                        any(not _same_process(parent, _stat(proc, parent['pid'])) for parent in ancestors)):
+                    continue
+                waiter = {'pid': current, 'parent': before['parent'], 'started': before['started'],
+                          'kernel_stack': _kernel_stack(proc / str(current)),
+                          'open_fdinfo': _open_fdinfo(proc / str(current)), 'omitted_waiters': 0}
             children = []
             tasks = proc / str(current) / 'task'
             with os.scandir(tasks) as entries:
@@ -196,6 +284,10 @@ def timeout_snapshot(pid, command, env, fixture, checkout, *, proc=Path('/proc')
                 continue
             if any(not _same_process(parent, _stat(proc, parent['pid'])) for parent in ancestors):
                 continue
+            if waiter is not None:
+                result['waiter'] = waiter
+            elif before['state'] == 'D' and 'pid' in result['waiter']:
+                result['waiter']['omitted_waiters'] += 1
             result['processes'].append(dict(before, executable=executable, wait=wait, syscall=syscall))
             if len(ancestors) < MAX_DEPTH:
                 pending.extend((child, ancestors + [before]) for child in dict.fromkeys(children[:MAX_CHILDREN]))
