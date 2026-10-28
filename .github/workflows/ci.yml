@@ -231,7 +231,7 @@ jobs:
             known_hosts::tests::permission_errors_preserve_path_and_source_for_either_store; do
             grep -Fx "test $name ... ok" "$runtime/results.log"
           done
-          grep -F 'test result: ok. 41 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 42 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq SKIPPED "$runtime/results.log"; then exit 1; fi
           cargo test -p qsh --lib --locked ssh_step::tests::unreadable_stores_stop_foreground_and_background_before_ssh -- --exact --color never --nocapture \
             2>&1 | tee "$runtime/caller.log"
