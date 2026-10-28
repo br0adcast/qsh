@@ -137,6 +137,8 @@ pub struct Setup {
     /// initial login. Warm recovery must retain that way of authenticating.
     allowlisted: Mutex<HashSet<(String, u16)>>,
     trust_write: Mutex<Option<crate::ssh_bindings::TrustWritePermit>>,
+    /// A consented replacement is still recovery within this client connection.
+    recovery_only: bool,
 }
 
 impl Setup {
@@ -168,6 +170,7 @@ impl Setup {
             weighed: Mutex::new(HashSet::new()),
             allowlisted: Mutex::new(HashSet::new()),
             trust_write: Mutex::new(None),
+            recovery_only: false,
         }
     }
 
@@ -187,6 +190,7 @@ impl Setup {
             agent: self.agent.clone(),
             ssh_dir: self.ssh_dir.clone(),
             token,
+            recovery_only: true,
             input_budget: self.input_budget.clone(),
             candidates: Mutex::new(self.cached_candidates()),
             session_key: Mutex::new(self.server_identity().map(|s| s.qsh_key)),
@@ -244,14 +248,9 @@ impl Setup {
             .ssh_bindings()
             .allowed(&server, &endpoint)
             .map_err(|e| SshStepError::Failed(::connect::SshFailure::plain(e.to_string())))?;
-        let ready = self.ssh_step(true).run_bound_observed(
-            address,
-            route,
-            self.keypair.public,
-            &keys,
-            cancel,
-            started,
-        )?;
+        let ready = self
+            .ssh_step(true, bringup::InstallPolicy::RestartOnly)
+            .run_bound_observed(address, route, self.keypair.public, &keys, cancel, started)?;
         let port = ready.port_for(address.qsh_port);
         trust::check_bootstrap_key(&address.host, port, server.qsh_key, ready.server_pubkey)
             .and_then(|()| {
@@ -351,7 +350,7 @@ impl Setup {
     }
 
     /// The ssh step, as one climb step uses it.
-    fn ssh_step(&self, background: bool) -> SshStep<'_> {
+    fn ssh_step(&self, background: bool, install_policy: bringup::InstallPolicy) -> SshStep<'_> {
         SshStep {
             login: &self.args.login,
             identity: self.args.identity.as_deref(),
@@ -361,7 +360,20 @@ impl Setup {
             known_hosts: &self.ssh_hosts,
             tty: &self.tty,
             background,
+            install_policy,
             images: Arc::new(crate::releases::GitHubImages::new(crate::paths::cache_dir())),
+        }
+    }
+
+    fn install_policy(&self, recovering: bool, background: bool) -> bringup::InstallPolicy {
+        if recovering || self.recovery_only {
+            bringup::InstallPolicy::RestartOnly
+        } else if background {
+            bringup::InstallPolicy::ExistingOnly
+        } else {
+            bringup::InstallPolicy::AskIfMissing {
+                version: env!("CARGO_PKG_VERSION").into(),
+            }
         }
     }
 
@@ -610,12 +622,14 @@ impl<'a> Climb<'a> {
                         .expect("the ladder asks for ssh only where there is one");
                     self.progress(host);
                     self.say(&report::trying_ssh(host, route));
-                    let result = self.setup.ssh_step(self.background()).run_identified(
-                        &addrs[addr],
-                        route,
-                        self.setup.keypair.public,
-                        cancel,
-                    );
+                    let result = self
+                        .setup
+                        .ssh_step(
+                            self.background(),
+                            self.setup
+                                .install_policy(self.recovery.is_some(), self.background()),
+                        )
+                        .run_identified(&addrs[addr], route, self.setup.keypair.public, cancel);
                     if !self.background() && crate::signals::termination_requested() {
                         return Climbed::Exit(130);
                     }
@@ -1838,7 +1852,26 @@ mod tests {
         for road in &roads {
             old.allowlist("127.0.0.1", road.local_addr().unwrap().port());
         }
+        assert!(matches!(
+            old.install_policy(false, false),
+            bringup::InstallPolicy::AskIfMissing { .. }
+        ));
+        assert_eq!(
+            old.install_policy(true, true),
+            bringup::InstallPolicy::RestartOnly
+        );
+        assert_eq!(
+            old.ssh_step(true, old.install_policy(false, true))
+                .install_policy,
+            bringup::InstallPolicy::ExistingOnly,
+            "initial background work retains its no-install-prompt policy"
+        );
         let setup = old.replacement([2; 16]);
+        assert_eq!(
+            setup.install_policy(false, false),
+            bringup::InstallPolicy::RestartOnly,
+            "foreground replacement must not regain initial installation policy"
+        );
         let epoch = RecoveryEpoch {
             connection: 2,
             network: 1,

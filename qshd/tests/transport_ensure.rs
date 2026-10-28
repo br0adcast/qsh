@@ -578,3 +578,55 @@ fn a_fresh_daemon_reports_only_the_port_it_bound() {
         run.stderr
     );
 }
+
+#[test]
+fn restart_only_missing_identity_fails_without_creating_one() {
+    let _serial = serialised();
+    let home = private_temp_home().unwrap();
+    let path = home.path().join("qsh/transport_server_key.bin");
+    // Keep custody even if a regression unexpectedly starts a daemon.
+    let _guard = DaemonGuard::new(home.path().join("qsh/control.sock"));
+    let output = Command::new(env!("CARGO_BIN_EXE_qshd"))
+        .args([
+            "transport-ensure",
+            "--name",
+            "recovery",
+            "--port",
+            &free_udp_port().to_string(),
+            "--restart-only",
+        ])
+        .env("XDG_CACHE_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("existing qshd identity is unavailable")
+    );
+    assert!(!path.exists());
+    assert!(!home.path().join("qsh/control.sock").exists());
+}
+
+#[test]
+fn restart_only_starts_installed_daemon_with_the_existing_identity() {
+    let _serial = serialised();
+    let home = private_temp_home().unwrap();
+    let cache = home.path().join("qsh");
+    std::fs::create_dir(&cache).unwrap();
+    let path = cache.join("transport_server_key.bin");
+    let key = qshd::load_or_create_transport_key(&path).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let sock = cache.join("control.sock");
+    let _guard = DaemonGuard::new(sock.clone());
+    let run = spawn_transport_ensure_with(
+        home.path(),
+        "recovery",
+        free_udp_port(),
+        &BASE64.encode([5; 32]),
+        &["--restart-only"],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert_eq!(run.server_pubkey, BASE64.encode(key.public));
+    assert!(wait_for_status(&sock, DAEMON_STATUS_TIMEOUT));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}

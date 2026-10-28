@@ -923,3 +923,71 @@ fn partial_ready_then_timeout_is_not_success_and_keeps_stderr() {
     assert!(error.to_string().contains("stderr: unfinished-ensure"));
     assert_no_temporary(&sb);
 }
+
+#[test]
+fn restart_only_missing_never_approves_or_loads_an_image() {
+    let mut sb = Sandbox::start();
+    let source = source(SCRIPT);
+    let approval = approval(true);
+    let result = run(
+        &mut sb,
+        InstallPolicy::RestartOnly,
+        hooks(source.clone(), approval.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    );
+    assert!(
+        matches!(result, Err(BringUpError::InstallRequired)),
+        "{result:?}"
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert!(approval.offers.lock().unwrap().is_empty());
+    assert_not_started(&sb);
+}
+
+#[test]
+fn restart_only_found_passes_restriction_without_image_or_approval() {
+    let mut sb = Sandbox::start();
+    let mut script = b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/ensure-args\"\n".to_vec();
+    script.extend_from_slice(SCRIPT.strip_prefix(b"#!/bin/sh\n").unwrap());
+    fs::write(final_path(&sb), script).unwrap();
+    fs::set_permissions(final_path(&sb), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = source(b"unused");
+    let approval = approval(true);
+    run(
+        &mut sb,
+        InstallPolicy::RestartOnly,
+        hooks(source.clone(), approval.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert!(approval.offers.lock().unwrap().is_empty());
+    let args = fs::read_to_string(sb.home.path().join("ensure-args")).unwrap();
+    assert!(args.lines().any(|arg| arg == "--restart-only"), "{args}");
+}
+
+#[test]
+fn restart_only_rejected_flag_never_retries_an_unrestricted_command() {
+    let mut sb = Sandbox::start();
+    let script = b"#!/bin/sh\nprintf 'x' >> \"$HOME/ensure-attempts\"\nprintf 'unsupported recovery mode\n' >&2\nexit 77\n";
+    fs::write(final_path(&sb), script).unwrap();
+    fs::set_permissions(final_path(&sb), fs::Permissions::from_mode(0o700)).unwrap();
+    let source = source(b"unused");
+    let approval = approval(true);
+    let result = run(
+        &mut sb,
+        InstallPolicy::RestartOnly,
+        hooks(source.clone(), approval.clone(), Arc::default()),
+        &knock::Cancel::new(),
+    );
+    assert!(
+        matches!(result, Err(BringUpError::EnsureFailed(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        fs::read(sb.home.path().join("ensure-attempts")).unwrap(),
+        b"x"
+    );
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert!(approval.offers.lock().unwrap().is_empty());
+}

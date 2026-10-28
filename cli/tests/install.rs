@@ -290,7 +290,7 @@ fn background_never_installs_even_with_cached_image() {
     assert!(
         wait_until(|| std::fs::read_to_string(home.path().join("qsh/log"))
             .unwrap_or_default()
-            .contains("NeedsPrompt")),
+            .contains("qshd is missing; recovery will not install it")),
         "{}",
         screen.text()
     );
