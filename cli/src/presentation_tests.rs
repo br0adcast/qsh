@@ -6,6 +6,7 @@ fn presentation304_burst_keeps_fixed_deadline_and_latest_quiet_frame() {
     let mut physical = terminal::TerminalCore::new(20, 5);
     physical.feed(&written(&s.handle(UiEvent::Stream0(record(b"\rA")), 100)));
     let projections = s.projections;
+    let commits = s.commits;
     for (at, byte) in [(101, b'B'), (105, b'C'), (115, b'D')] {
         let actions=s.handle(UiEvent::Stream0(record(&[b'\r',byte])),at);
         assert!(written(&actions).is_empty());

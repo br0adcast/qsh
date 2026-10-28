@@ -609,6 +609,18 @@ The client reconciles the predicted display with the authoritative server frame.
 On applications with unusual redraw behavior, disabling prediction may avoid
 visible corrections.
 
+### Ordinary output presentation
+
+The console keeps ingesting server output and evaluating the terminal model
+immediately. During a burst it can retain the latest ordinary-output snapshot
+until 16 ms after the last changed presentation. New output does not extend
+that deadline, and quiet final output is presented when the deadline arrives.
+
+Input, echo acknowledgements, synchronized-output boundaries, input-mode changes,
+geometry and visible UI changes bypass this pacing. Normal exit and suspension
+flush already-executed pending output before restoring the local terminal.
+This interval is not a global frame-rate limit.
+
 ## Logs and troubleshooting
 
 The client log is enabled without `--verbose`:

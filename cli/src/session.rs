@@ -316,6 +316,8 @@ pub struct Session {
     #[cfg(test)]
     projections: usize,
     #[cfg(test)]
+    commits: usize,
+    #[cfg(test)]
     repaints: usize,
     /// The TERMINAL's current size; the shell's is [`Session::size`].
     cols: u16,
@@ -433,6 +435,8 @@ impl Session {
             recycling: tests::Recycling::Keep,
             #[cfg(test)]
             projections: 0,
+            #[cfg(test)]
+            commits: 0,
             #[cfg(test)]
             repaints: 0,
             cols: terminal_size::ViewportSize::new(cols, rows).cols(),
@@ -1732,7 +1736,9 @@ impl Session {
         }
     }
 
-    fn flush_presentation(&mut self, now_ms: i64) -> Vec<Action> {
+    /// Flush only the already-executed snapshot before an ordered owner boundary.
+    /// This does not evaluate the model or execute synchronized parser bytes.
+    pub fn flush_presentation(&mut self, now_ms: i64) -> Vec<Action> {
         match self.pending_presentation.take() {
             Some(pending) => self.paint_at(pending.frame, now_ms),
             None => Vec::new(),
@@ -1891,6 +1897,10 @@ impl Session {
         self.last_presentation_ms = Some(now_ms);
         self.renderer
             .set_physical_scroll_eligible(shown.rows == self.raw_rows);
+        #[cfg(test)]
+        {
+            self.commits += 1;
+        }
         let bytes = self.renderer.render(&shown);
         if let Some(old) = self.last_frame.replace(shown) {
             self.recycle(old);

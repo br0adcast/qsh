@@ -113,6 +113,13 @@ mod applied_gap_tests {
         fn data(&mut self, text: &[u8]) {
             self.record(16, ShellRecord::Data(text.to_vec()));
             self.flush();
+            // Existing assertions inspect a completed presentation. Service its
+            // actual deadline; tests of a held candidate use record/flush directly.
+            if let Some(at) = self.session.ui_deadlines().presentation_ms {
+                self.now = at;
+                let actions = self.session.handle(UiEvent::Tick, at);
+                self.paint(&actions);
+            }
         }
     }
     fn gap(instance: u64) -> ShellRecord {
@@ -120,6 +127,38 @@ mod applied_gap_tests {
             instance: ChannelInstance::new(instance).unwrap(),
             cause: OutputGapCause::PreviousConnectionOutputUnconfirmed,
         }
+    }
+
+    #[test]
+    fn presentation304_main_deadline_delivers_latest_snapshot_and_gap_cancels_it() {
+        let mut rig = Rig::new();
+        rig.now = 100;
+        rig.data(b"A");
+        rig.record(16, ShellRecord::Data(b"B".to_vec()));
+        rig.flush();
+        let due = rig.session.ui_deadlines().presentation_ms.unwrap();
+        assert_eq!(due, 117);
+        assert!(!rig.text().contains("AB"));
+        let origin = Instant::now();
+        assert_eq!(session_deadline(&rig.session, origin, None),
+            Some(origin + Duration::from_millis(due as u64)));
+        let inbox = UiInbox::new().unwrap();
+        let mut events = Vec::new();
+        collect_ui_turn(&inbox, &mut events, session_deadline(&rig.session, origin, None),
+            origin + Duration::from_millis(due as u64));
+        assert!(matches!(events.as_slice(), [UiEvent::Tick]));
+        let actions = rig.session.handle(events.pop().unwrap(), due);
+        rig.paint(&actions);
+        rig.now = due;
+        assert!(rig.text().contains("AB"));
+        assert!(rig.session.ui_deadlines().presentation_ms.is_none());
+        rig.record(16, ShellRecord::Data(b"C".to_vec()));
+        rig.flush();
+        assert!(rig.session.ui_deadlines().presentation_ms.is_some());
+        let (_, states) = rig.record(16, gap(1));
+        assert!(states.first().is_some_and(|frame| frame.contains("ABC")));
+        assert!(rig.session.ui_deadlines().presentation_ms.is_none());
+        assert!(rig.text().contains("Output continuity"));
     }
 
     #[test]
