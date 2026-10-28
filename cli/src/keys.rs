@@ -281,41 +281,39 @@ fn file_candidates(
 ///
 /// `ask` is `None` when there is nobody to ask on this caller's behalf: an
 /// encrypted file is then reported as [`KeyError::Locked`] instead of
-/// prompting. Only the loader's typed PassphraseRequired result enters this
+/// prompting. Only the selected decoded key's encrypted state enters this
 /// flow; unreadable, invalid and unsupported encrypted formats never ask.
 fn load_file(
     path: &Path,
     ask: Option<&dyn Passphrase>,
     login: &str,
 ) -> Result<(Arc<dyn AuthSigner>, String), KeyError> {
-    let loaded = match FileSigner::load_classified(path, None) {
-        Ok(signer) => signer,
-        Err(first) => {
-            if !matches!(first, sshauth::keyfile::KeyFileError::PassphraseRequired) {
-                return Err(KeyError::IdentityUnreadable {
-                    path: path.to_path_buf(),
-                    why: first.to_string(),
-                });
-            }
-            let Some(ask) = ask else {
-                return Err(KeyError::Locked {
-                    path: path.to_path_buf(),
-                });
-            };
-            let Some(phrase) = ask.ask(&format!("Passphrase for key {}: ", path.display())) else {
-                return Err(KeyError::IdentityUnreadable {
-                    path: path.to_path_buf(),
-                    why: first.to_string(),
-                });
-            };
-            FileSigner::load_classified(path, Some(&phrase)).map_err(|e| {
-                KeyError::IdentityUnreadable {
-                    path: path.to_path_buf(),
-                    why: e.to_string(),
-                }
-            })?
-        }
+    let unreadable = |error: sshauth::keyfile::KeyFileError| KeyError::IdentityUnreadable {
+        path: path.to_path_buf(),
+        why: error.to_string(),
     };
+    // Retain the selected encrypted/prepared object across the callback. A
+    // pathname or even an open inode can change while the user is answering.
+    let selected = sshauth::keyfile::read(path).map_err(unreadable)?;
+    let phrase = if selected.is_encrypted() {
+        let Some(ask) = ask else {
+            return Err(KeyError::Locked {
+                path: path.to_path_buf(),
+            });
+        };
+        let Some(phrase) = ask.ask(&format!("Passphrase for key {}: ", path.display())) else {
+            return Err(unreadable(
+                sshauth::keyfile::KeyFileError::PassphraseRequired,
+            ));
+        };
+        Some(phrase)
+    } else {
+        None
+    };
+    let prepared = selected
+        .into_prepared(phrase.as_deref())
+        .map_err(unreadable)?;
+    let loaded = FileSigner::from_prepared(prepared);
     let print = sshauth::verify::fingerprint(loaded.public_key());
     let loaded = loaded.with_login(login.to_string());
     Ok((Arc::new(loaded), print))
@@ -733,5 +731,118 @@ mod tests {
             Err(KeyError::IdentityUnreadable { .. })
         ));
         assert!(!ask.asked.get());
+    }
+
+    #[derive(Clone, Copy)]
+    enum PromptChange {
+        Replace,
+        Delete,
+        InPlace,
+    }
+
+    struct ChangingPrompt {
+        path: PathBuf,
+        replacement: String,
+        change: PromptChange,
+        calls: Cell<usize>,
+    }
+
+    impl Passphrase for ChangingPrompt {
+        fn ask(&self, _prompt: &str) -> Option<String> {
+            self.calls.set(self.calls.get() + 1);
+            match self.change {
+                PromptChange::Replace => {
+                    let other = self.path.with_extension("replacement");
+                    std::fs::write(&other, &self.replacement).unwrap();
+                    std::fs::rename(other, &self.path).unwrap();
+                }
+                PromptChange::Delete => std::fs::remove_file(&self.path).unwrap(),
+                PromptChange::InPlace => std::fs::write(&self.path, &self.replacement).unwrap(),
+            }
+            Some("retained-key-fixture".into())
+        }
+    }
+
+    fn selected_key_survives_prompt_change(change: PromptChange) {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let generate = || {
+            ssh_key::PrivateKey::random(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                ssh_key::Algorithm::Ed25519,
+            )
+            .unwrap()
+        };
+        let first = generate();
+        let second = generate();
+        assert_ne!(first.public_key(), second.public_key());
+        let path = dir.path().join("selected");
+        let encrypted = first
+            .encrypt(
+                &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                "retained-key-fixture",
+            )
+            .unwrap();
+        std::fs::write(
+            &path,
+            encrypted
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        let ask = ChangingPrompt {
+            path: path.clone(),
+            replacement: second
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .to_string(),
+            change,
+            calls: Cell::new(0),
+        };
+        let (signer, fingerprint) =
+            load_file(&path, Some(&ask), "fixture").expect("the selected key survives its prompt");
+        assert_eq!(ask.calls.get(), 1);
+        match change {
+            PromptChange::Delete => assert!(!path.exists()),
+            PromptChange::Replace | PromptChange::InPlace => {
+                assert!(
+                    std::fs::read_to_string(&path).unwrap() == ask.replacement,
+                    "callback replacement bytes must remain on disk"
+                );
+                let current = std::fs::metadata(&path).unwrap();
+                assert_eq!(
+                    (original.dev(), original.ino()) == (current.dev(), current.ino()),
+                    matches!(change, PromptChange::InPlace)
+                );
+            }
+        }
+        let hash = [41; 32];
+        let record = signer.sign(&hash, Some(&[23; 16])).unwrap();
+        let verified = sshauth::verify::verify_record_signature(&hash, &record)
+            .expect("actual signature verifies");
+        assert_eq!(&verified, first.public_key());
+        assert_eq!(
+            fingerprint,
+            sshauth::verify::fingerprint(first.public_key())
+        );
+        assert_ne!(&verified, second.public_key());
+        assert!(sshauth::verify::verify_record_signature(&[42; 32], &record).is_err());
+    }
+
+    #[test]
+    fn selected_key_survives_prompt_path_replacement() {
+        selected_key_survives_prompt_change(PromptChange::Replace);
+    }
+
+    #[test]
+    fn selected_key_survives_prompt_path_deletion() {
+        selected_key_survives_prompt_change(PromptChange::Delete);
+    }
+
+    #[test]
+    fn selected_key_survives_prompt_in_place_change() {
+        selected_key_survives_prompt_change(PromptChange::InPlace);
     }
 }

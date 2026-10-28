@@ -44,6 +44,9 @@ Both QSH signing and SSH authentication read private keys only from regular
 files, with a 1 MiB input limit (including comments and padding). This is a
 resource limit, not a maximum defined by key formats. Explicit symbolic links
 remain supported; these read checks do not add owner or permission restrictions.
+For a QSH key file, a passphrase unlocks the key selected before the prompt.
+Replacing or editing its path during that attempt does not select another key;
+a later selection attempt can read the changed file normally.
 Supported key types include Ed25519, ECDSA P-256/P-384, and RSA with SHA-2. Legacy
 RSA/SHA-1 (`ssh-rsa`) authentication is refused. A personal daemon checks
 `~/.ssh/authorized_keys`; system mode checks the claimed account through a
