@@ -140,12 +140,18 @@ mod applied_gap_tests {
         assert_eq!(due, 117);
         assert!(!rig.text().contains("AB"));
         let origin = Instant::now();
-        assert_eq!(session_deadline(&rig.session, origin, None),
-            Some(origin + Duration::from_millis(due as u64)));
+        assert_eq!(
+            session_deadline(&rig.session, origin, None),
+            Some(origin + Duration::from_millis(due as u64))
+        );
         let inbox = UiInbox::new().unwrap();
         let mut events = Vec::new();
-        collect_ui_turn(&inbox, &mut events, session_deadline(&rig.session, origin, None),
-            origin + Duration::from_millis(due as u64));
+        collect_ui_turn(
+            &inbox,
+            &mut events,
+            session_deadline(&rig.session, origin, None),
+            origin + Duration::from_millis(due as u64),
+        );
         assert!(matches!(events.as_slice(), [UiEvent::Tick]));
         let actions = rig.session.handle(events.pop().unwrap(), due);
         rig.paint(&actions);
