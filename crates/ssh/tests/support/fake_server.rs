@@ -51,6 +51,8 @@ pub struct FakeAuth {
 pub struct ServerActivity {
     pub connections: AtomicUsize,
     pub userauth: AtomicUsize,
+    /// Called only after russh has verified an actual signed public-key request.
+    pub signed_publickey: AtomicUsize,
     pub exec: AtomicUsize,
 }
 
@@ -468,6 +470,10 @@ impl russh::server::Handler for Login {
         key: &russh::keys::PublicKey,
     ) -> Result<Auth, Self::Error> {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
+        self.auth
+            .activity
+            .signed_publickey
+            .fetch_add(1, Ordering::SeqCst);
         if self.auth.accept_any_key {
             self.authenticated.store(true, Ordering::SeqCst);
             return Ok(Auth::Accept);
