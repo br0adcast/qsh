@@ -10,8 +10,10 @@ use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
 
+pub(super) use crate::authority::{declared_parent, trusted_directory, trusted_leaf};
+use crate::authority::{same, AliasError};
+
 const MAX_ALIASES: usize = 40;
-const MAX_ALIAS_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const SEARCH: OFlags = OFlags::PATH;
 #[cfg(target_vendor = "apple")]
@@ -38,22 +40,6 @@ pub(crate) enum Intent {
 
 fn refused(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
-}
-
-fn same(a: &Stat, b: &Stat) -> bool {
-    a.st_dev == b.st_dev && a.st_ino == b.st_ino
-}
-
-pub(super) fn trusted_directory(owner: u32, mode: u32, uid: u32) -> bool {
-    (owner == 0 || owner == uid) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
-}
-
-pub(super) fn declared_parent(owner: u32, mode: u32, uid: u32, is_root: bool) -> bool {
-    owner == uid && (mode & 0o077 == 0 || (!is_root && mode & 0o1000 == 0))
-}
-
-pub(super) fn trusted_leaf(owner: u32, links: u64, uid: u32) -> bool {
-    owner == uid && links == 1
 }
 
 fn directory(fd: &impl AsFd, uid: u32) -> io::Result<Stat> {
@@ -101,16 +87,12 @@ fn alias(parent: &OwnedFd, name: &OsStr, uid: u32) -> io::Result<OsString> {
     {
         return Err(refused("log parent alias is not trusted"));
     }
-    let mut buffer = [0u8; MAX_ALIAS_BYTES + 1];
-    let count = fs::readlinkat_raw(parent, name, &mut buffer)?;
-    if count > MAX_ALIAS_BYTES {
-        return Err(refused("log parent alias target is too long"));
+    match crate::authority::read_alias(parent, name, &before) {
+        Ok(target) => Ok(OsString::from_vec(target)),
+        Err(AliasError::Read(error) | AliasError::Restat(error)) => Err(error),
+        Err(AliasError::TooLong) => Err(refused("log parent alias target is too long")),
+        Err(AliasError::Changed) => Err(refused("log parent alias changed during resolution")),
     }
-    let after = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if !same(&before, &after) || before.st_uid != after.st_uid {
-        return Err(refused("log parent alias changed during resolution"));
-    }
-    Ok(OsString::from_vec(buffer[..count].to_vec()))
 }
 
 pub(crate) struct ParentAuthority {
@@ -270,16 +252,12 @@ impl ParentAuthority {
         // the pinned directory's own dot entry and check exact identity first.
         let parent_repair =
             if matches!(self.intent, Intent::DeclaredPrivate) && parent.st_mode & 0o077 != 0 {
-                let fd = fs::openat(
-                    &self.directory,
-                    ".",
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?;
-                let current = directory(&fd, self.uid)?;
-                if !same(&parent, &current) || current.st_uid != self.uid {
+                let handle = crate::authority::repair_handle(&self.directory, &parent, |fd| {
+                    directory(fd, self.uid)
+                })?;
+                let Some((fd, _)) = handle.filter(|(_, current)| current.st_uid == self.uid) else {
                     return Err(refused("log directory changed before repair"));
-                }
+                };
                 self.validate_parent()?;
                 Some(fd)
             } else {

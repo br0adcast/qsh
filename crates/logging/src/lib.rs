@@ -4,6 +4,7 @@
 //! sink and a `log::Log` with a per-component filter. Logging is best
 //! effort: it never panics and never reports write errors.
 
+pub mod authority;
 mod diagnostic;
 mod file;
 mod file_path;

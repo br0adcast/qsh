@@ -120,8 +120,12 @@ jobs:
             --require file::tests::rotation_bound_missing_or_replaced_parent_does_not_extend_old_file \
             --require file::tests::rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records \
             --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
-            --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
-          grep -F 'test result: ok. 47 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+            --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover \
+            --require authority::tests::declared_parent_is_the_negation_of_the_session_refusal \
+            --require authority::tests::an_alias_target_is_followed_up_to_the_limit \
+            --require authority::tests::a_verified_alias_is_read_whole_and_rechecked \
+            --require authority::tests::a_repair_handle_is_the_pinned_directory_itself
+          grep -F 'test result: ok. 51 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Release cache authority on macOS
         shell: bash
         run: |
