@@ -734,6 +734,19 @@ fn split_with_clients<T>(
                 // Credential changes clear PDEATHSIG; restore exact parent
                 // protection before constructing any auxiliary thread.
                 arm_and_verify_pdeathsig(helper_pid)?;
+                #[cfg(target_os = "linux")]
+                {
+                    // Only the dropped worker and its future threads inherit
+                    // this exec restriction. PAM and user processes descend
+                    // from the unchanged privileged helper instead.
+                    nix::sys::prctl::set_no_new_privs()
+                        .context("restricting privilege gains in worker exec")?;
+                    anyhow::ensure!(
+                        nix::sys::prctl::get_no_new_privs()
+                            .context("verifying worker no_new_privs")?,
+                        "worker no_new_privs did not read back enabled"
+                    );
+                }
                 let clients = make_clients(worker_channels, worker_auth, &config, control)?;
                 run_worker(clients)
             })();

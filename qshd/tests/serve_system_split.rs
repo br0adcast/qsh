@@ -35,9 +35,10 @@
 //! `system_mode_accounts.rs` already warn about -- so, like them, this file
 //! runs its bodies through `common::on_a_disposable_host`: root AND
 //! `QSHD_TEST_DISPOSABLE_HOST=1`, which only a disposable container may
-//! set, or a loud `SKIPPED` line and nothing touched. No account is
-//! created here, but the write is exactly as irreversible on a host anyone
-//! keeps. Run it like this, from the repository's root:
+//! set, or a loud `SKIPPED` line and nothing touched. The worker-only
+//! no_new_privs control also creates a throwaway account and an identity
+//! probe only in the guest filesystem. None may run on a host anyone keeps.
+//! Run it like this, from the repository's root:
 //!
 //! ```text
 //! cargo test -p qshd --features system --test serve_system_split --locked --no-run
@@ -1483,3 +1484,7 @@ fn helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inheri
         assert_eq!(std::fs::read(&path).unwrap(), b"owned non-socket fixture");
     });
 }
+
+#[cfg(target_os = "linux")]
+#[path = "serve_system_split/worker_no_new_privs.rs"]
+mod worker_no_new_privs;
