@@ -93,6 +93,18 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected runtime SKIPPED"):
             self.module.check_report(self.report, selected)
 
+    def test_worker_no_new_privs_fixture_has_one_exact_disposable_owner(self):
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        binary = "qshd::serve_system_split"
+        name = "worker_no_new_privs::worker67_no_new_privs_does_not_restrict_helper_or_user_exec"
+        key = (binary, name)
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite test serve_system_split")
+        self.assertEqual([item for item in expected if item[1] == name], [key])
+        self.assertEqual(self.module.exclusion_filter({key: expected[key]}),
+                         f"not ((binary_id(={binary}) & test(={name})))")
+        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
+        self.assertIn("--require " + name, workflow)
+
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),
                              ("tests::safe", "stdout", "<&> ordinary output"),

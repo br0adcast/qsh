@@ -261,6 +261,14 @@ user and group IDs and its supplementary groups, checks that no permitted,
 effective or ambient capabilities remain, and verifies that an attempt to
 regain UID 0 fails. These checks do not enforce exclusive use of the account.
 
+On Linux, the dropped worker sets and verifies `no_new_privs` before starting
+its client/runtime threads. It cannot gain privileges by executing a setuid,
+setgid or file-capability program. This worker-only setting does not change the
+helper's state: PAM monitors and user shells/commands descend from the helper,
+so their intended privilege transitions remain available. A restriction already
+inherited from a service manager still applies and cannot be undone. Other
+platforms retain their existing credential checks without this Linux mechanism.
+
 The network worker holds the daemon's private host key and user PTY and screen
 state. Compromising it can expose the daemon's identity and session content
 across the accounts it serves. Privilege separation protects the privileged

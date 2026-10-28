@@ -60,7 +60,8 @@
         "the_worker_dies_when_the_helper_dies_even_with_the_seam_held_open",
         "the_worker_ends_itself_when_only_its_authentication_seam_is_lost",
         "the_worker_holds_no_privileged_log_descriptor_after_the_split",
-        "the_worker_runs_as_its_configured_account"
+        "the_worker_runs_as_its_configured_account",
+        "worker_no_new_privs::worker67_no_new_privs_does_not_restrict_helper_or_user_exec"
       ],
       "reason": "Requires disposable root account and helper split fixture",
       "owner": "CI container job: run_suite test serve_system_split"
