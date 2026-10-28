@@ -15,7 +15,8 @@ use hmac::{Hmac, Mac};
 
 #[derive(Clone)]
 pub struct KnownHosts {
-    user: PathBuf,
+    /// `~/.ssh/known_hosts`; none without a home directory.
+    user: Option<PathBuf>,
     system: Option<PathBuf>,
 }
 
@@ -72,25 +73,32 @@ pub fn entry_name(host: &str, port: u16) -> String {
 
 impl KnownHosts {
     pub fn new(user: PathBuf, system: Option<PathBuf>) -> KnownHosts {
-        KnownHosts { user, system }
+        KnownHosts {
+            user: Some(user),
+            system,
+        }
     }
 
-    /// The file new keys are appended to.
-    pub fn user_file(&self) -> &std::path::Path {
-        &self.user
+    /// The file new keys are appended to, when there is one.
+    pub fn user_file(&self) -> Option<&std::path::Path> {
+        self.user.as_deref()
     }
 
     /// All configured stores, in lookup order, for host-key diagnostics.
     pub fn files(&self) -> impl Iterator<Item = &std::path::Path> {
-        std::iter::once(self.user.as_path()).chain(self.system.as_deref())
+        self.user
+            .as_deref()
+            .into_iter()
+            .chain(self.system.as_deref())
     }
 
+    /// `~/.ssh/known_hosts` and the system file. Without a home directory
+    /// only the system file is read, and an accepted key cannot be saved.
     pub fn standard() -> KnownHosts {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        KnownHosts::new(
-            home.join(".ssh").join("known_hosts"),
-            Some(PathBuf::from("/etc/ssh/ssh_known_hosts")),
-        )
+        KnownHosts {
+            user: crate::paths::ssh_dir().map(|ssh| ssh.join("known_hosts")),
+            system: Some(PathBuf::from("/etc/ssh/ssh_known_hosts")),
+        }
     }
 
     pub fn lookup(&self, host: &str, port: u16) -> Result<HostKeys, ReadError> {
@@ -183,7 +191,13 @@ impl KnownHosts {
             entry_name(host, port),
             B64.encode(wire)
         );
-        storage::AppendFile::open(&self.user)?.append_with(record.as_bytes(), read_tail, after_tail)
+        let Some(user) = &self.user else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no home directory is known, so there is no ~/.ssh/known_hosts",
+            ));
+        };
+        storage::AppendFile::open(user)?.append_with(record.as_bytes(), read_tail, after_tail)
     }
 }
 
@@ -545,6 +559,30 @@ mod tests {
         let keys = kh.lookup("h", 22).unwrap();
         assert!(keys.known.is_empty());
         assert_eq!(keys.revoked, vec![K1.to_vec()]);
+    }
+
+    /// Without a home directory only the system file is consulted, and an
+    /// accepted key is refused rather than written relative to the current
+    /// directory.
+    #[test]
+    fn without_a_user_file_only_the_system_file_is_read_and_nothing_is_added() {
+        let dir = authority_dir();
+        let system = dir.path().join("ssh_known_hosts");
+        authority_write(&system, line("h", K1)).unwrap();
+        let kh = KnownHosts {
+            user: None,
+            system: Some(system.clone()),
+        };
+        assert_eq!(kh.user_file(), None);
+        assert_eq!(kh.files().collect::<Vec<_>>(), [system.as_path()]);
+        assert_eq!(kh.lookup("h", 22).unwrap().known, vec![K1.to_vec()]);
+        let error = kh.add("h", 22, "ssh-ed25519", K2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "nothing is created beside the system file"
+        );
     }
 
     #[test]

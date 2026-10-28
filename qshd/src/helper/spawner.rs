@@ -2575,6 +2575,7 @@ pub(crate) mod tests {
     /// `HelperAuth`.
     fn daemon_config() -> HelperConfig {
         HelperConfig::resolve(&crate::serve::ServeArgs {
+            status_socket: None,
             port: 60022,
             authorized_keys: None, // unread in the system mode -- see its own doc comment
             host_key: "/etc/qshd/host_key".into(),

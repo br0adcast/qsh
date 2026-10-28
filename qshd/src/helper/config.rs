@@ -141,6 +141,7 @@ mod tests {
     /// from its default, so a `resolve` that dropped one on the floor shows.
     fn args() -> ServeArgs {
         ServeArgs {
+            status_socket: None,
             port: 60022,
             authorized_keys: None, // unread in the system mode -- see its own doc comment
             host_key: "/etc/qshd/host_key".into(),

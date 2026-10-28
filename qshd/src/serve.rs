@@ -36,6 +36,8 @@ pub const MAX_RUNTIME_THREADS: usize = 256;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ServeArgs {
     pub port: u16,
+    /// Explicit root-only helper diagnostics endpoint in Linux system mode.
+    pub status_socket: Option<PathBuf>,
     /// Where the personal mode's `AuthorizedKeysVerifier` looks -- `None`
     /// in, and only in, the system mode, which never reads a single shared
     /// file at all (`--authorized-keys` is refused outright for
@@ -100,6 +102,7 @@ fn argument_text((index, value): (usize, &OsString)) -> Result<&str> {
 /// Parse OS arguments without converting filesystem paths to text.
 pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
     let mut port = None;
+    let mut status_socket = None;
     let mut authorized_keys = None;
     let mut host_key = None;
     // Only mutated in the `#[cfg(feature = "system")]` arm below -- without
@@ -124,6 +127,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
                 .ok_or_else(|| anyhow::anyhow!("flag {flag} needs a value"))
         };
         match flag {
+            "--status-socket" => status_socket = Some(PathBuf::from(value()?.1)),
             "--port" => {
                 let parsed_port: u16 = argument_text(value()?)?
                     .parse()
@@ -216,6 +220,14 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         bail!("--authorized-keys-template applies to --system only");
     }
 
+    if let Some(path) = &status_socket {
+        if !system || !cfg!(target_os = "linux") {
+            bail!("--status-socket requires Linux --system mode");
+        }
+        if !path.is_absolute() {
+            bail!("--status-socket must be absolute");
+        }
+    }
     let authorized_keys = match authorized_keys {
         Some(p) => Some(p),
         // Symmetric to `host_key` below: the system mode never reads this
@@ -240,6 +252,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         authorized_keys_template.unwrap_or_else(|| "%h/.ssh/authorized_keys".to_string());
     Ok(ServeArgs {
         port: port.unwrap_or(DEFAULT_SERVE_PORT),
+        status_socket,
         authorized_keys,
         host_key,
         system,
@@ -312,13 +325,40 @@ pub const SYSTEM_LOG_DIR: &str = "/var/log/qshd";
 /// own diagnostics, which is what this file is; a service log is not a
 /// per-user cache in the first place, in the personal mode either, but that
 /// mismatch is not this task's to fix.
-pub fn cache_dir(system: bool) -> PathBuf {
+///
+/// A personal mode without a home directory has no cache directory: an
+/// error, never a directory relative to wherever the daemon was started. A
+/// relative `$HOME` is the caller's explicit choice and is kept;
+/// `transport-ensure` captures it before detaching.
+pub fn cache_dir(system: bool) -> Result<PathBuf> {
     if system {
-        return PathBuf::from(SYSTEM_LOG_DIR);
+        return Ok(PathBuf::from(SYSTEM_LOG_DIR));
     }
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("qsh")
+    personal_cache_dir(dirs::cache_dir())
+}
+
+/// The personal cache directory under the platform's cache root, as
+/// `dirs::cache_dir()` found it.
+fn personal_cache_dir(root: Option<PathBuf>) -> Result<PathBuf> {
+    let variables = if cfg!(target_os = "macos") {
+        "HOME"
+    } else {
+        "HOME or XDG_CACHE_HOME"
+    };
+    root.map(|root| root.join("qsh")).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot locate the cache directory: no home directory is known; set {variables}"
+        )
+    })
+}
+
+/// Start the diagnostic file log in the mode's cache directory, or report
+/// once, as a log that cannot be opened is, that there is none.
+pub fn init_log(system: bool) {
+    match cache_dir(system) {
+        Ok(directory) => log::init(&directory),
+        Err(error) => log::init_unavailable(&error),
+    }
 }
 
 /// The personal mode serves the account that starts it. As root that
@@ -451,7 +491,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     // watch for in `journalctl`. Set before `init`, and before the system
     // mode forks, so the helper and the worker mirror their lines too.
     log::mirror_to_stderr();
-    log::init(&cache_dir(parsed.system));
+    init_log(parsed.system);
 
     let keypair = crate::load_or_create_transport_key(&parsed.host_key).with_context(|| {
         format!(
@@ -534,6 +574,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // service at once rather than after a process tree exists.
         return crate::helper::split_and_run_owned(
             helper_config,
+            parsed.status_socket.clone(),
             move |mut spawner, mut helper_auth, login_ends, context| {
                 let stop = context.stop();
                 // Fixed custody is outside all published Arc clients. On an
@@ -1049,7 +1090,7 @@ mod tests {
         let _restore = RestoreEnvVars::unset(&["HOME", "XDG_CACHE_HOME"]);
         std::env::set_var("HOME", "/tmp/qshd-test-decoy-home");
         assert_eq!(
-            cache_dir(true),
+            cache_dir(true).unwrap(),
             PathBuf::from("/var/log/qshd"),
             "the system mode's log directory must be fixed, not tied to whichever \
              account's $HOME happens to be set"
@@ -1058,13 +1099,43 @@ mod tests {
 
     /// The personal mode is unchanged: it still follows `$HOME` (through
     /// `dirs::cache_dir()`), exactly as before this task.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_personal_mode_log_directory_still_follows_home() {
         let _restore = RestoreEnvVars::unset(&["HOME", "XDG_CACHE_HOME"]);
         std::env::set_var("HOME", "/tmp/qshd-test-decoy-home");
         assert_eq!(
-            cache_dir(false),
+            cache_dir(false).unwrap(),
             PathBuf::from("/tmp/qshd-test-decoy-home/.cache/qsh")
+        );
+        // An absolute XDG override wins; a relative one is ignored.
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/qshd-test-decoy-cache");
+        assert_eq!(
+            cache_dir(false).unwrap(),
+            PathBuf::from("/tmp/qshd-test-decoy-cache/qsh")
+        );
+        std::env::set_var("XDG_CACHE_HOME", "relative-cache");
+        assert_eq!(
+            cache_dir(false).unwrap(),
+            PathBuf::from("/tmp/qshd-test-decoy-home/.cache/qsh")
+        );
+    }
+
+    /// No cache root at all -- `$HOME` unset or empty and an account the
+    /// database does not know -- is refused on every platform rather than
+    /// replaced by the working directory.
+    #[test]
+    fn the_personal_mode_refuses_a_missing_cache_root() {
+        let error = personal_cache_dir(None).unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "cannot locate the cache directory: no home directory is known; set HOME"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            personal_cache_dir(Some(PathBuf::from("/h/Library/Caches"))).unwrap(),
+            PathBuf::from("/h/Library/Caches/qsh")
         );
     }
 
@@ -2425,4 +2496,20 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "system"))]
+#[test]
+fn helper_status143_status_socket_is_explicit_system_only() {
+    let parse =
+        |xs: &[&str]| parse_serve_args(&xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+    assert!(parse(&[
+        "serve",
+        "--system",
+        "--status-socket",
+        "/run/qshd/status.sock"
+    ])
+    .is_ok());
+    assert!(parse(&["serve", "--status-socket", "/run/qshd/status.sock"]).is_err());
+    assert!(parse(&["serve", "--system", "--status-socket", "relative.sock"]).is_err());
 }

@@ -684,18 +684,11 @@ Session shells are separate processes. In system mode the setting applies
 to the worker process, which runs the runtime; PAM and session starts
 happen in the privileged helper, which is single-threaded either way.
 
-The default is what qshd has always run, and the measurements so far
-support keeping it. They come from one 4-CPU VM ([performance
-baseline](performance-baseline.md#runtime-worker-threads-2026-10-26)) and
-showed no latency difference between one worker and one per CPU with up to
-five active sessions, in personal and system mode; with heavy output, and
-with up to 16 sessions, fewer workers used somewhat less CPU and fewer
-context switches. They do not show that the counts are equivalent on other
-hosts. Hosts with more than 4 CPUs and more than 16 sessions have not been
-measured. Setting a small count, such as `--runtime-threads 2`, limits how
-many CPUs qshd's async work spreads over, for example where qshd shares a
-large machine with other work; measure the effect there before relying on
-it.
+Choose an explicit worker count only after evaluating the deployment's workload.
+A smaller count limits how widely async work can run, but does not cap the
+blocking pool or session processes. Use the maintained [measurement
+procedure](performance-baseline.md#procedure) to compare configurations on the
+same host before relying on a CPU or latency benefit.
 
 ## Checking it
 
@@ -720,6 +713,12 @@ tail -f /var/log/qshd/qshd.log        # Linux, system mode -- a fixed,
                                       # root-owned path, not a per-account
                                       # cache directory; see "System mode" above
 ```
+
+Unless an absolute `XDG_CACHE_HOME` selects it (Linux), the personal mode's
+cache directory is under the home directory: `$HOME`, or the account
+database's entry when `HOME` is unset or empty. When neither names one, qshd
+does not use the working directory instead: `transport-ensure` fails with an
+error, and `serve` runs without its file log.
 
 This confirms the daemon is alive and listening on the port, but not that
 a real client can get past signature verification and get a shell — for
@@ -941,3 +940,33 @@ for those versions needs that one edit.
   log out from under the other — short entries aren't split in half
   (rotation is atomic), but a handful of lines around the rotation moment
   can get lost.
+
+### Root-only helper status (Linux system service)
+
+The packaged system service publishes `/run/qshd/helper-status.sock` in its
+root-owned `0700` runtime directory. Query it locally as root:
+
+```sh
+qshd helper-status --socket /run/qshd/helper-status.sock
+```
+
+Standalone system services opt in with `serve --system --status-socket PATH`.
+The absolute socket path must have an existing root-owned `0700` parent. Each
+service needs a distinct path; a retained lifetime lock prevents another service
+from replacing its endpoint. Personal daemons do not publish this endpoint.
+
+The command returns one schema-versioned JSON snapshot of registered helper
+capacity: serving/stopping phase, available/unavailable counts, admitted and
+provisional logins, pending retirement, unconfirmed obligations, overlapping
+reason counts, outstanding waits/receipts/slots, and PAM outcome categories.
+Healthy admitted logins are not cleanup debt. Pending retirement is distinct
+from explicitly lost evidence. Queries neither advance nor refund ownership.
+The snapshot remains queryable while the helper retains stopping custody.
+
+These are point-in-time registered-domain diagnostics, not an admission
+reservation or proof that every operating-system descendant or PAM side effect
+has finished. No global `cleanup_complete` flag is provided. Connection errors,
+timeouts, partial responses and unsupported schemas mean status unavailable,
+never zero capacity or successful cleanup. A helper blocked inside a syscall
+cannot answer. Diagnostic-client errors do not stop sessions or extend cleanup;
+a hard listener failure disables only diagnostics and emits a warning.

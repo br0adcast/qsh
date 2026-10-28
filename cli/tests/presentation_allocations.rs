@@ -418,10 +418,22 @@ fn steady_presentation_allocates_no_grid() {
             for event in step(n) {
                 now += 1;
                 LARGEST.set(0);
-                let (actions, cost) = measured(|| session.handle(event, now));
+                let ((immediate, due), cost) = measured(|| {
+                    let immediate = session.handle(event, now);
+                    // Include staged storage and the actual projection/render
+                    // at its fixed deadline in the same allocation boundary.
+                    let due = if let Some(deadline) = session.ui_deadlines().presentation_ms {
+                        now = deadline;
+                        session.handle(UiEvent::Tick, now)
+                    } else {
+                        Vec::new()
+                    };
+                    (immediate, due)
+                });
                 assert!(
-                    actions
+                    immediate
                         .iter()
+                        .chain(due.iter())
                         .any(|action| matches!(action, Action::Write(bytes) if !bytes.is_empty())),
                     "{name} step {n} presented nothing"
                 );

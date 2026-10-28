@@ -394,9 +394,7 @@ pub(super) fn run_with_owned_worker(
     auth: UnixStream,
     config: HelperConfig,
     diagnostics: crate::log::relay::Receiver,
-    worker: super::worker_owner::WorkerOwner,
-    adoption: AdoptionRuntime,
-    stop: super::stop_signal::StopOwner,
+    owned: OwnedParent,
 ) -> ! {
     let outcome = match serve_inner(
         channels,
@@ -405,11 +403,7 @@ pub(super) fn run_with_owned_worker(
         HashMap::new(),
         AccountSwitches::REAL,
         Some(diagnostics),
-        Some(OwnedParent {
-            worker,
-            adoption: Some(adoption),
-            stop: Some(stop),
-        }),
+        Some(owned),
     ) {
         HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
         _ => unreachable!("qualified helper cannot take an unqualified tail"),
@@ -443,6 +437,8 @@ fn serve_owned(
         diagnostics,
         Some(OwnedParent {
             worker,
+            status_socket: None,
+            status_gate: None,
             // Component-only worker proof, not qualified helper completion.
             adoption: None,
             stop: None,
@@ -1053,10 +1049,12 @@ enum HelperLoopExit {
 }
 
 #[cfg(target_os = "linux")]
-struct OwnedParent {
-    worker: super::worker_owner::WorkerOwner,
-    adoption: Option<AdoptionRuntime>,
-    stop: Option<super::stop_signal::StopOwner>,
+pub(super) struct OwnedParent {
+    pub(super) status_socket: Option<std::path::PathBuf>,
+    pub(super) status_gate: Option<UnixStream>,
+    pub(super) worker: super::worker_owner::WorkerOwner,
+    pub(super) adoption: Option<AdoptionRuntime>,
+    pub(super) stop: Option<super::stop_signal::StopOwner>,
 }
 
 fn serve_inner(
@@ -1069,14 +1067,59 @@ fn serve_inner(
     #[cfg(target_os = "linux")] owned: Option<OwnedParent>,
 ) -> HelperLoopExit {
     #[cfg(target_os = "linux")]
-    let (mut worker, adoption, stop) = match owned {
+    let (mut worker, adoption, stop, status_socket, status_gate) = match owned {
         Some(owned) => (
             Some(WorkerDomain::new(owned.worker)),
             owned.adoption,
             owned.stop,
+            owned.status_socket,
+            owned.status_gate,
         ),
-        None => (None, None, None),
+        None => (None, None, None, None, None),
     };
+    #[cfg(target_os = "linux")]
+    let status = status_socket.and_then(|path| match crate::helper_status::Endpoint::bind(&path) {
+        Ok(endpoint) => Some(endpoint),
+        Err(error) => {
+            crate::log::error(
+                "helper",
+                &format!("requested helper status endpoint failed: {error}"),
+            );
+            if let Some(worker) = worker.as_mut() {
+                worker.setup_failed = true;
+                worker.record(ParentFailure::Setup(
+                    error.raw_os_error().unwrap_or(nix::libc::EIO),
+                ));
+                worker.request_stop(super::worker_protocol::StopReason::Protocol);
+            }
+            None
+        }
+    });
+    #[cfg(target_os = "linux")]
+    if let Some(gate) = status_gate {
+        if status.is_some() {
+            // SAFETY: gate owns this socket, and ready is one initialized byte.
+            let ready = [1u8];
+            let sent = unsafe {
+                nix::libc::send(
+                    gate.as_raw_fd(),
+                    ready.as_ptr().cast(),
+                    1,
+                    nix::libc::MSG_DONTWAIT | nix::libc::MSG_NOSIGNAL,
+                )
+            };
+            if sent != 1 {
+                crate::log::error("helper", "could not release helper status startup gate");
+                if let Some(worker) = worker.as_mut() {
+                    worker.setup_failed = true;
+                    worker.record(ParentFailure::Setup(nix::libc::EIO));
+                    worker.request_stop(super::worker_protocol::StopReason::Protocol);
+                }
+            }
+        }
+        // Close on success and failure; the child never owns a copy of this end.
+        drop(gate);
+    }
     // Neither seam may be able to park this loop for good -- see
     // `SEAM_SEND_TIMEOUT`. Owned setup failure enters retained cooperative
     // stopping before serving any request. Legacy fixture behavior stays separate.
@@ -1150,6 +1193,7 @@ fn serve_inner(
             shutdown.channels_open = false;
             shutdown.auth_open = false;
         }
+        shutdown.status = status;
         shutdown.worker = worker;
         shutdown.adoption = adoption;
         shutdown.stop = stop;
@@ -1261,6 +1305,12 @@ fn serve_inner(
             fds.push(PollFd::new(stop.fd(), PollFlags::POLLIN));
             index
         });
+        #[cfg(target_os = "linux")]
+        if let Some(endpoint) = shutdown.status.as_ref() {
+            if let Some(fd) = endpoint.fd() {
+                fds.push(PollFd::new(fd, PollFlags::POLLIN));
+            }
+        }
         // Never longer than REAP_INTERVAL, so a child that exits while the
         // worker is silent is still noticed -- and never past the nearest
         // startup deadline either, so a child that says nothing at all is
@@ -1323,6 +1373,8 @@ fn serve_inner(
         #[cfg(target_os = "linux")]
         let stop_ready = poll_ok && stop_index.is_some_and(|i| fds[i].any().unwrap_or(true));
         drop(fds);
+        #[cfg(target_os = "linux")]
+        service_helper_status(&mut shutdown.status, state);
         #[cfg(target_os = "linux")]
         if stop_ready {
             if let (Some(stop), Some(worker)) = (shutdown.stop.as_ref(), worker.as_mut()) {
@@ -1460,6 +1512,8 @@ include!("adoption_parent.rs");
 /// Worker physical settlement and cooperative receipt outcome remain separate.
 /// Monitor-descendant custody and service signal delivery remain unqualified.
 struct HelperShutdown {
+    #[cfg(target_os = "linux")]
+    status: Option<crate::helper_status::Endpoint>,
     state: LoopState,
     first_monitor_failure: Option<MonitorShutdownFailure>,
     channels_open: bool,
@@ -1485,6 +1539,8 @@ impl HelperShutdown {
     fn new(state: LoopState) -> Self {
         Self {
             state,
+            #[cfg(target_os = "linux")]
+            status: None,
             first_monitor_failure: None,
             channels_open: true,
             auth_open: true,
@@ -1586,6 +1642,12 @@ impl HelperShutdown {
         fds.extend(owners.iter().map(|owner| {
             PollFd::new(self.state.monitors[owner].seam().as_fd(), PollFlags::POLLIN)
         }));
+        #[cfg(target_os = "linux")]
+        if let Some(endpoint) = self.status.as_ref() {
+            if let Some(fd) = endpoint.fd() {
+                fds.push(PollFd::new(fd, PollFlags::POLLIN));
+            }
+        }
         let (ready_reports, ready) =
             match poll(&mut fds, PollTimeout::try_from(REAP_INTERVAL).unwrap()) {
                 Ok(_) => (
@@ -1613,6 +1675,8 @@ impl HelperShutdown {
                 }
             };
         drop(fds);
+        #[cfg(target_os = "linux")]
+        service_helper_status(&mut self.status, &self.state);
         settle_ready_pending(seams, &mut self.state, config, &ready_reports);
         serve_ready_monitors(seams, &mut self.state, &ready);
         #[cfg(target_os = "linux")]
@@ -2416,6 +2480,78 @@ fn capacity_snapshot(state: &LoopState) -> Option<CapacityCounts> {
         counts.observe(state, owner, true, false)?;
     }
     Some(counts)
+}
+
+#[cfg(target_os = "linux")]
+fn service_helper_status(endpoint: &mut Option<crate::helper_status::Endpoint>, state: &LoopState) {
+    if let Some(owner) = endpoint.as_mut() {
+        if let Err(error) = owner.service(|| helper_status_snapshot(state)) {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                return;
+            }
+            crate::log::warn(
+                "helper",
+                &format!("helper status diagnostics disabled: {error}"),
+            );
+            owner.disable();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn helper_status_snapshot(state: &LoopState) -> Vec<u8> {
+    use crate::helper_status::{Capacity, Counts, Pam, PamStep, Phase, Snapshot};
+    let step = |step| match step {
+        super::pam_completion::PamStep::Skipped => PamStep::Skipped,
+        super::pam_completion::PamStep::Attempted(0) => PamStep::Ok,
+        super::pam_completion::PamStep::Attempted(_) => PamStep::Failed,
+    };
+    let counts = capacity_snapshot(state).map(|c| Counts {
+        admitted: c.admitted,
+        provisional: c.provisional,
+        retiring: c.retiring,
+        retiring_pending: c.retiring_pending,
+        charged: c.charged,
+        unconfirmed: c.unconfirmed,
+        missing_monitor: c.missing_monitor,
+        wait_lost: c.wait_lost,
+        monitor_failed: c.monitor_failed,
+        receipt_lost: c.receipt_lost,
+        retired_slots: c.retired_slots,
+        wait_outstanding: c.wait_outstanding,
+        receipt_outstanding: c.receipt_outstanding,
+        pam: match c.pam {
+            PamCompletion::NotOpened => Pam::NotOpened,
+            PamCompletion::Finished {
+                close_session,
+                delete_cred,
+                end,
+            } => Pam::Finished {
+                close_session: step(close_session),
+                delete_cred: step(delete_cred),
+                end: step(end),
+            },
+        },
+    });
+    serde_json::to_vec(&Snapshot {
+        schema: 1,
+        phase: if state.stopping {
+            Phase::Stopping
+        } else {
+            Phase::Serving
+        },
+        capacity: if counts.is_some() {
+            Capacity::Available
+        } else {
+            Capacity::Unavailable
+        },
+        limit: MAX_LOGINS as u16,
+        counts,
+    })
+    .expect("fixed helper snapshot is serializable")
 }
 
 fn capacity_pam_step(step: super::pam_completion::PamStep) -> &'static str {
@@ -15095,6 +15231,170 @@ pub(crate) mod tests {
         Some(module)
     }
 
+    // One request may be preceded by its exact unsolicited login retirement.
+    fn group_refusal_response(
+        channels: &UnixStream,
+        login: LoginId,
+        incarnation: u64,
+        deadline: Instant,
+    ) -> Result<Response, String> {
+        let mut notice_seen = false;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or("group refusal receive budget expired")?;
+            channels
+                .set_read_timeout(Some(remaining))
+                .map_err(|e| e.to_string())?;
+            let packet = match channel::recv_once(channels) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.map_err(|e| e.to_string())?,
+            };
+            if Instant::now() >= deadline {
+                return Err("group refusal receive budget expired".into());
+            }
+            let (bytes, fd) = packet.ok_or("helper closed before group refusal")?;
+            if fd.is_some() {
+                return Err("unexpected group refusal descriptor".into());
+            }
+            let answer = decode::<Response>(&bytes).map_err(|e| e.to_string())?;
+            match answer {
+                Response::Failed { id: 1, .. } => return Ok(answer),
+                Response::LoginEnded {
+                    login: ended,
+                    incarnation: generation,
+                } if !notice_seen && ended == login && generation == incarnation => {
+                    notice_seen = true;
+                }
+                _ => return Err(format!("unexpected group refusal response: {answer:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_accepts_both_valid_orders() {
+        for notice in [false, true] {
+            let (reader, writer) = channel::pair().unwrap();
+            if notice {
+                channel::send(
+                    &writer,
+                    &encode(&Response::LoginEnded {
+                        login: PROOF_LOGIN,
+                        incarnation: 1,
+                    })
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+            }
+            channel::send(
+                &writer,
+                &encode(&Response::Failed {
+                    id: 1,
+                    reason: REFUSED_REASON.into(),
+                })
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+            let answer =
+                group_refusal_response(&reader, PROOF_LOGIN, 1, Instant::now() + TEST_RECV_TIMEOUT);
+            assert!(
+                matches!(answer, Ok(Response::Failed { id: 1, reason })
+                if reason == REFUSED_REASON),
+                "valid notice order must preserve refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_rejects_unrelated_duplicate_and_descriptors() {
+        let ended = |login, incarnation| Response::LoginEnded { login, incarnation };
+        let failed = |id| Response::Failed {
+            id,
+            reason: REFUSED_REASON.into(),
+        };
+        let cases = vec![
+            vec![ended([0; 16], 1)],
+            vec![ended(PROOF_LOGIN, 2)],
+            vec![ended(PROOF_LOGIN, 1), ended(PROOF_LOGIN, 1)],
+            vec![failed(2)],
+            vec![Response::Opened { id: 1 }],
+            vec![Response::Exited { id: 1, code: 0 }],
+        ];
+        for messages in cases {
+            let (reader, writer) = channel::pair().unwrap();
+            for message in messages {
+                channel::send(&writer, &encode(&message).unwrap(), None).unwrap();
+            }
+            assert!(group_refusal_response(
+                &reader,
+                PROOF_LOGIN,
+                1,
+                Instant::now() + TEST_RECV_TIMEOUT
+            )
+            .is_err());
+        }
+        let descriptor = std::fs::File::open("/dev/null").unwrap();
+        for message in [ended(PROOF_LOGIN, 1), failed(1)] {
+            let (reader, writer) = channel::pair().unwrap();
+            channel::send(
+                &writer,
+                &encode(&message).unwrap(),
+                Some(descriptor.as_fd()),
+            )
+            .unwrap();
+            assert!(group_refusal_response(
+                &reader,
+                PROOF_LOGIN,
+                1,
+                Instant::now() + TEST_RECV_TIMEOUT
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn group_refusal_response_rejects_malformed_closed_and_expired() {
+        let (reader, writer) = channel::pair().unwrap();
+        channel::send(&writer, b"invalid response", None).unwrap();
+        assert!(group_refusal_response(
+            &reader,
+            PROOF_LOGIN,
+            1,
+            Instant::now() + TEST_RECV_TIMEOUT
+        )
+        .is_err());
+        let (reader, writer) = channel::pair().unwrap();
+        drop(writer);
+        assert!(group_refusal_response(
+            &reader,
+            PROOF_LOGIN,
+            1,
+            Instant::now() + TEST_RECV_TIMEOUT
+        )
+        .is_err());
+        let (reader, writer) = channel::pair().unwrap();
+        channel::send(
+            &writer,
+            &encode(&Response::Failed {
+                id: 1,
+                reason: REFUSED_REASON.into(),
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let result = group_refusal_response(&reader, PROOF_LOGIN, 1, Instant::now());
+        assert!(result.unwrap_err().contains("budget expired"));
+        // Expiry must not consume an already queued outcome.
+        assert!(matches!(
+            next_response(&reader),
+            (Response::Failed { id: 1, .. }, None)
+        ));
+    }
+
     /// Only monitors and their children mutate identity, never this libtest process.
     fn refused_group_session(
         module: &str,
@@ -15123,25 +15423,29 @@ pub(crate) mod tests {
         };
         let account = nobody_with_shell("/bin/sh");
         let h = helper_for(account.clone(), config, switches);
-        channel::send(
-            &h.channels,
-            &encode(&open_for(
-                1,
-                &account,
-                &format!("touch {}", marker.display()),
-            ))
-            .unwrap(),
-            None,
-        )
-        .unwrap();
-        let (answer, fd) = next_response(&h.channels);
+        // helper_for seeds exactly one login, assigned incarnation 1 by serve.
+        // Capture every send/receive/decode failure before ending the owned loop.
+        let outcome = (|| -> Result<Response, String> {
+            channel::send(
+                &h.channels,
+                &encode(&open_for(
+                    1,
+                    &account,
+                    &format!("touch {}", marker.display()),
+                ))
+                .map_err(|e| e.to_string())?,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            group_refusal_response(&h.channels, h.login, 1, Instant::now() + TEST_RECV_TIMEOUT)
+        })();
+        h.stop();
+        let answer = outcome.expect("group fixture receives its exact refusal");
         assert!(
             matches!(&answer, Response::Failed { id: 1, reason }
             if if child_failure { reason.contains("EPERM") } else { reason == REFUSED_REASON }),
             "{answer:?}"
         );
-        assert!(fd.is_none());
-        h.stop();
         assert!(
             !marker.exists(),
             "refused session must never execute a shell"

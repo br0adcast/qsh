@@ -9,7 +9,7 @@ use std::time::Duration;
 use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::agent::AgentIdentity;
-use russh::keys::{HashAlg, PublicKey};
+use russh::keys::{Algorithm, HashAlg, PublicKey};
 use russh::{MethodKind, MethodSet};
 
 use crate::{
@@ -393,11 +393,14 @@ async fn run_method<H: russh::client::Handler>(
             if !offered.insert(canonical(&public)?) {
                 return Ok(vec![Attempt::Duplicate]);
             }
+            let Some(hash) = hash_for(login, &wait, &public).await? else {
+                return Ok(vec![Attempt::Gone]);
+            };
             let sent = wait
                 .on(login.handle.authenticate_publickey_with(
                     username,
                     public,
-                    None,
+                    hash,
                     &mut GuardedSigner {
                         signer: &mut SignerBridge(signer),
                         cancel: &wait.cancel,
@@ -818,18 +821,32 @@ impl russh::Signer for SignerBridge {
 
     fn auth_sign(
         &mut self,
-        _key: &AgentIdentity,
-        _hash_alg: Option<HashAlg>,
+        key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
         to_sign: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
         let signer = Arc::clone(&self.0);
+        // russh supplies the public key from this authentication's offer, not
+        // another read of the provider's potentially mutable public identity.
+        let algorithm = match key.public_key().algorithm() {
+            Algorithm::Rsa { .. } => Algorithm::Rsa { hash: hash_alg },
+            other => other,
+        };
         async move {
             // Synchronous on the connection's single-threaded runtime: while a
             // slow key store signs, nothing else runs, so a cancel is only
             // noticed after the signature returns.
-            let blob = signer.sign_ssh(&to_sign).map_err(SignError::Signer)?;
-            sshauth::record::decode_signature(&blob)
+            let blob = signer
+                .sign_ssh_with_algorithm(&to_sign, algorithm.as_str())
+                .map_err(SignError::Signer)?;
+            let signature = sshauth::record::decode_signature(&blob)
                 .map_err(|e| SignError::Signer(e.to_string()))?;
+            if signature.algorithm() != algorithm {
+                return Err(SignError::Signer(format!(
+                    "external signature algorithm does not match requested {}",
+                    algorithm.as_str()
+                )));
+            }
             Ok(keyfile::append_signature(to_sign, &blob))
         }
     }
@@ -943,3 +960,7 @@ mod native_worker_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "auth_external_signer_tests.rs"]
+mod external_signer_tests;

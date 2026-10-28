@@ -262,16 +262,16 @@ pub struct Detail {
 }
 
 /// The summary a login prints before exit 12: [`all_failed`], then where
-/// the log is.
+/// the log is, when there is one.
 pub fn exit_12_summary(
     addrs: &[::connect::Address],
     failures: &[::connect::Failure],
     details: &[Detail],
     account: &str,
-    log: &Path,
+    log: Option<&Path>,
 ) -> Vec<String> {
     let mut lines = all_failed(addrs, failures, details, account);
-    lines.push(self::details(log));
+    lines.extend(log.map(self::details));
     lines
 }
 
@@ -341,26 +341,6 @@ pub fn install_declined() -> String {
     "qsh: daemon installation was declined".into()
 }
 
-/// Separate recovery consent names both independently verified identities,
-/// the account, host and fingerprint shown by `identity`'s rules.
-pub fn ssh_authorization(
-    server: &::connect::server_identity::ServerIdentity,
-    endpoint: &::connect::server_identity::SshEndpoint,
-    ssh: &ssh::HostKeyInfo,
-) -> String {
-    crate::identity::with_note(
-        format!(
-            "QSH server {} (account {})\nSSH host {}:{} ({})\nAuthorize SSH recovery for this QSH server?",
-            key_fingerprint(&server.qsh_key),
-            crate::identity::show(&server.username),
-            crate::identity::show(&endpoint.host),
-            endpoint.port,
-            crate::identity::show(&ssh.fingerprint),
-        ),
-        &[&server.username, &endpoint.host, &ssh.fingerprint],
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,35 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_control_policy_reaches_warnings_and_authorization_fields() {
-        let server = connect::server_identity::ServerIdentity {
-            qsh_key: [0; 32], // Public fingerprint fixture, not a private key.
-            username: "ali\u{202e}ce\u{2029}account".into(),
-        };
-        let endpoint = connect::server_identity::SshEndpoint {
-            host: "host\u{2066}.example\u{2028}name".into(),
-            port: 22,
-        };
-        let info = ssh::HostKeyInfo {
-            key_type: "ssh-ed25519".into(),
-            key: vec![],
-            fingerprint: "SHA256:fixture\u{200f}".into(),
-        };
-        let question = ssh_authorization(&server, &endpoint, &info);
-        // Identity fields escape what the general policy turns into `?` or
-        // a space, so two names never look alike (`identity.rs`).
-        assert!(
-            question.contains(
-                "(account ali\\u{202E}ce\\u{2029}account)\nSSH host \
-                 host\\u{2066}.example\\u{2028}name:22 (SHA256:fixture\\u{200F})\n"
-            ),
-            "{question}"
-        );
-        assert!(question.ends_with(&format!(
-            "\n{}\nAuthorize SSH recovery for this QSH server?",
-            crate::identity::NOTE
-        )));
-        assert_eq!(question.matches('\n').count(), 3);
+    fn unicode_control_policy_reaches_warning_fields() {
         assert_eq!(
             qshd_warning("h", "care\u{061c}ful\u{2028}now"),
             "qsh: h: qshd: care?ful now"
@@ -755,7 +707,7 @@ mod tests {
             &failures,
             &[],
             "u",
-            std::path::Path::new("/c/qsh/log"),
+            Some(std::path::Path::new("/c/qsh/log")),
         );
         assert_eq!(
             lines,
@@ -837,7 +789,8 @@ mod tests {
             addr: 0,
             reasons: vec![Reason::NoAnswer(NoAnswerWhy::Silent { waited_secs: 5 })],
         }];
-        let lines = exit_12_summary(&addrs, &f, &[], "alice", std::path::Path::new("/c/qsh/log"));
+        let log = std::path::Path::new("/c/qsh/log");
+        let lines = exit_12_summary(&addrs, &f, &[], "alice", Some(log));
         assert_eq!(
             lines.last().map(String::as_str),
             Some("qsh: details: /c/qsh/log")
@@ -845,6 +798,11 @@ mod tests {
         assert_eq!(
             lines[..lines.len() - 1],
             all_failed(&addrs, &f, &[], "alice")[..]
+        );
+        // Without a cache directory there is no log to point at.
+        assert_eq!(
+            exit_12_summary(&addrs, &f, &[], "alice", None),
+            all_failed(&addrs, &f, &[], "alice")
         );
     }
 

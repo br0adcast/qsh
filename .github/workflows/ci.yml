@@ -120,8 +120,12 @@ jobs:
             --require file::tests::rotation_bound_missing_or_replaced_parent_does_not_extend_old_file \
             --require file::tests::rotation_bound_oversize_zero_and_exact_fit_preserve_whole_records \
             --require file::tests::rotation_bound_existing_oversize_file_is_not_truncated_or_extended_on_failure \
-            --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover
-          grep -F 'test result: ok. 47 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+            --require file::tests::rotation_bound_independent_writers_have_a_finite_race_bound_and_recover \
+            --require authority::tests::declared_parent_is_the_negation_of_the_session_refusal \
+            --require authority::tests::an_alias_target_is_followed_up_to_the_limit \
+            --require authority::tests::a_verified_alias_is_read_whole_and_rechecked \
+            --require authority::tests::a_repair_handle_is_the_pinned_directory_itself
+          grep -F 'test result: ok. 51 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Release cache authority on macOS
         shell: bash
         run: |
@@ -231,7 +235,7 @@ jobs:
             known_hosts::tests::permission_errors_preserve_path_and_source_for_either_store; do
             grep -Fx "test $name ... ok" "$runtime/results.log"
           done
-          grep -F 'test result: ok. 41 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 42 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq SKIPPED "$runtime/results.log"; then exit 1; fi
           cargo test -p qsh --lib --locked ssh_step::tests::unreadable_stores_stop_foreground_and_background_before_ssh -- --exact --color never --nocapture \
             2>&1 | tee "$runtime/caller.log"
@@ -391,7 +395,13 @@ jobs:
             climb::bootstrap_tests::background_ssh_rejects_a_conflicting_pin_on_the_returned_port \
             climb::bootstrap_tests::background_ssh_cannot_publish_from_an_unreadable_endpoint_pin_store \
             climb::bootstrap_tests::an_ssh_bootstrap_grant_is_bound_to_the_exact_route_port_and_stage \
-            climb::bootstrap_tests::foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key; do
+            climb::bootstrap_tests::foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key \
+            climb::bootstrap_tests::ssh_first_memory_recovery_ignores_corrupt_store_and_rechecks_qsh_identity \
+            climb::bootstrap_tests::ssh_first_mismatched_or_cancelled_bootstrap_never_publishes \
+            climb::bootstrap_tests::ssh_first_new_connection_is_empty_and_foreign_identity_cannot_inherit \
+            climb::bootstrap_tests::ssh_first_origin_uses_ssh_port_and_established_evidence_is_immutable \
+            climb::bootstrap_tests::ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it \
+            climb::bootstrap_tests::ssh_first_wrong_origin_or_unauthenticated_peer_cannot_publish; do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 {
                 seen++; pending = 1
@@ -402,14 +412,15 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 11 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
           fi
-      - name: Portable pin-store text and locking tests
+      - name: Portable pin-store and private-key file tests
         run: |
           set -euo pipefail
+          umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           runtime=$(mktemp -d "$RUNNER_TEMP/qsh-pin-store.XXXXXX")
@@ -445,6 +456,28 @@ jobs:
           done
           grep -F 'test result: ok. 33 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           ! grep -F 'SKIPPED' "$runtime/results.log"
+          cargo test -p sshauth --lib --locked keyfile::read_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$runtime/private-key-reader.log"
+          for test in \
+            private_key_read_accepts_exactly_one_mib \
+            private_key_read_rejects_one_byte_over_one_mib_without_secret_diagnostic \
+            private_key_read_refuses_fifo_instead_of_reading_a_key_from_it \
+            private_key_read_fifo_timeout_reaps_the_owned_reader \
+            private_key_read_bounds_growth_after_descriptor_metadata \
+            private_key_read_preserves_explicit_links_and_file_modes \
+            private_key_read_rejects_directory_socket_and_device; do
+            awk -v expected="test keyfile::read_tests::$test ... " '
+              index($0, expected) == 1 { pending=1 }
+              pending && /(^|[[:space:]])ok$/ { found=1; exit }
+              /^test / && index($0, expected) != 1 { pending=0 }
+              END { exit !found }
+            ' "$runtime/private-key-reader.log"
+          done
+          grep -F 'test result: ok. 7 passed; 0 failed; 0 ignored;' "$runtime/private-key-reader.log"
+          ! grep -F 'SKIPPED' "$runtime/private-key-reader.log"
+          cargo test -p ssh --lib --locked keyfile::tests::private_key_read_ -- --nocapture --test-threads=1 2>&1 | tee "$runtime/private-key-caller.log"
+          grep -Fx 'test keyfile::tests::private_key_read_uses_the_shared_input_limit ... ok' "$runtime/private-key-caller.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/private-key-caller.log"
+          ! grep -F 'SKIPPED' "$runtime/private-key-caller.log"
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Personal authorization file integrity on macOS
@@ -996,7 +1029,9 @@ jobs:
           run_suite test ssh_known_hosts_authority_privilege \
             --require ssh_known_hosts_real_owner_read_and_append_boundaries
           run_suite test serve_system_split \
-            --require the_worker_runs_as_its_configured_account
+            --require the_worker_runs_as_its_configured_account \
+            --require helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it \
+            --require a_monitor_holds_no_seam_and_the_worker_still_sees_the_end
           run_suite test system_mode_accounts \
             --require two_accounts_each_get_their_own_shell \
             --require attacker_controlled_authorization_is_refused

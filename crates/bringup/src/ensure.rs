@@ -18,6 +18,20 @@ pub(crate) fn command(path: &str, name: &str, port: u16, client_pubkey: &[u8; 32
     )
 }
 
+pub(crate) fn command_for_policy(
+    path: &str,
+    name: &str,
+    port: u16,
+    client_pubkey: &[u8; 32],
+    policy: &crate::InstallPolicy,
+) -> String {
+    let mut command = command(path, name, port, client_pubkey);
+    if matches!(policy, crate::InstallPolicy::RestartOnly) {
+        command.push_str(" --restart-only");
+    }
+    command
+}
+
 #[derive(Deserialize)]
 struct ReadyBody {
     version: String,

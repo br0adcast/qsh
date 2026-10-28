@@ -229,6 +229,12 @@ impl PredictionEngine {
         self.suppressed_until.is_none() && self.showing() && self.has_active_overlays()
     }
 
+    /// Outstanding prediction work can affect the next evaluation even while hidden.
+    pub fn presentation_sensitive(&self) -> bool {
+        self.display_preference != DisplayPreference::Never
+            && (self.has_active_overlays() || self.display_refresh_pending())
+    }
+
     /// Earliest existing time-driven display transition for pending cells.
     /// Hidden adaptive predictions participate; ACK/frame validity and tentative
     /// epochs are still evaluated by `cull`, not changed by this query.
@@ -923,6 +929,24 @@ mod tests {
         server.cursor_col = 1;
         e.cull(&server, 0); // 'a' Correct -> confirmed_epoch == prediction_epoch
         e.set_local_frame_sent(1);
+    }
+
+    #[test]
+    fn presentation304_hidden_predictions_still_require_immediate_evaluation() {
+        let mut e = PredictionEngine::new(DisplayPreference::Adaptive);
+        let f = terminal::Frame::blank(80, 24);
+        assert!(!e.presentation_sensitive());
+        e.cull(&f, 0);
+        e.set_send_interval(10);
+        e.cull(&f, 0);
+        e.new_user_byte(b'x', &f, 0);
+        assert!(!e.active());
+        assert!(e.presentation_sensitive());
+        e.reset();
+        assert!(!e.presentation_sensitive());
+        let mut never = PredictionEngine::new(DisplayPreference::Never);
+        never.new_user_byte(b'x', &f, 0);
+        assert!(!never.presentation_sensitive());
     }
 
     #[test]

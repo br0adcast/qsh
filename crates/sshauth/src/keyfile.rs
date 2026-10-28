@@ -1,7 +1,7 @@
 //! Private-file containers shared by QSH signing and SSH authentication.
 //! Parsing never prompts or decrypts an encrypted OpenSSH key.
 
-use std::{fmt, io, path::Path};
+use std::{fmt, io, io::Read, path::Path};
 
 use pkcs8::{AssociatedOid, DecodePrivateKey, SecretDocument};
 use ssh_key::{
@@ -91,10 +91,49 @@ impl DecodedKey {
     }
 }
 
-/// Read once into storage that is cleared when parsing finishes.
+/// Operational input budget, not a maximum imposed by private-key formats.
+pub const MAX_KEY_FILE_BYTES: usize = 1024 * 1024;
+
+/// Read a regular private-key file into storage cleared when parsing finishes.
+/// Explicit symlinks remain supported; this does not add owner or mode policy.
 pub fn read(path: &Path) -> Result<DecodedKey, KeyFileError> {
-    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(KeyFileError::Io)?);
-    decode(&text)
+    decode(&read_text(path)?)
+}
+
+/// Shared file boundary for QSH and SSH decoders, capped at 1 MiB of input.
+/// File type is checked on the opened descriptor; no pathname check can stand
+/// in for that observation. Owner, mode and symlink acceptance are unchanged.
+pub fn read_text(path: &Path) -> Result<Zeroizing<String>, KeyFileError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(KeyFileError::Io)?;
+    if !file.metadata().map_err(KeyFileError::Io)?.is_file() {
+        return Err(KeyFileError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private key must be a regular file",
+        )));
+    }
+    read_bounded(&mut file)
+}
+
+fn read_bounded(reader: &mut impl io::Read) -> Result<Zeroizing<String>, KeyFileError> {
+    let mut text = Zeroizing::new(String::new());
+    reader
+        .take((MAX_KEY_FILE_BYTES + 1) as u64)
+        .read_to_string(&mut text)
+        .map_err(KeyFileError::Io)?;
+    if text.len() > MAX_KEY_FILE_BYTES {
+        return Err(KeyFileError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private-key file exceeds the 1 MiB input limit",
+        )));
+    }
+    Ok(text)
 }
 
 /// Decode a supported container, retaining an OpenSSH key's encryption state.
@@ -301,3 +340,7 @@ fn explicit_ec_parameters(bytes: &[u8]) -> Result<bool, pkcs8::der::Error> {
     reader.finish()?;
     Ok(explicit)
 }
+
+#[cfg(test)]
+#[path = "keyfile_read_tests.rs"]
+mod read_tests;

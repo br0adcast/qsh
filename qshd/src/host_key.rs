@@ -37,6 +37,15 @@ pub fn load_or_create_transport_key(path: &Path) -> Result<Keypair> {
     load_or_create_with(path, &mut FileIo)
 }
 
+/// Load the existing trusted identity without creating a key or parent directory.
+/// Validation and permission repair use the same descriptor policy as ordinary startup.
+pub fn load_transport_key(path: &Path) -> Result<Keypair> {
+    let bytes = FileIo
+        .read(path)
+        .context("existing qshd identity is unavailable; recovery cannot create an identity")?;
+    decode_key(path, &bytes)
+}
+
 // Keep filesystem phase boundaries explicit so failure tests exercise the real
 // staging/publication path while substituting only the failing operation.
 trait KeyFileIo {
@@ -188,6 +197,37 @@ fn warn_repair(path: &Path, mode: Option<u32>) {
              verified file permissions tightened to 0600, which cannot undo a possible past disclosure",
             logging::diagnostic(&path.to_string_lossy())
         ));
+    }
+}
+
+#[cfg(test)]
+mod existing_identity_tests {
+    #[test]
+    fn existing_identity_never_creates_a_missing_parent_or_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent").join("identity");
+        assert!(super::load_transport_key(&path).is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn existing_identity_preserves_the_original_and_rejects_invalid_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("identity");
+        let original = super::load_or_create_transport_key(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            super::load_transport_key(&path).unwrap().public,
+            original.public
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, b"invalid").unwrap();
+        assert!(super::load_transport_key(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
     }
 }
 

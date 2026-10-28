@@ -73,3 +73,29 @@ fn sync111_esu_manual_flush_and_restarted_bsu_replace_the_deadline() {
     assert!(term.flush_due_output(renewed));
     assert!(text(&term).contains("ABCD"));
 }
+
+#[test]
+fn presentation304_sync_observation_is_independent_of_replay() {
+    for replay in [false, true] {
+        let mut t = if replay {
+            TerminalCore::with_replay(80, 24)
+        } else {
+            TerminalCore::new(80, 24)
+        };
+        t.feed(b"ordinary");
+        assert!(!t.take_sync_boundary());
+        t.feed(b"\x1b[?2026hhidden\x1b[?2026l");
+        assert_eq!(t.sync_deadline(), None);
+        assert!(t.take_sync_boundary());
+        assert!(!t.take_sync_boundary());
+        t.feed(b"\x1b[?2026");
+        assert!(!t.take_sync_boundary());
+        t.feed(b"hmore");
+        assert!(t.take_sync_boundary());
+        t.feed(b"\x1b[?2026hrestarted");
+        assert!(t.take_sync_boundary());
+        t.flush_pending_output();
+        assert!(t.take_sync_boundary());
+        assert_eq!(t.sync_deadline(), None);
+    }
+}

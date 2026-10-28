@@ -7,8 +7,15 @@ use crate::{BringUpError, BringUpObserver, ImageRequest, ImageSource, InstallTim
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallPolicy {
     ExistingOnly,
-    AskIfMissing { version: String },
-    EnsureBundled { version: String },
+    /// Recovery may reuse/restart an installed daemon with its existing identity.
+    /// Never install, create an identity, or replace a live daemon.
+    RestartOnly,
+    AskIfMissing {
+        version: String,
+    },
+    EnsureBundled {
+        version: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

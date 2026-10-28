@@ -412,6 +412,7 @@ pub struct TerminalCore {
     /// did, and pays nothing for it.
     replay: Option<ReplayState>,
     history_limit: usize,
+    sync_boundary: bool,
 }
 
 /// What a replay needs on top of the `Term` (see `tracking`).
@@ -452,6 +453,7 @@ impl TerminalCore {
                 pending: tracking::PendingSequence::default(),
             }),
             history_limit: options.history_lines,
+            sync_boundary: false,
         }
     }
 
@@ -506,6 +508,7 @@ impl TerminalCore {
     /// Feeds bytes to the parser: printable characters land in the grid,
     /// while control sequences move the cursor and change modes.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.sync_boundary |= self.sync_deadline().is_some();
         for bytes in bytes.chunks(4096) {
             if let Some(replay) = &mut self.replay {
                 replay.pending.push(bytes);
@@ -514,10 +517,17 @@ impl TerminalCore {
                 &mut tracking::Tracking {
                     term: &mut self.term,
                     tracked: self.replay.as_mut().map(|replay| &mut replay.tracked),
+                    sync_boundary: &mut self.sync_boundary,
                 },
                 bytes,
             );
         }
+    }
+
+    /// Whether a synchronized-output boundary was encountered since the last observation.
+    /// Independent of replay tracking; does not execute buffered output.
+    pub fn take_sync_boundary(&mut self) -> bool {
+        std::mem::take(&mut self.sync_boundary)
     }
 
     /// Feed fresh application output and return its ordered terminal replies.
@@ -590,6 +600,7 @@ impl TerminalCore {
             self.parser.stop_sync(&mut tracking::Tracking {
                 term: &mut self.term,
                 tracked: self.replay.as_mut().map(|replay| &mut replay.tracked),
+                sync_boundary: &mut self.sync_boundary,
             });
         }
     }

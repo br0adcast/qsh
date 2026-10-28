@@ -119,7 +119,7 @@ fn run(a: args::Args) -> i32 {
         prompt::Tty::new(),
         known_hosts::KnownHosts::standard(),
         std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
-        dirs::home_dir().map(|h| h.join(".ssh")),
+        qsh::paths::ssh_dir(),
         claim.token,
     ));
 
@@ -147,37 +147,6 @@ fn run(a: args::Args) -> i32 {
         Climbed::Failed { .. } => unreachable!("only a background round ends as Failed"),
     };
     drop(climb);
-    if setup.args().authorize_ssh {
-        let server = setup
-            .server_identity()
-            .expect("successful QSH login establishes identity");
-        let mut endpoints = Vec::new();
-        for address in &setup.args().addresses {
-            if let Some(route) = &address.ssh {
-                let endpoint = ::connect::server_identity::SshEndpoint {
-                    host: address.host.clone(),
-                    port: route.port,
-                };
-                if !endpoints.contains(&endpoint) {
-                    endpoints.push(endpoint);
-                }
-            }
-        }
-        let permit = setup.begin_ssh_authorization(::connect::recovery_gate::RecoveryEpoch {
-            connection: 0,
-            network: 0,
-        });
-        let cancel = knock::Cancel::new();
-        if let Err(error) =
-            qsh::ssh_authorization::authorize_ssh(&server, &endpoints, &setup, &permit, &cancel)
-        {
-            eprintln!("qsh: {error}; QSH session remains connected");
-        }
-        setup.invalidate_ssh_authorization();
-        if signals::termination_requested() {
-            return 130;
-        }
-    }
     let mut connected = connected;
     let mut events = link_rx;
     let mut display = DisplaySize {
@@ -564,6 +533,13 @@ fn flush_shell_bytes(shell_bytes: &mut Vec<u8>, sess: &mut Session, now_ms: i64)
     } else {
         sess.handle(UiEvent::Stream0(std::mem::take(shell_bytes)), now_ms)
     }
+}
+
+/// Ordered protocol boundaries retain the executed prefix's paint-before-boundary order.
+fn flush_shell_boundary(shell_bytes: &mut Vec<u8>, sess: &mut Session, now_ms: i64) -> Vec<Action> {
+    let mut actions = flush_shell_bytes(shell_bytes, sess, now_ms);
+    actions.extend(sess.flush_presentation(now_ms));
+    actions
 }
 
 /// The connection a session is running on.
@@ -958,7 +934,6 @@ impl Links {
 
     /// Invalidate every writer before changing the common catalog/worker epoch.
     fn advance_epoch(&mut self, network: bool) {
-        self.setup.invalidate_ssh_authorization();
         self.round = None;
         if network {
             self.road_epoch.network += 1;
@@ -1226,7 +1201,6 @@ impl Links {
     /// holds a live connection into the session: it is let go quietly, not
     /// dropped -- dropping it could send `Close` while "kept" is printed.
     fn leave(mut self) -> BoundedResolver {
-        self.setup.invalidate_ssh_authorization();
         self.resolver.cancel();
         let host = self.addresses[self.at].host.as_str();
         if let Some(Ok(Round::Connected { connected, .. })) =
@@ -1419,7 +1393,7 @@ fn on_wire_reset(
     shell_bytes: &mut Vec<u8>,
     now_ms: &impl Fn() -> i64,
 ) -> Vec<Action> {
-    let mut actions = flush_shell_bytes(shell_bytes, sess, now_ms());
+    let mut actions = flush_shell_boundary(shell_bytes, sess, now_ms());
     if Some(stream) == links.shell_channel {
         // Whatever partial record the substrate was holding
         // for THIS channel belongs to a byte offset the peer
@@ -1454,13 +1428,13 @@ fn channel_events(
     for se in events {
         match se {
             SessionEvent::Ready(ch) if shell_channel.is_none_or(|shell| shell == ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 *shell_channel = Some(ch);
                 actions.extend(sess.on_channel_ready(ch, now_ms()));
                 log::log(&format!("shell channel {ch} ready"));
             }
             SessionEvent::Announced { active, draining } => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 if shell_channel.is_none() {
                     *shell_channel = active.first().or(draining.first()).copied();
                 }
@@ -1469,24 +1443,24 @@ fn channel_events(
             SessionEvent::Geometry { ch, record }
                 if shell_channel.is_none_or(|shell| shell == ch) =>
             {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 *shell_channel = Some(ch);
                 actions.extend(sess.on_geometry(record, now_ms()));
             }
             SessionEvent::ResizeRefused { ch, reason, .. } if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_resize_refused(reason, now_ms()));
             }
             SessionEvent::DrainingReady(ch) if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                sess.on_channel_draining(ch);
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
+                actions.extend(sess.on_channel_draining(ch, now_ms()));
             }
             SessionEvent::OutputContinuityLost { ch, cause, .. } if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_output_gap(cause, now_ms()));
             }
             SessionEvent::SendFailure { error, .. } => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 actions.extend(sess.handle(
                     UiEvent::InputFailure(session::LocalInputFailure::Channel(error)),
                     now_ms(),
@@ -1494,7 +1468,7 @@ fn channel_events(
                 return actions;
             }
             SessionEvent::ProtocolFailure(error) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 actions.push(Action::Notice(format!(
                     "qsh: channel protocol failure: {error:?}"
                 )));
@@ -1506,17 +1480,17 @@ fn channel_events(
             | SessionEvent::DrainingReady(_)
             | SessionEvent::OutputContinuityLost { .. } => {}
             SessionEvent::Exit { ch, code } if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 actions.extend(sess.on_channel_exit(ch, code, now_ms()));
             }
             SessionEvent::ExitStatusUnavailable { ch } if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                actions.extend(sess.on_channel_exit_status_unavailable(ch));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
+                actions.extend(sess.on_channel_exit_status_unavailable(ch, now_ms()));
             }
             SessionEvent::Refused { ch, reason }
                 if shell_channel.is_none_or(|shell| shell == ch) =>
             {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 // `log::log` alone is not enough: the person would just see
                 // a bare exit code and a closed terminal, with no idea why
                 // unless they went looking in the log. A notice, printed
@@ -1527,7 +1501,7 @@ fn channel_events(
                 actions.extend(sess.on_channel_exit(ch, 1, now_ms()));
             }
             SessionEvent::Vanished { ch } if *shell_channel == Some(ch) => {
-                actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
+                actions.extend(flush_shell_boundary(shell_bytes, sess, now_ms()));
                 // Unlike `Refused`/`Exit`, there is no reason to report: the
                 // server simply no longer lists this channel (typically
                 // after a warm reattach), and neither side can say why it is
@@ -1741,7 +1715,7 @@ fn interactive(
             // screen and a full repaint back. The SIGCONT that ends the stop
             // is taken here too, or it would repaint a second time; a group
             // the kernel does not stop comes straight back all the same.
-            let _ = stdout.write_all(&sess.suspend());
+            let _ = stdout.write_all(&sess.suspend(now_ms()));
             let _ = stdout.flush();
             if let Err(error) = raw.suspend() {
                 log::error(&format!(
@@ -1940,6 +1914,9 @@ fn session_deadline(sess: &Session, origin: Instant, followup: Option<Instant>) 
     [
         elapsed_deadline(origin, deadlines.status_ms),
         deadlines
+            .presentation_ms
+            .and_then(|at| elapsed_deadline(origin, at)),
+        deadlines
             .resize_ms
             .and_then(|at| elapsed_deadline(origin, at)),
         deadlines.shell.synchronized_output,
@@ -2068,7 +2045,13 @@ mod tests {
         sess.on_channel_ready(ch, 0);
         let mut reference = geometry_session();
         reference.on_channel_ready(ch, 0);
-        let expected_prefix = reference.handle(UiEvent::Stream0(encode_record(REC_DATA, old)), 1);
+        let mut expected_prefix =
+            reference.handle(UiEvent::Stream0(encode_record(REC_DATA, old)), 1);
+        expected_prefix.extend(reference.flush_presentation(1));
+        assert!(
+            !expected_prefix.is_empty(),
+            "the old-geometry prefix must actually paint"
+        );
         let mut pending = Vec::new();
         let actions = channel_events(
             channels.on_bytes(ch, &batch),

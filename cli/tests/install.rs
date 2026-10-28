@@ -33,6 +33,29 @@ impl Screen {
         );
     }
 }
+fn wait_for_bootstrap_ready(home: &Path) {
+    let log = || std::fs::read_to_string(home.join("qsh/log")).unwrap_or_default();
+    assert!(
+        wait_until(|| log()
+            .lines()
+            .any(|line| line.contains("shell channel ") && line.ends_with(" ready"))),
+        "SSH bootstrap did not deliver the current shell Ready: {}",
+        log()
+    );
+}
+
+fn assert_no_bootstrap_recovery_offer(home: &Path, screen: &Screen) {
+    assert!(
+        !screen.text().contains("Authorize SSH recovery"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        !home.join("qsh/ssh_bindings.json").exists(),
+        "SSH-first bootstrap must retain trust without a persistent grant"
+    );
+}
+
 fn key(home: &Path) -> (PathBuf, String) {
     let key = ssh_key::PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
@@ -110,15 +133,15 @@ fn accept_installs_and_opens_shell() {
     assert!(screen.text().contains(server_target));
     assert!(screen.text().contains(image_path(&sb).to_str().unwrap()));
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("Authorize SSH recovery");
+    wait_for_bootstrap_ready(home.path());
+    client.type_line("echo INSTALL_'OK'");
+    screen.wait("INSTALL_OK");
+    assert_no_bootstrap_recovery_offer(home.path(), &screen);
     assert!(
         !screen.text().contains("Key fingerprint"),
         "{}",
         screen.text()
     );
-    client.master.write_all(b"no\n").unwrap();
-    client.type_line("echo INSTALL_'OK'");
-    screen.wait("INSTALL_OK");
     assert!(image_path(&sb).is_file());
     screen.wait("Uploading qshd");
     let output = screen.text();
@@ -161,15 +184,15 @@ fn enter_accepts_installation_and_opens_shell() {
     screen.wait("[Y/n]");
     assert!(screen.text().contains("  Source    GitHub Releases"));
     client.master.write_all(b"\n").unwrap();
-    screen.wait("Authorize SSH recovery");
+    wait_for_bootstrap_ready(home.path());
+    client.type_line("echo INSTALL_'OK'");
+    screen.wait("INSTALL_OK");
+    assert_no_bootstrap_recovery_offer(home.path(), &screen);
     assert!(
         !screen.text().contains("Key fingerprint"),
         "{}",
         screen.text()
     );
-    client.master.write_all(b"no\n").unwrap();
-    client.type_line("echo INSTALL_'OK'");
-    screen.wait("INSTALL_OK");
     assert!(image_path(&sb).is_file());
     screen.wait("Uploading qshd");
     client.type_line("exit");
@@ -269,20 +292,13 @@ fn background_never_installs_even_with_cached_image() {
     let relay = UdpRelay::start(daemon.port);
     let address = format!("127.0.0.1:{},ssh={}", relay.port, sb.sshd.port);
     let mut client = spawn_qsh(
-        &[
-            "--authorize-ssh",
-            "--verbose",
-            "-i",
-            identity.to_str().unwrap(),
-            &address,
-        ],
+        &["--verbose", "-i", identity.to_str().unwrap(), &address],
         home.path(),
     );
     let screen = Screen::of(&client);
     screen.wait("Key fingerprint");
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("Authorize SSH recovery");
-    client.master.write_all(b"yes\n").unwrap();
+    wait_for_bootstrap_ready(home.path());
     client.type_line("echo BEFORE_'RECOVERY'");
     screen.wait("BEFORE_RECOVERY");
     relay.cut();
@@ -290,7 +306,7 @@ fn background_never_installs_even_with_cached_image() {
     assert!(
         wait_until(|| std::fs::read_to_string(home.path().join("qsh/log"))
             .unwrap_or_default()
-            .contains("NeedsPrompt")),
+            .contains("qshd is missing; recovery will not install it")),
         "{}",
         screen.text()
     );

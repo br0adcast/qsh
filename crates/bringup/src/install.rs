@@ -286,10 +286,14 @@ pub(crate) fn bring_up(
     }
     let path = match (&policy, probe.located) {
         (
-            InstallPolicy::ExistingOnly | InstallPolicy::AskIfMissing { .. },
+            InstallPolicy::ExistingOnly
+            | InstallPolicy::RestartOnly
+            | InstallPolicy::AskIfMissing { .. },
             locate::Located::Found(path),
         ) => path,
-        (InstallPolicy::ExistingOnly, _) => return Err(BringUpError::InstallRequired),
+        (InstallPolicy::ExistingOnly | InstallPolicy::RestartOnly, _) => {
+            return Err(BringUpError::InstallRequired)
+        }
         (InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version }, _) => {
             let request = ImageRequest::new(probe.platform, version.clone())?;
             request.validate()?;
@@ -331,7 +335,7 @@ pub(crate) fn bring_up(
     check_cancel(cancel)?;
     let output = session.command(
         "qshd transport-ensure",
-        &ensure::command(&path, &req.name, req.qsh_port, &req.client_pubkey),
+        &ensure::command_for_policy(&path, &req.name, req.qsh_port, &req.client_pubkey, &policy),
         hooks.timing.ensure,
         cancel,
     )?;

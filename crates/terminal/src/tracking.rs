@@ -92,6 +92,7 @@ fn default_tabs(from: usize, to: usize) -> impl Iterator<Item = bool> {
 pub(crate) struct Tracking<'a, T> {
     pub term: &'a mut Term<T>,
     pub tracked: Option<&'a mut Tracked>,
+    pub sync_boundary: &'a mut bool,
 }
 
 /// Mirror the pinned Term::input target selection, including pending wrap
@@ -286,10 +287,16 @@ impl<T: EventListener> Handler for Tracking<'_, T> {
         self.term.report_mode(mode)
     }
     fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode == alacritty_terminal::vte::ansi::NamedPrivateMode::SyncUpdate.into() {
+            *self.sync_boundary = true;
+        }
         self.note_column_mode(mode);
         self.term.set_private_mode(mode)
     }
     fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if mode == alacritty_terminal::vte::ansi::NamedPrivateMode::SyncUpdate.into() {
+            *self.sync_boundary = true;
+        }
         self.note_column_mode(mode);
         self.term.unset_private_mode(mode)
     }
@@ -733,6 +740,7 @@ mod tests {
         let mut handler = Tracking {
             term: &mut term,
             tracked: None,
+            sync_boundary: &mut false,
         };
         handler.set_title(Some("é".repeat(4096)));
         handler.push_title();

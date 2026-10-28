@@ -107,9 +107,9 @@ pub fn candidates(
     ask: &dyn Passphrase,
     login: &str,
 ) -> Result<Vec<Candidate>, KeyError> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let consult_agent = std::env::var_os("SSH_AUTH_SOCK").is_some();
-    candidates_in(identity, ask, consult_agent, &home.join(".ssh"), login)
+    let ssh_dir = crate::paths::ssh_dir();
+    candidates_in(identity, ask, consult_agent, ssh_dir.as_deref(), login)
 }
 
 /// The same, with the places to look handed in -- so a test does not depend
@@ -127,7 +127,7 @@ fn candidates_in(
     identity: Option<&Path>,
     ask: &dyn Passphrase,
     consult_agent: bool,
-    ssh_dir: &Path,
+    ssh_dir: Option<&Path>,
     login: &str,
 ) -> Result<Vec<Candidate>, KeyError> {
     // An explicit key is an instruction: use it, and only it -- no agent
@@ -152,13 +152,19 @@ fn candidates_in(
         looked.push("ssh-agent: SSH_AUTH_SOCK not set".to_string());
         Vec::new()
     };
-    let files = file_candidates(
-        ask,
-        may_prompt_for_files(&agent),
-        ssh_dir,
-        &mut looked,
-        login,
-    );
+    let files = match ssh_dir {
+        Some(ssh_dir) => file_candidates(
+            ask,
+            may_prompt_for_files(&agent),
+            ssh_dir,
+            &mut looked,
+            login,
+        ),
+        None => {
+            looked.push("~/.ssh: no home directory is known".to_string());
+            Vec::new()
+        }
+    };
 
     let found = assemble(None, agent, files);
     if found.is_empty() {
@@ -539,7 +545,7 @@ mod tests {
     #[test]
     fn nothing_anywhere_lists_where_it_looked() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = candidates_in(None, &NoPassphrase, false, dir.path(), "alice")
+        let err = candidates_in(None, &NoPassphrase, false, Some(dir.path()), "alice")
             .expect_err("nothing to sign with");
         let message = err.to_string();
         assert!(matches!(err, KeyError::NoKeys { .. }), "{err:?}");
@@ -550,6 +556,19 @@ mod tests {
         assert!(
             message.contains("SSH_AUTH_SOCK"),
             "and the agent: {message}"
+        );
+    }
+
+    /// Without a home directory there is no `~/.ssh` to scan, and the
+    /// working directory is not scanned in its place.
+    #[test]
+    fn without_a_home_no_key_files_are_looked_for() {
+        let err = candidates_in(None, &NoPassphrase, false, None, "alice")
+            .expect_err("nothing to sign with");
+        assert_eq!(
+            err.to_string(),
+            "no key found to sign with. Looked:\n  ssh-agent: SSH_AUTH_SOCK not set\n  \
+             ~/.ssh: no home directory is known"
         );
     }
 

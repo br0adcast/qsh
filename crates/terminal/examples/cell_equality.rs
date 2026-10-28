@@ -4,8 +4,8 @@
 //! by cell, the way the renderer diffs rows, a fixed number of times. It is
 //! a measurement procedure, not a test: run it under a counter of executed
 //! instructions or of `memcmp`/`bcmp` calls to see how much work the
-//! comparisons take. The method and recorded results are in
-//! docs/performance-baseline.md, under "Combining-mark equality".
+//! comparisons take. Maintained usage is in
+//! docs/performance-baseline.md, under "Combining-mark comparison probe".
 //!
 //!   cargo run --release -p terminal --example cell_equality -- CASE [ROUNDS]
 //!

@@ -171,6 +171,17 @@ fn start_daemon(
     client_pub: [u8; 32],
     labels: &str,
 ) -> [u8; 32] {
+    start_daemon_mode(bin, home, port, client_pub, labels, false)
+}
+
+fn start_daemon_mode(
+    bin: &Path,
+    home: &Path,
+    port: u16,
+    client_pub: [u8; 32],
+    labels: &str,
+    restart_only: bool,
+) -> [u8; 32] {
     let mut child = Command::new(bin)
         .args([
             "transport-ensure",
@@ -181,6 +192,11 @@ fn start_daemon(
             "--client-pubkey",
             &BASE64.encode(client_pub),
         ])
+        .args(if restart_only {
+            vec!["--restart-only"]
+        } else {
+            vec![]
+        })
         .env("XDG_CACHE_HOME", home)
         .env("HISTFILE", "/dev/null")
         .env("TMUX_TMPDIR", home)
@@ -810,4 +826,47 @@ mod test_borrowed_scope;
 #[cfg(target_os = "linux")]
 fn qualify_borrowed_fixture() {
     personal_signals::qualify_borrowed_fixture();
+}
+
+#[test]
+fn restart_only_reuses_a_live_different_build_without_stopping_it() {
+    let _serial = serialised();
+    let binaries = stripped_qshd();
+    let newer = binaries.dir.path().join("newer-qshd");
+    let mut bytes = binaries.old.clone();
+    bytes.extend_from_slice(b"different installed build");
+    std::fs::write(&newer, &bytes).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&newer, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let labels = format!(
+        "{}=1,{}=2",
+        hex::encode(sha256(&binaries.old)),
+        hex::encode(sha256(&bytes))
+    );
+    let home = private_temp_home().unwrap();
+    let sock = home.path().join("qsh/control.sock");
+    let _guard = DaemonGuard::new(sock.clone());
+    let port = free_udp_port();
+    let key = start_daemon(&binaries.bin, home.path(), port, [1; 32], &labels);
+    assert!(wait_for(Duration::from_secs(5), || status(&sock).is_some()));
+    let before = status(&sock).unwrap();
+    assert_eq!(before.build, 1);
+    let identity = std::fs::read(home.path().join("qsh/transport_server_key.bin")).unwrap();
+    assert_eq!(
+        start_daemon_mode(&newer, home.path(), port, [2; 32], &labels, true),
+        key
+    );
+    let after = status(&sock).unwrap();
+    assert_eq!(
+        after.pid, before.pid,
+        "recovery must not Stop/restart a live daemon"
+    );
+    assert_eq!(
+        after.build, 1,
+        "recovery must not replace the running build"
+    );
+    assert_eq!(
+        std::fs::read(home.path().join("qsh/transport_server_key.bin")).unwrap(),
+        identity
+    );
 }

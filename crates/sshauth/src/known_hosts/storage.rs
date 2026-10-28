@@ -1,28 +1,14 @@
 //! QSH pin read authority. Trusted owners may still edit held files in place;
 //! these observations are not an atomic snapshot against root/the same UID.
+//! The observed route is [`crate::route`]'s; creation, locking and
+//! publication are this store's.
+use crate::route::{self, directory, kind, mutation_parent, public, same, Entry, Refusals, Route};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const SEARCH: OFlags = OFlags::PATH;
-#[cfg(target_vendor = "apple")]
-const SEARCH: OFlags = OFlags::from_bits_retain(libc::O_SEARCH as _);
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-const SEARCH: OFlags = OFlags::RDONLY;
-const DIR: OFlags = SEARCH
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::CLOEXEC);
-const READ: OFlags = OFlags::RDONLY
-    .union(OFlags::NONBLOCK)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NOCTTY)
-    .union(OFlags::CLOEXEC);
 
 fn refused() -> io::Error {
     io::Error::new(
@@ -30,112 +16,14 @@ fn refused() -> io::Error {
         "untrusted QSH pin-store authority",
     )
 }
-fn owner(stat: &Stat) -> bool {
-    stat.st_uid == 0 || stat.st_uid == rustix::process::geteuid().as_raw()
-}
-fn kind(stat: &Stat) -> FileType {
-    FileType::from_raw_mode(stat.st_mode)
-}
-fn directory(stat: &Stat) -> bool {
-    kind(stat) == FileType::Directory
-        && owner(stat)
-        && (stat.st_mode & 0o022 == 0 || stat.st_mode & 0o1000 != 0)
-}
-fn public(stat: &Stat) -> bool {
-    kind(stat) == FileType::RegularFile && owner(stat) && stat.st_mode & 0o022 == 0
-}
-fn same(a: &Stat, b: &Stat) -> bool {
-    a.st_dev == b.st_dev && a.st_ino == b.st_ino
-}
+/// Every refusal, an over-long alias target included, is the same opaque one.
+const REFUSALS: Refusals = Refusals {
+    untrusted: refused,
+    alias_too_long: refused,
+};
 
-// Preserve raw slash/dot syntax: regular-file/ and regular-file/. must still
-// require a directory, and symlink/.. traverses the symlink before its parent.
-pub(super) fn parts(bytes: &[u8], alias: bool) -> VecDeque<(OsString, bool)> {
-    let mut result: VecDeque<_> = bytes
-        .split(|b| *b == b'/')
-        .filter(|p| !p.is_empty())
-        .map(|p| (OsString::from_vec(p.to_vec()), alias))
-        .collect();
-    if bytes.ends_with(b"/") {
-        result.push_back((".".into(), alias));
-    }
-    result
-}
-fn target(parent: &File, name: &OsString) -> io::Result<Vec<u8>> {
-    let mut bytes = [0u8; 4097];
-    let length = fs::readlinkat_raw(parent, name, &mut bytes[..])?;
-    if length > 4096 {
-        return Err(refused());
-    }
-    Ok(bytes[..length].to_vec())
-}
-
-struct Entry {
-    parent: File,
-    name: OsString,
-    observed: Option<Stat>,
-    alias: Option<Vec<u8>>,
-}
-impl Entry {
-    fn validate(&self) -> io::Result<()> {
-        if !directory(&fs::fstat(&self.parent)?) {
-            return Err(refused());
-        }
-        let named = fs::statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW);
-        let Some(observed) = &self.observed else {
-            return match named {
-                Err(rustix::io::Errno::NOENT) => Ok(()),
-                _ => Err(refused()),
-            };
-        };
-        let named = named?;
-        if !same(observed, &named) || kind(observed) != kind(&named) {
-            return Err(refused());
-        }
-        let valid = match kind(&named) {
-            FileType::Directory => directory(&named),
-            FileType::RegularFile => public(&named),
-            FileType::Symlink => {
-                owner(&named)
-                    && self.alias.as_deref() == Some(target(&self.parent, &self.name)?.as_slice())
-            }
-            _ => false,
-        };
-        if valid {
-            Ok(())
-        } else {
-            Err(refused())
-        }
-    }
-}
-pub(super) struct ReadBinding {
-    root: File,
-    entries: Vec<Entry>,
-    source: Option<File>,
-}
-impl ReadBinding {
-    pub(super) fn validate(&self) -> io::Result<()> {
-        if !directory(&fs::fstat(&self.root)?) {
-            return Err(refused());
-        }
-        for entry in &self.entries {
-            entry.validate()?;
-        }
-        if let Some(file) = &self.source {
-            let held = fs::fstat(file)?;
-            if !public(&held)
-                || !self
-                    .entries
-                    .last()
-                    .and_then(|e| e.observed.as_ref())
-                    .is_some_and(|named| same(&held, named))
-            {
-                return Err(refused());
-            }
-        }
-        Ok(())
-    }
-}
+pub(super) use route::parts;
+pub(super) type ReadBinding = route::Binding;
 pub(super) struct ReadSnapshot {
     text: String,
     binding: ReadBinding,
@@ -164,13 +52,9 @@ fn walk(path: &Path, parent_only: bool, create: bool) -> io::Result<Walk> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    let root = File::from(fs::open("/", DIR, Mode::empty())?);
-    if !directory(&fs::fstat(&root)?) {
-        return Err(refused());
-    }
-    let mut stack = vec![root.try_clone()?];
+    let mut route = Route::open(REFUSALS)?;
+    let mut stack = vec![route.root().try_clone()?];
     let mut pending = parts(absolute.as_os_str().as_bytes(), false);
-    let mut entries = Vec::new();
     let mut aliases = 0;
     while let Some((name, from_alias)) = pending.pop_front() {
         if name == "." || name == ".." {
@@ -188,11 +72,7 @@ fn walk(path: &Path, parent_only: bool, create: bool) -> io::Result<Walk> {
         }
         if parent_only && pending.is_empty() {
             let parent = parent.try_clone()?;
-            let route = ReadBinding {
-                root,
-                entries,
-                source: None,
-            };
+            let route = ReadBinding::new(route, None);
             route.validate()?;
             return Ok(Walk::Parent {
                 route,
@@ -215,37 +95,23 @@ fn walk(path: &Path, parent_only: bool, create: bool) -> io::Result<Walk> {
                 fs::statat(parent, &name, AtFlags::SYMLINK_NOFOLLOW)?
             }
             Err(rustix::io::Errno::NOENT) if !from_alias => {
-                entries.push(Entry {
-                    parent: parent.try_clone()?,
-                    name,
-                    observed: None,
-                    alias: None,
-                });
-                let binding = ReadBinding {
-                    root,
-                    entries,
-                    source: None,
-                };
+                route.push(Entry::absent(parent, name)?);
+                let binding = ReadBinding::new(route, None);
                 binding.validate()?;
                 return Ok(Walk::Read(binding));
             }
             Err(error) => return Err(error.into()),
         };
         if kind(&observed) == FileType::Symlink {
-            if !owner(&observed) {
+            if !route::owner(&observed) {
                 return Err(refused());
             }
             aliases += 1;
             if aliases > 40 {
                 return Err(refused());
             }
-            let bytes = target(parent, &name)?;
-            entries.push(Entry {
-                parent: parent.try_clone()?,
-                name,
-                observed: Some(observed),
-                alias: Some(bytes.clone()),
-            });
+            let bytes = route::alias_target(parent, &name, &REFUSALS)?;
+            route.push(Entry::alias(parent, name, observed, bytes.clone())?);
             if bytes.starts_with(b"/") {
                 stack.truncate(1);
             }
@@ -260,37 +126,23 @@ fn walk(path: &Path, parent_only: bool, create: bool) -> io::Result<Walk> {
             if !public(&observed) {
                 return Err(refused());
             }
-            let source = File::from(fs::openat(parent, &name, READ, Mode::empty())?);
+            let source = File::from(fs::openat(parent, &name, route::READ, Mode::empty())?);
             if !same(&observed, &fs::fstat(&source)?) {
                 return Err(refused());
             }
-            entries.push(Entry {
-                parent: parent.try_clone()?,
-                name,
-                observed: Some(observed),
-                alias: None,
-            });
-            let binding = ReadBinding {
-                root,
-                entries,
-                source: Some(source),
-            };
+            route.push(Entry::object(parent, name, observed)?);
+            let binding = ReadBinding::new(route, Some(source));
             binding.validate()?;
             return Ok(Walk::Read(binding));
         }
         if !directory(&observed) {
             return Err(refused());
         }
-        let child = File::from(fs::openat(parent, &name, DIR, Mode::empty())?);
+        let child = File::from(fs::openat(parent, &name, route::DIRECTORY, Mode::empty())?);
         if !same(&observed, &fs::fstat(&child)?) {
             return Err(refused());
         }
-        entries.push(Entry {
-            parent: parent.try_clone()?,
-            name,
-            observed: Some(observed),
-            alias: None,
-        });
+        route.push(Entry::object(parent, name, observed)?);
         stack.push(child);
     }
     Err(refused())
@@ -310,7 +162,7 @@ pub(super) fn read_with(
     let Walk::Read(mut binding) = walk(path, false, false)? else {
         unreachable!()
     };
-    let text = match &mut binding.source {
+    let text = match binding.source_mut() {
         Some(file) => reader(file)?,
         None => String::new(),
     };
@@ -318,11 +170,6 @@ pub(super) fn read_with(
     Ok(ReadSnapshot { text, binding })
 }
 
-fn mutation_parent(stat: &Stat) -> bool {
-    kind(stat) == FileType::Directory
-        && stat.st_uid == rustix::process::geteuid().as_raw()
-        && stat.st_mode & 0o022 == 0
-}
 fn private_lock(stat: &Stat) -> bool {
     kind(stat) == FileType::RegularFile
         && stat.st_uid == rustix::process::geteuid().as_raw()
