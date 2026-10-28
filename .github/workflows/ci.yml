@@ -177,6 +177,7 @@ jobs:
           for name in \
             sessions::tests::slot139_planted_leaves_cannot_change_outside_objects \
             sessions::tests::slot139_directory_repair_requires_explicit_intent \
+            sessions::tests::group_writable_session_authority_is_refused_without_repair \
             sessions::tests::slot139_bounded_trim_and_read_failures_have_distinct_results \
             sessions::tests::slot139_replacement_refuses_displaced_routes_and_keeps_lock \
             sessions_store::tests::slot139_traversal_preserves_aliases_and_raw_paths \
@@ -201,7 +202,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 27 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 28 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::native session-slot tests reported a runtime skip' >&2
             exit 1

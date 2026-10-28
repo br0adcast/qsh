@@ -22,7 +22,7 @@ fn authority_file(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
 fn ssh_host_authority_reads_refuse_unsafe_and_special_evidence() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for system_fails in [false, true] {
-        for unsafe_parent in [false, true] {
+        for (unsafe_parent, permissions) in [(false, 0o666), (true, 0o777), (true, 0o775)] {
             let dir = authority_dir();
             let user_dir = dir.path().join("user");
             let system_dir = dir.path().join("system");
@@ -41,11 +41,8 @@ fn ssh_host_authority_reads_refuse_unsafe_and_special_evidence() {
             } else {
                 failed.as_path()
             };
-            std::fs::set_permissions(
-                unsafe_path,
-                std::fs::Permissions::from_mode(if unsafe_parent { 0o777 } else { 0o666 }),
-            )
-            .unwrap();
+            std::fs::set_permissions(unsafe_path, std::fs::Permissions::from_mode(permissions))
+                .unwrap();
             let before = std::fs::metadata(unsafe_path).unwrap();
             let error = KnownHosts::new(user.clone(), Some(system.clone()))
                 .lookup("h", 22)
