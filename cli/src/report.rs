@@ -262,16 +262,16 @@ pub struct Detail {
 }
 
 /// The summary a login prints before exit 12: [`all_failed`], then where
-/// the log is.
+/// the log is, when there is one.
 pub fn exit_12_summary(
     addrs: &[::connect::Address],
     failures: &[::connect::Failure],
     details: &[Detail],
     account: &str,
-    log: &Path,
+    log: Option<&Path>,
 ) -> Vec<String> {
     let mut lines = all_failed(addrs, failures, details, account);
-    lines.push(self::details(log));
+    lines.extend(log.map(self::details));
     lines
 }
 
@@ -755,7 +755,7 @@ mod tests {
             &failures,
             &[],
             "u",
-            std::path::Path::new("/c/qsh/log"),
+            Some(std::path::Path::new("/c/qsh/log")),
         );
         assert_eq!(
             lines,
@@ -837,7 +837,8 @@ mod tests {
             addr: 0,
             reasons: vec![Reason::NoAnswer(NoAnswerWhy::Silent { waited_secs: 5 })],
         }];
-        let lines = exit_12_summary(&addrs, &f, &[], "alice", std::path::Path::new("/c/qsh/log"));
+        let log = std::path::Path::new("/c/qsh/log");
+        let lines = exit_12_summary(&addrs, &f, &[], "alice", Some(log));
         assert_eq!(
             lines.last().map(String::as_str),
             Some("qsh: details: /c/qsh/log")
@@ -845,6 +846,11 @@ mod tests {
         assert_eq!(
             lines[..lines.len() - 1],
             all_failed(&addrs, &f, &[], "alice")[..]
+        );
+        // Without a cache directory there is no log to point at.
+        assert_eq!(
+            exit_12_summary(&addrs, &f, &[], "alice", None),
+            all_failed(&addrs, &f, &[], "alice")
         );
     }
 

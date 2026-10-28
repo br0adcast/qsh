@@ -154,6 +154,14 @@ OpenSSH's separate host-key store is not changed by them.
 Session tokens live in the adjacent `sessions` directory. XDG overrides must be
 absolute paths; empty or relative values use the defaults above.
 
+`~` is `$HOME`, or the account database's home directory when `HOME` is unset
+or empty. When neither names one, qsh never uses the current directory instead.
+Without an absolute `XDG_CONFIG_HOME` it exits with an error. Without an
+absolute `XDG_CACHE_HOME` it runs without a log file and without the release
+cache: a daemon image is still downloaded and verified, but not kept. SSH then
+tries no default key files and reads only `/etc/ssh/ssh_known_hosts`, so an
+accepted SSH host key is not saved.
+
 The CLI treats its sessions directory as dedicated private storage. It validates
 the directory route and each regular, single-linked, same-user slot before use,
 and can tighten initial directory/file permissions after locking a free slot.

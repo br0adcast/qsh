@@ -219,11 +219,10 @@ fn wait_for_daemon_release(transaction: &control::EnsureLock, port: u16) -> Resu
 fn run_transport_echo_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_echo_args(args)?;
 
-    let cache_dir = serve::cache_dir(false);
-    let key_path = parsed
-        .server_key_file
-        .clone()
-        .unwrap_or_else(|| default_transport_key_path(&cache_dir));
+    let key_path = match parsed.server_key_file.clone() {
+        Some(path) => path,
+        None => default_transport_key_path(&serve::cache_dir(false)?),
+    };
     let keypair = load_or_create_transport_key(&key_path)?;
 
     // The server's public key is this command's only line of stdout.
@@ -336,11 +335,10 @@ fn parse_transport_echo_args(args: &[OsString]) -> Result<ParsedTransportEchoArg
 fn run_transport_shell_command(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_shell_args(args)?;
 
-    let cache_dir = serve::cache_dir(false);
-    let key_path = parsed
-        .server_key_file
-        .clone()
-        .unwrap_or_else(|| default_transport_key_path(&cache_dir));
+    let key_path = match parsed.server_key_file.clone() {
+        Some(path) => path,
+        None => default_transport_key_path(&serve::cache_dir(false)?),
+    };
     let keypair = load_or_create_transport_key(&key_path)?;
 
     // The server's public key is the only protocol line on stdout.
@@ -703,7 +701,7 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
 
-    let cache_dir = absolute_cache_route(serve::cache_dir(false))
+    let cache_dir = absolute_cache_route(serve::cache_dir(false)?)
         .context("resolving the personal cache directory")?;
     let sock_path = control_sock_path(&cache_dir);
     let transaction = control::EnsureLock::acquire(&sock_path, ENSURE_LOCK_WAIT)
@@ -1162,7 +1160,7 @@ fn personal_server_auth(
 /// daemon that vanished after an update is looked for in its log.
 fn run_transport_resume_command() -> Result<()> {
     let refuse = |why: String| -> anyhow::Error {
-        log::init(&serve::cache_dir(false));
+        serve::init_log(false);
         log::error("update", &format!("transport-resume: {why}"));
         anyhow::anyhow!(why)
     };

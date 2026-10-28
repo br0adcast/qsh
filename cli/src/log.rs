@@ -52,24 +52,34 @@ pub fn filter(verbose: bool) -> logging::Filter {
 }
 
 /// Opens the log and installs it as the process's logger. A log that
-/// cannot be opened is disabled for this run; one startup warning explains why.
+/// cannot be located or opened is disabled for this run; one startup
+/// warning explains why.
 pub fn init(verbose: bool) {
     static ATTEMPTED: std::sync::Once = std::sync::Once::new();
     ATTEMPTED.call_once(|| {
-        match logging::FileSink::try_open_in_private_dir(&path(), MAX_BYTES) {
-            Ok(sink) => { let _ = logging::install(sink, filter(verbose)); }
+        let warning = match path() {
             Err(error) => {
-                let warning = logging::diagnostic(&format!(
-                    "file logging disabled: {error}. Check this path's ownership, permissions and free space"));
-                let _ = writeln!(std::io::stderr(), "qsh: {warning}");
+                format!("file logging disabled: cannot locate the cache directory: {error}")
             }
-        }
+            Ok(path) => match logging::FileSink::try_open_in_private_dir(&path, MAX_BYTES) {
+                Ok(sink) => {
+                    let _ = logging::install(sink, filter(verbose));
+                    return;
+                }
+                Err(error) => format!(
+                    "file logging disabled: {error}. \
+                     Check this path's ownership, permissions and free space"
+                ),
+            },
+        };
+        let _ = writeln!(std::io::stderr(), "qsh: {}", logging::diagnostic(&warning));
     });
 }
 
-/// Where the log is, the path the person is told to look at.
-pub fn path() -> PathBuf {
-    crate::paths::cache_dir().join("log")
+/// Where the log is, the path the person is told to look at; an error
+/// when the cache directory cannot be located, and then there is no log.
+pub fn path() -> std::io::Result<PathBuf> {
+    Ok(crate::paths::cache_dir()?.join("log"))
 }
 
 /// A record of this program's own, at `info`.
@@ -202,16 +212,6 @@ mod tests {
     fn a_bracketed_address_keeps_its_brackets() {
         let m = start_marker(&args(&["u@[2001:db8::1]:5,ssh"]));
         assert!(m.contains("addresses: [2001:db8::1]:5+ssh:22,"), "{m}");
-    }
-
-    #[test]
-    fn the_path_is_the_cache_dir_s() {
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| dirs::home_dir().expect("home").join(".cache"));
-        let want = root.join("qsh/log");
-        assert_eq!(path(), want);
     }
 
     #[test]

@@ -721,6 +721,12 @@ tail -f /var/log/qshd/qshd.log        # Linux, system mode -- a fixed,
                                       # cache directory; see "System mode" above
 ```
 
+Unless an absolute `XDG_CACHE_HOME` selects it (Linux), the personal mode's
+cache directory is under the home directory: `$HOME`, or the account
+database's entry when `HOME` is unset or empty. When neither names one, qshd
+does not use the working directory instead: `transport-ensure` fails with an
+error, and `serve` runs without its file log.
+
 This confirms the daemon is alive and listening on the port, but not that
 a real client can get past signature verification and get a shell — for
 that, connect with the `qsh` client binary (see `cli/`):
