@@ -1,14 +1,18 @@
 //! Session-slot-specific descriptor authority; no path mutation after acquisition.
+//! The trust predicates, the verified alias read and the repair handle are
+//! `logging::authority`'s, shared with the log path; the resolver, its
+//! limits, errors and repair sequence are this store's.
+use logging::authority::{declared_parent, same, trusted_directory, trusted_leaf, AliasError};
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 const MAX_ALIASES: usize = 40;
-const MAX_ALIAS_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const SEARCH: OFlags = OFlags::PATH;
 #[cfg(target_vendor = "apple")]
@@ -33,16 +37,7 @@ pub(crate) enum DirectoryIntent {
 fn refused(text: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, text)
 }
-fn same(a: &Stat, b: &Stat) -> bool {
-    a.st_dev == b.st_dev && a.st_ino == b.st_ino
-}
-fn trusted_directory(owner: u32, mode: u32, uid: u32) -> bool {
-    (owner == 0 || owner == uid) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
-}
-fn trusted_leaf(owner: u32, links: u64, uid: u32) -> bool {
-    owner == uid && links == 1
-}
-fn directory(file: &File, uid: u32) -> io::Result<Stat> {
+fn directory(file: &impl AsFd, uid: u32) -> io::Result<Stat> {
     let m = fs::fstat(file)?;
     if FileType::from_raw_mode(m.st_mode) != FileType::Directory
         || !trusted_directory(m.st_uid, m.st_mode as u32, uid)
@@ -65,13 +60,6 @@ fn leaf(m: &Stat, uid: u32) -> io::Result<()> {
             m.st_uid, m.st_mode & 0o7777)));
     }
     Ok(())
-}
-fn alias_length(length: usize) -> io::Result<()> {
-    if length > MAX_ALIAS_BYTES {
-        Err(refused("session directory alias target is too long"))
-    } else {
-        Ok(())
-    }
 }
 fn parts(bytes: &[u8]) -> VecDeque<OsString> {
     // Preserve raw bytes and directory syntax, including regular-file/.. errors.
@@ -115,22 +103,28 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
                         refused("session directory alias limit exceeded"),
                     ));
                 }
-                let mut buffer = [0u8; MAX_ALIAS_BYTES + 1];
-                let count =
-                    fs::readlinkat_raw(parent, &name, &mut buffer[..]).map_err(|error| {
-                        logging::path_error(&component, "reading session alias", error.into())
-                    })?;
-                alias_length(count)?;
-                let after = fs::statat(parent, &name, AtFlags::SYMLINK_NOFOLLOW)?;
-                if !same(&m, &after) || m.st_uid != after.st_uid {
-                    return Err(refused("session alias changed during resolution"));
-                }
-                let target = &buffer[..count];
+                let target = match logging::authority::read_alias(parent, &name, &m) {
+                    Ok(target) => target,
+                    Err(AliasError::Read(error)) => {
+                        return Err(logging::path_error(
+                            &component,
+                            "reading session alias",
+                            error,
+                        ))
+                    }
+                    Err(AliasError::TooLong) => {
+                        return Err(refused("session directory alias target is too long"))
+                    }
+                    Err(AliasError::Restat(error)) => return Err(error),
+                    Err(AliasError::Changed) => {
+                        return Err(refused("session alias changed during resolution"))
+                    }
+                };
                 if target.starts_with(b"/") {
                     stack.truncate(1);
                     resolved = PathBuf::from("/");
                 }
-                let mut target = parts(target);
+                let mut target = parts(&target);
                 target.append(&mut pending);
                 pending = target;
                 continue;
@@ -169,8 +163,7 @@ fn resolve(route: &Path, intent: DirectoryIntent, create: bool) -> io::Result<Fi
     let file = stack.pop().expect("root stays pinned");
     let m = directory(&file, uid)?;
     if matches!(intent, DirectoryIntent::DeclaredPrivate)
-        && (m.st_uid != uid
-            || (m.st_mode & 0o077 != 0 && (same(&m, &root_stat) || m.st_mode & 0o1000 != 0)))
+        && !declared_parent(m.st_uid, m.st_mode as u32, uid, same(&m, &root_stat))
     {
         return Err(logging::path_error(&resolved, "checking dedicated session directory",
             io::Error::new(io::ErrorKind::PermissionDenied, format!(
@@ -269,16 +262,11 @@ impl Store {
         {
             // Search-only authority does not imply fchmod rights. Open only its
             // pinned dot entry, compare identity, and fail closed on denial.
-            let fd = File::from(fs::openat(
-                parent,
-                ".",
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?);
-            if !same(&p, &directory(&fd, uid)?) {
+            let handle = logging::authority::repair_handle(parent, &p, |fd| directory(fd, uid))?;
+            let Some((fd, _)) = handle else {
                 return Err(refused("session parent changed before repair"));
-            }
-            Some(fd)
+            };
+            Some(File::from(fd))
         } else {
             None
         };
@@ -479,8 +467,7 @@ mod tests {
         assert!(Store::open(&base.join("alias40"), DirectoryIntent::Generic).is_err());
         symlink("loop", base.join("loop")).unwrap();
         assert!(Store::open(&base.join("loop"), DirectoryIntent::Generic).is_err());
-        assert!(alias_length(4096).is_ok());
-        assert!(alias_length(4097).is_err());
+        assert_eq!(logging::authority::MAX_ALIAS_BYTES, 4096);
         assert!(trusted_directory(0, 0o755, 123));
         assert!(trusted_directory(123, 0o1777, 123));
         assert!(!trusted_directory(124, 0o755, 123));
