@@ -281,6 +281,39 @@ unit. Service-wide `NoNewPrivileges` or capability restrictions can break
 also break PAM or access to users' files. Follow the warnings in the shipped
 unit rather than applying a blanket sandbox to the whole service.
 
+### Optional systemd resource limits
+
+The packaged system and per-user units set no qshd-specific memory, task, or
+CPU quota. Administrators can add deployment-specific `MemoryMax=`, `TasksMax=`,
+or `CPUQuota=` settings in a `[Service]` drop-in with `sudo systemctl edit
+qshd.service` for system mode or `systemctl --user edit qshd.service` for
+personal mode. Check the resulting unit files with `systemctl cat
+qshd.service` (add `--user` for personal mode). Choose values for the host's
+actual interactive workload; qshd does not prescribe values.
+
+These [systemd resource controls](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)
+account for processes in the service's cgroup, not just the network worker.
+The system helper and worker start there, as do login monitors. A monitor
+opens PAM before forking user shells and commands. A host PAM stack using
+[`pam_systemd`](https://www.freedesktop.org/software/systemd/man/latest/pam_systemd.html)
+may move the monitor into a separate session scope; its later shells and
+commands may then be outside the service cgroup. Other stacks may leave them
+inside it. Inspect process cgroup placement on the deployed host before
+relying on a service drop-in to account for user jobs. A service drop-in does
+not guarantee a worker-only limit or a limit on every user command.
+
+`MemoryMax=` can cause a cgroup out-of-memory kill if usage cannot be kept
+under the cap. If it kills the helper or worker, live sessions end. `TasksMax=`
+counts threads as well as processes and can prevent new runtime
+threads, login monitors, or commands from starting. `CPUQuota=` throttles CPU
+time for processes in the cgroup, including the helper and worker, and can
+delay login, terminal work, and cleanup. Parent slice limits and service
+manager defaults may also apply. Inherited process limits (`Limit*=`) can
+follow descendants even if PAM moves them to another cgroup; PAM or programs
+may change those limits. If you restart qshd to apply a drop-in, its live
+sessions end; in system mode this affects every user it serves. See
+[the session-loss warning](#a-restart-kills-every-session-on-the-machine).
+
 ### Turning it on
 
 Installing the `qshd` package does not start or enable anything — neither
