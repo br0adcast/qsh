@@ -75,8 +75,7 @@ interface-based equivalence is inferred. Stored spelling is not migrated.
 
 Two different names must not be shown as the same text where you decide
 whether to trust them. The QSH first-use question and changed-key refusal, the SSH unknown and
-changed host-key messages, the SSH recovery authorization and the qshd
-installation question therefore show account names, host names, key types and
+changed host-key messages and the qshd installation question therefore show account names, host names, key types and
 fingerprints by a stricter rule than other text. Only the presentation changes:
 the connection, the known-hosts lookup and the stored pins use the name exactly
 as given.
@@ -197,35 +196,29 @@ Conflicting existing pins, discovery keys, or session identities are refused;
 Noise still proves the daemon holds the private key. Other QSH endpoints do not
 inherit this daemon-key grant; the SSH recovery key has the separate scope below.
 
-After an initial verified SSH bootstrap and successful QSH authentication,
-SSH recovery automatically retains that SSH host key in memory for this client
-connection, bound to the authenticated QSH server and account. There is no
-separate association question, persistent recovery grant, extra SSH setup or
-server-key query. A same-connection shell replacement retains this evidence; a
-new client connection starts afresh. `--authorize-ssh` performs no extra setup
-when this connection already has that bootstrap evidence.
+Recovery SSH accepts keys already approved for the attempted SSH hostname and
+port in the configured OpenSSH `known_hosts` files. This works after either a
+direct QSH login or an SSH bootstrap, without a separate association question,
+key query or persistent recovery grant. Unapproved or revoked keys cannot trigger
+recovery authentication or remote commands. The removed `--authorize-ssh`
+option is rejected; old `ssh_bindings.json` files are ignored and left untouched.
 
-Recovery may use that key through another explicitly SSH-enabled address,
-including an address absent from ordinary SSH `known_hosts`. Before each attempt,
-the configured user/system stores are reread for both the original SSH
-hostname/port and the attempted hostname/port. A matching `@revoked` entry or an
-explicit conflicting known-key set at either context refuses that attempt;
-unreadable stores also fail closed. This never overwrites an entry or imports
-unrelated known keys. These are per-attempt, pattern-matched checks, not a
-continuous or global revocation service. Initial SSH host verification is unchanged.
+After verified SSH bootstrap and successful QSH authentication, the checked SSH
+host key is also retained in memory for this client connection, bound to the
+actual QSH server and account. A same-connection shell replacement retains this
+evidence; a new client starts afresh. An explicitly SSH-enabled alias absent from
+ordinary known-hosts files may use this memory key. Before each attempt, fresh
+origin trust checks and target revocations determine whether memory remains
+eligible. An origin conflict, revocation or read failure suppresses only that
+memory authority; independently approved target keys remain usable. A different approved target key does not veto eligible memory evidence; when
+origin and target are the same endpoint, its origin conflict still suppresses
+memory. A matching target revocation always excludes the affected key. An unreadable target trust
+store fails closed. These checks never overwrite known-host entries or import
+unrelated keys, and are per-attempt checks rather than a global revocation service.
 
-Direct QSH connections still use the existing explicit recovery opt-in in this
-intermediate version; automatic authenticated SSH service-key discovery is not
-implemented. Such a login does not probe SSH or create associations. Run
-`qsh --authorize-ssh user@server.example.org,ssh` to configure it; at least one
-SSH-enabled address is required. Setup shows both fingerprints and the endpoint
-before consent, which defaults to No; declining leaves the live QSH session usable.
-It verifies host keys without user authentication or daemon startup.
-Each endpoint is authorized separately. These direct-QSH grants remain in
-`ssh_bindings.json` beside QSH `known_hosts`; recovery intersects them with
-current ordinary SSH trust. Missing grants or unreadable/corrupt grant stores
-disable that recovery path while leaving QSH usable. SSH-first memory trust
-never reads or falls back to this grant store.
+The actual restricted SSH handshake proves possession before authentication.
+After SSH startup, QSH must still prove the original authenticated daemon identity
+before the session can continue. Initial SSH host verification is unchanged.
 
 Encryption does not conceal network addresses, volume, or timing. It cannot
 protect either endpoint after that machine is compromised. The full threat model
@@ -463,21 +456,19 @@ Successful QSH recovery cancels further SSH authentication and commands; late
 results cannot change the active path or server key. `Ctrl-] r` removes a pending
 SSH delay without starting a duplicate login already in flight.
 
-Background SSH uses either this connection's authenticated bootstrap evidence
-or, for a direct-QSH login, an explicit legacy binding as described above.
-Ordinary OpenSSH `known_hosts` alone grants neither kind of recovery authority.
-Fresh revocation/conflict checks apply before credentials or commands. A foreign
-key refuses only that attempt; it does not erase evidence or permanently ban an
-address, so returning to the expected service remains retryable.
+Background SSH uses applicable ordinary known-host approval or eligible
+connection-local bootstrap evidence, as described above. A refused key affects
+only that attempt; it does not erase evidence, permanently ban an address or stop
+all-address QSH recovery. Background recovery asks no questions. Missing approval
+or credentials leaves QSH recovery running; bounded, deduplicated explanations
+appear in the active terminal notice area.
 
 Background recovery asks no questions and never installs or updates qshd. It only
 reuses or restarts an installed daemon with its existing identity; a missing
 executable or identity refuses that SSH attempt while other paths remain eligible.
 Consenting to a replacement shell in the same client run does not permit installation
 or binary replacement. Initial connection installation remains available.
-Missing bindings or credentials leave QSH recovery running; skipped SSH steps
-are explained in the log. Explicit foreground setup can provide the missing
-permission. The initial foreground connection retains its sequential address
+The initial foreground connection retains its sequential address
 ladder and strict handling of conflicting QSH keys.
 
 A foreign QSH key or rejected SSH login fails that path for the attempt. It does
@@ -556,7 +547,7 @@ restart, or an authenticated resume no longer lists the tracked shell, qsh resto
 in the same invocation. `no`, EOF, or no controlling terminal exits with
 code 13; Ctrl-C cancels with code 130. The new shell uses the same locked local
 session slot with a new persisted resume token, so detach and resume work as
-usual. Consent preserves the expected server identity and SSH recovery bindings;
+usual. Consent preserves the expected server identity and connection-local SSH recovery evidence;
 a changed endpoint continues retrying without another trust question. Replacement
 first tries the authenticated road that confirmed the loss, then the other
 configured roads if needed.
@@ -569,7 +560,6 @@ configured roads if needed.
 | `-p, --port N` | Default qsh UDP port; an explicit `host:port` takes precedence. |
 | `-i, --identity PATH` | The only identity for direct qsh authentication; first choice for SSH. |
 | `--ssh[=N]` | Enable SSH for addresses without their own override. |
-| `--authorize-ssh` | After direct QSH login, explicitly configure SSH recovery. SSH-first connections already retain bootstrap trust without extra setup. |
 | `--knock STEPS` | Shared pre-SSH knock sequence. |
 | `--no-password` | Do not ask for passwords or passphrases. |
 | `--predict adaptive\|always\|never` | Local input prediction; default `adaptive`. |

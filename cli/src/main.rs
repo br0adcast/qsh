@@ -147,37 +147,6 @@ fn run(a: args::Args) -> i32 {
         Climbed::Failed { .. } => unreachable!("only a background round ends as Failed"),
     };
     drop(climb);
-    if setup.args().authorize_ssh && !setup.has_bootstrap_recovery_trust() {
-        let server = setup
-            .server_identity()
-            .expect("successful QSH login establishes identity");
-        let mut endpoints = Vec::new();
-        for address in &setup.args().addresses {
-            if let Some(route) = &address.ssh {
-                let endpoint = ::connect::server_identity::SshEndpoint {
-                    host: address.host.clone(),
-                    port: route.port,
-                };
-                if !endpoints.contains(&endpoint) {
-                    endpoints.push(endpoint);
-                }
-            }
-        }
-        let permit = setup.begin_ssh_authorization(::connect::recovery_gate::RecoveryEpoch {
-            connection: 0,
-            network: 0,
-        });
-        let cancel = knock::Cancel::new();
-        if let Err(error) =
-            qsh::ssh_authorization::authorize_ssh(&server, &endpoints, &setup, &permit, &cancel)
-        {
-            eprintln!("qsh: {error}; QSH session remains connected");
-        }
-        setup.invalidate_ssh_authorization();
-        if signals::termination_requested() {
-            return 130;
-        }
-    }
     let mut connected = connected;
     let mut events = link_rx;
     let mut display = DisplaySize {
@@ -958,7 +927,6 @@ impl Links {
 
     /// Invalidate every writer before changing the common catalog/worker epoch.
     fn advance_epoch(&mut self, network: bool) {
-        self.setup.invalidate_ssh_authorization();
         self.round = None;
         if network {
             self.road_epoch.network += 1;
@@ -1226,7 +1194,6 @@ impl Links {
     /// holds a live connection into the session: it is let go quietly, not
     /// dropped -- dropping it could send `Close` while "kept" is printed.
     fn leave(mut self) -> BoundedResolver {
-        self.setup.invalidate_ssh_authorization();
         self.resolver.cancel();
         let host = self.addresses[self.at].host.as_str();
         if let Some(Ok(Round::Connected { connected, .. })) =

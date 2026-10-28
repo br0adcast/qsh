@@ -35,8 +35,6 @@ pub mod sessions;
 mod sessions_store;
 mod signal_wake;
 pub mod signals;
-pub mod ssh_authorization;
-pub mod ssh_bindings;
 pub mod ssh_step;
 pub mod status;
 pub mod statusline;

@@ -60,24 +60,6 @@ fn fixture(keys: &[[u8; 32]]) -> (tempfile::TempDir, fake::FakeServer, Setup) {
         [1; 16],
     );
     *setup.session_key.lock().unwrap() = Some([7; 32]);
-    let epoch = ::connect::recovery_gate::RecoveryEpoch {
-        connection: 1,
-        network: 1,
-    };
-    setup
-        .ssh_bindings()
-        .grant(
-            &::connect::server_identity::SshBinding {
-                server: setup.server_identity().unwrap(),
-                endpoint: ::connect::server_identity::SshEndpoint {
-                    host: "127.0.0.1".into(),
-                    port: ssh.port,
-                },
-                host_key: ssh.host_public_key_wire(),
-            },
-            &crate::ssh_bindings::TrustWritePermit::new(epoch),
-        )
-        .unwrap();
     (home, ssh, setup)
 }
 
@@ -249,14 +231,12 @@ fn memory_bootstrap(key: [u8; 32], ssh_key: Vec<u8>) -> SshBootstrap {
 
 #[test]
 fn ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it() {
-    let (home, ssh, mut setup) = fixture(&[]);
-    std::fs::remove_file(home.path().join("ssh_bindings.json")).unwrap();
+    let (home, ssh, setup) = fixture(&[]);
     let origin = ::connect::server_identity::SshEndpoint {
         host: "127.0.0.1".into(),
         port: ssh.port,
     };
     assert!(!setup.has_bootstrap_recovery_trust());
-    setup.args.authorize_ssh = true;
     assert!(setup.remember_bootstrap(
         memory_bootstrap([7; 32], ssh.host_public_key_wire()),
         0,
@@ -266,16 +246,6 @@ fn ssh_first_selected_identity_publishes_without_store_and_replacement_retains_i
     ));
     assert!(setup.has_bootstrap_recovery_trust());
     assert!(!home.path().join("ssh_bindings.json").exists());
-    let permit = setup.begin_ssh_authorization(::connect::recovery_gate::RecoveryEpoch {
-        connection: 1,
-        network: 2,
-    });
-    setup.invalidate_ssh_authorization();
-    assert!(permit.ensure_active().is_err());
-    assert!(
-        setup.has_bootstrap_recovery_trust(),
-        "network authorization invalidation retains connection evidence"
-    );
     let replacement = setup.replacement([8; 16]);
     assert!(
         replacement.has_bootstrap_recovery_trust(),

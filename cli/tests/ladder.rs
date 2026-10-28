@@ -914,15 +914,11 @@ fn ssh_recovery_hands_a_new_port_to_udp_and_keeps_the_shell() {
     )
     .unwrap();
     let address = format!("127.0.0.1:{},ssh={sshd}", relay.port);
-    let mut client = spawn_qsh(
-        &["--authorize-ssh", "-i", key.to_str().unwrap(), &address],
-        home.path(),
-    );
+    let mut client = spawn_qsh(&["-i", key.to_str().unwrap(), &address], home.path());
     let mut screen = Screen::of(&client);
     assert!(screen.next("Key fingerprint"), "{}", screen.text());
     answer_yes(&mut client);
-    assert!(screen.next("Authorize SSH recovery"), "{}", screen.text());
-    answer_yes(&mut client);
+    wait_for_bootstrap_ready(home.path());
     // Keep the original shell at an external barrier. Opening a nonblocking
     // reader first lets the writer open without waiting for the shell. Writer
     // Drop gives EOF once the shell has opened the FIFO; the existing client

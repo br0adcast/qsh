@@ -292,20 +292,13 @@ fn background_never_installs_even_with_cached_image() {
     let relay = UdpRelay::start(daemon.port);
     let address = format!("127.0.0.1:{},ssh={}", relay.port, sb.sshd.port);
     let mut client = spawn_qsh(
-        &[
-            "--authorize-ssh",
-            "--verbose",
-            "-i",
-            identity.to_str().unwrap(),
-            &address,
-        ],
+        &["--verbose", "-i", identity.to_str().unwrap(), &address],
         home.path(),
     );
     let screen = Screen::of(&client);
     screen.wait("Key fingerprint");
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("Authorize SSH recovery");
-    client.master.write_all(b"yes\n").unwrap();
+    wait_for_bootstrap_ready(home.path());
     client.type_line("echo BEFORE_'RECOVERY'");
     screen.wait("BEFORE_RECOVERY");
     relay.cut();
