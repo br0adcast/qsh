@@ -1004,7 +1004,17 @@ impl<T> Term<T> {
             // Remove leading spacers.
             if point.column <= 1 && point.line != self.topmost_line() {
                 let column = self.last_column();
-                self.grid[point.line - 1i32][column].flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                let line = point.line - 1i32;
+                let cell = &mut self.grid[line][column];
+                if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                    cell.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                    if line.0 >= 0 {
+                        self.damage.damage_point(Point::new(line.0 as usize, column));
+                    } else if self.grid.display_offset() != 0 {
+                        // Damage coordinates cannot address negative history lines.
+                        self.mark_fully_damaged();
+                    }
+                }
             }
 
             cursor_cell = self.grid.cursor_cell();

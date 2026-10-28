@@ -72,3 +72,18 @@
 -        if self.display_offset != 0 {
 +        // Only new history moves a view which is not pinned to the active area.
 +        if self.display_offset != 0 && region.start == 0 {
+--- a/src/term/mod.rs
++++ b/src/term/mod.rs
+@@ -1007 +1007,11 @@ impl<T> Term<T> {
+-                self.grid[point.line - 1i32][column].flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
++                let line = point.line - 1i32;
++                let cell = &mut self.grid[line][column];
++                if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
++                    cell.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
++                    if line.0 >= 0 {
++                        self.damage.damage_point(Point::new(line.0 as usize, column));
++                    } else if self.grid.display_offset() != 0 {
++                        // Damage coordinates cannot address negative history lines.
++                        self.mark_fully_damaged();
++                    }
++                }

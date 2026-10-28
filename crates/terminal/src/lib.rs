@@ -1268,6 +1268,84 @@ mod tests {
         assert_eq!((f.cols, f.rows), (512, 257));
     }
 
+    // Damage consumers must observe cross-row flag changes, even though qsh currently
+    // extracts complete frames rather than relying on the damage iterator.
+    #[test]
+    fn wide_spacer_damage_marks_previous_row_for_both_halves() {
+        use alacritty_terminal::term::TermDamage;
+        for col in [1, 2] {
+            let mut t = TerminalCore::new(8, 4);
+            t.feed("\x1b[1;8H界".as_bytes());
+            t.feed(format!("\x1b[2;{col}H").as_bytes());
+            let _ = t.term.damage();
+            t.term.reset_damage();
+            t.feed(b"x");
+            assert!(!t.term.grid()[Point::new(Line(0), Column(7))]
+                .flags
+                .contains(CellFlags::LEADING_WIDE_CHAR_SPACER));
+            let TermDamage::Partial(rows) = t.term.damage() else {
+                panic!("expected partial damage")
+            };
+            assert!(
+                rows.into_iter()
+                    .any(|row| row.line == 0 && row.left <= 7 && row.right >= 7),
+                "previous-row mutation was not damaged for column {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_spacer_damage_does_not_mark_unchanged_previous_row() {
+        use alacritty_terminal::term::TermDamage;
+        let mut t = TerminalCore::new(8, 4);
+        t.feed("\x1b[2;1H界\x1b[2;1H".as_bytes());
+        let _ = t.term.damage();
+        t.term.reset_damage();
+        t.feed(b"x");
+        let TermDamage::Partial(rows) = t.term.damage() else {
+            panic!("expected partial damage")
+        };
+        assert!(!rows.into_iter().any(|row| row.line == 0));
+    }
+
+    #[test]
+    fn wide_spacer_damage_history_boundary_keeps_full_invalidation() {
+        use alacritty_terminal::term::TermDamage;
+        let mut t = TerminalCore::new(8, 2);
+        t.feed("\x1b[1;8H界\x1b[S\x1b[1;1H".as_bytes());
+        assert_eq!(t.term.grid().history_size(), 1);
+        assert!(t.term.grid()[Point::new(Line(-1), Column(7))]
+            .flags
+            .contains(CellFlags::LEADING_WIDE_CHAR_SPACER));
+        t.scroll(1);
+        assert!(matches!(t.term.damage(), TermDamage::Full));
+        // Consume the scroll invalidation before fresh output changes the visible history row.
+        t.term.reset_damage();
+        t.feed(b"x");
+        assert!(!t.term.grid()[Point::new(Line(-1), Column(7))]
+            .flags
+            .contains(CellFlags::LEADING_WIDE_CHAR_SPACER));
+        assert!(matches!(t.term.damage(), TermDamage::Full));
+    }
+
+    #[test]
+    fn wide_spacer_damage_offscreen_history_does_not_invalidate_viewport() {
+        use alacritty_terminal::term::TermDamage;
+        let mut t = TerminalCore::new(8, 2);
+        t.feed("\x1b[1;8H界\x1b[S\x1b[1;1H".as_bytes());
+        assert_eq!(t.term.grid().display_offset(), 0);
+        assert!(t.term.grid()[Point::new(Line(-1), Column(7))]
+            .flags
+            .contains(CellFlags::LEADING_WIDE_CHAR_SPACER));
+        let _ = t.term.damage();
+        t.term.reset_damage();
+        t.feed(b"x");
+        assert!(!t.term.grid()[Point::new(Line(-1), Column(7))]
+            .flags
+            .contains(CellFlags::LEADING_WIDE_CHAR_SPACER));
+        assert!(matches!(t.term.damage(), TermDamage::Partial(_)));
+    }
+
     #[test]
     fn feed_puts_char_into_grid() {
         let mut t = TerminalCore::new(80, 24);
