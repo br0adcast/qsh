@@ -34,6 +34,13 @@ regressions cover partial and whole-region deletion, frame extraction while
 scrolled to the oldest row, an in-range history anchor, and genuine history
 growth through the configured cap.
 
+Overwriting a wrapped wide character damages the previous row's leading spacer
+only when that flag actually changes. Visible grid cells use bounded cell damage;
+a changed history spacer while history is displayed forces full invalidation,
+since the damage array cannot address negative history lines. When the viewport
+is at the live bottom, history changes do not force full invalidation. Ordinary terminal workspace tests cover
+both wide-character halves, absent spacers and consumed history invalidation.
+
 The product and fuzz workspace roots select this same directory with
 `[patch.crates-io]`. Downstream workspaces must explicitly carry this patch and
 the separate `vte` patch during integration. Keep the patch minimal and review
