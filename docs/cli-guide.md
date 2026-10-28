@@ -40,6 +40,10 @@ The client's fresh Noise key alone does not identify a user.
 
 Direct login proves identity with an SSH key signature. qsh tries agent keys and
 usual key files, or only the file named by `-i` for direct authentication.
+Both QSH signing and SSH authentication read private keys only from regular
+files, with a 1 MiB input limit (including comments and padding). This is a
+resource limit, not a maximum defined by key formats. Explicit symbolic links
+remain supported; these read checks do not add owner or permission restrictions.
 Supported key types include Ed25519, ECDSA P-256/P-384, and RSA with SHA-2. Legacy
 RSA/SHA-1 (`ssh-rsa`) authentication is refused. A personal daemon checks
 `~/.ssh/authorized_keys`; system mode checks the claimed account through a

@@ -417,9 +417,10 @@ jobs:
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
           fi
-      - name: Portable pin-store text and locking tests
+      - name: Portable pin-store and private-key file tests
         run: |
           set -euo pipefail
+          umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           runtime=$(mktemp -d "$RUNNER_TEMP/qsh-pin-store.XXXXXX")
@@ -455,6 +456,28 @@ jobs:
           done
           grep -F 'test result: ok. 33 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           ! grep -F 'SKIPPED' "$runtime/results.log"
+          cargo test -p sshauth --lib --locked keyfile::read_tests:: -- --nocapture --test-threads=1 2>&1 | tee "$runtime/private-key-reader.log"
+          for test in \
+            private_key_read_accepts_exactly_one_mib \
+            private_key_read_rejects_one_byte_over_one_mib_without_secret_diagnostic \
+            private_key_read_refuses_fifo_instead_of_reading_a_key_from_it \
+            private_key_read_fifo_timeout_reaps_the_owned_reader \
+            private_key_read_bounds_growth_after_descriptor_metadata \
+            private_key_read_preserves_explicit_links_and_file_modes \
+            private_key_read_rejects_directory_socket_and_device; do
+            awk -v expected="test keyfile::read_tests::$test ... " '
+              index($0, expected) == 1 { pending=1 }
+              pending && /(^|[[:space:]])ok$/ { found=1; exit }
+              /^test / && index($0, expected) != 1 { pending=0 }
+              END { exit !found }
+            ' "$runtime/private-key-reader.log"
+          done
+          grep -F 'test result: ok. 7 passed; 0 failed; 0 ignored;' "$runtime/private-key-reader.log"
+          ! grep -F 'SKIPPED' "$runtime/private-key-reader.log"
+          cargo test -p ssh --lib --locked keyfile::tests::private_key_read_ -- --nocapture --test-threads=1 2>&1 | tee "$runtime/private-key-caller.log"
+          grep -Fx 'test keyfile::tests::private_key_read_uses_the_shared_input_limit ... ok' "$runtime/private-key-caller.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/private-key-caller.log"
+          ! grep -F 'SKIPPED' "$runtime/private-key-caller.log"
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests
       - name: Personal authorization file integrity on macOS
