@@ -187,6 +187,17 @@ pub trait ExternalSigner: Send + Sync {
     fn public_key(&self) -> Result<Vec<u8>, String>;
     /// SSH-encoded signature over `data`, including its algorithm name.
     fn sign_ssh(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Sign using the requested SSH signature algorithm, returning its SSH wire record.
+    /// The argument identifies a signature algorithm, not merely a key format.
+    /// For RSA, `rsa-sha2-256` and `rsa-sha2-512` select SHA-2; `ssh-rsa`
+    /// selects legacy SHA-1 under the existing peer negotiation policy.
+    /// Fixed-algorithm providers may retain
+    /// this default; a returned record must still match the requested name.
+    /// RSA providers supporting multiple hashes should override this method.
+    fn sign_ssh_with_algorithm(&self, data: &[u8], _algorithm: &str) -> Result<Vec<u8>, String> {
+        self.sign_ssh(data)
+    }
 }
 
 /// A server's host key as shown to a person.
