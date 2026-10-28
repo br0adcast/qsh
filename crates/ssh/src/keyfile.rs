@@ -10,7 +10,6 @@ use sshauth::{
     keyfile::DecodedKey,
     prepared_key::{PreparedKey, RsaDigest},
 };
-use zeroize::Zeroizing;
 
 use crate::auth::{PromptClock, SignError};
 use crate::AuthPrompter;
@@ -28,7 +27,7 @@ const ENCRYPTED_PEM: &str = "encrypted PEM keys are not supported; convert with 
 /// `Proc-Type: 4,ENCRYPTED` or PKCS#8 `ENCRYPTED PRIVATE KEY`) has no
 /// public half to offer before its passphrase, and is not decoded here.
 pub(crate) fn read(path: &Path) -> Result<DecodedKey, String> {
-    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| e.to_string())?);
+    let text = sshauth::keyfile::read_text(path).map_err(|e| e.to_string())?;
     decode(&text)
 }
 
@@ -134,6 +133,15 @@ pub(crate) fn sign_with_hash_alg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_key_read_uses_the_shared_input_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let error = read(file.path()).unwrap_err();
+        assert!(error.contains("1 MiB"), "{error}");
+        assert!(!error.contains("xxxx"));
+    }
 
     #[test]
     fn a_signature_is_appended_as_an_ssh_string() {
