@@ -28,6 +28,7 @@ fn attempt(home: &Path, server: &fake::Server, grants: &[Vec<u8>]) {
         known_hosts: &known,
         tty: &tty,
         background: true,
+        install_policy: bringup::InstallPolicy::RestartOnly,
         images: Arc::new(qsh::releases::GitHubImages::new(home.join("cache"))),
     };
     let route = connect::SshRoute {

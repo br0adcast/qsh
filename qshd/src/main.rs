@@ -65,8 +65,8 @@ use base64::Engine as _;
 use serde::Serialize;
 
 use qshd::{
-    channel_backend, control, handover, load_or_create_transport_key, log, pty, serve, state,
-    transport_daemon, update, version,
+    channel_backend, control, handover, load_or_create_transport_key, load_transport_key, log, pty,
+    serve, state, transport_daemon, update, version,
 };
 
 /// Printed by `--version`. Carries the build stamp as well as the version:
@@ -105,7 +105,7 @@ fn help_text() -> String {
             .to_string(),
         "                    Interactive shell over the transport, no daemonization.".to_string(),
         "  transport-ensure  --name <session> --port <P> [--default-port <D>] \
-         [--client-pubkey <base64>]"
+         [--client-pubkey <base64>] [--restart-only]"
             .to_string(),
         "                    Self-installing, self-daemonizing production path, started \
          over SSH."
@@ -479,6 +479,7 @@ fn parse_transport_shell_args(args: &[OsString]) -> Result<ParsedTransportShellA
 /// allowlist -- via `ADD-CLIENT` if reusing a live daemon, or seeded into
 /// [`transport_daemon::build_server_allowlist`] if becoming the daemon.
 struct ParsedTransportEnsureArgs {
+    restart_only: bool,
     name: String,
     port: u16,
     // Part of the CLI parsing contract (checked by unit tests), but not
@@ -503,6 +504,7 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         bail!("expected command `transport-ensure`, got: {:?}", command);
     }
 
+    let mut restart_only = false;
     let mut name: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut default_port: Option<u16> = None;
@@ -511,6 +513,10 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut i = 1;
     while i < args.len() {
         match argument_text(&args[i], i + 1)? {
+            "--restart-only" => {
+                restart_only = true;
+                i += 1;
+            }
             "--name" => {
                 let value = args.get(i + 1).context("--name requires a value")?;
                 let value = argument_text(value, i + 2)?;
@@ -564,6 +570,7 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     }
 
     Ok(ParsedTransportEnsureArgs {
+        restart_only,
         name,
         port,
         default_port,
@@ -708,7 +715,11 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     // daemon's key byte-for-byte (same file), so the client sees a stable
     // `server-pubkey`, like an SSH host key.
     let key_path = default_transport_key_path(&cache_dir);
-    let keypair = load_or_create_transport_key(&key_path)?;
+    let keypair = if parsed.restart_only {
+        load_transport_key(&key_path)?
+    } else {
+        load_or_create_transport_key(&key_path)?
+    };
 
     // Try the control socket BEFORE binding our own sockets -- like
     // `run_ensure`: is a daemon already alive.
@@ -716,8 +727,19 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
         control::ControlReply::Answered(line) => {
             let status = control::StatusResponse::from_line(&line)
                 .context("parsing the transport control socket's STATUS response")?;
-            let action =
-                version::reconcile(state::build_label(), &state::self_checksum()?, &status);
+            let action = if parsed.restart_only {
+                // Readiness still requires the client's actual QSH negotiation. A
+                // different build never authorizes stopping a daemon during recovery.
+                if status.build != state::build_label() || status.version != state::QSHD_VERSION {
+                    version::ReconcileAction::KeepOldWarn(
+                        "the running qshd build differs; recovery will not replace it".into(),
+                    )
+                } else {
+                    version::ReconcileAction::UpToDate
+                }
+            } else {
+                version::reconcile(state::build_label(), &state::self_checksum()?, &status)
+            };
             // `KeepOldWarn` is a `Reuse` too (see `decide_reuse` below) --
             // the reason is both logged to stderr (unchanged) and carried
             // into `TRANSPORT-READY` so the app can surface it to the user.
@@ -1531,6 +1553,29 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "expected exactly 0600 permissions");
+    }
+
+    #[test]
+    fn transport_restart_only_is_explicit_and_not_the_initial_default() {
+        let normal = parse_transport_ensure_args(&args(&[
+            "transport-ensure",
+            "--name",
+            "console",
+            "--port",
+            "60022",
+        ]))
+        .unwrap();
+        assert!(!normal.restart_only);
+        let recovery = parse_transport_ensure_args(&args(&[
+            "transport-ensure",
+            "--name",
+            "console",
+            "--port",
+            "60022",
+            "--restart-only",
+        ]))
+        .unwrap();
+        assert!(recovery.restart_only);
     }
 
     #[test]

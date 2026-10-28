@@ -236,6 +236,8 @@ pub struct SshStep<'a> {
     /// A reconnect round behind the live terminal: nothing is asked, and
     /// `tty` is never touched.
     pub background: bool,
+    /// Lifecycle policy is independent of whether authentication may prompt.
+    pub install_policy: bringup::InstallPolicy,
     pub images: Arc<dyn bringup::ImageSource>,
 }
 
@@ -329,13 +331,7 @@ impl SshStep<'_> {
         let prompter = self.prompter();
         let result = bringup::bring_up_identified(
             self.request(addr, route, client_pubkey, keys, prompter.answers.clone()),
-            if self.background {
-                bringup::InstallPolicy::ExistingOnly
-            } else {
-                bringup::InstallPolicy::AskIfMissing {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                }
-            },
+            self.install_policy.clone(),
             bringup::BringUpHooks {
                 source: Some(self.images.clone()),
                 approval: Arc::new(InstallQuestion(self.tty.clone())),
@@ -357,6 +353,13 @@ impl SshStep<'_> {
             }
             Err(bringup::BringUpError::Ssh(e)) => Err(Attempted::Ssh(e)),
             Err(bringup::BringUpError::Declined) => Err(Attempted::InstallDeclined),
+            Err(bringup::BringUpError::InstallRequired)
+                if self.install_policy == bringup::InstallPolicy::RestartOnly =>
+            {
+                Err(Attempted::Other(
+                    "qshd is missing; recovery will not install it".into(),
+                ))
+            }
             Err(bringup::BringUpError::InstallRequired) => Err(Attempted::Unanswered),
             Err(other) => Err(Attempted::Other(other.to_string())),
         }
@@ -621,6 +624,7 @@ mod tests {
                     known_hosts: &known,
                     tty: &tty,
                     background,
+                    install_policy: bringup::InstallPolicy::ExistingOnly,
                     images: Arc::new(crate::releases::GitHubImages::new(
                         home.path().join("cache"),
                     )),
@@ -662,7 +666,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn background_missing_daemon_never_calls_image_source() {
+    fn recovery_missing_daemon_never_calls_image_source() {
         struct Spy(std::sync::atomic::AtomicUsize);
         impl bringup::ImageSource for Spy {
             fn load(
@@ -702,6 +706,7 @@ mod tests {
             known_hosts: &known,
             tty: &Tty::at("/nonexistent/qsh-background-tty"),
             background: true,
+            install_policy: bringup::InstallPolicy::RestartOnly,
             images: source.clone(),
         };
         let route = ::connect::SshRoute {
@@ -724,16 +729,17 @@ mod tests {
             !observed.get(),
             "an unbound route is not an active SSH attempt"
         );
-        assert_eq!(
-            step.run_bound(
+        let error = step
+            .run_bound(
                 &addr,
                 &route,
                 [7; 32],
                 &known.lookup("127.0.0.1", sb.sshd.port).unwrap().known,
-                &knock::Cancel::new()
-            ),
-            Err(SshStepError::NeedsPrompt)
-        );
+                &knock::Cancel::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SshStepError::Failed(_)), "{error:?}");
+        assert!(format!("{error:?}").contains("qshd is missing; recovery will not install it"));
         assert_eq!(source.0.load(Ordering::SeqCst), 0);
         assert!(std::fs::read_dir(sb.cache()).unwrap().next().is_none());
     }

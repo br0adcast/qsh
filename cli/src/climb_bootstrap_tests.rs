@@ -145,7 +145,7 @@ fn an_ssh_bootstrap_grant_is_bound_to_the_exact_route_port_and_stage() {
     let (_home, _ssh, mut setup) = fixture(&[[7; 32]]);
     let address = setup.args.addresses[0].clone();
     let identified = setup
-        .ssh_step(false)
+        .ssh_step(false, setup.install_policy(false, false))
         .run_identified(
             &address,
             address.ssh.as_ref().unwrap(),
@@ -199,7 +199,7 @@ fn foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key() {
     let (_home, _ssh, mut setup) = fixture(&[[9; 32]]);
     let address = &setup.args.addresses[0];
     let identified = setup
-        .ssh_step(false)
+        .ssh_step(false, setup.install_policy(false, false))
         .run_identified(
             address,
             address.ssh.as_ref().unwrap(),

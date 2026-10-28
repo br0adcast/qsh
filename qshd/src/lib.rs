@@ -77,7 +77,7 @@ pub mod update;
 pub mod version;
 
 mod host_key;
-pub use host_key::load_or_create_transport_key;
+pub use host_key::{load_or_create_transport_key, load_transport_key};
 
 /// The personal mode's source of handshake nonces -- one fresh, locally
 /// minted value per handshake, with no privileged helper involved.

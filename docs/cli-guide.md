@@ -457,7 +457,11 @@ remain trusted there, and `@revoked` entries still block it. A direct QSH login
 creates no SSH binding automatically. Use `--authorize-ssh` during a foreground
 login to review both fingerprints and grant the selected pair.
 
-Background recovery asks no questions and never installs or updates qshd.
+Background recovery asks no questions and never installs or updates qshd. It only
+reuses or restarts an installed daemon with its existing identity; a missing
+executable or identity refuses that SSH attempt while other paths remain eligible.
+Consenting to a replacement shell in the same client run does not permit installation
+or binary replacement. Initial connection installation remains available.
 Missing bindings or credentials leave QSH recovery running; skipped SSH steps
 are explained in the log. Explicit foreground setup can provide the missing
 permission. The initial foreground connection retains its sequential address
