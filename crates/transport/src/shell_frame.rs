@@ -258,6 +258,30 @@ pub struct ShellDeframer {
     error: Option<ShellCodecError>,
 }
 
+/// Parsed records and conservative presentation-boundary observations.
+/// Unknown extensions retain their existing skip behavior.
+pub struct ShellPush {
+    pub records: Vec<ShellRecord>,
+    pub tail_before: bool,
+    pub tail_after: bool,
+    pub unknown_record: bool,
+    pub rejected: bool,
+}
+impl ShellPush {
+    /// A whole update containing only DATA, with no partial or rejected boundary.
+    pub fn complete_data_only(&self) -> bool {
+        !self.tail_before
+            && !self.tail_after
+            && !self.unknown_record
+            && !self.rejected
+            && !self.records.is_empty()
+            && self
+                .records
+                .iter()
+                .all(|record| matches!(record, ShellRecord::Data(_)))
+    }
+}
+
 impl ShellDeframer {
     /// A new parser with an empty buffer.
     pub fn new() -> Self {
@@ -270,23 +294,37 @@ impl ShellDeframer {
     /// Feed in newly arrived bytes and return all complete records. An
     /// unfinished tail stays in the buffer until the next call.
     pub fn push(&mut self, data: &[u8]) -> Vec<ShellRecord> {
+        self.push_observed(data).records
+    }
+
+    /// Feed bytes with observations from the actual deframer, without changing framing.
+    pub fn push_observed(&mut self, data: &[u8]) -> ShellPush {
+        let tail_before = self.inner.buffered_len() != 0;
+        let mut update = ShellPush {
+            records: Vec::new(),
+            tail_before,
+            tail_after: tail_before,
+            unknown_record: false,
+            rejected: self.error.is_some() || self.inner.overflowed(),
+        };
         if self.error.is_some() {
-            return Vec::new();
+            return update;
         }
-        let mut records = Vec::new();
         for raw in self.inner.push(data) {
             match decode_shell(raw) {
-                Ok(record) => records.push(record),
-                Err(ShellCodecError::UnknownKind(_)) => {}
+                Ok(record) => update.records.push(record),
+                Err(ShellCodecError::UnknownKind(_)) => update.unknown_record = true,
                 Err(error) => {
                     self.error = Some(error);
-                    // Do not retain a partial suffix after a failed boundary.
                     self.inner = RecordDeframer::new();
+                    update.rejected = true;
                     break;
                 }
             }
         }
-        records
+        update.tail_after = self.inner.buffered_len() != 0;
+        update.rejected |= self.inner.overflowed();
+        update
     }
 
     /// A sticky failure. The owner must propagate it; subsequent pushes emit
@@ -700,5 +738,32 @@ mod terminal_reply_failure_tests {
             encode_shell(&old).unwrap(),
             vec![3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 7, 1]
         );
+    }
+}
+
+#[cfg(test)]
+mod presentation304_tests {
+    use super::*;
+    #[test]
+    fn presentation304_deframer_observes_partial_unknown_and_complete_data() {
+        let bytes = encode_record(REC_DATA, b"data");
+        let mut d = ShellDeframer::new();
+        let first = d.push_observed(&bytes[..2]);
+        assert!(!first.complete_data_only());
+        assert!(!first.tail_before && first.tail_after);
+        let end = d.push_observed(&bytes[2..]);
+        assert!(!end.complete_data_only());
+        assert!(end.tail_before && !end.tail_after);
+        assert!(d.push_observed(&bytes).complete_data_only());
+        let mut mixed = bytes.clone();
+        mixed.extend(encode_record(255, b"extension"));
+        let update = d.push_observed(&mixed);
+        assert!(update.unknown_record);
+        assert!(!update.complete_data_only());
+        assert_eq!(update.records.len(), 1);
+        assert!(!d
+            .push_observed(&encode_record(REC_ECHO_ACK, &0u64.to_be_bytes()))
+            .complete_data_only());
+        assert!(!d.push_observed(&[]).complete_data_only());
     }
 }

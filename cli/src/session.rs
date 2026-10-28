@@ -245,9 +245,44 @@ struct SessionDeadlines {
 /// The existing model and owner clocks, read without consuming work.
 #[derive(Clone, Copy, Debug)]
 pub struct UiDeadlines {
+    pub presentation_ms: Option<i64>,
     pub resize_ms: Option<i64>,
     pub status_ms: i64,
     pub shell: client::ShellDeadlines,
+}
+
+const PRESENTATION_INTERVAL_MS: i64 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentationModes {
+    cols: u16,
+    rows: u16,
+    app_cursor: bool,
+    app_keypad: bool,
+    origin: bool,
+    mouse: MouseTracking,
+    mouse_sgr: bool,
+    paste: bool,
+    alternate: bool,
+}
+impl PresentationModes {
+    fn of(frame: &terminal::Frame) -> Self {
+        Self {
+            cols: frame.cols,
+            rows: frame.rows,
+            app_cursor: frame.app_cursor,
+            app_keypad: frame.app_keypad,
+            origin: frame.origin_mode,
+            mouse: frame.mouse_tracking,
+            mouse_sgr: frame.mouse_sgr,
+            paste: frame.bracketed_paste,
+            alternate: frame.alt_screen,
+        }
+    }
+}
+struct PendingPresentation {
+    frame: terminal::Frame,
+    due_ms: i64,
 }
 
 pub struct Session {
@@ -273,6 +308,9 @@ pub struct Session {
     /// (SGR reset, mirrored modes off, `\r\n`) this cache does not describe.
     last_frame: Option<terminal::Frame>,
     painted_clock: Option<TemporalChromeKey>,
+    pending_presentation: Option<PendingPresentation>,
+    presented_modes: Option<PresentationModes>,
+    last_presentation_ms: Option<i64>,
     #[cfg(test)]
     recycling: tests::Recycling,
     #[cfg(test)]
@@ -388,6 +426,9 @@ impl Session {
             rtt_ms: 0,
             last_frame: None,
             painted_clock: None,
+            pending_presentation: None,
+            presented_modes: None,
+            last_presentation_ms: None,
             #[cfg(test)]
             recycling: tests::Recycling::Keep,
             #[cfg(test)]
@@ -450,7 +491,7 @@ impl Session {
                     return Vec::new();
                 }
                 self.session_abort = Some(reason);
-                let mut actions = self.leave(1);
+                let mut actions = self.leave(1, now_ms);
                 // `leave` ends with Exit; capture the diagnostic after terminal
                 // restoration actions, before the executor stops at that Exit.
                 actions.insert(
@@ -476,7 +517,7 @@ impl Session {
                 self.input_failed = true;
                 drop(self.take_pending_input());
                 let mut actions = vec![Action::Keep];
-                actions.extend(self.leave(1));
+                actions.extend(self.leave(1, now_ms));
                 let message = match failure {
                     LocalInputFailure::Channel(error) => format!("qsh: local channel write was not accepted ({error:?})"),
                     LocalInputFailure::Accepted(transport::driver_std::InputFailure::DriverUnavailable) => "qsh: local transport wait or socket failed after input admission".into(),
@@ -498,12 +539,17 @@ impl Session {
                 );
                 actions
             }
-            UiEvent::Stdin(bytes) => self.on_stdin(bytes, now_ms),
+            UiEvent::Stdin(bytes) => {
+                let mut actions = self.flush_presentation(now_ms);
+                actions.extend(self.on_stdin(bytes, now_ms));
+                actions
+            }
             UiEvent::Stream0(bytes) => {
-                let frame = self.shell.on_stream0(&bytes, now_ms, self.rtt_ms);
-                self.paint_at(frame, now_ms)
+                let update = self.shell.on_stream0_observed(&bytes, now_ms, self.rtt_ms);
+                self.paint_output(update, now_ms)
             }
             UiEvent::StreamReset => {
+                self.discard_presentation();
                 self.close_history();
                 let frame = self.shell.on_reset();
                 // Our idea of the screen came from a backlog the peer has
@@ -527,7 +573,7 @@ impl Session {
                 self.forget_shown();
                 self.repaint(now_ms)
             }
-            UiEvent::Terminate => self.leave(0),
+            UiEvent::Terminate => self.leave(0, now_ms),
             UiEvent::Tick => self.on_tick(now_ms),
             // `main` intercepts these before they ever reach `handle`: it is
             // the one that knows what a stream number means, and decodes
@@ -614,6 +660,10 @@ impl Session {
     pub fn ui_deadlines(&self) -> UiDeadlines {
         let local = self.deadlines();
         UiDeadlines {
+            presentation_ms: self
+                .pending_presentation
+                .as_ref()
+                .map(|pending| pending.due_ms),
             resize_ms: local.resize_ms,
             status_ms: local.status_ms,
             shell: self.shell.deadlines(self.rtt_ms),
@@ -671,6 +721,12 @@ impl Session {
             actions.extend(self.paint_at(frame, now_ms));
         } else if self.raw_cols != 0 && self.raw_rows != 0 && chrome_changed {
             actions.extend(self.repaint(now_ms));
+        } else if self.pending_presentation.as_ref().is_some_and(|pending| {
+            now_ms >= pending.due_ms
+                || now_ms >= deadlines.status_ms
+                || deadlines.resize_ms.is_some_and(|at| now_ms >= at)
+        }) {
+            actions.extend(self.flush_presentation(now_ms));
         }
         actions
     }
@@ -726,6 +782,7 @@ impl Session {
 
     /// The link is gone; retain only input not yet admitted to the driver.
     pub fn on_link_gone(&mut self, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         self.lost_since_ms.get_or_insert(now_ms);
         let ch = match &self.shell_channel {
             ShellChannel::Ready(ch) | ShellChannel::Draining(ch) => Some(*ch),
@@ -741,6 +798,7 @@ impl Session {
 
     /// A new connection reached the same session: start over on it.
     pub fn on_reattached(&mut self, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         let frame = self.shell.on_reattach();
         self.renderer.invalidate();
         self.forget_shown();
@@ -764,7 +822,7 @@ impl Session {
     }
 
     /// The server listed what it is running (a warm reattach).
-    pub fn on_announced(&mut self, live: &[ChannelId], _now_ms: i64) -> Vec<Action> {
+    pub fn on_announced(&mut self, live: &[ChannelId], now_ms: i64) -> Vec<Action> {
         let (cols, rows) = self.desired_size();
         if let ShellChannel::Reattaching { ch, .. } = self.shell_channel {
             return match ch {
@@ -779,7 +837,7 @@ impl Session {
                         Action::ShellUnavailable,
                     ];
                     actions.splice(0..0, self.discard_pending_input());
-                    actions.extend(self.leave(13));
+                    actions.extend(self.leave(13, now_ms));
                     actions
                 }
             };
@@ -808,13 +866,15 @@ impl Session {
         self.on_announced(&present, now_ms)
     }
 
-    pub fn on_channel_draining(&mut self, ch: ChannelId) {
+    pub fn on_channel_draining(&mut self, ch: ChannelId, now_ms: i64) -> Vec<Action> {
+        let actions = self.flush_presentation(now_ms);
         if self.shell_channel != ShellChannel::Draining(ch) {
             self.read_only_notice = false;
         }
         self.shell_channel = ShellChannel::Draining(ch);
         self.pending_size = None;
         self.release_draining_input();
+        actions
     }
 
     fn release_draining_input(&mut self) {
@@ -831,6 +891,7 @@ impl Session {
 
     /// Called only after the channel owner validated lifecycle and geometry.
     pub fn on_geometry(&mut self, record: GeometryRecord, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         let Ok(size) = terminal_size::TerminalSize::new(record.cols, record.rows) else {
             return vec![
                 Action::Notice("qsh: shell channel has no valid PTY geometry".into()),
@@ -870,6 +931,7 @@ impl Session {
     }
 
     pub fn on_output_gap(&mut self, cause: OutputGapCause, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         let terminal_failure = cause == OutputGapCause::TerminalReplyFailure;
         let first_terminal_failure = terminal_failure
             && self.continuity_notice != Some(OutputGapCause::TerminalReplyFailure);
@@ -968,22 +1030,26 @@ impl Session {
     /// The channel's process ended with `code`. Silent for a channel this
     /// session is not (or is no longer) tracking: a stale or duplicate event
     /// for a stream that is not the one shell channel it ever opened.
-    pub fn on_channel_exit(&mut self, ch: ChannelId, code: i32, _now_ms: i64) -> Vec<Action> {
+    pub fn on_channel_exit(&mut self, ch: ChannelId, code: i32, now_ms: i64) -> Vec<Action> {
         match &self.shell_channel {
             ShellChannel::Ready(known) | ShellChannel::Draining(known) if *known == ch => {
-                self.leave(code)
+                self.leave(code, now_ms)
             }
             // A refusal arrives before the channel is ever `Ready` -- there
             // is no confirmed number to compare against yet, only the one
             // channel this session is waiting on, so any `ch` here is it.
-            ShellChannel::Opening { .. } => self.leave(code),
+            ShellChannel::Opening { .. } => self.leave(code, now_ms),
             _ => Vec::new(),
         }
     }
 
     /// The remote child ended, but its status was lost. The local failure code
     /// must not be represented as an exit status supplied by the remote process.
-    pub fn on_channel_exit_status_unavailable(&mut self, ch: ChannelId) -> Vec<Action> {
+    pub fn on_channel_exit_status_unavailable(
+        &mut self,
+        ch: ChannelId,
+        now_ms: i64,
+    ) -> Vec<Action> {
         let tracked = match &self.shell_channel {
             ShellChannel::Ready(known) | ShellChannel::Draining(known) => *known == ch,
             ShellChannel::Opening { .. } => true,
@@ -995,7 +1061,7 @@ impl Session {
         let mut actions = vec![Action::Notice(
             "qsh: the remote process ended, but its exit status is unavailable".into(),
         )];
-        actions.extend(self.leave(1));
+        actions.extend(self.leave(1, now_ms));
         actions
     }
 
@@ -1022,7 +1088,7 @@ impl Session {
                     // that exited: code 1, not 0. The session stays on the
                     // server.
                     actions.push(Action::Keep);
-                    actions.extend(self.leave(1));
+                    actions.extend(self.leave(1, now_ms));
                     return actions;
                 }
                 Piece::Command(Command::Reconnect) => {
@@ -1404,7 +1470,7 @@ impl Session {
             // "left without the ordinary way ever happening", which this
             // `Closed` path is not -- it is the ordinary way, just with no
             // real code to report.
-            LinkState::Closed => self.leave(0),
+            LinkState::Closed => self.leave(0, now_ms),
             LinkState::PathDown => {
                 if self.lost_since_ms.is_none() {
                     self.lost_since_ms = Some(now_ms);
@@ -1444,6 +1510,7 @@ impl Session {
     }
 
     fn on_resize(&mut self, cols: u16, rows: u16, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         let restored = (self.raw_cols == 0 || self.raw_rows == 0) && cols != 0 && rows != 0;
         self.raw_cols = cols;
         self.raw_rows = rows;
@@ -1659,7 +1726,65 @@ impl Session {
     /// snapshot, so a steady presentation allocates no new grid. Spares
     /// holding more than twice what the shell or the display needs are
     /// dropped, so a shrink releases the storage of the larger size.
+    fn discard_presentation(&mut self) {
+        if let Some(pending) = self.pending_presentation.take() {
+            self.recycle(pending.frame);
+        }
+    }
+
+    fn flush_presentation(&mut self, now_ms: i64) -> Vec<Action> {
+        match self.pending_presentation.take() {
+            Some(pending) => self.paint_at(pending.frame, now_ms),
+            None => Vec::new(),
+        }
+    }
+
+    fn paint_output(&mut self, update: client::ShellUpdate, now_ms: i64) -> Vec<Action> {
+        let frame = update.frame;
+        let ordinary = update.effects.ordinary_data()
+            && matches!(self.shell_channel, ShellChannel::Ready(_))
+            && self.raw_cols != 0
+            && self.raw_rows != 0
+            && self.history_frame.is_none()
+            && self.shell.display_offset() == 0
+            && self.window.is_none()
+            && self.recovery_view.is_none()
+            && self.lost_since_ms.is_none()
+            && self.plate.is_none()
+            && self.pending_size.is_none()
+            && !self.input_failed
+            && self.last_frame.is_some()
+            && self.presented_modes == Some(PresentationModes::of(&frame))
+            && self.painted_clock == Some(self.temporal_chrome_key())
+            && now_ms < self.deadlines().status_ms;
+        // This side effect belongs to input routing, even if a grid is deferred.
+        // Zero extent retains the previous value, as in `present`.
+        if self.raw_cols != 0 && self.raw_rows != 0 {
+            self.shell_mouse =
+                self.history_frame.is_none() && frame.mouse_tracking != MouseTracking::Off;
+        }
+        let due = self
+            .last_presentation_ms
+            .and_then(|at| at.checked_add(PRESENTATION_INTERVAL_MS));
+        if ordinary && due.is_some_and(|at| now_ms < at) {
+            self.discard_presentation();
+            let needed = frame
+                .cells
+                .len()
+                .max(usize::from(self.cols) * usize::from(self.rows));
+            self.pending_presentation = Some(PendingPresentation {
+                frame,
+                due_ms: due.unwrap(),
+            });
+            self.shell.trim_spares(needed);
+            Vec::new()
+        } else {
+            self.paint_at(frame, now_ms)
+        }
+    }
+
     fn paint_at(&mut self, frame: terminal::Frame, now_ms: i64) -> Vec<Action> {
+        self.discard_presentation();
         // The spares serve snapshots of the shell and padded projections
         // onto the display: none needs more than the larger of the two.
         let needed = frame
@@ -1677,6 +1802,7 @@ impl Session {
             self.recycle(frame);
             return Vec::new();
         }
+        let modes = PresentationModes::of(&frame);
         if let Some(history) = &mut self.history_frame {
             if history.cols != frame.cols || history.rows != frame.rows {
                 history.clone_from(&frame);
@@ -1761,6 +1887,8 @@ impl Session {
             self.recycle(shown);
             return Vec::new();
         }
+        self.presented_modes = Some(modes);
+        self.last_presentation_ms = Some(now_ms);
         self.renderer
             .set_physical_scroll_eligible(shown.rows == self.raw_rows);
         let bytes = self.renderer.render(&shown);
@@ -1789,6 +1917,9 @@ impl Session {
     /// Forget what was painted, so the next paint goes to the renderer
     /// whatever it shows; the frame's storage is kept for reuse.
     fn forget_shown(&mut self) {
+        self.discard_presentation();
+        self.presented_modes = None;
+        self.last_presentation_ms = None;
         if let Some(old) = self.last_frame.take() {
             self.recycle(old);
         }
@@ -1797,12 +1928,25 @@ impl Session {
     /// Bytes that hand the terminal back ahead of a stop (SIGTSTP): what
     /// `leave` writes, without leaving. The next paint after `Resumed` is a
     /// full one, the mirrored modes with it.
-    pub fn suspend(&mut self) -> Vec<u8> {
+    pub fn suspend(&mut self, now_ms: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for action in self.flush_presentation(now_ms) {
+            if let Action::Write(part) = action {
+                bytes.extend(part);
+            }
+        }
         self.forget_shown();
-        self.renderer.finish()
+        bytes.extend(self.renderer.finish());
+        bytes
     }
 
-    fn leave(&mut self, code: i32) -> Vec<Action> {
+    fn leave(&mut self, code: i32, now_ms: i64) -> Vec<Action> {
+        let mut presentation = if self.input_failed || self.session_abort.is_some() {
+            self.discard_presentation();
+            Vec::new()
+        } else {
+            self.flush_presentation(now_ms)
+        };
         // A resize still waiting out the debounce must not be swallowed: it
         // is what keeps a warm reconnect from resuming at the wrong size.
         // Local admission failures must finish even when remote writes fail.
@@ -1812,6 +1956,8 @@ impl Session {
         } else {
             self.flush_resize()
         };
+        presentation.append(&mut actions);
+        let mut actions = presentation;
         let bytes = self.renderer.finish();
         // `finish` resets the renderer's own idea of the screen; ours has to
         // go with it, or a `handle` call reached after `Exit` (a duplicate
@@ -2390,7 +2536,7 @@ mod tests {
         let mut s = session();
         s.assume_channel_opening();
         assert!(s.on_snapshot(&[], &[16], 0).is_empty());
-        s.on_channel_draining(16);
+        s.on_channel_draining(16, 0);
         assert!(sent(&s.handle(UiEvent::Stdin(ingress_input(b"no".to_vec())), 1)).is_empty());
         s.on_resize(30, 7, 2);
         assert!(control(&s.on_tick(1000)).is_empty());
@@ -3992,7 +4138,7 @@ mod tests {
     fn a_suspend_hands_the_terminal_back_and_the_return_repaints_in_full() {
         let mut s = lined(20, 5);
         let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?2004hhello")), 0);
-        let back = s.suspend();
+        let back = s.suspend(0);
         let back = String::from_utf8_lossy(&back);
         assert!(back.contains("\x1b[?2004l"), "{back:?}");
         assert!(back.contains("\x1b[?25h"), "{back:?}");
@@ -4673,4 +4819,5 @@ mod tests {
         assert!(abort.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("ended the session") && !text.contains("resource limit"))));
     }
     include!("input_bounds_tests.rs");
+    include!("presentation_tests.rs");
 }

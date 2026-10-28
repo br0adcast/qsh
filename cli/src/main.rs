@@ -1446,7 +1446,7 @@ fn channel_events(
             }
             SessionEvent::DrainingReady(ch) if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                sess.on_channel_draining(ch);
+                actions.extend(sess.on_channel_draining(ch, now_ms()));
             }
             SessionEvent::OutputContinuityLost { ch, cause, .. } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
@@ -1478,7 +1478,7 @@ fn channel_events(
             }
             SessionEvent::ExitStatusUnavailable { ch } if *shell_channel == Some(ch) => {
                 actions.extend(flush_shell_bytes(shell_bytes, sess, now_ms()));
-                actions.extend(sess.on_channel_exit_status_unavailable(ch));
+                actions.extend(sess.on_channel_exit_status_unavailable(ch, now_ms()));
             }
             SessionEvent::Refused { ch, reason }
                 if shell_channel.is_none_or(|shell| shell == ch) =>
@@ -1708,7 +1708,7 @@ fn interactive(
             // screen and a full repaint back. The SIGCONT that ends the stop
             // is taken here too, or it would repaint a second time; a group
             // the kernel does not stop comes straight back all the same.
-            let _ = stdout.write_all(&sess.suspend());
+            let _ = stdout.write_all(&sess.suspend(now_ms()));
             let _ = stdout.flush();
             if let Err(error) = raw.suspend() {
                 log::error(&format!(
@@ -1906,6 +1906,9 @@ fn session_deadline(sess: &Session, origin: Instant, followup: Option<Instant>) 
     let deadlines = sess.ui_deadlines();
     [
         elapsed_deadline(origin, deadlines.status_ms),
+        deadlines
+            .presentation_ms
+            .and_then(|at| elapsed_deadline(origin, at)),
         deadlines
             .resize_ms
             .and_then(|at| elapsed_deadline(origin, at)),
