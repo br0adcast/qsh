@@ -386,6 +386,157 @@ class TimeoutDiagnosticTests(unittest.TestCase):
             self.assert_owned_pipe_read()
         self.assertTrue(observed, 'real owned snapshot did not observe the renamed wait symbol')
 
+    def fake_waiter(self, root):
+        self.fake_syscall(root, -1)
+        stat = root / '100/stat'
+        stat.write_text(stat.read_text().replace('(ar) S', '(ar) D'))
+        (root / '100/stack').write_text(
+            '[<00000000feedface>] folio_wait_bit_common+0x10/0x200 [PRIVATE_MODULE]\n'
+            '[<00000000deadbeef>] filemap_fault+0x20/0x100\n')
+
+    def test_waiter_outside_syscall_reports_only_numeric_fdinfo(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_waiter(root)
+            readlink = os.readlink
+            def no_fd_targets(path):
+                self.assertNotEqual(Path(path).parent.name, 'fd', 'new report must not inspect FD targets')
+                return readlink(path)
+            with patch.object(diagnostic.os, 'readlink', side_effect=no_fd_targets):
+                report = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            waiter = report['waiter']
+            self.assertEqual((waiter['pid'], waiter['parent'], waiter['started']), (100, 1, 1))
+            self.assertEqual(waiter['open_fdinfo']['entries'], [
+                {'number': 3, 'metadata': {'pos': 42, 'flags': 32768, 'mnt_id': 9, 'ino': 17}}])
+            self.assertEqual(report['processes'][0]['syscall']['number'], -1)
+            encoded = json.dumps(waiter)
+            for private in ['PRIVATE_BUFFER_CONTENT', 'PRIVATE_FDINFO', 'UNRELATED_FD_PATH', 'object.o', str(root)]:
+                self.assertNotIn(private, encoded)
+
+    def test_waiter_stack_symbols_exclude_addresses_offsets_and_modules(self):
+        from native_timeout_diagnostics import timeout_snapshot
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_waiter(root)
+            with (root / '100/stack').open('a') as output:
+                output.write('PRIVATE_TEXT 0x12345678\n[<00000000abcdef01>] malformed PRIVATE_TEXT\n')
+            stack = timeout_snapshot(100, [], {}, root, ROOT, proc=root)['waiter']['kernel_stack']
+            self.assertEqual(stack['symbols'], ['folio_wait_bit_common', 'filemap_fault'])
+            for private in ['feedface', 'deadbeef', 'abcdef01', '0x10', '0x20', 'PRIVATE_MODULE', 'PRIVATE_TEXT']:
+                self.assertNotIn(private, json.dumps(stack))
+
+    def test_waiter_collection_budgets_bound_reads_and_json(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_waiter(root)
+            (root / '100/stack').write_text(('[<12345678>] ' + 's' * 96 + '+0x1/0x2\n') * 40)
+            for number in range(4, 80):
+                (root / '100/fdinfo' / str(number)).write_text(
+                    'pos: 18446744073709551615\nflags: 01777777777777777777777\n'
+                    'mnt_id: 18446744073709551615\nino: 18446744073709551615\n')
+            # The producer must bound the read, not just truncate its report.
+            (root / '100/fdinfo/3').write_text('private: ' + 'x' * 1000)
+            (root / '100/task/100/children').write_text('101')
+            self.fake_process(root, 101, 100)
+            stat = root / '101/stat'
+            stat.write_text(stat.read_text().replace('(ar) S', '(ar) D'))
+            requests, entries = [], []
+            original_open, original_scan = Path.open, os.scandir
+            class CountRead:
+                def __init__(self, file, path): self.file, self.path = file, path
+                def __enter__(self): self.file.__enter__(); return self
+                def __exit__(self, *args): return self.file.__exit__(*args)
+                def read(self, limit=-1):
+                    requests.append((self.path, limit))
+                    return self.file.read(limit)
+            def opened(path, *args, **kwargs):
+                file = original_open(path, *args, **kwargs)
+                if path.name == 'stack' or path.parent.name == 'fdinfo':
+                    return CountRead(file, path)
+                return file
+            class CountScan:
+                def __init__(self, iterator): self.iterator = iterator
+                def __enter__(self): self.iterator.__enter__(); return self
+                def __exit__(self, *args): return self.iterator.__exit__(*args)
+                def __iter__(self): return self
+                def __next__(self):
+                    item = next(self.iterator); entries.append(item.name); return item
+            def scanned(path):
+                iterator = original_scan(path)
+                return CountScan(iterator) if Path(path).name == 'fdinfo' else iterator
+            with patch.object(Path, 'open', opened), patch.object(diagnostic.os, 'scandir', scanned):
+                waiter = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)['waiter']
+            self.assertEqual(len(waiter['kernel_stack']['symbols']), 8)
+            self.assertEqual(len(waiter['open_fdinfo']['entries']), 8)
+            self.assertEqual(waiter['omitted_waiters'], 1)
+            self.assertIn('truncated', waiter['kernel_stack']['status'])
+            self.assertIn('truncated', waiter['open_fdinfo']['status'])
+            self.assertLessEqual(len(entries), 9)
+            self.assertEqual([limit for path, limit in requests if path.name == 'stack'], [2049])
+            self.assertTrue(all(limit == 513 for path, limit in requests if path.parent.name == 'fdinfo'))
+            self.assertLessEqual(len(json.dumps(waiter)), 4096)
+            self.assertNotIn('x' * 64, json.dumps(waiter))
+
+    def test_waiter_changed_identity_and_fdinfo_are_omitted(self):
+        import io
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        for change_identity in [True, False]:
+            with self.subTest(identity=change_identity), tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+                root = Path(temp)
+                self.fake_waiter(root)
+                original_open = Path.open
+                calls = []
+                def opened(path, *args, **kwargs):
+                    if path == root / '100/fdinfo/3':
+                        calls.append(1)
+                        if change_identity:
+                            stat = root / '100/stat'
+                            stat.write_text(stat.read_text().rsplit(' ', 1)[0] + ' 2')
+                        elif len(calls) == 2:
+                            return io.BytesIO(b'pos: 43\nflags: 0100000\nmnt_id: 9\nino: 17\n')
+                    return original_open(path, *args, **kwargs)
+                with patch.object(Path, 'open', opened):
+                    report = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+                if change_identity:
+                    self.assertNotIn(100, [process['pid'] for process in report['processes']])
+                    self.assertNotIn('pid', report['waiter'])
+                else:
+                    entry = report['waiter']['open_fdinfo']['entries'][0]
+                    self.assertEqual(entry['status'], 'changed during snapshot')
+                    self.assertNotIn('metadata', entry)
+
+    def test_waiter_unavailable_metadata_preserves_original_snapshot(self):
+        import native_timeout_diagnostics as diagnostic
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='qsh-timeout-diagnostic-') as temp:
+            root = Path(temp)
+            self.fake_waiter(root)
+            original_open, original_scan = Path.open, os.scandir
+            def opened(path, *args, **kwargs):
+                if path.name == 'stack': raise PermissionError('PRIVATE_PATH/PRIVATE_SECRET')
+                return original_open(path, *args, **kwargs)
+            def scanned(path):
+                if Path(path).name == 'fdinfo': raise PermissionError('PRIVATE_PATH/PRIVATE_SECRET')
+                return original_scan(path)
+            with patch.object(Path, 'open', opened), patch.object(diagnostic.os, 'scandir', scanned):
+                report = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            self.assertEqual(report['processes'][0]['syscall']['number'], -1)
+            self.assertEqual(report['waiter']['kernel_stack']['status'], 'unavailable')
+            self.assertEqual(report['waiter']['open_fdinfo']['status'], 'unavailable')
+            self.assertNotIn('PRIVATE_PATH', json.dumps(report))
+            self.assertNotIn('PRIVATE_SECRET', json.dumps(report))
+            (root / '100/fdinfo/3').write_text(
+                'pos: PRIVATE_SECRET\nflags: 0xdead\nmnt_id: -1\nino: ' + '9' * 100 + '\n')
+            report = diagnostic.timeout_snapshot(100, [], {}, root, ROOT, proc=root)
+            entry = report['waiter']['open_fdinfo']['entries'][0]
+            self.assertEqual(entry['status'], 'unavailable')
+            self.assertNotIn('metadata', entry)
+
     def test_original_timeout_emits_diagnostics_without_changing_failure(self):
         import contextlib
         import io

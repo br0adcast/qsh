@@ -1031,6 +1031,7 @@ jobs:
           run_suite test serve_system_split \
             --require the_worker_runs_as_its_configured_account \
             --require helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it \
+            --require worker_no_new_privs::worker67_no_new_privs_does_not_restrict_helper_or_user_exec \
             --require a_monitor_holds_no_seam_and_the_worker_still_sees_the_end
           run_suite test system_mode_accounts \
             --require two_accounts_each_get_their_own_shell \
