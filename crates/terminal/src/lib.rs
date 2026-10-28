@@ -1491,6 +1491,99 @@ mod tests {
         assert_eq!(t.frame(), bottom, "back to the same live frame");
     }
 
+    fn history_region_delete_fixture(offset: i32, positions: usize) -> (TerminalCore, Frame) {
+        let mut terminal = TerminalCore::new(8, 7);
+        terminal.feed(b"A\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG");
+        assert_eq!(terminal.history_size(), 0);
+        terminal.feed(b"\x1b[6S");
+        assert_eq!(terminal.history_size(), 6);
+        terminal.scroll(offset);
+        assert_eq!(terminal.display_offset(), offset as usize);
+        let pinned = terminal.frame();
+        assert_eq!(pinned.cell(0, 0).ch, (b'G' - offset as u8) as char);
+        terminal.feed(format!("\x1b[2;2H\x1b[{positions}M").as_bytes());
+        (terminal, pinned)
+    }
+
+    #[test]
+    fn history_region_delete_keeps_offset_within_retained_history() {
+        let (terminal, _) = history_region_delete_fixture(6, 2);
+        assert_eq!(
+            terminal.history_size(),
+            6,
+            "region deletion adds no history"
+        );
+        assert_eq!(
+            terminal.display_offset(),
+            6,
+            "unchanged history remains pinned"
+        );
+    }
+
+    #[test]
+    fn history_region_delete_frame_keeps_pinned_rows() {
+        let (terminal, pinned) = history_region_delete_fixture(6, 2);
+        let frame = terminal.frame();
+        assert_eq!(
+            frame.cells, pinned.cells,
+            "region deletion cannot move retained history"
+        );
+    }
+
+    #[test]
+    fn history_region_delete_keeps_partial_history_anchor() {
+        let (terminal, pinned) = history_region_delete_fixture(3, 2);
+        assert_eq!(terminal.history_size(), 6);
+        let frame = terminal.frame();
+        assert_eq!(
+            (terminal.display_offset(), frame.cell(0, 0).ch),
+            (3, pinned.cell(0, 0).ch),
+            "a subregion scroll cannot move history even within its bounds"
+        );
+        let retained_cells = 3 * pinned.width() as usize;
+        assert_eq!(
+            &frame.cells[..retained_cells],
+            &pinned.cells[..retained_cells]
+        );
+    }
+
+    #[test]
+    fn history_region_delete_full_clear_preserves_retained_prefix() {
+        for offset in [3, 6] {
+            let (terminal, pinned) = history_region_delete_fixture(offset, 99);
+            assert_eq!(
+                (terminal.history_size(), terminal.display_offset()),
+                (6, offset as usize)
+            );
+            let frame = terminal.frame();
+            let retained_cells = offset as usize * pinned.width() as usize;
+            assert_eq!(
+                &frame.cells[..retained_cells],
+                &pinned.cells[..retained_cells]
+            );
+        }
+    }
+
+    #[test]
+    fn history_region_scroll_from_top_keeps_anchor_until_evicted_at_cap() {
+        let mut terminal = TerminalCore::new(8, 7);
+        terminal.set_history_limit(8);
+        terminal.feed(b"A\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG\x1b[6S");
+        terminal.scroll(3);
+        assert_eq!(terminal.frame().cell(0, 0).ch, 'D');
+        for offset in [5, 7] {
+            terminal.feed(b"\x1b[2S");
+            assert_eq!(
+                (terminal.history_size(), terminal.display_offset()),
+                (8, offset)
+            );
+            assert_eq!(terminal.frame().cell(0, 0).ch, 'D');
+        }
+        terminal.feed(b"\x1b[2S");
+        assert_eq!((terminal.history_size(), terminal.display_offset()), (8, 8));
+        assert_eq!(terminal.frame().cell(0, 0).ch, 'E');
+    }
+
     #[test]
     fn history_limit_and_clear_preserve_the_live_screen() {
         let mut t = TerminalCore::new(20, 3);
