@@ -32,12 +32,7 @@ impl FileSigner {
         passphrase: Option<&str>,
     ) -> Result<FileSigner, crate::keyfile::KeyFileError> {
         let key = crate::keyfile::read(path)?.into_prepared(passphrase)?;
-        Ok(FileSigner {
-            key,
-            login: None,
-            #[cfg(test)]
-            native_probe: None,
-        })
+        Ok(Self::from_prepared(key))
     }
 
     /// Build a signer around a key already in hand. The loader above is the
@@ -45,12 +40,18 @@ impl FileSigner {
     /// themselves, and for tests.
     pub fn from_key(key: PrivateKey) -> Result<FileSigner, crate::keyfile::KeyFileError> {
         let key = crate::prepared_key::PreparedKey::from_key(key)?;
-        Ok(FileSigner {
+        Ok(Self::from_prepared(key))
+    }
+
+    /// Build a signer from an already prepared owner without rereading a file
+    /// or validating private factors again.
+    pub fn from_prepared(key: crate::prepared_key::PreparedKey) -> FileSigner {
+        FileSigner {
             key,
             login: None,
             #[cfg(test)]
             native_probe: None,
-        })
+        }
     }
 
     /// The login name this signer claims. Required before a version 2
