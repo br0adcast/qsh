@@ -474,6 +474,7 @@ pub fn split_and_run(
 ) -> anyhow::Result<()> {
     split_with_clients(
         config,
+        None,
         false,
         |channels, auth, config, _control| spawner::worker_clients(channels, auth, config),
         move |(spawner, auth, login_ends)| {
@@ -487,6 +488,7 @@ pub fn split_and_run(
 /// this local outcome alone never certifies native/PAM/service completion.
 pub(crate) fn split_and_run_owned(
     config: HelperConfig,
+    status_socket: Option<std::path::PathBuf>,
     run_worker: impl FnOnce(
         spawner::HelperChannelSpawner,
         spawner::HelperAuth,
@@ -496,6 +498,7 @@ pub(crate) fn split_and_run_owned(
 ) -> anyhow::Result<()> {
     split_with_clients(
         config,
+        status_socket,
         true,
         |channels, auth, config, control| {
             // Executed only in the post-fork child, before any auxiliary starts.
@@ -513,6 +516,7 @@ pub(crate) fn split_and_run_owned(
 
 fn split_with_clients<T>(
     config: HelperConfig,
+    status_socket: Option<std::path::PathBuf>,
     owned: bool,
     make_clients: impl FnOnce(
         std::os::unix::net::UnixStream,
@@ -522,6 +526,8 @@ fn split_with_clients<T>(
     ) -> anyhow::Result<T>,
     run_worker: impl FnOnce(T) -> anyhow::Result<Option<worker_drain::WorkerDrainOutcome>>,
 ) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = &status_socket;
     // A multi-threaded `fork` leaves the child holding locks -- the
     // allocator's among them -- that nobody in it will ever release, since
     // the thread that held them does not exist there. Refusing outright,
@@ -577,6 +583,19 @@ fn split_with_clients<T>(
     let (worker_log, mut helper_log) =
         crate::log::relay::pair().context("creating the diagnostic socket pair")?;
 
+    // Only a requested diagnostic endpoint gates initialization. No listener,
+    // lock or cleanup owner exists before fork; this dedicated pair carries
+    // only one success byte, never authentication or cleanup evidence.
+    #[cfg(target_os = "linux")]
+    let (status_parent, mut status_child) = if status_socket.is_some() {
+        let (parent, child) = std::os::unix::net::UnixStream::pair()
+            .context("creating helper status startup gate")?;
+        child.set_read_timeout(Some(config.startup_timeout))?;
+        (Some(parent), Some(child))
+    } else {
+        (None, None)
+    };
+
     // All ordinary fallible preparation is complete. Only fork can now fail;
     // its error path explicitly restores the complete original signal mask.
     #[cfg(target_os = "linux")]
@@ -625,6 +644,8 @@ fn split_with_clients<T>(
                 );
                 (worker, prepared.adoption, prepared.stop)
             });
+            #[cfg(target_os = "linux")]
+            drop(status_child);
             // The helper has no business with the network: drop the worker's
             // ends of both pairs here and let the worker own them alone.
             drop(worker_channels);
@@ -649,14 +670,20 @@ fn split_with_clients<T>(
                     helper_auth,
                     config,
                     helper_log,
-                    worker,
-                    adoption,
-                    stop,
+                    server::OwnedParent {
+                        worker,
+                        adoption: Some(adoption),
+                        stop: Some(stop),
+                        status_socket,
+                        status_gate: status_parent,
+                    },
                 )
             }
             server::run_with_diagnostics(helper_channels, helper_auth, config, helper_log)
         }
         nix::unistd::ForkResult::Child => {
+            #[cfg(target_os = "linux")]
+            drop(status_parent);
             #[cfg(target_os = "linux")]
             let (mut publisher, child_mask) = match prepared.map(|prepared| {
                 // No helper adoption state belongs to the worker. Close its
@@ -691,6 +718,15 @@ fn split_with_clients<T>(
                 };
                 #[cfg(not(target_os = "linux"))]
                 let control = None;
+                #[cfg(target_os = "linux")]
+                if let Some(mut gate) = status_child.take() {
+                    use std::io::Read;
+                    let mut ready = [0u8; 1];
+                    gate.read_exact(&mut ready).context(
+                        "helper status endpoint was not qualified before worker initialization",
+                    )?;
+                    anyhow::ensure!(ready == [1], "invalid helper status startup release");
+                }
                 crate::log::use_worker_relay(worker_log)
                     .context("releasing the worker's privileged log descriptor")?;
                 drop_worker_privileges(&config.worker_user)

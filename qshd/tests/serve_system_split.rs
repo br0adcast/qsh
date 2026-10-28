@@ -955,7 +955,24 @@ fn a_monitor_holds_no_seam_and_the_worker_still_sees_the_end() {
         )
         .expect("keygen");
         common::write_authorized_keys(dir.path(), &key);
-        let (mut daemon, server_pub, port) = common::start_daemon(dir.path());
+        let status_dir = dir.path().join("status");
+        std::fs::create_dir(&status_dir).unwrap();
+        std::fs::set_permissions(
+            &status_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let status_path = status_dir.join("helper.sock");
+        let (mut daemon, server_pub, port) = common::start_daemon_with(
+            dir.path(),
+            &[
+                "--permit-root",
+                "--authorized-keys-template",
+                common::authorized_keys_path(dir.path()).to_str().unwrap(),
+                "--status-socket",
+                status_path.to_str().unwrap(),
+            ],
+        );
         let helper_pid = daemon.child.id();
 
         let Some((worker_pid, _worker_role)) = wait_for_worker_pid(helper_pid) else {
@@ -1017,6 +1034,18 @@ fn a_monitor_holds_no_seam_and_the_worker_still_sees_the_end() {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
+
+        let snapshot = qshd::helper_status::query(&status_path).unwrap();
+        assert_eq!(snapshot.capacity, qshd::helper_status::Capacity::Available);
+        for fd in std::fs::read_dir(format!("/proc/{monitor}/fd")).unwrap() {
+            if let Ok(target) = std::fs::read_link(fd.unwrap().path()) {
+                assert!(
+                    target != status_path.with_file_name("helper.sock.lock")
+                        && target != status_dir,
+                    "monitor retained helper lock/directory authority; socket identity is checked below"
+                );
+            }
+        }
 
         // The monitor's socket table must share nothing with the helper's
         // or the worker's. A COUNT of sockets used to say this, and cannot
@@ -1317,4 +1346,140 @@ fn a_thread_name_linux_would_cut_is_refused_at_once() {
         !has_thread_named(std::process::id(), &at_limit),
         "no thread of this test is named {at_limit:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    const NAME: &str =
+        "helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inherit_it";
+    common::on_a_disposable_host(NAME, WHAT_THESE_TESTS_DO, || {
+        common::install_service_file(include_str!("../../packaging/pam.d/qshd.debian"));
+        let dir = tempfile::tempdir().unwrap();
+        let status_dir = dir.path().join("status");
+        std::fs::create_dir(&status_dir).unwrap();
+        std::fs::set_permissions(&status_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = status_dir.join("helper.sock");
+        let (mut daemon, _, _) =
+            common::start_daemon_with(dir.path(), &["--status-socket", path.to_str().unwrap()]);
+        // The existing identity banner predates serving. Wait for a real
+        // endpoint publication, not a guessed delay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let snapshot = loop {
+            match qshd::helper_status::query(&path) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(
+                        daemon.child.try_wait().unwrap().is_none(),
+                        "helper startup failed: {e}"
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "status endpoint unavailable: {e}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        };
+        let cli = std::process::Command::new(env!("CARGO_BIN_EXE_qshd"))
+            .args(["helper-status", "--socket", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            cli.status.success(),
+            "helper-status CLI failed: {}",
+            String::from_utf8_lossy(&cli.stderr)
+        );
+        let command_snapshot: qshd::helper_status::Snapshot =
+            serde_json::from_slice(&cli.stdout).unwrap();
+        assert_eq!(command_snapshot.schema, 1);
+        assert_eq!(
+            command_snapshot.capacity,
+            qshd::helper_status::Capacity::Available
+        );
+        assert_eq!(snapshot.capacity, qshd::helper_status::Capacity::Available);
+        assert_eq!(snapshot.counts.unwrap().charged, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        // /proc socket descriptors expose kernel socket identities, not paths.
+        let parent_sockets: HashSet<_> =
+            open_socket_inodes(daemon.child.id()).into_iter().collect();
+        // Root-owned runtime path is never authority delegated to the worker.
+        let helper = daemon.child.id();
+        let children = children_of(helper);
+        assert_eq!(children.len(), 1);
+        assert!(
+            open_socket_inodes(children[0])
+                .iter()
+                .all(|inode| !parent_sockets.contains(inode)),
+            "worker retained an actual helper-owned socket, including the listener"
+        );
+        let forbidden = [path.with_file_name("helper.sock.lock"), status_dir];
+        for fd in std::fs::read_dir(format!("/proc/{}/fd", children[0])).unwrap() {
+            if let Ok(target) = std::fs::read_link(fd.unwrap().path()) {
+                assert!(
+                    !forbidden.contains(&target),
+                    "worker inherited helper endpoint authority"
+                );
+            }
+        }
+        // This owned runtime log is after nonce-pool fill and auth construction;
+        // endpoint availability alone does not prove worker runtime readiness.
+        while !std::fs::read_to_string(common::daemon_log_path())
+            .unwrap_or_default()
+            .contains("runtime workers")
+        {
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not finish nonce-backed startup"
+            );
+            std::thread::yield_now();
+        }
+        // A real service stop keeps endpoint ownership until physical settlement.
+        assert_eq!(
+            unsafe { nix::libc::kill(helper as i32, nix::libc::SIGTERM) },
+            0
+        );
+        loop {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "owned helper did not settle successfully: {status}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned helper stop did not settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!path.exists(), "settled helper left its published socket");
+        assert!(path.with_file_name("helper.sock.lock").exists());
+        // Requested startup publication failure must take the retained stop path,
+        // not leave an unqualified worker serving behind an unavailable status.
+        std::fs::write(&path, b"owned non-socket fixture").unwrap();
+        let (mut refused, _, _) =
+            common::start_daemon_with(dir.path(), &["--status-socket", path.to_str().unwrap()]);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = refused.child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(1));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "failed status setup abandoned worker custody"
+            );
+            std::thread::yield_now();
+        }
+        let refused_log = std::fs::read_to_string(common::daemon_log_path()).unwrap();
+        assert!(refused_log.contains("requested helper status endpoint failed"));
+        assert!(
+            !refused_log.contains("runtime workers"),
+            "worker advertised runtime despite failed endpoint setup"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"owned non-socket fixture");
+    });
 }

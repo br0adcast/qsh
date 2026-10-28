@@ -535,3 +535,148 @@ fn cleanup143_capacity_format_is_bounded_private_and_normalizes_pam_codes() {
         "an unsuccessful PAM outcome alone is not lost custody"
     );
 }
+
+#[test]
+fn helper_status143_serialized_snapshot_preserves_registered_custody() {
+    let mut state = empty_state();
+    capacity143_fill_provisional(&mut state, 3);
+    let before = (
+        state.logins.len(),
+        state.retired.len(),
+        state.next_incarnation,
+    );
+    let bytes = helper_status_snapshot(&state);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["phase"], "serving");
+    assert_eq!(value["capacity"], "available");
+    assert_eq!(value["counts"]["charged"], 3);
+    assert_eq!(value["counts"]["provisional"], 3);
+    assert!(value.get("cleanup_complete").is_none());
+    assert_eq!(
+        before,
+        (
+            state.logins.len(),
+            state.retired.len(),
+            state.next_incarnation
+        )
+    );
+    state.stopping = true;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&helper_status_snapshot(&state)).unwrap()
+            ["phase"],
+        "stopping"
+    );
+    state.retired.insert(MonitorOwner {
+        login: login_token(0),
+        incarnation: state.logins[&login_token(0)].incarnation,
+    });
+    let unavailable: serde_json::Value =
+        serde_json::from_slice(&helper_status_snapshot(&state)).unwrap();
+    assert_eq!(unavailable["capacity"], "unavailable");
+    assert!(unavailable.get("counts").is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn helper_status143_legacy_drain_answers_pending_and_queries_do_not_hold_exit() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("status.sock");
+    let endpoint =
+        crate::helper_status::Endpoint::bind_for(&path, nix::unistd::geteuid().as_raw()).unwrap();
+    let (state, _owner, peer) = pam40_controlled_retiring_monitor(true);
+    let thread = std::thread::spawn(move || {
+        let seams = DirectSeam::new();
+        let mut shutdown = HelperShutdown::new(state);
+        shutdown.status = Some(endpoint);
+        shutdown.end_the_monitors(seams.seams(), &test_config());
+        assert!(shutdown.state.retired.is_empty());
+    });
+    let result = (|| -> std::io::Result<Vec<u8>> {
+        let client = UnixStream::connect(&path)?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut bytes = Vec::new();
+        client
+            .take((crate::helper_status::MAX_RESPONSE + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    let queued: Vec<_> = (0..4)
+        .map(|_| UnixStream::connect(&path).unwrap())
+        .collect();
+    // Release the exact controlled final receipt even if the query failed.
+    let sent = channel::send(
+        &peer,
+        &encode(&MonitorEvent::SessionClosed {
+            result: PamCompletion::NotOpened,
+        })
+        .unwrap(),
+        None,
+    );
+    thread.join().unwrap();
+    sent.unwrap();
+    drop(queued);
+    let snapshot: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+    assert_eq!(snapshot["phase"], "stopping");
+    assert_eq!(snapshot["counts"]["retiring_pending"], 1);
+    assert_eq!(snapshot["counts"]["receipt_outstanding"], 1);
+    assert!(
+        !path.exists(),
+        "query clients do not retain endpoint custody"
+    );
+}
+
+#[test]
+fn helper_status143_serializes_overlapping_uncertainty_and_pam_after_exact_release() {
+    let (mut lost, owner, _peer) = pam40_controlled_retiring_monitor(false);
+    let monitor = lost.monitors.get_mut(&owner).unwrap();
+    monitor.wait_lost = true;
+    monitor.failure = Some(MonitorFailure::Wait(nix::libc::ECHILD));
+    monitor.seam_closed = true;
+    let before = (
+        lost.logins.len(),
+        lost.retired.len(),
+        lost.monitors.len(),
+        lost.live.len(),
+    );
+    let bytes = helper_status_snapshot(&lost);
+    let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(snapshot["counts"]["charged"], 1);
+    assert_eq!(
+        snapshot["counts"]["unconfirmed"], 1,
+        "overlapping reasons count one owner"
+    );
+    for reason in ["wait_lost", "monitor_failed", "receipt_lost"] {
+        assert_eq!(snapshot["counts"][reason], 1);
+    }
+    assert_eq!(snapshot["counts"]["retiring_pending"], 0);
+    assert_eq!(bytes, helper_status_snapshot(&lost));
+    assert_eq!(
+        before,
+        (
+            lost.logins.len(),
+            lost.retired.len(),
+            lost.monitors.len(),
+            lost.live.len()
+        )
+    );
+
+    let (mut settled, owner, _peer) = pam40_controlled_retiring_monitor(true);
+    settled.monitors.get_mut(&owner).unwrap().completion = Some(PamCompletion::Finished {
+        close_session: super::super::pam_completion::PamStep::Attempted(17),
+        delete_cred: super::super::pam_completion::PamStep::Skipped,
+        end: super::super::pam_completion::PamStep::Attempted(0),
+    });
+    finish_retired(&mut settled, owner);
+    let after: serde_json::Value =
+        serde_json::from_slice(&helper_status_snapshot(&settled)).unwrap();
+    assert_eq!(after["counts"]["charged"], 0);
+    assert_eq!(after["counts"]["retiring"], 0);
+    assert_eq!(after["counts"]["pam"]["state"], "finished");
+    assert_eq!(after["counts"]["pam"]["close_session"], "failed");
+    assert_eq!(after["counts"]["pam"]["delete_cred"], "skipped");
+    assert_eq!(after["counts"]["pam"]["end"], "ok");
+}

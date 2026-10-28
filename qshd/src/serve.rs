@@ -36,6 +36,8 @@ pub const MAX_RUNTIME_THREADS: usize = 256;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ServeArgs {
     pub port: u16,
+    /// Explicit root-only helper diagnostics endpoint in Linux system mode.
+    pub status_socket: Option<PathBuf>,
     /// Where the personal mode's `AuthorizedKeysVerifier` looks -- `None`
     /// in, and only in, the system mode, which never reads a single shared
     /// file at all (`--authorized-keys` is refused outright for
@@ -100,6 +102,7 @@ fn argument_text((index, value): (usize, &OsString)) -> Result<&str> {
 /// Parse OS arguments without converting filesystem paths to text.
 pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
     let mut port = None;
+    let mut status_socket = None;
     let mut authorized_keys = None;
     let mut host_key = None;
     // Only mutated in the `#[cfg(feature = "system")]` arm below -- without
@@ -124,6 +127,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
                 .ok_or_else(|| anyhow::anyhow!("flag {flag} needs a value"))
         };
         match flag {
+            "--status-socket" => status_socket = Some(PathBuf::from(value()?.1)),
             "--port" => {
                 let parsed_port: u16 = argument_text(value()?)?
                     .parse()
@@ -216,6 +220,14 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         bail!("--authorized-keys-template applies to --system only");
     }
 
+    if let Some(path) = &status_socket {
+        if !system || !cfg!(target_os = "linux") {
+            bail!("--status-socket requires Linux --system mode");
+        }
+        if !path.is_absolute() {
+            bail!("--status-socket must be absolute");
+        }
+    }
     let authorized_keys = match authorized_keys {
         Some(p) => Some(p),
         // Symmetric to `host_key` below: the system mode never reads this
@@ -240,6 +252,7 @@ pub fn parse_serve_args_os(args: &[OsString]) -> Result<ServeArgs> {
         authorized_keys_template.unwrap_or_else(|| "%h/.ssh/authorized_keys".to_string());
     Ok(ServeArgs {
         port: port.unwrap_or(DEFAULT_SERVE_PORT),
+        status_socket,
         authorized_keys,
         host_key,
         system,
@@ -561,6 +574,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         // service at once rather than after a process tree exists.
         return crate::helper::split_and_run_owned(
             helper_config,
+            parsed.status_socket.clone(),
             move |mut spawner, mut helper_auth, login_ends, context| {
                 let stop = context.stop();
                 // Fixed custody is outside all published Arc clients. On an
@@ -2482,4 +2496,20 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "system"))]
+#[test]
+fn helper_status143_status_socket_is_explicit_system_only() {
+    let parse =
+        |xs: &[&str]| parse_serve_args(&xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+    assert!(parse(&[
+        "serve",
+        "--system",
+        "--status-socket",
+        "/run/qshd/status.sock"
+    ])
+    .is_ok());
+    assert!(parse(&["serve", "--status-socket", "/run/qshd/status.sock"]).is_err());
+    assert!(parse(&["serve", "--system", "--status-socket", "relative.sock"]).is_err());
 }

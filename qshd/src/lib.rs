@@ -62,6 +62,7 @@ pub mod control;
 pub mod handover;
 #[cfg(feature = "system")]
 pub mod helper;
+pub mod helper_status;
 pub mod log;
 #[cfg(feature = "system")]
 pub mod nonce_pool;

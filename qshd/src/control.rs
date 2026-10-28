@@ -589,6 +589,21 @@ impl EnsureLock {
         bind_with_authority(&self.authority)
     }
 
+    /// Check the retained parent, not a pathname reopened independently.
+    #[cfg(all(target_os = "linux", feature = "system"))]
+    pub(crate) fn require_private_parent(&self, uid: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.validate_route()?;
+        let m = self.authority.parent.metadata()?;
+        if m.uid() != uid || m.mode() & 0o7777 != 0o700 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "helper status requires an existing private directory owned by root",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn endpoint_exists(&self) -> std::io::Result<bool> {
         self.validate_route()?;
         Ok(self.authority.entry()?.is_some())

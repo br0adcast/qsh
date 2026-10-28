@@ -138,6 +138,8 @@ mod adoption_pump {
             UNPRIVILEGED,
             None,
             Some(OwnedParent {
+                status_socket: None,
+                status_gate: None,
                 worker,
                 adoption: Some(adoption),
                 stop: None,

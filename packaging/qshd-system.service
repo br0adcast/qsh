@@ -10,7 +10,9 @@ Description=qshd — a resilient terminal daemon (system mode)
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/qshd serve --system --port 60022
+RuntimeDirectory=qshd
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/qshd serve --system --port 60022 --status-socket /run/qshd/helper-status.sock
 Restart=on-failure
 RestartSec=2
 # Deliver the initial stop to the privileged helper; it retains child custody
