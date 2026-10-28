@@ -56,15 +56,22 @@ pub fn read_alias(parent: &impl AsFd, name: &OsStr, before: &Stat) -> Result<Vec
     let mut buffer = [0u8; MAX_ALIAS_BYTES + 1];
     let count = fs::readlinkat_raw(parent, name, &mut buffer[..])
         .map_err(|error| AliasError::Read(error.into()))?;
-    if count > MAX_ALIAS_BYTES {
-        return Err(AliasError::TooLong);
-    }
+    alias_length(count)?;
     let after = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|error| AliasError::Restat(error.into()))?;
     if !same(before, &after) || before.st_uid != after.st_uid {
         return Err(AliasError::Changed);
     }
     Ok(buffer[..count].to_vec())
+}
+
+/// A target of `count` bytes is followed only up to [`MAX_ALIAS_BYTES`].
+fn alias_length(count: usize) -> Result<(), AliasError> {
+    if count > MAX_ALIAS_BYTES {
+        Err(AliasError::TooLong)
+    } else {
+        Ok(())
+    }
 }
 
 /// A descriptor through which `directory` itself can be `fchmod`ed. Search
@@ -124,6 +131,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_alias_target_is_followed_up_to_the_limit() {
+        // A 4097-byte symlink target cannot be created on Linux, so the
+        // boundary is checked on the length `read_alias` measures.
+        assert!(alias_length(0).is_ok());
+        assert!(alias_length(4096).is_ok());
+        assert!(matches!(alias_length(4097), Err(AliasError::TooLong)));
     }
 
     #[test]
