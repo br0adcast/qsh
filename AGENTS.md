@@ -66,3 +66,19 @@ documentation such as README, architecture, protocol, and contributor guides.
 Inspect the staged paths before committing. Ignore rules do not untrack existing
 files: preserve already tracked documents unless their removal or migration is
 explicitly requested.
+
+## Performance experiments
+
+Keep raw benchmark outputs, run manifests, logs, profiles, experiment reports,
+one-off comparison patches and experiment-only tests or prototypes local unless
+the user explicitly requests their inclusion in version control. Do not publish
+an entire experiment or dataset as part of an implementation PR. Use ignored
+local directories for this evidence and review any requested publication under
+the privacy rules above.
+
+Record experiment conclusions in the relevant issue by default. Add conclusions
+or dated experiment reports to repository documentation only when explicitly
+requested. Reusable measurement tools and normal product regression tests may
+be maintained in the repository; keep their usage and contracts separate from
+particular experiment results. Do not remove meaningful regression coverage when
+moving experimental evidence out of the tracked tree.
