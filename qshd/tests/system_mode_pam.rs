@@ -302,7 +302,8 @@ fn a_session_is_closed_when_the_login_ends() {
 
 const SENTINEL_GROUP: u32 = 61001;
 const PAM_GROUP: u32 = 61002;
-const GROUP_REPORT: &str = r#"awk '/^(Uid|Gid|Groups|CapEff|CapPrm):/ {printf "qshd-proc-%s=[", $1; for(i=2;i<=NF;i++)printf "%s%s",i==2?"":" ",$i; print "]"}' /proc/self/status"#;
+// Keep the first report separate from an interactive shell's pending prompt.
+const GROUP_REPORT: &str = r#"printf '\n'; awk '/^(Uid|Gid|Groups|CapEff|CapPrm):/ {printf "qshd-proc-%s=[", $1; for(i=2;i<=NF;i++)printf "%s%s",i==2?"":" ",$i; print "]"}' /proc/self/status"#;
 
 fn fixture_stack(record: &std::path::Path, options: &str) -> String {
     let module = std::env::var("QSHD_TEST_PAM_GROUP_MODULE")
@@ -331,6 +332,41 @@ fn proc_values(output: &str, name: &str) -> Vec<u32> {
         .split_whitespace()
         .map(|n| n.parse().expect("numeric proc field"))
         .collect()
+}
+
+#[test]
+fn process_report_starts_after_an_interactive_prompt() {
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("printf '$ '; {GROUP_REPORT}"))
+        .env("HISTFILE", "/dev/null")
+        .output()
+        .expect("run the finite process-report producer");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let output = String::from_utf8(output.stdout).expect("ASCII process report");
+    assert_eq!(
+        proc_values(&output, "Uid"),
+        vec![nix::unistd::getuid().as_raw(); 4]
+    );
+    for name in ["Gid", "Groups", "CapEff", "CapPrm"] {
+        let prefix = format!("qshd-proc-{name}:=[");
+        assert!(
+            output.lines().any(|line| line.starts_with(&prefix)),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn process_report_rejects_missing_field() {
+    assert!(std::panic::catch_unwind(|| proc_values("qshd-proc-Groups:=[]\n", "Uid")).is_err());
+}
+
+#[test]
+fn process_report_rejects_echo_only() {
+    let echo = format!("$ {GROUP_REPORT}\r\n$ ");
+    assert!(std::panic::catch_unwind(|| proc_values(&echo, "Uid")).is_err());
 }
 
 fn group_regression(test: &str, baseline_only: bool) {
