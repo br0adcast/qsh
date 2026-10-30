@@ -120,10 +120,10 @@ impl ShellState {
         }
         match self.spare.pop() {
             Some(mut frame) => {
-                self.terminal.frame_into(&mut frame);
+                self.terminal.frame_into_cached(&mut frame);
                 frame
             }
-            None => self.terminal.frame(),
+            None => self.terminal.frame_cached(),
         }
     }
 
@@ -1269,3 +1269,6 @@ mod presentation304_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cached_snapshot_tests;

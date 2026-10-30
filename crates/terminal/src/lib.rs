@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
+mod cached_frame_tests;
+#[cfg(test)]
 mod combining_equality_tests;
+mod frame_cache;
 #[cfg(test)]
 mod frame_storage_tests;
 mod limits;
@@ -413,6 +416,11 @@ pub struct TerminalCore {
     replay: Option<ReplayState>,
     history_limit: usize,
     sync_boundary: bool,
+    frame_cache: Option<Box<frame_cache::CachedFrame>>,
+    #[cfg(test)]
+    cache_counts: frame_cache::CacheCounts,
+    #[cfg(test)]
+    cache_omit_row: Option<usize>,
 }
 
 /// What a replay needs on top of the `Term` (see `tracking`).
@@ -454,6 +462,11 @@ impl TerminalCore {
             }),
             history_limit: options.history_lines,
             sync_boundary: false,
+            frame_cache: None,
+            #[cfg(test)]
+            cache_counts: frame_cache::CacheCounts::default(),
+            #[cfg(test)]
+            cache_omit_row: None,
         }
     }
 
@@ -470,6 +483,7 @@ impl TerminalCore {
 
     /// Sets the primary screen's history capacity, including zero to disable it.
     pub fn set_history_limit(&mut self, lines: usize) {
+        self.invalidate_frame_cache();
         self.history_limit = lines;
         self.term.set_options(Config {
             scrolling_history: self.effective_history_limit(),
@@ -614,6 +628,9 @@ impl TerminalCore {
     /// Resizes the model, shrinking history before any width growth.
     pub fn resize_to(&mut self, size: TerminalSize) {
         let (old_cols, old_rows) = (self.term.columns(), self.term.screen_lines());
+        if (old_cols, old_rows) != (usize::from(size.cols()), usize::from(size.rows())) {
+            self.frame_cache = None;
+        }
         // Alacritty set_options targets the primary grid even while it is inactive.
         self.term.set_options(Config {
             scrolling_history: limits::effective_history(self.history_limit, size),
@@ -648,6 +665,7 @@ impl TerminalCore {
     /// `None` from a core not made [`TerminalCore::with_replay`].
     pub fn replay(&mut self) -> Option<Vec<u8>> {
         self.replay.as_ref()?;
+        self.invalidate_frame_cache();
         self.flush_pending_output();
         let replay = self.replay.as_ref().expect("replay policy is unchanged");
         Some(replay::write(
@@ -661,7 +679,9 @@ impl TerminalCore {
     /// emulators by; `None` from a core not made
     /// [`TerminalCore::with_replay`].
     pub fn snapshot(&mut self) -> Option<StateSnapshot> {
-        let replay = self.replay.as_ref()?;
+        self.replay.as_ref()?;
+        self.invalidate_frame_cache();
+        let replay = self.replay.as_ref().expect("replay policy is unchanged");
         Some(replay::snapshot(&mut self.term, &replay.tracked))
     }
 
@@ -670,6 +690,7 @@ impl TerminalCore {
     /// the live bottom. An empty history (little output) doesn't panic -
     /// `scroll_display` itself clamps the offset to the buffered range.
     pub fn scroll(&mut self, delta_lines: i32) {
+        let before = self.display_offset();
         let target = self.display_offset() as i64 + i64::from(delta_lines);
         let scroll = if target <= 0 {
             Scroll::Bottom
@@ -679,11 +700,18 @@ impl TerminalCore {
             Scroll::Delta(delta_lines)
         };
         self.term.scroll_display(scroll);
+        if self.display_offset() != before {
+            self.invalidate_frame_cache();
+        }
     }
 
     /// Returns the view to the live bottom (resets the history offset).
     pub fn scroll_to_bottom(&mut self) {
+        let before = self.display_offset();
         self.term.scroll_display(Scroll::Bottom);
+        if self.display_offset() != before {
+            self.invalidate_frame_cache();
+        }
     }
 
     /// Current history view offset (0 = live bottom, increasing towards the top of the buffer).
@@ -702,7 +730,13 @@ impl TerminalCore {
     /// hidden, since it makes no sense in a historical frame (the cursor
     /// always lives at the live bottom).
     pub fn frame(&self) -> Frame {
-        let mut frame = Frame {
+        let mut frame = self.empty_frame();
+        self.fill(&mut frame);
+        frame
+    }
+
+    fn empty_frame(&self) -> Frame {
+        Frame {
             cols: 0,
             rows: 0,
             cells: Vec::new(),
@@ -717,9 +751,7 @@ impl TerminalCore {
             bracketed_paste: false,
             alt_screen: false,
             palette: Arc::new(snapshot_palette(self.term.colors())),
-        };
-        self.fill(&mut frame);
-        frame
+        }
     }
 
     /// [`TerminalCore::frame`] written over `frame`, reusing its cell storage
@@ -760,6 +792,13 @@ impl TerminalCore {
             }
         }
 
+        self.fill_metadata(frame);
+    }
+
+    fn fill_metadata(&self, frame: &mut Frame) {
+        let cols = self.term.columns() as u16;
+        let rows = self.term.screen_lines() as u16;
+        let offset = self.term.grid().display_offset();
         // Input modes are read from the emulator's state: the platform
         // encodes keypresses based on them (see the `app_cursor`/`app_keypad` fields).
         let mode = self.term.mode();
