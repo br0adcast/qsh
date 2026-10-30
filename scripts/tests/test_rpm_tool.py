@@ -8,7 +8,6 @@ import importlib.util
 import io
 import os
 import shlex
-import struct
 from pathlib import Path
 import subprocess
 import tarfile
@@ -93,6 +92,41 @@ class PreparationTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(list(self.root.glob("tmp.*")), [])
 
+    def test_installer_runs_fresh_binary_checks_and_propagates_failure(self):
+        # Stand in for downloading/building only; execute the real installer
+        # and real header tests. A stale PATH binary must never be selected.
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        for name in ["install.sh", "test_dependencies.py"]:
+            source = ROOT / "packaging/rpm-tool" / name
+            (bundle / name).write_bytes(source.read_bytes())
+        (bundle / "prepare.py").write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).mkdir()\n")
+        commands = self.root / "commands"
+        commands.mkdir()
+        cargo = commands / "cargo"
+        cargo.write_text("""#!/bin/sh
+mkdir -p "$CARGO_INSTALL_ROOT/bin"
+cat > "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm" <<'TOOL'
+#!/bin/sh
+echo fresh-tool >&2
+exit 17
+TOOL
+chmod +x "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm"
+""")
+        cargo.chmod(0o755)
+        stale = commands / "cargo-generate-rpm"
+        stale.write_text('#!/bin/sh\necho stale-tool >&2\nexit 18\n')
+        stale.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(PATH=str(commands) + os.pathsep + environment["PATH"],
+                           CARGO_INSTALL_ROOT=str(self.root / "installed"),
+                           QSH_RPM_TOOL=str(stale))
+        result = subprocess.run(["bash", str(bundle / "install.sh")], env=environment,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"fresh-tool", result.stderr)
+        self.assertNotIn(b"stale-tool", result.stderr)
+
     def test_package_floor_copy_sources_exist_in_both_actual_contexts(self):
         native = (ROOT / ".github/workflows/native-crypto.yml").read_text()
         native_line = next(line for line in native.splitlines()
@@ -122,68 +156,15 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual((target / "fixture-1/src/lib.rs").read_text(), "before\n")
 
 
+DEPENDENCY_SPEC = importlib.util.spec_from_file_location(
+    "rpm_dependencies", ROOT / "packaging/rpm-tool/test_dependencies.py")
+dependencies = importlib.util.module_from_spec(DEPENDENCY_SPEC)
+DEPENDENCY_SPEC.loader.exec_module(dependencies)
+
+
 @unittest.skipUnless(os.environ.get("QSH_RPM_TOOL"), "set QSH_RPM_TOOL to the prepared generator binary")
-class GeneratedDependencyTests(unittest.TestCase):
-    def generate(self, metadata):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            elf_source = Path("/bin/true")
-            (root / "payload").write_bytes(elf_source.read_bytes())
-            (root / "payload").chmod(0o755)
-            (root / "Cargo.toml").write_text(
-                '[package]\nname="phase-test"\nversion="1.0.0"\nlicense="MIT"\n'
-                'description="RPM phase test"\n[package.metadata.generate-rpm]\n'
-                'assets=[{source="payload", dest="/usr/bin/phase-test", mode="755"}]\n'
-                + metadata)
-            output = root / "test.rpm"
-            result = subprocess.run([os.environ["QSH_RPM_TOOL"], "--auto-req", "builtin",
-                                     "--output", str(output)], cwd=root,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if result.returncode:
-                return result, None
-            data = output.read_bytes()
-            def header(offset):
-                self.assertEqual(data[offset:offset + 3], b"\x8e\xad\xe8")
-                count, size = struct.unpack_from(">II", data, offset + 8)
-                store = offset + 16 + count * 16
-                entries = {}
-                for index in range(count):
-                    tag, kind, start, length = struct.unpack_from(">IIII", data, offset + 16 + index * 16)
-                    if kind == 8:
-                        entries[tag] = data[store + start:].split(b"\0", length)[:length]
-                    elif kind == 4:
-                        entries[tag] = struct.unpack_from(">" + "I" * length, data, store + start)
-                return entries, store + size
-            _, end = header(96)
-            entries, _ = header((end + 7) & ~7)
-            return result, list(zip(entries[1049], entries[1048], entries[1050]))
-
-    def test_pre_post_and_automatic_elf_requirements(self):
-        result, dependencies = self.generate(
-            '[package.metadata.generate-rpm.requires]\n"pre-provider"=">= 3"\n'
-            '[package.metadata.generate-rpm.requires-pre]\n"pre-provider"=" * "\n'
-            '[package.metadata.generate-rpm.requires-post]\n"post-provider"=""\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn((b"pre-provider", 1 << 9, b""), dependencies)
-        self.assertIn((b"pre-provider", 12, b"3"), dependencies)
-        self.assertIn((b"post-provider", 1 << 10, b""), dependencies)
-        self.assertTrue(any(name.startswith(b"libc.so.6") for name, _, _ in dependencies))
-        self.assertFalse(any(b"(pre)" in name for name, _, _ in dependencies))
-
-    def test_absent_and_empty_pre_metadata_preserve_dependencies(self):
-        result, absent = self.generate("")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        result, empty = self.generate('[package.metadata.generate-rpm.requires-pre]\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(absent, empty)
-        self.assertTrue(absent)
-
-    def test_pre_rejects_versions_and_non_strings(self):
-        for value in ['">= 1"', '1']:
-            with self.subTest(value=value):
-                result, _ = self.generate(
-                    '[package.metadata.generate-rpm.requires-pre]\nprovider=' + value + '\n')
-                self.assertNotEqual(result.returncode, 0)
+class GeneratedDependencyTests(dependencies.GeneratedDependencyTests):
+    tool = os.environ.get("QSH_RPM_TOOL")
 
 
 if __name__ == "__main__":
