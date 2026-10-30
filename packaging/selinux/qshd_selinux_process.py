@@ -33,7 +33,8 @@ class _Limits:
         if (type(self.execution_seconds) not in (int, float)
                 or not math.isfinite(self.execution_seconds)
                 or not (0 < self.execution_seconds <= 15 or
-                        (self.execution_seconds == 60 and self.output_bytes == 4096))
+                        (self.execution_seconds == 60 and self.output_bytes == 4096) or
+                        (self.execution_seconds == 75 and self.output_bytes == 1024 * 1024))
                 or type(self.output_bytes) is not int
                 or not 0 < self.output_bytes <= 4 * 1024 * 1024):
             raise _CommandError('COMMAND_LIMITS')
