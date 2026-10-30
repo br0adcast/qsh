@@ -67,6 +67,19 @@ def _frozen(value):
     return value
 
 
+def _protected_file(files, parent, name, limit, *, mode=None, executable=False):
+    value = files._read(parent, name, limit=limit)
+    if value['mode'] & 0o022 or (mode is not None and value['mode'] != mode):
+        _fail('PROTECTED_MODE')
+    if executable and not value['mode'] & 0o100:
+        _fail('EXECUTABLE_MODE')
+    return value
+
+def _store_readlock(files, store):
+    value = _protected_file(files, store, 'semanage.read.LOCK', 0, mode=0o600)
+    return _frozen({key: value[key] for key in ('inode','uid','gid','mode','xattrs')})
+
+
 @dataclass(frozen=True)
 class ModuleObservation:
     entry: ModuleEntry
@@ -124,12 +137,7 @@ class ModuleObserver(SafeFiles):
         self._acquired = []
 
     def _protected(self, parent, name, limit, *, mode=None, executable=False):
-        value = self._read(parent, name, limit=limit)
-        if value['mode'] & 0o022 or (mode is not None and value['mode'] != mode):
-            _fail('PROTECTED_MODE')
-        if executable and not value['mode'] & 0o100:
-            _fail('EXECUTABLE_MODE')
-        return value
+        return _protected_file(self, parent, name, limit, mode=mode, executable=executable)
 
     def __enter__(self):
         if self._state != 'new':
@@ -166,8 +174,7 @@ class ModuleObserver(SafeFiles):
             raise
 
     def _lock_snapshot(self):
-        value = self._protected(self._dirs['store'], 'semanage.read.LOCK', 0, mode=0o600)
-        return _frozen({key: value[key] for key in ('inode','uid','gid','mode','xattrs')})
+        return _store_readlock(self, self._dirs['store'])
 
     def _guard(self):
         self._validate_directory_routes()
