@@ -375,6 +375,7 @@ mod owned_signal {
                 adoption: Some(adoption),
                 stop: Some(stop),
             }),
+            None,
         ) {
             HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
             _ => panic!("signal pump returned an unqualified result"),

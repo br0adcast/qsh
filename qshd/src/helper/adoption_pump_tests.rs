@@ -144,6 +144,7 @@ mod adoption_pump {
                 adoption: Some(adoption),
                 stop: None,
             }),
+            None,
         );
         let outcome = match exit {
             HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,

@@ -404,6 +404,8 @@ pub(super) fn run_with_owned_worker(
         AccountSwitches::REAL,
         Some(diagnostics),
         Some(owned),
+        #[cfg(test)]
+        None,
     ) {
         HelperLoopExit::HelperPhysicallyExited(outcome) => outcome,
         _ => unreachable!("qualified helper cannot take an unqualified tail"),
@@ -443,6 +445,7 @@ fn serve_owned(
             adoption: None,
             stop: None,
         }),
+        None,
     ) {
         HelperLoopExit::WorkerPhysicallyExited(outcome) => outcome,
         _ => unreachable!("component worker pump cannot take a different tail"),
@@ -1047,6 +1050,8 @@ fn serve(
         diagnostics,
         #[cfg(target_os = "linux")]
         None,
+        #[cfg(test)]
+        None,
     );
 }
 
@@ -1067,6 +1072,8 @@ pub(super) struct OwnedParent {
     pub(super) stop: Option<super::stop_signal::StopOwner>,
 }
 
+// Only test builds add the opt-in checkpoint argument.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 fn serve_inner(
     channels: UnixStream,
     auth: UnixStream,
@@ -1075,6 +1082,7 @@ fn serve_inner(
     switches: AccountSwitches,
     mut diagnostics: Option<crate::log::relay::Receiver>,
     #[cfg(target_os = "linux")] owned: Option<OwnedParent>,
+    #[cfg(test)] checkpoint: Option<std::sync::Arc<shutdown_checkpoint::Note>>,
 ) -> HelperLoopExit {
     #[cfg(target_os = "linux")]
     let (mut worker, adoption, stop, status_socket, status_gate) = match owned {
@@ -1208,6 +1216,11 @@ fn serve_inner(
         shutdown.worker = worker;
         shutdown.adoption = adoption;
         shutdown.stop = stop;
+    }
+    #[cfg(test)]
+    {
+        shutdown.checkpoint = checkpoint;
+        shutdown.checkpoint(shutdown_checkpoint::Phase::Serving, None);
     }
     // Borrowed once, for the whole loop: both are owned locals that outlive
     // it, and everything below takes them immutably.
@@ -1351,11 +1364,21 @@ fn serve_inner(
                     std::thread::sleep(REAP_INTERVAL);
                 } else {
                     crate::log::error("helper", &format!("poll failed: {e}"));
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(shutdown_checkpoint::SeamEnd::Other),
+                    );
                     break;
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
                     crate::log::error("helper", &format!("poll failed: {e}"));
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(shutdown_checkpoint::SeamEnd::Other),
+                    );
                     break;
                 }
             }
@@ -1450,10 +1473,28 @@ fn serve_inner(
                         super::worker_protocol::StopReason::ChannelLost,
                     );
                 } else {
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(match next {
+                            Next::Eof => shutdown_checkpoint::SeamEnd::ChannelEof,
+                            _ => shutdown_checkpoint::SeamEnd::ChannelFailed,
+                        }),
+                    );
                     break;
                 }
                 #[cfg(not(target_os = "linux"))]
-                break;
+                {
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(match next {
+                            Next::Eof => shutdown_checkpoint::SeamEnd::ChannelEof,
+                            _ => shutdown_checkpoint::SeamEnd::ChannelFailed,
+                        }),
+                    );
+                    break;
+                }
             }
         }
         if auth_ready {
@@ -1470,10 +1511,28 @@ fn serve_inner(
                         super::worker_protocol::StopReason::AuthLost,
                     );
                 } else {
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(match next {
+                            Next::Eof => shutdown_checkpoint::SeamEnd::AuthEof,
+                            _ => shutdown_checkpoint::SeamEnd::AuthFailed,
+                        }),
+                    );
                     break;
                 }
                 #[cfg(not(target_os = "linux"))]
-                break;
+                {
+                    #[cfg(test)]
+                    shutdown.checkpoint(
+                        shutdown_checkpoint::Phase::SeamEnded,
+                        Some(match next {
+                            Next::Eof => shutdown_checkpoint::SeamEnd::AuthEof,
+                            _ => shutdown_checkpoint::SeamEnd::AuthFailed,
+                        }),
+                    );
+                    break;
+                }
             }
         }
         expire_pending(seams, state, &config, Instant::now());
@@ -1518,11 +1577,17 @@ fn serve_inner(
 include!("worker_parent.rs");
 include!("adoption_parent.rs");
 
+#[cfg(test)]
+#[path = "shutdown_checkpoint.rs"]
+mod shutdown_checkpoint;
+
 /// Owns the existing serve state through monitor receipt/wait drainage.
 /// Linux verification owners remain retained through native cleanup and wait.
 /// Worker physical settlement and cooperative receipt outcome remain separate.
 /// Monitor-descendant custody and service signal delivery remain unqualified.
 struct HelperShutdown {
+    #[cfg(test)]
+    checkpoint: Option<std::sync::Arc<shutdown_checkpoint::Note>>,
     #[cfg(target_os = "linux")]
     status: Option<crate::helper_status::Endpoint>,
     state: LoopState,
@@ -1549,6 +1614,8 @@ enum MonitorShutdownFailure {
 impl HelperShutdown {
     fn new(state: LoopState) -> Self {
         Self {
+            #[cfg(test)]
+            checkpoint: None,
             state,
             #[cfg(target_os = "linux")]
             status: None,
@@ -1563,6 +1630,17 @@ impl HelperShutdown {
             forced_worker: false,
             #[cfg(target_os = "linux")]
             stop: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn checkpoint(
+        &self,
+        phase: shutdown_checkpoint::Phase,
+        end: Option<shutdown_checkpoint::SeamEnd>,
+    ) {
+        if let Some(note) = &self.checkpoint {
+            note.publish(phase, end, self);
         }
     }
 
@@ -1604,6 +1682,8 @@ impl HelperShutdown {
     }
 
     fn end_the_monitors(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        #[cfg(test)]
+        self.checkpoint(shutdown_checkpoint::Phase::Retiring, None);
         self.begin_monitor_stop(seams);
         loop {
             self.observe_monitor_failures();
@@ -1612,6 +1692,8 @@ impl HelperShutdown {
                 && self.state.live.is_empty()
                 && self.verifications_settled()
             {
+                #[cfg(test)]
+                self.checkpoint(shutdown_checkpoint::Phase::Returned, None);
                 return;
             }
             self.monitor_pass(seams, config);
@@ -1630,6 +1712,8 @@ impl HelperShutdown {
     }
 
     fn monitor_pass(&mut self, seams: Seams<'_>, config: &HelperConfig) {
+        #[cfg(test)]
+        self.checkpoint(shutdown_checkpoint::Phase::BeforePass, None);
         #[cfg(target_os = "linux")]
         let reports = self.state.pending.poll_fds();
         #[cfg(not(target_os = "linux"))]
@@ -1701,6 +1785,8 @@ impl HelperShutdown {
             finish_retired(&mut self.state, owner);
         }
         self.observe_monitor_failures();
+        #[cfg(test)]
+        self.checkpoint(shutdown_checkpoint::Phase::AfterPass, None);
     }
 }
 
@@ -5822,6 +5908,7 @@ fn disable_echo(master: BorrowedFd<'_>) -> nix::Result<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    include!("shutdown_checkpoint_tests.rs");
     include!("log_tests.rs");
     include!("capacity_diagnostic_tests.rs");
     include!("monitor_scope_tests.rs");
@@ -5899,6 +5986,10 @@ pub(crate) mod tests {
         }
 
         fn stop_named(self, what: &str) {
+            self.stop_observed(what, None);
+        }
+
+        fn stop_observed(self, what: &str, note: Option<&shutdown_checkpoint::Note>) {
             let TestHelper {
                 channels,
                 auth,
@@ -5907,7 +5998,7 @@ pub(crate) mod tests {
             } = self;
             drop(channels);
             drop(auth);
-            join_within(thread, what);
+            join_within_observed(thread, what, note);
         }
     }
 
@@ -5918,14 +6009,37 @@ pub(crate) mod tests {
     /// has no timeout; a thread still running at the deadline is left
     /// behind, not waited for.
     pub(crate) fn join_within(thread: JoinHandle<()>, what: &str) {
-        let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        join_within_observed(thread, what, None);
+    }
+
+    fn wait_for_thread(thread: &JoinHandle<()>, deadline: Instant) -> bool {
         while !thread.is_finished() {
-            assert!(
-                Instant::now() < deadline,
-                "{what} -- still running after {TEST_RECV_TIMEOUT:?}"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
+        true
+    }
+
+    fn timeout_message(what: &str, note: Option<&shutdown_checkpoint::Note>) -> String {
+        let suffix = note
+            .map(|note| format!("; {}", note.receipt()))
+            .unwrap_or_default();
+        format!("{what} -- still running after {TEST_RECV_TIMEOUT:?}{suffix}")
+    }
+
+    fn join_within_observed(
+        thread: JoinHandle<()>,
+        what: &str,
+        note: Option<&shutdown_checkpoint::Note>,
+    ) {
+        let deadline = Instant::now() + TEST_RECV_TIMEOUT;
+        assert!(
+            wait_for_thread(&thread, deadline),
+            "{}",
+            timeout_message(what, note)
+        );
         thread
             .join()
             .unwrap_or_else(|_| panic!("{what} -- the helper loop must not panic"));
@@ -7336,16 +7450,41 @@ pub(crate) mod tests {
         dir: TempDir,
         login: LoginId,
     ) -> TestHelper {
+        helper_running_observed(config, admitted, switches, dir, login, None)
+    }
+
+    fn helper_running_observed(
+        config: HelperConfig,
+        admitted: HashMap<LoginId, Account>,
+        switches: AccountSwitches,
+        dir: TempDir,
+        login: LoginId,
+        checkpoint: Option<std::sync::Arc<shutdown_checkpoint::Note>>,
+    ) -> TestHelper {
         let ((channels, auth), (helper_channels, helper_auth)) = seams_for_test();
         let thread = std::thread::spawn(move || {
-            serve(
-                helper_channels,
-                helper_auth,
-                config,
-                admitted,
-                switches,
-                None,
-            )
+            if checkpoint.is_some() {
+                let _ = serve_inner(
+                    helper_channels,
+                    helper_auth,
+                    config,
+                    admitted,
+                    switches,
+                    None,
+                    #[cfg(target_os = "linux")]
+                    None,
+                    checkpoint,
+                );
+            } else {
+                serve(
+                    helper_channels,
+                    helper_auth,
+                    config,
+                    admitted,
+                    switches,
+                    None,
+                );
+            }
         });
         TestHelper {
             channels,
@@ -15386,6 +15525,14 @@ pub(crate) mod tests {
     /// `LoginEnded` -- the thing that ends a login, and with it its
     /// session -- over the authentication one.
     fn helper_with_pam_confdir(dir: &Path, service: &str) -> TestHelper {
+        helper_with_pam_confdir_observed(dir, service, None)
+    }
+
+    fn helper_with_pam_confdir_observed(
+        dir: &Path,
+        service: &str,
+        checkpoint: Option<std::sync::Arc<shutdown_checkpoint::Note>>,
+    ) -> TestHelper {
         let key = PrivateKey::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             Algorithm::Ed25519,
@@ -15397,7 +15544,14 @@ pub(crate) mod tests {
             pam_confdir: Some(dir.to_path_buf()),
             ..trusting_config(keys.path(), &key)
         };
-        let h = helper_running(config, HashMap::new(), UNPRIVILEGED, keys, PROOF_LOGIN);
+        let h = helper_running_observed(
+            config,
+            HashMap::new(),
+            UNPRIVILEGED,
+            keys,
+            PROOF_LOGIN,
+            checkpoint,
+        );
         assert_admits(&h.auth, &key, &h.me);
         h
     }
@@ -15978,7 +16132,12 @@ pub(crate) mod tests {
         );
         ok.stop_named("permit-control helper must end after both seams close");
 
-        let h = helper_with_pam_confdir(dir.path(), "qshd-test-deny");
+        let checkpoint = std::sync::Arc::new(shutdown_checkpoint::Note::default());
+        let h = helper_with_pam_confdir_observed(
+            dir.path(),
+            "qshd-test-deny",
+            Some(checkpoint.clone()),
+        );
         let (first, _fd) = open_result_with_fd(&h.channels, 1, my_uid(), h.login);
         assert!(
             matches!(&first, Response::Failed { id: 1, reason } if reason == REFUSED_REASON),
@@ -16003,7 +16162,10 @@ pub(crate) mod tests {
             "the refusal must end the LOGIN: the second Open must find no monitor and no login \
              left, so the account stack is asked once and not once per channel"
         );
-        h.stop_named("refused-account helper must end after both seams close");
+        h.stop_observed(
+            "refused-account helper must end after both seams close",
+            Some(&checkpoint),
+        );
     }
 
     /// What the session stack puts in the environment reaches the account's
