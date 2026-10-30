@@ -7,6 +7,7 @@ Status observations detect cooperative policy/mode changes, not hostile races.
 import ctypes as C
 from contextlib import contextmanager
 import re
+import stat
 
 
 class SelinuxError(RuntimeError):
@@ -71,6 +72,10 @@ class SelinuxApi:
             'security_compute_relabel_raw': ([context, context, cls, output], C.c_int),
             'security_validatetrans_raw': ([context, context, cls, context], C.c_int),
             'freecon': ([C.c_void_p], None),
+            'selabel_open': ([C.c_uint, C.c_void_p, C.c_uint], C.c_void_p),
+            'selabel_close': ([C.c_void_p], None),
+            'selabel_lookup_raw': ([C.c_void_p, output, context, C.c_int], C.c_int),
+            'fgetfilecon_raw': ([C.c_int, output], C.c_int),
             'selinux_status_open': ([C.c_int], C.c_int),
             'selinux_status_close': ([], None),
             'selinux_status_updated': ([], C.c_int),
@@ -134,6 +139,22 @@ class SelinuxApi:
         if decision.allowed & requested != requested or decision.flags & 1:
             raise SelinuxError('access', class_name)
 
+    def _raw_output(self, operation, pointer):
+        # libselinux owns a valid NUL-terminated allocation. Inspect only
+        # through its first NUL; fixed-size copies can overread strdup.
+        data = bytearray()
+        for offset in range(_CONTEXT_LIMIT):
+            byte = C.c_ubyte.from_address(pointer.value + offset).value
+            if byte == 0:
+                try:
+                    result = data.decode('ascii')
+                except UnicodeError:
+                    raise SelinuxError(operation, 'output encoding') from None
+                _context(result)
+                return result
+            data.append(byte)
+        raise SelinuxError(operation, 'output length')
+
     def _compute(self, operation, source, target, class_name):
         source, target = _context(source), _context(target)
         cls = self._class(class_name)
@@ -142,20 +163,31 @@ class SelinuxApi:
             self._call(operation, source, target, cls, C.byref(pointer))
             if not pointer.value:
                 raise SelinuxError(operation, 'null output')
-            # libselinux owns a valid NUL-terminated allocation. Inspect only
-            # through its first NUL; fixed-size copies can overread strdup.
-            data = bytearray()
-            for offset in range(_CONTEXT_LIMIT):
-                byte = C.c_ubyte.from_address(pointer.value + offset).value
-                if byte == 0:
-                    try:
-                        result = data.decode('ascii')
-                    except UnicodeError:
-                        raise SelinuxError(operation, 'output encoding') from None
-                    _context(result)
-                    return result
-                data.append(byte)
-            raise SelinuxError(operation, 'output length')
+            return self._raw_output(operation, pointer)
+        finally:
+            if pointer.value:
+                self._lib.freecon(pointer)
+
+    def file_defaults(self):
+        """One default file-backend scope; create a new scope at each endpoint.
+
+        Fresh handles refresh backend contents, not global configuration path
+        selection, nor an atomic snapshot of every configuration source file.
+        """
+        return _FileDefaults(self)
+
+    def file_context(self, fd):
+        """Return a raw label from a borrowed FD; never closes the caller's FD."""
+        if type(fd) is not int or not 0 <= fd <= (1 << (8 * C.sizeof(C.c_int) - 1)) - 1:
+            raise SelinuxError('input', 'file descriptor')
+        pointer = C.c_void_p()
+        try:
+            result = self._call('fgetfilecon_raw', fd, C.byref(pointer))
+            if result == 0 or not pointer.value:
+                raise SelinuxError('fgetfilecon_raw', 'invalid output')
+            raw = self._raw_output('fgetfilecon_raw', pointer)
+            self.check_context(raw)
+            return raw
         finally:
             if pointer.value:
                 self._lib.freecon(pointer)
@@ -198,3 +230,59 @@ class SelinuxApi:
                     self._lib.selinux_status_close()
             finally:
                 self._observing = False
+
+
+class _FileDefaults:
+    """One single-use native default backend, owned by its explicit scope."""
+
+    def __init__(self, api):
+        self._api = api
+        self._used = False
+        self._handle = None
+
+    def __enter__(self):
+        if self._used:
+            raise SelinuxError('file defaults', 'scope reused')
+        self._used = True
+        C.set_errno(0)
+        handle = self._api._lib.selabel_open(0, None, 0)
+        saved_errno = C.get_errno()
+        if not handle:
+            raise SelinuxError('selabel_open', errno=saved_errno)
+        self._handle = handle
+        return self
+
+    def lookup(self, path, kind):
+        if self._handle is None:
+            raise SelinuxError('file defaults', 'scope closed')
+        if type(path) is not str:
+            raise SelinuxError('input', 'file path')
+        try:
+            encoded = path.encode('ascii')
+        except UnicodeError:
+            raise SelinuxError('input', 'file path') from None
+        if (not 1 <= len(encoded) < 4096 or not path.startswith('/')
+                or any(byte < 32 or byte > 126 for byte in encoded)
+                or (path != '/' and any(part in ('', '.', '..') for part in path[1:].split('/')))):
+            raise SelinuxError('input', 'file path')
+        if type(kind) is not int or kind not in (stat.S_IFREG, stat.S_IFDIR):
+            raise SelinuxError('input', 'file kind')
+        api = self._api
+        pointer = C.c_void_p()
+        try:
+            result = api._call('selabel_lookup_raw', self._handle, C.byref(pointer), encoded, kind)
+            if result != 0 or not pointer.value:
+                raise SelinuxError('selabel_lookup_raw', 'invalid output')
+            raw = api._raw_output('selabel_lookup_raw', pointer)
+            api.check_context(raw)
+            return raw
+        finally:
+            if pointer.value:
+                api._lib.freecon(pointer)
+
+    def __exit__(self, kind, value, traceback):
+        if self._handle is None:
+            raise SelinuxError('file defaults', 'scope closed')
+        handle, self._handle = self._handle, None
+        self._api._lib.selabel_close(handle)
+        return False

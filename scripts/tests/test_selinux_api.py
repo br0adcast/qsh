@@ -3,6 +3,9 @@ import ctypes as C
 import importlib.util
 from pathlib import Path
 import unittest
+import os
+import stat
+import tempfile
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[2] / 'packaging/selinux/qshd_selinux_api.py'
@@ -22,7 +25,8 @@ class Library:
                  'security_compute_create_raw security_compute_relabel_raw '
                  'security_validatetrans_raw freecon selinux_status_open '
                  'selinux_status_close selinux_status_updated '
-                 'selinux_status_getenforce selinux_status_policyload').split()
+                 'selinux_status_getenforce selinux_status_policyload '
+                 'selabel_open selabel_close selabel_lookup_raw fgetfilecon_raw').split()
         for name in names:
             setattr(self, name, Function())
         self.string_to_security_class.impl = lambda name: 7
@@ -46,6 +50,15 @@ class Library:
             decision.flags = self.flags
             return 0
         self.security_compute_av_flags_raw.impl = av
+        self.handles_closed=[]
+        self.selabel_open.impl=lambda backend,options,count:123
+        self.selabel_close.impl=lambda handle:self.handles_closed.append(handle)
+        self.selabel_lookup_raw.impl=lambda handle,ptr,path,mode:output(None,None,None,ptr)
+        self.file_rc=len(self.buffer.raw)
+        def file_output(fd,ptr):
+            output(None,None,None,ptr)
+            return self.file_rc
+        self.fgetfilecon_raw.impl=file_output
 
 
 try:
@@ -89,6 +102,103 @@ class AdapterTests(unittest.TestCase):
         lib.freecon = 0
         with self.assertRaises(api.SelinuxError):
             api.SelinuxApi(lib)
+
+    def test_file_label_abi_and_exact_lookup_arguments(self):
+        output=C.POINTER(C.c_void_p)
+        self.assertEqual(self.lib.selabel_open.argtypes,[C.c_uint,C.c_void_p,C.c_uint])
+        self.assertIs(self.lib.selabel_open.restype,C.c_void_p)
+        self.assertEqual(self.lib.selabel_lookup_raw.argtypes,[C.c_void_p,output,C.c_char_p,C.c_int])
+        self.assertEqual(self.lib.fgetfilecon_raw.argtypes,[C.c_int,output])
+        self.assertEqual(self.lib.selabel_close.argtypes,[C.c_void_p])
+        self.assertIsNone(self.lib.selabel_close.restype)
+        calls=[];original=self.lib.selabel_lookup_raw.impl
+        self.lib.selabel_lookup_raw.impl=lambda *args:(calls.append(args),original(*args))[1]
+        with self.adapter.file_defaults() as defaults:
+            self.assertEqual(defaults.lookup('/usr/bin/qshd',stat.S_IFREG),'user:role:type:s0')
+        self.assertEqual(calls[0][0],123)
+        self.assertEqual(calls[0][2:],(b'/usr/bin/qshd',stat.S_IFREG))
+        self.assertEqual(self.lib.handles_closed,[123]);self.assertEqual(len(self.lib.freed),1)
+    def test_defaults_are_single_use_fresh_and_closed_after_body_error(self):
+        opened=[]
+        self.lib.selabel_open.impl=lambda *args:(opened.append(args),123)[1]
+        defaults=self.adapter.file_defaults()
+        with self.assertRaises(api.SelinuxError):defaults.lookup('/x',stat.S_IFDIR)
+        with self.assertRaises(KeyboardInterrupt):
+            with defaults as handle:
+                with self.assertRaises(api.SelinuxError):defaults.__enter__()
+                handle.lookup('/x',stat.S_IFDIR);raise KeyboardInterrupt()
+        with self.assertRaises(api.SelinuxError):defaults.lookup('/x',stat.S_IFDIR)
+        with self.assertRaises(api.SelinuxError):defaults.__enter__()
+        with self.adapter.file_defaults():pass
+        self.assertEqual(opened,[(0,None,0),(0,None,0)])
+        self.assertEqual(self.lib.handles_closed,[123,123])
+    def test_default_open_failure_does_not_close_null_handle(self):
+        self.lib.selabel_open.impl=lambda *args:None
+        with self.assertRaises(api.SelinuxError):
+            with self.adapter.file_defaults():self.fail('null handle admitted')
+        self.assertEqual(self.lib.handles_closed,[])
+    def test_file_inputs_reject_before_native_calls(self):
+        calls=[];self.lib.selabel_lookup_raw.impl=lambda *args:calls.append(args)
+        with self.adapter.file_defaults() as defaults:
+            for path in ('relative','//x','/a/../b','/a/./b','/a//b','/x/','/x\x00y','/é','/'+'x'*4096,17):
+                with self.subTest(path=path),self.assertRaises(api.SelinuxError):defaults.lookup(path,stat.S_IFREG)
+            for mode in (0,True,stat.S_IFSOCK,stat.S_IFREG|0o600,2**40):
+                with self.assertRaises(api.SelinuxError):defaults.lookup('/x',mode)
+        self.lib.fgetfilecon_raw.impl=lambda *args:calls.append(args)
+        for fd in (-1,True,1.0,2**31,None):
+            with self.assertRaises(api.SelinuxError):self.adapter.file_context(fd)
+        self.assertEqual(calls,[])
+    def test_file_context_borrows_fd_and_positive_result(self):
+        read,write=os.pipe()
+        try:
+            self.assertEqual(self.adapter.file_context(read),'user:role:type:s0')
+            os.fstat(read)
+        finally:os.close(read);os.close(write)
+        self.assertEqual(len(self.lib.freed),1)
+    def test_file_result_length_is_not_string_length_and_directory_fd_is_borrowed(self):
+        self.lib.file_rc=1
+        with tempfile.TemporaryDirectory() as directory:
+            fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                self.assertEqual(self.adapter.file_context(fd),'user:role:type:s0')
+                os.fstat(fd)
+            finally:os.close(fd)
+        self.assertEqual(len(self.lib.freed),1)
+    def test_default_kernel_validation_failure_frees_and_closes(self):
+        self.lib.security_check_context_raw.impl=lambda raw:-1
+        with self.assertRaises(api.SelinuxError):
+            with self.adapter.file_defaults() as handle:handle.lookup('/x',stat.S_IFDIR)
+        self.assertEqual(len(self.lib.freed),1)
+        self.assertEqual(self.lib.handles_closed,[123])
+
+    def test_distinct_result_conventions_and_free_even_on_error(self):
+        for operation,results in (('selabel_lookup_raw',(-1,1)),('fgetfilecon_raw',(-1,0))):
+            for result in results:
+                lib=Library();lib.output_rc=result;lib.file_rc=result;adapter=api.SelinuxApi(lib)
+                with self.assertRaises(api.SelinuxError):
+                    if operation=='fgetfilecon_raw':adapter.file_context(0)
+                    else:
+                        with adapter.file_defaults() as handle:handle.lookup('/x',stat.S_IFDIR)
+                self.assertEqual(len(lib.freed),1)
+        for operation in ('selabel_lookup_raw','fgetfilecon_raw'):
+            lib=Library();getattr(lib,operation).impl=lambda *args:0 if operation=='selabel_lookup_raw' else 1
+            with self.assertRaises(api.SelinuxError):
+                if operation=='fgetfilecon_raw':api.SelinuxApi(lib).file_context(0)
+                else:
+                    with api.SelinuxApi(lib).file_defaults() as handle:handle.lookup('/x',stat.S_IFDIR)
+            self.assertEqual(lib.freed,[])
+    def test_raw_file_outputs_validate_and_free_invalid_allocations(self):
+        for raw in (b'wrong',b'user:role:type:s0\xff',b'x'*4096):
+            for defaults in (True,False):
+                lib=Library();lib.buffer=C.create_string_buffer(raw);adapter=api.SelinuxApi(lib)
+                with self.assertRaises(api.SelinuxError):
+                    if defaults:
+                        with adapter.file_defaults() as handle:handle.lookup('/x',stat.S_IFREG)
+                    else:adapter.file_context(0)
+                self.assertEqual(len(lib.freed),1)
+        self.lib.security_check_context_raw.impl=lambda raw:-1
+        with self.assertRaises(api.SelinuxError):self.adapter.file_context(0)
+        self.assertEqual(len(self.lib.freed),1)
 
     def test_status_open_refusal_and_initial_indication(self):
         for result in (-1, 1):
