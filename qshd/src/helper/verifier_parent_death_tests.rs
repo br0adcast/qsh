@@ -4,6 +4,60 @@ mod verifier_parent {
     use super::*;
     use authorized::{IdentityTransition as Step, VerifierBoundary as Boundary};
 
+    fn publish_release(path: &Path, before_publish: impl FnOnce()) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let pending = path.with_extension("release.pending");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pending)
+            .unwrap();
+        file.write_all(b"release\n").unwrap();
+        // This public control record is also read after switching to nobody.
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        drop(file);
+        before_publish();
+        // A polling verifier must see absence or the whole release record.
+        std::fs::rename(pending, path).unwrap();
+    }
+
+    #[test]
+    fn verifier_release_is_hidden_until_complete_publication() {
+        if std::env::var_os("QSH_TEST_RELEASE_PRIVATE_UMASK").is_some() {
+            // Only the explicit self-reexec child changes its process umask.
+            unsafe { nix::libc::umask(0o077) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("boundary.release");
+        publish_release(&release, || {
+            assert_eq!(
+                std::fs::read(&release).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        });
+        assert_eq!(std::fs::read(&release).unwrap(), b"release\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&release).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn verifier_release_publication_ignores_restrictive_umask() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "helper::server::tests::verifier_parent::verifier_release_is_hidden_until_complete_publication",
+                "--test-threads=1",
+            ])
+            .env("QSH_TEST_RELEASE_PRIVATE_UMASK", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn verifier39_helper_death_kills_actual_blocked_lookup() {
         super::adoption_native::run_case(Some("verifier_lookup_death"));
@@ -610,7 +664,7 @@ mod verifier_parent {
         helper.signal_kill();
         wait_exited(helper, "owned helper did not finish its actual SIGKILL");
         if race {
-            std::fs::write(marker.with_extension("release"), b"release\n").unwrap();
+            publish_release(&marker.with_extension("release"), || {});
         }
         wait_exited(&verifier, &format!("actual verifier survived helper death before fixture rescue: mode={mode}, observed={observation:?}"));
         let fd = verifier.as_fd();
