@@ -298,6 +298,14 @@ mod queued_refusal {
         ).assert_clean(0);
     }
 
+    #[test]
+    fn refusal406_native_nonterminal_nonzero_exit_cannot_refund() {
+        crate::test_borrowed_scope::run_exact(
+            "helper::server::tests::queued_refusal::refusal406_native_nonterminal_nonzero_exit_cannot_refund", 0,
+            || queued_refusal_body_with_stop("failed-gated-exit75", false),
+        ).assert_clean(0);
+    }
+
     fn queued_refusal_body(mode: &str) {
         queued_refusal_body_with_stop(mode, true);
     }

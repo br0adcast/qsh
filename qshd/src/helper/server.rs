@@ -2771,7 +2771,7 @@ fn poll_monitor_wait_using(
     }
     match wait() {
         Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
-            if monitor.refusal_seal.is_some() && !matches!(status, WaitStatus::Exited(_, 0)) {
+            if !matches!(status, WaitStatus::Exited(_, 0)) {
                 monitor.failure.get_or_insert(MonitorFailure::Request(
                     super::protocol::RequestDrainFailure::Exit,
                 ));
@@ -3065,8 +3065,7 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             update.native,
             crate::process_scope::scope::Progress::Complete(_)
         );
-        if monitor.refusal_seal.is_some()
-            && matches!(update.native, crate::process_scope::scope::Progress::Complete(code) if code != 0)
+        if matches!(update.native, crate::process_scope::scope::Progress::Complete(code) if code != 0)
         {
             monitor.failure.get_or_insert(MonitorFailure::Request(
                 super::protocol::RequestDrainFailure::Exit,

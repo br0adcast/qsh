@@ -188,6 +188,11 @@ fn monitor40_private_producer_body() {
         None,
     )
     .unwrap();
+    if mode == "failed-gated-exit75" {
+        unsafe {
+            nix::libc::_exit(75);
+        }
+    }
 }
 fn fixture() -> (NativeMonitor, Fixture) {
     fixture_mode("good")

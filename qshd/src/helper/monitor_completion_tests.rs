@@ -500,6 +500,26 @@ fn refusal406_terminal_close_cannot_create_new_escalation_debt() {
 #[test]
 fn refusal406_legacy_wait_preserves_physical_fact_without_clean_refund() {
     for code in [0, 75, 19] {
+        let (mut signaled, signaled_owner, _signal_peer) = pam40_controlled_retiring_monitor(false);
+        let monitor = signaled.monitors.get_mut(&signaled_owner).unwrap();
+        assert!(monitor.refusal_seal.is_none());
+        assert!(poll_monitor_wait_using(monitor, || Ok(
+            nix::sys::wait::WaitStatus::Signaled(
+                Pid::this(),
+                nix::sys::signal::Signal::SIGKILL,
+                false
+            )
+        )));
+        monitor.reaped = true;
+        assert!(
+            !monitor.wait_lost
+                && matches!(
+                    monitor.failure,
+                    Some(MonitorFailure::Request(
+                        super::super::protocol::RequestDrainFailure::Exit
+                    ))
+                )
+        );
         let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
         let monitor = state.monitors.get_mut(&owner).unwrap();
         monitor.refusal_seal = Some(RefusalSeal::Sent);
@@ -534,4 +554,75 @@ fn refusal406_legacy_wait_preserves_physical_fact_without_clean_refund() {
     assert!(monitor.wait_lost && !monitor.reaped);
     finish_retired(&mut state, owner);
     assert!(state.monitors.contains_key(&owner));
+}
+
+#[test]
+fn refusal406_legacy_wait_before_buffered_refusal_keeps_exit_failure() {
+    let (mut state, owner, peer) = pam40_controlled_retiring_monitor(false);
+    state.live.insert(406, ChannelSlot::Starting(owner));
+    state.pending.insert(Pending {
+        deadline: Instant::now() + Duration::from_secs(1),
+        what: PendingWhat::Channel {
+            id: 406,
+            master: tempfile::tempfile().unwrap().into(),
+            login: owner.login,
+            uid: my_uid(),
+            cancelled: false,
+        },
+    });
+    let monitor = state.monitors.get_mut(&owner).unwrap();
+    assert!(monitor.refusal_seal.is_none());
+    assert!(poll_monitor_wait_using(monitor, || Ok(
+        nix::sys::wait::WaitStatus::Exited(Pid::this(), 75)
+    )));
+    monitor.reaped = true;
+    let seams = DirectSeam::new();
+    dispatch_monitor_event(
+        seams.seams(),
+        &mut state,
+        owner,
+        MonitorEvent::Refused {
+            id: 406,
+            why: "buffered denial".into(),
+        },
+    );
+    progress_refusal_seals(&mut state, Instant::now());
+    let (marker, fd) = channel::recv_once(&peer).unwrap().unwrap();
+    assert!(
+        fd.is_none()
+            && matches!(
+                decode::<MonitorRequest>(&marker).unwrap(),
+                MonitorRequest::SealRefused
+            )
+    );
+    dispatch_monitor_event(
+        seams.seams(),
+        &mut state,
+        owner,
+        MonitorEvent::CleanupComplete {
+            id: 406,
+            kind: super::super::protocol::CleanupKind::NoChild,
+        },
+    );
+    dispatch_monitor_event(
+        seams.seams(),
+        &mut state,
+        owner,
+        MonitorEvent::SessionClosed {
+            result: PamCompletion::NotOpened,
+            cleanup_failure: None,
+            request_failure: None,
+        },
+    );
+    let retained = state
+        .monitors
+        .get(&owner)
+        .expect("early nonzero wait cannot be forgotten by buffered clean records");
+    assert!(retained.reaped && !retained.wait_lost && retained.completion.is_some());
+    assert_eq!(
+        retained.failure,
+        Some(MonitorFailure::Request(
+            super::super::protocol::RequestDrainFailure::Exit
+        ))
+    );
 }
