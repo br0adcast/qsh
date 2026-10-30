@@ -88,7 +88,15 @@ fn receive_with<T>(
     }
 }
 
-fn receive_packet(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+pub(super) struct OwnedPacket {
+    pub bytes: Vec<u8>,
+    pub descriptors: Vec<OwnedFd>,
+    pub sender: Option<i32>,
+    pub invalid: bool,
+    pub truncated: bool,
+}
+
+fn receive_packet_raw(sock: &UnixStream, nonblocking: bool) -> io::Result<OwnedPacket> {
     let mut buf = vec![0u8; MAX_MESSAGE_LEN];
     // Credential-enabled private monitor peers still carry one terminal fd.
     #[cfg(target_os = "linux")]
@@ -102,7 +110,12 @@ fn receive_packet(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<Owned
         sock.as_raw_fd(),
         &mut iov,
         Some(&mut cmsg_space),
-        MsgFlags::MSG_CMSG_CLOEXEC,
+        MsgFlags::MSG_CMSG_CLOEXEC
+            | if nonblocking {
+                MsgFlags::MSG_DONTWAIT
+            } else {
+                MsgFlags::empty()
+            },
     )
     .map_err(io::Error::from)?;
 
@@ -110,38 +123,137 @@ fn receive_packet(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<Owned
     let truncated = msg
         .flags
         .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC);
-    let mut received_fd = None;
+    let mut descriptors = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut sender = None;
+    #[cfg(not(target_os = "linux"))]
+    let sender = None;
+    let mut unsupported = false;
     for cmsg in msg.cmsgs() {
-        if let ControlMessageOwned::ScmRights(fds) = cmsg {
-            for raw in fds {
-                // Every installed descriptor is owned even for a zero record;
-                // returning EOF below drops it rather than leaking it.
-                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-                if received_fd.is_none() {
-                    received_fd = Some(owned);
+        match cmsg {
+            ControlMessageOwned::ScmRights(fds) => {
+                for raw in fds {
+                    descriptors.push(unsafe { OwnedFd::from_raw_fd(raw) });
                 }
             }
+            #[cfg(target_os = "linux")]
+            ControlMessageOwned::ScmCredentials(cred) => {
+                if sender.replace(cred.pid()).is_some() {
+                    unsupported = true;
+                }
+            }
+            _ => unsupported = true,
         }
     }
     // `msg` (and so `iov`'s borrow of `buf`) is not used past this point,
     // which is why `buf` can be mutated again below.
 
-    if truncated {
+    buf.truncate(bytes);
+    Ok(OwnedPacket {
+        bytes: buf,
+        descriptors,
+        sender,
+        invalid: truncated || unsupported,
+        truncated,
+    })
+}
+
+fn receive_packet(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+    // Preserve the generic receiver's blocking/default policy; raw ownership is
+    // shared with the strict nonblocking terminal receiver below.
+    receive_owned(sock)
+}
+
+fn receive_owned(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
+    let packet = receive_packet_raw(sock, false)?;
+    if packet.truncated {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated helper message",
         ));
     }
-    if bytes == 0 {
+    if packet.bytes.is_empty() {
         return Ok(None);
     }
-    buf.truncate(bytes);
-    Ok(Some((buf, received_fd)))
+    let first = packet.descriptors.into_iter().next();
+    Ok(Some((packet.bytes, first)))
+}
+
+/// One nonblocking packet send. EINTR/WouldBlock yield to the owner's deadline.
+pub(super) fn try_send_once(sock: &UnixStream, bytes: &[u8]) -> io::Result<()> {
+    let flags = MsgFlags::MSG_DONTWAIT;
+    #[cfg(target_os = "linux")]
+    let flags = flags | MsgFlags::MSG_NOSIGNAL;
+    match sendmsg::<()>(
+        sock.as_raw_fd(),
+        &[io::IoSlice::new(bytes)],
+        &[],
+        flags,
+        None,
+    ) {
+        Ok(n) if n == bytes.len() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short helper packet",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn send_before_using(
+    send: impl FnOnce() -> io::Result<()>,
+    mut now: impl FnMut() -> std::time::Instant,
+    until: std::time::Instant,
+) -> io::Result<()> {
+    if now() >= until {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let result = send();
+    // A successful syscall is not a timely acknowledgment after preemption.
+    if now() >= until {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    result
+}
+
+pub(super) fn try_send_before(
+    sock: &UnixStream,
+    bytes: &[u8],
+    until: std::time::Instant,
+) -> io::Result<()> {
+    send_before_using(
+        || try_send_once(sock, bytes),
+        std::time::Instant::now,
+        until,
+    )
+}
+
+pub(super) fn receive_owned_once(sock: &UnixStream) -> io::Result<OwnedPacket> {
+    receive_packet_raw(sock, true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal406_send_deadline_checks_both_sides_of_preemption() {
+        let until = std::time::Instant::now();
+        let early = until - std::time::Duration::from_millis(1);
+        let mut clock = [early, until].into_iter();
+        assert!(
+            matches!(send_before_using(|| Ok(()), || clock.next().unwrap(), until),
+            Err(error) if error.kind()==io::ErrorKind::TimedOut)
+        );
+        assert!(
+            matches!(send_before_using(|| panic!("expired send must not run"), || until, until),
+            Err(error) if error.kind()==io::ErrorKind::TimedOut)
+        );
+        assert!(
+            matches!(send_before_using(|| Err(io::ErrorKind::WouldBlock.into()), || early, until),
+            Err(error) if error.kind()==io::ErrorKind::WouldBlock)
+        );
+    }
 
     #[test]
     fn parent40_interrupted_receive_yields_without_consuming_the_next_record() {

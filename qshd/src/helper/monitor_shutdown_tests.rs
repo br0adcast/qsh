@@ -9,6 +9,7 @@ fn pam40_shutdown_tail_reads_queued_final_receipt_after_modeled_wait() {
     channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            request_failure: None,
             cleanup_failure: None,
             result,
         })

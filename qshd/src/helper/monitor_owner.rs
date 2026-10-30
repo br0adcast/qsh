@@ -16,6 +16,7 @@ impl Established {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Failure {
     Protocol,
+    Request(super::protocol::RequestDrainFailure),
     Stream(i32),
     LostAuthority,
     Signal(i32, i32),
@@ -153,7 +154,16 @@ impl NativeMonitor {
                         self.ambiguous = true;
                         self.failure.get_or_insert(Failure::Protocol);
                     }
-                    Ok(record) if self.established => event = Some(record),
+                    Ok(record) if self.established => {
+                        if let MonitorEvent::SessionClosed {
+                            request_failure: Some(failure),
+                            ..
+                        } = &record
+                        {
+                            self.failure.get_or_insert(Failure::Request(*failure));
+                        }
+                        event = Some(record);
+                    }
                     _ => {
                         self.ambiguous = true;
                         self.failure.get_or_insert(Failure::Protocol);

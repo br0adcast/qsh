@@ -683,6 +683,12 @@ enum MonitorProcess {
     #[cfg(test)]
     Controlled(UnixStream),
 }
+enum RefusalSeal {
+    Pending { until: Instant, packet: Vec<u8> },
+    Sent,
+    Failed,
+}
+
 struct Monitor {
     process: MonitorProcess,
     /// Diagnostic identity; Linux wait/signalling authority lives only in
@@ -692,6 +698,8 @@ struct Monitor {
     /// End requested; the read half and admission remain owned through PAM completion.
     write_closed: bool,
     stop_attempted: bool,
+    refusal_seal: Option<RefusalSeal>,
+    refusal_budget: Duration,
     completion: Option<PamCompletion>,
     seam_closed: bool,
     wait_lost: bool,
@@ -724,6 +732,7 @@ impl Monitor {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorFailure {
+    Request(super::protocol::RequestDrainFailure),
     Shutdown(i32),
     Send(i32),
     Stream,
@@ -1981,6 +1990,15 @@ fn serve_channel_seam(
                 .get(&id)
                 .map(|slot| (slot.owner(), matches!(slot, ChannelSlot::Starting(_))));
             if let Some((owner, still_starting)) = slot {
+                if state
+                    .monitors
+                    .get(&owner)
+                    .is_some_and(|monitor| monitor.refusal_seal.is_some())
+                {
+                    // The terminal drain owns these exact receipts; no new
+                    // unsent Close or escalation deadline is created.
+                    return Next::Continue;
+                }
                 if still_starting {
                     // The monitor's `SIGHUP` ends a shell that has not
                     // exec'd yet, and its report pipe then reaches
@@ -2705,7 +2723,7 @@ fn finish_retired_using(
     }
     // A final receipt already reports completed PAM work. Retain only the
     // remaining wait obligation rather than issuing a new shutdown request.
-    if monitor.completion.is_none() {
+    if monitor.completion.is_none() && monitor.refusal_seal.is_none() {
         request_monitor_end_using(monitor, shutdown);
     }
 }
@@ -2752,7 +2770,14 @@ fn poll_monitor_wait_using(
         return false;
     }
     match wait() {
-        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => true,
+        Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+            if monitor.refusal_seal.is_some() && !matches!(status, WaitStatus::Exited(_, 0)) {
+                monitor.failure.get_or_insert(MonitorFailure::Request(
+                    super::protocol::RequestDrainFailure::Exit,
+                ));
+            }
+            true
+        }
         Err(nix::Error::EINTR) => false,
         Err(error) => {
             record_monitor_wait_failure(monitor, error as i32);
@@ -2767,7 +2792,7 @@ fn monitor_signal_authority(monitor: &Monitor) -> bool {
     !monitor.reaped && !monitor.wait_lost
 }
 
-fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
+fn revoke_login_admission(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
     if state
         .logins
         .get(&owner.login)
@@ -2791,6 +2816,10 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
             },
         );
     }
+}
+
+fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
+    revoke_login_admission(sock, state, owner);
     // Monitor fork publication is synchronous before Open is sent. A login
     // without a monitor or live slot acquired no PAM/process obligation. An
     // already retained owner is never repaired by this absence check.
@@ -2851,7 +2880,7 @@ fn retire_login(sock: &UnixStream, state: &mut LoopState, owner: MonitorOwner) {
             && state
                 .monitors
                 .get(&owner)
-                .is_some_and(|m| !m.leader_exited())
+                .is_some_and(|m| !m.leader_exited() && m.refusal_seal.is_none())
         {
             tell_monitor(sock, state, owner, &MonitorRequest::Close { id });
             state
@@ -2927,7 +2956,7 @@ fn tell_monitor(
     let Some(monitor) = state.monitors.get(&owner) else {
         return;
     };
-    if monitor.seam_closed {
+    if monitor.seam_closed || monitor.refusal_seal.is_some() {
         return;
     }
     let failed = match encode(request) {
@@ -2967,6 +2996,43 @@ fn tell_monitor(
     }
 }
 
+/// One nonblocking seal attempt on every bounded normal/shutdown pass.
+fn progress_refusal_seals(state: &mut LoopState, now: Instant) {
+    use super::protocol::RequestDrainFailure as Fault;
+    for monitor in state.monitors.values_mut() {
+        let Some(RefusalSeal::Pending { until, packet }) = &monitor.refusal_seal else {
+            continue;
+        };
+        let result = if now >= *until {
+            Err(Fault::Deadline)
+        } else {
+            match channel::try_send_before(monitor.seam(), packet, *until) {
+                Ok(()) => Ok(true),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(Fault::Deadline),
+                Err(_) => Err(Fault::Seal),
+            }
+        };
+        match result {
+            Ok(true) => monitor.refusal_seal = Some(RefusalSeal::Sent),
+            Ok(false) => {}
+            Err(failure) => {
+                monitor.refusal_seal = Some(RefusalSeal::Failed);
+                monitor
+                    .failure
+                    .get_or_insert(MonitorFailure::Request(failure));
+            }
+        }
+    }
+}
+
 /// Read one event from each monitor whose seam `poll` has just reported
 /// ready, and act on it.
 ///
@@ -2975,6 +3041,7 @@ fn tell_monitor(
 /// comes straight back for the rest (`poll` returns at once while anything
 /// is still readable).
 fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[MonitorOwner]) {
+    progress_refusal_seals(state, Instant::now());
     #[cfg(target_os = "linux")]
     let native: Vec<_> = state
         .monitors
@@ -2998,6 +3065,13 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             update.native,
             crate::process_scope::scope::Progress::Complete(_)
         );
+        if monitor.refusal_seal.is_some()
+            && matches!(update.native, crate::process_scope::scope::Progress::Complete(code) if code != 0)
+        {
+            monitor.failure.get_or_insert(MonitorFailure::Request(
+                super::protocol::RequestDrainFailure::Exit,
+            ));
+        }
         monitor.wait_lost |= update.leader == crate::process_scope::scope::LeaderStatus::Unknown;
         monitor.seam_closed |= native.closed();
         if monitor.seam_closed && monitor.completion.is_none() {
@@ -3090,10 +3164,25 @@ fn dispatch_monitor_event(
     if let MonitorEvent::SessionClosed {
         result,
         cleanup_failure,
+        request_failure,
     } = event
     {
         if let Some(monitor) = state.monitors.get_mut(&owner) {
             merge_cleanup_failure(&mut state.cleanup_failure, cleanup_failure);
+            if monitor.refusal_seal.is_some()
+                && !matches!(monitor.refusal_seal, Some(RefusalSeal::Sent))
+                && request_failure.is_none()
+            {
+                monitor.failure.get_or_insert(MonitorFailure::Request(
+                    super::protocol::RequestDrainFailure::Seal,
+                ));
+            }
+            if let Some(failure) = request_failure {
+                monitor
+                    .failure
+                    .get_or_insert(MonitorFailure::Request(failure));
+                state.pam_cleanup.merge(result);
+            }
             if monitor.completion.is_some() {
                 monitor
                     .failure
@@ -3103,6 +3192,51 @@ fn dispatch_monitor_event(
             }
         }
         retire_login(seams.channels, state, owner);
+        return;
+    }
+    if let MonitorEvent::Refused { id, why } = event {
+        let Some(monitor) = state.monitors.get_mut(&owner) else {
+            return;
+        };
+        if monitor.refusal_seal.is_none() {
+            monitor.refusal_seal = Some(match encode(&MonitorRequest::SealRefused) {
+                Ok(packet) => RefusalSeal::Pending {
+                    until: Instant::now() + monitor.refusal_budget,
+                    packet,
+                },
+                Err(_) => RefusalSeal::Failed,
+            });
+            if matches!(monitor.refusal_seal, Some(RefusalSeal::Failed)) {
+                monitor.failure.get_or_insert(MonitorFailure::Request(
+                    super::protocol::RequestDrainFailure::Seal,
+                ));
+            }
+        }
+        state.retired.insert(owner);
+        revoke_login_admission(seams.channels, state, owner);
+        // Cancel all unanswered callbacks immediately, but retain each live
+        // charge until its producer's own per-ID cleanup receipt arrives.
+        let pending_ids: Vec<_> = state
+            .live
+            .iter()
+            .filter_map(|(candidate, slot)| {
+                (slot.owner() == owner && *candidate != id).then_some(*candidate)
+            })
+            .collect();
+        for pending_id in pending_ids {
+            refuse_channel_outright(seams.channels, state, pending_id);
+        }
+        if state
+            .live
+            .get(&id)
+            .is_some_and(|slot| slot.owner() == owner)
+        {
+            crate::log::warn(
+                "helper",
+                &format!("login session setup failed: {why}; ending the login"),
+            );
+            refuse_channel_outright(seams.channels, state, id);
+        }
         return;
     }
     let id = match &event {
@@ -4585,6 +4719,8 @@ fn fork_monitor(plan: MonitorPlan) -> anyhow::Result<Monitor> {
                 reaped: false,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: plan.session_budget,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,
@@ -9902,6 +10038,8 @@ pub(crate) mod tests {
                 reaped: false,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,

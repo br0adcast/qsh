@@ -61,6 +61,7 @@ fn selinux57_failed_cleanup_preserves_physical_receipt_and_retires_charge() {
             owner,
             MonitorEvent::SessionClosed {
                 result: PamCompletion::NotOpened,
+                request_failure: None,
                 cleanup_failure: None,
             },
         );
@@ -102,6 +103,7 @@ fn selinux57_final_summary_retains_failure_without_channel_event() {
         owner,
         MonitorEvent::SessionClosed {
             result: PamCompletion::NotOpened,
+            request_failure: None,
             cleanup_failure: Some(failure),
         },
     );

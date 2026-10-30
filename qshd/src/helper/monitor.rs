@@ -77,7 +77,7 @@
 //! witnessed; it was wrong, and the reasoning is left here so the next
 //! reader does not repeat it.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -304,12 +304,16 @@ struct Shell {
 struct CleanupSummary {
     pam: PamCompletion,
     failure: Option<CleanupFailure>,
+    terminal: Option<Result<(), super::protocol::RequestDrainFailure>>,
+    request_failure: Option<super::protocol::RequestDrainFailure>,
 }
 impl Default for CleanupSummary {
     fn default() -> Self {
         Self {
             pam: PamCompletion::NotOpened,
             failure: None,
+            terminal: None,
+            request_failure: None,
         }
     }
 }
@@ -717,6 +721,7 @@ const SESSION_DEADLINE_FIRINGS: usize = 2;
 /// `strace` or a core file which of the two exits this was, since a muted
 /// monitor cannot say so in the log.
 const SESSION_DEADLINE_EXIT: i32 = 70;
+const TERMINAL_REFUSAL_FAILED_EXIT: i32 = 75;
 
 /// A private session stage was not established; PAM has not been entered.
 #[cfg(target_os = "linux")]
@@ -1178,7 +1183,23 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
     let mut shells = Vec::new();
     let mut session = None;
     let mut cleanup = CleanupSummary::default();
-    serve(&plan, &seam, &mut shells, &mut session, &mut cleanup);
+    serve(
+        &plan,
+        &seam,
+        &mut shells,
+        &mut session,
+        &mut cleanup,
+        helper_pid,
+    );
+    if let Some(result) = cleanup.terminal {
+        unsafe {
+            nix::libc::_exit(if result.is_ok() {
+                0
+            } else {
+                TERMINAL_REFUSAL_FAILED_EXIT
+            })
+        }
+    }
     // The shells first, then the session: a session closed under a live
     // shell would be closed while the thing it was opened for is still
     // running, and the modules that count logins (`pam_systemd`,
@@ -1202,13 +1223,20 @@ fn run_monitor_until_its_login_ends(plan: MonitorPlan, seam: UnixStream, helper_
         &seam,
         &MonitorEvent::SessionClosed {
             result: cleanup.pam,
+            request_failure: cleanup.request_failure,
             cleanup_failure: cleanup.failure,
         },
     );
     // SAFETY: `_exit` ends the process immediately, running no atexit
     // handlers and no Rust `Drop` impls -- which is what has to happen
     // here, in a process that shares its parent's image.
-    unsafe { nix::libc::_exit(0) }
+    unsafe {
+        nix::libc::_exit(if cleanup.request_failure.is_none() {
+            0
+        } else {
+            TERMINAL_REFUSAL_FAILED_EXIT
+        })
+    }
 }
 
 /// The monitor's own loop: serve the helper's requests, report what becomes
@@ -1220,6 +1248,7 @@ fn serve(
     shells: &mut Vec<Shell>,
     session: &mut Option<Session>,
     cleanup: &mut CleanupSummary,
+    helper_pid: Pid,
 ) {
     // Channels a `MonitorRequest::Close` has sent `SIGHUP`, keyed to the
     // deadline by which the escalation to `SIGKILL` follows -- the helper's
@@ -1282,13 +1311,235 @@ fn serve(
         }
         #[cfg(not(target_os = "linux"))]
         report_startups(seam, shells, &ready);
-        if seam_ready && !serve_request(plan, seam, shells, session, cleanup, &mut closing) {
+        if seam_ready
+            && !serve_request(
+                plan,
+                seam,
+                shells,
+                session,
+                cleanup,
+                &mut closing,
+                helper_pid,
+            )
+        {
             return;
         }
         #[cfg(not(target_os = "linux"))]
         {
             reap_shells(seam, shells, &mut closing);
             escalate(seam, shells, &mut closing);
+        }
+    }
+}
+
+/// Consume the sealed refused request queue without ever starting PAM/shells.
+/// One absolute phase covers original outcomes, queue drain and final send.
+#[cfg(test)]
+pub(super) fn refused_requests_fixture(
+    seam: &UnixStream,
+    helper_pid: Pid,
+    original: ChannelId,
+) -> bool {
+    refused_requests(
+        seam,
+        helper_pid,
+        original,
+        "fixture account denied".into(),
+        &CleanupSummary::default(),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .is_ok()
+}
+
+fn refused_requests(
+    seam: &UnixStream,
+    helper_pid: Pid,
+    original: ChannelId,
+    why: String,
+    cleanup: &CleanupSummary,
+    until: Instant,
+) -> Result<(), super::protocol::RequestDrainFailure> {
+    let mut acknowledged = false;
+    let result = refused_requests_inner(
+        seam,
+        helper_pid,
+        original,
+        why,
+        cleanup,
+        until,
+        &mut acknowledged,
+    );
+    if let Err(failure) = result {
+        if !acknowledged {
+            if let Ok(packet) = encode(&MonitorEvent::SessionClosed {
+                result: cleanup.pam,
+                cleanup_failure: cleanup.failure,
+                request_failure: Some(failure),
+            }) {
+                while Instant::now() < until {
+                    match channel::try_send_before(seam, &packet, until) {
+                        Ok(()) => break,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        Err(_) => break,
+                    }
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    let mut fds = [PollFd::new(seam.as_fd(), PollFlags::POLLOUT)];
+                    match poll(
+                        &mut fds,
+                        PollTimeout::try_from(remaining.min(REAP_INTERVAL)).unwrap(),
+                    ) {
+                        Ok(_) | Err(nix::Error::EINTR) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn refused_requests_inner(
+    seam: &UnixStream,
+    helper_pid: Pid,
+    original: ChannelId,
+    why: String,
+    cleanup: &CleanupSummary,
+    until: Instant,
+    acknowledged: &mut bool,
+) -> Result<(), super::protocol::RequestDrainFailure> {
+    use super::protocol::RequestDrainFailure as Fault;
+    let mut queue = VecDeque::new();
+    let mut ids = vec![original];
+    let mut sealed = false;
+    let mut final_queued = false;
+    let mut phase_failure = None;
+    let append = |queue: &mut VecDeque<Vec<u8>>, event: MonitorEvent| -> Result<(), Fault> {
+        if queue.len() >= 33 {
+            return Err(Fault::Protocol);
+        }
+        queue.push_back(encode(&event).map_err(|_| Fault::Protocol)?);
+        Ok(())
+    };
+    append(&mut queue, MonitorEvent::Refused { id: original, why })?;
+    append(
+        &mut queue,
+        MonitorEvent::CleanupComplete {
+            id: original,
+            kind: CleanupKind::NoChild,
+        },
+    )?;
+    loop {
+        if Instant::now() >= until {
+            return Err(Fault::Deadline);
+        }
+        if (sealed || phase_failure.is_some()) && queue.is_empty() && !final_queued {
+            append(
+                &mut queue,
+                MonitorEvent::SessionClosed {
+                    result: cleanup.pam,
+                    cleanup_failure: cleanup.failure,
+                    request_failure: phase_failure,
+                },
+            )?;
+            final_queued = true;
+        }
+        if let Some(packet) = queue.front() {
+            match channel::try_send_before(seam, packet, until) {
+                Ok(()) => {
+                    queue.pop_front();
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(Fault::Deadline)
+                }
+                Err(_) => return Err(Fault::Send),
+            }
+        }
+        if final_queued && queue.is_empty() {
+            *acknowledged = true;
+            return phase_failure.map_or(Ok(()), Err);
+        }
+        if !sealed && phase_failure.is_none() {
+            let received = channel::receive_owned_once(seam);
+            match received {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(_) => phase_failure = Some(Fault::Receive),
+                Ok(packet) => {
+                    #[cfg(target_os = "linux")]
+                    let sender_ok = packet.sender == Some(helper_pid.as_raw());
+                    #[cfg(not(target_os = "linux"))]
+                    let sender_ok = {
+                        let _ = helper_pid;
+                        true
+                    };
+                    if packet.invalid || !sender_ok || packet.bytes.is_empty() {
+                        phase_failure = Some(Fault::Protocol);
+                    } else {
+                        match decode::<MonitorRequest>(&packet.bytes) {
+                            Ok(MonitorRequest::SealRefused) if packet.descriptors.is_empty() => {
+                                sealed = true
+                            }
+                            Ok(MonitorRequest::Close { id })
+                                if packet.descriptors.is_empty() && ids.contains(&id) => {}
+                            Ok(MonitorRequest::Open { id, .. })
+                                if packet.descriptors.len() == 1
+                                    && ids.len() < 16
+                                    && id > *ids.last().unwrap() =>
+                            {
+                                // All received PTYs close before certifying this exact no-fork request.
+                                drop(packet.descriptors);
+                                ids.push(id);
+                                append(
+                                    &mut queue,
+                                    MonitorEvent::Refused {
+                                        id,
+                                        why: "authentication failed".into(),
+                                    },
+                                )?;
+                                append(
+                                    &mut queue,
+                                    MonitorEvent::CleanupComplete {
+                                        id,
+                                        kind: CleanupKind::NoChild,
+                                    },
+                                )?;
+                            }
+                            _ => phase_failure = Some(Fault::Protocol),
+                        }
+                    }
+                }
+            }
+        }
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Fault::Deadline);
+        }
+        let mut interests = PollFlags::empty();
+        if !queue.is_empty() {
+            interests |= PollFlags::POLLOUT;
+        }
+        if !sealed && phase_failure.is_none() {
+            interests |= PollFlags::POLLIN;
+        }
+        let mut fds = [PollFd::new(seam.as_fd(), interests)];
+        match poll(
+            &mut fds,
+            PollTimeout::try_from(remaining.min(REAP_INTERVAL)).unwrap(),
+        ) {
+            Ok(_) | Err(nix::Error::EINTR) => {}
+            Err(_) => return Err(Fault::Receive),
         }
     }
 }
@@ -1302,6 +1553,7 @@ fn serve_request(
     session: &mut Option<Session>,
     cleanup: &mut CleanupSummary,
     closing: &mut HashMap<ChannelId, Instant>,
+    helper_pid: Pid,
 ) -> bool {
     let (bytes, slave) = match channel::recv(seam) {
         Ok(Some(message)) => message,
@@ -1316,6 +1568,10 @@ fn serve_request(
         return false;
     };
     match request {
+        MonitorRequest::SealRefused => {
+            cleanup.request_failure = Some(super::protocol::RequestDrainFailure::Protocol);
+            return false;
+        }
         MonitorRequest::Open {
             id,
             term,
@@ -1362,9 +1618,10 @@ fn serve_request(
                         // the shared `server::REFUSED_REASON`; the real
                         // reason travels in `why`, for the helper's log,
                         // because this process may not write to it.
+                        let until = Instant::now() + plan.session_budget;
                         drop(slave); // no startup descriptor may outlive the proof
-                        tell(seam, &MonitorEvent::Refused { id, why });
-                        report_channel_cleanup(seam, id, CleanupKind::NoChild, None, cleanup);
+                        cleanup.terminal =
+                            Some(refused_requests(seam, helper_pid, id, why, cleanup, until));
                         return false;
                     }
                 }
@@ -2045,6 +2302,180 @@ fn fork_shell(
 mod tests {
     include!("session_cleanup_tests.rs");
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal406_consumed_requests_get_exact_nochild_before_completion() {
+        crate::test_borrowed_scope::run_exact(
+            "helper::monitor::tests::refusal406_consumed_requests_get_exact_nochild_before_completion", 0, || {
+                use std::os::fd::AsFd;
+                let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+                {
+                    let (helper, monitor) = super::super::worker_control::pair().unwrap();
+                    let file = tempfile::tempfile().unwrap();
+                    for id in 2..=16 {
+                        channel::send(&helper, &encode(&MonitorRequest::Open { id, term: None,
+                            shell: false, command: "never executed".into() }).unwrap(), Some(file.as_fd())).unwrap();
+                        channel::send(&helper, &encode(&MonitorRequest::Close { id }).unwrap(), None).unwrap();
+                    }
+                    channel::send(&helper, &encode(&MonitorRequest::SealRefused).unwrap(), None).unwrap();
+                    let summary = CleanupSummary::default();
+                    assert_eq!(refused_requests(&monitor, Pid::this(), 1, "denied".into(), &summary,
+                        Instant::now() + Duration::from_secs(1)), Ok(()));
+                    helper.set_nonblocking(true).unwrap();
+                    let mut nochild = Vec::new();
+                    let mut refused = Vec::new();
+                    let mut closed = false;
+                    while let Ok(Some((bytes, fd))) = channel::recv_once(&helper) {
+                        assert!(fd.is_none() && !closed);
+                        match decode::<MonitorEvent>(&bytes).unwrap() {
+                            MonitorEvent::Refused { id, .. } => refused.push(id),
+                            MonitorEvent::CleanupComplete { id, kind: CleanupKind::NoChild } => nochild.push(id),
+                            MonitorEvent::SessionClosed { request_failure: None, result: PamCompletion::NotOpened, cleanup_failure: None } => closed = true,
+                            other => panic!("unexpected terminal outcome {other:?}"),
+                        }
+                    }
+                    assert!(closed);
+                    assert_eq!(nochild, (1..=16).collect::<Vec<_>>());
+                    assert_eq!(refused, nochild);
+                }
+                assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), before);
+            },
+        ).assert_clean(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal406_invalid_barriers_preserve_pam_without_blanket_receipts() {
+        crate::test_borrowed_scope::run_exact(
+            "helper::monitor::tests::refusal406_invalid_barriers_preserve_pam_without_blanket_receipts", 0, || {
+                use std::os::fd::AsFd;
+                use super::super::protocol::RequestDrainFailure as Fault;
+                use super::super::pam_completion::PamStep;
+                let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+                for mode in ["marker-fd", "zero", "duplicate", "missing-fd", "wrong-sender", "extra-fd", "truncated", "wrong-close", "eof", "excess"] {
+                    let (helper, monitor) = super::super::worker_control::pair().unwrap();
+                    let file = tempfile::tempfile().unwrap();
+                    let open = |id| encode(&MonitorRequest::Open { id, term: None, shell: false, command: "never".into() }).unwrap();
+                    match mode {
+                        "marker-fd" => channel::send(&helper, &encode(&MonitorRequest::SealRefused).unwrap(), Some(file.as_fd())).unwrap(),
+                        "zero" => channel::send(&helper, b"", None).unwrap(),
+                        "duplicate" => channel::send(&helper, &open(1), Some(file.as_fd())).unwrap(),
+                        "missing-fd" => channel::send(&helper, &open(2), None).unwrap(),
+                        "wrong-sender" => channel::send(&helper, &open(2), Some(file.as_fd())).unwrap(),
+                        "extra-fd" => {
+                            let raw = file.as_raw_fd();
+                            nix::sys::socket::sendmsg::<()>(helper.as_raw_fd(), &[std::io::IoSlice::new(&open(2))],
+                                &[nix::sys::socket::ControlMessage::ScmRights(&[raw, raw])],
+                                nix::sys::socket::MsgFlags::empty(), None).unwrap();
+                        },
+                        "truncated" => channel::send(&helper, &vec![b'x'; super::super::protocol::MAX_MESSAGE_LEN+1], None).unwrap(),
+                        "wrong-close" => channel::send(&helper, &encode(&MonitorRequest::Close { id:999 }).unwrap(), None).unwrap(),
+                        "eof" => helper.shutdown(std::net::Shutdown::Write).unwrap(),
+                        "excess" => for id in 2..=17 { channel::send(&helper, &open(id), Some(file.as_fd())).unwrap(); },
+                        _ => unreachable!(),
+                    }
+                    let pam = PamCompletion::Finished { close_session: PamStep::Skipped,
+                        delete_cred: PamStep::Skipped, end: PamStep::Attempted(7) };
+                    let summary = CleanupSummary { pam, failure: Some(CleanupFailure::PtyLabelRestore { errno: 13 }), terminal: None, request_failure: None };
+                    let expected_pid = if mode == "wrong-sender" { Pid::from_raw(1) } else { Pid::this() };
+                    assert_eq!(refused_requests(&monitor, expected_pid, 1, "denied".into(), &summary,
+                        Instant::now() + Duration::from_secs(1)), Err(Fault::Protocol));
+                    helper.set_nonblocking(true).unwrap();
+                    let mut ids = Vec::new();
+                    let mut final_seen = false;
+                    while let Ok(Some((bytes, fd))) = channel::recv_once(&helper) {
+                        assert!(fd.is_none());
+                        match decode::<MonitorEvent>(&bytes).unwrap() {
+                            MonitorEvent::CleanupComplete { id, .. } => ids.push(id),
+                            MonitorEvent::SessionClosed { request_failure: Some(Fault::Protocol), result, cleanup_failure } => {
+                                assert_eq!(result, pam); assert_eq!(cleanup_failure, summary.failure); final_seen = true;
+                            },
+                            _ => {},
+                        }
+                    }
+                    assert!(final_seen);
+                    assert!(!ids.contains(&17));
+                    if mode != "excess" { assert_eq!(ids, vec![1]); }
+                }
+                assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), before);
+            },
+        ).assert_clean(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refusal406_absolute_deadline_and_send_failure_never_complete_cleanly() {
+        crate::test_borrowed_scope::run_exact(
+            "helper::monitor::tests::refusal406_absolute_deadline_and_send_failure_never_complete_cleanly", 0, || {
+                use super::super::protocol::RequestDrainFailure as Fault;
+                let (helper, monitor) = super::super::worker_control::pair().unwrap();
+                let summary = CleanupSummary::default();
+                assert_eq!(refused_requests(&monitor, Pid::this(), 1, "denied".into(), &summary,
+                    Instant::now()), Err(Fault::Deadline));
+                helper.set_nonblocking(true).unwrap();
+                assert!(matches!(channel::recv_once(&helper), Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+                assert_eq!(refused_requests(&monitor, Pid::this(), 1, "denied".into(), &summary,
+                    Instant::now()+Duration::from_millis(20)), Err(Fault::Deadline));
+                while let Ok(Some((bytes, _))) = channel::recv_once(&helper) {
+                    assert!(!matches!(decode::<MonitorEvent>(&bytes).unwrap(), MonitorEvent::SessionClosed { request_failure: None, .. }));
+                }
+                helper.shutdown(std::net::Shutdown::Read).unwrap();
+                assert_eq!(refused_requests(&monitor, Pid::this(), 1, "denied".into(), &summary,
+                    Instant::now()+Duration::from_secs(1)), Err(Fault::Send));
+            },
+        ).assert_clean(0);
+    }
+
+    #[test]
+    fn refusal406_unexpected_marker_is_typed_failure_without_pam_or_fork() {
+        let (helper, monitor) = channel::pair().unwrap();
+        channel::send(
+            &helper,
+            &encode(&MonitorRequest::SealRefused).unwrap(),
+            None,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let account = super::super::account::lookup(&current_account_name()).unwrap();
+        let plan = MonitorPlan {
+            #[cfg(target_os = "linux")]
+            child_mask: None,
+            account,
+            login: [6; 16],
+            tty: String::new(),
+            rhost: String::new(),
+            pam_service: "must-not-open".into(),
+            pam_confdir: Some(directory.path().to_path_buf()),
+            become_account: |_, _, _| panic!("unexpected marker must not fork"),
+            session_group_ops: SessionGroupOps {
+                install: |_| panic!("unexpected marker must not enter PAM"),
+                capture: || panic!("unexpected marker must not enter PAM"),
+            },
+            fd_limit: 0,
+            session_budget: Duration::from_secs(1),
+            session_close_budget: Duration::from_secs(1),
+        };
+        let mut summary = CleanupSummary::default();
+        let mut shells = Vec::new();
+        let mut session = None;
+        let mut closing = HashMap::new();
+        assert!(!serve_request(
+            &plan,
+            &monitor,
+            &mut shells,
+            &mut session,
+            &mut summary,
+            &mut closing,
+            Pid::this()
+        ));
+        assert_eq!(
+            summary.request_failure,
+            Some(super::super::protocol::RequestDrainFailure::Protocol)
+        );
+        assert!(shells.is_empty() && session.is_none());
+        assert_eq!(summary.pam, PamCompletion::NotOpened);
+    }
 
     fn current_account_name() -> String {
         nix::unistd::User::from_uid(Uid::current())
@@ -2971,6 +3402,7 @@ mod cleanup_receipt_tests {
         assert_eq!(summary.pam, PamCompletion::NotOpened);
         let event = MonitorEvent::SessionClosed {
             result: summary.pam,
+            request_failure: None,
             cleanup_failure: summary.failure,
         };
         assert_eq!(
