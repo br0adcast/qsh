@@ -93,6 +93,31 @@ class ContextRows(unittest.TestCase):
         with self.assertRaises(rows.ReconcileError):
             rows.plan_reconcile(b'#' * (rows.MAX_CONTENT + 1), None, I)
 
+    def test_maximum_input_refuses_oversized_installation(self):
+        source = b'system_r:sshd_t:s0 user_r:user_t:s0\n'
+        content = b'#' + b'x' * (rows.MAX_CONTENT - len(source) - 2) + b'\n' + source
+        original_identity = copy.deepcopy(I)
+        self.assertEqual(len(content), rows.MAX_CONTENT)
+        with self.assertRaises(rows.ReconcileError) as caught:
+            rows.plan_reconcile(content, None, I)
+        self.assertEqual(caught.exception.code, 'CONTENT_INVALID')
+        self.assertEqual(content, b'#' + b'x' * (rows.MAX_CONTENT - len(source) - 2) + b'\n' + source)
+        self.assertEqual(I, original_identity)
+        self.assertEqual(rows.plan_remove(content, None), (content, None))
+
+    def test_maximum_installed_output_roundtrips(self):
+        source = b'system_r:sshd_t:s0 user_r:user_t:s0\n'
+        # Two marker lines and the derived row add exactly 126 bytes.
+        content = b'#' + b'x' * (rows.MAX_CONTENT - 126 - len(source) - 2) + b'\n' + source
+        out, receipt = rows.plan_reconcile(content, None, I)
+        self.assertEqual(len(out), rows.MAX_CONTENT)
+        self.assertTrue(rows.check_current(out, receipt, I))
+        self.assertEqual(rows.plan_reconcile(out, receipt, I), (out, receipt))
+        self.assertEqual(rows.plan_remove(out, receipt), (content, None))
+        with self.assertRaises(rows.ReconcileError) as caught:
+            rows.plan_reconcile(b'#' + content, None, I)
+        self.assertEqual(caught.exception.code, 'CONTENT_INVALID')
+
     def test_strict_receipt_validation_and_recovery_intent(self):
         out, receipt = self.install()
         import hashlib

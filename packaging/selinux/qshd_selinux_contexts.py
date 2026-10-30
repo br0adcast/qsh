@@ -160,6 +160,8 @@ def plan_reconcile(content: bytes, receipt: dict | None, identity: dict) -> tupl
     lines = _lines(content)
     lines.insert(index + 1, block)
     after = b''.join(lines)
+    if len(after) > MAX_CONTENT:
+        _fail('CONTENT_INVALID')
     return after, dict(schema_version=1, owner='qshd', identity=dict(identity), block=block.decode('ascii'), block_sha256=_digest(block), source_row=source_line.decode('ascii'), source_row_sha256=_digest(source_line), marker_id=marker, original_sha256=_digest(content), after_sha256=_digest(after))
 
 
