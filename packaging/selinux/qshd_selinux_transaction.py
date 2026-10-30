@@ -115,6 +115,54 @@ class Inspection:
             fail('INSPECTION_DRIFT')
 
 
+class Writer:
+    """Retained context exclusion; borrowed inspection never reacquires flock."""
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._active = True
+        self._borrow = None
+
+    def _live(self, *, mutation=False):
+        if not self._active:
+            fail('WRITER_CLOSED')
+        if mutation and self._borrow is not None:
+            fail('INSPECTION_ACTIVE')
+
+    def reconcile(self, identities):
+        self._live(mutation=True)
+        return self._engine._operation_locked('reconcile', identities)
+
+    def update(self, identities):
+        self._live(mutation=True)
+        return self._engine._operation_locked('update', identities)
+
+    def remove(self):
+        self._live(mutation=True)
+        return self._engine._operation_locked('remove')
+
+    def resume(self):
+        self._live(mutation=True)
+        return self._engine.recover()
+
+    def status(self, identities):
+        self._live()
+        return self._engine._status_locked(identities)
+
+    @contextmanager
+    def inspection(self, identities):
+        self._live(mutation=True)
+        registry = self._engine._inspection_registry(identities)
+        lease = Inspection(self._engine, registry)
+        self._borrow = lease
+        try:
+            lease._no_journal()
+            yield lease
+        finally:
+            lease._active = False
+            self._borrow = None
+
+
 class Transaction(SafeFiles):
     """Injected roots are for trusted library callers and disposable tests only."""
 
@@ -134,6 +182,7 @@ class Transaction(SafeFiles):
         self.anchors = []
         self.fds = {}
         self.journal = None
+        self._writer_active = False
 
 
     def _validate_routes(self):
@@ -143,6 +192,8 @@ class Transaction(SafeFiles):
 
     @contextmanager
     def locked(self, *, provision=True):
+        if self._writer_active:
+            fail('WRITER_ACTIVE')
         opened = []
         try:
             parent = self._directory(self.state.parent)
@@ -201,13 +252,7 @@ class Transaction(SafeFiles):
         acceptance evidence. Explicit registry discovery remains caller-owned.
         Reads may have kernel atime effects; no intentional state writes occur.
         """
-        if not isinstance(identities, dict) or set(identities) != set(self.targets):
-            fail('IDENTITY_PATHS')
-        for key, value in identities.items():
-            pure._identity(value)
-            if value['path'] != key:
-                fail('IDENTITY_PATH')
-        registry = json_bytes(identities)
+        registry = self._inspection_registry(identities)
         # Copy before entering: later caller mutations cannot change this lease.
         with self.locked(provision=False):
             lease = Inspection(self, registry)
@@ -216,6 +261,35 @@ class Transaction(SafeFiles):
                 yield lease
             finally:
                 lease._active = False
+
+    def _inspection_registry(self, identities):
+        if not isinstance(identities, dict) or set(identities) != set(self.targets):
+            fail('IDENTITY_PATHS')
+        for key, value in identities.items():
+            pure._identity(value)
+            if value['path'] != key:
+                fail('IDENTITY_PATH')
+        registry = json_bytes(identities)
+        return registry
+
+    @contextmanager
+    def writer(self):
+        """Retain existing context lock across mutation and final observation.
+
+        Caller owns package/activation exclusion and any one native status
+        window. Release inner leases before invoking a fresh observer child.
+        Entry provisions as locked() does; recovery remains operation-specific.
+        """
+        with self.locked():
+            lease = Writer(self)
+            self._writer_active = True
+            try:
+                yield lease
+            finally:
+                lease._active = False
+                if lease._borrow is not None:
+                    lease._borrow._active = False
+                self._writer_active = False
 
     def snapshot(self, key):
         self._validate_routes()
@@ -471,27 +545,30 @@ class Transaction(SafeFiles):
 
     def _operation(self, kind, identities=None):
         with self.locked():
-            self.recover()
-            receipts = self._receipts(self._read(self.state_fd, 'receipts', state=True, limit=MAX_STATE)['data'])
+            return self._operation_locked(kind, identities)
+
+    def _operation_locked(self, kind, identities=None):
+        self.recover()
+        receipts = self._receipts(self._read(self.state_fd, 'receipts', state=True, limit=MAX_STATE)['data'])
+        if kind != 'remove':
+            if not isinstance(identities, dict) or set(identities) != set(self.targets):
+                fail('IDENTITY_PATHS')
+            for key, value in identities.items():
+                pure._identity(value)
+                if value['path'] != key:
+                    fail('IDENTITY_PATH')
+        snapshots = {key: self.snapshot(key) for key in sorted(self.targets)}
+        changes, new_receipts = {}, {}
+        for key, snapshot in snapshots.items():
+            current = snapshot['data']
+            old = receipts.get(key)
+            if kind in ('remove', 'update'):
+                current, _ = pure.plan_remove(current, old)
             if kind != 'remove':
-                if not isinstance(identities, dict) or set(identities) != set(self.targets):
-                    fail('IDENTITY_PATHS')
-                for key, value in identities.items():
-                    pure._identity(value)
-                    if value['path'] != key:
-                        fail('IDENTITY_PATH')
-            snapshots = {key: self.snapshot(key) for key in sorted(self.targets)}
-            changes, new_receipts = {}, {}
-            for key, snapshot in snapshots.items():
-                current = snapshot['data']
-                old = receipts.get(key)
-                if kind in ('remove', 'update'):
-                    current, _ = pure.plan_remove(current, old)
-                if kind != 'remove':
-                    current, receipt = pure.plan_reconcile(current, None if kind == 'update' else old, identities[key])
-                    new_receipts[key] = receipt
-                changes[key] = current
-            return self.commit(changes, new_receipts, kind, expected=snapshots)
+                current, receipt = pure.plan_reconcile(current, None if kind == 'update' else old, identities[key])
+                new_receipts[key] = receipt
+            changes[key] = current
+        return self.commit(changes, new_receipts, kind, expected=snapshots)
 
     def reconcile(self, identities):
         """Plan every target before publishing; ordinary source drift refuses."""
@@ -508,16 +585,19 @@ class Transaction(SafeFiles):
     def status(self, identities):
         """Read-only inspection: never provision, recover, adopt or publish."""
         with self.locked(provision=False):
-            pending = self._journal_load() is not None
-            receipts = self._receipts(self._read(self.state_fd, 'receipts', state=True, limit=MAX_STATE)['data'])
-            if not isinstance(identities, dict) or set(identities) != set(self.targets):
-                fail('IDENTITY_PATHS')
-            result = {}
-            for key in sorted(self.targets):
-                if identities[key].get('path') != key:
-                    fail('IDENTITY_PATH')
-                result[key] = pure.check_current(self.snapshot(key)['data'], receipts.get(key), identities[key])
-            return {'pending': pending, 'targets': result}
+            return self._status_locked(identities)
+
+    def _status_locked(self, identities):
+        pending = self._journal_load() is not None
+        receipts = self._receipts(self._read(self.state_fd, 'receipts', state=True, limit=MAX_STATE)['data'])
+        if not isinstance(identities, dict) or set(identities) != set(self.targets):
+            fail('IDENTITY_PATHS')
+        result = {}
+        for key in sorted(self.targets):
+            if identities[key].get('path') != key:
+                fail('IDENTITY_PATH')
+            result[key] = pure.check_current(self.snapshot(key)['data'], receipts.get(key), identities[key])
+        return {'pending': pending, 'targets': result}
 
     def resume(self):
         """Public recovery call; refuses uninitialized state."""
