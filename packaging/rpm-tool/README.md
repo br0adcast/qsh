@@ -3,8 +3,10 @@
 `install.sh` installs `cargo-generate-rpm 0.21.0` with a narrow source patch
 for its locked `rpm 0.23.2` dependency. Client and daemon packaging must use
 this same installer. It requires Bash, Python 3.6 or newer, curl, GNU patch,
-and the selected Rust toolchain. It preserves `CARGO_HOME` and Cargo's normal
-installation directory.
+and the selected Rust toolchain. It preserves `CARGO_HOME`. Installation
+explicitly selects `CARGO_INSTALL_ROOT`, then `$CARGO_HOME` (defaulting to `$HOME/.cargo`), so qualification checks the
+fresh binary by absolute path. Cargo config `install.root` is not consulted;
+set `CARGO_INSTALL_ROOT` to override the destination.
 
 The upstream V4 builder already counts finalized uncompressed CPIO bytes,
 including entry alignment and the trailer, but does not write that archive
@@ -44,6 +46,17 @@ a patch update:
 ```sh
 cargo test --manifest-path /tmp/new-rpm-tool-sources/rpm-0.23.2/Cargo.toml \
   --locked --lib --no-default-features --features payload archive_size_tests
+```
+
+Every installation runs the shared `test_dependencies.py` checks against the
+freshly installed binary. They generate RPMs and inspect numeric PRE/POST flags,
+ordinary version constraints, automatic ELF requirements, and invalid PRE
+metadata rejection. Failure stops both hosted release packaging and the RPM
+floor image build, without a second tool build or separate CI job. Payloads
+are never executed. Run the same checks against an existing prepared tool:
+
+```sh
+python3 packaging/rpm-tool/test_dependencies.py /absolute/path/to/cargo-generate-rpm
 ```
 
 Lightweight preparation tests run without downloads or tool compilation:

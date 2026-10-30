@@ -1,4 +1,8 @@
-"""Preparation controls; no network or packaging-tool compilation."""
+"""Offline preparation controls and optional generated RPM header checks.
+
+Set QSH_RPM_TOOL to an absolute prepared generator path to run header checks;
+the test suite never downloads, compiles, installs, or runs packaged payloads.
+"""
 import hashlib
 import importlib.util
 import io
@@ -88,6 +92,41 @@ class PreparationTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(list(self.root.glob("tmp.*")), [])
 
+    def test_installer_runs_fresh_binary_checks_and_propagates_failure(self):
+        # Stand in for downloading/building only; execute the real installer
+        # and real header tests. A stale PATH binary must never be selected.
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        for name in ["install.sh", "test_dependencies.py"]:
+            source = ROOT / "packaging/rpm-tool" / name
+            (bundle / name).write_bytes(source.read_bytes())
+        (bundle / "prepare.py").write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).mkdir()\n")
+        commands = self.root / "commands"
+        commands.mkdir()
+        cargo = commands / "cargo"
+        cargo.write_text("""#!/bin/sh
+mkdir -p "$CARGO_INSTALL_ROOT/bin"
+cat > "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm" <<'TOOL'
+#!/bin/sh
+echo fresh-tool >&2
+exit 17
+TOOL
+chmod +x "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm"
+""")
+        cargo.chmod(0o755)
+        stale = commands / "cargo-generate-rpm"
+        stale.write_text('#!/bin/sh\necho stale-tool >&2\nexit 18\n')
+        stale.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(PATH=str(commands) + os.pathsep + environment["PATH"],
+                           CARGO_INSTALL_ROOT=str(self.root / "installed"),
+                           QSH_RPM_TOOL=str(stale))
+        result = subprocess.run(["bash", str(bundle / "install.sh")], env=environment,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"fresh-tool", result.stderr)
+        self.assertNotIn(b"stale-tool", result.stderr)
+
     def test_package_floor_copy_sources_exist_in_both_actual_contexts(self):
         native = (ROOT / ".github/workflows/native-crypto.yml").read_text()
         native_line = next(line for line in native.splitlines()
@@ -115,6 +154,17 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             prepare.apply_patch(target, patch)
         self.assertEqual((target / "fixture-1/src/lib.rs").read_text(), "before\n")
+
+
+DEPENDENCY_SPEC = importlib.util.spec_from_file_location(
+    "rpm_dependencies", ROOT / "packaging/rpm-tool/test_dependencies.py")
+dependencies = importlib.util.module_from_spec(DEPENDENCY_SPEC)
+DEPENDENCY_SPEC.loader.exec_module(dependencies)
+
+
+@unittest.skipUnless(os.environ.get("QSH_RPM_TOOL"), "set QSH_RPM_TOOL to the prepared generator binary")
+class GeneratedDependencyTests(dependencies.GeneratedDependencyTests):
+    tool = os.environ.get("QSH_RPM_TOOL")
 
 
 if __name__ == "__main__":

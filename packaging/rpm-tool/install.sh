@@ -14,4 +14,8 @@ command -v cargo >/dev/null
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 python3 "$bundle/prepare.py" "$work/source"
-cargo install --path "$work/source/cargo-generate-rpm-0.21.0" --locked --force
+install_root=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}
+mkdir -p -- "$install_root"
+install_root=$(cd -- "$install_root" && pwd)
+cargo install --root "$install_root" --path "$work/source/cargo-generate-rpm-0.21.0" --locked --force
+python3 "$bundle/test_dependencies.py" "$install_root/bin/cargo-generate-rpm"

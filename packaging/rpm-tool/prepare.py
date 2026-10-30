@@ -14,6 +14,7 @@ PATCHES = (
     "rpm-0.23.2-archive-size.patch",
     "cargo-generate-rpm-0.21.0-local-rpm.patch",
     "cargo-generate-rpm-0.21.0-requires-post.patch",
+    "cargo-generate-rpm-0.21.0-requires-pre.patch",
 )
 
 
