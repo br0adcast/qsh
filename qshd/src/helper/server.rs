@@ -5763,6 +5763,10 @@ pub(crate) mod tests {
     impl TestHelper {
         /// Close both seams and wait for the loop to notice.
         pub(crate) fn stop(self) {
+            self.stop_named("the helper loop must end once its peer closes both seams");
+        }
+
+        fn stop_named(self, what: &str) {
             let TestHelper {
                 channels,
                 auth,
@@ -5771,10 +5775,7 @@ pub(crate) mod tests {
             } = self;
             drop(channels);
             drop(auth);
-            join_within(
-                thread,
-                "the helper loop must end once its peer closes both seams",
-            );
+            join_within(thread, what);
         }
     }
 
@@ -5793,7 +5794,9 @@ pub(crate) mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        thread.join().expect("the helper loop must not panic");
+        thread
+            .join()
+            .unwrap_or_else(|_| panic!("{what} -- the helper loop must not panic"));
     }
 
     /// The uid of the account this test process runs as -- the one account
@@ -15839,7 +15842,7 @@ pub(crate) mod tests {
             "control: two channels of one login must ask the account stack once, and it must \
              have been asked at all"
         );
-        ok.stop();
+        ok.stop_named("permit-control helper must end after both seams close");
 
         let h = helper_with_pam_confdir(dir.path(), "qshd-test-deny");
         let (first, _fd) = open_result_with_fd(&h.channels, 1, my_uid(), h.login);
@@ -15866,7 +15869,7 @@ pub(crate) mod tests {
             "the refusal must end the LOGIN: the second Open must find no monitor and no login \
              left, so the account stack is asked once and not once per channel"
         );
-        h.stop();
+        h.stop_named("refused-account helper must end after both seams close");
     }
 
     /// What the session stack puts in the environment reaches the account's
