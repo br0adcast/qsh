@@ -1,6 +1,7 @@
 """Actual private state and locks; policy/registry/native seams are injected."""
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
+import importlib.util
 import fcntl
 import hashlib
 import json
@@ -31,6 +32,7 @@ class Bindings:
         self.target.write_bytes(self.original);self.target.chmod(0o640)
         self.ids={'/contexts':dict(path='/contexts',source_type='sshd_t',original_package='fixture')}
         self.routing=json.dumps(self.ids,sort_keys=True,separators=(',',':')).encode()
+        self.expected_trust=TRUST
         self.events=[];self.active=set();self.failure=None;self.registry_count=0;self.loads=0;self.now=100
     def fails(self,name):
         return name in self.failure if isinstance(self.failure,set) else self.failure==name
@@ -96,7 +98,7 @@ class Bindings:
                 assert {'package','activation','contexts'}<=binding.active
                 binding.assert_locked();assert binding.record()['state']=='PENDING'
                 assert binding.target.read_bytes()==binding.original
-                assert trust==TRUST and pp==PP and deadline<=binding.now+240
+                assert trust==binding.expected_trust and pp==PP and deadline<=binding.now+240
                 binding.point('load');binding.loads+=1
                 if binding.failure=='late load':binding.now=400
                 return SimpleNamespace(artifact=trust,pp_sha256=trust.pp_sha256)
@@ -123,6 +125,77 @@ class CoordinatorTests(unittest.TestCase):
         self.b=Bindings(Path(self.temp.name))
     def run_coordinator(self,trust=TRUST,pp=PP,deadline=1000):
         return c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(trust,pp,deadline=deadline)
+    def installed(self):
+        import qshd_selinux_reference_loader as refs
+        root=Path(__file__).resolve().parents[2]
+        spec=importlib.util.spec_from_file_location('builder',root/'packaging/selinux/assemble_payload.py')
+        builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
+        pp=self.b.root/'qshd.pp';pp.write_bytes(PP)
+        source=root/'packaging/selinux';artifact=source/'artifact.json';pam=root/'packaging/pam.d/qshd.fedora-selinux'
+        expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in builder.MODULES}
+        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,artifact,pam)})
+        out=self.b.root/'installed';builder.assemble_payload(source,pp,artifact,pam,expected,out,1000000000)
+        self.b.expected_trust=TrustedArtifact('0.2.0',expected['artifact.json'],expected['qshd.pp'])
+        @contextmanager
+        def references():
+            assert 'package' in self.b.active
+            with self.b.track('references',refs._testing_references(out)) as reader:yield reader
+        self.b.references=references
+        return out/'usr/share/qshd-selinux/reference.json'
+
+    def test_installed_real_references_under_single_package_lease(self):
+        self.installed()
+        value=c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertEqual(value.artifact,self.b.expected_trust)
+        self.assertEqual(self.b.events.count('package enter'),1)
+        self.assertLess(self.b.events.index('references exit'),self.b.events.index('package exit'))
+        self.assertEqual(self.b.record()['state'],'COMPLETE')
+
+    def test_installed_reference_drift_before_complete_remains_pending(self):
+        path=self.installed();point=self.b.point
+        def drift(name):
+            point(name)
+            if name=='window exit':path.write_bytes(path.read_bytes()+b' ')
+        self.b.point=drift
+        with self.assertRaises(c.CoordinatorError):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertEqual(self.b.record()['state'],'PENDING')
+
+    def test_installed_reference_finalizer_failure_is_uncertain(self):
+        path=self.installed();point=self.b.point
+        def drift(name):
+            point(name)
+            if name=='complete replace':path.write_bytes(path.read_bytes()+b' ')
+        self.b.point=drift
+        with self.assertRaises(slot.OutcomeUncertain):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertEqual(self.b.record()['state'],'COMPLETE')
+
+    def test_installed_invalid_reference_never_begins_pending_or_load(self):
+        path=self.installed();path.write_bytes(b'{}')
+        with self.assertRaises(c.CoordinatorError):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertFalse((self.b.common/'selinux-activation/activation.json').exists())
+        self.assertEqual(self.b.loads,0)
+        self.assertEqual(self.b.target.read_bytes(),self.b.original)
+
+    def test_installed_uncertainty_survives_reference_exit_masking(self):
+        self.installed();self.b.failure={'completion fsync','references exit'}
+        with self.assertRaises(slot.OutcomeUncertain):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertEqual(self.b.record()['state'],'COMPLETE')
+
+    def test_installed_public_entry_and_reference_factory_are_fixed(self):
+        self.installed();self.b.now=time.monotonic()
+        with patch.object(c,'_Production',return_value=self.b) as factory:
+            self.assertEqual(c.activate_installed_first(deadline=time.monotonic()+200).state,'COMPLETE')
+        factory.assert_called_once_with()
+        import qshd_selinux_reference_loader as references
+        sentinel=object()
+        with patch.object(references,'production_references',return_value=sentinel) as factory:
+            self.assertIs(c._Production().references(),sentinel)
+        factory.assert_called_once_with()
+
     def test_positive_real_durable_state_and_normal_exit_order(self):
         result=self.run_coordinator()
         self.assertEqual(result.state,'COMPLETE');self.assertEqual(self.b.record()['state'],'COMPLETE')
@@ -331,7 +404,7 @@ class CoordinatorTests(unittest.TestCase):
                 def trace(frame,event,arg):
                     if event=='return' and frame.f_code is slot._Writer.publish_complete.__code__:
                         returned[0]=True
-                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator.activate_first.__code__:
+                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_locked.__code__:
                         returned[0]=False;interrupted.append(frame.f_lineno)
                         raise ReturnInterruption('first coordinator line after actual publication return')
                     return trace
