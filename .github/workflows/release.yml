@@ -246,6 +246,8 @@ jobs:
         run: |
           VERSION="$RELEASE_VERSION"
           mkdir -p dist
+          evidence="$RUNNER_TEMP/darwin-producer-evidence"
+          mkdir -p "$evidence"
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             stage="qsh-$VERSION-$target"
             mkdir -p "$stage"
@@ -254,14 +256,26 @@ jobs:
             cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
             # Probes both actual stripped inputs, then checks archived bytes.
+            scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+            native_prefix="${scoped}_OPENSSL_DIR"
             python3 scripts/check-release-output.py archive --version "$VERSION" \
-              --target "$target" --inputs "$stage" "dist/$stage.tar.gz"
+              --target "$target" --inputs "$stage" \
+              --darwin-metadata "$evidence/$target.json" --native-prefix "${!native_prefix}" \
+              "dist/$stage.tar.gz"
           done
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
           path: dist/
+
+      # CI evidence is intentionally separate from distributable release assets.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: darwin-producer-evidence
+          path: ${{ runner.temp }}/darwin-producer-evidence/*.json
+          if-no-files-found: error
+          retention-days: 7
 
   # The system-mode `qshd`: dynamically linked against glibc and libpam, and
   # for that reason built nowhere above. The other jobs build personal-mode
@@ -482,7 +496,7 @@ jobs:
       - name: Collect and checksum
         run: |
           mkdir -p dist
-          find artifacts -type f -exec cp {} dist/ \;
+          find artifacts -type f ! -path 'artifacts/darwin-producer-evidence/*' -exec cp {} dist/ \;
           cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
 
       - name: Check release artifacts for secrets

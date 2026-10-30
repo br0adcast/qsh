@@ -1,5 +1,7 @@
 """Owned output fixtures exercise release validation without compiling products."""
 import importlib.util
+import json
+import hashlib
 import io
 import os
 import shutil
@@ -260,6 +262,156 @@ class ReleaseOutputTests(unittest.TestCase):
                     output.check_fields(fmt, changed, filename, program, '0.5.0', arch)
             with self.subTest(fmt=fmt, filename=True), self.assertRaises(ValueError):
                 output.check_fields(fmt, fields, 'wrong-' + filename, program, '0.5.0', arch)
+
+
+class DarwinMetadataTests(unittest.TestCase):
+    # Synthetic Apple-tool text, not an observed runner/artifact qualification.
+    MODERN=b"/Users/PRIVATE/build/qsh:\nLoad command 0\n cmd LC_RPATH\n path /Users/PRIVATE/secret\nLoad command 1\n cmd LC_BUILD_VERSION\n cmdsize 32\n platform 1\n minos 11.0\n sdk 15.4\n ntools 1\n tool 3\n version 1115.7.3\n"
+    LEGACY=b"/private/path:\nLoad command 0\n cmd LC_VERSION_MIN_MACOSX\n cmdsize 16\n version 10.12\n sdk n/a\n"
+
+    def setUp(self):
+        self.helper=ReleaseOutputTests();self.helper.setUp();self.addCleanup(self.helper.doCleanups)
+        self.root=self.helper.root
+
+    def test_modern_legacy_fields_and_private_decoys(self):
+        modern=output.parse_darwin_load_commands(self.MODERN)
+        self.assertEqual(modern,dict(kind='LC_BUILD_VERSION',platform='macos',minos='11.0',sdk='15.4'))
+        self.assertEqual(output.parse_darwin_load_commands(self.LEGACY),dict(kind='LC_VERSION_MIN_MACOSX',platform='macos',minos='10.12',sdk=None))
+        self.assertNotIn('PRIVATE',json.dumps(modern))
+        for bad in (b'',self.MODERN+self.LEGACY,self.MODERN.replace(b'platform 1',b'platform 2'),self.MODERN.replace(b'minos 11.0',b'minos /Users/PRIVATE'),self.MODERN.replace(b'sdk 15.4',b'sdk 15.4\n sdk 15.4'),b'x'*65537):
+            with self.subTest(bad=bad[:20]),self.assertRaises(ValueError):output.parse_darwin_load_commands(bad)
+
+    def fixture(self,target='aarch64-apple-darwin'):
+        archive,inputs=self.helper.archive()
+        renamed=self.root/('qsh-0.5.0-'+target+'.tar.gz')
+        with tarfile.open(archive,'r:gz') as old,tarfile.open(renamed,'w:gz') as new:
+            for member in old:
+                member.name=member.name.replace('fixture-target',target)
+                new.addfile(member,old.extractfile(member) if member.isfile() else None)
+        prefix=self.root/'native';prefix.mkdir()
+        (prefix/'version-probe').write_bytes(b'PUBLIC SYNTHETIC NATIVE PROBE')
+        self.sdk=self.root/'SDK';self.sdk.mkdir()
+        self.native=dict(identity=dict(source=dict(version='3.5.9'),target=target,compiler=dict(sha256='b'*64,version='Apple clang version 17.0.0\nInstalledDir: /Users/PRIVATE/clang',flags=['-arch','arm64' if target.startswith('aarch64') else 'x86_64','-isysroot',str(self.sdk)],macros='#define __APPLE__ 1\n#define __arm64__ 1\n#define __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 150400\n#define PRIVATE "/Users/PRIVATE/secret"\n',path='/Users/PRIVATE/clang')),artifacts={'version-probe':hashlib.sha256((prefix/'version-probe').read_bytes()).hexdigest()})
+        (prefix/'manifest.json').write_text(json.dumps(self.native))
+        return renamed,inputs,prefix
+
+    def command(self,argv):
+        values={('/usr/bin/uname','-m'):b'arm64\n',('/usr/bin/sw_vers','-productVersion'):b'15.4\n',('/usr/bin/sw_vers','-buildVersion'):b'24E248\n',('/usr/bin/xcodebuild','-version'):b'Xcode 16.4\nBuild version 16F6\n',('/usr/bin/xcrun','--show-sdk-path'):(str(self.sdk)+'\n').encode(),('/usr/bin/xcrun','--show-sdk-version'):b'15.4\n',('rustc','--version','--verbose'):b'rustc 1.99.1\nbinary: rustc\ncommit-hash: '+b'c'*40+b'\nhost: aarch64-apple-darwin\nrelease: 1.99.1\n',('/usr/bin/xcrun','--find','otool'):b'/usr/bin/otool\n',('/usr/bin/xcrun','--find','lipo'):b'/usr/bin/lipo\n'}
+        if argv[:2]==['/usr/bin/otool','-l']:return self.MODERN
+        if argv[:2]==['/usr/bin/lipo','-archs']:return b'arm64\n'
+        if argv[:2]==['rustc','--print=deployment-target']:return b'MACOSX_DEPLOYMENT_TARGET=11.0\n'
+        return values[tuple(argv)]
+
+    def context(self):
+        return mock.patch.dict(os.environ,dict(GITHUB_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',ImageVersion='20261025.1'),clear=True)
+
+    def test_archive_metadata_has_exact_five_bound_records_and_no_private_paths(self):
+        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+        with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=self.command):
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+        raw=destination.read_text();value=json.loads(raw)
+        self.assertEqual(len(value['binaries']),5)
+        self.assertEqual(value['native']['flags'],['-arch','arm64','-isysroot','<SDK>'])
+        self.assertEqual(value['rust']['reported_deployment_target'],'11.0')
+        self.assertLess(len(raw.encode()),32768)
+        for forbidden in ('PRIVATE','/Users/',str(self.root),'InstalledDir'):self.assertNotIn(forbidden,raw)
+        self.assertEqual(value['binaries'][0]['sha256'],value['binaries'][1]['sha256'])
+        self.assertEqual(value['binaries'][2]['sha256'],value['binaries'][3]['sha256'])
+
+    def test_metadata_cannot_rebind_the_already_version_probed_identity(self):
+        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+        native_binary=output._darwin_binary;native_digest=output.digest;changed=False
+        def binary(*args,**kwargs):
+            nonlocal changed
+            value=native_binary(*args,**kwargs)
+            if value['role'] in ('staged','extracted'):
+                changed=True;value['sha256']='f'*64
+            return value
+        def digest(stream):
+            # Simulate a coherent later archive/staging generation. It must not
+            # replace the version-probed baseline, even if later hashes agree.
+            if changed and isinstance(stream,tarfile.ExFileObject):return bytes.fromhex('f'*64)
+            return native_digest(stream)
+        with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=self.command),mock.patch.object(output,'_darwin_binary',side_effect=binary),mock.patch.object(output,'digest',side_effect=digest),self.assertRaises(ValueError):
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+        self.assertFalse(destination.exists())
+
+    def test_metadata_failure_never_creates_completed_evidence(self):
+        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+        for failure in ('probe','arch','sdk','flag','command'):
+            (prefix/'manifest.json').write_text(json.dumps(self.native))
+            def command(argv):
+                if failure=='command':raise ValueError('fixed tool refusal')
+                if failure=='arch' and argv[:2]==['/usr/bin/lipo','-archs']:return b'x86_64\n'
+                return self.command(argv)
+            if failure=='probe':
+                changed=json.loads(json.dumps(self.native));changed['artifacts']['version-probe']='0'*64;(prefix/'manifest.json').write_text(json.dumps(changed))
+            if failure=='sdk':
+                changed=json.loads(json.dumps(self.native));changed['identity']['compiler']['flags'][-1]=str(self.root/'other');(prefix/'manifest.json').write_text(json.dumps(changed))
+            if failure=='flag':
+                changed=json.loads(json.dumps(self.native));changed['identity']['compiler']['flags'].append('-I/Users/PRIVATE/include');(prefix/'manifest.json').write_text(json.dumps(changed))
+            with self.subTest(failure=failure),self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=command),self.assertRaises(ValueError):
+                output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+            self.assertFalse(destination.exists())
+
+    def test_metadata_tool_timeout_overflow_and_exact_direct_child_reap(self):
+        for body,timeout in [('import time;time.sleep(30)',.1),('import os;os.write(1,b"x"*70000)',10),('import sys;sys.stderr.write("PRIVATE")',10)]:
+            program=self.helper.executable('tool',body+'\n');children=[];native=subprocess.Popen
+            def spawn(*args,**kwargs):
+                child=native(*args,**kwargs);children.append(child);return child
+            with self.subTest(body=body),mock.patch.object(output.subprocess,'Popen',side_effect=spawn),self.assertRaises(ValueError):output.metadata_command([str(program)],timeout=timeout)
+            self.assertEqual(len(children),1);self.assertIsNotNone(children[0].returncode)
+            with self.assertRaises(ChildProcessError):os.waitpid(children[0].pid,os.WNOHANG)
+
+    def test_metadata_direct_tool_interrupt_still_reaps_owned_child(self):
+        record=self.root/'metadata-tool-pid'
+        program=self.helper.executable('metadata-tool',
+            'import os,time\nfrom pathlib import Path\np=Path('+repr(str(record))+')\np.with_suffix(".pending").write_text(str(os.getpid()))\np.with_suffix(".pending").replace(p)\ntime.sleep(30)\n')
+        cancelled=threading.Event();delivered=threading.Event()
+        def interrupt():
+            deadline=time.monotonic()+5
+            while not cancelled.is_set() and time.monotonic()<deadline:
+                if record.exists():delivered.set();os.kill(os.getpid(),signal.SIGINT);return
+                cancelled.wait(.01)
+        previous=signal.signal(signal.SIGINT,signal.default_int_handler);sender=threading.Thread(target=interrupt);sender.start()
+        try:
+            with self.assertRaises(KeyboardInterrupt):output.metadata_command([str(program)])
+        finally:cancelled.set();sender.join();signal.signal(signal.SIGINT,previous)
+        self.assertTrue(delivered.is_set())
+        with self.assertRaises(ChildProcessError):os.waitpid(int(record.read_text()),os.WNOHANG)
+
+    def test_metadata_argument_pair_existing_output_and_changed_binary_refuse(self):
+        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+        for args in (dict(darwin_metadata=destination),dict(native_prefix=prefix)):
+            with self.subTest(args=sorted(args)),self.assertRaises(ValueError):output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',**args)
+        destination.write_text('PUBLIC EXISTING EVIDENCE')
+        with self.assertRaises(ValueError):output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+        self.assertEqual(destination.read_text(),'PUBLIC EXISTING EVIDENCE');destination.unlink()
+        def changed(argv):
+            result=self.command(argv)
+            if argv[:2]==['/usr/bin/otool','-l']:
+                path=Path(argv[-1]);path.write_bytes(path.read_bytes()+b'\n# public mutation\n')
+            return result
+        with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=changed),self.assertRaises(ValueError):
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+        self.assertFalse(destination.exists())
+
+    def test_collector_preserves_exact_release_set_and_excludes_ci_only_evidence(self):
+        workflow=(ROOT/'.github/workflows/release.yml').read_text()
+        command=next(line.strip() for line in workflow.splitlines() if line.strip().startswith('find artifacts -type f'))
+        artifacts=self.root/'artifacts';artifacts.mkdir();(self.root/'dist').mkdir()
+        expected={'qsh-0.5.0-'+target+'.tar.gz' for target in ('x86_64-unknown-linux-musl','aarch64-unknown-linux-musl','aarch64-apple-darwin','x86_64-apple-darwin')}
+        for program in ('qsh','qshd'):
+            expected.update(program+'_0.5.0-1_'+arch+'.deb' for arch in ('amd64','arm64'))
+            expected.update(program+'-0.5.0-1.'+arch+'.rpm' for arch in ('x86_64','aarch64'))
+        self.assertEqual(len(expected),12)
+        for name in expected:
+            path=artifacts/'producer'/name;path.parent.mkdir(exist_ok=True);path.write_bytes(b'public')
+        private=artifacts/'darwin-producer-evidence';private.mkdir();(private/'arm.json').write_text('{}');(private/'intel.json').write_text('{}')
+        subprocess.run(['sh','-c',command],cwd=self.root,check=True,capture_output=True,timeout=5)
+        self.assertEqual({p.name for p in (self.root/'dist').iterdir()},expected)
+        self.assertEqual(workflow.count('name: darwin-producer-evidence'),1)
+        self.assertIn('retention-days: 7',workflow)
 
 
 if __name__ == '__main__':
