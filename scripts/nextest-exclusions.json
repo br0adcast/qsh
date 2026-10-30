@@ -6,6 +6,9 @@
         "a_uid_0_alias_is_refused_while_permit_root_is_off",
         "an_account_confined_by_its_shell_stays_confined",
         "attacker_controlled_authorization_is_refused",
+        "authorization_template_characterization::configured_fixed_template_shares_authorization_with_independent_root_gate",
+        "authorization_template_characterization::configured_per_name_template_separates_the_selected_key_files",
+        "authorization_template_characterization::configured_shared_home_template_shares_authorization_with_independent_root_gate",
         "the_daemon_refuses_to_start_with_a_dangerous_securebit",
         "the_daemon_refuses_to_start_without_its_pam_service_file",
         "two_accounts_each_get_their_own_shell"
