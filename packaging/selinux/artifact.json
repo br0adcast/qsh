@@ -1,0 +1,12 @@
+{
+  "name": "qshd-selinux",
+  "architecture": "noarch",
+  "policy_module": "qshd",
+  "policy_version": "0.2.0",
+  "module_priority": 400,
+  "authored_source_license": "AGPL-3.0-only",
+  "reference_policy_source_license": "GPL-2.0-or-later",
+  "combined_artifact_license": "AGPL-3.0-only AND GPL-2.0-or-later",
+  "reference_policy_selected_terms": "GPL-3.0 (GPL-2.0-or-later option; GNU GPLv3 section 13 combination)",
+  "runtime_qualification": "Fedora 44 targeted policy"
+}

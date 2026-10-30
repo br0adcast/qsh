@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Authored qshd policy calls old-floor reference-policy interfaces; it does not
+# incorporate their implementations. One qshd_t covers daemon, helper and worker.
+policy_module(qshd, 0.2.0)
+
+type qshd_t;
+type qshd_exec_t;
+init_daemon_domain(qshd_t, qshd_exec_t)
+auth_login_pgm_domain(qshd_t)
+
+# PAM chooses each account's pending exec context. Keep the existing transition
+# and PTY logic; no fixed user_t label or helper/worker SELinux domain split.
+allow qshd_t self:process { setexec setkeycreate };
+userdom_spec_domtrans_all_users(qshd_t)
+type qshd_devpts_t;
+term_login_pty(qshd_devpts_t)
+term_create_pty(qshd_t, qshd_devpts_t)
+allow qshd_t qshd_devpts_t:chr_file { rw_chr_file_perms setattr relabelfrom };
+userdom_relabelto_user_ptys(qshd_t)
+userdom_use_user_ptys(qshd_t)
+userdom_setattr_user_ptys(qshd_t)
+allow qshd_t qshd_devpts_t:chr_file relabelto;
+gen_require(`type user_devpts_t;')
+allow qshd_t user_devpts_t:chr_file relabelfrom;
+selinux_compute_relabel_context(qshd_t)
+
+# serve.rs creates/binds the documented UDP listener, then the worker uses it.
+# Explicit self socket access does not depend on optional NIS policy linkage.
+# The three generic types support unnamed nonprivileged custom ports without
+# adding a local dontaudit. They are broader than numeric 60022. Retained
+# auth_use_pam may conditionally expand to NIS bind/dontaudit/RPC rules when
+# that distribution policy is linked; this block does not remove those rules.
+allow qshd_t self:udp_socket create_socket_perms;
+gen_require(`type port_t, unreserved_port_t, ephemeral_port_t;')
+allow qshd_t { port_t unreserved_port_t ephemeral_port_t }:udp_socket name_bind;
+corenet_udp_bind_generic_node(qshd_t)
+corenet_udp_sendrecv_generic_if(qshd_t)
+corenet_udp_sendrecv_generic_node(qshd_t)
+corenet_sendrecv_generic_server_packets(qshd_t)
+
+# host_key.rs creates /etc/qshd and atomically stages/publishes host_key.
+# Existing-key reads and mode repair stay inside this dedicated config type.
+type qshd_config_t;
+files_config_file(qshd_config_t)
+files_search_etc(qshd_t)
+files_etc_filetrans(qshd_t, qshd_config_t, dir, "qshd")
+type_transition qshd_t qshd_config_t:file qshd_config_t;
+allow qshd_t qshd_config_t:dir { create open read getattr search write add_name remove_name };
+allow qshd_t qshd_config_t:file { create open read write getattr setattr rename unlink };
+
+# log.rs creates /var/log/qshd, appends qshd.log and renames to qshd.log.1.
+type qshd_log_t;
+logging_log_file(qshd_log_t)
+logging_search_logs(qshd_t)
+logging_log_filetrans(qshd_t, qshd_log_t, dir, "qshd")
+type_transition qshd_t qshd_log_t:file qshd_log_t;
+allow qshd_t qshd_log_t:dir { create open read getattr search write add_name remove_name };
+allow qshd_t qshd_log_t:file { create open read write append getattr setattr rename unlink };
+
+# systemd RuntimeDirectory labels /run/qshd from file contexts; qshd creates
+# its staging dir, lock file and status socket below that already-owned dir.
+type qshd_runtime_t;
+files_pid_file(qshd_runtime_t)
+files_search_pids(qshd_t)
+type_transition qshd_t qshd_runtime_t:dir qshd_runtime_t;
+type_transition qshd_t qshd_runtime_t:file qshd_runtime_t;
+type_transition qshd_t qshd_runtime_t:sock_file qshd_runtime_t;
+allow qshd_t qshd_runtime_t:dir { create open read getattr search write add_name remove_name rmdir };
+allow qshd_t qshd_runtime_t:file { create open read write getattr setattr unlink lock };
+allow qshd_t qshd_runtime_t:sock_file { create open read write getattr setattr rename unlink };
+
+# helper/mod.rs uses socketpairs and forks; monitor/process_scope reaps and
+# signals only owned children. The worker is DAC/capability-dropped, not a
+# distinct MAC domain. Root helper temporarily switches IDs and chowns PTYs.
+# The monitor then labels/restores the account-owned slave via fsetfilecon;
+# kernel owner checks require fowner on that operation after the chown.
+allow qshd_t self:unix_stream_socket create_stream_socket_perms;
+allow qshd_t self:unix_stream_socket connectto;
+allow qshd_t self:process { fork sigchld signal sigkill setpgid };
+# pam_limits re-applies current priority; Linux still checks this permission.
+allow qshd_t self:process setsched;
+allow qshd_t self:capability { setuid setgid chown kill fowner };
+
+# Default authorized_keys is an account's ~/.ssh/authorized_keys. Custom
+# templates outside known labels need a separately reviewed label contract.
+ssh_read_user_home_files(qshd_t)
+
+# /proc/self/status, /proc/self/task and process_scope's pidfd custody require
+# proc traversal and reads. Account shells may transition to user domains;
+# userdomain-wide state/signals are used only after code-side ownership checks.
+kernel_search_proc(qshd_t)
+kernel_read_proc_symlinks(qshd_t)
+allow qshd_t self:dir { open read getattr search };
+allow qshd_t self:file { open read getattr };
+userdom_read_all_users_state(qshd_t)
+userdom_signal_all_users(qshd_t)
+userdom_kill_all_users(qshd_t)

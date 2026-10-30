@@ -1,0 +1,38 @@
+{
+  "base_image": "rockylinux/rockylinux:8@sha256:e8a49c5403b687db05d4d67333fa45808fbe74f36e683cec7abb1f7d0f2338c6",
+  "compiler_rpm_urls": {
+    "checkpolicy-2.9-1.el8.x86_64.rpm": "https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/Packages/c/checkpolicy-2.9-1.el8.x86_64.rpm",
+    "m4-1.4.18-7.el8.x86_64.rpm": "https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/Packages/m/m4-1.4.18-7.el8.x86_64.rpm",
+    "make-4.2.1-11.el8.x86_64.rpm": "https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/Packages/m/make-4.2.1-11.el8.x86_64.rpm",
+    "policycoreutils-devel-2.9-26.el8_10.x86_64.rpm": "https://dl.rockylinux.org/pub/rocky/8/BaseOS/x86_64/os/Packages/p/policycoreutils-devel-2.9-26.el8_10.x86_64.rpm"
+  },
+  "installed_tools": {
+    "checkpolicy": "2.9-1.el8.x86_64",
+    "gawk": "4.2.1-4.el8.x86_64",
+    "libsepol": "2.9-3.el8.x86_64",
+    "m4": "1.4.18-7.el8.x86_64",
+    "make": "4.2.1-11.el8.x86_64",
+    "policycoreutils-devel": "2.9-26.el8_10.x86_64"
+  },
+  "policy_devel": "selinux-policy-devel-3.14.3-67.el8.noarch.rpm",
+  "policy_rpm_urls": {
+    "selinux-policy-3.14.3-67.el8.src.rpm": "https://dl.rockylinux.org/vault/rocky/8.4/BaseOS/source/tree/Packages/selinux-policy-3.14.3-67.el8.src.rpm",
+    "selinux-policy-devel-3.14.3-67.el8.noarch.rpm": "https://dl.rockylinux.org/vault/rocky/8.4/BaseOS/x86_64/os/Packages/selinux-policy-devel-3.14.3-67.el8.noarch.rpm"
+  },
+  "policy_source": "selinux-policy-3.14.3-67.el8.src.rpm",
+  "rpms": {
+    "checkpolicy-2.9-1.el8.x86_64.rpm": "99298960b34764108eca6376d69cc572d1db3ef6a1720de07dfe388820d46318",
+    "m4-1.4.18-7.el8.x86_64.rpm": "d7881a93d82deb52eaf09ef9c71260050206e0c674a72dfa75d07ed9bcdcb489",
+    "make-4.2.1-11.el8.x86_64.rpm": "4395686eb6662d9ce01e699cb55f34911f41fe6168437d47dc2c6f7738facb82",
+    "policycoreutils-devel-2.9-26.el8_10.x86_64.rpm": "ad8ef9680fe981a0283e8c2ea07e6db5a4e92f74e2e5138351b0dca9ffc05df6",
+    "selinux-policy-3.14.3-67.el8.src.rpm": "ad51ec0041ea302bff8f91f60a1a86dfc42b76e632cdefc30b342f28bf702b6c",
+    "selinux-policy-devel-3.14.3-67.el8.noarch.rpm": "efc6cd4bf08c1b055d987eda24d82d707d1a6655716c68514c51990a6f3d0f83"
+  },
+  "signing_key_fingerprint": "7051C470A929F454CEBE37B715AF5DAC6D745A60",
+  "signing_key_sha256": "ef1ca99bba38bb2869a06fbf46860fcdaeece796be98f8dfb0160b84bdbc69ab",
+  "source_archives": {
+    "base": "https://github.com/fedora-selinux/selinux-policy/archive/55f4df96a3aff2ed1791e428385e1967856eed49/selinux-policy-55f4df9.tar.gz",
+    "contrib": "https://github.com/fedora-selinux/selinux-policy-contrib/archive/5a34aedf6563624d8543cbc708ba2a29be508872/selinux-policy-contrib-5a34aed.tar.gz"
+  },
+  "source_license": "GPL-2.0-or-later"
+}
