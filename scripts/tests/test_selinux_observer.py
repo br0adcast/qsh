@@ -24,6 +24,19 @@ class ProtocolTests(unittest.TestCase):
 
 
 
+    def test_deep_bounded_json_is_a_bounded_protocol_refusal(self):
+        import qshd_selinux_observer as m
+        nested=b'['*1100+b'0'+b']'*1100
+        self.assertLess(len(nested),4096)
+        # Exercise the standard-library recursive decoder independently of
+        # accelerator-specific C stack limits on this Python build.
+        from unittest.mock import patch
+        with patch.object(json.scanner,'make_scanner',json.scanner.py_make_scanner):
+            with self.assertRaisesRegex(m.ObserverError,'^RESPONSE$'):
+                m._parse_response(nested,'public-request')
+            with self.assertRaisesRegex(m.ObserverError,'^PROTOCOL$'):
+                m._parse_request(base64.b64encode(nested).decode('ascii'))
+
     def test_response_binding_shape_and_custody_categories(self):
         import qshd_selinux_observer as m
         from types import SimpleNamespace as N

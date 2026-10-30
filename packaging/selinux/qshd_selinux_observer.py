@@ -72,7 +72,7 @@ def _parse_request(encoded):
         pam=base64.b64decode(value['pam_base64'],validate=True)
         if _request(trust,pam)!=encoded:_fail('PROTOCOL')
         return trust,pam
-    except (ValueError,TypeError,KeyError,UnicodeError):_fail('PROTOCOL')
+    except (ValueError,TypeError,KeyError,UnicodeError,RecursionError):_fail('PROTOCOL')
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ def _parse_response(data,encoded):
         binding=ContextBinding(value['registry_sha256'],value['receipts_sha256'])
         if data!=_response(encoded,binding):_fail('RESPONSE')
         return ManagedPrestartObservation(_PROFILE,binding)
-    except (ValueError,TypeError,KeyError,UnicodeError):_fail('RESPONSE')
+    except (ValueError,TypeError,KeyError,UnicodeError,RecursionError):_fail('RESPONSE')
 
 
 def observe_managed_prestart(trusted_artifact,expected_pam):
