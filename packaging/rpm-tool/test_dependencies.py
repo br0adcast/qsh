@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -13,8 +14,13 @@ class GeneratedDependencyTests(unittest.TestCase):
     def generate(self, metadata):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            elf_source = Path("/bin/true")
-            (root / "payload").write_bytes(elf_source.read_bytes())
+            # Rocky minimal images expose /bin/true as a coreutils shebang
+            # script. The running interpreter is a native ELF on our Linux
+            # packaging hosts, so it exercises automatic library requirements.
+            elf_source = Path(sys.executable).resolve()
+            payload = elf_source.read_bytes()
+            self.assertEqual(payload[:4], b"\x7fELF", str(elf_source))
+            (root / "payload").write_bytes(payload)
             (root / "payload").chmod(0o755)
             (root / "Cargo.toml").write_text(
                 '[package]\nname="phase-test"\nversion="1.0.0"\nlicense="MIT"\n'
