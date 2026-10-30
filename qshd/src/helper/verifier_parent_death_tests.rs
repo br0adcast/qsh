@@ -46,16 +46,61 @@ mod verifier_parent {
 
     #[test]
     fn verifier_release_publication_ignores_restrictive_umask() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        use std::io::{Read, Seek, SeekFrom};
+        use std::process::{Child, Stdio};
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                loop {
+                    match self.0.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("owned release child wait failed: {error}"),
+                    }
+                }
+                self.0.kill().unwrap();
+                loop {
+                    match self.0.wait() {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => { result.unwrap(); break; }
+                    }
+                }
+            }
+        }
+        // File capture cannot block the child on a full pipe and keeps nested
+        // libtest control lines out of this test's --nocapture CI stream.
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let mut child = OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "helper::server::tests::verifier_parent::verifier_release_is_hidden_until_complete_publication",
                 "--test-threads=1",
             ])
             .env("QSH_TEST_RELEASE_PRIVATE_UMASK", "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout.try_clone().unwrap()))
+            .stderr(Stdio::from(stderr.try_clone().unwrap()))
+            .spawn()
+            .unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() { break status; }
+            assert!(Instant::now() < deadline, "owned release child deadline");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let mut output = Vec::new();
+        stdout.seek(SeekFrom::Start(0)).unwrap();
+        stdout.take(65537).read_to_end(&mut output).unwrap();
+        let mut errors = Vec::new();
+        stderr.seek(SeekFrom::Start(0)).unwrap();
+        stderr.take(65537).read_to_end(&mut errors).unwrap();
+        assert!(output.len() <= 65536 && errors.len() <= 65536, "release child output bound");
+        assert!(status.success(), "release child status={status:?}, stdout={output:?}, stderr={errors:?}");
+        assert!(errors.is_empty(), "release child stderr={errors:?}");
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"), "release child result={output:?}");
     }
 
     #[test]
