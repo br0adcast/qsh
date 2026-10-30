@@ -1053,6 +1053,9 @@ jobs:
             --require worker_no_new_privs::worker67_no_new_privs_does_not_restrict_helper_or_user_exec \
             --require a_monitor_holds_no_seam_and_the_worker_still_sees_the_end
           run_suite test system_mode_accounts \
+            --require authorization_template_characterization::configured_fixed_template_shares_authorization_with_independent_root_gate \
+            --require authorization_template_characterization::configured_per_name_template_separates_the_selected_key_files \
+            --require authorization_template_characterization::configured_shared_home_template_shares_authorization_with_independent_root_gate \
             --require two_accounts_each_get_their_own_shell \
             --require attacker_controlled_authorization_is_refused
           run_suite test system_mode_pam \

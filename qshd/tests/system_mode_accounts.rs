@@ -12,6 +12,11 @@
 //!   end-to-end pin that commands go through the account's own shell, so a
 //!   shell that confines key holders keeps confining them.
 //!
+//! The configured-template characterization below additionally contrasts fixed,
+//! per-name and shared-home key sources with the independent root gate. It
+//! records existing administrator-configured behavior, not a default bypass
+//! or a new authorization policy.
+//!
 //! And, since the final review of slice 2c, one test that creates no
 //! account at all but belongs to the same tier because it needs root:
 //! [`the_daemon_refuses_to_start_with_a_dangerous_securebit`], which pins
@@ -619,4 +624,265 @@ fn attacker_controlled_authorization_is_refused() {
             prove_alice();
         },
     );
+}
+
+/// Characterize administrator-selected sharing without selecting a new policy.
+/// All keys/accounts are generated inside the existing disposable-host guard;
+/// no fixture credential grants access to any persistent account or service.
+mod authorization_template_characterization {
+    use super::*;
+    use nix::unistd::User;
+    use ssh_key::PrivateKey;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Template {
+        Fixed,
+        PerName,
+        SharedHome,
+    }
+
+    /// Restore only the two passwd entries created by this test, before their
+    /// account guards remove their original homes. Also run on a failed case.
+    struct Homes(Vec<(String, PathBuf)>);
+
+    impl Homes {
+        fn share(accounts: &[&common::TestAccount], home: &Path) -> Self {
+            let guard = Self(
+                accounts
+                    .iter()
+                    .map(|account| {
+                        let user = User::from_name(&account.name).unwrap().unwrap();
+                        assert!(!user.uid.is_root());
+                        (account.name.clone(), user.dir)
+                    })
+                    .collect(),
+            );
+            for (name, _) in &guard.0 {
+                common::run_account_command_or_panic(
+                    "usermod",
+                    &["--home", home.to_str().unwrap(), name],
+                );
+                assert_eq!(User::from_name(name).unwrap().unwrap().dir, home);
+            }
+            guard
+        }
+
+        fn restore(&mut self) {
+            while let Some((name, home)) = self.0.last() {
+                common::run_account_command_or_panic(
+                    "usermod",
+                    &["--home", home.to_str().unwrap(), name],
+                );
+                assert_eq!(User::from_name(name).unwrap().unwrap().dir, *home);
+                self.0.pop();
+            }
+        }
+    }
+
+    impl Drop for Homes {
+        fn drop(&mut self) {
+            // A primary assertion must remain a failure if restoration fails;
+            // do not double-panic during unwinding. Container teardown still
+            // contains every account/path even on that failed-test boundary.
+            for (name, home) in self.0.iter().rev() {
+                if let Err((_, error)) = common::run_account_command(
+                    "usermod",
+                    &["--home", home.to_str().unwrap(), name],
+                ) {
+                    eprintln!("LEFT BEHIND test home restoration: {error}");
+                }
+            }
+        }
+    }
+
+    fn public_key(path: &Path, key: &PrivateKey) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{}", key.public_key().to_openssh().unwrap()).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+    }
+
+    fn accepted(port: u16, server: [u8; 32], key: &PrivateKey, account: &common::TestAccount) {
+        let session = common::Session::connect(port, server, key, &account.name);
+        session.request_channel(Some(WHO_AM_I));
+        session.wait_for_opened();
+        assert_eq!(session.wait_for_exit(), 0);
+        assert!(session.wait_for_output(|text| !reported(text, "qshd-uid").is_empty()));
+        let output = session.output();
+        assert_eq!(reported(&output, "qshd-uid"), [account.uid.to_string()]);
+        if !account.uid.is_root() {
+            assert_eq!(
+                reported(&output, "qshd-who"),
+                std::slice::from_ref(&account.name)
+            );
+        }
+    }
+
+    fn refused(
+        port: u16,
+        server: [u8; 32],
+        key: &PrivateKey,
+        account: &common::TestAccount,
+        reason: &str,
+    ) {
+        let log = common::daemon_log_path();
+        let before = common::log_mentions(&log, reason);
+        let session = common::Session::connect(port, server, key, &account.name);
+        session.request_channel(Some(WHO_AM_I));
+        let observed = common::wait_until(|| {
+            session.saw_opened() || common::log_mentions(&log, reason) > before
+        });
+        assert!(
+            !session.saw_opened(),
+            "unexpected authorization for {}",
+            account.name
+        );
+        assert!(
+            observed,
+            "no explicit fresh refusal {reason:?} for {}",
+            account.name
+        );
+        assert!(common::log_mentions(&log, reason) > before);
+    }
+
+    fn characterize(case: Template) {
+        let parent = Path::new("/var/lib/qshd-test-keys");
+        std::fs::create_dir_all(parent).unwrap();
+        let metadata = std::fs::symlink_metadata(parent).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), 0);
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Authorization must not be rooted beneath world-writable /tmp. This
+        // unique root and all of its public leaves belong only to this case.
+        let keys = tempfile::Builder::new()
+            .prefix("qshd134-")
+            .tempdir_in(parent)
+            .unwrap();
+        std::fs::set_permissions(keys.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alice = common::TestAccount::create("qshd-test-134-alice", "/bin/sh");
+        let bob = common::TestAccount::create("qshd-test-134-bob", "/bin/sh");
+        let root = common::TestAccount::create_uid0_alias("qshd-test-134-root");
+        assert_ne!(alice.uid, bob.uid);
+        assert!(!alice.uid.is_root() && !bob.uid.is_root() && root.uid.is_root());
+        let mut homes = None;
+        let template = match case {
+            Template::Fixed => {
+                let path = keys.path().join("authorized_keys");
+                public_key(&path, &alice.key);
+                path.to_str().unwrap().to_owned()
+            }
+            Template::PerName => {
+                for account in [&alice, &bob, &root] {
+                    public_key(&keys.path().join(&account.name), &account.key);
+                }
+                assert_ne!(
+                    std::fs::metadata(keys.path().join(&alice.name))
+                        .unwrap()
+                        .ino(),
+                    std::fs::metadata(keys.path().join(&bob.name))
+                        .unwrap()
+                        .ino()
+                );
+                keys.path().join("%u").to_str().unwrap().to_owned()
+            }
+            Template::SharedHome => {
+                let home = keys.path().join("shared-home");
+                let ssh = home.join(".ssh");
+                std::fs::create_dir(&home).unwrap();
+                std::fs::create_dir(&ssh).unwrap();
+                for path in [&home, &ssh] {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                public_key(&ssh.join("authorized_keys"), &alice.key);
+                homes = Some(Homes::share(&[&alice, &bob], &home));
+                assert_eq!(
+                    User::from_name(&alice.name).unwrap().unwrap().dir,
+                    User::from_name(&bob.name).unwrap().unwrap().dir
+                );
+                "%h/.ssh/authorized_keys".to_owned()
+            }
+        };
+        common::install_service_file(include_str!("../../packaging/pam.d/qshd.debian"));
+        for permit_root in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            let mut args = vec!["--authorized-keys-template", template.as_str()];
+            if permit_root {
+                args.push("--permit-root");
+            }
+            let (daemon, server, port) = common::start_daemon_with(state.path(), &args);
+            accepted(port, server, &alice.key, &alice);
+            match case {
+                Template::PerName => {
+                    accepted(port, server, &bob.key, &bob);
+                    refused(port, server, &alice.key, &bob, "key not listed");
+                }
+                Template::Fixed | Template::SharedHome => {
+                    accepted(port, server, &alice.key, &bob);
+                    refused(port, server, &bob.key, &bob, "key not listed");
+                }
+            }
+            // A constant file intentionally also lists this key for UID0;
+            // the other templates use the root alias's own separate key file.
+            let root_key = match case {
+                Template::Fixed => &alice.key,
+                Template::PerName | Template::SharedHome => &root.key,
+            };
+            if permit_root {
+                accepted(port, server, root_key, &root);
+            } else {
+                refused(port, server, root_key, &root, ROOT_REFUSAL);
+            }
+            eprintln!("SEEN configured {case:?}: two distinct UIDs; permit_root={permit_root}");
+            drop(daemon);
+        }
+        if let Some(homes) = homes.as_mut() {
+            homes.restore();
+        }
+        let names = [&alice, &bob, &root].map(|account| account.name.clone());
+        drop((root, bob, alice));
+        for name in names {
+            assert!(
+                User::from_name(&name).unwrap().is_none(),
+                "test account not removed"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_fixed_template_shares_authorization_with_independent_root_gate() {
+        common::on_a_disposable_host(
+            "configured_fixed_template_shares_authorization_with_independent_root_gate",
+            "creates two accounts and a uid0 alias and installs the disposable PAM service",
+            || characterize(Template::Fixed),
+        );
+    }
+
+    #[test]
+    fn configured_per_name_template_separates_the_selected_key_files() {
+        common::on_a_disposable_host(
+            "configured_per_name_template_separates_the_selected_key_files",
+            "creates two accounts and a uid0 alias and installs the disposable PAM service",
+            || characterize(Template::PerName),
+        );
+    }
+
+    #[test]
+    fn configured_shared_home_template_shares_authorization_with_independent_root_gate() {
+        common::on_a_disposable_host(
+            "configured_shared_home_template_shares_authorization_with_independent_root_gate",
+            "creates disposable accounts, temporarily changes two test homes, and installs PAM",
+            || characterize(Template::SharedHome),
+        );
+    }
 }

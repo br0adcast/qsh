@@ -46,6 +46,22 @@ class ReportTests(unittest.TestCase):
         self.write(cases)
         return self.module.check_report(self.report, self.expected if expected is None else expected)
 
+    def test_authorization_template_cases_have_exact_disposable_owner(self):
+        names = {
+            "authorization_template_characterization::configured_fixed_template_shares_authorization_with_independent_root_gate",
+            "authorization_template_characterization::configured_per_name_template_separates_the_selected_key_files",
+            "authorization_template_characterization::configured_shared_home_template_shares_authorization_with_independent_root_gate",
+        }
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        actual = {name for binary, name in expected if binary == "qshd::system_mode_accounts" and name.startswith("authorization_template_characterization::")}
+        self.assertEqual(actual, names)
+        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
+        for name in names:
+            key = ("qshd::system_mode_accounts", name)
+            self.assertEqual(expected[key]["owner"], "CI container job: run_suite test system_mode_accounts")
+            self.assertIn(f"test(={name})", self.module.exclusion_filter({key: expected[key]}))
+            self.assertIn(f"--require {name}", workflow)
+
     def test_cache_authority_privilege_exclusion_has_exact_owner_and_identity(self):
         expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
         key = ("qsh::release_cache_authority_privilege", "release_cache_root_readonly_and_foreign_owner_boundaries")
