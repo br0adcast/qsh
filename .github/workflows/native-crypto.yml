@@ -17,6 +17,8 @@ on:
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
       - 'packaging/bootstrap/**'
+      - 'packaging/rpm-tool/**'
+      - 'scripts/tests/test_rpm_tool.py'
       - 'scripts/tests/test_bootstrap_tools.py'
   push:
     branches: [main]
@@ -35,6 +37,8 @@ on:
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
       - 'packaging/bootstrap/**'
+      - 'packaging/rpm-tool/**'
+      - 'scripts/tests/test_rpm_tool.py'
       - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
   workflow_call:
