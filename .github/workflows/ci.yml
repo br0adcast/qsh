@@ -700,6 +700,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_linkage.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_context_rows.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_inspection.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_transaction.py'
           python3 -m unittest discover -s scripts/tests -p 'test_qshd_stop_guard.py'
