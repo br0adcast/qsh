@@ -58,6 +58,7 @@ mod adoption_legacy {
                 adoption: Some(adoption),
                 stop: None,
             }),
+            None,
         );
         assert_ne!(
             mode, "legacy_helper_death",
