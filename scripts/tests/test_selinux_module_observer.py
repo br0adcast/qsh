@@ -5,6 +5,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import errno
+import ast
+import inspect
+import textwrap
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'packaging/selinux'))
 from qshd_selinux_activation import TrustedArtifact
@@ -171,6 +176,67 @@ class ObserverTests(unittest.TestCase):
                 with self.assertRaises(m.ObserverError):lease.capture()
         self.assertEqual(len(self.calls),1)
         self.assertEqual(list((self.root/'run').iterdir()),[])
+    def test_scratch_post_open_fstat_failure_closes_acquired_fd(self):
+        before=len(os.listdir('/proc/self/fd'));opened=[]
+        native_open=os.open;native_fstat=os.fstat;failed=False
+        def opening(name,*args,**kwargs):
+            fd=native_open(name,*args,**kwargs)
+            if str(name).startswith('qshd-module-'):opened.append(fd)
+            return fd
+        def failing(fd):
+            nonlocal failed
+            if fd in opened and not failed:
+                failed=True;raise OSError(errno.EIO,'injected')
+            return native_fstat(fd)
+        try:
+            with patch.object(m.os,'open',side_effect=opening),patch.object(m.os,'fstat',side_effect=failing):
+                with self.assertRaises(m.ObserverError):
+                    with self.observer():pass
+            self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+            self.assertTrue(list((self.root/'run').iterdir()))
+        finally:
+            for fd in opened:
+                try:native_fstat(fd)
+                except OSError:continue
+                os.close(fd)
+    def test_hll_post_open_fstat_failure_closes_acquired_fd(self):
+        before=len(os.listdir('/proc/self/fd'));opened=[];count=0;failed=False
+        original=m.ModuleObserver._open;native_fstat=os.fstat
+        def opening(lease,parent,name,**kwargs):
+            nonlocal count
+            fd=original(lease,parent,name,**kwargs)
+            if name=='qshd.pp':
+                count+=1
+                if count==2:opened.append(fd)
+            return fd
+        def failing(fd):
+            nonlocal failed
+            if fd in opened and not failed:
+                failed=True;raise OSError(errno.EIO,'injected')
+            return native_fstat(fd)
+        try:
+            with patch.object(m.ModuleObserver,'_open',opening),patch.object(m.os,'fstat',side_effect=failing):
+                with self.assertRaises(m.ObserverError):
+                    with self.observer() as lease:lease.capture()
+            self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+            self.assertTrue(list((self.root/'run').rglob('qshd.pp')))
+        finally:
+            for fd in opened:
+                try:native_fstat(fd)
+                except OSError:continue
+                os.close(fd)
+    def test_platform_fields_refuse_all_duplicates(self):
+        tree=ast.parse(textwrap.dedent(inspect.getsource(m.ModuleObserver.__enter__)))
+        gate=next(node for node in ast.walk(tree) if isinstance(node,ast.If)
+                  and 'fields' in ast.unparse(node.test))
+        code=compile(ast.Expression(gate.test),'<platform-predicate>','eval')
+        def refused(data):return eval(code,{},dict(fields=data.splitlines()))
+        self.assertFalse(refused(b'ID=fedora\nVERSION_ID=44\n'))
+        for data in (b'ID=fedora\nID=other\nVERSION_ID=44\n',
+                     b'ID=fedora\nID=fedora\nVERSION_ID=44\n',
+                     b'ID=fedora\nVERSION_ID=44\nVERSION_ID=45\n',
+                     b'ID=fedora\nVERSION_ID=44\nVERSION_ID=44\n'):
+            self.assertTrue(refused(data))
     def test_caller_error_cleans_scratch(self):
         with self.assertRaisesRegex(RuntimeError,'caller'):
             with self.observer() as lease:

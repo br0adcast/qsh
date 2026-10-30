@@ -121,6 +121,7 @@ class ModuleObserver(SafeFiles):
         self._dirs = {}
         self._scratch = []
         self._output = []
+        self._acquired = []
 
     def _protected(self, parent, name, limit, *, mode=None, executable=False):
         value = self._read(parent, name, limit=limit)
@@ -149,7 +150,8 @@ class ModuleObserver(SafeFiles):
                 self._files['platform'] = self._protected(self._dirs['platform'], 'os-release', 8192)
                 release = self._files['platform']['data']
                 fields = release.splitlines()
-                if fields.count(b'ID=fedora') != 1 or fields.count(b'VERSION_ID=44') != 1:
+                if ([line for line in fields if line.startswith(b'ID=')] != [b'ID=fedora']
+                        or [line for line in fields if line.startswith(b'VERSION_ID=')] != [b'VERSION_ID=44']):
                     _fail('PLATFORM')
                 self._owner = _SemoduleOwner()
             self._guard()
@@ -199,9 +201,9 @@ class ModuleObserver(SafeFiles):
                 _fail('CLEANUP_BINDING')
             os.rmdir(name,dir_fd=parent)
             raise
+        self._acquired.append(fd)
         opened = os.fstat(fd)
         if (made.st_dev,made.st_ino) != (opened.st_dev,opened.st_ino):
-            os.close(fd)
             _fail('SCRATCH_BINDING')
         base = self.anchor / 'run' if not self._scratch else self._scratch[0][3]
         self._scratch.append((parent,name,fd,base/name))
@@ -231,9 +233,9 @@ class ModuleObserver(SafeFiles):
         if 'qshd.pp' in os.listdir(fd):
             value = self._protected(fd,'qshd.pp',MAX_HLL,mode=0o600)
             held = self._open(fd,'qshd.pp')
+            self._acquired.append(held)
             current = os.fstat(held)
             if (current.st_dev,current.st_ino) != tuple(value['inode']):
-                os.close(held)
                 _fail('HLL_BINDING')
             self._output.append((fd,'qshd.pp',held))
         else:
@@ -316,8 +318,9 @@ class ModuleObserver(SafeFiles):
                     errors = True
         else:
             errors = True
-        descriptors = [item[2] for item in self._output]
-        descriptors += [item[2] for item in self._scratch]
+        # Includes descriptors acquired before later validation could fail,
+        # even when no safe output/directory cleanup identity was admitted.
+        descriptors = self._acquired.copy()
         descriptors += self.anchors + [item[2] for item in self.routes]
         for fd in reversed(descriptors):
             try:
