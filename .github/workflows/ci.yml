@@ -32,7 +32,7 @@ concurrency:
 jobs:
   macos:
     name: macOS portable tests
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       RUSTUP_TOOLCHAIN: "1.98.1"
