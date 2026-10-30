@@ -222,6 +222,38 @@ class RegistryTests(unittest.TestCase):
         with self.lease(clock=lambda:now[0]) as lease:
             lease.routing();now[0]+=61
             with self.assertRaises(reg.RegistryError):lease.capture()
+    def test_cleanup_close_error_attempts_all_and_resets(self):
+        engine=reg.Registry(self.contexts,anchor=self.root,uid=os.geteuid(),owner=self.runner)
+        close=os.close
+        for body_failure in (False,True):
+            attempted=[];owned=set();injection=None;phase=reg.RegistryError('PHASE_FAILURE')
+            def close_then_error(fd):
+                attempted.append(fd);close(fd)
+                if len(attempted)==1:raise OSError('private close diagnostic')
+            try:
+                with self.assertRaises(reg.RegistryError) as caught:
+                    with engine.inspection() as lease:
+                        lease.routing()
+                        owned=set(engine.anchors+[part for route in engine.routes for part in (route[0],route[2])])
+                        injection=patch.object(reg.os,'close',side_effect=close_then_error)
+                        injection.start()
+                        if body_failure:raise phase
+                self.assertEqual(set(attempted),owned)
+                self.assertEqual(len(attempted),len(owned))
+                self.assertFalse(engine._active);self.assertEqual(engine.routes,[]);self.assertEqual(engine.anchors,[])
+                self.assertFalse(lease._active)
+                if body_failure:
+                    self.assertIs(caught.exception,phase)
+                    self.assertIn('REGISTRY_CLEANUP',caught.exception.__notes__)
+                else:self.assertEqual(str(caught.exception),'REGISTRY_CLEANUP')
+                for fd in owned:
+                    with self.assertRaises(OSError):os.fstat(fd)
+            finally:
+                if injection is not None:injection.stop()
+                for fd in owned:
+                    try:os.fstat(fd)
+                    except OSError:continue
+                    close(fd)
     def test_command_failure_bounded_and_cleanup(self):
         before=len(list(Path('/proc/self/fd').iterdir()));self.runner.fail=True
         for _ in range(3):

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import posixpath
 import re
+import sys
 import time
 
 import qshd_selinux_contexts as pure
@@ -143,10 +144,23 @@ class Registry(SafeFiles):
         finally:
             if lease is not None:
                 lease._active = False
-            for fd in set(self.anchors + [part for route in self.routes for part in (route[0], route[2])]):
-                os.close(fd)
-            self.anchors, self.routes = [], []
-            self._active = False
+            phase_error = sys.exception()
+            cleanup_failed = False
+            try:
+                for fd in set(self.anchors + [part for route in self.routes for part in (route[0], route[2])]):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        # Do not retry an ambiguous close: the FD may be reused.
+                        cleanup_failed = True
+            finally:
+                self.anchors, self.routes = [], []
+                self._active = False
+            if cleanup_failed:
+                if phase_error is not None:
+                    phase_error.add_note('REGISTRY_CLEANUP')
+                else:
+                    _fail('REGISTRY_CLEANUP')
 
     def _inventory(self):
         self._validate_directory_routes()
