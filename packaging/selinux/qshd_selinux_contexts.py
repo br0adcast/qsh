@@ -64,6 +64,19 @@ def _rows(content, kind):
     return result
 
 
+def context_relevant(content: bytes) -> bool:
+    """Classify bounded rows/markers; ownership still requires current receipts.
+
+    Both row kinds are validated even when the other already establishes
+    relevance. Reserved markers remain relevant, never silently ignored; the
+    mandatory composed context inspection validates their receipt/block binding.
+    """
+    source = _rows(content, b'sshd_t')
+    target = _rows(content, b'qshd_t')
+    markers = [line for line in _lines(content) if PREFIX.strip() in line]
+    return bool(source or target or markers)
+
+
 def _new_row(source):
     fields = source.strip().split()
     return b'system_r:qshd_t:' + fields[0].split(b':', 2)[2] + b'\t' + b' '.join(fields[1:]) + b'\n'
