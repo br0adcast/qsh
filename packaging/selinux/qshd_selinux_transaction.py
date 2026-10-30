@@ -118,16 +118,21 @@ class Transaction:
     def _open(self, parent, name, *, state=False):
         # O_PATH validates type without opening devices or blocking on FIFOs.
         probe = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=parent)
+        fd = None
         try:
-            self._bound(parent, name, probe, state=state)
-            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
-            if identity(os.fstat(probe)) != identity(os.fstat(fd)):
+            try:
+                self._bound(parent, name, probe, state=state)
+                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+                if identity(os.fstat(probe)) != identity(os.fstat(fd)):
+                    fail('OPEN_BINDING')
+                self._bound(parent, name, fd, state=state)
+            finally:
+                os.close(probe)
+        except BaseException:
+            if fd is not None:
                 os.close(fd)
-                fail('OPEN_BINDING')
-            self._bound(parent, name, fd, state=state)
-            return fd
-        finally:
-            os.close(probe)
+            raise
+        return fd
 
     def _read(self, parent, name, *, state=False, limit=MAX_FILE):
         fd = self._open(parent, name, state=state)
