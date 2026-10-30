@@ -155,7 +155,7 @@ qshd serve --system [--port N] [--host-key PATH] \
 | `--system` | off | Turn on system mode. |
 | `--port` | `60022` | same as the personal mode |
 | `--host-key` | `/etc/qshd/host_key` | the machine's host key, owned by root, mode `0600` — see "The host key's move" below |
-| `--authorized-keys-template` | `%h/.ssh/authorized_keys` | where an account's own keys live; `%h` expands to its home directory, `%u` to its login name |
+| `--authorized-keys-template` | `%h/.ssh/authorized_keys` | key source for the requested account; `%h` expands to its home directory, `%u` to its login name |
 | `--worker-user` | `qshd` | the unprivileged account the daemon's network-facing half drops to once it has split off from its root-privileged half; the `qshd` package creates this account if absent |
 | `--permit-root` | off | allow logging in as `uid 0`; refused otherwise |
 | `--runtime-threads` | one per CPU | same as the personal mode; the count applies to the worker's runtime |
@@ -164,11 +164,19 @@ qshd serve --system [--port N] [--host-key PATH] \
 (the `qshd` package's binary is; the portable release binary is not) — asking for it on a binary without the feature fails with an
 explicit error rather than doing nothing. `--authorized-keys` (the
 personal mode's flag, above) is refused outright together with
-`--system` — a single file can't serve several accounts, and silently
-reinterpreting the flag would be worse than refusing it; use
-`--authorized-keys-template` instead. `--authorized-keys-template`, in
+`--system`; use `--authorized-keys-template` to select the key source for
+the requested account instead. `--authorized-keys-template`, in
 turn, is refused without `--system`, for the same reason in the other
 direction: the personal mode has one account and nothing to expand.
+
+A key listed in the selected source can authorize the requested account, subject
+to the remaining checks. A fixed template selects the same file
+for multiple accounts. `%h` can also select a shared file when accounts have the
+same home directory. `%u` selects a path by login name, but distinct files can
+still list the same key; the token does not guarantee unique credentials.
+Configure these sources according to which accounts each key should authorize.
+The root gate remains independent: UID 0 is refused unless `--permit-root` is
+set, including when its selected source shares keys with other accounts.
 
 In system mode, the expanded key path must be absolute. The helper checks every
 opened directory from `/` to the file, and the file itself: each must be owned
