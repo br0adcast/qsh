@@ -41,6 +41,23 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(self.g.Refusal):
                 self.g.snapshot(text)
 
+    def test_snapshot_requires_literal_lf_records(self):
+        # Synthetic malformed records, not captured Fedora manager output.
+        for control in map(chr, [*range(10), *range(11, 32), 127, 133, 8232, 8233]):
+            text = self.snapshot().replace('\n', control, 1)
+            with self.subTest(control=repr(control)), self.assertRaises(self.g.Refusal):
+                self.g.snapshot(text)
+        self.assertEqual(self.g.snapshot(self.snapshot())['Job'], '')
+
+    def test_events_require_literal_lf_records(self):
+        # Preserve the final LF so only internal record framing is malformed.
+        for control in map(chr, [*range(10), *range(11, 32), 127, 133, 8232, 8233]):
+            with self.subTest(control=repr(control)), self.assertRaises(self.g.Refusal):
+                self.g.events('populated 0' + control + 'frozen 0\n')
+        for text in ('populated 0\r\n', 'populated 0\n\n', 'populated 0'):
+            with self.subTest(text=repr(text)), self.assertRaises(self.g.Refusal):
+                self.g.events(text)
+
     def test_absence_is_explicit_not_phase_automatic(self):
         text = self.snapshot(LoadState='not-found', Slice='')
         self.g.snapshot(text, allow_absent=True)
@@ -131,6 +148,21 @@ class GuardTests(unittest.TestCase):
                      good.replace(' / /sys', ' /delegated /sys'),
                      good+'8 7 0:2 / /sys/fs/cgroup/system.slice rw - tmpfs tmpfs rw\n']:
             with self.assertRaises(self.g.Refusal): self.g.mount(text)
+
+    def test_mount_records_reject_noncanonical_controls(self):
+        good = '7 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
+        for control in ('\v', '\f', '\x1c', '\x1d', '\x1e', '\r', '\x7f'):
+            with self.subTest(control=repr(control)), self.assertRaises(self.g.Refusal):
+                self.g.mount(good[:-1] + control + '\n')
+
+    def test_mount_identity_requires_literal_lf_records(self):
+        for control in ('\v', '\f', '\x1c', '\x1d', '\x1e', '\r', '\x7f'):
+            with self.subTest(control=repr(control)), \
+                 patch.object(self.g, 'read', return_value='pos:\t0' + control + 'mnt_id:\t7\n'), \
+                 self.assertRaises(self.g.Refusal):
+                self.g.mount_id(99)
+        with patch.object(self.g, 'read', return_value='pos:\t0\nmnt_id:\t7\n'):
+            self.assertEqual(self.g.mount_id(99), 7)
 
 class RunnerTests(unittest.TestCase):
     setUpClass = GuardTests.__dict__['setUpClass']

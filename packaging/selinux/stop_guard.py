@@ -30,11 +30,16 @@ def require(condition, message):
         raise Refusal(message)
 
 
+def canonical_records(text, allow_tab=False):
+    require(len(text) <= LIMIT and text.endswith('\n') and
+            all(c == '\n' or 32 <= ord(c) < 127 or (allow_tab and c == '\t')
+                for c in text), 'incomplete or noncanonical record output')
+    return text[:-1].split('\n')
+
+
 def snapshot(text, allow_absent=False):
-    require(len(text) <= LIMIT and text.endswith('\n') and '\r' not in text and
-            all(ord(c) < 128 for c in text), 'incomplete or noncanonical property output')
     values = {}
-    for line in text.splitlines():
+    for line in canonical_records(text):
         key, sep, value = line.partition('=')
         require(sep and key in PROPERTIES and key not in values, 'ambiguous property output')
         values[key] = value
@@ -59,8 +64,7 @@ def snapshot(text, allow_absent=False):
 
 def events(text):
     values = {}
-    require(text.endswith('\n'), 'incomplete cgroup events')
-    for line in text.splitlines():
+    for line in canonical_records(text):
         parts = line.split(' ')
         require(len(parts) == 2 and parts[0] in ('populated', 'frozen') and
                 parts[0] not in values and parts[1] in ('0', '1'), 'invalid cgroup events')
@@ -70,7 +74,7 @@ def events(text):
 
 def mount(text):
     mounts = []
-    for line in text.splitlines():
+    for line in canonical_records(text):
         fields = line.split()
         require(len(fields) >= 10 and '-' in fields, 'invalid mountinfo')
         split = fields.index('-')
@@ -108,7 +112,7 @@ def read(path):
 
 
 def mount_id(fd):
-    records = [line for line in read(f'/proc/self/fdinfo/{fd}').splitlines()
+    records = [line for line in canonical_records(read(f'/proc/self/fdinfo/{fd}'), allow_tab=True)
                if line.startswith('mnt_id:')]
     require(len(records) == 1, 'missing descriptor mount identity')
     return int(records[0].split(':', 1)[1])
