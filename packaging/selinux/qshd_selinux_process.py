@@ -249,7 +249,13 @@ class _Owner:
                                 custody_error(error)
                             killed.add(pid)
                     if proc.returncode is not None and ids == []:
-                        break
+                        # Reaping establishes custody settlement, not pipe EOF.
+                        # Keep bounded drain turns until every retained tail is read.
+                        if not readable:
+                            break
+                        if time.monotonic() - start >= _CLEANUP_SECONDS:
+                            failure = failure or 'OUTPUT_INCOMPLETE'
+                            break
                     if time.monotonic() - start >= _CLEANUP_SECONDS:
                         self._unsettled = True
                         self._last = _Outcome(*captured(), proc.returncode,

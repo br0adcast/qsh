@@ -60,6 +60,8 @@ else:
         return original_poll(proc)
     os.killpg=group;subprocess.Popen.poll=poll
     scripts={
+      'short-tail':'import os;os.write(1,b"abcdefghij"*20);os.write(2,b"tail"*25)',
+      'tail-overflow':'import os;os.write(1,b"x"*200)',
       'normal':'import os;os.write(1,b"raw\\xff\\x00")',
       'nonzero':'raise SystemExit(7)',
       'timeout':'import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)',
@@ -84,8 +86,17 @@ else:
         assert kwargs['stdin']==subprocess.DEVNULL and kwargs['stderr']==subprocess.PIPE
         assert kwargs['env']=={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C','HOME':kwargs['cwd'],'XDG_CONFIG_HOME':kwargs['cwd'],'XDG_CACHE_HOME':kwargs['cwd'],'HISTFILE':'/dev/null'}
         result=native_popen([sys.executable,'-I','-B','-c',scripts.get(case,'pass')],**kwargs)
-        started.append(result);return result
+        started.append(result)
+        if case in ('short-tail','tail-overflow'):
+            os.waitid(os.P_PID,result.pid,os.WEXITED|os.WNOWAIT)
+        return result
     m.subprocess.Popen=spawn
+    if case in ('short-tail','tail-overflow'):
+        native_read=os.read
+        def short_read(fd,size):return native_read(fd,min(size,1))
+        m.os.read=short_read
+        if case=='tail-overflow':owner._owner._limits=m._Limits(.2,100)
+
     if case=='anchor':
         def lost_anchor(*args):raise ChildProcessError()
         m.os.waitid=lost_anchor
@@ -101,7 +112,7 @@ else:
         result=None;error=None
         try:
             try:
-                if case in ('streams','profile'):
+                if case in ('streams','profile','short-tail'):
                     owner=m._Owner(m._Limits(5,4*1024**2))
                     result=owner._run(('/usr/bin/semodule','--store-path','/var/lib/selinux','-s','targeted','-lfull'),temporary)
                 elif case in ('remaining','lease-cleanup'):
@@ -128,7 +139,9 @@ else:
                     else:raise AssertionError('fifth command admitted')
                 else:result=owner._run('extract' if case=='extract-output' else 'list',temporary)
             except (m._CommandError,KeyboardInterrupt) as exc:error=exc
-            if case=='normal':assert result==b'raw\xff\x00' and error is None
+            if case=='short-tail':assert result.stdout==b'abcdefghij'*20 and result.stderr==b'tail'*25 and error is None
+            elif case=='tail-overflow':assert isinstance(error,m._CommandError) and str(error)=='OUTPUT_LIMIT'
+            elif case=='normal':assert result==b'raw\xff\x00' and error is None
             elif case=='streams':assert result.stdout==b'out\xff' and result.stderr==b'err\x00' and error is None
             elif case=='profile':assert result.stdout==b'x'*(2*1024**2) and result.stderr==b'' and error is None
             elif case=='stderr-finite':assert isinstance(error,m._CommandError) and str(error)=='COMMAND_STDERR'
@@ -189,6 +202,8 @@ class ProcessTests(unittest.TestCase):
     def test_combined_stream_cap(self): self.control('combined')
     def test_valid_looking_stderr_is_never_merged(self): self.control('stderr-finite')
     def test_expired_lease_never_launches(self): self.control('expired')
+    def test_short_reads_preserve_completed_child_tail(self): self.control('short-tail')
+    def test_completed_child_trailing_overflow_refuses(self): self.control('tail-overflow')
     def test_cleanup_after_lease_cannot_succeed(self): self.control('lease-cleanup')
     def test_remaining_lease_shortens_profile_deadline(self): self.control('remaining')
     def test_nonzero_exit_refuses(self): self.control('nonzero')
