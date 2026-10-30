@@ -376,3 +376,32 @@ class FilesystemTests(unittest.TestCase):
                 with engine.locked():
                     pass
         self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), count)
+
+    def test_same_content_stage_substitution_is_not_adopted(self):
+        replacements = []
+        def substitute(event):
+            if event == 'stage_directory_sync' and not replacements:
+                path = next(self.root.glob('.qshd-*'))
+                other = self.root / 'replacement'
+                other.write_bytes(path.read_bytes())
+                other.chmod(0o640)
+                other.replace(path)
+                replacements.append(path)
+        with self.engine(substitute).locked() as engine:
+            snapshot = engine.snapshot('/contexts')
+            with self.assertRaises(tx.Conflict):
+                engine.stage('/contexts', b'new', snapshot)
+        self.assertEqual(replacements[0].read_bytes(), b'new')
+
+    def test_journal_rebinding_before_retire_is_preserved(self):
+        def substitute(event):
+            if event == 'before_journal_retire':
+                path = self.root / 'state/journal'
+                other = self.root / 'replacement'
+                other.write_bytes(path.read_bytes())
+                other.chmod(0o600)
+                other.replace(path)
+        with self.assertRaises(tx.Conflict):
+            with self.engine(substitute).locked() as engine:
+                engine.commit({'/contexts': b'new'}, {})
+        self.assertTrue((self.root / 'state/journal').exists())

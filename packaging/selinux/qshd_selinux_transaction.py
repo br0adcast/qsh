@@ -181,7 +181,10 @@ class Transaction:
             self.hook('stage_file_sync')
             os.fsync(parent)
             self.hook('stage_directory_sync')
+            self._bound(parent, name, fd)
             result = self._read(parent, name, limit=MAX_STATE)
+            if result['inode'] != own:
+                fail('STAGE_BINDING')
             if not self._same(result, dict(metadata, data=data), inode=False):
                 fail('STAGE_METADATA')
             result['name'] = name
@@ -487,6 +490,10 @@ class Transaction:
         if not self._same(current, self.journal, times=True):
             fail('JOURNAL_BINDING')
         self.hook('before_journal_retire')
+        self._validate_routes()
+        current = self._read(self.state_fd, 'journal', state=True, limit=MAX_STATE)
+        if not self._same(current, self.journal, times=True):
+            fail('JOURNAL_BINDING')
         os.unlink('journal', dir_fd=self.state_fd)
         self.hook('journal_retire')
         os.fsync(self.state_fd)
