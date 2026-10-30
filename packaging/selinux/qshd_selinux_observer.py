@@ -18,7 +18,7 @@ import time
 if __name__=='__main__':
     sys.path.insert(0,str(Path(__file__).resolve().parent))
 
-from qshd_selinux_activation import TrustedArtifact, ContextBinding, require_complete
+from qshd_selinux_activation import TrustedArtifact, ContextBinding, ActivationError, require_complete
 from qshd_selinux_process import _Owner, _Limits, _CommandError, _preconditions
 
 _PROFILE='fedora44-targeted-v1'
@@ -32,6 +32,16 @@ class ObserverError(ValueError):
 
 
 def _fail(code):raise ObserverError(code)
+
+
+class _PendingRefusal(Exception):
+    """Only require_complete may select this after successful outer exits."""
+
+
+def _pending_record(encoded):
+    return _json(dict(schema=1,error='ACTIVATION_PENDING',
+        request_sha256=hashlib.sha256(encoded.encode('ascii')).hexdigest()))+b'\n'
+
 
 
 def _json(value):return json.dumps(value,sort_keys=True,separators=(',',':')).encode('ascii')
@@ -109,6 +119,7 @@ def observe_managed_prestart(trusted_artifact,expected_pam):
     """
     started=time.monotonic()
     encoded=_request(trusted_artifact,expected_pam)
+    owner=None
     try:
         owner=_Owner(_Limits(60,4096))
         streams=owner._run(('/usr/bin/python3','-I','-B',str(Path(__file__).resolve()),_MODE,encoded),
@@ -120,6 +131,16 @@ def observe_managed_prestart(trusted_artifact,expected_pam):
         return result
     except _CommandError as error:
         code=str(error)
+        if code=='TOOL_FAILURE' and owner is not None:
+            # A normal exit1 has no recorded owner failure. Parent-side OSError
+            # may use TOOL_FAILURE provenance and must never be reclassified.
+            if time.monotonic()>=started+_SECONDS:_fail('DEADLINE')
+            outcome=owner._last
+            if (outcome is not None and outcome.failure is None and outcome.exit_code==1
+                    and outcome.settled and not outcome.unreaped and outcome.stdout==b''
+                    and outcome.stderr==_pending_record(encoded)):
+                if time.monotonic()>=started+_SECONDS:_fail('DEADLINE')
+                _fail('ACTIVATION_PENDING')
         if code=='COMMAND_TIMEOUT':_fail('DEADLINE')
         if code in ('COMMAND_CUSTODY','COMMAND_UNSETTLED','OUTPUT_INCOMPLETE','PROCESS_OWNER'):_fail('CUSTODY')
         if code.startswith('PROCESS_'):_fail('CALLER_PROCESS')
@@ -137,6 +158,7 @@ def _compose(trust,pam):
     import qshd_selinux_queries as queries
     from qshd_selinux_api import SelinuxApi
     api=SelinuxApi()
+    pending=False
     with state.production().inspection() as slot:
         with registry_module.production().inspection() as registry:
             routing=registry.routing()
@@ -153,12 +175,18 @@ def _compose(trust,pam):
                             if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
                                 _fail('REGISTRY_BINDING')
                             binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
-                            require_complete(activation.record,trust,binding)
+                            try:require_complete(activation.record,trust,binding)
+                            except ActivationError as error:
+                                if str(error)!='ACTIVATION_PENDING':raise
+                                pending=True
                             slot.recheck(activation)
                             module.recheck(selected)
                             current_files.recheck(installed)
                             registry.recheck(discovered)
                             contexts.recheck(context)
+    # Deferred refusal lets native post-yield checks and every finalizer run
+    # normally. Any failure there supersedes the selected pending diagnostic.
+    if pending:raise _PendingRefusal()
     return binding
 
 
@@ -171,6 +199,9 @@ def _main():
         _preconditions()
         binding=_compose(trust,pam)
         sys.stdout.buffer.write(_response(sys.argv[2],binding));sys.stdout.buffer.flush()
+    except _PendingRefusal:
+        sys.stderr.buffer.write(_pending_record(sys.argv[2]));sys.stderr.buffer.flush()
+        return 1
     except Exception:
         sys.stderr.write('OBSERVATION_REFUSED\n')
         return 1

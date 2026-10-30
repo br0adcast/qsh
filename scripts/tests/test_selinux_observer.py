@@ -37,6 +37,33 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(m.ObserverError,'^PROTOCOL$'):
                 m._parse_request(base64.b64encode(nested).decode('ascii'))
 
+    def test_pending_requires_clean_settled_exit_and_exact_private_record(self):
+        import qshd_selinux_observer as m
+        from types import SimpleNamespace as N
+        from unittest.mock import patch
+        trust=m.TrustedArtifact('0.2.0','a'*64,'b'*64)
+        pam=(ROOT.parent/'pam.d/qshd.fedora-selinux').read_bytes()
+        request=m._request(trust,pam)
+        record=m._json(dict(schema=1,error='ACTIVATION_PENDING',request_sha256=__import__('hashlib').sha256(request.encode('ascii')).hexdigest()))+b'\n'
+        base=dict(exit_code=1,failure=None,settled=True,unreaped=(),stdout=b'',stderr=record)
+        cases=[({},'ACTIVATION_PENDING'),({'failure':'TOOL_FAILURE'},'CHILD_REFUSED'),({'exit_code':2},'CHILD_REFUSED'),({'settled':False},'CHILD_REFUSED'),({'unreaped':(123,)},'CHILD_REFUSED'),({'stdout':b'extra'},'CHILD_REFUSED'),({'stderr':record+record},'CHILD_REFUSED'),({'stderr':record.replace(b'ACTIVATION_PENDING',b'OTHER')},'CHILD_REFUSED')]
+        for changes,expected in cases:
+            owner=N(_last=N(**(base|changes)))
+            def run(*args,**kwargs):raise m._CommandError('TOOL_FAILURE')
+            owner._run=run
+            with self.subTest(changes=changes),patch.object(m,'_Owner',return_value=owner),self.assertRaisesRegex(m.ObserverError,'^'+expected+'$'):
+                m.observe_managed_prestart(trust,pam)
+        for code in ('COMMAND_TIMEOUT','COMMAND_CUSTODY','COMMAND_UNSETTLED','OUTPUT_LIMIT'):
+            owner=N(_last=N(**base),_run=lambda *a,**kw:(_ for _ in ()).throw(m._CommandError(code)))
+            with patch.object(m,'_Owner',return_value=owner),self.assertRaises(m.ObserverError) as error:
+                m.observe_managed_prestart(trust,pam)
+            self.assertNotEqual(str(error.exception),'ACTIVATION_PENDING')
+        owner=N(_last=N(**base),_run=lambda *a,**kw:(_ for _ in ()).throw(m._CommandError('TOOL_FAILURE')))
+        with patch.object(m,'_Owner',return_value=owner),patch.object(m.time,'monotonic',side_effect=[0,61]),self.assertRaisesRegex(m.ObserverError,'^DEADLINE$'):
+            m.observe_managed_prestart(trust,pam)
+        with patch.object(m,'_Owner',return_value=owner),patch.object(m.time,'monotonic',side_effect=[0,0,61]),self.assertRaisesRegex(m.ObserverError,'^DEADLINE$'):
+            m.observe_managed_prestart(trust,pam)
+
     def test_response_binding_shape_and_custody_categories(self):
         import qshd_selinux_observer as m
         from types import SimpleNamespace as N
@@ -65,6 +92,7 @@ from types import SimpleNamespace as N
 from qshd_selinux_activation import *
 ROOT=Path(__file__).parent
 CASE=(ROOT/'case').read_text()
+def case(value):return value in CASE.split('+')
 TRUST=TrustedArtifact('0.2.0','a'*64,'b'*64)
 ROUTING=b'{"/fixed":"owner"}'
 def event(s):
@@ -73,36 +101,36 @@ class Lease:
  def __init__(self,name):self.name=name;self.baseline=None
  def __enter__(self):
   event('enter-'+self.name)
-  if CASE=='enter-'+self.name:raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
-  if CASE=='setup' and self.name=='slot':time.sleep(30)
-  if CASE=='lock' and self.name=='slot':
+  if case('enter-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
+  if case('setup') and self.name=='slot':time.sleep(30)
+  if case('lock') and self.name=='slot':
    self.fd=os.open(ROOT/'lock',os.O_RDWR);fcntl.flock(self.fd,fcntl.LOCK_EX)
   return self
  def __exit__(self,*exc):
   event('exit-'+self.name)
   if hasattr(self,'fd'):os.close(self.fd)
-  if CASE=='exit-'+self.name:raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
+  if case('exit-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
  def inspection(self,*args):return self
  def routing(self):event('routing');return ROUTING
  def capture(self):
   event('capture-'+self.name)
-  if CASE=='capture-'+self.name:raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
+  if case('capture-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
   if self.name=='slot':
    binding=ContextBinding('c'*64,'d'*64)
-   rec=Activation(1,'PENDING' if CASE=='pending' else 'COMPLETE','a'*32,'fedora44-targeted-v1',1,1,TRUST,ModuleIdentity('qshd',400,'targeted','pp'),None if CASE=='pending' else Completion('normal-install-reload-v1','b'*64,binding))
+   rec=Activation(1,'PENDING' if case('pending') else 'COMPLETE','a'*32,'fedora44-targeted-v1',1,1,TRUST,ModuleIdentity('qshd',400,'targeted','pp'),None if case('pending') else Completion('normal-install-reload-v1','b'*64,binding))
    result=N(record=rec)
-  elif self.name in ('registry','context'):result=N(registry_bytes=b'{}' if CASE=='drift' else ROUTING,registry_sha256='c'*64,receipts_sha256='d'*64)
+  elif self.name in ('registry','context'):result=N(registry_bytes=b'{}' if case('drift') else ROUTING,registry_sha256='c'*64,receipts_sha256='d'*64)
   else:result=object()
   assert self.baseline is None;self.baseline=result;return result
  def recheck(self,baseline):
   event('recheck-'+self.name);assert baseline is self.baseline
-  if CASE=='recheck-'+self.name:raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
+  if case('recheck-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
 @contextmanager
 def window(api):
  event('enter-window')
  try:yield object()
  finally:event('exit-window')
- if CASE=='exit-window':raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
+ if case('exit-window'):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
 '''
 HARNESS=r'''
 import json,pathlib,resource,sys,time
@@ -161,6 +189,14 @@ class ChildTests(unittest.TestCase):
                 result,events=self.run_child(case)
                 self.assertFalse(result['ok'])
                 self.assertEqual(events,[])
+
+    def test_real_pending_refusal_waits_for_every_normal_exit(self):
+        result,events=self.run_child('pending')
+        self.assertEqual(result['error'],'ACTIVATION_PENDING')
+        self.assertEqual(events[-6:],['exit-window','exit-files','exit-module','exit-context','exit-registry','exit-slot'])
+        for failure in ('exit-window','recheck-files','exit-slot'):
+            result,_=self.run_child('pending+'+failure)
+            self.assertFalse(result['ok']);self.assertNotEqual(result['error'],'ACTIVATION_PENDING')
 
     def test_real_child_all_scopes_before_success(self):
         result,events=self.run_child('normal')
