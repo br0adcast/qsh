@@ -6,6 +6,7 @@ incomplete initial provision refuses and requires administrator resolution.
 """
 import base64
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -56,6 +57,85 @@ def pairs(items):
             fail('DUPLICATE_KEY')
         result[key] = value
     return result
+
+
+@dataclass(frozen=True)
+class ContextObservation:
+    """Immutable partial evidence; snapshots apply only to one live lease.
+
+    Persistent bindings cover registry/ownership receipts, not whole target
+    content or retired journal IDs. No stability is promised after lock release.
+    """
+
+    registry_bytes: bytes
+    registry_sha256: str
+    receipts_bytes: bytes
+    receipts_sha256: str
+    receipts_snapshot: bytes
+    target_snapshots: tuple[tuple[str, bytes], ...]
+
+
+class Inspection:
+    """Narrow read-only facade, not a sandbox against private-member access."""
+
+    def __init__(self, engine, registry):
+        self._engine = engine
+        self._registry = registry
+        self._identities = engine._json(registry)
+        self._active = True
+        self._baseline = None
+
+    def _live(self):
+        if not self._active:
+            fail('INSPECTION_CLOSED')
+
+    def _no_journal(self):
+        engine = self._engine
+        engine._validate_routes()
+        try:
+            os.stat('journal', dir_fd=engine.state_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        fail('JOURNAL_PRESENT')
+
+    def _observe(self):
+        self._no_journal()
+        engine = self._engine
+        receipt = engine._read(engine.state_fd, 'receipts', state=True, limit=MAX_STATE)
+        receipts = engine._receipts(receipt['data'])
+        targets = []
+        for key in sorted(self._identities):
+            snapshot = engine.snapshot(key)
+            if not pure.check_current(snapshot['data'], receipts.get(key), self._identities[key]):
+                fail('CONTEXT_NOT_CURRENT')
+            targets.append((key, json_bytes(engine._pack(snapshot))))
+        self._no_journal()
+        return ContextObservation(self._registry, hashlib.sha256(self._registry).hexdigest(),
+                                  receipt['data'], hashlib.sha256(receipt['data']).hexdigest(),
+                                  json_bytes(engine._pack(receipt)), tuple(targets))
+
+    def capture(self):
+        """Capture once inside the caller's one required status window.
+
+        Repeated safe reads establish a stable complete baseline under the
+        cooperating context lock; unrestricted root can still race observations.
+        """
+        self._live()
+        if self._baseline is not None:
+            fail('INSPECTION_CAPTURED')
+        observed = self._observe()
+        if self._observe() != observed:
+            fail('INSPECTION_DRIFT')
+        self._baseline = observed
+        return observed
+
+    def recheck(self, observation):
+        """Recheck only this live lease's exact original observation."""
+        self._live()
+        if self._baseline is None or observation is not self._baseline:
+            fail('INSPECTION_OBSERVATION')
+        if self._observe() != observation:
+            fail('INSPECTION_DRIFT')
 
 
 class Transaction:
@@ -268,6 +348,32 @@ class Transaction:
             self.routes = []
             self.anchors = []
             self.fds = {}
+
+    @contextmanager
+    def inspection(self, identities):
+        """Hold existing context exclusion without provisioning or recovery.
+
+        Lock order: package/activation lock, context lock, then one caller-owned
+        required_observation window. Capture/recheck belong inside that window;
+        keep this lease open through status finalization. Setup reads are not
+        acceptance evidence. Explicit registry discovery remains caller-owned.
+        Reads may have kernel atime effects; no intentional state writes occur.
+        """
+        if not isinstance(identities, dict) or set(identities) != set(self.targets):
+            fail('IDENTITY_PATHS')
+        for key, value in identities.items():
+            pure._identity(value)
+            if value['path'] != key:
+                fail('IDENTITY_PATH')
+        registry = json_bytes(identities)
+        # Copy before entering: later caller mutations cannot change this lease.
+        with self.locked(provision=False):
+            lease = Inspection(self, registry)
+            try:
+                lease._no_journal()
+                yield lease
+            finally:
+                lease._active = False
 
     def snapshot(self, key):
         self._validate_routes()
