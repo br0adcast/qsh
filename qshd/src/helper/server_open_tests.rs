@@ -39,6 +39,8 @@ mod open24_receipts {
                 reaped: true,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,
@@ -52,6 +54,7 @@ mod open24_receipts {
         channel::send(
             peer,
             &encode(&MonitorEvent::SessionClosed {
+                request_failure: None,
                 cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             })
@@ -324,6 +327,8 @@ mod open24_receipts {
                 reaped: false,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,
@@ -338,6 +343,7 @@ mod open24_receipts {
             },
             // /bin/true never acquired a PAM transaction.
             MonitorEvent::SessionClosed {
+                request_failure: None,
                 cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             },
@@ -443,6 +449,8 @@ mod open24_receipts {
                 reaped: true,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,
@@ -485,6 +493,8 @@ mod open24_receipts {
                 reaped: false,
                 write_closed: false,
                 stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
                 completion: None,
                 seam_closed: false,
                 wait_lost: false,
@@ -502,6 +512,7 @@ mod open24_receipts {
             },
             // /bin/true never acquired a PAM transaction.
             MonitorEvent::SessionClosed {
+                request_failure: None,
                 cleanup_failure: None,
                 result: PamCompletion::NotOpened,
             },

@@ -321,6 +321,8 @@ pub enum Response {
 /// (`monitor::MonitorPlan`) -- so nothing here names an account or a uid.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum MonitorRequest {
+    /// Ordered request barrier after a terminal account refusal; carries no FD.
+    SealRefused,
     /// Fork a shell for channel `id` on the terminal that travels with this
     /// message -- its SLAVE side, out of band, the way a channel's master
     /// travels back to the worker (see `super::channel`).
@@ -412,6 +414,17 @@ fn selinux57_failed_receipts_roundtrip_both_physical_kinds() {
             response
         );
     }
+}
+
+/// Terminal request-drain faults are independent from actual PAM cleanup.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum RequestDrainFailure {
+    Exit,
+    Deadline,
+    Protocol,
+    Receive,
+    Send,
+    Seal,
 }
 
 /// What a monitor tells the helper about the shells it was asked to fork.
@@ -515,6 +528,8 @@ pub enum MonitorEvent {
     SessionClosed {
         result: super::pam_completion::PamCompletion,
         cleanup_failure: Option<CleanupFailure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_failure: Option<RequestDrainFailure>,
     },
 }
 

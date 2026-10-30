@@ -126,6 +126,8 @@ fn capacity143_add_retiring_monitor(
             reaped,
             write_closed: false,
             stop_attempted: false,
+            refusal_seal: None,
+            refusal_budget: STARTUP_REPORT_TIMEOUT,
             completion: None,
             seam_closed: false,
             wait_lost: false,
@@ -356,6 +358,7 @@ fn cleanup143_capacity_exact_receipt_wait_settlement_keeps_failed_pam_outcomes()
     channel::send(
         &newer_peer,
         &encode(&MonitorEvent::SessionClosed {
+            request_failure: None,
             cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
@@ -388,6 +391,7 @@ fn cleanup143_capacity_exact_receipt_wait_settlement_keeps_failed_pam_outcomes()
     channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            request_failure: None,
             cleanup_failure: None,
             result: failed,
         })
@@ -618,6 +622,7 @@ fn helper_status143_legacy_drain_answers_pending_and_queries_do_not_hold_exit() 
     let sent = channel::send(
         &peer,
         &encode(&MonitorEvent::SessionClosed {
+            request_failure: None,
             cleanup_failure: None,
             result: PamCompletion::NotOpened,
         })
