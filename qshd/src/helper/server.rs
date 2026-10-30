@@ -3232,7 +3232,7 @@ fn dispatch_monitor_event(
         {
             crate::log::warn(
                 "helper",
-                &format!("login session setup failed: {why}; ending the login"),
+                &format!("login session setup failed {:02x}{:02x}.. at channel {id}: {why}; refusing the channel and ending the login", owner.login[0], owner.login[1]),
             );
             refuse_channel_outright(seams.channels, state, id);
         }
@@ -3266,10 +3266,7 @@ fn dispatch_monitor_event(
             MonitorEvent::Exited { id, code } => report_exit(seams.channels, state, id, code),
             MonitorEvent::CleanupComplete { id, kind } => complete_cleanup(seams.channels, state, owner, id, kind),
             MonitorEvent::CleanupFailed { id, kind, failure } => complete_cleanup_with_failure(seams.channels, state, owner, id, kind, Some(failure)),
-            MonitorEvent::Refused { id, why } => {
-                crate::log::warn("helper", &format!("login session setup failed {:02x}{:02x}.. at channel {id}: {why}; refusing the channel and ending the login", owner.login[0], owner.login[1]));
-                refuse_channel_outright(seams.channels, state, id);
-            }
+            MonitorEvent::Refused { .. } => unreachable!("terminal refusal handled before channel filtering"),
             MonitorEvent::Noted { id, what } => crate::log::info("helper", &format!("the PAM stack of login {:02x}{:02x}.. admitted channel {id} and said: {what}", owner.login[0], owner.login[1])),
             MonitorEvent::SignalFailed { id, signal, errno } => crate::log::warn("helper",
                 &format!("signal {signal} to channel {id}'s process failed in the monitor of login {:02x}{:02x}..: {} -- the process may outlive its channel (does the service unit grant CAP_KILL?)", owner.login[0], owner.login[1], nix::Error::from_raw(errno))),

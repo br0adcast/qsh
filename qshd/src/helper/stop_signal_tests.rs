@@ -86,13 +86,42 @@ mod owned_signal {
             Some(pty.slave.as_fd()),
         )
         .unwrap();
-        let refused = channel::recv(monitor.seam()).unwrap().unwrap();
-        assert!(matches!(
-            decode::<MonitorEvent>(&refused.0).unwrap(),
-            MonitorEvent::Refused { .. }
-        ));
-        monitor.seam().shutdown(std::net::Shutdown::Write).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
+        let receive = |phase| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{phase}: monitor event deadline");
+            monitor.seam().set_read_timeout(Some(remaining)).unwrap();
+            let (bytes, fd) = channel::recv(monitor.seam())
+                .unwrap_or_else(|error| panic!("{phase}: receive failed: {error}"))
+                .unwrap_or_else(|| panic!("{phase}: unexpected monitor EOF"));
+            assert!(fd.is_none(), "{phase}: unexpected descriptor");
+            decode::<MonitorEvent>(&bytes).unwrap()
+        };
+        assert!(matches!(
+            receive("refusal"),
+            MonitorEvent::Refused { id: 4040, .. }
+        ));
+        channel::try_send_before(
+            monitor.seam(),
+            &encode(&MonitorRequest::SealRefused).unwrap(),
+            deadline,
+        )
+        .unwrap();
+        assert!(matches!(
+            receive("channel cleanup"),
+            MonitorEvent::CleanupComplete {
+                id: 4040,
+                kind: super::super::super::protocol::CleanupKind::NoChild,
+            }
+        ));
+        assert!(matches!(
+            receive("normal completion"),
+            MonitorEvent::SessionClosed {
+                result: PamCompletion::NotOpened,
+                request_failure: None,
+                cleanup_failure: None,
+            }
+        ));
         while !pin.exited() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
