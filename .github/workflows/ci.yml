@@ -701,6 +701,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_linkage.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_context_rows.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_transaction.py'
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
           # Harness accounting only; benchmark runs and thresholds stay out of CI.
           python3 -m unittest discover -s scripts/tests -p 'test_perf_baseline.py'

@@ -62,6 +62,8 @@ class Transaction:
     """Injected roots are for trusted library callers and disposable tests only."""
 
     def __init__(self, state, targets, *, uid=0, hook=None, anchor=None):
+        if any(not Path(p).is_absolute() or str(Path(p)) != os.path.normpath(str(p)) or '..' in Path(p).parts for p in [state, *targets.values()]):
+            fail('ROOT_PATH')
         self.state = Path(state)
         self.targets = {key: Path(value) for key, value in targets.items()}
         if not 0 < len(targets) <= MAX_TARGETS:
@@ -79,12 +81,12 @@ class Transaction:
     def _directory(self, path):
         relative = path.relative_to(self.anchor)
         fd = os.open(self.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        self._dir_mode(fd)
         self.anchors.append(fd)
+        self._dir_mode(fd)
         for part in relative.parts:
             new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            self._dir_mode(new)
             self.routes.append((fd, part, new))
+            self._dir_mode(new)
             fd = new
         return fd
 
@@ -265,12 +267,13 @@ class Transaction:
     @staticmethod
     def _pack(snapshot):
         result = dict(snapshot)
+        result['sha256'] = hashlib.sha256(result['data']).hexdigest()
         result['data'] = encode(result['data'])
         return result
 
     @staticmethod
     def _unpack(value):
-        required = {'inode', 'data', 'uid', 'gid', 'mode', 'xattrs', 'mtime', 'ctime'}
+        required = {'inode', 'data', 'sha256', 'uid', 'gid', 'mode', 'xattrs', 'mtime', 'ctime'}
         if not isinstance(value, dict) or set(value) not in (required, required | {'name'}):
             fail('SNAPSHOT_SCHEMA')
         if not isinstance(value['inode'], list) or len(value['inode']) != 2 or any(type(v) is not int or v < 0 for v in value['inode']):
@@ -286,6 +289,8 @@ class Transaction:
         if 'name' in value and (not isinstance(value['name'], str) or not value['name'].startswith('.qshd-') or len(value['name']) != 38 or any(c not in '0123456789abcdef' for c in value['name'][6:])):
             fail('STAGE_NAME')
         result = dict(value, data=decode(value['data']))
+        if hashlib.sha256(result['data']).hexdigest() != result['sha256']:
+            fail('SNAPSHOT_DIGEST')
         if len(result['data']) > MAX_STATE:
             fail('SNAPSHOT_LIMIT')
         return result
@@ -320,7 +325,7 @@ class Transaction:
         value = self._json(snap['data'])
         if not isinstance(value, dict) or set(value) != {'version', 'id', 'kind', 'entries'} or type(value['version']) is not int or value['version'] != 1:
             fail('JOURNAL_SCHEMA')
-        if value['kind'] not in ('reconcile', 'remove', 'update', 'internal') or not isinstance(value['id'], str) or len(value['id']) != 32:
+        if value['kind'] not in ('reconcile', 'remove', 'update', 'internal') or not isinstance(value['id'], str) or len(value['id']) != 32 or any(c not in '0123456789abcdef' for c in value['id']):
             fail('JOURNAL_OPERATION')
         entries = value['entries']
         if not isinstance(entries, list) or not 1 <= len(entries) <= MAX_TARGETS + 1:
@@ -553,10 +558,24 @@ class Transaction:
             return self.recover()
 
 
-def production():
-    """Fixed Fedora paths; there is deliberately no arbitrary-root CLI."""
+def production(paths):
+    """Root lifecycle caller supplies policy-owned files; no CLI or discovery.
+
+    Only default_contexts and direct users/ leaves in the fixed targeted policy
+    are supported. The lifecycle caller must qualify the installed file set.
+    """
     if os.geteuid() != 0:
         fail('ROOT_REQUIRED')
     base = '/etc/selinux/targeted/contexts'
-    paths = [base + '/default_contexts', base + '/users/root', base + '/users/user_u']
+    if not isinstance(paths, (list, tuple)) or not 0 < len(paths) <= MAX_TARGETS or len(set(paths)) != len(paths):
+        fail('PRODUCTION_PATHS')
+    for path in paths:
+        if not isinstance(path, str) or '\0' in path:
+            fail('PRODUCTION_PATH')
+        try:
+            pure._identity({'path': path, 'source_type': 'sshd_t', 'original_package': 'validation'})
+        except pure.ReconcileError:
+            fail('PRODUCTION_PATH')
+        if path != base + '/default_contexts' and (str(Path(path).parent) != base + '/users' or Path(path).name in ('.', '..')):
+            fail('PRODUCTION_PATH')
     return Transaction('/var/lib/qshd/selinux-contexts', {path: path for path in paths}, anchor='/')

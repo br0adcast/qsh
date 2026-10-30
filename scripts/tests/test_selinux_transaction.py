@@ -180,3 +180,199 @@ class FilesystemTests(unittest.TestCase):
         self.engine(lambda event: publications.append(self.target.read_bytes()) if event == 'target_rename' else None).update(changed)
         self.assertEqual(len(publications), 1)
         self.assertIn(b'qshd_t', publications[0])
+
+    def test_recorded_missing_stage_restages_but_substitution_refuses(self):
+        for substitute in (False, True):
+            with self.subTest(substitute=substitute), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / 'context'
+                target.write_bytes(b'before')
+                def instance(hook=None):
+                    return tx.Transaction(root / 'state', {'/contexts': target}, uid=os.geteuid(), hook=hook)
+                def stop(event):
+                    if event == 'stage_recorded':
+                        raise RuntimeError('interrupted')
+                with self.assertRaises(RuntimeError):
+                    with instance(stop).locked() as engine:
+                        engine.commit({'/contexts': b'after'}, {})
+                value = tx.Transaction._json((root / 'state/journal').read_bytes())
+                stage = root / value['entries'][0]['stage']['name']
+                stage.unlink()
+                if substitute:
+                    stage.write_bytes(b'after')
+                    with self.assertRaises(tx.Conflict):
+                        instance().resume()
+                    self.assertEqual(stage.read_bytes(), b'after')
+                    self.assertEqual(target.read_bytes(), b'before')
+                else:
+                    self.assertTrue(instance().resume())
+                    self.assertEqual(target.read_bytes(), b'after')
+
+    def test_multifile_all_plans_before_write(self):
+        second = self.root / 'second'
+        second.write_bytes(b'invalid source\n')
+        engine = tx.Transaction(self.root / 'state', {'/contexts': self.target, '/second': second}, uid=os.geteuid())
+        identities = {path: {'path': path, 'source_type': 'sshd_t', 'original_package': 'fixture-1'} for path in ('/contexts', '/second')}
+        original = self.target.read_bytes()
+        with self.assertRaises(tx.pure.ReconcileError):
+            engine.reconcile(identities)
+        self.assertEqual(self.target.read_bytes(), original)
+        self.assertEqual((self.root / 'state/receipts').read_bytes(), b'{}')
+        self.assertFalse((self.root / 'state/journal').exists())
+
+    def test_partial_io_failure_retains_journal_and_recovers(self):
+        second = self.root / 'second'
+        second.write_bytes(b'before2')
+        fired = []
+        def stop(event):
+            if event == 'target_directory_sync' and not fired:
+                fired.append(event)
+                raise OSError(28, 'injected ENOSPC')
+        def instance(hook=None):
+            return tx.Transaction(self.root / 'state', {'/contexts': self.target, '/second': second}, uid=os.geteuid(), hook=hook)
+        with self.assertRaises(tx.Conflict):
+            with instance(stop).locked() as engine:
+                engine.commit({'/contexts': b'after1', '/second': b'after2'}, {})
+        self.assertTrue((self.root / 'state/journal').exists())
+        self.assertEqual(second.read_bytes(), b'before2')
+        instance().resume()
+        self.assertEqual(self.target.read_bytes(), b'after1')
+        self.assertEqual(second.read_bytes(), b'after2')
+
+    def test_receipt_only_adoption_preserves_context_inode(self):
+        self.target.write_bytes(self.target.read_bytes() + b'system_r:qshd_t:s0 user_r:user_t:s0\n')
+        inode = self.target.stat().st_ino
+        identities = {'/contexts': {'path': '/contexts', 'source_type': 'sshd_t', 'original_package': 'fixture-1'}}
+        self.assertTrue(self.engine().reconcile(identities))
+        self.assertEqual(self.target.stat().st_ino, inode)
+        self.assertTrue(self.engine().remove())
+        self.assertEqual(self.target.stat().st_ino, inode)
+        self.assertIn(b'qshd_t', self.target.read_bytes())
+
+    def test_pending_metadata_drift_refuses_recovery(self):
+        def stop(event):
+            if event == 'stage_recorded':
+                raise RuntimeError('interrupted')
+        with self.assertRaises(RuntimeError):
+            with self.engine(stop).locked() as engine:
+                engine.commit({'/contexts': b'new'}, {})
+        self.target.chmod(0o600)
+        with self.assertRaises(tx.Conflict):
+            self.engine().resume()
+        self.assertNotEqual(self.target.read_bytes(), b'new')
+
+    def test_status_does_not_initialize(self):
+        with self.assertRaises(tx.Conflict):
+            self.engine().status({})
+        self.assertFalse((self.root / 'state').exists())
+
+    def test_subprocess_lock_serialization(self):
+        import subprocess
+        import select
+        with self.engine().locked():
+            code = "import sys; sys.path.insert(0,sys.argv[1]); import qshd_selinux_transaction as t; import os; from pathlib import Path; print('ready',flush=True); e=t.Transaction(Path(sys.argv[2])/'state', {'/contexts':Path(sys.argv[2])/'contexts'},uid=os.geteuid());\nwith e.locked(): print('locked',flush=True)"
+            process = subprocess.Popen([sys.executable, '-c', code, str(MODULES), str(self.root)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ, HISTFILE='/dev/null', HOME=str(self.root), XDG_CONFIG_HOME=str(self.root), XDG_CACHE_HOME=str(self.root)))
+            try:
+                self.assertEqual(process.stdout.readline().strip(), 'ready')
+                self.assertFalse(select.select([process.stdout], [], [], 0.15)[0])
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout.strip(), 'locked')
+
+    def test_production_factory_validates_explicit_registry_without_opening_paths(self):
+        from unittest.mock import patch
+        with patch.object(tx.os, 'geteuid', return_value=0):
+            good = '/etc/selinux/targeted/contexts/users/staff_u'
+            engine = tx.production([good])
+            self.assertEqual(set(engine.targets), {good})
+            for bad in ('/tmp/context', '/etc/selinux/targeted/contexts/users/../default_contexts', '/etc/selinux/targeted/contexts/users/nested/file'):
+                with self.assertRaises(tx.Conflict):
+                    tx.production([bad])
+        with patch.object(tx.os, 'geteuid', return_value=1000):
+            with self.assertRaises(tx.Conflict):
+                tx.production([good])
+
+    def test_rewritten_journal_interruptions(self):
+        for event in ('journal_stage_sync', 'journal_rename', 'journal_directory_sync'):
+            for occurrence in (2, 3):
+                with self.subTest(event=event, occurrence=occurrence), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    target = root / 'context'
+                    target.write_bytes(b'before')
+                    identities = {'/contexts': {'path': '/contexts', 'source_type': 'sshd_t', 'original_package': 'fixture-1'}}
+                    target.write_bytes(b'system_r:sshd_t:s0 user_r:user_t:s0\n')
+                    count = []
+                    def stop(actual):
+                        if actual == event:
+                            count.append(actual)
+                            if len(count) == occurrence:
+                                raise RuntimeError('interrupted')
+                    def instance(hook=None):
+                        return tx.Transaction(root / 'state', {'/contexts': target}, uid=os.geteuid(), hook=hook)
+                    with self.assertRaises(RuntimeError):
+                        instance(stop).reconcile(identities)
+                    instance().resume()
+                    self.assertTrue(instance().status(identities)['targets']['/contexts'])
+
+    def test_parent_rebinding_and_symlinked_parent_refuse(self):
+        nested = self.root / 'nested'
+        nested.mkdir(mode=0o700)
+        target = nested / 'context'
+        target.write_bytes(b'before')
+        engine = tx.Transaction(self.root / 'state', {'/contexts': target}, uid=os.geteuid())
+        with engine.locked():
+            nested.rename(self.root / 'old-nested')
+            nested.mkdir(mode=0o700)
+            (nested / 'context').write_bytes(b'before')
+            with self.assertRaises(tx.Conflict):
+                engine.snapshot('/contexts')
+        (nested / 'context').unlink()
+        nested.rmdir()
+        nested.symlink_to(self.root / 'old-nested')
+        with self.assertRaises(tx.Conflict):
+            with engine.locked():
+                pass
+
+    def test_hardlinked_receipt_and_wrong_state_mode_refuse(self):
+        with self.engine().locked():
+            pass
+        os.link(self.root / 'state/receipts', self.root / 'receipt-link')
+        with self.assertRaises(tx.Conflict):
+            with self.engine().locked():
+                pass
+        (self.root / 'receipt-link').unlink()
+        (self.root / 'state').chmod(0o755)
+        with self.assertRaises(tx.Conflict):
+            with self.engine().locked():
+                pass
+
+    def test_cleanup_keeps_substituted_stage(self):
+        replacement = []
+        def substitute(event):
+            if event == 'stage_file_sync':
+                path = next(self.root.glob('.qshd-*'))
+                path.rename(self.root / 'owned-old')
+                path.write_bytes(b'administrator replacement')
+                replacement.append(path)
+                raise RuntimeError('interrupted')
+        with self.engine(substitute).locked() as engine:
+            snapshot = engine.snapshot('/contexts')
+            with self.assertRaises(RuntimeError):
+                engine.stage('/contexts', b'new', snapshot)
+        self.assertEqual(replacement[0].read_bytes(), b'administrator replacement')
+
+    def test_refused_directory_does_not_leak_descriptors(self):
+        nested = self.root / 'writable'
+        nested.mkdir(mode=0o777)
+        nested.chmod(0o777)
+        engine = tx.Transaction(self.root / 'state', {'/contexts': nested / 'context'}, uid=os.geteuid())
+        count = len(list(Path('/proc/self/fd').iterdir()))
+        for _ in range(5):
+            with self.assertRaises(tx.Conflict):
+                with engine.locked():
+                    pass
+        self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), count)
