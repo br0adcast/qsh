@@ -160,4 +160,90 @@ class InspectionTests(unittest.TestCase):
                 with self.engine().inspection(self.ids) as lease:lease.capture();raise RuntimeError('caller/status exit')
         self.assertEqual(len(list(Path('/proc/self/fd').iterdir())),before)
 
+    def assert_competitor(self, busy):
+        import fcntl
+        fd=os.open(self.root/'state/lock',os.O_RDONLY)
+        try:
+            if busy:
+                with self.assertRaises(BlockingIOError):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            else:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        finally:os.close(fd)
+
+    def test_retained_writer_mutation_observation_and_lifetimes(self):
+        engine=self.engine()
+        with engine.writer() as writer:
+            writer.reconcile(self.ids)
+            self.assert_competitor(True)
+            with writer.inspection(self.ids) as view:
+                observed=view.capture();view.recheck(observed)
+                self.assert_competitor(True)
+                for operation in (lambda:writer.reconcile(self.ids),writer.remove,writer.resume):
+                    with self.assertRaises(tx.Conflict):operation()
+                with self.assertRaises(tx.Conflict):
+                    with writer.inspection(self.ids):pass
+                with self.assertRaises(tx.Conflict):engine.status(self.ids)
+            with self.assertRaises(tx.Conflict):view.recheck(observed)
+            self.assertTrue(all(writer.status(self.ids)['targets'].values()))
+        self.assert_competitor(False)
+        for operation in (lambda:writer.reconcile(self.ids),writer.resume,lambda:writer.status(self.ids)):
+            with self.assertRaises(tx.Conflict):operation()
+        with self.assertRaises(tx.Conflict):
+            with writer.inspection(self.ids):pass
+
+    def test_writer_journal_refusal_and_caller_failure_release(self):
+        engine=self.engine()
+        journal=self.root/'state/journal';journal.write_bytes(b'foreign malformed journal');journal.chmod(0o600)
+        original=self.target.read_bytes()
+        with engine.writer() as writer:
+            with self.assertRaises(tx.Conflict):
+                with writer.inspection(self.ids):pass
+            with self.assertRaises(tx.Conflict):writer.reconcile(self.ids)
+            self.assertEqual(self.target.read_bytes(),original)
+            self.assertEqual(journal.read_bytes(),b'foreign malformed journal')
+        journal.unlink()
+        with self.assertRaisesRegex(RuntimeError,'caller'):
+            with engine.writer() as writer:
+                with writer.inspection(self.ids) as view:
+                    view.capture();raise RuntimeError('caller')
+        self.assert_competitor(False)
+        with self.assertRaises(tx.Conflict):view.capture()
+
+    def test_writer_existing_operations_metadata_and_no_recursive_flock(self):
+        import fcntl
+        self.target.chmod(0o640)
+        os.setxattr(self.target,'user.fixture',b'kept')
+        lock=self.root/'state/lock';before=lock.stat().st_ino
+        engine=self.engine()
+        native=fcntl.flock
+        with patch.object(tx.fcntl,'flock',wraps=native) as acquired:
+            with engine.writer() as writer:
+                self.assertFalse(writer.resume())
+                writer.remove()
+                self.assertFalse(writer.status(self.ids)['targets']['/contexts'])
+                writer.reconcile(self.ids)
+                changed=json.loads(json.dumps(self.ids));changed['/contexts']['original_package']='fixture-2'
+                writer.update(changed)
+                with writer.inspection(changed) as view:
+                    changed['/contexts']['original_package']='caller-mutated'
+                    record=view.capture();view.recheck(record)
+                self.assertEqual(acquired.call_count,1)
+        self.assertEqual(lock.stat().st_ino,before)
+        self.assertEqual(self.target.stat().st_mode & 0o777,0o640)
+        self.assertEqual(os.getxattr(self.target,'user.fixture'),b'kept')
+        ids=json.loads(json.dumps(self.ids));ids['/contexts']['original_package']='fixture-2'
+        self.assertTrue(engine.status(ids)['targets']['/contexts'])
+        with engine.inspection(ids) as view:view.recheck(view.capture())
+
+    def test_writer_close_invalidates_outstanding_borrow(self):
+        engine=self.engine()
+        with engine.writer() as writer:
+            borrowed=writer.inspection(self.ids)
+            view=borrowed.__enter__()
+            record=view.capture()
+        try:
+            with self.assertRaisesRegex(tx.Conflict,'INSPECTION_CLOSED'):view.recheck(record)
+            with self.assertRaisesRegex(tx.Conflict,'WRITER_CLOSED'):writer.remove()
+            self.assert_competitor(False)
+        finally:borrowed.__exit__(None,None,None)
+
 if __name__=='__main__':unittest.main()
