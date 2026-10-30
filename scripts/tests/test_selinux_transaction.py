@@ -26,6 +26,97 @@ class FilesystemTests(unittest.TestCase):
     def engine(self, hook=None):
         return tx.Transaction(self.root / 'state', {'/contexts': self.target}, uid=os.geteuid(), hook=hook)
 
+    def test_final_open_binding_failure_closes_read_descriptor(self):
+        with self.engine().locked() as engine:
+            before = set(os.listdir('/proc/self/fd'))
+            original_bound = engine._bound
+            read_fds = []
+            count = 0
+            def bound(parent, name, fd, *, state=False):
+                nonlocal count
+                count += 1
+                if count == 2:
+                    read_fds.append(fd)
+                    raise tx.Conflict('INJECTED_FINAL_BINDING')
+                return original_bound(parent, name, fd, state=state)
+            try:
+                with patch.object(engine, '_bound', side_effect=bound):
+                    with self.assertRaisesRegex(tx.Conflict, '^INJECTED_FINAL_BINDING$'):
+                        engine._open(engine.state_fd, 'receipts', state=True)
+                self.assertEqual(count, 2)
+                self.assertEqual(len(read_fds), 1)
+                with self.assertRaises(OSError) as caught:
+                    os.fstat(read_fds[0])
+                self.assertEqual(caught.exception.errno, errno.EBADF)
+                self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+            finally:
+                # Keep the intentionally failing pre-fix run from leaking an FD.
+                for fd in read_fds:
+                    try: os.close(fd)
+                    except OSError as error:
+                        if error.errno != errno.EBADF: raise
+
+    def test_successful_open_transfers_read_descriptor_to_caller(self):
+        with self.engine().locked() as engine:
+            before = set(os.listdir('/proc/self/fd'))
+            fd = engine._open(engine.state_fd, 'receipts', state=True)
+            try:
+                self.assertEqual(os.read(fd, 2), b'{}')
+                self.assertEqual(set(os.listdir('/proc/self/fd')), before | {str(fd)})
+            finally:
+                os.close(fd)
+            self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+
+    def test_open_mismatch_closes_each_descriptor_once(self):
+        with self.engine().locked() as engine:
+            original_identity = tx.identity
+            original_open, original_close = os.open, os.close
+            opened, closed = [], []
+            count = 0
+            def identity(info):
+                nonlocal count
+                count += 1
+                return ['injected mismatch'] if count == 4 else original_identity(info)
+            def tracked_open(*args, **kwargs):
+                fd = original_open(*args, **kwargs); opened.append(fd); return fd
+            def tracked_close(fd):
+                closed.append(fd); original_close(fd)
+            with patch.object(tx, 'identity', side_effect=identity), \
+                 patch.object(tx.os, 'open', side_effect=tracked_open), \
+                 patch.object(tx.os, 'close', side_effect=tracked_close):
+                with self.assertRaisesRegex(tx.Conflict, '^OPEN_BINDING$'):
+                    engine._open(engine.state_fd, 'receipts', state=True)
+            self.assertEqual(len(opened), 2)
+            self.assertCountEqual(closed, opened)
+            self.assertEqual(len(closed), 2)
+
+    def test_probe_close_error_does_not_transfer_or_leak_read_descriptor(self):
+        with self.engine().locked() as engine:
+            before = set(os.listdir('/proc/self/fd'))
+            original_open, original_close = os.open, os.close
+            opened, closed = [], []
+            def tracked_open(*args, **kwargs):
+                fd = original_open(*args, **kwargs); opened.append(fd); return fd
+            def close_then_refuse(fd):
+                closed.append(fd); original_close(fd)
+                if fd == opened[0]:
+                    raise OSError(errno.EIO, 'injected probe cleanup error')
+            try:
+                with patch.object(tx.os, 'open', side_effect=tracked_open), \
+                     patch.object(tx.os, 'close', side_effect=close_then_refuse):
+                    with self.assertRaises(OSError) as caught:
+                        engine._open(engine.state_fd, 'receipts', state=True)
+                self.assertEqual(caught.exception.errno, errno.EIO)
+                self.assertEqual(len(opened), 2)
+                self.assertCountEqual(closed, opened)
+                self.assertEqual(len(closed), 2)
+                self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+            finally:
+                for fd in opened:
+                    try: original_close(fd)
+                    except OSError as error:
+                        if error.errno != errno.EBADF: raise
+
     @contextmanager
     def mandatory_labels(self):
         """Model kernel labels on disposable files, without host SELinux calls."""
