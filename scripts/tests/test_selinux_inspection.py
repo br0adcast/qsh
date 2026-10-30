@@ -246,4 +246,88 @@ class InspectionTests(unittest.TestCase):
             self.assert_competitor(False)
         finally:borrowed.__exit__(None,None,None)
 
+    def test_pristine_guard_is_read_only_and_retains_exclusion(self):
+        self.engine().remove()
+        engine=self.engine()
+        before={p:(p.stat().st_ino,p.stat().st_mode,p.read_bytes()) for p in [self.target,self.root/'state/lock',self.root/'state/receipts']}
+        with engine.writer() as writer:
+            with ExitStack() as stack:
+                for name in ('write','rename','unlink','mkdir','fsync','fchmod','fchown','setxattr','removexattr'):
+                    stack.enter_context(patch.object(tx.os,name,side_effect=AssertionError('pristine wrote')))
+                stack.enter_context(patch.object(engine,'recover',side_effect=AssertionError('pristine recovered')))
+                native_open=tx.os.open
+                def read_open(path,flags,*args,**kwargs):
+                    self.assertFalse(flags & (os.O_CREAT|os.O_WRONLY|os.O_RDWR|os.O_TRUNC))
+                    return native_open(path,flags,*args,**kwargs)
+                stack.enter_context(patch.object(tx.os,'open',side_effect=read_open))
+                self.assertIsNone(writer.require_pristine(self.ids))
+                self.assertIsNone(writer.require_pristine(self.ids))
+                for path,value in before.items():
+                    self.assertEqual((path.stat().st_ino,path.stat().st_mode,path.read_bytes()),value)
+                self.assert_competitor(True)
+            writer.reconcile(self.ids)
+            with writer.inspection(self.ids) as view:view.recheck(view.capture())
+        for p,value in before.items():
+            if p==self.target or p.name=='receipts':continue
+            self.assertEqual((p.stat().st_ino,p.stat().st_mode,p.read_bytes()),value)
+        self.assert_competitor(False)
+        with self.assertRaisesRegex(tx.Conflict,'WRITER_CLOSED'):writer.require_pristine(self.ids)
+
+    def test_pristine_guard_refuses_every_journal_before_recovery_or_planning(self):
+        self.engine().remove()
+        engine=self.engine();journal=self.root/'state/journal'
+        for kind in ('malformed','symlink','fifo','directory'):
+            if kind=='malformed':journal.write_bytes(b'not a journal');journal.chmod(0o600)
+            elif kind=='symlink':journal.symlink_to(self.root/'missing')
+            elif kind=='fifo':os.mkfifo(journal)
+            else:journal.mkdir()
+            inode=journal.lstat().st_ino
+            try:
+                with engine.writer() as writer,patch.object(engine,'recover',side_effect=AssertionError('recovery')),patch.object(tx.pure,'plan_reconcile',side_effect=AssertionError('planned before journal refusal')):
+                    with self.assertRaisesRegex(tx.Conflict,'JOURNAL_PRESENT'):writer.require_pristine(self.ids)
+                self.assertEqual(journal.lstat().st_ino,inode)
+            finally:
+                if kind=='directory':journal.rmdir()
+                else:journal.unlink()
+
+    def test_pristine_guard_rejects_receipts_rows_markers_and_unknown_names(self):
+        # A valid existing owned receipt is explicitly refused, without adoption.
+        with self.engine().writer() as writer:
+            with self.assertRaisesRegex(tx.Conflict,'RECEIPTS_NOT_PRISTINE'):writer.require_pristine(self.ids)
+        self.engine().remove();original=self.target.read_bytes()
+        for addition in [b'system_r:qshd_t:s0 user_r:user_t:s0\n',tx.pure.PREFIX+b'orphan\n']:
+            self.target.write_bytes(original+addition)
+            before=self.target.read_bytes()
+            with self.engine().writer() as writer:
+                with self.assertRaises((tx.Conflict,tx.pure.ReconcileError)):writer.require_pristine(self.ids)
+            self.assertEqual(self.target.read_bytes(),before)
+        self.target.write_bytes(original)
+        for kind in ('file','symlink','fifo','directory'):
+            unknown=self.root/'state/orphan'
+            if kind=='file':unknown.write_bytes(b'preserve')
+            elif kind=='symlink':unknown.symlink_to(self.root/'missing')
+            elif kind=='fifo':os.mkfifo(unknown)
+            else:unknown.mkdir()
+            inode=unknown.lstat().st_ino
+            try:
+                with self.engine().writer() as writer:
+                    with self.assertRaisesRegex(tx.Conflict,'STATE_NOT_PRISTINE'):writer.require_pristine(self.ids)
+                self.assertEqual(unknown.lstat().st_ino,inode)
+            finally:
+                if kind=='directory':unknown.rmdir()
+                else:unknown.unlink()
+
+    def test_pristine_guard_identity_set_and_source_metadata_refusals(self):
+        self.engine().remove()
+        invalid=[{}, {'/other':self.ids['/contexts']}, {'/contexts':dict(self.ids['/contexts'],path='/other')}]
+        with self.engine().writer() as writer:
+            for value in invalid:
+                with self.assertRaises((tx.Conflict,tx.pure.ReconcileError)):writer.require_pristine(value)
+            self.target.chmod(0o4640)
+            try:
+                with self.assertRaises(tx.Conflict):writer.require_pristine(self.ids)
+            finally:self.target.chmod(0o640)
+            self.target.write_bytes(b'no supported source row\n')
+            with self.assertRaises(tx.pure.ReconcileError):writer.require_pristine(self.ids)
+
 if __name__=='__main__':unittest.main()
