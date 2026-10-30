@@ -129,6 +129,35 @@ class Writer:
         if mutation and self._borrow is not None:
             fail('INSPECTION_ACTIVE')
 
+    def require_pristine(self, identities):
+        """Read-only first-install guard, valid only under retained exclusion.
+
+        No recovery/adoption or returned token. Caller must keep this writer
+        and outer package exclusion through subsequent operations.
+        """
+        self._live()
+        engine = self._engine
+        registry = engine._inspection_registry(identities)
+        inspector = Inspection(engine, registry)
+
+        def prerequisites():
+            inspector._no_journal()  # Any kind, including malformed/symlink.
+            with os.scandir(engine.state_fd) as entries:
+                for entry in entries:
+                    if entry.name not in ('lock', 'receipts'):
+                        fail('STATE_NOT_PRISTINE')
+            receipt = engine._read(engine.state_fd, 'receipts', state=True, limit=MAX_STATE)
+            if engine._receipts(receipt['data']):
+                fail('RECEIPTS_NOT_PRISTINE')
+
+        prerequisites()
+        for key, value in inspector._identities.items():
+            snapshot = engine.snapshot(key)
+            _, proposed = pure.plan_reconcile(snapshot['data'], None, value)
+            if proposed['owner'] != 'qshd':
+                fail('CONTEXT_NOT_PRISTINE')
+        prerequisites()
+
     def reconcile(self, identities):
         self._live(mutation=True)
         return self._engine._operation_locked('reconcile', identities)
