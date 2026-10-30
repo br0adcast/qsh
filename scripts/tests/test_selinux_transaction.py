@@ -1,10 +1,13 @@
 """Disposable filesystem tests; no host policy or package operations."""
+from contextlib import contextmanager
+import errno
 import importlib.util
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULES = Path(__file__).resolve().parents[2] / 'packaging/selinux'
 sys.path.insert(0, str(MODULES))
@@ -22,6 +25,95 @@ class FilesystemTests(unittest.TestCase):
 
     def engine(self, hook=None):
         return tx.Transaction(self.root / 'state', {'/contexts': self.target}, uid=os.geteuid(), hook=hook)
+
+    @contextmanager
+    def mandatory_labels(self):
+        """Model kernel labels on disposable files, without host SELinux calls."""
+        original = {name: getattr(os, name) for name in
+                    ('listxattr', 'getxattr', 'setxattr', 'removexattr')}
+        label = 'security.selinux'
+        backing = 'user.qsh-test-label'
+        default = b'system_u:object_r:var_lib_t:s0\0'
+        def names(fd):
+            return [key for key in original['listxattr'](fd) if key != backing] + [label]
+        def get(fd, key):
+            if key == label:
+                try:
+                    return original['getxattr'](fd, backing)
+                except OSError as error:
+                    if error.errno != errno.ENODATA:
+                        raise
+                    return default
+            return original['getxattr'](fd, key)
+        def set_value(fd, key, value):
+            if key == label:
+                if value == get(fd, key):
+                    raise PermissionError(errno.EACCES, 'mandatory label mutation')
+                return original['setxattr'](fd, backing, value)
+            return original['setxattr'](fd, key, value)
+        def remove(fd, key):
+            if key == label:
+                raise PermissionError(errno.EACCES, 'mandatory label removal')
+            return original['removexattr'](fd, key)
+        with patch.multiple(tx.os, listxattr=names, getxattr=get,
+                            setxattr=set_value, removexattr=remove):
+            yield default
+
+    def test_state_defaults_survive_publication_receipts_and_fresh_recovery(self):
+        identities = {'/contexts': {'path': '/contexts', 'source_type': 'sshd_t', 'original_package': 'fixture-1'}}
+        custom = b'system_u:object_r:custom_context_t:s0\0'
+        os.setxattr(self.target, 'user.qsh-test-label', custom)
+        def stop(event):
+            if event == 'journal_directory_sync':
+                raise RuntimeError('interrupted')
+        with self.mandatory_labels() as default:
+            with self.assertRaises(RuntimeError):
+                self.engine(stop).reconcile(identities)
+            journal = self.root / 'state/journal'
+            os.setxattr(journal, 'user.qsh-state', b'trusted journal metadata')
+            journal_labels = []
+            def observe(event):
+                if event == 'journal_directory_sync':
+                    journal_labels.append((os.getxattr(journal, 'security.selinux'),
+                                           os.getxattr(journal, 'user.qsh-state')))
+            self.assertTrue(self.engine(observe).resume())
+            self.assertTrue(journal_labels)
+            self.assertTrue(all(item == (default, b'trusted journal metadata') for item in journal_labels))
+            receipt = self.root / 'state/receipts'
+            os.setxattr(receipt, 'user.qsh-state', b'trusted receipt metadata')
+            self.assertTrue(self.engine().remove())
+            self.assertEqual(os.getxattr(receipt, 'security.selinux'), default)
+            self.assertEqual(os.getxattr(receipt, 'user.qsh-state'), b'trusted receipt metadata')
+            self.assertEqual(os.getxattr(self.target, 'security.selinux'), custom)
+            for name in ('lock', 'receipts'):
+                self.assertEqual((self.root / 'state' / name).stat().st_mode & 0o7777, 0o600)
+
+    def test_state_differing_label_is_applied_or_refused(self):
+        custom = b'system_u:object_r:custom_state_t:s0\0'
+        with self.mandatory_labels(), self.engine().locked() as engine:
+            metadata = engine._read(engine.state_fd, 'receipts', state=True)
+            metadata['xattrs']['security.selinux'] = tx.encode(custom)
+            stage = engine._create(engine.state_fd, b'{}', metadata, state=True)
+            self.assertEqual(stage['xattrs'], metadata['xattrs'])
+            os.unlink(stage['name'], dir_fd=engine.state_fd)
+            original = os.setxattr
+            def refuse(fd, key, value):
+                if key == 'security.selinux':
+                    raise PermissionError(errno.EACCES, 'label update denied')
+                return original(fd, key, value)
+            with patch.object(tx.os, 'setxattr', side_effect=refuse):
+                with self.assertRaises(PermissionError):
+                    engine._create(engine.state_fd, b'{}', metadata, state=True)
+            self.assertEqual(list((self.root / 'state').glob('.qshd-*')), [])
+
+    def test_target_exact_metadata_still_refuses_mandatory_label_removal(self):
+        with self.mandatory_labels(), self.engine().locked() as engine:
+            snapshot = engine.snapshot('/contexts')
+            del snapshot['xattrs']['security.selinux']
+            with self.assertRaises(PermissionError):
+                engine.stage('/contexts', b'new', snapshot)
+            self.assertEqual(self.target.read_bytes(), snapshot['data'])
+            self.assertEqual(list(self.root.glob('.qshd-*')), [])
 
     def test_stage_preserves_mode_and_user_xattrs(self):
         os.setxattr(self.target, 'user.qsh-test', b'preserved')

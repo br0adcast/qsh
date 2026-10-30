@@ -159,7 +159,10 @@ class Transaction:
         finally:
             os.close(fd)
 
-    def _create(self, parent, data, metadata):
+    def _create(self, parent, data, metadata, *, state=False):
+        """Targets copy exact metadata; new state retains validated kernel defaults."""
+        if metadata is None and not state:
+            fail('STAGE_METADATA')
         name = '.qshd-' + uuid.uuid4().hex
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
         own = identity(os.fstat(fd))
@@ -170,19 +173,26 @@ class Transaction:
                 if n <= 0:
                     fail('SHORT_WRITE')
                 view = view[n:]
-            os.fchown(fd, metadata['uid'], metadata['gid'])
-            os.fchmod(fd, metadata['mode'])
+            os.fchown(fd, metadata['uid'] if metadata is not None else self.uid,
+                      metadata['gid'] if metadata is not None else os.fstat(parent).st_gid)
+            os.fchmod(fd, metadata['mode'] if metadata is not None else 0o600)
+            if metadata is None:
+                metadata = self._read(parent, name, state=True, limit=MAX_STATE)
+                if metadata['inode'] != own:
+                    fail('STAGE_BINDING')
             for key in os.listxattr(fd):
                 if key not in metadata['xattrs']:
                     os.removexattr(fd, key)
             for key, value in metadata['xattrs'].items():
-                os.setxattr(fd, key, decode(value))
+                desired = decode(value)
+                if not state or key not in os.listxattr(fd) or os.getxattr(fd, key) != desired:
+                    os.setxattr(fd, key, desired)
             os.fsync(fd)
             self.hook('stage_file_sync')
             os.fsync(parent)
             self.hook('stage_directory_sync')
-            self._bound(parent, name, fd)
-            result = self._read(parent, name, limit=MAX_STATE)
+            self._bound(parent, name, fd, state=state)
+            result = self._read(parent, name, state=state, limit=MAX_STATE)
             if result['inode'] != own:
                 fail('STAGE_BINDING')
             if not self._same(result, dict(metadata, data=data), inode=False):
@@ -379,8 +389,9 @@ class Transaction:
         data = json_bytes(value)
         if len(data) > MAX_STATE:
             fail('JOURNAL_LIMIT')
-        metadata = {'uid': self.uid, 'gid': os.fstat(self.state_fd).st_gid, 'mode': 0o600, 'xattrs': {}}
-        staged = self._create(self.state_fd, data, metadata)
+        # A new journal keeps kernel/default security metadata. Rewrites copy
+        # the validated prior journal, including its label and all other xattrs.
+        staged = self._create(self.state_fd, data, self.journal, state=True)
         self.hook('journal_stage_sync')
         self._validate_routes()
         # Recheck authority after all staging hooks and before replacement.
@@ -469,7 +480,8 @@ class Transaction:
                     except FileNotFoundError:
                         stage = None
                 if stage is None:
-                    stage = self._create(parent, decode(entry['after']), before)
+                    stage = self._create(parent, decode(entry['after']), before,
+                                         state=entry['key'] == '@receipts')
                     entry['stage'] = self._pack(stage)
                     self._journal_write(value)
                     self.hook('stage_recorded')
