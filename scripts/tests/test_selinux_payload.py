@@ -14,7 +14,7 @@ from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
 TOOL=ROOT/'packaging/selinux/assemble_payload.py'
-NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer','reference_loader'))
+NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation'))
 
 
 class PayloadTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class PayloadTests(unittest.TestCase):
         (self.source/'__pycache__').mkdir();(self.source/'__pycache__/cache.pyc').write_bytes(b'decoy')
         before={p:(p.read_bytes(),p.stat().st_mode) for p in self.source.iterdir() if p.is_file()}
         inventory=self.assemble();other=self.base/'second';self.assertEqual(inventory,self.assemble(other))
-        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),18)
+        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),21)
         prefix='usr/libexec/qshd-selinux/'
         for name in NAMES:self.assertEqual(tree[prefix+name][0],(self.source/name).read_bytes())
         for path in (self.pp,self.artifact,self.pam):self.assertEqual(tree['usr/share/qshd-selinux/'+path.name][0],path.read_bytes())
@@ -115,7 +115,7 @@ class PayloadTests(unittest.TestCase):
         expected=self.base/'expected.json';expected.write_text(json.dumps(self.expected))
         code="import os,runpy,sys;os.umask(0o077);sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')"
         p=subprocess.run([sys.executable,'-I','-B','-c',code,str(TOOL),'--source',str(self.source),'--pp',str(self.pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
-        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),18)
+        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),21)
         self.assertTrue(all(v[1]==0o644 for v in self.tree(self.output).values()))
         self.assertTrue(all(p.stat().st_mode&0o777==0o755 for p in [self.output,*[p for p in self.output.rglob('*') if p.is_dir()]]))
 
