@@ -1,12 +1,11 @@
-"""Internal representative query profile, pending Fedora query-output qualification.
+"""Representative Fedora 44 targeted-policy prerequisites.
 
-This is partial query evidence, not a complete readiness gate or startup proof.
-Existing I/D/E/U/T runtime witnesses retain their exact observed values. P and
-computed outputs still require Fedora qualification before publication. No
-receipt, store, label, PAM or package lifecycle admission is implemented here.
-The caller must finish its other observers inside required_observation and
-accept only after normal context-manager exit. One fresh process/adapter owns
-the status window; this library cannot impose a hard native-call timeout.
+This profile provides partial query evidence, not a complete readiness gate or
+startup proof. It does not implement receipt, store, label, PAM or package
+lifecycle admission. Callers complete their other observers inside the same
+required_observation window and accept evidence only after normal scope exit.
+Integrations must run the complete verifier in a fresh process with an external
+hard deadline; this library cannot interrupt a blocking native call.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass
