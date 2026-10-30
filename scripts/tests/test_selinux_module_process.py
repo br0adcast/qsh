@@ -18,7 +18,13 @@ resource.setrlimit(resource.RLIMIT_FSIZE,(16*1024**2,16*1024**2))
 resource.setrlimit(resource.RLIMIT_CPU,(15,15))
 resource.setrlimit(resource.RLIMIT_AS,(512*1024**2,512*1024**2))
 native_popen=subprocess.Popen
-if case=='preconditions':
+if case=='observer-profile':
+    assert m._Limits(60,4096).execution_seconds==60
+    for pair in ((16,4096),(30,4096),(59,4096),(60,4097),(60,1024**2)):
+        try:m._Limits(*pair)
+        except m._CommandError:pass
+        else:raise AssertionError('unapproved observer profile')
+elif case=='preconditions':
     before=m._children()
     for option in (resource.RLIMIT_CORE,resource.RLIMIT_FSIZE,resource.RLIMIT_CPU,resource.RLIMIT_AS):
         original=resource.getrlimit
@@ -191,6 +197,8 @@ class ProcessTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"passed": true', result.stdout)
+
+    def test_exact_observer_profile_only(self): self.control('observer-profile')
 
     def test_resource_thread_and_prior_child_preconditions(self): self.control('preconditions')
     def test_exact_fixed_list_raw_output_and_environment(self): self.control('normal')
