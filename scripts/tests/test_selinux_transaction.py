@@ -12,6 +12,7 @@ from unittest.mock import patch
 MODULES = Path(__file__).resolve().parents[2] / 'packaging/selinux'
 sys.path.insert(0, str(MODULES))
 import qshd_selinux_transaction as tx
+import qshd_selinux_fs as fs
 
 
 class FilesystemTests(unittest.TestCase):
@@ -81,7 +82,7 @@ class FilesystemTests(unittest.TestCase):
                 fd = original_open(*args, **kwargs); opened.append(fd); return fd
             def tracked_close(fd):
                 closed.append(fd); original_close(fd)
-            with patch.object(tx, 'identity', side_effect=identity), \
+            with patch.object(fs, 'identity', side_effect=identity), \
                  patch.object(tx.os, 'open', side_effect=tracked_open), \
                  patch.object(tx.os, 'close', side_effect=tracked_close):
                 with self.assertRaisesRegex(tx.Conflict, '^OPEN_BINDING$'):
