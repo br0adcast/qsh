@@ -139,6 +139,9 @@ struct State {
     /// for a test that must act only once the thread is asleep.
     #[cfg(test)]
     sleeps: usize,
+    /// Pauses this test pool after the predicate check, before atomic wait.
+    #[cfg(test)]
+    before_wait: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 impl Shared {
@@ -256,6 +259,8 @@ impl PooledNonces {
                 closing: false,
                 #[cfg(test)]
                 sleeps: 0,
+                #[cfg(test)]
+                before_wait: None,
             }),
             wake: Condvar::new(),
             max_age,
@@ -305,6 +310,8 @@ impl PooledNonces {
     /// Makes the pool's thread panic, and wakes it to do so.
     #[cfg(test)]
     pub(crate) fn panic_thread_for_test(&self) {
+        // Serialize with the predicate check and atomic condition wait.
+        let _state = self.shared.lock();
         self.shared
             .panic_now
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -432,6 +439,13 @@ fn keep_filled(shared: Arc<Shared>, helper: Arc<HelperAuth>, end_worker: EndWork
                 #[cfg(test)]
                 {
                     state.sleeps += 1;
+                }
+                #[cfg(test)]
+                if let Some((entered, resume)) = state.before_wait.take() {
+                    entered.send(()).expect("check-before-wait observer");
+                    resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release check-before-wait gate");
                 }
                 state = shared
                     .wake

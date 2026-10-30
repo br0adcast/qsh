@@ -90,3 +90,54 @@ fn auxiliary40_pool_drop_waits_for_actual_refill_thread_body() {
         "pool Drop returned before its real refill thread joined"
     );
 }
+
+#[test]
+fn panic_request_cannot_cross_the_checked_before_wait_boundary() {
+    use std::sync::mpsc;
+    let (worker, _stub) = helper_stub_answering_nonces_at_once();
+    let (death, ended) = mpsc::channel();
+    let end_worker: EndWorker = Arc::new(move |why| {
+        let _ = death.send(why.to_owned());
+    });
+    let pool = PooledNonces::with_end_worker(client(worker), end_worker).expect("pool");
+    wait_until_warm(&pool, POOL_TARGET, TEST_WAIT);
+    let (checked, at_boundary) = mpsc::channel();
+    let (resume, paused) = mpsc::channel();
+    {
+        let mut state = pool.shared.lock();
+        state.before_wait = Some((checked, paused));
+        pool.shared.wake.notify_one();
+    }
+    at_boundary
+        .recv_timeout(TEST_WAIT)
+        .expect("actual worker reached check-before-wait boundary");
+    let (finished, completion) = mpsc::channel();
+    let request_pool = Arc::clone(&pool);
+    let requester = std::thread::spawn(move || {
+        request_pool.panic_thread_for_test();
+        finished.send(()).expect("panic request observer");
+    });
+    // The worker still owns the predicate mutex. A completed request here has
+    // notified before the worker can atomically enter its condition wait.
+    let crossed = completion.recv_timeout(Duration::from_millis(100)).is_ok();
+    resume.send(()).expect("release actual worker to wait");
+    if !crossed {
+        completion
+            .recv_timeout(TEST_WAIT)
+            .expect("panic request completed after wait release");
+    }
+    requester.join().expect("panic requester joined");
+    let actual = ended.recv_timeout(TEST_WAIT);
+    // Release the real pool/thread/helper before either assertion can fail.
+    drop(pool);
+    eprintln!("SEEN panic boundary: notified_before_wait={crossed}, death={actual:?}");
+    assert!(
+        !crossed,
+        "panic request notified across the checked-before-wait gap"
+    );
+    assert_eq!(
+        actual,
+        Ok(POOL_THREAD_GONE_REASON.to_owned()),
+        "actual pool panic must report worker death"
+    );
+}
