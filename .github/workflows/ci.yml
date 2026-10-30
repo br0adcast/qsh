@@ -702,6 +702,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_context_rows.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_transaction.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_activation.py'
           python3 -m unittest discover -s scripts/tests -p 'test_qshd_stop_guard.py'
           python3 -m unittest discover -s scripts/tests -p 'test_embed_stop_guard.py'
           python3 -m unittest discover -s scripts/tests -p 'test_shell_fixture_output.py'
