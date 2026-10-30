@@ -4,6 +4,105 @@ mod verifier_parent {
     use super::*;
     use authorized::{IdentityTransition as Step, VerifierBoundary as Boundary};
 
+    fn publish_release(path: &Path, before_publish: impl FnOnce()) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let pending = path.with_extension("release.pending");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&pending)
+            .unwrap();
+        file.write_all(b"release\n").unwrap();
+        // This public control record is also read after switching to nobody.
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        drop(file);
+        before_publish();
+        // A polling verifier must see absence or the whole release record.
+        std::fs::rename(pending, path).unwrap();
+    }
+
+    #[test]
+    fn verifier_release_is_hidden_until_complete_publication() {
+        if std::env::var_os("QSH_TEST_RELEASE_PRIVATE_UMASK").is_some() {
+            // Only the explicit self-reexec child changes its process umask.
+            unsafe { nix::libc::umask(0o077) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("boundary.release");
+        publish_release(&release, || {
+            assert_eq!(
+                std::fs::read(&release).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        });
+        assert_eq!(std::fs::read(&release).unwrap(), b"release\n");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&release).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn verifier_release_publication_ignores_restrictive_umask() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::process::{Child, Stdio};
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                loop {
+                    match self.0.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => panic!("owned release child wait failed: {error}"),
+                    }
+                }
+                self.0.kill().unwrap();
+                loop {
+                    match self.0.wait() {
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        result => { result.unwrap(); break; }
+                    }
+                }
+            }
+        }
+        // File capture cannot block the child on a full pipe and keeps nested
+        // libtest control lines out of this test's --nocapture CI stream.
+        let mut stdout = tempfile::tempfile().unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        let mut child = OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "helper::server::tests::verifier_parent::verifier_release_is_hidden_until_complete_publication",
+                "--test-threads=1",
+            ])
+            .env("QSH_TEST_RELEASE_PRIVATE_UMASK", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout.try_clone().unwrap()))
+            .stderr(Stdio::from(stderr.try_clone().unwrap()))
+            .spawn()
+            .unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() { break status; }
+            assert!(Instant::now() < deadline, "owned release child deadline");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let mut output = Vec::new();
+        stdout.seek(SeekFrom::Start(0)).unwrap();
+        stdout.take(65537).read_to_end(&mut output).unwrap();
+        let mut errors = Vec::new();
+        stderr.seek(SeekFrom::Start(0)).unwrap();
+        stderr.take(65537).read_to_end(&mut errors).unwrap();
+        assert!(output.len() <= 65536 && errors.len() <= 65536, "release child output bound");
+        assert!(status.success(), "release child status={status:?}, stdout={output:?}, stderr={errors:?}");
+        assert!(errors.is_empty(), "release child stderr={errors:?}");
+        let output = std::str::from_utf8(&output).unwrap();
+        assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"), "release child result={output:?}");
+    }
+
     #[test]
     fn verifier39_helper_death_kills_actual_blocked_lookup() {
         super::adoption_native::run_case(Some("verifier_lookup_death"));
@@ -610,7 +709,7 @@ mod verifier_parent {
         helper.signal_kill();
         wait_exited(helper, "owned helper did not finish its actual SIGKILL");
         if race {
-            std::fs::write(marker.with_extension("release"), b"release\n").unwrap();
+            publish_release(&marker.with_extension("release"), || {});
         }
         wait_exited(&verifier, &format!("actual verifier survived helper death before fixture rescue: mode={mode}, observed={observation:?}"));
         let fd = verifier.as_fd();
