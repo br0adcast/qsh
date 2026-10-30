@@ -149,11 +149,38 @@ class GuardTests(unittest.TestCase):
                      good+'8 7 0:2 / /sys/fs/cgroup/system.slice rw - tmpfs tmpfs rw\n']:
             with self.assertRaises(self.g.Refusal): self.g.mount(text)
 
+    def test_mount_allows_unrelated_unicode_names(self):
+        good = '7 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
+        for name in ('café', 'wide\u2003space'):
+            with self.subTest(name=name):
+                unrelated = f'8 1 0:2 / /mnt/{name} rw - tmpfs tmpfs rw\n'
+                self.assertEqual(self.g.mount(good + unrelated), 7)
+
+    def test_mountinfo_read_preserves_non_utf8_filename_bytes(self):
+        data = (b'7 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
+                b'8 1 0:2 / /mnt/name-\xff rw - tmpfs tmpfs rw\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'mountinfo'
+            path.write_bytes(data)
+            text = self.g.read(path, errors='surrogateescape')
+            self.assertEqual(text.encode('utf-8', errors='surrogateescape'), data)
+            self.assertEqual(self.g.mount(text), 7)
+            with self.assertRaises(UnicodeDecodeError):
+                self.g.read(path)
+
     def test_mount_records_reject_noncanonical_controls(self):
         good = '7 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'
-        for control in ('\v', '\f', '\x1c', '\x1d', '\x1e', '\r', '\x7f'):
+        unrelated = '8 1 0:2 / /mnt/café rw - tmpfs tmpfs rw\n'
+        for control in ('\t', '\v', '\f', '\x1c', '\x1d', '\x1e', '\r', '\x7f'):
             with self.subTest(control=repr(control)), self.assertRaises(self.g.Refusal):
-                self.g.mount(good[:-1] + control + '\n')
+                self.g.mount(good + unrelated[:-1] + control + '\n')
+        for separator in ('\x85', '\u2028', '\u2029'):
+            with self.subTest(separator=repr(separator)), self.assertRaises(self.g.Refusal):
+                self.g.mount(good[:-1] + separator + unrelated)
+        for text in (good[:-1], good.replace('7 ', '٧ ', 1),
+                     good.replace('cgroup rw', 'cgróup rw')):
+            with self.subTest(text=text), self.assertRaises(self.g.Refusal):
+                self.g.mount(text)
 
     def test_mount_identity_requires_literal_lf_records(self):
         for control in ('\v', '\f', '\x1c', '\x1d', '\x1e', '\r', '\x7f'):
@@ -179,7 +206,10 @@ class RunnerTests(unittest.TestCase):
     def test_preflight_refuses_foreign_identity_without_manager_query(self):
         values = {'/usr/lib/os-release': 'ID=fedora\nVERSION_ID=44\n',
                   '/proc/self/mountinfo': '7 1 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n'}
-        def read(path): return values[path]
+        def read(path, **kwargs):
+            if path == '/proc/self/mountinfo':
+                self.assertEqual(kwargs, {'errors': 'surrogateescape'})
+            return values[path]
         def stat(path): return 2 if 'self/ns/mnt' in path else 1
         with patch.object(self.g, 'read', side_effect=read), \
              patch.object(self.g.os, 'geteuid', return_value=0), \

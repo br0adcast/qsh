@@ -74,9 +74,14 @@ def events(text):
 
 def mount(text):
     mounts = []
-    for line in canonical_records(text):
-        fields = line.split()
-        require(len(fields) >= 10 and '-' in fields, 'invalid mountinfo')
+    # mountinfo names are filesystem bytes, not an ASCII protocol. Only literal
+    # LF and ASCII space frame records/fields; Unicode whitespace is name data.
+    require(len(text) <= LIMIT and text.endswith('\n') and
+            all(c == '\n' or ord(c) >= 32 and ord(c) != 127 for c in text),
+            'incomplete or noncanonical mountinfo')
+    for line in text[:-1].split('\n'):
+        fields = line.split(' ')
+        require(len(fields) >= 10 and all(fields) and '-' in fields, 'invalid mountinfo')
         split = fields.index('-')
         require(split >= 6 and len(fields) == split + 4, 'invalid mountinfo fields')
         target = fields[4]
@@ -84,6 +89,7 @@ def mount(text):
         if fields[split+1] == 'cgroup':
             raise Refusal('cgroup v1/hybrid is unsupported')
         if target == '/sys/fs/cgroup' or target.startswith('/sys/fs/cgroup/'):
+            canonical_records(line + '\n')
             mounts.append((fields, split))
     require(len(mounts) == 1, 'missing, duplicate or overmounted cgroup hierarchy')
     fields, split = mounts[0]
@@ -92,7 +98,7 @@ def mount(text):
     return int(fields[0])
 
 
-def read_fd(fd):
+def read_fd(fd, errors='strict'):
     data = bytearray()
     while True:
         part = os.read(fd, min(4096, LIMIT + 1 - len(data)))
@@ -100,13 +106,13 @@ def read_fd(fd):
             break
         data.extend(part)
         require(len(data) <= LIMIT, 'file exceeds size bound')
-    return data.decode('utf-8', errors='strict')
+    return data.decode('utf-8', errors=errors)
 
 
-def read(path):
+def read(path, errors='strict'):
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
-        return read_fd(fd)
+        return read_fd(fd, errors=errors)
     finally:
         os.close(fd)
 
@@ -201,7 +207,7 @@ class Host:
         require(os.stat('/') == os.stat('/proc/1/root'), 'foreign root')
         for namespace in ('mnt', 'pid', 'user'):
             require(os.stat('/proc/self/ns/'+namespace) == os.stat('/proc/1/ns/'+namespace), 'foreign namespace')
-        self.cgroup = Cgroup('/sys/fs/cgroup', mount_id, mount(read('/proc/self/mountinfo')))
+        self.cgroup = Cgroup('/sys/fs/cgroup', mount_id, mount(read('/proc/self/mountinfo', errors='surrogateescape')))
 
     def empty(self):
         self.cgroup.empty()
