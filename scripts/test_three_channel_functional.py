@@ -6,6 +6,7 @@ import tempfile
 import threading
 import sys
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -50,12 +51,14 @@ class FunctionalControls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "run"
             identity = dict(commit="fixture", tree="fixture", lock_sha256="fixture", script_sha256="fixture")
+            # This controls late provenance, independently of live runner disk space.
             with mock.patch.object(functional, "source_identity", side_effect=[identity, ValueError("changed")]), \
                  mock.patch.object(functional, "sha", return_value="fixture"), \
                  mock.patch.object(functional, "subreaper"), \
                  mock.patch.object(functional, "children", return_value=[]), \
                  mock.patch.object(functional, "watch_resources"), \
                  mock.patch.object(functional, "resource_reason", return_value=None), \
+                 mock.patch.object(functional.os, "statvfs", return_value=SimpleNamespace(f_bavail=16 * 1024**3, f_frsize=1)), \
                  mock.patch.object(functional, "run_owned", return_value=complete()):
                 self.assertEqual(functional.execute(Path(sys.executable), root), 1)
             result = json.loads((root / "result.json").read_text())
@@ -64,6 +67,24 @@ class FunctionalControls(unittest.TestCase):
             self.assertIn("source verification failed after execution", result["stop_reasons"])
             self.assertTrue(result["record"]["driver_joined"])
             self.assertEqual((root / "output.log").read_text(), complete()["output"])
+
+    def test_insufficient_reserve_refuses_before_state_or_native_execution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "run"
+            with mock.patch.object(functional, "source_identity", return_value={}), \
+                 mock.patch.object(functional, "sha", return_value="fixture"), \
+                 mock.patch.object(functional, "children", return_value=[]), \
+                 mock.patch.object(functional.os, "statvfs", return_value=SimpleNamespace(f_bavail=0, f_frsize=1)) as space, \
+                 mock.patch.object(functional, "create_state") as create, \
+                 mock.patch.object(functional, "subreaper") as prepare, \
+                 mock.patch.object(functional, "run_owned") as run:
+                with self.assertRaisesRegex(ValueError, "^free reserve$"):
+                    functional.execute(Path(sys.executable), root)
+            space.assert_called_once_with(root.parent)
+            create.assert_not_called()
+            prepare.assert_not_called()
+            run.assert_not_called()
+            self.assertFalse(root.exists())
 
     def test_owned_python_child_capture_and_reaping(self):
         # Harmless ordinary Python children only; never qsh, SSH, a shell or PTY.
