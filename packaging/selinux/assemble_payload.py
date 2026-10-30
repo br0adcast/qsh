@@ -19,7 +19,7 @@ import stat
 
 MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
-    'process','modules','module_observer','api','queries','files','observer'))
+    'process','modules','module_observer','api','queries','files','observer','reference_loader'))
 _KEYS=frozenset(MODULES+('qshd.pp','artifact.json','qshd.fedora-selinux'))
 _PAM_SHA='61dc7f9dc6ada9a612a66b1bfda1f8d1802ec9734a9325edc4f600b0e55622c7'
 _SCHEMA=dict(name='qshd-selinux',architecture='noarch',policy_module='qshd',
@@ -103,12 +103,12 @@ def _imports(name,data):
 
 
 def _references(version,artifact,pp,pam):
-    values=dict(PROVIDER_VERSION=version,MANIFEST_SHA256=hashlib.sha256(artifact).hexdigest(),
-                PP_SHA256=hashlib.sha256(pp).hexdigest(),PAM_SHA256=_PAM_SHA,EXPECTED_PAM=pam)
-    data=('# Generated from explicit reviewed build inputs; public constants only.\n'+
-          ''.join(name+' = '+repr(value)+'\n' for name,value in values.items())).encode('ascii')
-    ast.parse(data)
-    return data
+    try:text=pam.decode('utf-8')
+    except UnicodeError:_fail('PAM_UTF8')
+    if not 0<len(pam)<=4096:_fail('PAM_LIMIT')
+    values=dict(provider_version=version,manifest_sha256=hashlib.sha256(artifact).hexdigest(),
+                pp_sha256=hashlib.sha256(pp).hexdigest(),pam_sha256=_PAM_SHA,expected_pam=text)
+    return json.dumps(values,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n'
 
 
 def _output(source,inputs,output):
@@ -166,7 +166,7 @@ def assemble_payload(source,pp,artifact,pam,expected,output,epoch):
         if hashlib.sha256(data['qshd.fedora-selinux']).hexdigest()!=_PAM_SHA:_fail('CANONICAL_PAM')
         for name in MODULES:_imports(name,data[name])
         staged={'usr/libexec/qshd-selinux/'+name:data[name] for name in MODULES}
-        staged['usr/libexec/qshd-selinux/qshd_selinux_reference.py']=_references(version,data['artifact.json'],data['qshd.pp'],data['qshd.fedora-selinux'])
+        staged['usr/share/qshd-selinux/reference.json']=_references(version,data['artifact.json'],data['qshd.pp'],data['qshd.fedora-selinux'])
         staged.update({'usr/share/qshd-selinux/'+name:data[name] for name in ('qshd.pp','artifact.json','qshd.fedora-selinux')})
         directories={out}
         for name in staged:

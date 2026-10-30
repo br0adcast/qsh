@@ -14,7 +14,7 @@ from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
 TOOL=ROOT/'packaging/selinux/assemble_payload.py'
-NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer'))
+NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer','reference_loader'))
 
 
 class PayloadTests(unittest.TestCase):
@@ -43,16 +43,20 @@ class PayloadTests(unittest.TestCase):
         (self.source/'__pycache__').mkdir();(self.source/'__pycache__/cache.pyc').write_bytes(b'decoy')
         before={p:(p.read_bytes(),p.stat().st_mode) for p in self.source.iterdir() if p.is_file()}
         inventory=self.assemble();other=self.base/'second';self.assertEqual(inventory,self.assemble(other))
-        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),17)
+        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),18)
         prefix='usr/libexec/qshd-selinux/'
         for name in NAMES:self.assertEqual(tree[prefix+name][0],(self.source/name).read_bytes())
         for path in (self.pp,self.artifact,self.pam):self.assertEqual(tree['usr/share/qshd-selinux/'+path.name][0],path.read_bytes())
-        generated=tree[prefix+'qshd_selinux_reference.py'][0]
-        constants={node.targets[0].id:ast.literal_eval(node.value) for node in ast.parse(generated).body if isinstance(node,ast.Assign)}
-        self.assertEqual(constants['PROVIDER_VERSION'],'0.2.0')
-        self.assertEqual(constants['MANIFEST_SHA256'],self.expected['artifact.json'])
-        self.assertEqual(constants['PP_SHA256'],self.expected['qshd.pp'])
-        self.assertEqual(constants['EXPECTED_PAM'],self.pam.read_bytes())
+        generated=tree['usr/share/qshd-selinux/reference.json'][0]
+        constants=json.loads(generated)
+        self.assertEqual(set(constants),{'provider_version','manifest_sha256','pp_sha256','pam_sha256','expected_pam'})
+        self.assertEqual(constants['provider_version'],'0.2.0')
+        self.assertEqual(constants['manifest_sha256'],self.expected['artifact.json'])
+        self.assertEqual(constants['pp_sha256'],self.expected['qshd.pp'])
+        self.assertEqual(constants['pam_sha256'],hashlib.sha256(self.pam.read_bytes()).hexdigest())
+        self.assertEqual(constants['expected_pam'].encode('utf-8'),self.pam.read_bytes())
+        self.assertNotIn(prefix+'qshd_selinux_reference.py',tree)
+        self.assertEqual(generated,json.dumps(constants,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n')
         self.assertTrue(all(mode==0o644 and epoch==1000000000 for _,mode,epoch in tree.values()))
         for path in [self.output,*[p for p in self.output.rglob('*') if p.is_dir()]]:
             self.assertEqual(path.stat().st_mode&0o777,0o755);self.assertEqual(int(path.stat().st_mtime),1000000000)
@@ -111,7 +115,7 @@ class PayloadTests(unittest.TestCase):
         expected=self.base/'expected.json';expected.write_text(json.dumps(self.expected))
         code="import os,runpy,sys;os.umask(0o077);sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')"
         p=subprocess.run([sys.executable,'-I','-B','-c',code,str(TOOL),'--source',str(self.source),'--pp',str(self.pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
-        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),17)
+        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),18)
         self.assertTrue(all(v[1]==0o644 for v in self.tree(self.output).values()))
         self.assertTrue(all(p.stat().st_mode&0o777==0o755 for p in [self.output,*[p for p in self.output.rglob('*') if p.is_dir()]]))
 
