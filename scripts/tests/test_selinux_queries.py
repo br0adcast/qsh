@@ -38,7 +38,7 @@ ROWS = (
     ('session-execute', 'require_av', 'D S file getattr open read execute'),
     ('session-entry', 'require_av', 'U S file entrypoint'),
     ('pty-create-result', 'compute_create', 'D V chr_file P'),
-    ('pty-owned', 'require_av', 'D P chr_file create open read write getattr ioctl setattr relabelfrom relabelto'),
+    ('pty-owned', 'require_av', 'D P chr_file open read write getattr ioctl setattr relabelfrom relabelto'),
     ('pty-user', 'require_av', 'D T chr_file open read write getattr ioctl setattr relabelfrom relabelto'),
     ('pty-select-result', 'compute_relabel', 'U P chr_file T'),
     ('pty-select-valid', 'validate_transition', 'P T chr_file D'),
