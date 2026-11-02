@@ -480,10 +480,11 @@ jobs:
           path: artifacts
 
       - name: Collect and checksum
+        env:
+          RELEASE_VERSION: ${{ needs.server-packages.outputs.version }}
         run: |
-          mkdir -p dist
-          find artifacts -type f -exec cp {} dist/ \;
-          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          python3 scripts/assemble-release-assets.py --artifacts artifacts --version "$RELEASE_VERSION" --output dist
+          cat dist/SHA256SUMS
 
       - name: Check release artifacts for secrets
         run: |
