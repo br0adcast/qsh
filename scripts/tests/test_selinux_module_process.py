@@ -20,7 +20,10 @@ resource.setrlimit(resource.RLIMIT_AS,(512*1024**2,512*1024**2))
 native_popen=subprocess.Popen
 if case=='observer-profile':
     assert m._Limits(60,4096).execution_seconds==60
-    for pair in ((16,4096),(30,4096),(59,4096),(60,4097),(60,1024**2)):
+    assert m._Limits(30,4096).execution_seconds==30
+    assert m._Limits(75,1024**2).execution_seconds==75
+    assert m._Limits(15,4*1024**2).execution_seconds==15
+    for pair in ((16,4096),(29,4096),(31,4096),(30,4095),(30,4097),(59,4096),(60,4097),(60,1024**2),(260,4096)):
         try:m._Limits(*pair)
         except m._CommandError:pass
         else:raise AssertionError('unapproved observer profile')
