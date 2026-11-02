@@ -507,20 +507,47 @@ class DarwinMetadataTests(unittest.TestCase):
 
     def test_collector_preserves_exact_release_set_and_excludes_ci_only_evidence(self):
         workflow=(ROOT/'.github/workflows/release.yml').read_text()
-        command=next(line.strip() for line in workflow.splitlines() if line.strip().startswith('find artifacts -type f'))
-        artifacts=self.root/'artifacts';artifacts.mkdir();(self.root/'dist').mkdir()
-        expected={'qsh-0.5.0-'+target+'.tar.gz' for target in ('x86_64-unknown-linux-musl','aarch64-unknown-linux-musl','aarch64-apple-darwin','x86_64-apple-darwin')}
-        for program in ('qsh','qshd'):
-            expected.update(program+'_0.5.0-1_'+arch+'.deb' for arch in ('amd64','arm64'))
-            expected.update(program+'-0.5.0-1.'+arch+'.rpm' for arch in ('x86_64','aarch64'))
-        self.assertEqual(len(expected),12)
-        for name in expected:
-            path=artifacts/'producer'/name;path.parent.mkdir(exist_ok=True);path.write_bytes(b'public')
-        private=artifacts/'darwin-producer-evidence';private.mkdir();(private/'arm.json').write_text('{}');(private/'intel.json').write_text('{}')
-        subprocess.run(['sh','-c',command],cwd=self.root,check=True,capture_output=True,timeout=5)
-        self.assertEqual({p.name for p in (self.root/'dist').iterdir()},expected)
+        step=workflow.split('      - name: Collect and checksum\n',1)[1]
+        before,body=step.split('        run: |\n',1)
+        self.assertIn('RELEASE_VERSION: ${{ needs.server-packages.outputs.version }}',before)
+        lines=[]
+        for line in body.splitlines():
+            if line and not line.startswith('          '):break
+            lines.append(line[10:])
+        command='\n'.join(lines)
+        products={
+            'linux-x86_64-unknown-linux-musl':('qsh-0.5.0-x86_64-unknown-linux-musl.tar.gz','qsh_0.5.0-1_amd64.deb','qsh-0.5.0-1.x86_64.rpm'),
+            'linux-aarch64-unknown-linux-musl':('qsh-0.5.0-aarch64-unknown-linux-musl.tar.gz','qsh_0.5.0-1_arm64.deb','qsh-0.5.0-1.aarch64.rpm'),
+            'macos':('qsh-0.5.0-aarch64-apple-darwin.tar.gz','qsh-0.5.0-x86_64-apple-darwin.tar.gz'),
+            'server-packages':('qshd_0.5.0-1_amd64.deb','qshd_0.5.0-1_arm64.deb','qshd-0.5.0-1.x86_64.rpm','qshd-0.5.0-1.aarch64.rpm')}
+        artifacts=self.root/'artifacts';artifacts.mkdir();expected={}
+        for producer,names in products.items():
+            directory=artifacts/producer;directory.mkdir()
+            for name in names:
+                data=('PUBLIC SYNTHETIC '+producer+'/'+name+'\n').encode()
+                (directory/name).write_bytes(data);expected[name]=data
+        self.assertEqual(len(expected),12);self.assertFalse((self.root/'dist').exists())
+        private=artifacts/'darwin-producer-evidence';private.mkdir()
+        (private/'arm.json').write_text('{}');(private/'intel.json').write_text('{}')
+        scripts=self.root/'scripts';scripts.mkdir()
+        for name in ('assemble-release-assets.py','check-release-version.py','check-release-output.py'):
+            shutil.copyfile(ROOT/'scripts'/name,scripts/name)
+        env=os.environ|dict(RELEASE_VERSION='0.5.0',HOME=str(self.root/'home'),
+            XDG_CONFIG_HOME=str(self.root/'config'),XDG_CACHE_HOME=str(self.root/'cache'),HISTFILE='/dev/null')
+        subprocess.run(['bash','-e','-c',command],cwd=self.root,env=env,check=True,capture_output=True,timeout=5)
+        dist=self.root/'dist'
+        self.assertEqual({p.name for p in dist.iterdir()},set(expected)|{'SHA256SUMS'})
+        for name,data in expected.items():self.assertEqual((dist/name).read_bytes(),data)
+        manifest=''.join(hashlib.sha256(expected[name]).hexdigest()+'  '+name+'\n' for name in sorted(expected))
+        self.assertEqual((dist/'SHA256SUMS').read_text(),manifest)
         self.assertEqual(workflow.count('name: darwin-producer-evidence'),1)
-        self.assertIn('retention-days: 7',workflow)
+        upload=workflow.split('          name: darwin-producer-evidence\n',1)[1]
+        upload_lines=[]
+        for line in upload.splitlines():
+            if line and not line.startswith('          '):break
+            upload_lines.append(line.strip())
+        self.assertIn('retention-days: 7',upload_lines)
+        self.assertIn('path: ${{ runner.temp }}/darwin-producer-evidence/*.json',upload_lines)
 
 
 if __name__ == '__main__':

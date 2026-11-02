@@ -249,5 +249,195 @@ def _main():
     return 0
 
 
+_POLICY_MODE='_consumer_preinstall_v1'
+
+
+@dataclass(frozen=True)
+class PolicyContextObservation:
+    profile: str
+    contexts: ContextBinding
+
+
+def _policy_request(trust):
+    if type(trust) is not TrustedArtifact:_fail('TRUSTED_INPUT')
+    trust.__post_init__()
+    encoded=base64.b64encode(_json(dict(schema=1,phase='consumer-preinstall',artifact=asdict(trust)))).decode('ascii')
+    if len(encoded)>8192:_fail('PROTOCOL')
+    return encoded
+
+
+def _parse_policy_request(encoded):
+    try:
+        if type(encoded) is not str or len(encoded)>8192:_fail('PROTOCOL')
+        raw=base64.b64decode(encoded,validate=True)
+        if base64.b64encode(raw).decode('ascii')!=encoded:_fail('PROTOCOL')
+        value=json.loads(raw,object_pairs_hook=_pairs)
+        if (type(value) is not dict or set(value)!={'schema','phase','artifact'}
+                or type(value['schema']) is not int or value['schema']!=1
+                or value['phase']!='consumer-preinstall'):_fail('PROTOCOL')
+        artifact=value['artifact']
+        if type(artifact) is not dict or set(artifact)!={'provider_version','manifest_sha256','pp_sha256'}:_fail('PROTOCOL')
+        trust=TrustedArtifact(**artifact)
+        if _policy_request(trust)!=encoded:_fail('PROTOCOL')
+        return trust
+    except (ValueError,TypeError,KeyError,UnicodeError,RecursionError):_fail('PROTOCOL')
+
+
+def _policy_response(encoded,binding):
+    return _json(dict(schema=1,phase='consumer-preinstall',profile=_PROFILE,
+        request_sha256=hashlib.sha256(encoded.encode('ascii')).hexdigest(),
+        registry_sha256=binding.registry_sha256,receipts_sha256=binding.receipts_sha256))+b'\n'
+
+
+def _parse_policy_response(data,encoded):
+    try:
+        if type(data) is not bytes or len(data)>4096:_fail('RESPONSE')
+        value=json.loads(data,object_pairs_hook=_pairs)
+        if type(value) is not dict or set(value)!={'schema','phase','profile','request_sha256','registry_sha256','receipts_sha256'}:
+            _fail('RESPONSE')
+        if (type(value['schema']) is not int or value['schema']!=1
+                or value['phase']!='consumer-preinstall' or value['profile']!=_PROFILE):_fail('RESPONSE')
+        binding=ContextBinding(value['registry_sha256'],value['receipts_sha256'])
+        if data!=_policy_response(encoded,binding):_fail('RESPONSE')
+        return PolicyContextObservation(_PROFILE,binding)
+    except (ValueError,TypeError,KeyError,UnicodeError,RecursionError):_fail('RESPONSE')
+
+
+def observe_installed_policy_context(*,deadline):
+    """Observe policy/context prerequisites, permitting absent consumer files.
+
+    The finite caller deadline also needs an external hard owner. Parent clock
+    checks cannot interrupt filesystem calls. More than 70 seconds must remain
+    before the unchanged 60-second child and its 10-second settlement allowance.
+    No deployed-file/default/local-override readiness is established. Result
+    ends at package lock release: future mutation phases must retain their own
+    single lease, not nest this public gate or reuse its stale return value.
+    Activation/context leases belong to that child, never this parent scope.
+    """
+    if type(deadline) not in (int,float) or not math.isfinite(deadline):_fail('DEADLINE')
+    def check(reserve=0):
+        if time.monotonic()+reserve>=deadline:_fail('DEADLINE')
+    check(70)
+    try:
+        _preconditions()
+        from qshd_selinux_package_state import production
+        from qshd_selinux_reference_loader import production_references
+        pending=False
+        with production().operation():
+            with production_references() as reader:
+                check(70)
+                captured=reader.capture()
+                check(70)
+                try:
+                    result=_observe_policy_context(captured.artifact)
+                except ObserverError as error:
+                    if str(error)!='ACTIVATION_PENDING':raise
+                    pending=True
+                check()
+                reader.recheck(captured)
+                check()
+        check()
+        if pending:_fail('ACTIVATION_PENDING')
+        return result
+    except ObserverError:raise
+    except _CommandError as error:
+        raise ObserverError('CALLER_PROCESS') from error
+    except Exception as error:
+        raise ObserverError('INSTALLED_REFUSED') from error
+
+
+def _observe_policy_context(trusted_artifact):
+    """Real fixed child; caller authority/exclusion is an explicit precondition.
+
+    The deterministic request digest correlates public input only. Fresh owned
+    process/pipes supply invocation binding; this is no durable replay receipt.
+    """
+    started=time.monotonic()
+    encoded=_policy_request(trusted_artifact)
+    owner=None
+    try:
+        owner=_Owner(_Limits(60,4096))
+        streams=owner._run(('/usr/bin/python3','-I','-B',str(Path(__file__).resolve()),_POLICY_MODE,encoded),
+                           '/',deadline=started+_SECONDS)
+        last=owner._last
+        if last is None or not last.settled or last.unreaped or streams.stderr:_fail('OBSERVATION_REFUSED')
+        result=_parse_policy_response(streams.stdout,encoded)
+        if time.monotonic()>=started+_SECONDS:_fail('DEADLINE')
+        return result
+    except _CommandError as error:
+        code=str(error)
+        if code=='TOOL_FAILURE' and owner is not None:
+            # A normal exit1 has no recorded owner failure. Parent-side OSError
+            # may use TOOL_FAILURE provenance and must never be reclassified.
+            if time.monotonic()>=started+_SECONDS:_fail('DEADLINE')
+            outcome=owner._last
+            if (outcome is not None and outcome.failure is None and outcome.exit_code==1
+                    and outcome.settled and not outcome.unreaped and outcome.stdout==b''
+                    and outcome.stderr==_pending_record(encoded)):
+                if time.monotonic()>=started+_SECONDS:_fail('DEADLINE')
+                _fail('ACTIVATION_PENDING')
+        if code=='COMMAND_TIMEOUT':_fail('DEADLINE')
+        if code in ('COMMAND_CUSTODY','COMMAND_UNSETTLED','OUTPUT_INCOMPLETE','PROCESS_OWNER'):_fail('CUSTODY')
+        if code.startswith('PROCESS_'):_fail('CALLER_PROCESS')
+        _fail('CHILD_REFUSED')
+    except OSError:_fail('CHILD_REFUSED')
+
+def _compose_policy_context(trust):
+    # Imports instantiate no policy engine until the explicit child mode runs.
+    import qshd_selinux_activation_state as state
+    import qshd_selinux_registry as registry_module
+    import qshd_selinux_transaction as transaction
+    import qshd_selinux_module_observer as modules
+    import qshd_selinux_queries as queries
+    from qshd_selinux_api import SelinuxApi
+    api=SelinuxApi()
+    pending=False
+    with state.production().inspection() as slot:
+        with registry_module.production().inspection() as registry:
+            routing=registry.routing()
+            identities=json.loads(routing,object_pairs_hook=_pairs)
+            with transaction.production(list(identities)).inspection(identities) as contexts:
+                with modules.production_observer(trust) as module:
+                    with queries.required_observation(api):
+                        activation=slot.capture()
+                        discovered=registry.capture()
+                        context=contexts.capture()
+                        selected=module.capture()
+                        if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
+                            _fail('REGISTRY_BINDING')
+                        binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
+                        try:require_complete(activation.record,trust,binding)
+                        except ActivationError as error:
+                            if str(error)!='ACTIVATION_PENDING':raise
+                            pending=True
+                        slot.recheck(activation)
+                        module.recheck(selected)
+                        registry.recheck(discovered)
+                        contexts.recheck(context)
+    # Deferred refusal lets native post-yield checks and every finalizer run
+    # normally. Any failure there supersedes the selected pending diagnostic.
+    if pending:raise _PendingRefusal()
+    return binding
+
+
+def _policy_main():
+    try:
+        if len(sys.argv)!=3 or sys.argv[1]!=_POLICY_MODE:_fail('PROTOCOL')
+        trust=_parse_policy_request(sys.argv[2])
+        if os.geteuid()!=0:_fail('ROOT_REQUIRED')
+        _preconditions()
+        binding=_compose_policy_context(trust)
+        sys.stdout.buffer.write(_policy_response(sys.argv[2],binding));sys.stdout.buffer.flush()
+    except _PendingRefusal:
+        sys.stderr.buffer.write(_pending_record(sys.argv[2]));sys.stderr.buffer.flush()
+        return 1
+    except Exception:
+        sys.stderr.write('OBSERVATION_REFUSED\n')
+        return 1
+    return 0
+
+
+
 if __name__=='__main__':
+    if len(sys.argv)==3 and sys.argv[1]==_POLICY_MODE:raise SystemExit(_policy_main())
     raise SystemExit(_main())

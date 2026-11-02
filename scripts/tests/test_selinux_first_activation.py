@@ -1,6 +1,6 @@
 """Actual private state and locks; policy/registry/native seams are injected."""
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict, replace
 import importlib.util
 import fcntl
 import hashlib
@@ -404,7 +404,7 @@ class CoordinatorTests(unittest.TestCase):
                 def trace(frame,event,arg):
                     if event=='return' and frame.f_code is slot._Writer.publish_complete.__code__:
                         returned[0]=True
-                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_locked.__code__:
+                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_pristine_locked.__code__:
                         returned[0]=False;interrupted.append(frame.f_lineno)
                         raise ReturnInterruption('first coordinator line after actual publication return')
                     return trace
@@ -415,5 +415,178 @@ class CoordinatorTests(unittest.TestCase):
                 self.assertEqual(len(interrupted),1)
                 self.assertIs(sys.gettrace(),previous)
                 self.assertEqual(self.b.record()['state'],'COMPLETE')
+
+
+class PristinePendingBridgeTests(unittest.TestCase):
+    installed=CoordinatorTests.installed
+    def setUp(self):
+        CoordinatorTests.setUp(self)
+        self.configure()
+    def configure(self):
+        self.reference_path=self.installed()
+        self.prior=c.Activation(1,'PENDING','1'*32,'fedora44-targeted-v1',1,1,self.b.expected_trust,
+            c.ModuleIdentity('qshd',400,'targeted','pp'),None)
+        with package.PackageState(self.b.common,uid=os.getuid(),anchor=self.b.root).initialize():
+            with self.b.slot_object().writer() as writer:
+                initial=writer.capture_current();writer.begin_pending(c._json(asdict(self.prior)),initial)
+        self.b.events.clear()
+        self.b.package_operation=lambda:self.b.track('package',package.PackageState(self.b.common,uid=os.getuid(),anchor=self.b.root).operation())
+        self.b.package=Mock(side_effect=AssertionError('initializer forbidden'))
+    @contextmanager
+    def fresh(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.b=Bindings(Path(root));self.configure();yield
+    def run_bridge(self,deadline=1000):
+        return c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_pristine_pending_first(deadline=deadline)
+    def test_matching_pending_becomes_new_complete_under_one_existing_package_lease(self):
+        result=self.run_bridge()
+        self.assertEqual(result.state,'COMPLETE');self.assertNotEqual(result.operation_id,self.prior.operation_id)
+        self.assertEqual(result.artifact,self.b.expected_trust);self.assertEqual(self.b.loads,1)
+        self.assertEqual(self.b.events.count('package enter'),1);self.b.package.assert_not_called()
+        self.assertIn('complete replace',self.b.events);self.assertFalse(self.b.active)
+    def test_matching_pending_still_refuses_in_both_original_first_apis(self):
+        before=self.b.record()
+        self.b.package=lambda:self.b.track('package',package.PackageState(self.b.common,uid=os.getuid(),anchor=self.b.root).initialize())
+        for invoke in (lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(self.b.expected_trust,PP,deadline=1000),lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)):
+            with self.assertRaisesRegex(c.CoordinatorError,'^ACTIVATION_EXISTS$'):invoke()
+        self.assertEqual(self.b.record(),before);self.assertEqual(self.b.loads,0)
+    def test_all_three_incoming_artifact_fields_must_match_before_replacement(self):
+        for changes in ({'provider_version':'different'},{'manifest_sha256':'b'*64},{'pp_sha256':'c'*64}):
+            with self.subTest(changes=changes),self.fresh():
+                prior=replace(self.prior,artifact=replace(self.prior.artifact,**changes))
+                path=self.b.common/'selinux-activation/activation.json';path.write_bytes(c._json(asdict(prior)))
+                before=path.read_bytes()
+                with self.assertRaisesRegex(c.CoordinatorError,'^PENDING_IDENTITY$'):self.run_bridge()
+                self.assertEqual(path.read_bytes(),before);self.assertEqual(self.b.loads,0)
+    def test_absent_record_or_complete_is_not_this_bridge(self):
+        path=self.b.common/'selinux-activation/activation.json';path.unlink()
+        with self.assertRaisesRegex(c.CoordinatorError,'^PENDING_REQUIRED$'):self.run_bridge()
+        self.assertFalse(path.exists());self.assertEqual(self.b.loads,0)
+        with self.fresh():
+            self.run_bridge();before=self.b.record();loads=self.b.loads
+            with self.assertRaisesRegex(c.CoordinatorError,'^PENDING_REQUIRED$'):self.run_bridge()
+            self.assertEqual(self.b.record(),before);self.assertEqual(self.b.loads,loads)
+
+    def test_generation_collision_never_reuses_old_pending_token(self):
+        before=self.b.record()
+        with patch.object(c.secrets,'token_hex',return_value=self.prior.operation_id),self.assertRaises(c.CoordinatorError):self.run_bridge()
+        self.assertEqual(self.b.record(),before);self.assertEqual(self.b.loads,0)
+    def test_missing_partial_or_malformed_prerequisites_never_repair(self):
+        for defect in ('package-lock','activation-lock','bad-json','bad-profile','bad-abi','bad-module','unsafe-mode'):
+            with self.subTest(defect=defect),self.fresh():
+                path=self.b.common/'selinux-activation/activation.json'
+                if defect=='package-lock':missing=self.b.common/'selinux-package.lock';missing.unlink()
+                elif defect=='activation-lock':missing=self.b.common/'selinux-activation/lock';missing.unlink()
+                elif defect=='bad-json':path.write_bytes(b'{')
+                elif defect=='unsafe-mode':path.chmod(0o644)
+                else:
+                    value=self.b.record()
+                    if defect=='bad-profile':value['profile']='unsupported'
+                    elif defect=='bad-abi':value['abi']=True
+                    else:value['module']['priority']=100
+                    path.write_text(json.dumps(value))
+                before=path.read_bytes();mode=path.stat().st_mode
+                with self.assertRaises(c.CoordinatorError):self.run_bridge()
+                self.assertEqual(path.read_bytes(),before);self.assertEqual(path.stat().st_mode,mode)
+                if defect in ('package-lock','activation-lock'):self.assertFalse(missing.exists())
+                self.assertEqual(self.b.loads,0);self.b.package.assert_not_called()
+    def test_real_nonpristine_contexts_refuse_without_recovery(self):
+        for defect in ('journal','symlink-journal','receipts','administrator-row','marker','foreign-stage'):
+            with self.subTest(defect=defect),self.fresh():
+                engine=self.b.transaction_object()
+                with engine.writer() as writer:
+                    if defect=='receipts':writer.reconcile(self.b.ids)
+                state=self.b.common/'selinux-contexts'
+                if defect=='journal':(state/'journal').write_bytes(b'not JSON')
+                elif defect=='symlink-journal':
+                    foreign=self.b.root/'foreign';foreign.write_bytes(b'unchanged foreign');(state/'journal').symlink_to(foreign)
+                elif defect=='administrator-row':self.b.target.write_bytes(self.b.original+b'system_r:qshd_t:s0\tuser_r:user_t:s0\n')
+                elif defect=='marker':self.b.target.write_bytes(self.b.original+b'# qshd-context-row begin unknown\n')
+                elif defect=='foreign-stage':(state/'unknown').write_bytes(b'foreign')
+                before=(self.b.target.read_bytes(),self.b.target.stat().st_mode,(state/'receipts').read_bytes())
+                journal=(state/'journal').read_bytes() if (state/'journal').exists() else None
+                with self.assertRaises(c.CoordinatorError):self.run_bridge()
+                self.assertEqual((self.b.target.read_bytes(),self.b.target.stat().st_mode,(state/'receipts').read_bytes()),before)
+                if journal is not None:self.assertEqual((state/'journal').read_bytes(),journal)
+                self.assertEqual(self.b.loads,0);self.assertEqual(self.b.record()['state'],'PENDING')
+                self.assertNotEqual(self.b.record()['operation_id'],self.prior.operation_id)
+    def test_existing_module_real_firstinstaller_is_list_only_after_generation_refresh(self):
+        import test_selinux_module_install as fixture
+        import qshd_selinux_module_install as install
+        for listing in (b'400 qshd pp\n',b'100 qshd cil disabled\n',b'999 qshd pp\n'):
+            with self.subTest(listing=listing),self.fresh():
+                store=fixture.InstallTests();store.setUp()
+                try:
+                    store.listing=listing
+                    self.b.installer=lambda trust,pp:install.FirstInstall(trust,pp,_root=store.root,_uid=os.getuid(),_owner=store,_clock=lambda:100)
+                    with self.assertRaises(c.CoordinatorError):self.run_bridge()
+                    self.assertEqual(len(store.calls),1);self.assertEqual(store.calls[0][0][-1],'-lfull')
+                    self.assertEqual(list((store.root/'run').iterdir()),[])
+                    self.assertNotEqual(self.b.record()['operation_id'],self.prior.operation_id)
+                    self.assertEqual(self.b.target.read_bytes(),self.b.original)
+                finally:store.doCleanups()
+    def test_prepublication_failures_and_reference_drift_never_complete(self):
+        for failure in ('load','window exit','registry recheck','module exit','late load','reference drift'):
+            with self.subTest(failure=failure),self.fresh():
+                if failure=='reference drift':
+                    point=self.b.point
+                    def drift(name):
+                        point(name)
+                        if name=='window exit':self.reference_path.write_bytes(self.reference_path.read_bytes()+b' ')
+                    self.b.point=drift
+                else:self.b.failure=failure
+                with self.assertRaises(c.CoordinatorError):self.run_bridge()
+                self.assertEqual(self.b.record()['state'],'PENDING')
+    def test_real_completion_sync_uncertainty_survives_every_outer_exit(self):
+        for later in ('contexts exit','activation exit','references exit','package exit'):
+            with self.subTest(later=later),self.fresh():
+                self.b.failure=later;native_sync=os.fsync;failed=[]
+                def fsync(fd):
+                    directory=self.b.common/'selinux-activation'
+                    if self.b.record()['state']=='COMPLETE' and stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino==directory.stat().st_ino:
+                        failed.append(True);raise OSError('controlled real directory sync')
+                    return native_sync(fd)
+                with patch.object(slot.os,'fsync',side_effect=fsync),self.assertRaises(slot.OutcomeUncertain):self.run_bridge()
+                self.assertEqual(failed,[True]);self.assertEqual(self.b.record()['state'],'COMPLETE')
+    def test_trace_return_boundary_and_reference_unwind_stay_uncertain(self):
+        class Interruption(BaseException):pass
+        for later in (None,'references exit'):
+            with self.subTest(later=later),self.fresh():
+                self.b.failure=later;returned=[False];interruptions=[];previous=sys.gettrace()
+                def trace(frame,event,arg):
+                    if event=='return' and frame.f_code is slot._Writer.publish_complete.__code__:returned[0]=True
+                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_pristine_locked.__code__:
+                        returned[0]=False;interruptions.append(True);raise Interruption()
+                    return trace
+                try:
+                    sys.settrace(trace)
+                    with self.assertRaises(slot.OutcomeUncertain):self.run_bridge()
+                finally:sys.settrace(previous)
+                self.assertEqual(interruptions,[True]);self.assertIs(sys.gettrace(),previous)
+                self.assertEqual(self.b.record()['state'],'COMPLETE')
+    def test_known_precompletion_slot_error_stays_ordinary_even_with_later_exit(self):
+        for later in (None,'references exit'):
+            with self.subTest(later=later),self.fresh():
+                self.b.failure=later;hook=self.b.slot_hook
+                def refuse(event):
+                    hook(event)
+                    if event=='before_slot_rename' and self.b.loads:raise slot.SlotError('CONTROLLED_PRE_REPLACE')
+                self.b.slot_hook=refuse
+                with self.assertRaises(c.CoordinatorError):self.run_bridge()
+                self.assertEqual(self.b.record()['state'],'PENDING');self.assertEqual(self.b.loads,1)
+    def test_public_factory_operation_deadline_and_single_use(self):
+        production=c._Production();value=Mock();sentinel=object();value.operation.return_value=sentinel
+        with patch.object(package,'production',return_value=value) as factory:self.assertIs(production.package_operation(),sentinel)
+        factory.assert_called_once_with();value.operation.assert_called_once_with();value.initialize.assert_not_called()
+        for deadline in (True,float('inf'),100,150):
+            with self.assertRaises(c.CoordinatorError):self.run_bridge(deadline)
+        self.assertNotIn('package enter',self.b.events)
+        self.b.now=time.monotonic()
+        with patch.object(c,'_Production',return_value=self.b):result=c.activate_installed_pristine_pending_first(deadline=self.b.now+200)
+        self.assertEqual(result.state,'COMPLETE')
+        with self.fresh():
+            coordinator=c._Coordinator(self.b,clock=lambda:self.b.now)
+            coordinator.activate_installed_pristine_pending_first(deadline=1000)
+            with self.assertRaisesRegex(c.CoordinatorError,'^COORDINATOR_USED$'):coordinator.activate_installed_pristine_pending_first(deadline=1000)
 
 if __name__=='__main__':unittest.main()
