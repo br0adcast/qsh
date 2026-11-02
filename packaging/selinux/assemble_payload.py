@@ -19,7 +19,8 @@ import stat
 
 MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
-    'process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation'))
+    'process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation',
+    'consumer_activation','phase'))+('stop_guard.py',)
 _KEYS=frozenset(MODULES+('qshd.pp','artifact.json','qshd.fedora-selinux'))
 _PAM_SHA='61dc7f9dc6ada9a612a66b1bfda1f8d1802ec9734a9325edc4f600b0e55622c7'
 _SCHEMA=dict(name='qshd-selinux',architecture='noarch',policy_module='qshd',
@@ -99,7 +100,7 @@ def _imports(name,data):
             if node.level:_fail('SOURCE_IMPORT')
             imports=[node.module or '']
         for imported in imports:
-            if imported.startswith('qshd_selinux_') and imported not in allowed:_fail('SOURCE_IMPORT')
+            if (imported.startswith('qshd_selinux_') or imported=='stop_guard' or imported.startswith('stop_guard.')) and imported not in allowed:_fail('SOURCE_IMPORT')
 
 
 def _references(version,artifact,pp,pam):

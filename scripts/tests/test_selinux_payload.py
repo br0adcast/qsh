@@ -14,7 +14,29 @@ from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
 TOOL=ROOT/'packaging/selinux/assemble_payload.py'
-NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation'))
+NAMES=tuple('qshd_selinux_'+x+'.py' for x in ('activation','activation_state','contexts','transaction','fs','registry','process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation','consumer_activation','phase'))+('stop_guard.py',)
+
+
+class ImportClosureTests(unittest.TestCase):
+    def setUp(self):
+        spec=importlib.util.spec_from_file_location('payload',TOOL)
+        self.m=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.m)
+
+    def test_exact_twenty_code_modules_and_twenty_three_hash_keys(self):
+        self.assertEqual(self.m.MODULES,NAMES)
+        self.assertEqual(len(NAMES),20)
+        expected={name:'a'*64 for name in (*NAMES,'qshd.pp','artifact.json','qshd.fedora-selinux')}
+        self.assertEqual(len(expected),23)
+        self.assertEqual(self.m._expected(expected),expected)
+
+    def test_direct_stop_guard_imports_share_the_explicit_module_boundary(self):
+        for source in (b'import stop_guard',b'from stop_guard import Host',
+                       b'import qshd_selinux_phase',b'from qshd_selinux_consumer_activation import finalize_installed_owned_pending_consumer'):
+            with self.subTest(source=source):self.m._imports('qshd_selinux_phase.py',source)
+        for source in (b'import stop_guard.unreviewed',b'from stop_guard.unreviewed import Host',
+                       b'import qshd_selinux_unreviewed',b'from . import stop_guard'):
+            with self.subTest(source=source),self.assertRaisesRegex(ValueError,'^SOURCE_IMPORT$'):
+                self.m._imports('qshd_selinux_phase.py',source)
 
 
 class PayloadTests(unittest.TestCase):
@@ -43,8 +65,17 @@ class PayloadTests(unittest.TestCase):
         (self.source/'__pycache__').mkdir();(self.source/'__pycache__/cache.pyc').write_bytes(b'decoy')
         before={p:(p.read_bytes(),p.stat().st_mode) for p in self.source.iterdir() if p.is_file()}
         inventory=self.assemble();other=self.base/'second';self.assertEqual(inventory,self.assemble(other))
-        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),21)
+        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),24)
         prefix='usr/libexec/qshd-selinux/'
+        self.assertEqual(len(self.expected),23)
+        self.assertEqual(set(tree),{prefix+name for name in NAMES}|{
+            'usr/share/qshd-selinux/'+name for name in
+            ('reference.json','qshd.pp','artifact.json','qshd.fedora-selinux')})
+        self.assertEqual({item['path'] for item in inventory},set(tree))
+        for item in inventory:
+            value=tree[item['path']][0]
+            self.assertEqual((item['sha256'],item['size'],item['mode']),
+                             (hashlib.sha256(value).hexdigest(),len(value),0o644))
         for name in NAMES:self.assertEqual(tree[prefix+name][0],(self.source/name).read_bytes())
         for path in (self.pp,self.artifact,self.pam):self.assertEqual(tree['usr/share/qshd-selinux/'+path.name][0],path.read_bytes())
         generated=tree['usr/share/qshd-selinux/reference.json'][0]
@@ -84,6 +115,32 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.assemble()
         self.assertFalse(self.output.exists())
 
+    def test_new_phase_sources_require_trusted_hashes_and_presence_before_output(self):
+        for name in ('qshd_selinux_consumer_activation.py','qshd_selinux_phase.py','stop_guard.py'):
+            path=self.source/name;original=path.read_bytes()
+            with self.subTest(name=name,case='missing expected hash'):
+                expected={key:value for key,value in self.expected.items() if key!=name}
+                with self.assertRaisesRegex(ValueError,'^EXPECTED_KEYS$'):self.assemble(expected=expected)
+                self.assertFalse(self.output.exists())
+            with self.subTest(name=name,case='bytes differ from trusted hash'):
+                path.write_bytes(original+b'\n# Public integrity contrast.\n')
+                with self.assertRaisesRegex(ValueError,'^HASH_MISMATCH$'):self.assemble()
+                self.assertFalse(self.output.exists());path.write_bytes(original)
+            with self.subTest(name=name,case='missing supplied file'):
+                path.unlink()
+                with self.assertRaisesRegex(ValueError,'^ASSEMBLY_IO$'):self.assemble()
+                self.assertFalse(self.output.exists());path.write_bytes(original)
+        with self.assertRaisesRegex(ValueError,'^EXPECTED_KEYS$'):
+            self.assemble(expected=self.expected|{'unreviewed_helper.py':'a'*64})
+        self.assertFalse(self.output.exists())
+
+    def test_stop_guard_submodule_with_matching_hash_refuses_before_output(self):
+        path=self.source/'qshd_selinux_phase.py'
+        path.write_bytes(path.read_bytes()+b'\nfrom stop_guard.unreviewed import Host\n')
+        self.expected[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError,'^SOURCE_IMPORT$'):self.assemble()
+        self.assertFalse(self.output.exists())
+
     def test_output_existing_overlap_and_symlink_ancestor_into_input_refuse(self):
         self.output.mkdir()
         with self.assertRaises(ValueError):self.assemble()
@@ -115,7 +172,7 @@ class PayloadTests(unittest.TestCase):
         expected=self.base/'expected.json';expected.write_text(json.dumps(self.expected))
         code="import os,runpy,sys;os.umask(0o077);sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')"
         p=subprocess.run([sys.executable,'-I','-B','-c',code,str(TOOL),'--source',str(self.source),'--pp',str(self.pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
-        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),21)
+        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),24)
         self.assertTrue(all(v[1]==0o644 for v in self.tree(self.output).values()))
         self.assertTrue(all(p.stat().st_mode&0o777==0o755 for p in [self.output,*[p for p in self.output.rglob('*') if p.is_dir()]]))
 

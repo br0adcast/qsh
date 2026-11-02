@@ -35,7 +35,8 @@ class _Limits:
                 or not (0 < self.execution_seconds <= 15 or
                         (self.execution_seconds == 30 and self.output_bytes == 4096) or
                         (self.execution_seconds == 60 and self.output_bytes == 4096) or
-                        (self.execution_seconds == 75 and self.output_bytes == 1024 * 1024))
+                        (self.execution_seconds == 75 and self.output_bytes == 1024 * 1024) or
+                        (self.execution_seconds == 250 and self.output_bytes == 4096))
                 or type(self.output_bytes) is not int
                 or not 0 < self.output_bytes <= 4 * 1024 * 1024):
             raise _CommandError('COMMAND_LIMITS')
