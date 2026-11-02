@@ -515,9 +515,10 @@ fn refusal406_legacy_wait_preserves_physical_fact_without_clean_refund() {
             !monitor.wait_lost
                 && matches!(
                     monitor.failure,
-                    Some(MonitorFailure::Request(
-                        super::super::protocol::RequestDrainFailure::Exit
-                    ))
+                    Some(MonitorFailure::Exit(MonitorExitStatus::Signal {
+                        number: 9,
+                        core_dumped: false,
+                    }))
                 )
         );
         let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
@@ -534,9 +535,7 @@ fn refusal406_legacy_wait_preserves_physical_fact_without_clean_refund() {
         if code != 0 {
             assert_eq!(
                 state.monitors[&owner].failure,
-                Some(MonitorFailure::Request(
-                    super::super::protocol::RequestDrainFailure::Exit
-                ))
+                Some(MonitorFailure::Exit(MonitorExitStatus::Code(code)))
             );
             assert_eq!(
                 state.monitors[&owner].completion,
@@ -621,8 +620,87 @@ fn refusal406_legacy_wait_before_buffered_refusal_keeps_exit_failure() {
     assert!(retained.reaped && !retained.wait_lost && retained.completion.is_some());
     assert_eq!(
         retained.failure,
-        Some(MonitorFailure::Request(
-            super::super::protocol::RequestDrainFailure::Exit
-        ))
+        Some(MonitorFailure::Exit(MonitorExitStatus::Code(75)))
     );
+}
+
+
+#[test]
+fn monitor440_wait_status_diagnostic_is_not_a_request_drain_fault() {
+    let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
+    let monitor = state.monitors.get_mut(&owner).unwrap();
+    assert!(monitor.refusal_seal.is_none() && monitor.completion.is_none());
+    assert!(poll_monitor_wait_using(monitor, || Ok(
+        nix::sys::wait::WaitStatus::Exited(Pid::this(), 75)
+    )));
+    assert!(!monitor.reaped && !monitor.wait_lost);
+    assert_eq!(format!("{:?}", monitor.failure), "Some(Exit(Code(75)))");
+}
+
+
+#[test]
+fn monitor440_signal_facts_and_earlier_causes_survive_wait() {
+    use nix::sys::{signal::Signal, wait::WaitStatus};
+    for (signal, core_dumped) in [(Signal::SIGKILL, false), (Signal::SIGABRT, true)] {
+        let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
+        let monitor = state.monitors.get_mut(&owner).unwrap();
+        assert!(poll_monitor_wait_using(monitor, || Ok(WaitStatus::Signaled(
+            Pid::this(), signal, core_dumped
+        ))));
+        assert_eq!(monitor.failure, Some(MonitorFailure::Exit(MonitorExitStatus::Signal {
+            number: signal as i32, core_dumped,
+        })));
+        assert!(!monitor.reaped && !monitor.wait_lost);
+        let diagnostic = format!("{:?}", monitor.failure);
+        assert!(diagnostic.contains("Signal") && diagnostic.contains(&(signal as i32).to_string()));
+    }
+    for earlier in [MonitorFailure::Stream,
+        MonitorFailure::Request(super::super::protocol::RequestDrainFailure::Protocol),
+        MonitorFailure::Wait(nix::libc::EIO)] {
+        for signaled in [false, true] {
+            let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
+            let monitor = state.monitors.get_mut(&owner).unwrap();
+            monitor.failure = Some(earlier);
+            let status = if signaled {WaitStatus::Signaled(Pid::this(),Signal::SIGKILL,false)}
+                else {WaitStatus::Exited(Pid::this(),75)};
+            assert!(poll_monitor_wait_using(monitor, || Ok(status)));
+            assert_eq!(monitor.failure,Some(earlier));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn monitor440_native_encoded_status_is_preserved_without_signal_guessing() {
+    use crate::process_scope::scope::Progress;
+    for value in [75,137] {
+        let mut failure=None;
+        record_monitor_native_exit(&mut failure,&Progress::Complete(value));
+        assert_eq!(failure,Some(MonitorFailure::Exit(MonitorExitStatus::NativeEncoded(value))));
+        assert!(format!("{failure:?}").contains(&format!("NativeEncoded({value})")));
+    }
+    for progress in [Progress::Complete(0),Progress::Pending,Progress::Unknown] {
+        let mut failure=None;record_monitor_native_exit(&mut failure,&progress);
+        assert_eq!(failure,None);
+    }
+    let earlier=MonitorFailure::Request(super::super::protocol::RequestDrainFailure::Protocol);
+    let mut failure=Some(earlier);record_monitor_native_exit(&mut failure,&Progress::Complete(75));
+    assert_eq!(failure,Some(earlier));
+}
+
+#[test]
+fn monitor440_genuine_reported_exit_drain_fault_stays_request() {
+    let (mut state, owner, _peer) = pam40_controlled_retiring_monitor(false);
+    let seams=DirectSeam::new();
+    dispatch_monitor_event(seams.seams(),&mut state,owner,MonitorEvent::SessionClosed {
+        result:PamCompletion::NotOpened,cleanup_failure:None,
+        request_failure:Some(super::super::protocol::RequestDrainFailure::Exit),
+    });
+    let monitor=state.monitors.get_mut(&owner).unwrap();
+    assert!(poll_monitor_wait_using(monitor, || Ok(nix::sys::wait::WaitStatus::Exited(Pid::this(),75))));
+    monitor.reaped=true;
+    assert_eq!(monitor.failure,Some(MonitorFailure::Request(super::super::protocol::RequestDrainFailure::Exit)));
+    finish_retired(&mut state,owner);
+    assert!(state.monitors.contains_key(&owner) && state.retired.contains(&owner));
+    assert_eq!(state.pam_cleanup,PamCompletion::NotOpened);
 }
