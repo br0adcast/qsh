@@ -219,3 +219,140 @@ class ChildTests(unittest.TestCase):
                 self.assertEqual(result['error'],'DEADLINE')
                 self.assertLess(result['elapsed'],5)
                 self.assertNotIn('capture-slot',events)
+
+class InstalledTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile, hashlib
+        from unittest.mock import patch
+        import qshd_selinux_package_state as package
+        import qshd_selinux_reference_loader as references
+        import qshd_selinux_observer as observer
+        self.m=observer;self.patch=patch
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name);self.common=self.root/'qshd'
+        self.pkg=lambda:package.PackageState(self.common,uid=__import__('os').getuid(),anchor=self.root)
+        with self.pkg().initialize():pass
+        spec=importlib.util.spec_from_file_location('builder',ROOT/'assemble_payload.py')
+        builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
+        pp=self.root/'qshd.pp';pp.write_bytes(b'inert synthetic PP')
+        artifact=ROOT/'artifact.json';pam=ROOT.parent/'pam.d/qshd.fedora-selinux'
+        expected={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in builder.MODULES}
+        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,artifact,pam)})
+        self.out=self.root/'installed';builder.assemble_payload(ROOT,pp,artifact,pam,expected,self.out,1000000000)
+        self.reader=lambda:references._testing_references(self.out)
+        self.document=self.out/'usr/share/qshd-selinux/reference.json'
+        self.now=100
+
+    def invoke(self,child,deadline=200):
+        import qshd_selinux_package_state as package
+        import qshd_selinux_reference_loader as references
+        with self.patch.object(package,'production',self.pkg),self.patch.object(references,'production_references',self.reader),self.patch.object(self.m,'_preconditions'),self.patch.object(self.m.time,'monotonic',lambda:self.now),self.patch.object(self.m,'observe_managed_prestart',side_effect=child) as run:
+            try:return self.m.observe_installed_managed_prestart(deadline=deadline)
+            finally:self.last_run=run
+
+    def test_installed_holds_only_one_package_lease_and_rechecks(self):
+        import fcntl,os
+        def child(trust,pam):
+            fd=os.open(self.common/'selinux-package.lock',os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:os.close(fd)
+            with self.reader() as reader:
+                value=reader.capture();reader.recheck(value)
+            self.assertEqual((trust,pam),(value.artifact,value.expected_pam))
+            return 'observed'
+        self.assertEqual(self.invoke(child),'observed')
+        self.last_run.assert_called_once()
+        with self.pkg().operation():pass
+
+    def test_insufficient_or_invalid_caller_deadline_never_starts_child(self):
+        for deadline in (True,float('nan'),170,169,100):
+            with self.subTest(deadline=deadline),self.assertRaises(self.m.ObserverError):self.invoke(lambda *a:'unexpected',deadline)
+            self.last_run.assert_not_called()
+
+    def test_pending_waits_for_reference_and_package_finalization(self):
+        def pending(*args):raise self.m.ObserverError('ACTIVATION_PENDING')
+        with self.assertRaisesRegex(self.m.ObserverError,'^ACTIVATION_PENDING$'):self.invoke(pending)
+        with self.pkg().operation():pass
+        def drift(*args):
+            self.document.write_bytes(self.document.read_bytes()+b' ')
+            raise self.m.ObserverError('ACTIVATION_PENDING')
+        with self.assertRaises(self.m.ObserverError) as error:self.invoke(drift)
+        self.assertNotEqual(str(error.exception),'ACTIVATION_PENDING')
+
+    def test_child_success_or_pending_after_deadline_is_refused(self):
+        for pending in (False,True):
+            def late(*args):
+                self.now=201
+                if pending:raise self.m.ObserverError('ACTIVATION_PENDING')
+                return 'observed'
+            self.now=100
+            with self.assertRaisesRegex(self.m.ObserverError,'^DEADLINE$'):self.invoke(late)
+
+    def test_package_exit_failure_dominates_pending(self):
+        from contextlib import contextmanager
+        original=self.pkg
+        class BadExit:
+            @contextmanager
+            def operation(inner):
+                with original().operation():yield
+                raise OSError('controlled package close failure')
+        self.pkg=lambda:BadExit()
+        def pending(*args):raise self.m.ObserverError('ACTIVATION_PENDING')
+        with self.assertRaisesRegex(self.m.ObserverError,'^INSTALLED_REFUSED$'):self.invoke(pending)
+
+    def test_remaining_budget_is_checked_after_reference_capture(self):
+        from contextlib import contextmanager
+        original=self.reader
+        @contextmanager
+        def delayed():
+            with original() as reader:
+                class Reader:
+                    def capture(inner):
+                        value=reader.capture();self.now=131;return value
+                    def recheck(inner,value):return reader.recheck(value)
+                yield Reader()
+        self.reader=delayed
+        with self.assertRaisesRegex(self.m.ObserverError,'^DEADLINE$'):self.invoke(lambda *a:'unexpected')
+        self.last_run.assert_not_called()
+
+    def test_child_custody_refusal_is_never_reclassified_pending(self):
+        def failed(*args):raise self.m.ObserverError('CUSTODY')
+        with self.assertRaisesRegex(self.m.ObserverError,'^CUSTODY$'):self.invoke(failed)
+
+    def test_expired_child_result_starts_no_reference_recheck(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        original=self.reader;recheck=Mock()
+        @contextmanager
+        def recorded():
+            with original() as reader:
+                class Reader:
+                    capture=reader.capture
+                    def recheck(inner,value):recheck();return reader.recheck(value)
+                yield Reader()
+        self.reader=recorded
+        for pending in (False,True):
+            def late(*args):
+                self.now=201
+                if pending:raise self.m.ObserverError('ACTIVATION_PENDING')
+                return 'observed'
+            self.now=100
+            with self.assertRaisesRegex(self.m.ObserverError,'^DEADLINE$'):self.invoke(late)
+            recheck.assert_not_called()
+
+    def test_expired_scope_admission_starts_no_reference_capture(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        original=self.reader;capture=Mock()
+        @contextmanager
+        def delayed():
+            with original() as reader:
+                self.now=131
+                class Reader:
+                    def capture(inner):capture();return reader.capture()
+                    recheck=reader.recheck
+                yield Reader()
+        self.reader=delayed
+        with self.assertRaisesRegex(self.m.ObserverError,'^DEADLINE$'):self.invoke(lambda *a:'unexpected')
+        capture.assert_not_called();self.last_run.assert_not_called()

@@ -10,6 +10,7 @@ import base64
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -109,6 +110,46 @@ def _parse_response(data,encoded):
         if data!=_response(encoded,binding):_fail('RESPONSE')
         return ManagedPrestartObservation(_PROFILE,binding)
     except (ValueError,TypeError,KeyError,UnicodeError,RecursionError):_fail('RESPONSE')
+
+
+def observe_installed_managed_prestart(*,deadline):
+    """Observe installed references while owning one existing package lease.
+
+    The finite caller deadline also needs an external hard owner. Parent clock
+    checks cannot interrupt filesystem calls. More than 70 seconds must remain
+    before the unchanged 60-second child and its 10-second settlement allowance.
+    Activation/context leases belong to that child, never this parent scope.
+    """
+    if type(deadline) not in (int,float) or not math.isfinite(deadline):_fail('DEADLINE')
+    def check(reserve=0):
+        if time.monotonic()+reserve>=deadline:_fail('DEADLINE')
+    check(70)
+    try:
+        _preconditions()
+        from qshd_selinux_package_state import production
+        from qshd_selinux_reference_loader import production_references
+        pending=False
+        with production().operation():
+            with production_references() as reader:
+                check(70)
+                captured=reader.capture()
+                check(70)
+                try:
+                    result=observe_managed_prestart(captured.artifact,captured.expected_pam)
+                except ObserverError as error:
+                    if str(error)!='ACTIVATION_PENDING':raise
+                    pending=True
+                check()
+                reader.recheck(captured)
+                check()
+        check()
+        if pending:_fail('ACTIVATION_PENDING')
+        return result
+    except ObserverError:raise
+    except _CommandError as error:
+        raise ObserverError('CALLER_PROCESS') from error
+    except Exception as error:
+        raise ObserverError('INSTALLED_REFUSED') from error
 
 
 def observe_managed_prestart(trusted_artifact,expected_pam):
