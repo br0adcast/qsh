@@ -271,3 +271,108 @@ fn private_key_read_rejects_directory_socket_and_device() {
         assert!(read_text(path).is_err());
     }
 }
+
+#[test]
+fn private_key_read_uses_one_fixed_destination_through_the_sentinel() {
+    struct FixedDestination {
+        remaining: usize,
+        used: usize,
+        base: Option<usize>,
+        calls: usize,
+    }
+    impl io::Read for FixedDestination {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert_eq!(
+                buffer.len(),
+                LIMIT + 1 - self.used,
+                "fixed remaining read budget"
+            );
+            let base = (buffer.as_ptr() as usize).checked_sub(self.used).unwrap();
+            if let Some(expected) = self.base {
+                assert!(base == expected, "read destination must not move");
+            } else {
+                self.base = Some(base);
+            }
+            self.calls += 1;
+            let count = self.remaining.min(buffer.len()).min(8191);
+            buffer[..count].fill(b'x');
+            self.remaining -= count;
+            self.used += count;
+            Ok(count)
+        }
+    }
+    for size in [0, 17, LIMIT, LIMIT + 32] {
+        let mut reader = FixedDestination {
+            remaining: size,
+            used: 0,
+            base: None,
+            calls: 0,
+        };
+        let result = read_bounded(&mut reader);
+        assert_eq!(reader.used, size.min(LIMIT + 1));
+        assert!(reader.calls > 0);
+        if size <= LIMIT {
+            assert_eq!(result.unwrap().len(), size);
+        } else {
+            assert!(
+                matches!(result, Err(KeyFileError::Io(ref e)) if e.kind() == io::ErrorKind::InvalidData)
+            );
+            assert_eq!(reader.remaining, 31, "no read beyond the overflow sentinel");
+        }
+    }
+}
+
+#[test]
+fn private_key_read_retries_interrupted_and_preserves_split_utf8() {
+    struct InterruptedChunks {
+        step: usize,
+    }
+    impl io::Read for InterruptedChunks {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let result = match self.step {
+                0 | 2 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                1 => {
+                    buffer[0] = 0xc3;
+                    Ok(1)
+                }
+                3 => {
+                    buffer[0] = 0xa9;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            };
+            self.step += 1;
+            result
+        }
+    }
+    let mut reader = InterruptedChunks { step: 0 };
+    assert_eq!(&**read_bounded(&mut reader).unwrap(), "é");
+    assert_eq!(reader.step, 5);
+}
+
+#[test]
+fn private_key_read_errors_do_not_disclose_a_partial_prefix() {
+    struct PartialFailure {
+        read: bool,
+    }
+    impl io::Read for PartialFailure {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.read {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            self.read = true;
+            buffer[..16].copy_from_slice(b"synthetic-secret");
+            Ok(16)
+        }
+    }
+    let error = read_bounded(&mut PartialFailure { read: false }).unwrap_err();
+    assert!(
+        matches!(error, KeyFileError::Io(ref e) if e.kind() == io::ErrorKind::PermissionDenied)
+    );
+    assert!(!error.to_string().contains("synthetic-secret"));
+    let mut invalid = io::Cursor::new(b"synthetic-secret\xff");
+    let error = read_bounded(&mut invalid).unwrap_err();
+    assert!(matches!(error, KeyFileError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
+    assert!(!error.to_string().contains("synthetic-secret"));
+    assert_eq!(invalid.position(), 17);
+}
