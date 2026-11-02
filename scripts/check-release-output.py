@@ -4,10 +4,13 @@ import argparse
 import errno
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
 import select
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -103,10 +106,288 @@ def digest(stream):
     return result.digest()
 
 
-def check_archive(path, inputs, version, target):
+# Producer-only static evidence. Apple text formats are documented in cctools'
+# loader.h/ofile_print.c; this does not parse Mach-O bytes or select an OS floor.
+DARWIN_TARGETS = {'aarch64-apple-darwin': 'arm64', 'x86_64-apple-darwin': 'x86_64'}
+METADATA_LIMIT = 65536
+
+
+METADATA_CATEGORIES = frozenset(('static-tool','rust-toolchain','rust-version',
+    'rust-deployment','sdk-path','sdk-version','xcode-version','host-arch',
+    'macos-version','macos-build','otool-path','lipo-path','binary-arch','binary-load-commands'))
+
+
+def _metadata_failure(category, reason):
+    return ValueError('Darwin metadata '+category+': '+reason)
+
+
+def _metadata_home(value):
+    return (type(value) is str and bool(value) and not any(c in value for c in '\0\n\r')
+            and Path(value).is_absolute() and str(Path(value))==value and '..' not in Path(value).parts)
+
+
+def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_homes=None):
+    """Bounded static-tool query; retain and reap the exact direct child."""
+    if type(category) is not str or category not in METADATA_CATEGORIES:
+        raise ValueError('invalid Darwin metadata query category')
+    if toolchain_homes is not None and (category!='rust-toolchain'
+            or type(toolchain_homes) is not dict or set(toolchain_homes)!={'RUSTUP_HOME','CARGO_HOME'}
+            or not all(_metadata_home(value) for value in toolchain_homes.values())):
+        raise ValueError('invalid Darwin metadata toolchain homes')
+    with tempfile.TemporaryDirectory(prefix='qsh-release-metadata-') as home:
+        env = os.environ.copy()
+        env.update(HOME=home, XDG_CACHE_HOME=home+'/cache', XDG_CONFIG_HOME=home+'/config',
+                   HISTFILE='/dev/null', LANG='C', LC_ALL='C')
+        env.pop('SSH_AUTH_SOCK', None)
+        env.pop('RUSTUP_HOME', None)
+        env.pop('CARGO_HOME', None)
+        env.update(RUSTUP_AUTO_INSTALL='0', RUSTUP_NO_UPDATE_CHECK='1')
+        if toolchain_homes is not None: env.update(toolchain_homes)
+        child = None
+        try:
+            deadline = time.monotonic()+timeout
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, env=env, start_new_session=True)
+            pipes = [child.stdout, child.stderr]
+            captured = [bytearray(), bytearray()]
+            live = set(range(2))
+            for pipe in pipes: os.set_blocking(pipe.fileno(), False)
+            while live:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0: raise _metadata_failure(category,'timed out')
+                ready, _, _ = select.select([pipes[i] for i in live], [], [], remaining)
+                if not ready: raise _metadata_failure(category,'timed out')
+                for index in tuple(live):
+                    if pipes[index] not in ready: continue
+                    try: data = os.read(pipes[index].fileno(), 4096)
+                    except BlockingIOError: continue
+                    if not data: live.remove(index); continue
+                    if sum(map(len, captured))+len(data)>METADATA_LIMIT:
+                        raise _metadata_failure(category,'output limit')
+                    captured[index].extend(data)
+            try: status=child.wait(timeout=max(0,deadline-time.monotonic()))
+            except subprocess.TimeoutExpired: raise _metadata_failure(category,'timed out')
+            if time.monotonic()>=deadline: raise _metadata_failure(category,'timed out')
+            if status or captured[1]: raise _metadata_failure(category,'tool refused')
+            return bytes(captured[0])
+        except OSError:
+            raise _metadata_failure(category,'tool unavailable') from None
+        finally:
+            if child is not None:
+                if child.poll() is None: child.kill()
+                child.wait()
+                for pipe in (child.stdout, child.stderr):
+                    if pipe is not None: pipe.close()
+
+
+def _metadata_token(value, pattern, limit=256):
+    if type(value) is not str or len(value)>limit or re.fullmatch(pattern,value) is None:
+        raise ValueError('invalid Darwin metadata field')
+    return value
+
+
+def _metadata_version(value):
+    return _metadata_token(value,r'[0-9]{1,5}(?:\.[0-9]{1,3}){0,2}',20)
+
+
+def parse_darwin_load_commands(data):
+    if len(data)>METADATA_LIMIT: raise ValueError('Darwin metadata output exceeds limit')
+    blocks=[];current=None
+    for line in data.decode('utf-8').splitlines():
+        match=re.fullmatch(r'\s*cmd (LC_[A-Z0-9_]+)\s*',line)
+        if match:
+            current={'cmd':match.group(1)};blocks.append(current)
+        elif current is not None:
+            field=re.fullmatch(r'\s*(platform|minos|sdk|version)\s+(\S+)\s*',line)
+            if field and ((current['cmd']=='LC_BUILD_VERSION' and field.group(1)!='version') or
+                          (current['cmd']=='LC_VERSION_MIN_MACOSX' and field.group(1) in ('version','sdk'))):
+                if field.group(1) in current: raise ValueError('ambiguous Darwin version metadata')
+                current[field.group(1)]=field.group(2)
+    selected=[block for block in blocks if block['cmd']=='LC_BUILD_VERSION' or block['cmd'].startswith('LC_VERSION_MIN_')]
+    if len(selected)!=1: raise ValueError('missing or ambiguous Darwin version command')
+    value=selected[0];kind=value['cmd']
+    if kind=='LC_BUILD_VERSION':
+        if set(value)!={'cmd','platform','minos','sdk'} or value['platform'] not in ('1','MACOS'):
+            raise ValueError('unexpected Darwin platform metadata')
+        minimum=value['minos']
+    elif kind=='LC_VERSION_MIN_MACOSX':
+        if set(value)!={'cmd','version','sdk'}: raise ValueError('invalid Darwin version metadata')
+        minimum=value['version']
+    else: raise ValueError('unexpected Darwin platform metadata')
+    return dict(kind=kind,platform='macos',minos=_metadata_version(minimum),
+                sdk=None if value['sdk']=='n/a' else _metadata_version(value['sdk']))
+
+
+def _metadata_digest(path):
+    info=Path(path).lstat()
+    if not stat.S_ISREG(info.st_mode) or not 0<info.st_size<=256*1024**2:
+        raise ValueError('invalid Darwin metadata input')
+    with Path(path).open('rb') as stream: return digest(stream).hex()
+
+
+def _metadata_text(argv, *, category, toolchain_homes=None):
+    try:
+        return metadata_command(argv,category=category,toolchain_homes=toolchain_homes).decode('utf-8').strip()
+    except UnicodeDecodeError:
+        raise _metadata_failure(category,'invalid output') from None
+
+
+def _metadata_rustc():
+    home=os.environ.get('HOME')
+    if not _metadata_home(home): raise ValueError('invalid Darwin metadata toolchain homes')
+    homes={key:os.environ.get(key) or str(Path(home)/suffix)
+           for key,suffix in (('RUSTUP_HOME','.rustup'),('CARGO_HOME','.cargo'))}
+    if not all(_metadata_home(value) for value in homes.values()):
+        raise ValueError('invalid Darwin metadata toolchain homes')
+    selected=os.environ.get('RUSTUP_TOOLCHAIN')
+    if type(selected) is not str or re.fullmatch(r'[A-Za-z0-9_.+-]{1,128}',selected) is None:
+        raise ValueError('invalid Darwin metadata selected toolchain')
+    located=shutil.which('rustup')
+    try:
+        if located is None or not Path(located).is_absolute():
+            raise _metadata_failure('rust-toolchain','tool unavailable')
+        rustup=Path(located).resolve(strict=True)
+        raw=metadata_command([str(rustup),'which','--toolchain',selected,'rustc'],
+                             category='rust-toolchain',toolchain_homes=homes)
+        value=raw.decode('utf-8')
+        if value.endswith('\n'):value=value[:-1]
+        if not _metadata_home(value):raise ValueError()
+        compiler=Path(value).resolve(strict=True)
+        info=compiler.stat()
+        if os.path.samefile(compiler,rustup) or not stat.S_ISREG(info.st_mode) or not os.access(compiler,os.X_OK):raise ValueError()
+        return compiler
+    except (UnicodeDecodeError,OSError,RuntimeError):
+        raise _metadata_failure('rust-toolchain','invalid output') from None
+    except ValueError as error:
+        if str(error).startswith('Darwin metadata '):raise
+        raise _metadata_failure('rust-toolchain','invalid output') from None
+
+
+def _metadata_compiler_identity(path):
+    try:
+        info=path.stat()
+        if not stat.S_ISREG(info.st_mode):raise OSError()
+        return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+    except OSError:
+        raise _metadata_failure('rust-toolchain','invalid output') from None
+
+
+def _metadata_compiler_version(text):
+    if type(text) is not str: raise ValueError('invalid compiler metadata')
+    match=re.match(r'(?:Apple clang|Apple LLVM|clang) version ([0-9]+(?:\.[0-9]+){1,2})(?: |$)',text.splitlines()[0])
+    if match is None: raise ValueError('invalid compiler metadata')
+    return _metadata_version(match.group(1))
+
+
+def _metadata_native(prefix,target,sdk):
+    with (Path(prefix)/'manifest.json').open('rb') as stream: raw=stream.read(262145)
+    if len(raw)>262144: raise ValueError('native metadata exceeds limit')
+    try:
+        value=json.loads(raw);identity=value['identity'];compiler=identity['compiler']
+        if identity['target']!=target: raise ValueError('native metadata target mismatch')
+        flags=compiler['flags'];normalized=[];index=0;seen=set()
+        if type(flags) is not list or len(flags)>32: raise ValueError('invalid native metadata flags')
+        while index<len(flags):
+            flag=flags[index]
+            if flag in ('-arch','-isysroot'):
+                if flag in seen or index+1>=len(flags): raise ValueError('invalid native metadata flags')
+                seen.add(flag);operand=flags[index+1]
+                if flag=='-arch' and operand!=DARWIN_TARGETS[target]: raise ValueError('native metadata architecture mismatch')
+                if flag=='-isysroot' and Path(operand).resolve()!=Path(sdk).resolve(): raise ValueError('native metadata SDK mismatch')
+                normalized.extend([flag,'<SDK>' if flag=='-isysroot' else operand]);index+=2
+            else:
+                _metadata_token(flag,r'-(?:O[0-3s]|fPIC|g0|mmacosx-version-min=[0-9]+(?:\.[0-9]+){0,2})')
+                normalized.append(flag);index+=1
+        if seen!={'-arch','-isysroot'}: raise ValueError('missing native metadata flags')
+        macros={}
+        allowed={'__APPLE__','__aarch64__','__arm64__','__x86_64__','__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__','__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__'}
+        for line in compiler['macros'].splitlines():
+            match=re.fullmatch(r'#define (\S+) (\S+)',line)
+            if match and match.group(1) in allowed:
+                if match.group(1) in macros: raise ValueError('ambiguous native metadata macro')
+                macros[match.group(1)]=_metadata_token(match.group(2),r'[0-9]+',20)
+        result=dict(version=_metadata_token(identity['source']['version'],r'[0-9]+(?:\.[0-9]+){1,2}'),
+                    manifest_sha256=hashlib.sha256(raw).hexdigest(),
+                    compiler_sha256=_metadata_token(compiler['sha256'],r'[0-9a-f]{64}',64),
+                    compiler_version=_metadata_compiler_version(compiler['version']),
+                    flags=normalized,macros=macros)
+        probe=_metadata_token(value['artifacts']['version-probe'],r'[0-9a-f]{64}',64)
+        return result,probe
+    except (KeyError,TypeError,AttributeError,IndexError,RecursionError):
+        raise ValueError('invalid native metadata manifest') from None
+
+
+def _darwin_context(prefix,target):
+    if sys.platform!='darwin': raise ValueError('Darwin metadata requires the Darwin producer')
+    sdk=_metadata_text(['/usr/bin/xcrun','--show-sdk-path'],category='sdk-path')
+    if not Path(sdk).is_absolute(): raise ValueError('invalid selected SDK metadata')
+    native,probe=_metadata_native(prefix,target,sdk)
+    xcode=_metadata_text(['/usr/bin/xcodebuild','-version'],category='xcode-version').splitlines()
+    if len(xcode)!=2 or not xcode[0].startswith('Xcode ') or not xcode[1].startswith('Build version '):
+        raise ValueError('invalid Xcode metadata')
+    compiler=_metadata_rustc();identity=_metadata_compiler_identity(compiler)
+    rust={}
+    for line in _metadata_text([str(compiler),'--version','--verbose'],category='rust-version').splitlines():
+        key,separator,item=line.partition(': ')
+        if separator and key in ('release','commit-hash','host'):
+            if key in rust: raise ValueError('ambiguous Rust metadata')
+            rust[key]=_metadata_token(item,r'[A-Za-z0-9_.+-]+')
+    if set(rust)!={'release','commit-hash','host'}: raise ValueError('missing Rust metadata')
+    reported=_metadata_text([str(compiler),'--print=deployment-target','--target',target],category='rust-deployment')
+    if not reported.startswith('MACOSX_DEPLOYMENT_TARGET='): raise ValueError('invalid Rust deployment metadata')
+    rust['reported_deployment_target']=_metadata_version(reported.split('=',1)[1])
+    if _metadata_compiler_identity(compiler)!=identity:
+        raise _metadata_failure('rust-toolchain','invalid output')
+    explicit=os.environ.get('MACOSX_DEPLOYMENT_TARGET')
+    rust['explicit_deployment_target']=None if explicit is None else _metadata_version(explicit)
+    result=dict(schema=1,target=target,
+        source=dict(sha=_metadata_token(os.environ.get('GITHUB_SHA'),r'[0-9a-f]{40}',40),
+                    run_id=_metadata_token(os.environ.get('GITHUB_RUN_ID'),r'[0-9]+',30),
+                    run_attempt=_metadata_token(os.environ.get('GITHUB_RUN_ATTEMPT'),r'[0-9]+',10)),
+        host=dict(arch=_metadata_token(_metadata_text(['/usr/bin/uname','-m'],category='host-arch'),r'arm64|x86_64'),
+                  macos_version=_metadata_version(_metadata_text(['/usr/bin/sw_vers','-productVersion'],category='macos-version')),
+                  macos_build=_metadata_token(_metadata_text(['/usr/bin/sw_vers','-buildVersion'],category='macos-build'),r'[A-Za-z0-9.-]+',64),
+                  image_version=None if 'ImageVersion' not in os.environ else _metadata_token(os.environ['ImageVersion'],r'[A-Za-z0-9_.-]+',80)),
+        sdk=dict(version=_metadata_version(_metadata_text(['/usr/bin/xcrun','--show-sdk-version'],category='sdk-version')),
+                 xcode_version=_metadata_version(xcode[0][6:]),xcode_build=_metadata_token(xcode[1][14:],r'[A-Za-z0-9.-]+',64)),
+        rust=rust,native=native,binaries=[])
+    tools={name:_metadata_text(['/usr/bin/xcrun','--find',name],category='otool-path' if name=='otool' else 'lipo-path') for name in ('otool','lipo')}
+    if any(not Path(path).is_absolute() for path in tools.values()): raise ValueError('invalid Darwin tool metadata')
+    return result,tools,probe
+
+
+def _darwin_binary(path,role,program,target,tools):
+    before=_metadata_digest(path)
+    arch=_metadata_text([tools['lipo'],'-archs',str(path)],category='binary-arch')
+    if arch!=DARWIN_TARGETS[target]: raise ValueError('Darwin metadata architecture mismatch')
+    try:
+        command=parse_darwin_load_commands(metadata_command([tools['otool'],'-l',str(path)],category='binary-load-commands'))
+    except UnicodeDecodeError:
+        raise _metadata_failure('binary-load-commands','invalid output') from None
+    if _metadata_digest(path)!=before: raise ValueError('Darwin metadata input changed')
+    return dict(role=role,program=program,sha256=before,arch=arch,version_command=command)
+
+
+def _write_darwin_metadata(path,value):
+    raw=(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode('ascii')
+    if len(raw)>32768: raise ValueError('Darwin evidence exceeds limit')
+    fd,temporary=tempfile.mkstemp(prefix='.darwin-metadata-',dir=Path(path).parent)
+    try:
+        with os.fdopen(fd,'wb') as stream: stream.write(raw)
+        os.link(temporary,path)  # Exclusive publication; never replace prior evidence.
+    finally: os.unlink(temporary)
+
+
+def check_archive(path, inputs, version, target, *, darwin_metadata=None, native_prefix=None):
+    enabled=darwin_metadata is not None
+    if enabled!=(native_prefix is not None) or (enabled and target not in DARWIN_TARGETS):
+        raise ValueError('Darwin metadata arguments require a selected Darwin pair')
+    if enabled and os.path.lexists(darwin_metadata): raise ValueError('Darwin evidence already exists')
+    evidence,tools,probe=_darwin_context(native_prefix,target) if enabled else (None,None,None)
     root = 'qsh-' + version + '-' + target
     if Path(path).name != root + '.tar.gz':
         raise ValueError('archive filename differs from selected version/target')
+    verified={}
     with tarfile.open(str(path), 'r:gz') as archive:
         members = archive.getmembers()
         names = set()
@@ -135,6 +416,31 @@ def check_archive(path, inputs, version, target):
                 archived = digest(stream)
             if before != after or before != archived:
                 raise ValueError('archive payload differs from the probed binary')
+            verified[program]=before.hex()
+
+        if enabled:
+            with tempfile.TemporaryDirectory(prefix='qsh-release-static-') as directory:
+                for program in ('qsh','qshd'):
+                    source=Path(inputs)/program
+                    member=next(member for member in members if member.name==root+'/'+program)
+                    if not 0<member.size<=256*1024**2: raise ValueError('invalid Darwin archive metadata size')
+                    extracted=Path(directory)/program
+                    with archive.extractfile(member) as stream,extracted.open('xb') as destination:
+                        remaining=member.size
+                        while remaining:
+                            data=stream.read(min(65536,remaining))
+                            if not data: raise ValueError('truncated Darwin metadata input')
+                            destination.write(data);remaining-=len(data)
+                    staged=_darwin_binary(source,'staged',program,target,tools)
+                    copied=_darwin_binary(extracted,'extracted',program,target,tools)
+                    with archive.extractfile(member) as stream: archived=digest(stream).hex()
+                    if staged['sha256']!=copied['sha256'] or copied['sha256']!=archived or archived!=verified[program]:
+                        raise ValueError('Darwin metadata archive identity changed')
+                    evidence['binaries'].extend([staged,copied])
+            native=_darwin_binary(Path(native_prefix)/'version-probe','native-probe','version-probe',target,tools)
+            if native['sha256']!=probe: raise ValueError('native metadata probe identity mismatch')
+            evidence['binaries'].append(native)
+            _write_darwin_metadata(darwin_metadata,evidence)
 
 
 def debian_version(version):
@@ -218,6 +524,8 @@ def main():
         if name == 'archive':
             command.add_argument('--inputs', required=True)
             command.add_argument('--target', required=True)
+            command.add_argument('--darwin-metadata')
+            command.add_argument('--native-prefix')
             command.add_argument('path')
         if name == 'package':
             command.add_argument('--probe', action='store_true')
@@ -228,7 +536,8 @@ def main():
         if args.version is not None and not _version.valid_version(args.version):
             raise ValueError('invalid selected version')
         if args.command == 'archive':
-            check_archive(args.path, args.inputs, args.version, args.target)
+            check_archive(args.path, args.inputs, args.version, args.target,
+                          darwin_metadata=args.darwin_metadata,native_prefix=args.native_prefix)
         elif args.command == 'package':
             check_package(args.path, args.format, args.program, args.version, args.arch, args.probe)
         else:
