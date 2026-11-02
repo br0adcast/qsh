@@ -176,7 +176,7 @@ jobs:
           path: dist/
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     # Both architectures build on one runner and must execute there; see the
     # `linux` job's timeout for why this is bounded at all.
     timeout-minutes: 45
