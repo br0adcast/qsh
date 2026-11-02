@@ -1,6 +1,7 @@
 """Build orchestration tests; all input and cache state belongs to each test."""
 import json
 import os
+import platform
 import signal
 import sys
 import time
@@ -613,6 +614,10 @@ open my $in, '<', 'Makefile.in' or die $!;
 open my $out, '>', 'Makefile' or die $!;
 while (<$in>) { s/INSTALL_PREFIX/$prefix/g; print $out $_; }
 ''')
+        # GNU ar's default plugin target dlopens every host BFD plugin. On the
+        # Linux CI image that includes LLVMgold for each installed clang and
+        # its libLLVM, whose first, cold load can exceed the result deadline.
+        # The explicit ELF target archives the same bytes without plugins.
         (source / 'Makefile.in').write_text(r'''all:
 	@test -z "$$QSH_TEST_BUILD_FAIL"
 	@if [ -n "$$QSH_TEST_BUILD_HOLD" ]; then echo held >&2; cat "$$QSH_TEST_BUILD_HOLD"; fi
@@ -623,8 +628,8 @@ install_sw:
 	printf 'unsigned long OpenSSL_version_num(void);\n' > $(DESTDIR)INSTALL_PREFIX/include/openssl/crypto.h
 	printf 'unsigned long OpenSSL_version_num(void){return 0x30500090UL;} const char *configured_prefix = "INSTALL_PREFIX";\n' > version.c
 	$(CC) -c version.c -o version.o
-	$(AR) rcs $(DESTDIR)INSTALL_PREFIX/lib/libcrypto.a version.o
-	$(AR) rcs $(DESTDIR)INSTALL_PREFIX/lib/libssl.a version.o
+	$(AR) --target=elf64-x86-64 rcs $(DESTDIR)INSTALL_PREFIX/lib/libcrypto.a version.o
+	$(AR) --target=elf64-x86-64 rcs $(DESTDIR)INSTALL_PREFIX/lib/libssl.a version.o
 ''')
         (source / 'LICENSE.txt').write_text('Generated test fixture; no upstream code.\n')
         with tarfile.open(self.archive, 'w:gz') as archive:
@@ -707,7 +712,7 @@ install_sw:
         calls = self.root / 'archiver-calls'
         actual = shutil.which('ar')
         self.assertIsNotNone(actual)
-        archiver.write_text('#!/bin/sh\nprintf "%s\\n" "$2" >> ' +
+        archiver.write_text('#!/bin/sh\nprintf "%s\\n" "$3" >> ' +
                             shlex.quote(str(calls)) + '\nexec ' +
                             shlex.quote(actual) + ' "$@"\n')
         archiver.chmod(0o755)
@@ -727,6 +732,29 @@ install_sw:
         self.assertEqual(cached.stdout, second.stdout)
         self.assertEqual(len(self.count.read_text().splitlines()), 2)
         self.assertEqual([Path(line).name for line in calls.read_text().splitlines()], archives * 2)
+
+    @unittest.skipUnless(platform.libc_ver()[0] == 'glibc',
+                         'dynamic loads are traced with the glibc loader')
+    def test_fixture_archiving_loads_no_host_bfd_plugins(self):
+        import shlex
+        import shutil
+        archiver = self.tools / 'traced-ar'
+        traces = self.root / 'archiver-loads'
+        traces.mkdir()
+        actual = shutil.which('ar')
+        self.assertIsNotNone(actual)
+        archiver.write_text('#!/bin/sh\nLD_DEBUG=files LD_DEBUG_OUTPUT=' +
+                            shlex.quote(str(traces / 'ar')) + ' exec ' +
+                            shlex.quote(actual) + ' "$@"\n')
+        archiver.chmod(0o755)
+        result = self.run_build('--ar', str(archiver))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        loads = [path.read_text() for path in sorted(traces.iterdir())]
+        self.assertEqual(len(loads), 2, 'each archive is traced once')
+        self.assertTrue(all('file=' in load for load in loads), 'loader trace is empty')
+        plugins = [line.split()[1] for load in loads for line in load.splitlines()
+                   if 'dynamically loaded by' in line]
+        self.assertEqual(plugins, [], 'fixture archiving loaded host BFD plugins')
 
     def test_selected_archiver_failure_publishes_nothing(self):
         import shlex
