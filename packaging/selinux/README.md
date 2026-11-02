@@ -152,3 +152,29 @@ capability names.
 The native RPM's Fedora 44 targeted-policy bounds and phase-specific dependency
 headers must be finalized from actual package headers before packaging or
 activation is integrated.
+
+## Installed maintenance phase entrypoint
+
+The staging payload includes 20 Python modules and four public data files. Its
+fixed entrypoint is `/usr/bin/python3 -I -B
+/usr/libexec/qshd-selinux/qshd_selinux_phase.py MODE`, where `MODE` is exactly
+`provider-post-pristine`, `consumer-pre-fresh`, `consumer-pre-installed`, or
+`consumer-post-owned`. These select the maintained pristine bridge, fresh or
+installed consumer invalidation, and owned consumer completion respectively.
+They do not authorize service startup or supply RPM hooks.
+
+Execution requires the administrator's stop/drain and maintenance exclusion,
+trusted installed code and reference files, root, one thread, default SIGCHLD,
+and no existing children. Imports alone do not alter resource limits or custody.
+The dedicated entry process fixes CORE to zero, FSIZE to 16 MiB, AS to 1 GiB,
+NOFILE to 128 and CPU to 260 seconds. It loads only the explicit sibling module
+map, without adding the installation directory to Python's search path.
+
+The original entry timestamp bounds library work to 240 seconds and the owned
+child to 250 seconds, with the existing ten-second cleanup allowance. Loading
+and setup consume that same budget. Only a normal settled child with the exact
+request-bound canonical response can succeed. Pre phases return PENDING; post
+phases return COMPLETE after their maintained finalizers. Source controls do
+not establish installed-package or native lifecycle qualification; that remains
+a separate acceptance step. This is a staging payload, not a complete
+redistributable package or a replacement for its license/source-offer assets.
