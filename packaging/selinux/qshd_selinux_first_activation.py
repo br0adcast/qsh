@@ -39,6 +39,9 @@ class _Production:
     def package(self):
         from qshd_selinux_package_state import production
         return production().initialize()
+    def package_operation(self):
+        from qshd_selinux_package_state import production
+        return production().operation()
     def references(self):
         from qshd_selinux_reference_loader import production_references
         return production_references()
@@ -82,6 +85,17 @@ def activate_installed_first(*,deadline):
     apply. Reference finalization after possible COMPLETE is outcome-uncertain.
     """
     return _Coordinator(_Production()).activate_installed_first(deadline=deadline)
+
+
+def activate_installed_pristine_pending_first(*,deadline):
+    """Explicitly retry only matching PENDING whose module/contexts are pristine.
+
+    This does not prove any particular pre script ran. Existing package/slot
+    prerequisites are required; no initialization, upgrade/adoption or recovery.
+    Refusal may advance PENDING's generation before the absent-module listing.
+    Existing activation caller exclusion/hard-owner prerequisites still apply.
+    """
+    return _Coordinator(_Production()).activate_installed_pristine_pending_first(deadline=deadline)
 
 
 class _Coordinator:
@@ -132,69 +146,75 @@ class _Coordinator:
         with b.activation() as activation:
             initial=activation.capture_current()
             if initial.record is not None:raise CoordinatorError('ACTIVATION_EXISTS')
-            self._stage='ROUTING';self._check(60)
-            with b.registry() as registry:
-                routing=registry.routing()
-            if type(routing) is not bytes or len(routing)>1024**2:raise CoordinatorError('ROUTING')
-            identities=json.loads(routing)
-            if type(identities) is not dict or not 0<len(identities)<=16 or _json(identities)!=routing:
-                raise CoordinatorError('ROUTING')
-            self._check(110)
-            pending=Activation(1,'PENDING',secrets.token_hex(16),'fedora44-targeted-v1',1,1,
-                               trust,ModuleIdentity('qshd',400,'targeted','pp'),None)
-            self._stage='PENDING'
-            token=activation.begin_pending(_json(asdict(pending)),initial)
+            return self._activate_pristine_locked(activation,initial,trust,pp_bytes,references=references)
+
+    def _activate_pristine_locked(self,activation,initial,trust,pp_bytes,*,references=None):
+        # Both concrete callers already own package+activation exclusion and
+        # independently gated their permitted initial slot state.
+        b=self._bindings
+        self._stage='ROUTING';self._check(60)
+        with b.registry() as registry:
+            routing=registry.routing()
+        if type(routing) is not bytes or len(routing)>1024**2:raise CoordinatorError('ROUTING')
+        identities=json.loads(routing)
+        if type(identities) is not dict or not 0<len(identities)<=16 or _json(identities)!=routing:
+            raise CoordinatorError('ROUTING')
+        self._check(110)
+        pending=Activation(1,'PENDING',secrets.token_hex(16),'fedora44-targeted-v1',1,1,
+                           trust,ModuleIdentity('qshd',400,'targeted','pp'),None)
+        self._stage='PENDING'
+        token=activation.begin_pending(_json(asdict(pending)),initial)
+        self._check()
+        self._stage='CONTEXT_PRISTINE'
+        with b.contexts(sorted(identities)) as writer:
+            writer.require_pristine(identities)
+            self._stage='INSTALL';self._check(110)
+            b.installer(trust,pp_bytes).install(deadline=self._end)
             self._check()
-            self._stage='CONTEXT_PRISTINE'
-            with b.contexts(sorted(identities)) as writer:
-                writer.require_pristine(identities)
-                self._stage='INSTALL';self._check(110)
-                b.installer(trust,pp_bytes).install(deadline=self._end)
-                self._check()
-                self._stage='RECONCILE';writer.reconcile(identities);self._check(60)
-                self._stage='OBSERVATION'
-                with b.registry() as registry:
-                    if registry.routing()!=routing:raise CoordinatorError('ROUTING_DRIFT')
-                    with writer.inspection(identities) as contexts:
-                        with b.modules(trust) as modules:
-                            with b.window():
-                                self._check()
-                                discovered=registry.capture()
-                                context=contexts.capture()
-                                module=modules.capture()
-                                if (discovered.registry_bytes!=routing or context.registry_bytes!=routing
-                                        or discovered.registry_sha256!=context.registry_sha256
-                                        or module.hll.sha256!=trust.pp_sha256):
-                                    raise CoordinatorError('BINDING')
-                                modules.recheck(module)
-                                registry.recheck(discovered)
-                                contexts.recheck(context)
-                                self._check()
-                # Status/module/borrowed view/registry all exited normally;
-                # the same context writer and activation writer remain held.
-                self._stage='COMPLETE';self._check(10)
-                if references is not None:
-                    reader,captured=references
-                    reader.recheck(captured)
-                    self._check(10)
-                binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
-                complete=replace(pending,state='COMPLETE',completion=Completion(
-                    'normal-install-reload-v1',module.hll.sha256,binding))
-                # Pre-arm before invocation: an unknown interruption may
-                # arrive after the actual return but before assignment.
-                self._completion_possible=True
-                try:
-                    observed=activation.publish_complete(_json(asdict(complete)),token,
-                        trusted_artifact=trust,trusted_context_binding=binding)
-                except OutcomeUncertain:
-                    raise
-                except SlotError:
-                    # The slot contract classifies this before replacement.
-                    self._completion_possible=False
-                    raise
-                require_complete(observed.record,trust,binding)
-                result=observed.record
-                self._stage='FINALIZE';self._check()
+            self._stage='RECONCILE';writer.reconcile(identities);self._check(60)
+            self._stage='OBSERVATION'
+            with b.registry() as registry:
+                if registry.routing()!=routing:raise CoordinatorError('ROUTING_DRIFT')
+                with writer.inspection(identities) as contexts:
+                    with b.modules(trust) as modules:
+                        with b.window():
+                            self._check()
+                            discovered=registry.capture()
+                            context=contexts.capture()
+                            module=modules.capture()
+                            if (discovered.registry_bytes!=routing or context.registry_bytes!=routing
+                                    or discovered.registry_sha256!=context.registry_sha256
+                                    or module.hll.sha256!=trust.pp_sha256):
+                                raise CoordinatorError('BINDING')
+                            modules.recheck(module)
+                            registry.recheck(discovered)
+                            contexts.recheck(context)
+                            self._check()
+            # Status/module/borrowed view/registry all exited normally;
+            # the same context writer and activation writer remain held.
+            self._stage='COMPLETE';self._check(10)
+            if references is not None:
+                reader,captured=references
+                reader.recheck(captured)
+                self._check(10)
+            binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
+            complete=replace(pending,state='COMPLETE',completion=Completion(
+                'normal-install-reload-v1',module.hll.sha256,binding))
+            # Pre-arm before invocation: an unknown interruption may
+            # arrive after the actual return but before assignment.
+            self._completion_possible=True
+            try:
+                observed=activation.publish_complete(_json(asdict(complete)),token,
+                    trusted_artifact=trust,trusted_context_binding=binding)
+            except OutcomeUncertain:
+                raise
+            except SlotError:
+                # The slot contract classifies this before replacement.
+                self._completion_possible=False
+                raise
+            require_complete(observed.record,trust,binding)
+            result=observed.record
+            self._stage='FINALIZE';self._check()
         return result
 
     def activate_installed_first(self,*,deadline):
@@ -221,6 +241,48 @@ class _Coordinator:
                     if hashlib.sha256(pp).hexdigest()!=trust.pp_sha256:raise CoordinatorError('PP_IDENTITY')
                     self._check(60)
                     result=self._activate_locked(trust,pp,references=(reader,captured))
+            self._check()
+            return result
+        except OutcomeUncertain:
+            raise
+        except BaseException as error:
+            if self._completion_possible:
+                raise OutcomeUncertain('COORDINATOR_OUTCOME_UNCERTAIN') from error
+            if not isinstance(error,Exception) or isinstance(error,CoordinatorError):raise
+            raise CoordinatorError(self._stage) from error
+
+    def activate_installed_pristine_pending_first(self,*,deadline):
+        if self._used:raise CoordinatorError('COORDINATOR_USED')
+        self._used=True
+        try:
+            start=self._clock()
+            if type(deadline) not in (int,float) or not math.isfinite(deadline):
+                raise CoordinatorError('DEADLINE')
+            self._end=min(deadline,start+240)
+            self._check(60)
+            b=self._bindings
+            self._stage='PROCESS';b.preconditions();self._check(60)
+            self._stage='PACKAGE'
+            with b.package_operation():
+                self._stage='REFERENCES'
+                with b.references() as reader:
+                    captured=reader.capture()
+                    trust=captured.artifact
+                    if type(trust) is not TrustedArtifact:raise CoordinatorError('TRUSTED_ARTIFACT')
+                    trust.__post_init__()
+                    pp=captured.pp_bytes
+                    if type(pp) is not bytes or not 0<len(pp)<=MAX_HLL:raise CoordinatorError('PP_INPUT')
+                    if hashlib.sha256(pp).hexdigest()!=trust.pp_sha256:raise CoordinatorError('PP_IDENTITY')
+                    self._check(60)
+                    self._stage='ACTIVATION'
+                    with b.activation() as activation:
+                        initial=activation.capture_current();record=initial.record
+                        if record is None or record.state!='PENDING':raise CoordinatorError('PENDING_REQUIRED')
+                        if (type(record) is not Activation or record.schema!=1 or record.profile!='fedora44-targeted-v1'
+                                or record.abi!=1 or record.query_profile!=1 or record.artifact!=trust
+                                or record.module!=ModuleIdentity('qshd',400,'targeted','pp') or record.completion is not None):
+                            raise CoordinatorError('PENDING_IDENTITY')
+                        result=self._activate_pristine_locked(activation,initial,trust,pp,references=(reader,captured))
             self._check()
             return result
         except OutcomeUncertain:
