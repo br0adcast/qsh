@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import stat
 import subprocess
 import sys
@@ -111,13 +112,37 @@ DARWIN_TARGETS = {'aarch64-apple-darwin': 'arm64', 'x86_64-apple-darwin': 'x86_6
 METADATA_LIMIT = 65536
 
 
-def metadata_command(argv, timeout=10):
+METADATA_CATEGORIES = frozenset(('static-tool','rust-toolchain','rust-version',
+    'rust-deployment','sdk-path','sdk-version','xcode-version','host-arch',
+    'macos-version','macos-build','otool-path','lipo-path','binary-arch','binary-load-commands'))
+
+
+def _metadata_failure(category, reason):
+    return ValueError('Darwin metadata '+category+': '+reason)
+
+
+def _metadata_home(value):
+    return (type(value) is str and bool(value) and not any(c in value for c in '\0\n\r')
+            and Path(value).is_absolute() and str(Path(value))==value and '..' not in Path(value).parts)
+
+
+def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_homes=None):
     """Bounded static-tool query; retain and reap the exact direct child."""
+    if type(category) is not str or category not in METADATA_CATEGORIES:
+        raise ValueError('invalid Darwin metadata query category')
+    if toolchain_homes is not None and (category!='rust-toolchain'
+            or type(toolchain_homes) is not dict or set(toolchain_homes)!={'RUSTUP_HOME','CARGO_HOME'}
+            or not all(_metadata_home(value) for value in toolchain_homes.values())):
+        raise ValueError('invalid Darwin metadata toolchain homes')
     with tempfile.TemporaryDirectory(prefix='qsh-release-metadata-') as home:
         env = os.environ.copy()
         env.update(HOME=home, XDG_CACHE_HOME=home+'/cache', XDG_CONFIG_HOME=home+'/config',
                    HISTFILE='/dev/null', LANG='C', LC_ALL='C')
         env.pop('SSH_AUTH_SOCK', None)
+        env.pop('RUSTUP_HOME', None)
+        env.pop('CARGO_HOME', None)
+        env.update(RUSTUP_AUTO_INSTALL='0', RUSTUP_NO_UPDATE_CHECK='1')
+        if toolchain_homes is not None: env.update(toolchain_homes)
         child = None
         try:
             deadline = time.monotonic()+timeout
@@ -129,22 +154,24 @@ def metadata_command(argv, timeout=10):
             for pipe in pipes: os.set_blocking(pipe.fileno(), False)
             while live:
                 remaining = deadline-time.monotonic()
-                if remaining <= 0: raise ValueError('Darwin metadata tool timed out')
+                if remaining <= 0: raise _metadata_failure(category,'timed out')
                 ready, _, _ = select.select([pipes[i] for i in live], [], [], remaining)
-                if not ready: raise ValueError('Darwin metadata tool timed out')
+                if not ready: raise _metadata_failure(category,'timed out')
                 for index in tuple(live):
                     if pipes[index] not in ready: continue
                     try: data = os.read(pipes[index].fileno(), 4096)
                     except BlockingIOError: continue
                     if not data: live.remove(index); continue
                     if sum(map(len, captured))+len(data)>METADATA_LIMIT:
-                        raise ValueError('Darwin metadata output exceeds limit')
+                        raise _metadata_failure(category,'output limit')
                     captured[index].extend(data)
             try: status=child.wait(timeout=max(0,deadline-time.monotonic()))
-            except subprocess.TimeoutExpired: raise ValueError('Darwin metadata tool timed out')
-            if time.monotonic()>=deadline: raise ValueError('Darwin metadata tool timed out')
-            if status or captured[1]: raise ValueError('Darwin metadata tool refused')
+            except subprocess.TimeoutExpired: raise _metadata_failure(category,'timed out')
+            if time.monotonic()>=deadline: raise _metadata_failure(category,'timed out')
+            if status or captured[1]: raise _metadata_failure(category,'tool refused')
             return bytes(captured[0])
+        except OSError:
+            raise _metadata_failure(category,'tool unavailable') from None
         finally:
             if child is not None:
                 if child.poll() is None: child.kill()
@@ -198,8 +225,51 @@ def _metadata_digest(path):
     with Path(path).open('rb') as stream: return digest(stream).hex()
 
 
-def _metadata_text(argv):
-    return metadata_command(argv).decode('utf-8').strip()
+def _metadata_text(argv, *, category, toolchain_homes=None):
+    try:
+        return metadata_command(argv,category=category,toolchain_homes=toolchain_homes).decode('utf-8').strip()
+    except UnicodeDecodeError:
+        raise _metadata_failure(category,'invalid output') from None
+
+
+def _metadata_rustc():
+    home=os.environ.get('HOME')
+    if not _metadata_home(home): raise ValueError('invalid Darwin metadata toolchain homes')
+    homes={key:os.environ.get(key) or str(Path(home)/suffix)
+           for key,suffix in (('RUSTUP_HOME','.rustup'),('CARGO_HOME','.cargo'))}
+    if not all(_metadata_home(value) for value in homes.values()):
+        raise ValueError('invalid Darwin metadata toolchain homes')
+    selected=os.environ.get('RUSTUP_TOOLCHAIN')
+    if type(selected) is not str or re.fullmatch(r'[A-Za-z0-9_.+-]{1,128}',selected) is None:
+        raise ValueError('invalid Darwin metadata selected toolchain')
+    located=shutil.which('rustup')
+    try:
+        if located is None or not Path(located).is_absolute():
+            raise _metadata_failure('rust-toolchain','tool unavailable')
+        rustup=Path(located).resolve(strict=True)
+        raw=metadata_command([str(rustup),'which','--toolchain',selected,'rustc'],
+                             category='rust-toolchain',toolchain_homes=homes)
+        value=raw.decode('utf-8')
+        if value.endswith('\n'):value=value[:-1]
+        if not _metadata_home(value):raise ValueError()
+        compiler=Path(value).resolve(strict=True)
+        info=compiler.stat()
+        if os.path.samefile(compiler,rustup) or not stat.S_ISREG(info.st_mode) or not os.access(compiler,os.X_OK):raise ValueError()
+        return compiler
+    except (UnicodeDecodeError,OSError,RuntimeError):
+        raise _metadata_failure('rust-toolchain','invalid output') from None
+    except ValueError as error:
+        if str(error).startswith('Darwin metadata '):raise
+        raise _metadata_failure('rust-toolchain','invalid output') from None
+
+
+def _metadata_compiler_identity(path):
+    try:
+        info=path.stat()
+        if not stat.S_ISREG(info.st_mode):raise OSError()
+        return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+    except OSError:
+        raise _metadata_failure('rust-toolchain','invalid output') from None
 
 
 def _metadata_compiler_version(text):
@@ -249,45 +319,51 @@ def _metadata_native(prefix,target,sdk):
 
 def _darwin_context(prefix,target):
     if sys.platform!='darwin': raise ValueError('Darwin metadata requires the Darwin producer')
-    sdk=_metadata_text(['/usr/bin/xcrun','--show-sdk-path'])
+    sdk=_metadata_text(['/usr/bin/xcrun','--show-sdk-path'],category='sdk-path')
     if not Path(sdk).is_absolute(): raise ValueError('invalid selected SDK metadata')
     native,probe=_metadata_native(prefix,target,sdk)
-    xcode=_metadata_text(['/usr/bin/xcodebuild','-version']).splitlines()
+    xcode=_metadata_text(['/usr/bin/xcodebuild','-version'],category='xcode-version').splitlines()
     if len(xcode)!=2 or not xcode[0].startswith('Xcode ') or not xcode[1].startswith('Build version '):
         raise ValueError('invalid Xcode metadata')
+    compiler=_metadata_rustc();identity=_metadata_compiler_identity(compiler)
     rust={}
-    for line in _metadata_text(['rustc','--version','--verbose']).splitlines():
+    for line in _metadata_text([str(compiler),'--version','--verbose'],category='rust-version').splitlines():
         key,separator,item=line.partition(': ')
         if separator and key in ('release','commit-hash','host'):
             if key in rust: raise ValueError('ambiguous Rust metadata')
             rust[key]=_metadata_token(item,r'[A-Za-z0-9_.+-]+')
     if set(rust)!={'release','commit-hash','host'}: raise ValueError('missing Rust metadata')
-    reported=_metadata_text(['rustc','--print=deployment-target','--target',target])
+    reported=_metadata_text([str(compiler),'--print=deployment-target','--target',target],category='rust-deployment')
     if not reported.startswith('MACOSX_DEPLOYMENT_TARGET='): raise ValueError('invalid Rust deployment metadata')
     rust['reported_deployment_target']=_metadata_version(reported.split('=',1)[1])
+    if _metadata_compiler_identity(compiler)!=identity:
+        raise _metadata_failure('rust-toolchain','invalid output')
     explicit=os.environ.get('MACOSX_DEPLOYMENT_TARGET')
     rust['explicit_deployment_target']=None if explicit is None else _metadata_version(explicit)
     result=dict(schema=1,target=target,
         source=dict(sha=_metadata_token(os.environ.get('GITHUB_SHA'),r'[0-9a-f]{40}',40),
                     run_id=_metadata_token(os.environ.get('GITHUB_RUN_ID'),r'[0-9]+',30),
                     run_attempt=_metadata_token(os.environ.get('GITHUB_RUN_ATTEMPT'),r'[0-9]+',10)),
-        host=dict(arch=_metadata_token(_metadata_text(['/usr/bin/uname','-m']),r'arm64|x86_64'),
-                  macos_version=_metadata_version(_metadata_text(['/usr/bin/sw_vers','-productVersion'])),
-                  macos_build=_metadata_token(_metadata_text(['/usr/bin/sw_vers','-buildVersion']),r'[A-Za-z0-9.-]+',64),
+        host=dict(arch=_metadata_token(_metadata_text(['/usr/bin/uname','-m'],category='host-arch'),r'arm64|x86_64'),
+                  macos_version=_metadata_version(_metadata_text(['/usr/bin/sw_vers','-productVersion'],category='macos-version')),
+                  macos_build=_metadata_token(_metadata_text(['/usr/bin/sw_vers','-buildVersion'],category='macos-build'),r'[A-Za-z0-9.-]+',64),
                   image_version=None if 'ImageVersion' not in os.environ else _metadata_token(os.environ['ImageVersion'],r'[A-Za-z0-9_.-]+',80)),
-        sdk=dict(version=_metadata_version(_metadata_text(['/usr/bin/xcrun','--show-sdk-version'])),
+        sdk=dict(version=_metadata_version(_metadata_text(['/usr/bin/xcrun','--show-sdk-version'],category='sdk-version')),
                  xcode_version=_metadata_version(xcode[0][6:]),xcode_build=_metadata_token(xcode[1][14:],r'[A-Za-z0-9.-]+',64)),
         rust=rust,native=native,binaries=[])
-    tools={name:_metadata_text(['/usr/bin/xcrun','--find',name]) for name in ('otool','lipo')}
+    tools={name:_metadata_text(['/usr/bin/xcrun','--find',name],category='otool-path' if name=='otool' else 'lipo-path') for name in ('otool','lipo')}
     if any(not Path(path).is_absolute() for path in tools.values()): raise ValueError('invalid Darwin tool metadata')
     return result,tools,probe
 
 
 def _darwin_binary(path,role,program,target,tools):
     before=_metadata_digest(path)
-    arch=_metadata_text([tools['lipo'],'-archs',str(path)])
+    arch=_metadata_text([tools['lipo'],'-archs',str(path)],category='binary-arch')
     if arch!=DARWIN_TARGETS[target]: raise ValueError('Darwin metadata architecture mismatch')
-    command=parse_darwin_load_commands(metadata_command([tools['otool'],'-l',str(path)]))
+    try:
+        command=parse_darwin_load_commands(metadata_command([tools['otool'],'-l',str(path)],category='binary-load-commands'))
+    except UnicodeDecodeError:
+        raise _metadata_failure('binary-load-commands','invalid output') from None
     if _metadata_digest(path)!=before: raise ValueError('Darwin metadata input changed')
     return dict(role=role,program=program,sha256=before,arch=arch,version_command=command)
 
