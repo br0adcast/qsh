@@ -1,7 +1,7 @@
 //! Private-file containers shared by QSH signing and SSH authentication.
 //! Parsing never prompts or decrypts an encrypted OpenSSH key.
 
-use std::{fmt, io, io::Read, path::Path};
+use std::{fmt, io, path::Path};
 
 use pkcs8::{AssociatedOid, DecodePrivateKey, SecretDocument};
 use ssh_key::{
@@ -122,17 +122,33 @@ pub fn read_text(path: &Path) -> Result<Zeroizing<String>, KeyFileError> {
 }
 
 fn read_bounded(reader: &mut impl io::Read) -> Result<Zeroizing<String>, KeyFileError> {
-    let mut text = Zeroizing::new(String::new());
-    reader
-        .take((MAX_KEY_FILE_BYTES + 1) as u64)
-        .read_to_string(&mut text)
-        .map_err(KeyFileError::Io)?;
-    if text.len() > MAX_KEY_FILE_BYTES {
+    // Keep the initialized read allocation fixed while it contains key bytes.
+    // Zeroizing also owns every early-error path, including partial I/O reads.
+    let mut bytes = Zeroizing::new(vec![0u8; MAX_KEY_FILE_BYTES + 1]);
+    let mut used = 0;
+    while used < bytes.len() {
+        match reader.read(&mut bytes[used..]) {
+            Ok(0) => break,
+            Ok(count) => used += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(KeyFileError::Io(error)),
+        }
+    }
+    if used > MAX_KEY_FILE_BYTES {
         return Err(KeyFileError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "private-key file exceeds the 1 MiB input limit",
         )));
     }
+    let valid = std::str::from_utf8(&bytes[..used]).map_err(|_| {
+        KeyFileError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private-key file is not valid UTF-8",
+        ))
+    })?;
+    // Establish the wiping owner before the sole copy, which cannot grow it.
+    let mut text = Zeroizing::new(String::with_capacity(used));
+    text.push_str(valid);
     Ok(text)
 }
 
