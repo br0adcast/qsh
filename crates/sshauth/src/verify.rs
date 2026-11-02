@@ -43,7 +43,8 @@ impl AuthorizedKeysVerifier {
 /// line carrying options (`command=`/`from=`/`restrict`/...) refuses it
 /// outright, and neither case keeps scanning for a laxer line further down
 /// the file -- a key must not become more permissive than its first, most
-/// specific listing.
+/// specific listing. As in OpenSSH, the fields of a bare line may be
+/// separated by spaces or tabs ([`bare_entry`]).
 ///
 /// Lines are walked ourselves (not via `AuthorizedKeys`'s iterator) because
 /// a line that fails to parse still needs to be checked for this key's own
@@ -70,7 +71,8 @@ pub fn key_is_listed(text: &str, key: &PublicKey) -> Result<bool, AuthError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match line.parse::<Entry>() {
+        let bare = bare_entry(line);
+        match bare.as_deref().unwrap_or(line).parse::<Entry>() {
             Ok(entry) if entry.public_key().key_data() == key.key_data() => {
                 return Ok(entry.config_opts().is_empty());
             }
@@ -100,6 +102,32 @@ pub fn key_is_listed(text: &str, key: &PublicKey) -> Result<bool, AuthError> {
         }
     }
     Ok(false)
+}
+
+/// A bare `<algorithm> <blob> [comment]` line rewritten with the single
+/// spaces ssh-key's parser expects. OpenSSH separates these fields with any
+/// run of spaces and tabs; ssh-key splits on one space and refuses a tab.
+///
+/// Only a line whose first token is exactly a known algorithm name
+/// qualifies. An options prefix never does, so quoted option values are
+/// never rewritten. Other separators (Unicode spaces, VT, FF, CR) stay
+/// unsupported: the blob or algorithm then fails to parse, and the caller's
+/// fallback still refuses the key. Returns `None` for every other line.
+fn bare_entry(line: &str) -> Option<String> {
+    const SEPARATORS: [char; 2] = [' ', '\t'];
+    let (algorithm, rest) = line.split_once(SEPARATORS)?;
+    match algorithm.parse::<Algorithm>() {
+        Ok(Algorithm::Other(_)) | Err(_) => return None,
+        Ok(_) => {}
+    }
+    let rest = rest.trim_start_matches(SEPARATORS);
+    let (blob, comment) = rest.split_once(SEPARATORS).unwrap_or((rest, ""));
+    let comment = comment.trim_start_matches(SEPARATORS);
+    Some(if comment.is_empty() {
+        format!("{algorithm} {blob}")
+    } else {
+        format!("{algorithm} {blob} {comment}")
+    })
 }
 
 /// The base64-encoded blob of `key`'s wire encoding -- the token that sits
@@ -521,6 +549,117 @@ mod tests {
         }
     }
 
+    /// The OpenSSH-format text of `key` split into its algorithm and blob.
+    fn fields(key: &PublicKey) -> (String, String) {
+        let openssh = key.to_openssh().unwrap();
+        let (algorithm, blob) = openssh.split_once(' ').unwrap();
+        (algorithm.to_string(), blob.to_string())
+    }
+
+    #[test]
+    fn space_and_tab_separators_in_a_bare_listing_authorize_a_key() {
+        let ecdsa = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        )
+        .expect("ecdsa keygen");
+        for k in [key(), ecdsa] {
+            let (algorithm, blob) = fields(k.public_key());
+            for prefix in ["", "\t"] {
+                for before_blob in [" ", "\t", "  ", " \t", "\t\t"] {
+                    for (before_comment, comment) in [
+                        ("", ""),
+                        ("\t", ""),
+                        (" \t ", ""),
+                        ("\t", "user@host"),
+                        ("\t \t", "user@host"),
+                        (" ", "user\twith a tab"),
+                        ("\t", "several words of comment"),
+                    ] {
+                        let line = format!(
+                            "{prefix}{algorithm}{before_blob}{blob}{before_comment}{comment}"
+                        );
+                        for ending in ["\n", "\r\n"] {
+                            assert!(
+                                key_is_listed(&format!("{line}{ending}"), k.public_key()).unwrap(),
+                                "{line:?} must authorize its key"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_separated_listings_keep_first_match_and_refusals() {
+        let k = key();
+        let other = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        let (algorithm, blob) = fields(k.public_key());
+        let (other_algorithm, other_blob) = fields(other.public_key());
+        let tabbed = format!("{algorithm}\t{blob}\tuser@host");
+
+        // The first listing still wins in both directions.
+        assert!(key_is_listed(&format!("{tabbed}\nrestrict {openssh}\n"), k.public_key()).unwrap());
+        assert!(!key_is_listed(
+            &format!("{other_algorithm}\t{other_blob}\n"),
+            k.public_key()
+        )
+        .unwrap());
+
+        // Restricted listings, however separated, and malformed ones refuse
+        // the key, even before a later bare tab-separated duplicate.
+        for first in [
+            format!("restrict {algorithm}\t{blob}"),
+            format!("restrict\t{algorithm}\t{blob}"),
+            format!("restrict\t{openssh} user"),
+            format!("command=\"echo\ta  b\" {algorithm}\t{blob}"),
+            format!("command=\"echo\ta  b\"\t{algorithm}\t{blob}\tuser"),
+            format!("ssh-rsa\t{blob}"),
+            format!("{algorithm}x\t{blob}"),
+            format!("x{algorithm}\t{blob}"),
+            format!("{algorithm}\t\u{a0}{blob}"),
+        ] {
+            assert!(
+                !key_is_listed(&format!("{first}\n"), k.public_key()).unwrap(),
+                "{first:?} must not authorize its key"
+            );
+            for later in [&openssh, &tabbed] {
+                assert!(
+                    !key_is_listed(&format!("{first}\n{later}\n"), k.public_key()).unwrap(),
+                    "{first:?} must block a later bare duplicate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_separators_inside_a_listing_do_not_authorize_a_key() {
+        let k = key();
+        let openssh = k.public_key().to_openssh().unwrap();
+        let (algorithm, blob) = fields(k.public_key());
+        for separator in ["\u{a0}", "\u{b}", "\u{c}", "\r", "\u{85}", "\u{2003}"] {
+            for line in [
+                format!("{algorithm}{separator}{blob}"),
+                format!("{algorithm}{separator}{blob} user"),
+                format!("{algorithm}\t{blob}{separator}user"),
+                format!("{algorithm} {blob}{separator}user"),
+            ] {
+                assert!(
+                    !key_is_listed(&format!("{line}\n"), k.public_key()).unwrap(),
+                    "{line:?} must not authorize its key"
+                );
+                assert!(
+                    !key_is_listed(&format!("{line}\n{openssh}\n"), k.public_key()).unwrap(),
+                    "{line:?} must block a later bare duplicate"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_missing_file_refuses_everyone_without_panicking() {
         let v = AuthorizedKeysVerifier::new(
@@ -695,6 +834,14 @@ mod tests {
             (
                 "trailing whitespace after the key",
                 format!("{openssh}   \n"),
+            ),
+            (
+                "a tab between the algorithm and the blob",
+                format!("{}\n", openssh.replacen(' ', "\t", 1)),
+            ),
+            (
+                "a tab before the comment",
+                format!("{openssh}\tuser@host\n"),
             ),
         ];
         for (label, contents) in cases {
