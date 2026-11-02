@@ -1,8 +1,8 @@
-"""First install only: settled tool success is never current-policy readiness.
+"""Strict first install and same-artifact reload; neither proves readiness.
 
 Trusted caller holds package exclusion, has stopped/drained service with the
 administrator stop guard, and has published fresh durable PENDING. No automatic
-adoption, update, removal, rollback, COMPLETE publication or package hooks.
+adoption, arbitrary update, removal, rollback, COMPLETE publication or hooks.
 An outer fresh process must impose the hard wall deadline on filesystem calls.
 """
 from dataclasses import dataclass
@@ -17,7 +17,8 @@ import time
 from qshd_selinux_activation import TrustedArtifact, ActivationError
 from qshd_selinux_fs import SafeFiles, Conflict, identity
 from qshd_selinux_modules import MAX_HLL, ModuleError, parse_full_listing
-from qshd_selinux_module_observer import _protected_file, _store_readlock, ObserverError
+from qshd_selinux_module_observer import (
+    _protected_file, _store_readlock, ObserverError, production_observer)
 from qshd_selinux_process import _Owner, _Limits, _CommandError, _Streams
 
 _PREFIX = ('/usr/bin/semodule','--store-path','/var/lib/selinux','-s','targeted')
@@ -62,7 +63,7 @@ def production_installer(trusted_artifact, pp_bytes):
     return FirstInstall(trusted_artifact,pp_bytes)
 
 
-class FirstInstall(SafeFiles):
+class _InstallFiles(SafeFiles):
     """Single use; underscored injection is only for trusted disposable tests."""
     def __init__(self, trusted_artifact, pp_bytes, *, _root=None, _uid=0,
                  _owner=None, _clock=time.monotonic):
@@ -195,6 +196,10 @@ class FirstInstall(SafeFiles):
         except BaseException:errors=True
         if errors:_fail('CLEANUP')
 
+
+class FirstInstall(_InstallFiles):
+    """Absent-module admission only; never adopt an existing module."""
+
     def install(self, *, deadline):
         if self._used:_fail('INSTALL_USED')
         self._used=True
@@ -212,6 +217,61 @@ class FirstInstall(SafeFiles):
                 self._active();self._guard()
             except (OSError,Conflict,ObserverError,ModuleError,_CommandError):
                 raise InstallError('INSTALL_REFUSED') from None
+        finally:self._cleanup()
+        self._time()
+        return InstallResult(self._trusted,self._trusted.pp_sha256)
+
+
+class _DeadlineOwner:
+    """Preserve observer custody/budget while sharing the reload deadline."""
+    def __init__(self, owner, deadline):
+        self._owner=owner;self._deadline=deadline
+
+    @property
+    def _last(self):
+        return self._owner._last
+
+    def _run(self, operation, cwd):
+        return self._owner._run(operation,cwd,deadline=self._deadline)
+
+
+def production_owned_reloader(trusted_artifact, pp_bytes):
+    """Caller holds exclusion, fresh PENDING and the completed stop guard."""
+    if os.geteuid()!=0:_fail('ROOT_REQUIRED')
+    return OwnedReload(trusted_artifact,pp_bytes)
+
+
+class OwnedReload(_InstallFiles):
+    """Single-use reload of exact already-owned policy; no readiness result."""
+    def __init__(self, trusted_artifact, pp_bytes, *, _root=None, _uid=0,
+                 _owner=None, _clock=time.monotonic, _observer=None):
+        super().__init__(trusted_artifact,pp_bytes,_root=_root,_uid=_uid,
+                         _owner=_owner,_clock=_clock)
+        self._observer=production_observer if _observer is None else _observer
+
+    def reload(self, *, deadline):
+        if self._used:_fail('RELOAD_USED')
+        self._used=True
+        if type(deadline) not in (int,float) or not math.isfinite(deadline):_fail('DEADLINE')
+        # Admission consumes this same budget; never grant a fresh allowance
+        # after the observer's four fixed list/extract calls and finalizers.
+        self._end=min(deadline,self._clock()+110)
+        if self._end-self._clock()<=10:_fail('DEADLINE')
+        try:
+            try:
+                self._admit()
+                with self._observer(self._trusted) as observer:
+                    if observer._owner is None:_fail('OBSERVER_OWNER')
+                    observer._owner=_DeadlineOwner(observer._owner,self._end-10)
+                    self._time();observed=observer.capture();self._time()
+                    observer.recheck(observed);self._time()
+                self._time();self._guard();self._active()
+                self._make_scratch()
+                path=str(self.anchor/'run'/self._scratch['name']/'qshd.pp')
+                self._command(_PREFIX+('-X','400','-i',path),_INSTALL)
+                self._active();self._guard()
+            except (OSError,Conflict,ObserverError,ModuleError,_CommandError):
+                raise InstallError('RELOAD_REFUSED') from None
         finally:self._cleanup()
         self._time()
         return InstallResult(self._trusted,self._trusted.pp_sha256)
