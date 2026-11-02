@@ -468,9 +468,7 @@ mod queued_refusal {
                 assert!(retained.reaped && !retained.wait_lost && retained.completion.is_some());
                 assert_eq!(
                     retained.failure,
-                    Some(MonitorFailure::Request(
-                        super::super::super::protocol::RequestDrainFailure::Exit
-                    ))
+                    Some(MonitorFailure::Exit(MonitorExitStatus::NativeEncoded(75)))
                 );
             } else {
                 assert!(state.monitors.is_empty() && state.retired.is_empty());
@@ -573,6 +571,9 @@ mod queued_refusal {
                     assert_eq!(retained.completion, Some(PamCompletion::NotOpened));
                 }
                 assert!(retained.failure.is_some() && shutdown.first_monitor_failure.is_some());
+                if mode == "failed-gated-exit75" {
+                    assert_eq!(retained.failure, Some(MonitorFailure::Exit(MonitorExitStatus::NativeEncoded(75))));
+                }
                 if mode.ends_with("-prior") {
                     assert_eq!(retained.failure, Some(MonitorFailure::DuplicateCompletion));
                     assert_eq!(

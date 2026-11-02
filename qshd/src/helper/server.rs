@@ -734,7 +734,20 @@ impl Monitor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorExitStatus {
+    #[cfg(any(test, not(target_os = "linux")))]
+    Code(i32),
+    #[cfg(any(test, not(target_os = "linux")))]
+    Signal { number: i32, core_dumped: bool },
+    // ProcessScope currently encodes both exit137 and SIGKILL as137.
+    // Preserve that representation without inventing signal provenance.
+    #[cfg(target_os = "linux")]
+    NativeEncoded(i32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorFailure {
+    Exit(MonitorExitStatus),
     Request(super::protocol::RequestDrainFailure),
     Shutdown(i32),
     Send(i32),
@@ -2842,6 +2855,20 @@ fn record_monitor_wait_failure(monitor: &mut Monitor, error: i32) {
     monitor.failure.get_or_insert(MonitorFailure::Wait(error));
 }
 
+#[cfg(target_os = "linux")]
+fn record_monitor_native_exit(
+    failure: &mut Option<MonitorFailure>,
+    progress: &crate::process_scope::scope::Progress,
+) {
+    if let crate::process_scope::scope::Progress::Complete(code) = progress {
+        if *code != 0 {
+            failure.get_or_insert(MonitorFailure::Exit(MonitorExitStatus::NativeEncoded(
+                *code,
+            )));
+        }
+    }
+}
+
 #[cfg(any(test, not(target_os = "linux")))]
 fn poll_monitor_wait_using(
     monitor: &mut Monitor,
@@ -2856,12 +2883,21 @@ fn poll_monitor_wait_using(
         return false;
     }
     match wait() {
-        Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
-            if !matches!(status, WaitStatus::Exited(_, 0)) {
-                monitor.failure.get_or_insert(MonitorFailure::Request(
-                    super::protocol::RequestDrainFailure::Exit,
-                ));
+        Ok(WaitStatus::Exited(_, code)) => {
+            if code != 0 {
+                monitor
+                    .failure
+                    .get_or_insert(MonitorFailure::Exit(MonitorExitStatus::Code(code)));
             }
+            true
+        }
+        Ok(WaitStatus::Signaled(_, signal, core_dumped)) => {
+            monitor
+                .failure
+                .get_or_insert(MonitorFailure::Exit(MonitorExitStatus::Signal {
+                    number: signal as i32,
+                    core_dumped,
+                }));
             true
         }
         Err(nix::Error::EINTR) => false,
@@ -3151,12 +3187,7 @@ fn serve_ready_monitors(seams: Seams<'_>, state: &mut LoopState, ready: &[Monito
             update.native,
             crate::process_scope::scope::Progress::Complete(_)
         );
-        if matches!(update.native, crate::process_scope::scope::Progress::Complete(code) if code != 0)
-        {
-            monitor.failure.get_or_insert(MonitorFailure::Request(
-                super::protocol::RequestDrainFailure::Exit,
-            ));
-        }
+        record_monitor_native_exit(&mut monitor.failure, &update.native);
         monitor.wait_lost |= update.leader == crate::process_scope::scope::LeaderStatus::Unknown;
         monitor.seam_closed |= native.closed();
         if monitor.seam_closed && monitor.completion.is_none() {
