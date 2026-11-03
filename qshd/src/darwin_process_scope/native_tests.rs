@@ -915,32 +915,176 @@ fn refusal_origin(reason: &str) -> &'static str {
         "channel preparation unavailable" => "INSTALLATION",
         "this Darwin runtime has no qualified process ownership contract" => "DARWIN_CONTRACT",
         _ if reason.starts_with("Darwin process ownership unavailable:") => "DARWIN_ADMISSION",
-        _ if reason.starts_with("could not open channel:") => "PTY_SPAWN",
+        _ if reason.starts_with("could not open channel: opening the pseudo-terminal: ") => "PTY_OPEN",
+        "could not open channel: disabling echo on the PTY master side: the PTY master side does not hand over a file descriptor" => "PTY_ECHO_FD",
+        _ if reason.starts_with("could not open channel: disabling echo on the PTY master side: reading the PTY master side's termios: ") => "PTY_ECHO_READ",
+        _ if reason.starts_with("could not open channel: disabling echo on the PTY master side: writing the PTY master side's termios: ") => "PTY_ECHO_WRITE",
+        _ if reason.starts_with("could not open channel: starting the command in the PTY: ") => "PTY_SPAWN",
         _ => "OTHER",
     }
 }
-fn bootstrap_error_origin(bytes: &[u8]) -> &'static str {
-    let text = String::from_utf8_lossy(bytes);
-    for (literal, code) in [
-        ("inherited control publication", "HANDOVER_CONTROL"),
-        ("inherited control socket", "HANDOVER_CONTROL"),
-        ("inherited UDP socket", "HANDOVER_UDP"),
-        ("handover descriptor", "HANDOVER_FD"),
-        ("handover file", "HANDOVER_FD"),
-        ("staged update", "HANDOVER_PATH"),
-        ("replacement paths", "HANDOVER_PATH"),
-        ("bootstrap GO frame", "ACTOR_GATE"),
-        ("panicked at", "ACTOR_PANIC"),
-    ] {
-        if text.contains(literal) {
-            return code;
+const FIXTURE_TRUE: &str = "/usr/bin/true";
+fn admit_fixture_true(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let info = file.metadata()?;
+    if !info.is_file() || info.len() == 0 || info.permissions().mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "FIXTURE_TRUE_ADMISSION",
+        ));
+    }
+    use std::os::fd::IntoRawFd;
+    let fd = file.into_raw_fd();
+    if unsafe { nix::libc::close(fd) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum BootstrapStage {
+    Input,
+    Parent,
+    FdValidate,
+    FdFlags,
+    Path,
+    Client,
+    Udp,
+    Control,
+    Gate,
+    StateFile,
+    FdSelection,
+    FdInherit,
+    Exec,
+    FdRestore,
+}
+const BOOTSTRAP_STAGES: [&str; 14] = [
+    "INPUT",
+    "PARENT",
+    "FD_VALIDATE",
+    "FD_FLAGS",
+    "PATH",
+    "CLIENT",
+    "UDP",
+    "CONTROL",
+    "GATE",
+    "STATE_FILE",
+    "FD_SELECTION",
+    "FD_INHERIT",
+    "EXEC",
+    "FD_RESTORE",
+];
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum BootstrapErrno {
+    Unknown,
+    Enoent,
+    Eacces,
+    Eperm,
+    Emfile,
+    Enfile,
+    Enomem,
+    Eio,
+    Enotty,
+    Einval,
+    Enoexec,
+}
+const BOOTSTRAP_ERRORS: [&str; 11] = [
+    "UNKNOWN", "ENOENT", "EACCES", "EPERM", "EMFILE", "ENFILE", "ENOMEM", "EIO", "ENOTTY",
+    "EINVAL", "ENOEXEC",
+];
+static BOOTSTRAP_STAGE: AtomicUsize = AtomicUsize::new(0);
+static BOOTSTRAP_ERROR: AtomicUsize = AtomicUsize::new(0);
+fn bootstrap_stage(stage: BootstrapStage) {
+    BOOTSTRAP_ERROR.store(0, Ordering::SeqCst);
+    BOOTSTRAP_STAGE.store(stage as usize, Ordering::SeqCst);
+}
+fn bootstrap_errno(value: i32) -> BootstrapErrno {
+    match value {
+        nix::libc::ENOENT => BootstrapErrno::Enoent,
+        nix::libc::EACCES => BootstrapErrno::Eacces,
+        nix::libc::EPERM => BootstrapErrno::Eperm,
+        nix::libc::EMFILE => BootstrapErrno::Emfile,
+        nix::libc::ENFILE => BootstrapErrno::Enfile,
+        nix::libc::ENOMEM => BootstrapErrno::Enomem,
+        nix::libc::EIO => BootstrapErrno::Eio,
+        nix::libc::ENOTTY => BootstrapErrno::Enotty,
+        nix::libc::EINVAL => BootstrapErrno::Einval,
+        nix::libc::ENOEXEC => BootstrapErrno::Enoexec,
+        _ => BootstrapErrno::Unknown,
+    }
+}
+fn bootstrap_result<T, E: Into<anyhow::Error>>(result: Result<T, E>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            let error = error.into();
+            let number = error.chain().take(8).find_map(|item| {
+                item.downcast_ref::<std::io::Error>()
+                    .and_then(|e| e.raw_os_error())
+                    .or_else(|| item.downcast_ref::<nix::errno::Errno>().map(|e| *e as i32))
+            });
+            let code = number
+                .map(bootstrap_errno)
+                .unwrap_or(BootstrapErrno::Unknown);
+            BOOTSTRAP_ERROR.store(code as usize, Ordering::SeqCst);
+            panic!("bootstrap operation refused");
         }
     }
-    if bytes.is_empty() {
-        "EMPTY"
-    } else {
-        "OTHER"
+}
+fn bootstrap_hook() -> Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static> {
+    let previous = std::panic::take_hook();
+    // Only the dedicated bootstrap reexec installs this hook. Never print the
+    // panic payload, original error or source location into public CI output.
+    std::panic::set_hook(Box::new(|_| {
+        use std::io::Write;
+        let stage = BOOTSTRAP_STAGES[BOOTSTRAP_STAGE.load(Ordering::SeqCst)];
+        let error = BOOTSTRAP_ERRORS[BOOTSTRAP_ERROR.load(Ordering::SeqCst)];
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "QSH223_BOOTSTRAP stage={stage} errno={error}"
+        );
+    }));
+    previous
+}
+fn bootstrap_record(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.len() > 64 * 1024 {
+        return None;
     }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut found = None;
+    for raw in text.split_inclusive('\n') {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        if !line.starts_with("QSH223_BOOTSTRAP") {
+            continue;
+        }
+        if found.is_some() || !raw.ends_with('\n') {
+            return None;
+        }
+        let (stage, error) = line
+            .strip_prefix("QSH223_BOOTSTRAP stage=")?
+            .split_once(" errno=")?;
+        let stage = *BOOTSTRAP_STAGES.iter().find(|value| **value == stage)?;
+        let error = *BOOTSTRAP_ERRORS.iter().find(|value| **value == error)?;
+        found = Some((stage, error));
+    }
+    found
+}
+fn settled_bootstrap_record(bytes: &[u8], settled: bool) -> Option<(&'static str, &'static str)> {
+    if settled {
+        bootstrap_record(bytes)
+    } else {
+        None
+    }
+}
+fn bootstrap_error_origin(bytes: &[u8]) -> &'static str {
+    bootstrap_record(bytes)
+        .map(|value| value.0)
+        .unwrap_or("OTHER")
 }
 fn retain_bootstrap_stderr(bytes: &[u8]) {
     use std::io::Write;
@@ -1215,6 +1359,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 }) { return Err("unexpected Exit after client CLOSE"); }
             }
             if mode == "fresh-session" {
+                admit_fixture_true(Path::new(FIXTURE_TRUE)).map_err(|_| "FIXTURE_TRUE_ADMISSION")?;
                 client.close();
                 connected_until(|| registry.outstanding() == 0).await?;
                 let fresh_keys = generate_keypair();
@@ -1225,7 +1370,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                     connected_until(|| fresh_events.live.load(Ordering::SeqCst)).await.map_err(|_| "fresh link observation failed")?;
                     let open = OpenRequest {
                         stream: FIRST_CHANNEL_STREAM, kind: ChannelKind::Command,
-                        cols: 80, rows: 24, screen: false, command: b"/bin/true".to_vec(),
+                        cols: 80, rows: 24, screen: false, command: FIXTURE_TRUE.as_bytes().to_vec(),
                     };
                     fresh.send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::Open(open)))
                         .map_err(|_| "fresh enqueue failed")?;
@@ -1238,7 +1383,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 let metadata = registry.try_cleanup_snapshot();
                 let origin = records.iter().find_map(|r| match r { ServerRecord::Refused { reason, .. } => Some(refusal_origin(reason)), _ => None }).unwrap_or("NONE");
                 let exit_code = records.iter().find_map(|r| match r { ServerRecord::Exit { code, .. } => Some(code.to_string()), _ => None }).unwrap_or_else(|| "none".into());
-                let receipt = format!("live={} opened={} exit0={} exitother={} code={} unavailable={} refused={} origin={} input_failed={} pending={} retiring={} debt={} leader_unknown={} cleanup_unknown={} unconfirmed={}",
+                let receipt = format!("live={} opened={} exit0={} exitother={} code={} unavailable={} refused={} origin={} errno=UNKNOWN input_failed={} pending={} retiring={} debt={} leader_unknown={} cleanup_unknown={} unconfirmed={}",
                     fresh_events.live.load(Ordering::SeqCst) as u8,
                     count(|r| matches!(r, ServerRecord::Opened { .. })),
                     count(|r| matches!(r, ServerRecord::Exit { code: 0, .. })),
@@ -1267,6 +1412,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
         }
     };
     let failure_code = match result {
+        Err("FIXTURE_TRUE_ADMISSION") => "FIXTURE_TRUE_ADMISSION",
         Err("fresh link observation failed") => "FRESH_LINK",
         Err("fresh enqueue failed") => "FRESH_ENQUEUE",
         Err("fresh exit observation failed") => "FRESH_EXIT",
@@ -1775,20 +1921,48 @@ fn fixture_socket_publication_controls() {
         .file_type()
         .is_socket());
 }
+fn bootstrap_failure_control(mode: &str) {
+    let previous = bootstrap_hook();
+    let result = std::panic::catch_unwind(|| {
+        bootstrap_stage(BootstrapStage::StateFile);
+        match mode {
+            "missing" => {
+                bootstrap_result(std::fs::File::open("/qsh223-no-such-private-canary/state"));
+            }
+            "typed" => {
+                bootstrap_stage(BootstrapStage::FdFlags);
+                bootstrap_result(Err::<(), _>(nix::errno::Errno::EINVAL));
+            }
+            "assert" => {
+                BOOTSTRAP_ERROR.store(BootstrapErrno::Enoent as usize, Ordering::SeqCst);
+                bootstrap_stage(BootstrapStage::Parent);
+                panic!("private assertion canary must never be emitted");
+            }
+            _ => panic!("invalid private control"),
+        }
+    });
+    std::panic::set_hook(previous);
+    std::panic::resume_unwind(result.unwrap_err());
+}
 fn bootstrap_actor() {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
+    bootstrap_stage(BootstrapStage::Input);
+    let _previous_hook = bootstrap_hook();
     let parent: u32 = std::env::var("QSH_DARWIN223_PARENT")
         .unwrap()
         .parse()
         .unwrap();
+    bootstrap_stage(BootstrapStage::Parent);
     assert_eq!(unsafe { nix::libc::getppid() } as u32, parent);
+    bootstrap_stage(BootstrapStage::Input);
     let fd = |name: &str| -> i32 { std::env::var(name).unwrap().parse().unwrap() };
     let fds = [
         fd("QSH_DARWIN223_UDP"),
         fd("QSH_DARWIN223_CONTROL"),
         fd("QSH_DARWIN223_GATE"),
     ];
+    bootstrap_stage(BootstrapStage::FdValidate);
     assert!(fds.iter().all(|fd| *fd > 2));
     assert!(fds[0] != fds[1] && fds[0] != fds[2] && fds[1] != fds[2]);
     // These descriptors are the three exclusively inherited actor inputs.
@@ -1796,8 +1970,10 @@ fn bootstrap_actor() {
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fds[1]) };
     let mut gate = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[2]) };
     for fd in fds {
-        crate::handover::set_cloexec(fd, true).unwrap();
+        bootstrap_stage(BootstrapStage::FdFlags);
+        bootstrap_result(crate::handover::set_cloexec(fd, true));
     }
+    bootstrap_stage(BootstrapStage::Path);
     let path = |name: &str| {
         let value = std::path::PathBuf::from(std::env::var_os(name).unwrap());
         assert!(value.is_absolute() && value.as_os_str().as_bytes().len() <= 1024);
@@ -1810,15 +1986,23 @@ fn bootstrap_actor() {
     let destination = path("QSH_DARWIN223_DESTINATION");
     let cache = path("QSH_DARWIN223_CACHE");
     let control = path("QSH_DARWIN223_CONTROL_PATH");
+    bootstrap_stage(BootstrapStage::Client);
     let client = std::env::var("QSH_DARWIN223_CLIENT").unwrap();
     assert_eq!(client.len(), 44);
-    crate::handover::decode_allowlist(std::slice::from_ref(&client)).unwrap();
-    let port = udp.local_addr().unwrap().port();
+    bootstrap_result(crate::handover::decode_allowlist(std::slice::from_ref(
+        &client,
+    )));
+    bootstrap_stage(BootstrapStage::Udp);
+    let port = bootstrap_result(udp.local_addr()).port();
+    bootstrap_stage(BootstrapStage::Control);
     assert_eq!(control, cache.join("control.sock"));
     // The actual startup validator separately checks the kernel's original
     // private bind address. It deliberately differs from this published path.
-    assert!(listener.local_addr().unwrap().as_pathname().is_some());
-    bootstrap_gate(&mut gate).unwrap();
+    assert!(bootstrap_result(listener.local_addr())
+        .as_pathname()
+        .is_some());
+    bootstrap_stage(BootstrapStage::Gate);
+    bootstrap_result(bootstrap_gate(&mut gate));
     drop(gate);
     let staged = destination.with_file_name(format!(".qshd-update-{}-a223", std::process::id()));
     let handover = crate::handover::Handover {
@@ -1834,17 +2018,26 @@ fn bootstrap_actor() {
         name: "main".into(),
         allowlist: vec![client],
     };
-    let state = crate::handover::write_memfd(&handover).unwrap();
+    bootstrap_stage(BootstrapStage::StateFile);
+    let state = bootstrap_result(crate::handover::write_memfd(&handover));
     let retained = [udp.as_raw_fd(), listener.as_raw_fd(), state.as_raw_fd()];
-    crate::handover::close_on_exec_except(&retained).unwrap();
+    bootstrap_stage(BootstrapStage::FdSelection);
+    bootstrap_result(crate::handover::close_on_exec_except(&retained));
     for fd in retained {
-        crate::handover::set_cloexec(fd, false).unwrap();
+        bootstrap_stage(BootstrapStage::FdInherit);
+        bootstrap_result(crate::handover::set_cloexec(fd, false));
     }
+    bootstrap_stage(BootstrapStage::Exec);
     let failure = crate::handover::exec_staged(&staged, state.as_raw_fd());
+    let exec_error = bootstrap_errno(failure as i32);
+    BOOTSTRAP_ERROR.store(exec_error as usize, Ordering::SeqCst);
     for fd in retained {
-        crate::handover::set_cloexec(fd, true).unwrap();
+        bootstrap_stage(BootstrapStage::FdRestore);
+        bootstrap_result(crate::handover::set_cloexec(fd, true));
     }
-    panic!("owned bootstrap exec refused: {failure}");
+    bootstrap_stage(BootstrapStage::Exec);
+    BOOTSTRAP_ERROR.store(exec_error as usize, Ordering::SeqCst);
+    panic!("owned bootstrap exec refused");
 }
 #[test]
 fn darwin223_owned_signal_server() {
@@ -1852,6 +2045,9 @@ fn darwin223_owned_signal_server() {
         return;
     };
     let directory = std::path::PathBuf::from(directory);
+    if let Ok(mode) = std::env::var("QSH_DARWIN223_BOOTSTRAP_CONTROL") {
+        bootstrap_failure_control(&mode);
+    }
     if std::env::var_os("QSH_DARWIN223_BOOTSTRAP").is_some() {
         bootstrap_actor();
         return;
@@ -1859,6 +2055,7 @@ fn darwin223_owned_signal_server() {
     if std::env::var_os("QSH_DARWIN223_COMMAND_CONTROLS").is_some() {
         fixture_command_controls();
         fixture_stderr_controls();
+        fixture_diagnostic_controls();
         fixture_gate_controls();
         fixture_socket_publication_controls();
         return;
@@ -2080,15 +2277,18 @@ impl DirectDaemonGuard {
             if let Some(status) = observed {
                 let settled = self.owner.finish(end).is_ok();
                 retain_bootstrap_stderr(&self.owner.stderr_bytes);
+                let record = settled_bootstrap_record(&self.owner.stderr_bytes, settled);
                 let category = if settled {
-                    bootstrap_error_origin(&self.owner.stderr_bytes)
+                    record.map(|v| v.0).unwrap_or("OTHER")
                 } else {
                     "STDERR_UNSETTLED"
                 };
                 panic!(
-                    "owned handover bootstrap exited before STATUS exit={} category={}",
+                    "owned handover bootstrap exited before STATUS exit={} category={} errno={} provenance={}",
                     status.code().unwrap_or(-1),
-                    category
+                    category,
+                    record.map(|v| v.1).unwrap_or("UNKNOWN"),
+                    if record.is_some_and(|v| v.1 != "UNKNOWN") { "TYPED" } else { "UNKNOWN" }
                 );
             }
             if daemon_status(&self.socket).is_some() {
@@ -2400,12 +2600,18 @@ fn fixture_command_controls() {
     );
 }
 fn fixture_stderr_controls() {
+    assert_eq!(
+        refusal_origin(
+            "could not open channel: opening the pseudo-terminal: synthetic private canary"
+        ),
+        "PTY_OPEN"
+    );
     let end = Instant::now() + Duration::from_secs(2);
     let mut command = Command::new("/bin/sh");
     command
         .args([
             "-c",
-            "printf 'inherited control publication test-only\\n' >&2; exit 7",
+            "printf 'QSH223_BOOTSTRAP stage=CONTROL errno=EIO\\n' >&2; exit 7",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -2413,10 +2619,7 @@ fn fixture_stderr_controls() {
     owner.capture_stderr().unwrap();
     assert_eq!(owner.finish(end).unwrap().code(), Some(7));
     assert!(owner.captured_stderr.is_none());
-    assert_eq!(
-        bootstrap_error_origin(&owner.stderr_bytes),
-        "HANDOVER_CONTROL"
-    );
+    assert_eq!(bootstrap_error_origin(&owner.stderr_bytes), "CONTROL");
     assert_eq!(
         bootstrap_error_origin(b"opaque fixture-only text /fixture/private"),
         "OTHER"
@@ -2427,7 +2630,7 @@ fn fixture_stderr_controls() {
     );
     assert_eq!(
         refusal_origin("could not open channel: fixture-only"),
-        "PTY_SPAWN"
+        "OTHER"
     );
     assert_eq!(
         refusal_origin("opaque fixture-only text /fixture/private"),
@@ -2461,6 +2664,73 @@ fn fixture_stderr_controls() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(nix::libc::ECHILD)
     );
+}
+fn fixture_diagnostic_controls() {
+    let record = b"QSH223_BOOTSTRAP stage=EXEC errno=EIO\n";
+    assert_eq!(settled_bootstrap_record(record, false), None);
+    assert_eq!(
+        settled_bootstrap_record(record, true),
+        Some(("EXEC", "EIO"))
+    );
+    for (reason, expected) in [
+        ("could not open channel: opening the pseudo-terminal: arbitrary (os error 2)", "PTY_OPEN"),
+        ("could not open channel: disabling echo on the PTY master side: the PTY master side does not hand over a file descriptor", "PTY_ECHO_FD"),
+        ("could not open channel: disabling echo on the PTY master side: reading the PTY master side's termios: opaque", "PTY_ECHO_READ"),
+        ("could not open channel: disabling echo on the PTY master side: writing the PTY master side's termios: opaque", "PTY_ECHO_WRITE"),
+        ("could not open channel: starting the command in the PTY: opaque", "PTY_SPAWN"),
+        ("/private/could not open channel: opening the pseudo-terminal: opaque", "OTHER"),
+        ("could not open channel: /private/starting the command in the PTY: opaque", "OTHER"),
+        ("could not open channel: disabling echo on the PTY master side: the PTY master side does not hand over a file descriptor suffix", "OTHER"),
+    ] { assert_eq!(refusal_origin(reason), expected); }
+    for raw in [
+        b"QSH223_BOOTSTRAP stage=EXEC errno=EIO extra\n".as_slice(),
+        b"QSH223_BOOTSTRAP stage=EXEC errno=EIO",
+        b"QSH223_BOOTSTRAP stage=EXEC errno=EIO\r\n",
+        b"QSH223_BOOTSTRAP stage=OTHER errno=EIO\n",
+        b"QSH223_BOOTSTRAP stage=EXEC errno=EBADF\n",
+        b"QSH223_BOOTSTRAP stage=EXEC errno=EIO\nQSH223_BOOTSTRAP stage=EXEC errno=EIO\n",
+    ] {
+        assert_eq!(bootstrap_record(raw), None);
+    }
+    for (mode, stage, errno) in [
+        ("missing", "STATE_FILE", "ENOENT"),
+        ("typed", "FD_FLAGS", "EINVAL"),
+        ("assert", "PARENT", "UNKNOWN"),
+    ] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "darwin_process_scope::native_tests::darwin223_owned_signal_server",
+                "--nocapture",
+            ])
+            .env("QSH_DARWIN223_SIGNAL_SERVER", "/private-fixture-canary")
+            .env("QSH_DARWIN223_BOOTSTRAP_CONTROL", mode)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+        owner.capture_stderr().unwrap();
+        let status = owner
+            .finish(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert!(!status.success());
+        assert!(owner.captured_stderr.is_none());
+        let expected = format!("QSH223_BOOTSTRAP stage={stage} errno={errno}\n");
+        assert_eq!(owner.stderr_bytes, expected.as_bytes());
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::temp_dir().join(format!("qsh223-admission-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let file = directory.join("inert");
+    std::fs::write(&file, b"inert-not-executed").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    admit_fixture_true(&file).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(admit_fixture_true(&file).is_err());
+    assert!(admit_fixture_true(&directory).is_err());
+    assert!(admit_fixture_true(&directory.join("missing")).is_err());
+    std::fs::remove_file(file).unwrap();
+    std::fs::remove_dir(directory).unwrap();
 }
 fn actual_self_check(binary: &Path, labels: Option<&str>) -> crate::state::SelfCheck {
     let mut command = Command::new(binary);
@@ -2853,6 +3123,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             .is_ok_and(|value| value.same_process(leader.identity)),
         "old direct leader must be physically reaped before exec"
     );
+    admit_fixture_true(Path::new(FIXTURE_TRUE)).expect("FIXTURE_TRUE_ADMISSION");
     let (fresh, fresh_events) = actual_connect(port, server_pub, first.private, [2; 16]);
     fresh
         .send_bytes(
@@ -2863,7 +3134,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
                 cols: 80,
                 rows: 24,
                 screen: false,
-                command: b"/bin/true".to_vec(),
+                command: FIXTURE_TRUE.as_bytes().to_vec(),
             })),
         )
         .unwrap();
