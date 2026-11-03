@@ -19,7 +19,8 @@ ROOT=Path(__file__).resolve().parents[2]
 SOURCE=ROOT/'packaging/selinux'
 SCRIPT=SOURCE/'qshd_selinux_phase.py'
 PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
-        'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE'}
+        'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
+        'consumer-preun-final':'PENDING'}
 RUNTIME_MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','observer',
@@ -49,12 +50,16 @@ class ProtocolTests(unittest.TestCase):
                     operation_id='c'*32,state=PHASES[phase],artifact=TRUST)
         return request,result
 
-    def test_fixed_four_requests_and_exact_response_binding(self):
+    def test_fixed_five_requests_and_exact_response_binding(self):
+        self.assertEqual(self.phase._PHASES,PHASES)
         for phase in PHASES:
             request,frame=self.response(phase)
             self.assertEqual(self.phase._request(phase),request)
+            self.assertEqual(self.phase._parse_request(request),{'schema':1,'phase':phase})
             self.assertEqual(self.phase._parse_response(canonical(frame)+b'\n',request),frame)
-        for phase in ('','provider-pre','erase','consumer-pre','/private/path','consumer-pre-fresh --deadline 999'):
+        for phase in ('','provider-pre','erase','consumer-pre','/private/path','consumer-pre-fresh --deadline 999',
+                      'consumer-preun','consumer-preun-final ','Consumer-preun-final','consumer-postun-final',
+                      'consumer-preun-upgrade'):
             with self.subTest(phase=phase),self.assertRaises(self.phase.PhaseError):self.phase._request(phase)
 
     def test_wrong_shape_phase_state_digest_type_and_noncanonical_response_refuse(self):
@@ -70,6 +75,22 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(b'['*1500+b']'*1500,request)
         with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(b'x'*4097,request)
 
+    def test_final_erase_preparation_frame_binds_its_own_phase_pending_state_and_digest(self):
+        request,frame=self.response('consumer-preun-final');raw=canonical(frame)+b'\n'
+        self.assertEqual(self.phase._parse_response(raw,request),frame)
+        other,_=self.response('consumer-post-owned')
+        for changes in ({'state':'COMPLETE'},{'phase':'consumer-post-owned'},{'phase':'consumer-pre-installed'},
+                        {'request_sha256':hashlib.sha256(other).hexdigest()}):
+            with self.subTest(changes=changes),self.assertRaises(self.phase.PhaseError):
+                self.phase._parse_response(canonical(frame|changes)+b'\n',request)
+        with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(raw,other)
+        for value in (canonical({'schema':1,'phase':'consumer-preun-final'})+b' ',
+                      b'{"phase":"consumer-preun-final","schema":1,"schema":1}',
+                      b'{"phase":"consumer-preun-final","schema":true}',
+                      b'{"phase":"consumer-preun-final","schema":1,"deadline":340}',
+                      b'{"schema":1,"phase":"consumer-preun-final"}'):
+            with self.subTest(value=value),self.assertRaises(self.phase.PhaseError):self.phase._parse_request(value)
+
     def test_actual_typed_pending_and_complete_records_emit_only_final_frame(self):
         from qshd_selinux_activation import Activation,TrustedArtifact,ModuleIdentity,Completion,ContextBinding
         trust=TrustedArtifact(**TRUST)
@@ -80,6 +101,9 @@ class ProtocolTests(unittest.TestCase):
             frame=self.phase._response(record,request)
             self.assertEqual(self.phase._parse_response(frame,request)['state'],state)
         with self.assertRaises(self.phase.PhaseError):self.phase._response(object(),self.phase._request('consumer-pre-fresh'))
+        completion=Completion('normal-install-reload-v1',trust.pp_sha256,ContextBinding('d'*64,'e'*64))
+        complete=Activation(1,'COMPLETE','c'*32,'fedora44-targeted-v1',1,1,trust,ModuleIdentity('qshd',400,'targeted','pp'),completion)
+        with self.assertRaises(self.phase.PhaseError):self.phase._response(complete,self.phase._request('consumer-preun-final'))
 
     def test_only_exact_250_combined_profile_is_new(self):
         from qshd_selinux_process import _Limits,_CommandError
@@ -91,7 +115,7 @@ class ProtocolTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
-    def test_four_modes_call_only_selected_existing_api_with_no_outer_package_recursion(self):
+    def test_five_modes_call_only_selected_existing_api_with_no_outer_package_recursion(self):
         phase=load_phase()
         import qshd_selinux_first_activation as first
         import qshd_selinux_consumer_activation as consumer
@@ -100,13 +124,55 @@ class DispatchTests(unittest.TestCase):
         def bridge(*,deadline):calls.append(('bridge',deadline));return records['provider-post-pristine']
         def pre(*,fresh,deadline):calls.append(('pre',fresh,deadline));return records['consumer-pre-fresh' if fresh else 'consumer-pre-installed']
         def post(*,deadline):calls.append(('post',deadline));return records['consumer-post-owned']
+        def erase(*,deadline):calls.append(('erase',deadline));return records['consumer-preun-final']
         with patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),\
              patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),\
              patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),\
+             patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),\
              patch.object(consumer._Production,'guard',side_effect=lambda deadline:calls.append(('guard',deadline))),\
              patch.object(package,'production',side_effect=AssertionError('entry must not nest a package lease')):
             for name in PHASES:self.assertIs(phase._dispatch(name,deadline=340.0),records[name])
-        self.assertEqual(calls,[('guard',340.0),('bridge',340.0),('pre',True,340.0),('pre',False,340.0),('post',340.0)])
+        self.assertEqual(calls,[('guard',340.0),('bridge',340.0),('pre',True,340.0),('pre',False,340.0),('post',340.0),
+                                ('erase',340.0)])
+
+    def patched_consumer(self,erase):
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_consumer_activation as consumer
+        import qshd_selinux_package_state as package
+        refuse=lambda name:AssertionError(name+' must not be called for final erase preparation')
+        return (patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),
+                patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=refuse('pre')),
+                patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=refuse('post')),
+                patch.object(first,'activate_installed_pristine_pending_first',side_effect=refuse('bridge')),
+                patch.object(consumer._Production,'guard',side_effect=refuse('another guard')),
+                patch.object(package,'production',side_effect=refuse('another package lease')))
+
+    def test_final_erase_preparation_passes_the_exact_original_deadline_once(self):
+        phase=load_phase();deadline=object();record=object();calls=[]
+        def erase(**kwargs):calls.append(kwargs);return record
+        patches=self.patched_consumer(erase)
+        with patches[0],patches[1],patches[2],patches[3],patches[4],patches[5]:
+            self.assertIs(phase._dispatch('consumer-preun-final',deadline=deadline),record)
+        self.assertEqual(len(calls),1);self.assertEqual(set(calls[0]),{'deadline'})
+        self.assertIs(calls[0]['deadline'],deadline)
+
+    def test_final_erase_preparation_failure_propagates_without_fallback_or_frame(self):
+        import io
+        from types import SimpleNamespace
+        phase=load_phase();request=phase._request('consumer-preun-final').decode()
+        class Failure(Exception):pass
+        failure=Failure('synthetic outcome-uncertain erase preparation');calls=[]
+        def erase(*,deadline):calls.append(deadline);raise failure
+        output=SimpleNamespace(buffer=io.BytesIO())
+        patches=self.patched_consumer(erase)
+        with patches[0],patches[1],patches[2],patches[3],patches[4],patches[5],\
+             patch.object(phase,'_resources'),patch.object(phase.time,'monotonic',return_value=101.0),\
+             patch.object(phase,'_response',side_effect=AssertionError('no frame after a failed operation')),\
+             patch.object(phase.sys,'stdout',output):
+            with self.assertRaises(Failure) as raised:phase._child_main([request,'100.0','340.0'])
+        self.assertIs(raised.exception,failure)
+        self.assertEqual(calls,[340.0])
+        self.assertEqual(output.buffer.getvalue(),b'')
 
 
 class DeadlineTests(unittest.TestCase):
@@ -263,7 +329,7 @@ else:
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'')
 
-    def test_four_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
+    def test_five_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
         spec=importlib.util.spec_from_file_location('integrated_payload_builder',SOURCE/'assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
         with tempfile.TemporaryDirectory() as directory:
@@ -320,12 +386,14 @@ calls=[]
 def pre(*,fresh,deadline):calls.append(('pre',fresh,deadline));return record
 def post(*,deadline):calls.append(('post',deadline));return record
 def bridge(*,deadline):calls.append(('bridge',deadline));return record
-with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
+def erase(*,deadline):calls.append(('erase',deadline));return record
+assert pathlib.Path(consumer.__file__).parent==root
+with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
  result=phase._dispatch(mode,deadline=1234.0)
  assert result is record
  request=phase._request(mode);frame=phase._response(result,request)
  assert phase._parse_response(frame,request)['state']==state
-expected={'provider-post-pristine':[('guard',1234.0),('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)]}
+expected={'provider-post-pristine':[('guard',1234.0),('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)],'consumer-preun-final':[('erase',1234.0)]}
 assert calls==expected[mode]
 for name,module in list(sys.modules.items()):
  if name in phase._MODULES:
