@@ -115,6 +115,14 @@ class Inspection:
             fail('INSPECTION_DRIFT')
 
 
+@dataclass(frozen=True)
+class _RemovalObservation:
+    """Private immutable after-state; valid only on its live originating writer."""
+
+    receipts_snapshot: bytes
+    target_snapshots: tuple[tuple[str, bytes], ...]
+
+
 class Writer:
     """Retained context exclusion; borrowed inspection never reacquires flock."""
 
@@ -122,12 +130,16 @@ class Writer:
         self._engine = engine
         self._active = True
         self._borrow = None
+        self._owned_attempt = False
+        self._removed = None
 
     def _live(self, *, mutation=False):
         if not self._active:
             fail('WRITER_CLOSED')
         if mutation and self._borrow is not None:
             fail('INSPECTION_ACTIVE')
+        if mutation and self._owned_attempt:
+            fail('OWNED_REMOVAL_STARTED')
 
     def require_pristine(self, identities):
         """Read-only first-install guard, valid only under retained exclusion.
@@ -169,6 +181,75 @@ class Writer:
     def remove(self):
         self._live(mutation=True)
         return self._engine._operation_locked('remove')
+
+    def remove_owned(self, identities):
+        """Remove an exact owned set once, without adopting or recovering state.
+
+        Caller has already completed read-only existing-state preflight and
+        retains outer package/activation and administrator maintenance exclusion.
+        Writer entry may provision; this operation cannot undo that entry effect.
+        Failures preserve partial output/journal and permanently bar mutation on
+        this writer. No policy/module absence or wall-clock bound is implied.
+        """
+        self._live(mutation=True)
+        self._owned_attempt = True
+        engine = self._engine
+        registry = engine._inspection_registry(identities)
+        inspector = Inspection(engine, registry)
+        before = inspector.capture()
+        receipts = engine._receipts(before.receipts_bytes)
+        if set(receipts) != set(inspector._identities):
+            fail('OWNED_RECEIPTS')
+        expected = {}
+        for key, packed in before.target_snapshots:
+            receipt = receipts[key]
+            if receipt['owner'] != 'qshd' or receipt['identity'] != inspector._identities[key]:
+                fail('OWNED_RECEIPTS')
+            snapshot = engine._unpack(engine._json(packed))
+            data, _ = pure.plan_remove(snapshot['data'], receipt)
+            expected[key] = dict(snapshot, data=data, sha256=hashlib.sha256(data).hexdigest())
+        inspector.recheck(before)
+        # Both maintained engine entry points recover, but admission above under
+        # retained exclusion has established that there is no journal to recover.
+        if not engine._operation_locked('remove'):
+            fail('OWNED_REMOVAL_UNCHANGED')
+        observed = self._removed_snapshot(expected)
+        if self._removed_snapshot(expected) != observed:
+            fail('OWNED_REMOVAL_DRIFT')
+        self._removed = observed
+        return observed
+
+    def _removed_snapshot(self, expected=None):
+        engine = self._engine
+        inspector = Inspection(engine, b'{}')
+        inspector._no_journal()
+        receipt = engine._read(engine.state_fd, 'receipts', state=True, limit=MAX_STATE)
+        if receipt['data'] != b'{}':
+            fail('OWNED_REMOVAL_RECEIPTS')
+        targets = []
+        for key in sorted(engine.targets):
+            current = engine.snapshot(key)
+            if expected is not None and not engine._same(current, expected[key], inode=False, times=False):
+                fail('OWNED_REMOVAL_RESULT')
+            targets.append((key, json_bytes(engine._pack(current))))
+        inspector._no_journal()
+        return _RemovalObservation(json_bytes(engine._pack(receipt)), tuple(targets))
+
+    def recheck_removed(self, observation):
+        """Read-only exact after-state proof, poisoned permanently on refusal.
+
+        Caller requires this and normal inner/outer closure before success;
+        no stability is promised after this writer releases its context lock.
+        """
+        self._live()
+        try:
+            if self._removed is None or observation is not self._removed:
+                fail('OWNED_REMOVAL_OBSERVATION')
+            if self._removed_snapshot() != observation:
+                fail('OWNED_REMOVAL_DRIFT')
+        except BaseException:
+            self._removed = None
+            raise
 
     def resume(self):
         self._live(mutation=True)

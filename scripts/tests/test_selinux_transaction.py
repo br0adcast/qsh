@@ -589,3 +589,264 @@ class FilesystemTests(unittest.TestCase):
             with self.engine(substitute).locked() as engine:
                 engine.commit({'/contexts': b'new'}, {})
         self.assertTrue((self.root / 'state/journal').exists())
+
+
+class OwnedRemovalTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.target = self.root / 'contexts'
+        self.original = b'# unrelated administrator bytes\nsystem_r:sshd_t:s0 user_r:user_t:s0\n'
+        self.target.write_bytes(self.original)
+        self.target.chmod(0o640)
+        os.setxattr(self.target, 'user.owned-test', b'preserve')
+        self.ids = {'/contexts': {'path': '/contexts', 'source_type': 'sshd_t', 'original_package': 'fixture-1'}}
+        self.engine().reconcile(self.ids)
+
+    def engine(self, hook=None):
+        return tx.Transaction(self.root / 'state', {'/contexts': self.target}, uid=os.geteuid(), hook=hook)
+
+    def test_owned_removal_preserves_admin_bytes_metadata_and_retained_lock(self):
+        import fcntl
+        with self.engine().writer() as writer:
+            self.assertTrue(hasattr(writer, 'remove_owned'), 'owned removal API missing')
+            token = writer.remove_owned(self.ids)
+            self.assertEqual(self.target.read_bytes(), self.original)
+            self.assertEqual(self.target.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(os.getxattr(self.target, 'user.owned-test'), b'preserve')
+            self.assertEqual((self.root/'state/receipts').read_bytes(), b'{}')
+            writer.recheck_removed(token)
+            fd = os.open(self.root/'state/lock', os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:os.close(fd)
+        with self.assertRaises(tx.Conflict):writer.recheck_removed(token)
+
+    def test_administrator_current_receipt_refuses_before_engine(self):
+        self.engine().remove()
+        self.target.write_bytes(self.original + b'system_r:qshd_t:s0 user_r:user_t:s0\n')
+        self.engine().reconcile(self.ids)
+        before = self.target.read_bytes()
+        with self.engine().writer() as writer:
+            self.assertTrue(hasattr(writer, 'remove_owned'), 'owned removal API missing')
+            with patch.object(writer._engine, '_operation_locked', side_effect=AssertionError('engine reached')):
+                with self.assertRaises(tx.Conflict):writer.remove_owned(self.ids)
+        self.assertEqual(self.target.read_bytes(), before)
+
+    def inventory(self):
+        return {str(p.relative_to(self.root)): (p.lstat().st_mode, p.read_bytes() if p.is_file() and not p.is_symlink() else os.readlink(p) if p.is_symlink() else None)
+                for p in self.root.rglob('*')}
+
+    def test_any_journal_refuses_without_recovery_or_publication(self):
+        journal = self.root/'state/journal'
+        for kind in ('valid', 'malformed', 'symlink', 'directory'):
+            with self.subTest(kind=kind):
+                if kind == 'valid':
+                    def stop(event):
+                        if event == 'journal_directory_sync':raise RuntimeError('intentional retained journal')
+                    with self.assertRaises(RuntimeError):self.engine(stop).remove()
+                elif kind == 'malformed':journal.write_bytes(b'not-json')
+                elif kind == 'symlink':journal.symlink_to(self.root/'missing')
+                else:journal.mkdir()
+                before = self.inventory()
+                with self.engine().writer() as writer:
+                    with patch.object(writer._engine, '_operation_locked', side_effect=AssertionError('engine reached')), \
+                         patch.object(writer._engine, 'recover', side_effect=AssertionError('recovery reached')), \
+                         patch.object(writer._engine, 'commit', side_effect=AssertionError('commit reached')):
+                        with self.assertRaises(tx.Conflict):writer.remove_owned(self.ids)
+                self.assertEqual(self.inventory(), before)
+                if kind == 'directory':journal.rmdir()
+                else:journal.unlink()
+
+    def test_missing_extra_wrong_identity_and_changed_source_refuse_before_engine(self):
+        receipt = self.root/'state/receipts'
+        saved = receipt.read_bytes()
+        for kind in ('missing', 'extra', 'identity', 'source', 'block'):
+            with self.subTest(kind=kind):
+                value = tx.json.loads(saved)
+                data = self.target.read_bytes()
+                if kind == 'missing':value = {}
+                elif kind == 'extra':value['/other'] = value['/contexts']
+                elif kind == 'identity':value['/contexts']['identity']['original_package'] = 'different'
+                elif kind == 'source':self.target.write_bytes(data.replace(b'user_r:user_t', b'user_r:other_t', 1))
+                else:self.target.write_bytes(data.replace(b'qshd_t', b'other_t'))
+                receipt.write_bytes(tx.json_bytes(value))
+                before = self.inventory()
+                with self.engine().writer() as writer:
+                    with patch.object(writer._engine, '_operation_locked', side_effect=AssertionError('engine reached')):
+                        with self.assertRaises((tx.Conflict, tx.pure.ReconcileError)):writer.remove_owned(self.ids)
+                self.assertEqual(self.inventory(), before)
+                receipt.write_bytes(saved)
+                self.target.write_bytes(data)
+
+    def test_post_engine_byte_and_metadata_mismatch_never_returns_observation(self):
+        for kind in ('bytes', 'mode', 'xattrs'):
+            with self.subTest(kind=kind):
+                engine = self.engine()
+                with engine.writer() as writer:
+                    original = engine._operation_locked
+                    def altered(*args):
+                        result = original(*args)
+                        if kind == 'bytes':self.target.write_bytes(self.original + b'# drift\n')
+                        elif kind == 'mode':self.target.chmod(0o600)
+                        else:os.setxattr(self.target, 'user.owned-test', b'changed')
+                        return result
+                    with patch.object(engine, '_operation_locked', side_effect=altered):
+                        with self.assertRaisesRegex(tx.Conflict, '^OWNED_REMOVAL_RESULT$'):writer.remove_owned(self.ids)
+                    self.assertIsNone(writer._removed)
+                    with self.assertRaises(tx.Conflict):writer.resume()
+                self.target.write_bytes(self.original)
+                self.target.chmod(0o640)
+                os.setxattr(self.target, 'user.owned-test', b'preserve')
+                self.engine().reconcile(self.ids)
+
+    def test_recheck_detects_full_after_state_and_permanently_poisons_token(self):
+        for kind in ('bytes', 'mode', 'xattrs', 'target-inode', 'receipt-inode', 'receipts', 'journal', 'route'):
+            with self.subTest(kind=kind):
+                engine = self.engine()
+                with engine.writer() as writer:
+                    token = writer.remove_owned(self.ids)
+                    target = self.target
+                    receipt = self.root/'state/receipts'
+                    if kind == 'bytes':target.write_bytes(self.original + b'# unrelated drift\n')
+                    elif kind == 'mode':target.chmod(0o600)
+                    elif kind == 'xattrs':os.setxattr(target, 'user.owned-test', b'drift')
+                    elif kind in ('target-inode', 'receipt-inode'):
+                        path = target if kind == 'target-inode' else receipt
+                        replacement = self.root/'replacement'
+                        replacement.write_bytes(path.read_bytes())
+                        replacement.chmod(path.stat().st_mode & 0o777)
+                        for attr in os.listxattr(path):os.setxattr(replacement, attr, os.getxattr(path, attr))
+                        replacement.replace(path)
+                    elif kind == 'receipts':receipt.write_bytes(b'{"unexpected":true}')
+                    elif kind == 'journal':(self.root/'state/journal').write_bytes(b'evidence')
+                    else:
+                        # A route binding refusal must invalidate even an otherwise equal view.
+                        with patch.object(engine, '_validate_routes', side_effect=tx.Conflict('ROUTE_DRIFT')):
+                            with self.assertRaises(tx.Conflict):writer.recheck_removed(token)
+                    if kind != 'route':
+                        with self.assertRaises(tx.Conflict):writer.recheck_removed(token)
+                    with self.assertRaisesRegex(tx.Conflict, '^OWNED_REMOVAL_OBSERVATION$'):writer.recheck_removed(token)
+                (self.root/'state/journal').unlink(missing_ok=True)
+                receipt.write_bytes(b'{}')
+                receipt.chmod(0o600)
+                target.write_bytes(self.original)
+                target.chmod(0o640)
+                os.setxattr(target, 'user.owned-test', b'preserve')
+                self.engine().reconcile(self.ids)
+
+    def test_token_identity_lifetime_and_mutation_barriers(self):
+        import dataclasses
+        with self.engine().writer() as writer:
+            with writer.inspection(self.ids):
+                with self.assertRaisesRegex(tx.Conflict, '^INSPECTION_ACTIVE$'):writer.remove_owned(self.ids)
+            token = writer.remove_owned(self.ids)
+            with self.assertRaises(dataclasses.FrozenInstanceError):token.receipts_snapshot = b'changed'
+            for call in (lambda: writer.remove_owned(self.ids), lambda: writer.reconcile(self.ids),
+                         lambda: writer.update(self.ids), writer.remove, writer.resume):
+                with self.assertRaisesRegex(tx.Conflict, '^OWNED_REMOVAL_STARTED$'):call()
+            with self.assertRaises(tx.Conflict):
+                with writer.inspection(self.ids):pass
+            writer.recheck_removed(token)
+            with self.assertRaises(tx.Conflict):writer.recheck_removed(dataclasses.replace(token))
+            with self.assertRaises(tx.Conflict):writer.recheck_removed(token)
+        with self.assertRaises(tx.Conflict):writer.recheck_removed(token)
+        with self.engine().writer() as other:
+            with self.assertRaises(tx.Conflict):other.recheck_removed(token)
+
+    def test_failed_publication_preserves_journal_and_closes_descriptors(self):
+        before = set(os.listdir('/proc/self/fd'))
+        def stop(event):
+            if event == 'journal_directory_sync':raise OSError(errno.EIO, 'injected fsync boundary')
+        with self.assertRaisesRegex(tx.Conflict, '^FILESYSTEM_5$'):
+            with self.engine(stop).writer() as writer:
+                with patch.object(writer._engine, 'recover', wraps=writer._engine.recover) as recover:
+                    try:writer.remove_owned(self.ids)
+                    finally:
+                        self.assertEqual(recover.call_count, 2)
+                        self.assertIsNone(writer._removed)
+                        with self.assertRaises(tx.Conflict):writer.resume()
+        self.assertTrue((self.root/'state/journal').exists())
+        self.assertEqual(set(os.listdir('/proc/self/fd')), before)
+
+    def test_actual_directory_fsync_failure_after_target_publish_keeps_evidence(self):
+        armed = False
+        real_fsync = os.fsync
+        def hook(event):
+            nonlocal armed
+            if event == 'target_rename':armed = True
+        def fsync(fd):
+            if armed:raise OSError(errno.EIO, 'injected actual directory sync')
+            return real_fsync(fd)
+        engine = self.engine(hook)
+        with engine.writer() as writer:
+            with patch.object(tx.os, 'fsync', side_effect=fsync):
+                with self.assertRaises(OSError):writer.remove_owned(self.ids)
+            self.assertIsNone(writer._removed)
+            self.assertEqual(self.target.read_bytes(), self.original)
+            self.assertTrue((self.root/'state/journal').exists())
+            self.assertNotEqual((self.root/'state/receipts').read_bytes(), b'{}')
+            with self.assertRaises(tx.Conflict):writer.remove_owned(self.ids)
+
+    def test_final_verification_drift_after_retirement_leaves_no_usable_token(self):
+        def hook(event):
+            if event == 'retire_directory_sync':self.target.write_bytes(self.original + b'# late change\n')
+        with self.engine(hook).writer() as writer:
+            with self.assertRaisesRegex(tx.Conflict, '^OWNED_REMOVAL_RESULT$'):writer.remove_owned(self.ids)
+            self.assertFalse((self.root/'state/journal').exists())
+            self.assertEqual((self.root/'state/receipts').read_bytes(), b'{}')
+            with self.assertRaises(tx.Conflict):writer.remove()
+            self.assertIsNone(writer._removed)
+
+    def test_partial_or_malformed_receipts_are_not_repaired(self):
+        receipt = self.root/'state/receipts'
+        saved = receipt.read_bytes()
+        for data in (b'not-json', b'{ }', b'{}'):
+            receipt.write_bytes(data)
+            before = self.inventory()
+            with self.engine().writer() as writer:
+                with patch.object(writer._engine, 'recover', side_effect=AssertionError('recovery reached')):
+                    with self.assertRaises((tx.Conflict, tx.pure.ReconcileError)):writer.remove_owned(self.ids)
+            self.assertEqual(self.inventory(), before)
+        receipt.unlink()
+        before = self.inventory()
+        with self.assertRaises(tx.Conflict):
+            with self.engine().writer():self.fail('partial state admitted')
+        self.assertEqual(self.inventory(), before)
+        receipt.write_bytes(saved)
+        receipt.chmod(0o600)
+
+    def test_exact_two_target_removal_preserves_distinct_bytes_and_metadata(self):
+        other = self.root / 'other-contexts'
+        other_original = b'# second administrator prefix\nsystem_r:sshd_t:s0 staff_r:staff_t:s0\n# second suffix\n'
+        other.write_bytes(other_original)
+        other.chmod(0o600)
+        os.setxattr(other, 'user.second-test', b'distinct metadata')
+        identities = dict(self.ids)
+        identities['/other-contexts'] = {
+            'path': '/other-contexts',
+            'source_type': 'sshd_t',
+            'original_package': 'second-fixture',
+        }
+        engine = tx.Transaction(
+            self.root / 'state',
+            {'/contexts': self.target, '/other-contexts': other},
+            uid=os.geteuid(),
+        )
+        engine.reconcile(identities)
+        with engine.writer() as writer:
+            observation = writer.remove_owned(identities)
+            self.assertEqual(self.target.read_bytes(), self.original)
+            self.assertEqual(other.read_bytes(), other_original)
+            self.assertEqual(self.target.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(other.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(os.getxattr(self.target, 'user.owned-test'), b'preserve')
+            self.assertEqual(os.getxattr(other, 'user.second-test'), b'distinct metadata')
+            self.assertEqual((self.root / 'state/receipts').read_bytes(), b'{}')
+            self.assertFalse((self.root / 'state/journal').exists())
+            self.assertEqual(
+                {key for key, _ in observation.target_snapshots},
+                set(identities),
+            )
+            writer.recheck_removed(observation)
