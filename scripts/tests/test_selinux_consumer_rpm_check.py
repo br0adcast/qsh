@@ -63,13 +63,29 @@ def generated_fixture(root):
     return binary,pam,manifest,receipt,values,rows,blobs
 
 
+_XML_FORMAT = ('<q><p>%{NAME:xml}<n>%|EPOCH?{%{EPOCH}}:{0}|</n>%{VERSION:xml}%{RELEASE:xml}%{ARCH:xml}</p>'
+               '<a>%{FILEDIGESTALGO}</a><files>'
+               '[<f>%{FILENAMES:xml}<n>%{FILESIZES}</n><n>%{FILEMODES}</n><n>%{FILEFLAGS}</n>'
+               '%{FILEUSERNAME:xml}%{FILEGROUPNAME:xml}%{FILEDIGESTS:xml}%{FILELINKTOS:xml}</f>]'
+               '</files></q>\n')
+
+
+def xml_string(value):
+    # RPM 4.18/6 formatter source escapes only these XML metacharacters.
+    if not value:
+        return '\t<string/>'
+    return '\t<string>'+value.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')+'</string>'
+
+
 def header(rows, package=None):
     package=package or {'name':'qshd','epoch':0,'version':'0.5.0','release':'1','arch':'x86_64'}
-    quote=lambda value:json.dumps(value,ensure_ascii=True)
-    result='P\t'+quote(package['name'])+'\t'+str(package['epoch'])+'\t'+quote(package['version'])+'\t'+quote(package['release'])+'\t'+quote(package['arch'])+'\nA\t8\n'
+    result='<q><p>'+xml_string(package['name'])+'<n>'+str(package['epoch'])+'</n>'
+    result+=''.join(xml_string(package[key]) for key in ('version','release','arch'))+'</p><a>8</a><files>'
     for row in rows:
-        result+='F\t'+quote(row['path'])+'\t'+str(row['size'])+'\t'+str(row['mode'])+'\t'+str(row['flags'])+'\t'+quote(row['owner'])+'\t'+quote(row['group'])+'\t'+quote(row['sha256'])+'\t'+quote(row.get('link',''))+'\n'
-    return result.encode('ascii')+b'E\n'
+        result+='<f>'+xml_string(row['path'])
+        result+=''.join('<n>'+str(row[key])+'</n>' for key in ('size','mode','flags'))
+        result+=''.join(xml_string(row.get(key,'')) for key in ('owner','group','sha256','link'))+'</f>'
+    return (result+'</files></q>\n').encode('utf-8')
 
 
 def cpio_entry(name,data=b'',*,mode=0o100644,nlink=1,uid=123,gid=456):
@@ -91,9 +107,10 @@ def tools(root,header_bytes,payload_bytes,*,query_tail='',decode_tail='',query_p
         script=root/name
         argv_check="""expected=['--rcfile','/dev/null','--macros','/dev/null','--noplugins','--nosignature','--query','--package','--nomanifest','--noglob','--queryformat']
 assert sys.argv[1:-2]==expected
+assert sys.argv[-2]=={fixed_format!r}
 assert sys.argv[-1].startswith('/proc/self/fd/')
 with open(sys.argv[-1],'rb') as source:assert source.read(64).startswith(b'synthetic RPM sentinel')
-""" if name=='rpm' else "assert len(sys.argv)==1\nassert sys.stdin.buffer.read(64).startswith(b'synthetic RPM sentinel')\n"
+""".format(fixed_format=_XML_FORMAT) if name=='rpm' else "assert len(sys.argv)==1\nassert sys.stdin.buffer.read(64).startswith(b'synthetic RPM sentinel')\n"
         script.write_text('#!/usr/bin/python3\nimport os,sys,time,signal\n'+argv_check+prefix+'\n'+
             'with open('+repr(str(data))+",'rb') as source:\n while True:\n  block=source.read("+str(chunk)+")\n  if not block:break\n  while block:\n   block=block[os.write(1,block):]\n"+tail+'\n')
         script.chmod(0o755)
@@ -182,6 +199,17 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(result['stdout']),b'')
         return result
 
+    def test_rpm418_xml_formatter_and_metacharacters_accept_actual_owned_worker(self):
+        path='/unselected-&<>"'
+        data=b'ordinary ignored bytes'
+        rows=self.rows+[{'path':path,'size':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+                         'mode':0o100644,'owner':'root','group':'root','flags':0}]
+        blobs=dict(self.blobs,**{path:data})
+        outcome=self.run_worker(raw_header=header(rows),raw_payload=payload(blobs))
+        self.assertEqual(outcome['exit'],0,'RPM 4.18 XML serialization must reach verified comparison')
+        self.assertIsNone(outcome['failure'])
+        self.assertEqual(json.loads(base64.b64decode(outcome['stdout']))['result'],'verified')
+
     def test_selected_content_and_header_succeed_under_actual_owner(self):
         outcome=self.run_worker()
         self.assertEqual(outcome['exit'],0)
@@ -240,11 +268,68 @@ class SourceTests(unittest.TestCase):
 
     def test_header_grammar_duplicates_missing_and_malformed_tail_refuse(self):
         good=header(self.rows)
-        cases=[good[:-1],good.replace(b'E\n',b''),good+good,good.replace(b'A\t8',b'A\t1'),
-               header(self.rows+[self.rows[0]]),header(self.rows[:-1]),good.replace(b'E\n',b'F\t"truncated"\nE\n'),
-               good.replace(b'"root"\t"root"',b'"root"',1),good.replace(b'F\t"/etc/pam.d/qshd"',b'F\t"/etc/../pam.d/qshd"')]
+        cases=[good[:-6],good.replace(b'</q>',b''),good+good,good.replace(b'<a>8</a>',b'<a>1</a>'),
+               header(self.rows+[self.rows[0]]),header(self.rows[:-1]),
+               good.replace(b'</files>',b'<f><string>truncated</string></f></files>'),
+               good.replace(b'<string>root</string>',b'',1),
+               good.replace(b'/etc/pam.d/qshd',b'/etc/../pam.d/qshd')]
         for index,raw in enumerate(cases):
             with self.subTest(case=index):self.assert_refused(raw_header=raw)
+
+    def test_utf16_autodetection_cannot_bypass_utf8_or_forbidden_constructs(self):
+        good=header(self.rows).decode('utf-8')
+        documents=[good,'<!DOCTYPE q>'+good,
+                   '<!DOCTYPE q [<!ENTITY fixture "qshd">]>'+good.replace('<string>qshd</string>','<string>&fixture;</string>'),
+                   good.replace('<q>','<q><?fixture benign?>')]
+        for encoding in ('utf-16-le','utf-16-be'):
+            for index,document in enumerate(documents):
+                with self.subTest(encoding=encoding,document=index):
+                    self.assert_refused(raw_header=document.encode(encoding))
+
+    def test_xml_declarations_entities_processing_and_comments_refuse(self):
+        good=header(self.rows)
+        cases=[b'<?xml version="1.0"?>'+good,b'<!DOCTYPE q>'+good,
+               b'<!DOCTYPE q [<!ENTITY injected "qshd">]>'+good.replace(b'>qshd<',b'>&injected;<'),
+               good.replace(b'<q>',b'<q><?injected value?>'),
+               good.replace(b'<q>',b'<q><!-- comment -->'),
+               good.replace(b'<string>qshd</string>',b'<string><![CDATA[qshd]]></string>')]
+        for index,raw in enumerate(cases):
+            with self.subTest(case=index):self.assert_refused(raw_header=raw)
+
+    def test_xml_exact_shape_attributes_namespaces_and_text_refuse(self):
+        good=header(self.rows)
+        cases=[good.replace(b'<q>',b'<q extra="1">'),
+               good.replace(b'<q>',b'<q xmlns="urn:unexpected">'),
+               good.replace(b'<p>',b'<p><extra/>'),
+               good.replace(b'<n>0</n>',b'<n><n>0</n></n>',1),
+               good.replace(b'<string>qshd</string>',b'<string><string>qshd</string></string>'),
+               good.replace(b'<a>8</a>',b'<a>8</a><extra/>'),
+               good.replace(b'<a>8</a><files>',b'<files><a>8</a>'),
+               good.replace(b'</p>',b'</p>unexpected'),
+               good.replace(b'<q>',b'<q>unexpected'),
+               good.replace(b'<string>root</string>',b'<string extra="1">root</string>',1),
+               good.replace(b'</q>',b'</q>unexpected')]
+        for index,raw in enumerate(cases):
+            with self.subTest(case=index):self.assert_refused(raw_header=raw)
+
+    def test_xml_numeric_leaves_and_control_bearing_paths_refuse(self):
+        good=header(self.rows)
+        for number in (b' 0',b'0 ',b'+0',b'-1',b'00',b'true',b'4294967296'):
+            with self.subTest(number=number):
+                self.assert_refused(raw_header=good.replace(b'<n>0</n>',b'<n>'+number+b'</n>',1))
+        for control in (b'\t',b'\n',b'\r',b'&#9;',b'&#10;',b'&#13;',b'\x01'):
+            with self.subTest(control=control):
+                self.assert_refused(raw_header=good.replace(b'/etc/pam.d/qshd',b'/etc/pam.d/qshd'+control))
+
+    def test_xml_empty_digest_and_link_for_unselected_members_accept(self):
+        rows=self.rows+[
+            {'path':'/unselected-dir','size':0,'mode':0o40755,'flags':0,'owner':'root','group':'root','sha256':'','link':''},
+            {'path':'/unselected-link','size':6,'mode':0o120777,'flags':0,'owner':'root','group':'root','sha256':'','link':'target'}]
+        stream=b''.join(cpio_entry('.'+path,data) for path,data in self.blobs.items())
+        stream+=cpio_entry('/unselected-dir',mode=0o40755)+cpio_entry('/unselected-link',b'target',mode=0o120777)
+        stream+=cpio_entry('TRAILER!!!',mode=0)
+        result=self.run_worker(raw_header=header(rows),raw_payload=stream,chunk=7)
+        self.assertEqual(result['exit'],0)
 
     def test_emitted_inventory_duplicate_missing_alias_and_links_refuse(self):
         normal=[cpio_entry('.'+path,data) for path,data in self.blobs.items()]
@@ -519,7 +604,7 @@ NATIVE=False
 
 def load_tests(loader, tests, pattern):
     suite=loader.loadTestsFromTestCase(NativeTests if NATIVE else SourceTests)
-    expected=4 if NATIVE else 17
+    expected=4 if NATIVE else 23
     declared=unittest.TestLoader().loadTestsFromTestCase(NativeTests if NATIVE else SourceTests).countTestCases()
     if declared!=expected or not 0<suite.countTestCases()<=expected:
         raise AssertionError('required RPM checker test count drift')
@@ -539,5 +624,5 @@ if __name__=='__main__':
     if len(sys.argv)==3 and sys.argv[1]=='--_owned-source':
         raise SystemExit(owned_source(sys.argv[2]))
     program=unittest.main(exit=False)
-    expected=4 if NATIVE else 17
+    expected=4 if NATIVE else 23
     raise SystemExit(0 if program.result.wasSuccessful() and program.result.testsRun==expected and not program.result.skipped else 1)

@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / 'packaging/selinux'))
@@ -49,9 +50,13 @@ _MAX_STDERR = 65536
 _BINARY = '/usr/bin/qshd'
 _PAM = '/etc/pam.d/qshd'
 _MANIFEST = '/usr/share/qshd/consumer-rpm.json'
-_FORMAT = (r'P\t%{NAME:json}\t%|EPOCH?{%{EPOCH}}:{0}|\t%{VERSION:json}\t%{RELEASE:json}\t%{ARCH:json}\n'
-           r'A\t%{FILEDIGESTALGO}\n'
-           r'[F\t%{FILENAMES:json}\t%{FILESIZES}\t%{FILEMODES}\t%{FILEFLAGS}\t%{FILEUSERNAME:json}\t%{FILEGROUPNAME:json}\t%{FILEDIGESTS:json}\t%{FILELINKTOS:json}\n]E\n')
+_FORMAT = ('<q><p>%{NAME:xml}<n>%|EPOCH?{%{EPOCH}}:{0}|</n>'
+           '%{VERSION:xml}%{RELEASE:xml}%{ARCH:xml}</p>'
+           '<a>%{FILEDIGESTALGO}</a><files>'
+           '[<f>%{FILENAMES:xml}<n>%{FILESIZES}</n><n>%{FILEMODES}</n>'
+           '<n>%{FILEFLAGS}</n>%{FILEUSERNAME:xml}%{FILEGROUPNAME:xml}'
+           '%{FILEDIGESTS:xml}%{FILELINKTOS:xml}</f>]'
+           '</files></q>\n')
 _TOOLS = ('/usr/bin/rpm', '/usr/bin/rpm2cpio')
 
 
@@ -173,34 +178,89 @@ def _number(value, maximum=2**64-1):
     return result
 
 
-def _string(value):
-    result = _json(value.encode('utf-8'))
-    if type(result) is not str or result in ('(none)', '(null)'):
+def _xml(raw):
+    if (type(raw) is not bytes or not 0 < len(raw) <= _MAX_HEADER
+            or b'\0' in raw or b'<!' in raw or b'<?' in raw):
+        _fail('HEADER_XML')
+    # Read events between bounded feeds so depth/count limits apply before the
+    # whole tree is retained. Namespace declarations must not disappear silently.
+    parser = ET.XMLPullParser(events=('start', 'end', 'start-ns'))
+    depth = count = 0
+    root = None
+    def events():
+        nonlocal depth, count, root
+        for event, node in parser.read_events():
+            if event == 'start-ns':
+                _fail('HEADER_XML')
+            if event == 'start':
+                depth += 1
+                count += 1
+                if (depth > 4 or count > 9*_MAX_ROWS+12 or node.attrib
+                        or node.tag not in ('q', 'p', 'a', 'files', 'f', 'string', 'n')):
+                    _fail('HEADER_XML')
+                if root is None:
+                    root = node
+            else:
+                depth -= 1
+    try:
+        # Explicit UTF-8 validation; no declaration-selected alternate encoding.
+        raw.decode('utf-8')
+        for offset in range(0, len(raw), 65536):
+            parser.feed(raw[offset:offset+65536])
+            events()
+        parser.close()
+        events()
+    except ET.ParseError:
+        raise CheckError('HEADER_XML') from None
+    if root is None or depth != 0:
+        _fail('HEADER_XML')
+    return root
+
+
+def _space(text):
+    return text is None or text.strip(' \t\r\n') == ''
+
+
+def _sequence(node, tag, fields=None):
+    if node.tag != tag or not _space(node.text) or not _space(node.tail):
+        _fail('HEADER_XML')
+    children = list(node)
+    if fields is not None and [child.tag for child in children] != list(fields):
+        _fail('HEADER_XML')
+    if any(not _space(child.tail) for child in children):
+        _fail('HEADER_XML')
+    return children
+
+
+def _leaf(node, tag):
+    if node.tag != tag or len(node) or not _space(node.tail):
+        _fail('HEADER_XML')
+    value = node.text if node.text is not None else ''
+    if tag == 'string' and value in ('(none)', '(null)'):
         _fail('STRING')
-    return result
+    return value
 
 
 def _header(raw, authority, manifest):
-    if not raw.endswith(b'\n'):
-        _fail('HEADER')
-    lines = raw.decode('utf-8').splitlines()
-    if not 4 <= len(lines) <= _MAX_ROWS + 3 or lines[-1] != 'E':
-        _fail('HEADER')
-    p = lines[0].split('\t')
-    if (len(p) != 6 or p[0] != 'P' or
-            [_string(p[1]), _number(p[2], 2**32-1), *(_string(v) for v in p[3:])] !=
-            list(asdict(authority.package).values()) or lines[1] != 'A\t8'):
+    package, algorithm, inventory = _sequence(_xml(raw), 'q', ('p', 'a', 'files'))
+    p = _sequence(package, 'p', ('string', 'n', 'string', 'string', 'string'))
+    if ([_leaf(p[0], 'string'), _number(_leaf(p[1], 'n'), 2**32-1),
+         *(_leaf(node, 'string') for node in p[2:])] != list(asdict(authority.package).values())
+            or _number(_leaf(algorithm, 'a'), 2**32-1) != 8):
         _fail('PACKAGE')
+    rows = _sequence(inventory, 'files')
+    if len(rows) > _MAX_ROWS:
+        _fail('HEADER')
     files = {}
-    for line in lines[2:-1]:
-        fields = line.split('\t')
-        if len(fields) != 9 or fields[0] != 'F':
-            _fail('HEADER_ROW')
-        path = _path(_string(fields[1]))
+    for row in rows:
+        fields = _sequence(row, 'f', ('string', 'n', 'n', 'n', 'string', 'string', 'string', 'string'))
+        path = _path(_leaf(fields[0], 'string'))
         if path in files:
             _fail('DUPLICATE_PATH')
-        size, mode, flags = _number(fields[2]), _number(fields[3], 65535), _number(fields[4], 2**32-1)
-        owner, group, digest, link = map(_string, fields[5:])
+        size = _number(_leaf(fields[1], 'n'))
+        mode = _number(_leaf(fields[2], 'n'), 65535)
+        flags = _number(_leaf(fields[3], 'n'), 2**32-1)
+        owner, group, digest, link = (_leaf(node, 'string') for node in fields[4:])
         kind = stat.S_IFMT(mode)
         if kind not in (stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK) or flags & 64:
             _fail('HEADER_TYPE')
