@@ -1,8 +1,9 @@
-"""Strict first install and same-artifact reload; neither proves readiness.
+"""Strict install/reload and distinct exact-owned removal; none proves readiness.
 
 Trusted caller holds package exclusion, has stopped/drained service with the
 administrator stop guard, and has published fresh durable PENDING. No automatic
-adoption, arbitrary update, removal, rollback, COMPLETE publication or hooks.
+adoption, arbitrary update, rollback, COMPLETE publication or hooks.
+Removal returns only normal completion and finite all-priority absence evidence.
 An outer fresh process must impose the hard wall deadline on filesystem calls.
 """
 from dataclasses import dataclass
@@ -275,3 +276,81 @@ class OwnedReload(_InstallFiles):
         finally:self._cleanup()
         self._time()
         return InstallResult(self._trusted,self._trusted.pp_sha256)
+
+
+@dataclass(frozen=True)
+class RemovalResult:
+    """Normal removal and finite all-priority absence, not durable readiness."""
+    artifact: TrustedArtifact
+    pp_sha256: str
+
+
+def production_owned_remover(trusted_artifact, pp_bytes):
+    """Caller retains exclusion, completed stop guard and fresh durable PENDING."""
+    if os.geteuid()!=0:_fail('ROOT_REQUIRED')
+    return OwnedRemove(trusted_artifact,pp_bytes)
+
+
+class OwnedRemove(_InstallFiles):
+    """Single-use exact-owned removal; never adopt absence or publish state."""
+    def __init__(self, trusted_artifact, pp_bytes, *, _root=None, _uid=0,
+                 _owner=None, _clock=time.monotonic, _observer=None):
+        super().__init__(trusted_artifact,pp_bytes,_root=_root,_uid=_uid,
+                         _owner=_owner,_clock=_clock)
+        self._observer=production_observer if _observer is None else _observer
+
+    def _removal_command(self, operation):
+        """Fixed remover commands need no PP scratch and use a read-only cwd."""
+        if operation=='remove':
+            argv=_PREFIX+('-X','400','-r','qshd');limits=_INSTALL;reserve=110
+        elif operation=='list':
+            argv=_PREFIX+('-lfull',);limits=_LIST;reserve=10
+        else:_fail('COMMAND_KIND')
+        self._guard()
+        if self._end-self._clock()<=reserve:_fail('DEADLINE')
+        owner=self._injected if self._injected is not None else _Owner(limits)
+        self._owner=owner
+        try:
+            streams=owner._run(argv,'/',deadline=self._end-10)
+        finally:
+            outcome=getattr(owner,'_last',None)
+            self._uncertain=(bool(getattr(owner,'_unsettled',False)) or
+                             (outcome is not None and (not outcome.settled or bool(outcome.unreaped))))
+        outcome=getattr(owner,'_last',None)
+        if (type(streams) is not _Streams or type(streams.stdout) is not bytes or
+                type(streams.stderr) is not bytes or outcome is None or not outcome.settled or
+                outcome.unreaped or outcome.failure is not None or outcome.exit_code!=0):_fail('TOOL_FAILURE')
+        if len(streams.stdout)+len(streams.stderr)>limits.output_bytes:_fail('OUTPUT_LIMIT')
+        self._time()
+        return streams
+
+    def remove(self, *, deadline):
+        if self._used:_fail('REMOVE_USED')
+        self._used=True
+        if type(deadline) not in (int,float):_fail('DEADLINE')
+        try:finite=math.isfinite(deadline)
+        except OverflowError:finite=False
+        if not finite:_fail('DEADLINE')
+        self._end=min(deadline,self._clock()+240)
+        if self._end-self._clock()<=180:_fail('DEADLINE')
+        try:
+            try:
+                self._admit()
+                with self._observer(self._trusted) as observer:
+                    if observer._owner is None:_fail('OBSERVER_OWNER')
+                    observer._owner=_DeadlineOwner(observer._owner,self._end-10)
+                    self._time();observed=observer.capture();self._time()
+                    observer.recheck(observed);self._time()
+                self._time();self._guard();self._active()
+                self._removal_command('remove')
+                self._active();self._guard()
+                for _ in range(2):
+                    listing=self._removal_command('list')
+                    if any(row.name=='qshd' for row in parse_full_listing(listing.stdout)):
+                        _fail('MODULE_REMAINS')
+                    self._active();self._guard()
+            except (OSError,Conflict,ObserverError,ModuleError,_CommandError):
+                raise InstallError('REMOVE_REFUSED') from None
+        finally:self._cleanup()
+        self._time()
+        return RemovalResult(self._trusted,self._trusted.pp_sha256)

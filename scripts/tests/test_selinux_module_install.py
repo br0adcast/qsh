@@ -352,4 +352,192 @@ class OwnedReloadTests(unittest.TestCase):
         self.assertEqual(self.observations,[]);self.assertEqual(self.calls,[])
 
 
+class OwnedRemoveTests(unittest.TestCase):
+    setUp = InstallTests.setUp
+
+    def _run(self,argv,cwd,*,deadline):
+        self.calls.append((argv,Path(cwd),deadline))
+        self.command_events.append(tuple(self.events))
+        self.assertEqual(list((self.root/'run').iterdir()),[])
+        if self.action:return self.action(argv,Path(cwd),deadline)
+        stdout=self.listing if argv[-1]=='-lfull' else b''
+        self._last=_Outcome(stdout,b'normal bounded diagnostic',0,None,True)
+        return _Streams(stdout,b'normal bounded diagnostic')
+
+    def observer(self,trusted):
+        from contextlib import contextmanager
+        @contextmanager
+        def lease():
+            with OwnedReloadTests.observer(self,trusted) as observed:
+                yield observed
+            if self.close_error:raise m.ObserverError('synthetic close failure')
+            self.events.append('observer closed')
+        return lease()
+
+    def remover(self):
+        self.observations=[];self.observe_action=None;self.owned_listing=b'100 base cil\n400 qshd pp\n'
+        self.events=[];self.command_events=[];self.close_error=False;self.calls=[];self.action=None
+        self.now=100.0;self.clock=lambda:self.now
+        return m.OwnedRemove(TRUST,PP,_root=self.root,_uid=os.getuid(),
+                             _owner=self,_clock=self.clock,_observer=self.observer)
+
+    def test_owned_observer_closes_before_one_remove_and_two_fresh_absence_reads(self):
+        item=self.remover()
+        with patch.object(item,'_make_scratch',side_effect=AssertionError('PP scratch forbidden')):
+            result=item.remove(deadline=1000)
+        self.assertEqual(result,m.RemovalResult(TRUST,TRUST.pp_sha256))
+        self.assertNotIsInstance(result,m.InstallResult)
+        self.assertEqual(self.command_events,[('observer closed',)]*3)
+        self.assertEqual([x[0] for x in self.observations],['list','extract','list','extract'])
+        self.assertEqual([x[2] for x in self.observations],[330]*4)
+        self.assertEqual([x[0] for x in self.calls],[m._PREFIX+('-X','400','-r','qshd'),m._PREFIX+('-lfull',),m._PREFIX+('-lfull',)])
+        self.assertEqual([x[1] for x in self.calls],[Path('/')]*3)
+        self.assertEqual([x[2] for x in self.calls],[330]*3)
+        with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+
+    def test_nonowned_module_never_reaches_remove(self):
+        for listing in (b'100 base cil\n',b'400 qshd pp disabled\n',b'100 qshd pp\n',b'500 qshd pp\n',
+                        b'400 qshd pp\n500 qshd pp\n',b'400 qshd cil\n',b'broken'):
+            item=self.remover();self.owned_listing=listing
+            with self.subTest(listing=listing),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+            self.assertEqual(self.calls,[])
+            self.assertEqual(list((self.root/'run').iterdir()),[])
+
+    def test_wrong_hll_recheck_drift_and_observer_close_refuse(self):
+        for case in ('HLL','recheck','close'):
+            item=self.remover()
+            def action(operation,cwd,owner):
+                if case=='HLL' and operation=='extract':
+                    path=cwd/'qshd.pp';path.write_bytes(b'wrong');path.chmod(0o600);return b''
+                if case=='recheck' and len(self.observations)==3:return b'400 qshd pp disabled\n'
+            self.observe_action=action;self.close_error=case=='close'
+            with self.subTest(case=case),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+            self.assertEqual(self.calls,[])
+
+    def test_removal_failure_never_reaches_absence(self):
+        for case in ('nonzero','failure','timeout','unsettled','unreaped','overflow','wrong result','wrong bytes'):
+            item=self.remover()
+            def action(argv,cwd,deadline):
+                if case=='timeout':raise _CommandError('COMMAND_TIMEOUT')
+                self._last=_Outcome(b'',b'',1 if case=='nonzero' else 0,'COMMAND_FAILURE' if case=='failure' else None,case!='unsettled',(987654,) if case=='unreaped' else ())
+                if case=='overflow':return _Streams(b'x'*(1024**2+1),b'')
+                if case=='wrong result':return b''
+                if case=='wrong bytes':return _Streams('not bytes',b'')
+                return _Streams(b'',b'')
+            self.action=action
+            with self.subTest(case=case),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+            self.assertEqual(len(self.calls),1)
+
+    def test_both_fresh_absence_samples_reject_any_qshd_or_invalid_listing(self):
+        for at in (2,3):
+            for listing in (b'1 qshd pp disabled\n',b'999 qshd cil\n',b'400 qshd pp\n',b'broken',b'100 base cil\n100 base cil\n',b'x'*(1024**2+1)):
+                item=self.remover()
+                def action(argv,cwd,deadline):
+                    stdout=listing if len(self.calls)==at else (b'100 base cil\n' if argv[-1]=='-lfull' else b'')
+                    self._last=_Outcome(stdout,b'',0,None,True);return _Streams(stdout,b'')
+                self.action=action
+                with self.subTest(at=at,listing=listing[:40]),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+                self.assertEqual(len(self.calls),at)
+
+    def test_absence_exit_failure_suppresses_both_read_positions(self):
+        for at in (2,3):
+            item=self.remover()
+            def action(argv,cwd,deadline):
+                stdout=b'100 base cil\n' if argv[-1]=='-lfull' else b''
+                self._last=_Outcome(stdout,b'',1 if len(self.calls)==at else 0,None,True)
+                return _Streams(stdout,b'')
+            self.action=action
+            with self.subTest(at=at),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+            self.assertEqual(len(self.calls),at)
+
+    def test_unsettled_observer_keeps_its_scratch_and_closes_fds(self):
+        item=self.remover();before=len(os.listdir('/proc/self/fd'))
+        def unsettled(operation,cwd,owner):
+            owner._last=_Outcome(b'',b'',None,'COMMAND_CUSTODY',False,(987654,))
+            raise _CommandError('COMMAND_CUSTODY')
+        self.observe_action=unsettled
+        with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+        self.assertEqual(self.calls,[]);self.assertTrue(list((self.root/'run').iterdir()))
+        self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+
+    def test_original_deadline_and_reserves_refuse_before_mutation(self):
+        for deadline in (True,float('nan'),float('inf'),10**1000,100,280):
+            item=self.remover()
+            with self.subTest(deadline=deadline),self.assertRaises(m.InstallError):item.remove(deadline=deadline)
+            self.assertEqual(self.calls,[]);self.assertEqual(self.observations,[])
+            with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+        item=self.remover()
+        def elapsed(operation,cwd,owner):
+            if len(self.observations)==4:self.now=230
+        self.observe_action=elapsed
+        with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+        self.assertEqual(self.calls,[])
+
+    def test_late_command_and_final_cleanup_suppress_result(self):
+        for case in ('command','cleanup'):
+            item=self.remover()
+            if case=='command':
+                def late(argv,cwd,deadline):
+                    self.now=340;self._last=_Outcome(b'',b'',0,None,True);return _Streams(b'',b'')
+                self.action=late
+                with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+                self.assertEqual(len(self.calls),1)
+            else:
+                original=item._cleanup
+                def late_cleanup():original();self.now=340
+                with patch.object(item,'_cleanup',side_effect=late_cleanup),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+                self.assertEqual(len(self.calls),3)
+
+    def test_active_tree_replacement_is_readmitted(self):
+        item=self.remover();active=self.root/'var/lib/selinux/targeted/active'
+        def replacement(argv,cwd,deadline):
+            if len(self.calls)==1:
+                shutil.rmtree(active);(active/'modules').mkdir(parents=True)
+                active.chmod(0o755);(active/'modules').chmod(0o755)
+            self._last=_Outcome(b'',b'',0,None,True);return _Streams(self.listing if argv[-1]=='-lfull' else b'',b'')
+        self.action=replacement
+        self.assertEqual(item.remove(deadline=1000),m.RemovalResult(TRUST,TRUST.pp_sha256))
+
+    def test_unsafe_active_and_changed_authority_refuse_after_remove(self):
+        for case in ('active','config','lock'):
+            item=self.remover();active=self.root/'var/lib/selinux/targeted/active/modules'
+            config=self.root/'etc/selinux/semanage.conf';lock=self.root/'var/lib/selinux/targeted/semanage.read.LOCK'
+            def changed(argv,cwd,deadline):
+                if case=='active':active.rmdir();active.symlink_to(self.root/'run',target_is_directory=True)
+                elif case=='config':config.write_bytes(b'changed')
+                else:lock.chmod(0o644)
+                self._last=_Outcome(b'',b'',0,None,True);return _Streams(b'',b'')
+            self.action=changed
+            with self.subTest(case=case),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+            self.assertEqual(len(self.calls),1)
+            if case=='active':active.unlink();active.mkdir();active.chmod(0o755)
+            elif case=='config':config.write_bytes(b'# fixture')
+            else:lock.chmod(0o600)
+
+    def test_normal_and_failed_setup_close_all_route_fds(self):
+        item=self.remover();before=len(os.listdir('/proc/self/fd'));item.remove(deadline=1000)
+        self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+        item=self.remover();(self.root/'usr/lib/os-release').unlink()
+        with self.assertRaises(m.InstallError):item.remove(deadline=1000)
+        self.assertEqual(len(os.listdir('/proc/self/fd')),before);self.assertEqual(self.calls,[])
+
+    def test_close_failure_after_second_absence_closes_remaining_fds(self):
+        item=self.remover();before=len(os.listdir('/proc/self/fd'));close=os.close;failed=False
+        def fault(fd):
+            nonlocal failed
+            close(fd)
+            if len(self.calls)==3 and not failed:failed=True;raise OSError('synthetic close failure')
+        with patch.object(m.os,'close',side_effect=fault),self.assertRaises(m.InstallError):item.remove(deadline=1000)
+        self.assertTrue(failed);self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+
+    def test_production_factory_and_exact_existing_profiles(self):
+        with patch.object(m.os,'geteuid',return_value=1),self.assertRaises(m.InstallError):m.production_owned_remover(TRUST,PP)
+        item=self.remover();item._injected=None;profiles=[]
+        def owner(limits):profiles.append(limits);return self
+        with patch.object(m,'_Owner',side_effect=owner):item.remove(deadline=1000)
+        self.assertEqual(profiles,[m._INSTALL,m._LIST,m._LIST])
+        self.assertEqual([(x.execution_seconds,x.output_bytes) for x in profiles],[(75,1024**2),(15,1024**2),(15,1024**2)])
+        with self.assertRaises(m.InstallError):m.OwnedRemove(TRUST,b'wrong')
+
+
 if __name__=='__main__':unittest.main()
