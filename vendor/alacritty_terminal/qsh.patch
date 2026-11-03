@@ -87,3 +87,8 @@
 +                        self.mark_fully_damaged();
 +                    }
 +                }
+--- a/src/term/cell.rs
++++ b/src/term/cell.rs
+@@ -165 +165 @@
+-        let extra = self.extra.get_or_insert(Default::default());
++        let extra = self.extra.get_or_insert_with(Default::default);

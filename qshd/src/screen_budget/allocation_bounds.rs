@@ -252,6 +252,74 @@ fn size(c: u16, r: u16) -> TerminalSize {
     TerminalSize::new(c, r).unwrap()
 }
 
+fn repeated_combining_marks_reuse_unique_extra() {
+    let mut cell = Cell::default();
+    cell.push_zerowidth('\u{301}');
+    let baseline = COUNTS.with(|counter| counter.get().live);
+    let (_, counts) = observe(|| {
+        for mark in ['\u{302}', '\u{303}', '\u{304}'] {
+            black_box(&mut cell).push_zerowidth(mark);
+        }
+        black_box(cell.zerowidth());
+    });
+    let transient = counts.peak - baseline;
+    let retained = counts.live - baseline;
+    eprintln!("combining extra steady append: transient={transient} retained={retained}");
+    assert_eq!(
+        cell.zerowidth(),
+        Some(['\u{301}', '\u{302}', '\u{303}', '\u{304}'].as_slice())
+    );
+    assert_eq!(retained, 0, "steady append must not grow retained storage");
+    assert_eq!(
+        transient, 0,
+        "existing unique extra must not allocate a temporary default"
+    );
+}
+
+#[test]
+fn combining_extra_preserves_empty_shared_attributes_and_all_marks() {
+    let mut cell = Cell::default();
+    assert!(cell.extra.is_none());
+    cell.push_zerowidth('\u{301}');
+    assert_eq!(cell.zerowidth(), Some(['\u{301}'].as_slice()));
+    let color = Color::Indexed(42);
+    cell.set_underline_color(Some(color));
+    cell.push_zerowidth('\u{302}');
+    let mut shared = cell.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        cell.extra.as_ref().unwrap(),
+        shared.extra.as_ref().unwrap()
+    ));
+    shared.push_zerowidth('\u{303}');
+    assert!(!std::sync::Arc::ptr_eq(
+        cell.extra.as_ref().unwrap(),
+        shared.extra.as_ref().unwrap()
+    ));
+    assert_eq!(cell.zerowidth(), Some(['\u{301}', '\u{302}'].as_slice()));
+    assert_eq!(
+        shared.zerowidth(),
+        Some(['\u{301}', '\u{302}', '\u{303}'].as_slice())
+    );
+    assert_eq!(cell.underline_color(), Some(color));
+    assert_eq!(shared.underline_color(), Some(color));
+
+    let marks: Vec<char> = (0..terminal::MAX_COMBINING_MARKS)
+        .map(|index| char::from_u32(0x301 + index as u32).unwrap())
+        .collect();
+    let mut core = TerminalCore::new(4, 2);
+    core.feed(b"a");
+    for mark in &marks {
+        let mut bytes = [0; 4];
+        core.feed(mark.encode_utf8(&mut bytes).as_bytes());
+    }
+    let frame = core.frame();
+    assert_eq!(frame.cells[0].combining.as_slice(), marks.as_slice());
+    let mut independent = frame.clone();
+    independent.cells[0].combining = terminal::CombiningMarks::default();
+    assert_eq!(core.frame(), frame);
+    assert_eq!(frame.cells[0].combining.as_slice(), marks.as_slice());
+}
+
 #[test]
 fn requested_storage() {
     const CHILD: &str = "QSH_ALLOCATION_OBSERVER_CHILD";
@@ -305,6 +373,7 @@ fn requested_storage() {
         !within(s, 0, 100),
         "negative control must reject a low peak bound"
     );
+    repeated_combining_marks_reuse_unique_extra();
     let max = replay_len(512, 256, TAIL).unwrap();
     assert_eq!(max, 41_457_964);
     assert_eq!(replay_len(1, 1, 0), None);
