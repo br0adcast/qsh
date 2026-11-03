@@ -734,6 +734,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_api.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_files.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_retained_labels.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_observer.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_payload.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_references.py'
