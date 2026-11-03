@@ -51,3 +51,9 @@ formatting does not rewrite upstream source. Validate product behavior with
 `cargo test --locked -p terminal`. Standalone upstream library/grid testing can
 use an owned source copy and its own lockfile with an explicit local `vte`
 patch; record that test graph separately from the product and fuzz lockfiles.
+
+Appending a zero-width character constructs extra cell storage lazily when it is
+absent. An existing extra no longer constructs and discards a default Arc before
+append; the existing Arc copy-on-write and suffix behavior are unchanged. Product
+allocation controls cover steady unique appends, and semantic controls preserve
+empty/shared extras, underline attributes and all sixteen accepted marks.

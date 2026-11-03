@@ -162,7 +162,7 @@ impl Cell {
     /// Write a new zerowidth character to this cell.
     #[inline]
     pub fn push_zerowidth(&mut self, character: char) {
-        let extra = self.extra.get_or_insert(Default::default());
+        let extra = self.extra.get_or_insert_with(Default::default);
         Arc::make_mut(extra).zerowidth.push(character);
     }
 
