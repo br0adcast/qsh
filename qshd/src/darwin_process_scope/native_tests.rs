@@ -729,6 +729,19 @@ async fn connected_until(mut predicate: impl FnMut() -> bool) -> Result<(), &'st
     }
     Ok(())
 }
+fn connected_actor_command(directory: &Path, executable: &Path) -> Vec<u8> {
+    let quote = |value: &Path| {
+        let value = value.to_str().expect("fixture path UTF-8");
+        assert!(
+            !value.contains('\''),
+            "fixture paths use the maintained single-quote grammar"
+        );
+        format!("'{value}'")
+    };
+    // Command channels parse argv; they do not evaluate shell assignments or exec.
+    format!("/usr/bin/env QSH_DARWIN223_ACTOR={} QSH_DARWIN223_CONNECTED_ACTOR=1 {} --exact darwin_process_scope::native_tests::darwin223_owned_actor --nocapture",
+        quote(directory), quote(executable)).into_bytes()
+}
 struct ConnectedActorAuthority {
     directory: Option<tempfile::TempDir>,
     bound: Option<DescendantGuard>,
@@ -775,9 +788,7 @@ impl ConnectedActorAuthority {
         publish(&self.path().join("controller-bound"));
     }
     fn command(directory: &Path) -> Vec<u8> {
-        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
-        format!("QSH_DARWIN223_ACTOR={} QSH_DARWIN223_CONNECTED_ACTOR=1 exec {} --exact darwin_process_scope::native_tests::darwin223_owned_actor --nocapture",
-            quote(directory.to_str().unwrap()), quote(std::env::current_exe().unwrap().to_str().unwrap())).into_bytes()
+        connected_actor_command(directory, &std::env::current_exe().unwrap())
     }
     fn abort(&self) {
         publish(&self.path().join("abort"));
@@ -868,6 +879,16 @@ impl Drop for ConnectedActorAuthority {
     }
 }
 fn connected_authority_controls() {
+    let command = connected_actor_command(
+        Path::new("/fixture with spaces"),
+        Path::new("/fixture executable"),
+    );
+    let argv = crate::channel_backend::split_command(&command).unwrap();
+    assert_eq!(argv[0], "/usr/bin/env");
+    assert_eq!(argv[1], "QSH_DARWIN223_ACTOR=/fixture with spaces");
+    assert_eq!(argv[2], "QSH_DARWIN223_CONNECTED_ACTOR=1");
+    assert_eq!(argv[3], "/fixture executable");
+    assert_eq!(argv.len(), 7);
     for delayed in [true, false] {
         let mut authority = ConnectedActorAuthority::new();
         let path = authority.path().to_path_buf();
@@ -1353,6 +1374,13 @@ fn darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork() {
             });
         }
         publish(&directory.path().join("exit"));
+        if mode == "last-fork" {
+            // Preserve the intended normal leader status before escalating the
+            // remaining grandchild. poll_leader is WNOWAIT: SID custody stays
+            // reserved, and no consuming wait can occur at this barrier.
+            until(|| scope.poll_leader(&mut ops) == Ok(Some(0)));
+            assert_eq!(guard.waits.load(Ordering::SeqCst), 0);
+        }
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut captured_last_fork = mode != "last-fork";
         loop {
@@ -1362,12 +1390,14 @@ fn darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork() {
                 captured_last_fork = true;
                 scope.escalate();
             }
-            if progress == super::scope::Progress::Complete(0) {
+            if let super::scope::Progress::Complete(code) = progress {
+                assert_eq!(code, 0, "fixture normal leader completion; mode={mode}");
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "native candidate closure failed; mode={mode}"
+                "native candidate closure failed; mode={mode} progress={progress:?} retained={:?} census={:?}",
+                scope.retained(), scope.census()
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1677,6 +1707,7 @@ fn darwin223_native_partial_descriptor_failure_retains_real_process_owner() {
         registry: Arc<ChannelOpenRegistry>,
         reader_failure: bool,
         guards: Mutex<Vec<FixtureGuard>>,
+        custodies: Mutex<Vec<OpenCustody>>,
     }
     impl ChannelSpawner for FailingSpawner {
         fn open_registry(&self) -> Arc<ChannelOpenRegistry> {
@@ -1701,6 +1732,7 @@ fn darwin223_native_partial_descriptor_failure_retains_real_process_owner() {
             let (guard, child) = FixtureGuard::new(child);
             self.guards.lock().unwrap().push(guard);
             let wait = own_child(child, qualification);
+            self.custodies.lock().unwrap().push(custody.clone());
             crate::channel_backend::darwin_setup_failure_for_test(
                 master,
                 wait,
@@ -1714,6 +1746,7 @@ fn darwin223_native_partial_descriptor_failure_retains_real_process_owner() {
             registry: ChannelOpenRegistry::new(Default::default()),
             reader_failure,
             guards: Mutex::new(Vec::new()),
+            custodies: Mutex::new(Vec::new()),
         };
         let owner = transport::auth::Principal {
             uid: unsafe { nix::libc::getuid() },
@@ -1733,9 +1766,30 @@ fn darwin223_native_partial_descriptor_failure_retains_real_process_owner() {
             crate::channel_backend::fixture_spawn(&spawner, &owner, [1; 16], &request, None)
                 .is_err()
         );
+        // fixture_spawn performs one cleanup observation. Unknown retains the
+        // exact capsule; this fixture owns the blocking retry duty that the real
+        // lifecycle normally drives, rather than assuming the first census stable.
+        let custody = spawner.custodies.lock().unwrap()[0].clone();
+        until(|| {
+            matches!(
+                custody.retry_cleanup(),
+                transport::channel_open::CleanupStatus::Confirmed(_)
+            )
+        });
+        assert_census_receipt();
         let guards = spawner.guards.lock().unwrap();
         assert_eq!(guards.len(), 1);
         guards[0].assert_normal();
+        let pid = guards[0].inner.lock().unwrap().process_id().unwrap() as i32;
+        let mut status = 0;
+        assert_eq!(
+            unsafe { nix::libc::waitpid(pid, &mut status, nix::libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::ECHILD)
+        );
         assert_eq!(spawner.registry.outstanding(), 0);
         assert_eq!(spawner.registry.retiring_count(), 0);
         eprintln!(
@@ -2147,6 +2201,11 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     eprintln!("darwin223 Cargo_binary_sha256={} original_build={} old_fixture_sha256={} new_fixture_sha256={} new_test_label={} profile=fixture-only-ad-hoc-signatures",hex::encode(original_hash),original_check.build,hex::encode(old_hash),hex::encode(new_hash),new_build);
     let home = tempfile::tempdir().unwrap();
     let actor_directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(home.path().join("qsh"))
+        .unwrap();
     let socket = home.path().join("qsh/control.sock");
     let first = transport::handshake::generate_keypair();
     let parked_key = transport::handshake::generate_keypair();
