@@ -904,6 +904,64 @@ impl Drop for ConnectedActorAuthority {
         }
     }
 }
+fn refusal_origin(reason: &str) -> &'static str {
+    match reason {
+        "the daemon is restarting" => "RESTARTING",
+        "channel already opening" | "channel already open" => "STREAM_OCCUPIED",
+        "too many channels" => "CHANNEL_LIMIT",
+        "too many pending channels" => "OPEN_ADMISSION",
+        "channel opening identity exhausted" => "IDENTITY",
+        "channel opening unavailable" => "EXECUTOR",
+        "channel preparation unavailable" => "INSTALLATION",
+        "this Darwin runtime has no qualified process ownership contract" => "DARWIN_CONTRACT",
+        _ if reason.starts_with("Darwin process ownership unavailable:") => "DARWIN_ADMISSION",
+        _ if reason.starts_with("could not open channel:") => "PTY_SPAWN",
+        _ => "OTHER",
+    }
+}
+fn bootstrap_error_origin(bytes: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(bytes);
+    for (literal, code) in [
+        ("inherited control publication", "HANDOVER_CONTROL"),
+        ("inherited control socket", "HANDOVER_CONTROL"),
+        ("inherited UDP socket", "HANDOVER_UDP"),
+        ("handover descriptor", "HANDOVER_FD"),
+        ("handover file", "HANDOVER_FD"),
+        ("staged update", "HANDOVER_PATH"),
+        ("replacement paths", "HANDOVER_PATH"),
+        ("bootstrap GO frame", "ACTOR_GATE"),
+        ("panicked at", "ACTOR_PANIC"),
+    ] {
+        if text.contains(literal) {
+            return code;
+        }
+    }
+    if bytes.is_empty() {
+        "EMPTY"
+    } else {
+        "OTHER"
+    }
+}
+fn retain_bootstrap_stderr(bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "qsh223-private-bootstrap-{}-{}.txt",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    // Raw controlled-fixture data stays in a private local evidence file;
+    // neither its bytes nor its path is emitted to public CI output.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        let _ = file.write_all(bytes);
+    }
+}
 fn bounded_fixture_receipt(path: &Path) -> String {
     use std::io::Read;
     let Ok(file) = std::fs::File::open(path) else {
@@ -1178,8 +1236,9 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 let records = fresh_events.records.lock().unwrap();
                 let count = |predicate: fn(&ServerRecord) -> bool| records.iter().filter(|record| predicate(record)).count();
                 let metadata = registry.try_cleanup_snapshot();
+                let origin = records.iter().find_map(|r| match r { ServerRecord::Refused { reason, .. } => Some(refusal_origin(reason)), _ => None }).unwrap_or("NONE");
                 let exit_code = records.iter().find_map(|r| match r { ServerRecord::Exit { code, .. } => Some(code.to_string()), _ => None }).unwrap_or_else(|| "none".into());
-                let receipt = format!("live={} opened={} exit0={} exitother={} code={} unavailable={} refused={} input_failed={} pending={} retiring={} debt={} leader_unknown={} cleanup_unknown={} unconfirmed={}",
+                let receipt = format!("live={} opened={} exit0={} exitother={} code={} unavailable={} refused={} origin={} input_failed={} pending={} retiring={} debt={} leader_unknown={} cleanup_unknown={} unconfirmed={}",
                     fresh_events.live.load(Ordering::SeqCst) as u8,
                     count(|r| matches!(r, ServerRecord::Opened { .. })),
                     count(|r| matches!(r, ServerRecord::Exit { code: 0, .. })),
@@ -1187,6 +1246,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                     exit_code,
                     count(|r| matches!(r, ServerRecord::ExitStatusUnavailable { .. })),
                     count(|r| matches!(r, ServerRecord::Refused { .. })),
+                    origin,
                     fresh_events.input_failed.load(Ordering::SeqCst) as u8,
                     metadata.as_ref().map(|m| m.healthy_pending_opens.to_string()).unwrap_or_else(|| "none".into()),
                     metadata.as_ref().map(|m| m.retiring_channels.to_string()).unwrap_or_else(|| "none".into()),
@@ -1595,7 +1655,7 @@ fn bootstrap_command(
         .env(crate::state::TEST_BUILD_LABELS_ENV, labels)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(move || {
             for fd in inherited {
@@ -1798,6 +1858,7 @@ fn darwin223_owned_signal_server() {
     }
     if std::env::var_os("QSH_DARWIN223_COMMAND_CONTROLS").is_some() {
         fixture_command_controls();
+        fixture_stderr_controls();
         fixture_gate_controls();
         fixture_socket_publication_controls();
         return;
@@ -2007,16 +2068,38 @@ struct DirectDaemonGuard {
 }
 impl DirectDaemonGuard {
     fn arm(&mut self) {
-        until(|| {
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = match self.owner.poll() {
+                Ok(value) => value,
+                Err(_) => {
+                    retain_bootstrap_stderr(&self.owner.stderr_bytes);
+                    panic!("owned handover bootstrap refused exit=-1 category=STDERR_CAPTURE");
+                }
+            };
+            if let Some(status) = observed {
+                let settled = self.owner.finish(end).is_ok();
+                retain_bootstrap_stderr(&self.owner.stderr_bytes);
+                let category = if settled {
+                    bootstrap_error_origin(&self.owner.stderr_bytes)
+                } else {
+                    "STDERR_UNSETTLED"
+                };
+                panic!(
+                    "owned handover bootstrap exited before STATUS exit={} category={}",
+                    status.code().unwrap_or(-1),
+                    category
+                );
+            }
+            if daemon_status(&self.socket).is_some() {
+                break;
+            }
             assert!(
-                self.owner
-                    .poll()
-                    .expect("bootstrap child observation")
-                    .is_none(),
-                "owned handover bootstrap exited before STATUS"
+                Instant::now() < end,
+                "owned bootstrap STATUS observation deadline"
             );
-            daemon_status(&self.socket).is_some()
-        });
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let status = daemon_status(&self.socket).unwrap();
         assert_eq!(status.pid, self.owner.child.id());
         assert!(self.owner.poll().unwrap().is_none());
@@ -2087,6 +2170,8 @@ struct OwnedCommand {
     child: std::process::Child,
     status: Option<std::process::ExitStatus>,
     transferred: bool,
+    captured_stderr: Option<std::process::ChildStderr>,
+    stderr_bytes: Vec<u8>,
 }
 impl OwnedCommand {
     fn spawn(command: &mut Command) -> std::io::Result<Self> {
@@ -2094,7 +2179,53 @@ impl OwnedCommand {
             child: command.spawn()?,
             status: None,
             transferred: false,
+            captured_stderr: None,
+            stderr_bytes: Vec::new(),
         })
+    }
+    fn capture_stderr(&mut self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let pipe = self.child.stderr.take().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "missing fixture stderr pipe",
+            )
+        })?;
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+        if flags < 0
+            || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.captured_stderr = Some(pipe);
+        Ok(())
+    }
+    fn drain_stderr(&mut self) -> std::io::Result<()> {
+        use std::io::Read;
+        if let Some(pipe) = self.captured_stderr.as_mut() {
+            let mut bytes = [0; 4096];
+            match pipe.read(&mut bytes) {
+                Ok(0) => self.captured_stderr = None,
+                Ok(n) if self.stderr_bytes.len() + n <= 64 * 1024 => {
+                    self.stderr_bytes.extend_from_slice(&bytes[..n])
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "fixture stderr cap",
+                    ))
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
     fn transfer_to_bound_controller(mut self) {
         // Only the actor's controller-bound gate may discharge this fixture
@@ -2102,6 +2233,7 @@ impl OwnedCommand {
         self.transferred = true;
     }
     fn poll(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.drain_stderr()?;
         if self.status.is_none() {
             self.status = self.child.try_wait()?;
         }
@@ -2110,7 +2242,9 @@ impl OwnedCommand {
     fn finish(&mut self, end: Instant) -> std::io::Result<std::process::ExitStatus> {
         loop {
             if let Some(status) = self.poll()? {
-                return Ok(status);
+                if self.captured_stderr.is_none() {
+                    return Ok(status);
+                }
             }
             if Instant::now() >= end {
                 return Err(std::io::Error::new(
@@ -2129,6 +2263,7 @@ impl Drop for OwnedCommand {
         }
         self.child.stdout.take();
         self.child.stderr.take();
+        self.captured_stderr.take();
         if self.status.is_none() {
             match self.child.try_wait() {
                 Ok(Some(status)) => self.status = Some(status),
@@ -2254,6 +2389,69 @@ fn fixture_command_controls() {
     .unwrap();
     assert_eq!(output.status.code(), Some(7));
     // No child can remain waitable after either refusal or normal completion.
+    let mut status = 0;
+    assert_eq!(
+        unsafe { nix::libc::waitpid(-1, &mut status, nix::libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(nix::libc::ECHILD)
+    );
+}
+fn fixture_stderr_controls() {
+    let end = Instant::now() + Duration::from_secs(2);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf 'inherited control publication test-only\\n' >&2; exit 7",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+    owner.capture_stderr().unwrap();
+    assert_eq!(owner.finish(end).unwrap().code(), Some(7));
+    assert!(owner.captured_stderr.is_none());
+    assert_eq!(
+        bootstrap_error_origin(&owner.stderr_bytes),
+        "HANDOVER_CONTROL"
+    );
+    assert_eq!(
+        bootstrap_error_origin(b"opaque fixture-only text /fixture/private"),
+        "OTHER"
+    );
+    assert_eq!(
+        refusal_origin("too many pending channels"),
+        "OPEN_ADMISSION"
+    );
+    assert_eq!(
+        refusal_origin("could not open channel: fixture-only"),
+        "PTY_SPAWN"
+    );
+    assert_eq!(
+        refusal_origin("opaque fixture-only text /fixture/private"),
+        "OTHER"
+    );
+    drop(owner);
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "while :; do printf 01234567890123456789 >&2; done"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+    owner.capture_stderr().unwrap();
+    loop {
+        match owner.poll() {
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                break;
+            }
+            Ok(_) => assert!(Instant::now() < end, "stderr cap observation deadline"),
+        }
+    }
+    assert!(owner.stderr_bytes.len() <= 64 * 1024);
+    drop(owner); // actual kill + consuming wait before leaving the refusal
     let mut status = 0;
     assert_eq!(
         unsafe { nix::libc::waitpid(-1, &mut status, nix::libc::WNOHANG) },
@@ -2412,6 +2610,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             &labels,
         );
         let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+        owner.capture_stderr().unwrap();
         drop(child_gate);
         gate.set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -2437,7 +2636,8 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             first.public,
             &labels,
         );
-        let owner = OwnedCommand::spawn(&mut command).unwrap();
+        let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+        owner.capture_stderr().unwrap();
         let pid = owner.child.id() as i32;
         drop(owner);
         drop(child_gate);
@@ -2461,7 +2661,8 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         first.public,
         &labels,
     );
-    let owner = OwnedCommand::spawn(&mut command).unwrap();
+    let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+    owner.capture_stderr().unwrap();
     let mut daemon = DirectDaemonGuard {
         owner,
         socket: socket.clone(),
