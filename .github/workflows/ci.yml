@@ -688,7 +688,7 @@ jobs:
       # `binutils` is for `strip`: qshd/tests/transport_ensure_update.rs
       # strips its copy of the debug qshd below MAX_UPDATE_SIZE.
       - name: Install integration test dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libselinux1-dev binutils patch zsh
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libselinux1-dev binutils patch zsh rpm rpm2cpio
 
       - name: Build and release script controls
         run: |
@@ -717,6 +717,8 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_phase.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_rpm_query.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_consumer_authority_generator.py'
+          python3 -B -m unittest discover -s scripts/tests -p 'test_selinux_consumer_rpm_check.py'
+          python3 -I -B scripts/tests/test_selinux_consumer_rpm_check.py --native -v
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_api.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_files.py'
