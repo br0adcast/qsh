@@ -2641,10 +2641,31 @@ dropping the datagram. A forged or corrupted datagram is dropped in silence.
 A replayed one is caught by the 32 704-position window of §1.3 and dropped
 before it can deliver data, advance liveness, or move the session.
 
-Each direction has its own key, derived from a handshake that includes a
-fresh ephemeral from each side on every connection. What that gives beyond
-the above is a property of the Noise IK pattern, not of code in this
-repository, and is not claimed here.
+Each `Connection` has a separate transport key for each direction. There is
+no periodic time- or volume-based rekey: healthy attached traffic can keep
+these keys in use indefinitely. A new handshake, including warm reattach
+or cold replacement, derives fresh transport keys; address migration or
+rebinding alone does not. Closing or dropping the `Connection` ends its
+logical key ownership. The connection and backend retention rules in
+[§2.0](#20-connection-lifecycle) are not a cryptographic key-expiry guarantee.
+
+Each handshake includes fresh ephemerals from both sides. Noise IK's
+forward-secrecy properties depend on its assumptions, including the
+security and erasure of the relevant secrets. In particular, the responder
+has only weak forward secrecy for its outgoing transport messages until it
+receives an initiator transport message; that confirmation establishes the
+strong forward-secrecy qualification described in
+[Noise §7.5](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
+and [§7.7](https://noiseprotocol.org/noise.html#payload-security-properties).
+
+A leak of exactly one live directional transport key exposes recorded and
+subsequent ciphertext protected by that key for that `Connection`. A new
+handshake derives fresh keys; it does not restore secrecy of previously
+recorded traffic. A whole-memory snapshot is a broader exposure:
+it may include other secrets and residual copies. Transport-owned key
+storage is wiped on drop, but this does not guarantee physical erasure of
+Snow-internal, compiler/register or caller copies. Logical key lifetime and
+complete memory erasure are different claims.
 
 ### 9.2 What an observer on the path still sees
 
@@ -2738,8 +2759,10 @@ every attempt, so a removed key stops getting in immediately — a warm
 reattach brings a new handshake with a new hash and goes through probation
 again, so it is refused too. But nothing re-checks the key of a session that
 is already running: **removing a key does not close the sessions it
-opened**, and one of those can sit there for a day (`SERVER_DEATH_AFTER`) or
-be retained for an hour after its client dies. To end them, stop the daemon.
+opened**. An active admitted session can remain indefinitely. The silence,
+connection-death and backend-retention timers in [§2.0](#20-connection-lifecycle)
+are conditional lifecycle rules, not revocation deadlines. To end those
+sessions, stop the daemon.
 
 ### 9.5 If the server's static key is stolen
 
