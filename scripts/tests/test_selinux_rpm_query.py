@@ -430,3 +430,337 @@ class StrictParserTests(unittest.TestCase):
             with self.assertRaises(m.RpmQueryError):m.ConsumerRpmAuthority(schema,package_value,file_values)
         for change in ({'sha256':''},{'mode':0o120777},{'size':True},{'flags':-1},{'path':'/arbitrary'}):
             with self.assertRaises(m.RpmQueryError):dataclasses.replace(values[0],**change)
+
+
+class AuthorityReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.parent=self.root/'usr/share/qshd'
+        self.parent.mkdir(parents=True)
+        for directory in self.root.rglob('*'):
+            if directory.is_dir():directory.chmod(0o755)
+        m=adapter()
+        self.authority=m.ConsumerRpmAuthority(1,m.RpmPackage('qshd',0,'0.5.0','1','x86_64'),tuple(
+            m.RpmFileAuthority(path,3,'a'*64,0o100755,'root','root',0)
+            for path in sorted(m._PATHS)))
+        self.raw=json.dumps(dataclasses.asdict(self.authority),sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n'
+        self.path=self.parent/'consumer-rpm.json'
+        self.path.write_bytes(self.raw)
+        self.path.chmod(0o644)
+        self.now=100.0
+
+    def reader(self, **changes):
+        m=adapter()
+        self.assertTrue(hasattr(m,'ConsumerAuthorityReader'),'protected reader API missing')
+        options=dict(_root=self.root,_uid=os.geteuid(),_gid=os.getegid(),_clock=lambda:self.now)
+        options.update(changes)
+        return m.ConsumerAuthorityReader(**options)
+
+    def test_protected_canonical_capture_repeat_recheck_and_closed_identity(self):
+        m=adapter()
+        reader=self.reader()
+        with reader.inspection(deadline=300.0) as lease:
+            value=lease.capture()
+            self.assertEqual(value,self.authority)
+            lease.recheck(value)
+            lease.recheck(value)
+        with self.assertRaises(m.RpmQueryError):lease.recheck(value)
+        with self.assertRaises(m.RpmQueryError):
+            with reader.inspection(deadline=300.0):pass
+
+    def test_wrong_gid_and_mode_cannot_return_authority(self):
+        m=adapter()
+        for kind in ('gid','mode'):
+            with self.subTest(kind=kind):
+                if kind=='mode':self.path.chmod(0o600)
+                reader=self.reader(**({'_gid':os.getegid()+1} if kind=='gid' else {}))
+                returned=[]
+                with self.assertRaises(m.RpmQueryError):
+                    with reader.inspection(deadline=300.0) as lease:
+                        returned.append(lease.capture())
+                self.assertEqual(returned,[])
+                self.path.chmod(0o644)
+
+    def encode(self, value):
+        return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n'
+
+    def test_strict_wire_schema_order_types_encoding_and_bounds(self):
+        m=adapter()
+        value=dataclasses.asdict(self.authority)
+        malformed=[self.raw[:-1],self.raw+b'\n',b' '+self.raw,self.raw.replace(b'"schema":1',b'"schema":true'),
+                   self.raw.replace(b'"schema":1',b'"schema":1,"schema":1'),
+                   self.raw.replace(b'"epoch":0',b'"epoch":0,"epoch":0'),
+                   self.raw.replace(b'"size":3',b'"size":3,"size":3',1),
+                   self.raw.replace(b'"qshd"',b'"\\u0071shd"'),b'\xef\xbb\xbf'+self.raw,
+                   self.raw.replace(b'"epoch":0',b'"epoch":NaN'),b'['*1500+b']'*1500,
+                   self.raw.replace(b'"epoch":0',b'"epoch":'+b'9'*5000),b'\xff\n']
+        for change in ({'extra':0},{'files':list(reversed(value['files']))},{'files':[value['files'][0]]},
+                       {'files':[value['files'][0],value['files'][0]]},{'package':{}},{'schema':None}):
+            malformed.append(self.encode(value|change))
+        for field in value:
+            missing=dict(value)
+            del missing[field]
+            malformed.append(self.encode(missing))
+        for field in ('size','flags','mode'):
+            changed=json.loads(self.raw)
+            changed['files'][0][field]=True
+            malformed.append(self.encode(changed))
+        for raw in malformed:
+            with self.subTest(prefix=raw[:35]),self.assertRaises(m.RpmQueryError):m._authority_document(raw)
+        for length in (16384,16385):
+            with self.assertRaises(m.RpmQueryError) as result:m._authority_document(b' '*length)
+            self.assertEqual(str(result.exception)=='MANIFEST_SIZE',length>16384)
+
+    def test_loader_schema_shape_does_not_select_pam_or_binary_policy(self):
+        m=adapter()
+        value=json.loads(self.raw)
+        value['files'][0].update(size=577,sha256='f'*64,mode=0o100600,owner='different',flags=0)
+        value['files'][1].update(mode=0o100600,flags=17)
+        self.path.write_bytes(self.encode(value))
+        with self.reader().inspection(deadline=300.0) as lease:
+            authority=lease.capture()
+            self.assertEqual(authority.files[0].size,577)
+            lease.recheck(authority)
+        self.assertEqual(type(authority),m.ConsumerRpmAuthority)
+
+    def test_loaded_authority_joins_actual_existing_query_with_injected_owner(self):
+        m=adapter()
+        fixture=LeaseTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        owner=ControlledOwner([package(),files('/usr/bin/qshd'),files('/etc/pam.d/qshd')]*2)
+        with self.reader().inspection(deadline=300.0) as manifest:
+            authority=manifest.capture()
+            with fixture.query(owner).inspection(deadline=300.0) as query:
+                observed=query.capture_owned(authority)
+                query.recheck(observed)
+            manifest.recheck(authority)
+        self.assertEqual(len(owner.calls),6)
+
+    def test_missing_unsafe_link_fifo_directory_and_parent_refuse_without_repair(self):
+        m=adapter()
+        before=set(os.listdir('/proc/self/fd'))
+        for kind in ('missing','symlink','hardlink','fifo','directory','parent','oversize'):
+            with self.subTest(kind=kind):
+                if kind=='missing':self.path.unlink()
+                elif kind=='symlink':
+                    self.path.unlink()
+                    self.path.symlink_to(self.root/'absent')
+                elif kind=='hardlink':os.link(self.path,self.root/'other-link')
+                elif kind=='fifo':
+                    self.path.unlink()
+                    os.mkfifo(self.path)
+                elif kind=='directory':
+                    self.path.unlink()
+                    self.path.mkdir()
+                elif kind=='parent':self.parent.chmod(0o777)
+                else:self.path.write_bytes(b'x'*16385)
+                returned=[]
+                with self.assertRaises(m.RpmQueryError):
+                    with self.reader().inspection(deadline=300.0) as lease:
+                        returned.append(lease.capture())
+                self.assertEqual(returned,[])
+                self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+                if kind=='missing':self.assertFalse(self.path.exists())
+                if kind=='hardlink':(self.root/'other-link').unlink()
+                if self.path.is_dir():self.path.rmdir()
+                elif self.path.is_symlink() or self.path.exists():self.path.unlink()
+                self.path.write_bytes(self.raw)
+                self.path.chmod(0o644)
+                self.parent.chmod(0o755)
+
+    def test_full_snapshot_drift_poison_and_equal_byte_replacement(self):
+        m=adapter()
+        for kind in ('inode','mode','xattrs','mtime','content','route'):
+            with self.subTest(kind=kind):
+                refusals=[]
+                with self.assertRaises(m.RpmQueryError):
+                    with self.reader().inspection(deadline=300.0) as lease:
+                        authority=lease.capture()
+                        if kind=='inode':
+                            replacement=self.root/'replacement'
+                            replacement.write_bytes(self.raw)
+                            replacement.chmod(0o644)
+                            replacement.replace(self.path)
+                        elif kind=='mode':self.path.chmod(0o600)
+                        elif kind=='xattrs':os.setxattr(self.path,'user.manifest-test',b'drift')
+                        elif kind=='mtime':
+                            info=self.path.stat()
+                            os.utime(self.path,ns=(info.st_atime_ns,info.st_mtime_ns+1000000000))
+                        elif kind=='content':self.path.write_bytes(self.raw.replace(b'0.5.0',b'0.5.1'))
+                        else:
+                            moved=self.root/'old-share'
+                            self.parent.rename(moved)
+                            self.parent.mkdir(mode=0o755)
+                            self.path.write_bytes(self.raw)
+                            self.path.chmod(0o644)
+                        for _ in range(2):
+                            try:lease.recheck(authority)
+                            except m.RpmQueryError:refusals.append(True)
+                            else:refusals.append(False)
+                self.assertEqual(refusals,[True,True],'drift or poisoned-token recheck admitted')
+                self.path.write_bytes(self.raw)
+                self.path.chmod(0o644)
+                for attr in os.listxattr(self.path):os.removexattr(self.path,attr)
+
+    def test_normal_exit_performs_full_final_recheck(self):
+        m=adapter()
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                authority=lease.capture()
+                lease.recheck(authority)
+                self.path.write_bytes(self.raw.replace(b'0.5.0',b'0.5.1'))
+
+    def test_double_sample_race_refuses_without_returning_authority(self):
+        m=adapter()
+        returned=[]
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                real=lease._read
+                count=0
+                def racing(*args,**kwargs):
+                    nonlocal count
+                    result=real(*args,**kwargs)
+                    count+=1
+                    if count==1:os.setxattr(self.path,'user.race',b'changed')
+                    return result
+                with patch.object(lease,'_read',side_effect=racing):returned.append(lease.capture())
+        self.assertEqual(returned,[])
+
+    def test_exact_copied_foreign_tokens_poison_and_fresh_reader_after_replacement(self):
+        m=adapter()
+        refusals=[]
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                value=lease.capture()
+                for token in (dataclasses.replace(value),value):
+                    try:lease.recheck(token)
+                    except m.RpmQueryError:refusals.append(True)
+                    else:refusals.append(False)
+        self.assertEqual(refusals,[True,True])
+        refusals=[]
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as other:
+                own=other.capture()
+                for token in (value,own):
+                    try:other.recheck(token)
+                    except m.RpmQueryError:refusals.append(True)
+                    else:refusals.append(False)
+        self.assertEqual(refusals,[True,True])
+        self.path.write_bytes(self.raw.replace(b'0.5.0',b'0.5.1'))
+        with self.reader().inspection(deadline=300.0) as fresh:
+            current=fresh.capture()
+            self.assertNotEqual(current,value)
+            fresh.recheck(current)
+
+    def test_reader_reuse_missing_capture_recheck_and_failed_entry(self):
+        m=adapter()
+        for action in ('none','capture','twice'):
+            reader=self.reader()
+            with self.assertRaises(m.RpmQueryError):
+                with reader.inspection(deadline=300.0) as lease:
+                    if action!='none':lease.capture()
+                    if action=='twice':
+                        with self.assertRaises(m.RpmQueryError):lease.capture()
+            with self.assertRaises(m.RpmQueryError):
+                with reader.inspection(deadline=300.0):pass
+        reader=self.reader()
+        self.parent.chmod(0o777)
+        with self.assertRaises(m.RpmQueryError):
+            with reader.inspection(deadline=300.0):pass
+        self.parent.chmod(0o755)
+        with self.assertRaises(m.RpmQueryError):
+            with reader.inspection(deadline=300.0):pass
+
+    def test_original_deadline_at_entry_sample_recheck_and_final_close(self):
+        m=adapter()
+        for value in (float('nan'),float('inf'),True,10**1000,100.0):
+            reader=self.reader()
+            with self.assertRaises(m.RpmQueryError):
+                with reader.inspection(deadline=value):pass
+            with self.assertRaises(m.RpmQueryError):
+                with reader.inspection(deadline=300.0):pass
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                original=lease._read
+                def slow(*args,**kwargs):
+                    result=original(*args,**kwargs)
+                    self.now=301.0
+                    return result
+                with patch.object(lease,'_read',side_effect=slow):lease.capture()
+        self.now=100.0
+        before=set(os.listdir('/proc/self/fd'))
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                authority=lease.capture()
+                lease.recheck(authority)
+                original=lease._close
+                def late():
+                    original()
+                    self.now=301.0
+                lease._close=late
+        self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+
+    def test_all_close_attempts_even_error_and_no_authority_retained(self):
+        m=adapter()
+        before=set(os.listdir('/proc/self/fd'))
+        closed=[]
+        real_close=os.close
+        def close_error(fd):
+            real_close(fd)
+            closed.append(fd)
+            if len(closed)==1:raise OSError('injected after actual close')
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                authority=lease.capture()
+                lease.recheck(authority)
+                original=lease._close
+                def close_scope():
+                    with patch.object(m.os,'close',side_effect=close_error):original()
+                lease._close=close_scope
+        self.assertGreater(len(closed),1)
+        self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+        self.assertIsNone(lease._observed)
+        self.assertIsNone(lease._snapshot)
+        with self.assertRaises(m.RpmQueryError):lease.recheck(authority)
+
+    def test_factory_and_private_constructor_fixed_authority(self):
+        m=adapter()
+        with patch.object(m.os,'geteuid',return_value=1000):
+            with self.assertRaises(m.RpmQueryError):m.production_consumer_authority()
+        with patch.object(m.os,'geteuid',return_value=0):
+            reader=m.production_consumer_authority()
+        self.assertEqual((reader._root,reader._uid,reader._gid),(Path('/'),0,0))
+        for changes in ({'_root':'relative'},{'_root':'/tmp/../etc'},{'_uid':True},{'_gid':-1}):
+            with self.assertRaises(m.RpmQueryError):self.reader(**changes)
+
+    def test_missing_parent_and_abnormal_exit_never_provision_or_leak(self):
+        m=adapter()
+        before=set(os.listdir('/proc/self/fd'))
+        moved=self.root/'retained-parent'
+        self.parent.rename(moved)
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0):self.fail('missing parent admitted')
+        self.assertFalse(self.parent.exists())
+        moved.rename(self.parent)
+        class Interrupted(BaseException):pass
+        with self.assertRaises(Interrupted):
+            with self.reader().inspection(deadline=300.0) as lease:
+                lease.capture()
+                raise Interrupted()
+        self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+        self.assertIsNone(lease._observed)
+        self.assertIsNone(lease._snapshot)
+
+    def test_expired_explicit_recheck_refuses_before_return(self):
+        m=adapter()
+        refused=False
+        with self.assertRaises(m.RpmQueryError):
+            with self.reader().inspection(deadline=300.0) as lease:
+                authority=lease.capture()
+                self.now=301.0
+                try:lease.recheck(authority)
+                except m.RpmQueryError:refused=True
+        self.assertTrue(refused)

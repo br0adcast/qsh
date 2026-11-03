@@ -435,3 +435,199 @@ class _Lease(SafeFiles):
             self._dirs = {}
         if failed:
             _fail('CLEANUP')
+
+
+def _manifest_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            _fail('MANIFEST_DUPLICATE')
+        result[key] = value
+    return result
+
+
+def _manifest_constant(value):
+    _fail('MANIFEST_JSON')
+
+
+def _authority_document(raw):
+    """Schema-shape parsing only: never canonical-PAM or package authentication."""
+    if type(raw) is not bytes or not 0 < len(raw) <= 16384:
+        _fail('MANIFEST_SIZE')
+    try:
+        value = json.loads(raw.decode('utf-8'), object_pairs_hook=_manifest_pairs,
+                           parse_constant=_manifest_constant)
+        if type(value) is not dict or set(value) != {'schema', 'package', 'files'}:
+            _fail('MANIFEST_SCHEMA')
+        package = value['package']
+        files = value['files']
+        if (type(package) is not dict
+                or set(package) != {'name', 'epoch', 'version', 'release', 'arch'}
+                or type(files) is not list or len(files) != 2):
+            _fail('MANIFEST_SCHEMA')
+        for record in files:
+            if (type(record) is not dict or set(record) !=
+                    {'path', 'size', 'sha256', 'mode', 'owner', 'group', 'flags'}):
+                _fail('MANIFEST_SCHEMA')
+        if [record['path'] for record in files] != sorted(_PATHS):
+            _fail('MANIFEST_ORDER')
+        authority = ConsumerRpmAuthority(value['schema'], RpmPackage(**package),
+                                        tuple(RpmFileAuthority(**record) for record in files))
+        canonical = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii') + b'\n'
+        if raw != canonical:
+            _fail('MANIFEST_CANONICAL')
+        return authority
+    except RpmQueryError:
+        raise
+    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+        raise RpmQueryError('MANIFEST_JSON') from None
+
+
+def production_consumer_authority():
+    """Fixed protected input, under caller-owned package/maintenance exclusion.
+
+    Trusted reviewed installation supplies authority; root metadata/self-hashes
+    alone do not authenticate arbitrary contents. No canonical PAM eligibility,
+    live leaf binding, query, package lock or lifecycle permission is provided.
+    """
+    if os.geteuid() != 0:
+        _fail('ROOT_REQUIRED')
+    return ConsumerAuthorityReader()
+
+
+class ConsumerAuthorityReader:
+    """Single-use read-only manifest scope; private seams serve disposable tests.
+
+    A caller retains its one package lease and original hard phase owner through
+    capture, use, explicit recheck and normal closure. Never reuse old authority
+    across payload replacement. Filesystem calls are not physically timed here.
+    """
+
+    def __init__(self, *, _root='/', _uid=0, _gid=0, _clock=time.monotonic):
+        try:
+            root = Path(_root)
+            if not root.is_absolute() or '..' in root.parts or '\0' in str(root):
+                _fail('MANIFEST_ROOT')
+        except (TypeError, ValueError):
+            _fail('MANIFEST_ROOT')
+        if any(type(value) is not int or value < 0 for value in (_uid, _gid)):
+            _fail('MANIFEST_IDS')
+        self._root = root
+        self._uid = _uid
+        self._gid = _gid
+        self._clock = _clock
+        self._used = False
+
+    @contextmanager
+    def inspection(self, *, deadline):
+        if self._used:
+            _fail('MANIFEST_USED')
+        self._used = True
+        deadline = _deadline(deadline)
+        lease = _AuthorityLease(self, deadline)
+        normal = False
+        try:
+            lease._open_routes()
+            yield lease
+            if lease._state != 'checked':
+                _fail('MANIFEST_RECHECK_REQUIRED')
+            lease.recheck(lease._observed)
+            normal = True
+        except Exception as error:
+            if isinstance(error, RpmQueryError):
+                raise
+            raise RpmQueryError('MANIFEST_REFUSED') from None
+        finally:
+            lease._close()
+            if normal:
+                lease._check()
+
+
+class _AuthorityLease(SafeFiles):
+    def __init__(self, reader, deadline):
+        self.anchor = reader._root
+        self.uid = reader._uid
+        self._gid = reader._gid
+        self._clock = reader._clock
+        self._end = deadline
+        self.anchors = []
+        self.routes = []
+        self.hook = lambda event: None
+        self._state = 'new'
+        self._observed = None
+        self._snapshot = None
+
+    def _check(self):
+        if self._clock() >= self._end:
+            _fail('MANIFEST_DEADLINE')
+
+    def _open_routes(self):
+        self._check()
+        self._parent = self._directory(self.anchor / 'usr/share/qshd')
+        self._validate_directory_routes()
+        self._check()
+        self._state = 'open'
+
+    def _sample(self):
+        self._check()
+        self._validate_directory_routes()
+        snapshot = self._read(self._parent, 'consumer-rpm.json', limit=16384)
+        if snapshot['uid'] != self.uid or snapshot['gid'] != self._gid or snapshot['mode'] != 0o644:
+            _fail('MANIFEST_AUTHORITY')
+        self._validate_directory_routes()
+        authority = _authority_document(snapshot['data'])
+        self._check()
+        return authority, snapshot
+
+    def capture(self):
+        if self._state != 'open':
+            if self._state != 'closed':
+                self._state = 'failed'
+            _fail('MANIFEST_ORDER')
+        self._state = 'failed'
+        try:
+            value, before = self._sample()
+            again, after = self._sample()
+            if value != again or not self._same(after, before, times=True):
+                _fail('MANIFEST_DRIFT')
+            self._check()
+            self._observed = value
+            self._snapshot = before
+            self._state = 'captured'
+            return value
+        except Exception:
+            raise RpmQueryError('MANIFEST_CAPTURE') from None
+
+    def recheck(self, authority):
+        valid = self._state in ('captured', 'checked') and authority is self._observed
+        if self._state != 'closed':
+            self._state = 'failed'
+        if not valid:
+            _fail('MANIFEST_OBSERVATION')
+        try:
+            value, snapshot = self._sample()
+            if value != authority or not self._same(snapshot, self._snapshot, times=True):
+                _fail('MANIFEST_DRIFT')
+            self._check()
+            self._state = 'checked'
+        except Exception:
+            raise RpmQueryError('MANIFEST_RECHECK') from None
+
+    def _close(self):
+        self._state = 'closed'
+        self._observed = None
+        self._snapshot = None
+        descriptors = list(dict.fromkeys(self.anchors + [fd for route in self.routes for fd in (route[0], route[2])]))
+        self.anchors = []
+        self.routes = []
+        first_error = None
+        for fd in reversed(descriptors):
+            try:
+                os.close(fd)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            if not isinstance(first_error, Exception):
+                raise first_error
+            _fail('MANIFEST_CLOSE')
