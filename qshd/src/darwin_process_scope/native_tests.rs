@@ -10,6 +10,7 @@ use transport::channel_server::ChildStatus;
 
 // Retain the actual fixture Child independently of the production wrapper so
 // assertion failure cannot discard it. Rescue is failure-only, never evidence.
+#[derive(Debug)]
 struct FixtureChild {
     inner: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     waits: Arc<AtomicUsize>,
@@ -2081,7 +2082,6 @@ fn actual_connect(
 #[test]
 fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session() {
     use std::ffi::OsStr;
-    use std::os::fd::AsRawFd;
     use transport::channel::{
         encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, UpdateAnswer,
         UpdateOffer, UpdateResult, CONTROL_STREAM, FIRST_CHANNEL_STREAM, UPDATE_STREAM,

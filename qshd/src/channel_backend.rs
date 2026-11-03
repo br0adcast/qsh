@@ -18,7 +18,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(
+    all(test, target_os = "macos"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 use portable_pty::Child;
 use portable_pty::{CommandBuilder, PtySize};
 
@@ -314,10 +317,16 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 
 /// Waits for the channel's child and reports its code. Blocking, which is
 /// why `run_channel_session` calls it on a blocking task.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(
+    all(test, target_os = "macos"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(
+    all(test, target_os = "macos"),
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 impl ChannelWait for ChildWait {
     fn active_observation(&self) -> transport::channel_server::ActiveObservation {
         transport::channel_server::ActiveObservation::Unavailable
