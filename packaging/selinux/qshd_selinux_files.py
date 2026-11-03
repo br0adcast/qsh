@@ -91,12 +91,19 @@ class Files:
         self._uid = _uid
         self._active = False
 
-    @contextmanager
     def inspection(self):
+        return self._inspection(erase=False)
+
+    def erase_inspection(self):
+        """Observe canonical erase files without requiring stopped runtime state."""
+        return self._inspection(erase=True)
+
+    @contextmanager
+    def _inspection(self, *, erase):
         if self._active:
             _fail('NESTED_LEASE')
         self._active = True
-        lease = _Inspection(self)
+        lease = _Inspection(self, erase=erase)
         try:
             try:
                 lease._setup()
@@ -113,7 +120,7 @@ class Files:
 
 
 class _Inspection(SafeFiles):
-    def __init__(self, files):
+    def __init__(self, files, *, erase=False):
         self.anchor = files._root
         self.uid = files._uid
         self.anchors, self.routes, self._acquired = [], [], []
@@ -122,6 +129,7 @@ class _Inspection(SafeFiles):
         self._parents, self._objects = {}, {}
         self._state = 'open'
         self._baseline = None
+        self._erase = erase
 
     def _dir_mode(self, fd):
         super()._dir_mode(fd)
@@ -172,6 +180,8 @@ class _Inspection(SafeFiles):
         result = []
         with self._api.file_defaults() as defaults:
             for path, kind, expected, required, role in _PATHS:
+                if self._erase and role == 'runtime':
+                    required = False
                 default = defaults.lookup(path, kind) if expected is not None else None
                 if default != expected:
                     _fail('DEFAULT_CONTEXT')
@@ -222,7 +232,8 @@ class _Inspection(SafeFiles):
                     _fail('READ_DRIFT')
                 result.append(PathObservation(path, kind, True, after, default, actual, pam_hash))
         self._validate_directory_routes()
-        return FilesObservation('managed-prestart', tuple(result))
+        phase = 'consumer-erase' if self._erase else 'managed-prestart'
+        return FilesObservation(phase, tuple(result))
 
     def capture(self):
         return self._observe(None)
