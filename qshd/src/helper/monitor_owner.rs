@@ -81,6 +81,11 @@ impl NativeMonitor {
     pub(super) fn leader_exited(&self) -> bool {
         self.leader_exited
     }
+    /// Test diagnostics only: whether the private session stage was proved.
+    #[cfg(test)]
+    pub(super) fn established(&self) -> bool {
+        self.established
+    }
     /// Explicit force is distinct from cooperative SHUT_WR on the seam.
     pub(super) fn force(&mut self, now: Instant) {
         self.stop_at.get_or_insert(now);
