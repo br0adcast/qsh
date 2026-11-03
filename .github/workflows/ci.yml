@@ -74,6 +74,53 @@ jobs:
           prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Qualify the production Darwin process owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-darwin-owner.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          cargo build -p qshd --bin qshd --features test-build-labels --locked --message-format=json-render-diagnostics > "$runtime/build.jsonl"
+          python3 - "$runtime/build.jsonl" "$runtime/daemon-path" <<'PY_DAEMON'
+          import json, pathlib, sys
+          records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+          paths = [record["executable"] for record in records if record.get("reason") == "compiler-artifact" and record.get("target", {}).get("name") == "qshd" and record.get("target", {}).get("kind") == ["bin"] and record.get("executable")]
+          assert len(paths) == 1 and pathlib.Path(paths[0]).is_file()
+          pathlib.Path(sys.argv[2]).write_text(paths[0])
+          PY_DAEMON
+          export QSH_DARWIN223_DAEMON="$(cat "$runtime/daemon-path")"
+          export QSH_DARWIN223_DAEMON_SHA256="$(shasum -a 256 "$QSH_DARWIN223_DAEMON" | awk '{print $1}')"
+          cargo test -p qshd --lib --features test-build-labels --locked darwin_process_scope::native_tests::darwin223_native_ \
+            -- --nocapture --test-threads=1 2>&1 | tee "$runtime/results.log"
+          for name in \
+            darwin_process_scope::native_tests::darwin223_native_noncooperative_token_exec_and_bound_exit \
+            darwin_process_scope::native_tests::darwin223_native_signaled_leader_scope_uses_portable_code_one \
+            darwin_process_scope::native_tests::darwin223_native_already_zombie_handshake_child_keeps_reserved_leader \
+            darwin_process_scope::native_tests::darwin223_native_classification_bracket_refuses_exec_and_one_sided_zombie \
+            darwin_process_scope::native_tests::darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins \
+            darwin_process_scope::native_tests::darwin223_native_connected_close_stop_rebind_and_fresh_session \
+            darwin_process_scope::native_tests::darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork \
+            darwin_process_scope::native_tests::darwin223_native_term_and_interrupt_join_real_manager_and_workers \
+            darwin_process_scope::native_tests::darwin223_native_partial_descriptor_failure_retains_real_process_owner \
+            darwin_process_scope::native_tests::darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
+          done
+          ! grep -F 'SKIPPED' "$runtime/results.log"
+          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Compile safe libraries and inline tests
         run: >-
           cargo test --lib --no-run --locked

@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use portable_pty::Child;
 use portable_pty::{CommandBuilder, PtySize};
 
@@ -82,6 +82,9 @@ impl ChannelSpawner for PtyChannelSpawner {
         #[cfg(target_os = "linux")]
         let process_view = crate::process_scope::prepare()
             .map_err(|error| custody.refuse_before_creation(error))?;
+        #[cfg(target_os = "macos")]
+        let process_view = crate::darwin_process_scope::prepare()
+            .map_err(|error| custody.refuse_before_creation(error.to_string()))?;
         let screen = make_screen(req, owner, Arc::clone(&self.budget))
             .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
@@ -115,7 +118,9 @@ impl ChannelSpawner for PtyChannelSpawner {
         // the unreaped leader before any fallible descriptor preparation.
         #[cfg(target_os = "linux")]
         let wait = crate::process_scope::own_child(child, process_view);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        let wait = crate::darwin_process_scope::own_child(child, process_view);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
         drop(permit);
         finish_personal_spawn(master, wait, screen, custody)
@@ -137,6 +142,56 @@ fn finish_personal_spawn(
         .take_writer()
         .map_err(|e| custody.failure(format!("writing to the channel is unavailable: {e:#}")))?;
     Ok(construction.finish(reader, writer, Box::new(pty::PtyResizeHandle::new(master))))
+}
+
+/// Exercise the actual post-creation custody boundary with one injected I/O
+/// failure. The native process owner and PTY are real; no identity is injected.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn darwin_setup_failure_for_test(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    wait: Box<dyn ChannelWait>,
+    custody: &OpenCustody,
+    reader_failure: bool,
+) -> Result<UninstalledChannel, SpawnFailure> {
+    struct BrokenMaster {
+        inner: Box<dyn portable_pty::MasterPty + Send>,
+        reader_failure: bool,
+    }
+    impl portable_pty::MasterPty for BrokenMaster {
+        fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+            self.inner.resize(size)
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            self.inner.get_size()
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            if self.reader_failure {
+                anyhow::bail!("injected Darwin reader setup failure");
+            }
+            self.inner.try_clone_reader()
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
+            anyhow::bail!("injected Darwin writer setup failure")
+        }
+        fn process_group_leader(&self) -> Option<nix::libc::pid_t> {
+            self.inner.process_group_leader()
+        }
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            self.inner.as_raw_fd()
+        }
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            self.inner.tty_name()
+        }
+    }
+    finish_personal_spawn(
+        Box::new(BrokenMaster {
+            inner: master,
+            reader_failure,
+        }),
+        wait,
+        Box::new(NoScreen),
+        custody,
+    )
 }
 
 #[cfg(test)]
@@ -259,10 +314,10 @@ fn command_builder(command: &[u8]) -> Result<CommandBuilder, String> {
 
 /// Waits for the channel's child and reports its code. Blocking, which is
 /// why `run_channel_session` calls it on a blocking task.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct ChildWait(Box<dyn Child + Send + Sync>);
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ChannelWait for ChildWait {
     fn active_observation(&self) -> transport::channel_server::ActiveObservation {
         transport::channel_server::ActiveObservation::Unavailable
