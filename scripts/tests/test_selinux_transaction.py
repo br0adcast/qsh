@@ -850,3 +850,214 @@ class OwnedRemovalTests(unittest.TestCase):
                 set(identities),
             )
             writer.recheck_removed(observation)
+
+
+class SharedRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for path in ('a/b', 'a/c'):
+            (self.root / path).mkdir(parents=True, exist_ok=True)
+        for directory in self.root.rglob('*'):
+            directory.chmod(0o755)
+
+    @contextmanager
+    def owner(self, root=None):
+        value = fs.SafeFiles()
+        value.anchor = self.root if root is None else root
+        value.uid = os.geteuid()
+        value.anchors = []
+        value.routes = []
+        value.hook = lambda event: None
+        try:
+            yield value
+        finally:
+            descriptors = set(value.anchors + [fd for route in value.routes for fd in (route[0], route[2])])
+            for fd in descriptors:
+                os.close(fd)
+            value.anchors = []
+            value.routes = []
+
+    def fd_count(self):
+        return len(os.listdir('/proc/self/fd')) - 1
+
+    def test_same_and_sibling_routes_hold_one_descriptor_per_lexical_prefix(self):
+        before = self.fd_count()
+        with self.owner() as owner:
+            first = owner._directory(self.root / 'a/b')
+            again = owner._directory(self.root / 'a/b')
+            sibling = owner._directory(self.root / 'a/c')
+            self.assertEqual(self.fd_count() - before, 4)
+            self.assertEqual(first, again)
+            self.assertNotEqual(first, sibling)
+            self.assertEqual(len(owner.anchors), 1)
+            self.assertEqual(len(owner.routes), 3)
+            owner._validate_directory_routes()
+        self.assertEqual(self.fd_count(), before)
+
+
+    def test_reused_prefix_replacement_rename_symlink_and_permissions_refuse(self):
+        for kind in ('endpoint-replacement', 'prefix-rename', 'symlink', 'prefix-mode', 'endpoint-mode', 'anchor-mode'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                root = Path(directory)
+                (root / 'a/b').mkdir(parents=True)
+                (root / 'a').chmod(0o755)
+                (root / 'a/b').chmod(0o755)
+                before = self.fd_count()
+                with self.owner(root) as owner:
+                    endpoint = owner._directory(root / 'a/b')
+                    original = (len(owner.anchors), len(owner.routes))
+                    if kind == 'endpoint-replacement':
+                        (root / 'a/b').rename(root / 'a/old-b')
+                        (root / 'a/b').mkdir(mode=0o755)
+                    elif kind in ('prefix-rename', 'symlink'):
+                        (root / 'a').rename(root / 'old-a')
+                        if kind == 'symlink':
+                            (root / 'a').symlink_to('old-a', target_is_directory=True)
+                        else:
+                            (root / 'a/b').mkdir(parents=True)
+                            (root / 'a').chmod(0o755)
+                            (root / 'a/b').chmod(0o755)
+                    elif kind == 'prefix-mode':
+                        (root / 'a').chmod(0o777)
+                    elif kind == 'endpoint-mode':
+                        (root / 'a/b').chmod(0o777)
+                    else:
+                        root.chmod(0o777)
+                    with self.assertRaises((fs.Conflict, OSError)):
+                        owner._directory(root / 'a/b')
+                    self.assertEqual((len(owner.anchors), len(owner.routes)), original)
+                    os.fstat(endpoint)
+                self.assertEqual(self.fd_count(), before)
+
+    def test_reused_anchor_replacement_is_not_rebound(self):
+        root = self.root / 'anchor'
+        (root / 'a').mkdir(parents=True)
+        (root / 'a').chmod(0o755)
+        root.chmod(0o755)
+        with self.owner(root) as owner:
+            held = owner._directory(root / 'a')
+            root.rename(self.root / 'held-anchor')
+            (root / 'a').mkdir(parents=True)
+            root.chmod(0o755)
+            (root / 'a').chmod(0o755)
+            with self.assertRaisesRegex(fs.Conflict, '^ANCHOR_BINDING$'):
+                owner._directory(root / 'a')
+            self.assertEqual(len(owner.anchors), 1)
+            os.fstat(held)
+
+    def test_reused_endpoint_checks_uid_without_privileged_chown(self):
+        with self.owner() as owner:
+            held = owner._directory(self.root / 'a/b')
+            original = os.fstat
+            def changed_uid(fd):
+                value = original(fd)
+                if fd == held:
+                    fields = list(value)
+                    fields[4] = value.st_uid + 1
+                    return os.stat_result(fields)
+                return value
+            # Fault only the returned UID; no real ownership mutation is performed.
+            with patch.object(fs.os, 'fstat', side_effect=changed_uid):
+                with self.assertRaisesRegex(fs.Conflict, '^DIRECTORY_AUTHORITY$'):
+                    owner._directory(self.root / 'a/b')
+
+    def test_independent_live_owners_do_not_share_descriptors(self):
+        before = self.fd_count()
+        with self.owner() as second:
+            second_fd = second._directory(self.root / 'a/b')
+            with self.owner() as first:
+                first_fd = first._directory(self.root / 'a/b')
+                self.assertNotEqual(first_fd, second_fd)
+                self.assertEqual(self.fd_count() - before, 6)
+            second._validate_directory_routes()
+            self.assertEqual(second._directory(self.root / 'a/b'), second_fd)
+        self.assertEqual(self.fd_count(), before)
+
+    def test_distinct_lexical_edges_are_not_coalesced_by_inode(self):
+        with self.owner() as owner:
+            direct = owner._directory(self.root / 'a')
+            alias = owner._directory(self.root / 'a/b/..')
+            self.assertNotEqual(direct, alias)
+            self.assertEqual(fs.identity(os.fstat(direct)), fs.identity(os.fstat(alias)))
+            owner._validate_directory_routes()
+
+    def test_new_edge_is_owned_before_mode_check_failure(self):
+        before = self.fd_count()
+        (self.root / 'a/c').chmod(0o777)
+        with self.owner() as owner:
+            owner._directory(self.root / 'a/b')
+            with self.assertRaisesRegex(fs.Conflict, '^DIRECTORY_AUTHORITY$'):
+                owner._directory(self.root / 'a/c')
+            self.assertEqual(len(owner.routes), 3)
+            self.assertEqual(self.fd_count() - before, 4)
+        self.assertEqual(self.fd_count(), before)
+
+    def test_closed_owner_graph_can_start_a_fresh_transaction_scope(self):
+        target = self.root / 'a/b/context'
+        target.write_bytes(b'system_r:sshd_t:s0 user_r:user_t:s0\n')
+        target.chmod(0o640)
+        engine = tx.Transaction(self.root / 'state', {'/contexts': target}, uid=os.geteuid(), anchor=self.root)
+        before = self.fd_count()
+        for _ in range(2):
+            with engine.locked():
+                engine._validate_routes()
+                self.assertEqual(len(engine.anchors), 1)
+            self.assertEqual(engine.anchors, [])
+            self.assertEqual(engine.routes, [])
+            self.assertEqual(self.fd_count(), before)
+
+
+    def test_closed_and_reused_endpoint_descriptor_is_not_accepted(self):
+        replacement = self.root / 'replacement-file'
+        replacement.write_bytes(b'inert descriptor replacement')
+        before = self.fd_count()
+        with self.owner() as owner:
+            held = owner._directory(self.root / 'a/b')
+            os.close(held)
+            with self.assertRaises(OSError):
+                owner._directory(self.root / 'a/b')
+            substitute = os.open(replacement, os.O_RDONLY)
+            if substitute != held:
+                os.dup2(substitute, held)
+                os.close(substitute)
+            with self.assertRaises((fs.Conflict, OSError)):
+                owner._directory(self.root / 'a/b')
+        self.assertEqual(self.fd_count(), before)
+
+    def test_two_target_writer_and_borrowed_inspection_preserve_authority(self):
+        import fcntl
+        targets = {}
+        originals = {}
+        for name, mode in (('one', 0o640), ('two', 0o600)):
+            path = self.root / 'a/b' / name
+            raw = ('# unrelated ' + name + '\n').encode() + b'system_r:sshd_t:s0 user_r:user_t:s0\n'
+            path.write_bytes(raw)
+            path.chmod(mode)
+            os.setxattr(path, 'user.shared-route-test', name.encode())
+            key = '/contexts/' + name
+            targets[key] = path
+            originals[key] = (raw, mode, name.encode())
+        ids = {key:dict(path=key, source_type='sshd_t', original_package='fixture') for key in targets}
+        engine = tx.Transaction(self.root / 'state', targets, uid=os.geteuid(), anchor=self.root)
+        before = self.fd_count()
+        with engine.writer() as writer:
+            self.assertEqual(engine.fds['/contexts/one'][0], engine.fds['/contexts/two'][0])
+            writer.reconcile(ids)
+            with writer.inspection(ids) as view:
+                observation = view.capture()
+                other_lock = os.open(self.root / 'state/lock', os.O_RDONLY)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(other_lock)
+                view.recheck(observation)
+            self.assertFalse((self.root / 'state/journal').exists())
+            for key, path in targets.items():
+                raw, mode, attribute = originals[key]
+                self.assertTrue(path.read_bytes().startswith(raw))
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+                self.assertEqual(os.getxattr(path, 'user.shared-route-test'), attribute)
+        self.assertEqual(self.fd_count(), before)
