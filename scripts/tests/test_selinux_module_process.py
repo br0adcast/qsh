@@ -134,7 +134,13 @@ else:
                     assert time.monotonic()-start<1.5
                 elif case=='expired':
                     try:owner._run('list',temporary,deadline=time.monotonic()-1)
-                    except m._CommandError as exc:assert str(exc)=='COMMAND_TIMEOUT'
+                    except m._CommandError as exc:
+                        assert str(exc)=='COMMAND_TIMEOUT'
+                        assert exc.summary.profile=='OTHER'
+                        assert exc.summary.failure=='COMMAND_TIMEOUT' and exc.summary.exit_code is None
+                        assert exc.summary.settled and exc.summary.unreaped==0 and seen==[]
+                        assert set(vars(exc.summary))=={'profile','failure','exit_code','settled','unreaped'}
+                        assert not hasattr(exc.summary,'stdout') and not hasattr(exc.summary,'stderr')
                     else:raise AssertionError('expired lease launched')
                     assert seen==[]
                     result=b''
@@ -171,6 +177,9 @@ else:
             assert seen==([] if case=='expired' else [listing,extract,listing,extract] if case=='binding' else [extract] if case=='extract-output' else [listing])
             if case in ('anchor','expired'):assert not any(event[0]=='group' for event in events),events
             else:assert events[0]==('group',signal.SIGTERM) and sum(event[0]=='group' for event in events)==(4 if case=='binding' else 1),events
+            if case=='nonzero':
+                assert error.summary.exit_code==7 and error.summary.failure is None and error.summary.settled
+                assert not hasattr(error.summary,'stdout') and not hasattr(error.summary,'stderr')
             if case!='expired':assert len(owner._last.stdout)+len(owner._last.stderr)<=(4*1024**2 if case=='profile' else 1024**2)
             if case not in ('unsettled','expired'):assert owner._last.settled and m._children()==[]
         finally:
