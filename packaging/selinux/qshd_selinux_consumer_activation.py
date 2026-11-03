@@ -5,7 +5,7 @@ Run in a fresh bounded root child with an external hard deadline; library clock
 checks cannot interrupt filesystem/native calls. No PAM migration or repair.
 """
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -15,10 +15,12 @@ import secrets
 import time
 
 import qshd_selinux_activation as model
-from qshd_selinux_activation_state import OutcomeUncertain, SlotError
+from qshd_selinux_activation_state import OutcomeUncertain, SlotError, SlotObservation
 from qshd_selinux_fs import SafeFiles
-from qshd_selinux_module_install import _close_routes
+from qshd_selinux_module_install import _close_routes, _DeadlineOwner
 from qshd_selinux_files import PAM_SHA256
+from qshd_selinux_registry import RegistryObservation
+from qshd_selinux_transaction import ContextObservation
 
 
 class CoordinatorError(RuntimeError):
@@ -168,6 +170,20 @@ def finalize_installed_owned_pending_consumer(*,deadline):
     return _Coordinator(_Production()).finalize_installed_owned_pending_consumer(deadline=deadline)
 
 
+@dataclass(frozen=True)
+class _OwnedEraseAdmission:
+    """Closed immutable views, not permission for start or module removal.
+
+    Only the exact slot object may be used with the same still-live activation
+    writer. The other observations are full comparison evidence from closed
+    leases, not live recheck tokens or a durable authority record.
+    """
+    slot: SlotObservation
+    routing: bytes
+    registry: RegistryObservation
+    contexts: ContextObservation
+
+
 class _Coordinator:
     """Private trusted test seam; no public path/tool/policy injection."""
     def __init__(self,bindings,*,clock=time.monotonic):
@@ -265,6 +281,45 @@ class _Coordinator:
                     views=self._context_views(registry,contexts,routing,identities)
         self._check(170)
         return routing,identities,views
+
+    def _admit_owned_erase(self,activation,trusted_artifact):
+        """Read-only exact-owned admission under caller-held outer leases."""
+        try:
+            self._check(70)
+            if type(trusted_artifact) is not model.TrustedArtifact:
+                raise CoordinatorError('ERASE_TRUST')
+            trusted_artifact.__post_init__()
+            current=activation.capture_current()
+            if (type(current) is not SlotObservation or type(current.record) is not model.Activation
+                    or type(current.document) is not bytes):raise CoordinatorError('ERASE_SLOT')
+            record=model.parse_activation(current.document)
+            if record!=current.record or record.artifact!=trusted_artifact:
+                raise CoordinatorError('ERASE_SLOT')
+            b=self._bindings
+            with b.registry() as registry:
+                routing,identities=self._routing(registry);self._check(70)
+                with b.context_inspection(sorted(identities),identities) as contexts:
+                    self._check(70)
+                    with b.modules(trusted_artifact) as modules:
+                        if modules._owner is None:raise CoordinatorError('ERASE_MODULE_OWNER')
+                        modules._owner=_DeadlineOwner(modules._owner,self._end-10)
+                        with b.window():
+                            discovered,context=self._context_views(registry,contexts,routing,identities,recheck=False)
+                            self._check(70);module=modules.capture();self._check()
+                            if module.hll.sha256!=trusted_artifact.pp_sha256:
+                                raise CoordinatorError('ERASE_MODULE_BINDING')
+                            modules.recheck(module)
+                            contexts.recheck(context);registry.recheck(discovered);self._check()
+                            if record.state=='COMPLETE':
+                                binding=model.ContextBinding(context.registry_sha256,context.receipts_sha256)
+                                model.require_complete(record,trusted_artifact,binding)
+                            elif record.state!='PENDING' or record.completion is not None:
+                                raise CoordinatorError('ERASE_SLOT')
+            self._check()
+            return _OwnedEraseAdmission(current,routing,discovered,context)
+        except BaseException as error:
+            if not isinstance(error,Exception) or isinstance(error,CoordinatorError):raise
+            raise CoordinatorError('OWNED_ERASE_ADMISSION') from None
 
     def finalize_installed_owned_pending_consumer(self,*,deadline):
         if self._used:raise CoordinatorError('COORDINATOR_USED')

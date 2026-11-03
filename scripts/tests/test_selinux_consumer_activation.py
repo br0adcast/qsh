@@ -609,4 +609,199 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(self.b.loads,0)
 
 
+class OwnedEraseAdmissionTests(unittest.TestCase):
+    coordinator=ConsumerTests.coordinator
+    inventory=ConsumerTests.inventory
+    unowned_current=ConsumerTests.unowned_current
+
+    def setUp(self):
+        ConsumerTests.setUp(self)
+        for name in ('usr/lib','usr/bin','etc/selinux','var/lib/selinux/targeted/active/modules'):
+            (self.b.root/name).mkdir(parents=True,exist_ok=True)
+        for name in ('usr/lib','etc/selinux','var/lib/selinux','var/lib/selinux/targeted','var/lib/selinux/targeted/active','var/lib/selinux/targeted/active/modules'):
+            (self.b.root/name).chmod(0o755)
+        for name,data,mode in [('usr/bin/semodule',b'inert',0o755),('usr/lib/os-release',b'ID=fedora\nVERSION_ID=44\n',0o644),('etc/selinux/semanage.conf',b'# controlled',0o644),('var/lib/selinux/targeted/semanage.read.LOCK',b'',0o600)]:
+            p=self.b.root/name;p.write_bytes(data);p.chmod(mode)
+        self.module_calls=[];self.module_listing=b'100 base cil\n400 qshd pp\n';self.module_pp=PP;self.module_action=None
+        self.b.modules=self.modules
+
+    @contextmanager
+    def modules(self,trust):
+        import qshd_selinux_module_observer as observer
+        from qshd_selinux_process import _Outcome
+        outer=self
+        class Owner:
+            _last=None
+            def _run(owner,operation,cwd,*,deadline=None):
+                outer.assertIn('window',outer.b.active)
+                outer.module_calls.append((operation,deadline))
+                owner._last=_Outcome(b'',b'',0,None,True)
+                if outer.module_action is not None:outer.module_action(operation,cwd,owner)
+                if operation=='list':return outer.module_listing
+                path=Path(cwd)/'qshd.pp';path.write_bytes(outer.module_pp);path.chmod(0o600);return b''
+        with self.b.track('module',observer.ModuleObserver(trust,_root=self.b.root,_uid=os.getuid(),_runner=lambda *args:None)) as lease:
+            lease._owner=Owner();yield lease
+
+    @contextmanager
+    def held(self):
+        from contextlib import ExitStack
+        item=self.coordinator();item._end=340
+        with self.b.package(),self.b.references() as refs,self.b.activation() as writer:
+            captured=refs.capture();trust=captured.artifact
+            with ExitStack() as forbidden:
+                for name in ('package','activation','policy_context','contexts','files','consumer_paths','preconditions','guard'):
+                    forbidden.enter_context(patch.object(self.b,name,side_effect=AssertionError('nested or unrelated phase call')))
+                forbidden.enter_context(patch.object(item,'_start',side_effect=AssertionError('deadline restarted')))
+                try:yield item,writer,trust
+                finally:refs.recheck(captured)
+
+    def test_complete_and_pending_capture_full_owned_evidence_without_mutation(self):
+        from dataclasses import FrozenInstanceError
+        for pending in (False,True):
+            if pending:self.b.matching_pending()
+            self.b.events=[];self.module_calls=[];before=self.inventory()
+            with self.held() as (item,writer,trust):
+                result=item._admit_owned_erase(writer,trust)
+                self.assertIs(result.slot,writer._initial)
+                self.assertEqual(result.slot.record.state,'PENDING' if pending else 'COMPLETE')
+                self.assertEqual(result.routing,self.b.routing)
+                self.assertEqual(result.registry.registry_bytes,result.routing)
+                self.assertEqual(result.contexts.registry_bytes,result.routing)
+                self.assertEqual(self.b.active,{'package','references','activation'})
+                with self.assertRaises(FrozenInstanceError):result.routing=b'changed'
+                self.assertIsInstance(result.contexts.target_snapshots,tuple)
+                self.assertIsInstance(result.registry.candidates,tuple)
+                self.assertFalse(hasattr(result,'identities'))
+                identities=json.loads(result.routing);identities.clear();self.assertEqual(result.routing,self.b.routing)
+            self.assertEqual(self.module_calls,[('list',330),('extract',330),('list',330),('extract',330)])
+            self.assertEqual(self.b.events.count('package enter'),1)
+            self.assertEqual(self.b.events.count('activation enter'),1)
+            self.assertNotIn('policy child',self.b.events);self.assertEqual(self.b.loads,0)
+            self.assertEqual(self.inventory(),before);self.assertFalse(self.b.active)
+
+    def test_returned_exact_slot_is_eligible_only_without_intervening_slot_change(self):
+        with self.held() as (item,writer,trust):
+            result=item._admit_owned_erase(writer,trust)
+            pending=self.b.record_value('PENDING','c'*32)
+            token=writer.begin_pending(canonical(asdict(pending)),result.slot)
+            self.assertEqual(token.observation.record,pending)
+        self.b.events=[]
+        with self.held() as (item,writer,trust):
+            result=item._admit_owned_erase(writer,trust)
+            path=self.b.common/'selinux-activation/activation.json';other=self.b.record_value('PENDING','d'*32)
+            path.write_bytes(canonical(asdict(other)))
+            with self.assertRaises(slot.SlotError):writer.begin_pending(canonical(asdict(self.b.record_value('PENDING','e'*32))),result.slot)
+            self.assertEqual(self.b.record(),other)
+
+    def test_pending_uses_an_explicit_branch_without_calling_complete_guard(self):
+        self.b.matching_pending()
+        with self.held() as (item,writer,trust),patch.object(model,'require_complete',side_effect=AssertionError('no pending exception fallback')):
+            result=item._admit_owned_erase(writer,trust)
+            self.assertEqual(result.slot.record.state,'PENDING')
+        self.assertEqual(len(self.module_calls),4)
+
+    def test_pending_requires_real_module_admission_not_policy_child_exception(self):
+        self.b.matching_pending();before=self.inventory()
+        self.module_listing=b'100 base cil\n'
+        with self.held() as (item,writer,trust),patch.object(model,'require_complete',side_effect=AssertionError('PENDING is a separate branch')):
+            with self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertTrue(self.module_calls);self.assertEqual(self.inventory(),before)
+        self.assertFalse(self.b.active)
+
+    def test_all_nonowned_priority_language_hll_and_recheck_drift_refuse(self):
+        self.b.matching_pending();before=self.inventory()
+        for listing in (b'400 qshd pp disabled\n',b'500 qshd pp\n',b'100 qshd pp\n',b'400 qshd pp\n500 qshd pp\n',b'400 qshd cil\n',b'bad'):
+            self.module_listing=listing;self.module_calls=[]
+            with self.subTest(listing=listing),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.module_listing=b'400 qshd pp\n';self.module_pp=b'wrong'
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.module_pp=PP;self.module_calls=[]
+        def drift(operation,cwd,owner):
+            if len(self.module_calls)==3:self.module_listing=b'500 qshd pp\n'
+        self.module_action=drift
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.inventory(),before)
+
+    def test_stale_complete_binding_and_wrong_artifact_refuse(self):
+        before=self.b.record();path=self.b.common/'selinux-activation/activation.json'
+        stale=replace(before,completion=replace(before.completion,contexts=model.ContextBinding('f'*64,'e'*64)))
+        path.write_bytes(canonical(asdict(stale)))
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(len(self.module_calls),4)
+        path.write_bytes(canonical(asdict(before)));self.module_calls=[]
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,replace(trust,provider_version='another'))
+        self.assertEqual(self.module_calls,[])
+
+    def test_absent_malformed_and_unsupported_slot_refuse_before_module(self):
+        path=self.b.common/'selinux-activation/activation.json';raw=path.read_bytes()
+        for case in ('absent','malformed','profile','module','pending-completion'):
+            if case=='absent':path.unlink()
+            elif case=='malformed':path.write_bytes(b'{malformed')
+            else:
+                value=json.loads(raw)
+                if case=='profile':value['abi']=2
+                elif case=='module':value['module']['priority']=500
+                else:value['state']='PENDING'
+                path.write_bytes(canonical(value))
+            with self.subTest(case=case),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+            self.assertEqual(self.module_calls,[]);path.write_bytes(raw)
+
+    def test_admin_and_receipt_free_current_rows_are_not_owned(self):
+        self.b.matching_pending();self.unowned_current(True);before=self.inventory()
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.module_calls,[]);self.assertEqual(self.inventory(),before)
+        receipts=self.b.common/'selinux-contexts/receipts';receipts.write_bytes(b'{}');before=self.inventory()
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.inventory(),before)
+
+    def test_dirty_or_missing_context_state_never_creates_or_enters_writer(self):
+        import shutil
+        state=self.b.common/'selinux-contexts';original={p.name:p.read_bytes() for p in state.iterdir() if p.is_file()};target=self.b.target.read_bytes()
+        for case in ('missing','partial','missing-lock','missing-receipt','extra-receipt','source','journal-file','journal-symlink','journal-fifo','journal-dir'):
+            self.b.target.write_bytes(target)
+            if state.exists():shutil.rmtree(state)
+            state.mkdir(mode=0o700)
+            for name,data in original.items():p=state/name;p.write_bytes(data);p.chmod(0o600)
+            if case=='missing':shutil.rmtree(state)
+            elif case=='partial':(state/'lock').unlink();(state/'receipts').unlink()
+            elif case=='missing-lock':(state/'lock').unlink()
+            elif case=='missing-receipt':(state/'receipts').unlink()
+            elif case=='extra-receipt':
+                value=json.loads((state/'receipts').read_bytes());value['/foreign']=value['/context'];(state/'receipts').write_bytes(canonical(value))
+            elif case=='source':self.b.target.write_bytes(self.b.target.read_bytes().replace(b'user_r:user_t',b'staff_r:staff_t'))
+            elif case=='journal-file':(state/'journal').write_bytes(b'unknown')
+            elif case=='journal-symlink':(state/'journal').symlink_to(self.b.root/'missing')
+            elif case=='journal-fifo':os.mkfifo(state/'journal')
+            else:(state/'journal').mkdir()
+            before=self.inventory();self.module_calls=[]
+            with self.subTest(case=case),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+            self.assertEqual(self.inventory(),before);self.assertEqual(self.module_calls,[])
+
+    def test_scope_finalizers_and_late_closure_suppress_admission(self):
+        before=self.inventory()
+        for event in ('window exit','module exit','preflight exit','registry exit'):
+            self.b.failure=event
+            with self.subTest(event=event),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+            self.assertFalse(self.b.active);self.assertEqual(self.inventory(),before)
+        self.b.failure=None;point=self.b.point
+        def late(event):
+            point(event)
+            if event=='module exit':self.b.now=340
+        self.b.point=late
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.inventory(),before)
+
+    def test_original_budget_consumes_setup_and_does_not_start_an_observer_late(self):
+        self.b.now=270
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.module_calls,[])
+        self.b.now=100;point=self.b.point
+        def elapsed(event):
+            point(event)
+            if event=='routing':self.b.now=270
+        self.b.point=elapsed
+        with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
+        self.assertEqual(self.module_calls,[]);self.assertNotIn('module enter',self.b.events)
+
+
 if __name__=='__main__':unittest.main()
