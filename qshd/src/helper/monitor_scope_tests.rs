@@ -17,7 +17,8 @@ fn monitor_sibling_jobs_body() {
     use crate::test_support::borrowed_scope::{
         diagnostic_assertion as checkpoint, diagnostic_cleanup_stops, diagnostic_exit_code,
         diagnostic_mode, diagnostic_observations, diagnostic_phase as phase,
-        DiagnosticAssertion as Check, DiagnosticMode as Mode, DiagnosticPhase as Phase,
+        owned_children_absent, DiagnosticAssertion as Check, DiagnosticMode as Mode,
+        DiagnosticPhase as Phase,
     };
     use nix::libc;
     use std::io::Read;
@@ -71,7 +72,8 @@ fn monitor_sibling_jobs_body() {
             // subreaper body now. ECHILD cannot stand in for its actual wait.
             crate::test_support::borrowed_scope::wait_expected(self.0.as_fd());
         }
-        fn reap_if_child(&self) {
+        /// True only after an actual consuming wait; false only on ECHILD.
+        fn reap_if_child(&self) -> bool {
             loop {
                 let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
                 let rc = unsafe {
@@ -84,14 +86,14 @@ fn monitor_sibling_jobs_body() {
                 };
                 if rc == 0 {
                     if unsafe { info.si_pid() } != 0 {
-                        return;
+                        return true;
                     }
                     std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
                 match std::io::Error::last_os_error().raw_os_error() {
                     Some(libc::EINTR) => continue,
-                    Some(libc::ECHILD) => return,
+                    Some(libc::ECHILD) => return false,
                     other => panic!("exact fixture wait unavailable: {other:?}"),
                 }
             }
@@ -107,18 +109,25 @@ fn monitor_sibling_jobs_body() {
         jobs: Option<Jobs>,
         master: Option<OwnedFd>,
         joined: bool,
+        // Every fixture stop or product-owned wait, as `cleanup_stops` bits.
+        interventions: usize,
     }
     impl Case {
         fn helper(&self) -> &TestHelper {
             self.helper.as_ref().unwrap()
         }
+        fn intervened(&mut self, bits: usize) {
+            self.interventions |= bits;
+            diagnostic_cleanup_stops(bits);
+        }
         fn finish(&mut self) -> bool {
+            // Observe fixture intervention before it can conceal an earlier
+            // product failure. Cleanup never overwrites the failing checkpoint.
+            let stops = self.jobs.as_ref().map_or(0, |jobs| {
+                usize::from(!jobs.leader.exited()) | (usize::from(!jobs.member.exited()) << 1)
+            });
+            self.intervened(stops);
             if let Some(jobs) = &self.jobs {
-                // Observe fixture intervention before it can conceal an earlier
-                // product failure. Cleanup never overwrites the failing checkpoint.
-                diagnostic_cleanup_stops(
-                    usize::from(!jobs.leader.exited()) | (usize::from(!jobs.member.exited()) << 1),
-                );
                 jobs.leader.stop();
                 jobs.member.stop();
             }
@@ -138,12 +147,15 @@ fn monitor_sibling_jobs_body() {
                 drop(dir);
             }
             if let Some(jobs) = self.jobs.take() {
-                diagnostic_cleanup_stops(usize::from(!jobs.monitor.exited()) << 2);
+                self.intervened(usize::from(!jobs.monitor.exited()) << 2);
                 jobs.monitor.stop();
                 // The helper thread is already joined: no competing product
                 // waiter can lose numeric-PID authority to fixture cleanup.
-                jobs.monitor.reap_if_child();
-                jobs.leader.reap_if_child();
+                // The product waits both; a wait here is recorded at once, so
+                // a later cleanup panic cannot lose it.
+                self.intervened(usize::from(jobs.monitor.reap_if_child()) << 3);
+                self.intervened(usize::from(jobs.leader.reap_if_child()) << 4);
+                // The adopted member's wait is the fixture's own contract.
                 jobs.member.reap_adopted_member();
             }
             self.master = None;
@@ -159,7 +171,7 @@ fn monitor_sibling_jobs_body() {
     // Fixture-only APIs are qualified before any helper or shell is created.
     // This does not establish or change the daemon's supported kernel floor.
     let self_pin = Pin::new(unsafe { libc::getpid() });
-    self_pin.reap_if_child();
+    assert!(!self_pin.reap_if_child(), "the body is not its own child");
     drop(self_pin);
 
     for mode in ["close", "leader-first", "login-ended"] {
@@ -185,6 +197,7 @@ fn monitor_sibling_jobs_body() {
             jobs: None,
             master: None,
             joined: false,
+            interventions: 0,
         };
         let ending = if mode == "leader-first" {
             "exit 0"
@@ -394,6 +407,19 @@ fn monitor_sibling_jobs_body() {
             checkpoint(Check::LeaderStatus, elapsed);
             assert_eq!(exited, Some(0));
         }
+        // After every semantic assertion, so none of them is overwritten: each
+        // of these success modes leaves stops and product waits to the product,
+        // and nothing owned to the next mode or the final drain.
+        checkpoint(Check::FixtureIntervention, elapsed);
+        assert_eq!(
+            case.interventions, 0,
+            "fixture stopped or waited a product-owned process in mode {mode}"
+        );
+        checkpoint(Check::ResidualChildren, elapsed);
+        assert!(
+            owned_children_absent(),
+            "mode {mode} left an owned child behind"
+        );
         phase(Phase::Complete);
     }
 }
