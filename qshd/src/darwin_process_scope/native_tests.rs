@@ -904,6 +904,22 @@ impl Drop for ConnectedActorAuthority {
         }
     }
 }
+fn bounded_fixture_receipt(path: &Path) -> String {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return "UNAVAILABLE".into();
+    };
+    let mut bytes = Vec::new();
+    if file.take(257).read_to_end(&mut bytes).is_err()
+        || bytes.len() > 256
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_ =-".contains(byte))
+    {
+        return "INVALID".into();
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| "INVALID".into())
+}
 fn connected_authority_controls() {
     let command = connected_actor_command(
         Path::new("/fixture with spaces"),
@@ -1148,7 +1164,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 let fresh_events = Arc::new(ConnectedEvents::default());
                 let fresh = connect([2; 16], fresh_events.clone(), fresh_keys.private);
                 let fresh_result = async {
-                    connected_until(|| fresh_events.live.load(Ordering::SeqCst)).await?;
+                    connected_until(|| fresh_events.live.load(Ordering::SeqCst)).await.map_err(|_| "fresh link observation failed")?;
                     let open = OpenRequest {
                         stream: FIRST_CHANNEL_STREAM, kind: ChannelKind::Command,
                         cols: 80, rows: 24, screen: false, command: b"/bin/true".to_vec(),
@@ -1157,8 +1173,29 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                         .map_err(|_| "fresh enqueue failed")?;
                     connected_until(|| fresh_events.records.lock().unwrap().iter().any(|record| {
                         matches!(record, ServerRecord::Exit { stream, code: 0 } if *stream == FIRST_CHANNEL_STREAM)
-                    })).await
+                    })).await.map_err(|_| "fresh exit observation failed")
                 }.await;
+                let records = fresh_events.records.lock().unwrap();
+                let count = |predicate: fn(&ServerRecord) -> bool| records.iter().filter(|record| predicate(record)).count();
+                let metadata = registry.try_cleanup_snapshot();
+                let exit_code = records.iter().find_map(|r| match r { ServerRecord::Exit { code, .. } => Some(code.to_string()), _ => None }).unwrap_or_else(|| "none".into());
+                let receipt = format!("live={} opened={} exit0={} exitother={} code={} unavailable={} refused={} input_failed={} pending={} retiring={} debt={} leader_unknown={} cleanup_unknown={} unconfirmed={}",
+                    fresh_events.live.load(Ordering::SeqCst) as u8,
+                    count(|r| matches!(r, ServerRecord::Opened { .. })),
+                    count(|r| matches!(r, ServerRecord::Exit { code: 0, .. })),
+                    count(|r| matches!(r, ServerRecord::Exit { code, .. } if *code != 0)),
+                    exit_code,
+                    count(|r| matches!(r, ServerRecord::ExitStatusUnavailable { .. })),
+                    count(|r| matches!(r, ServerRecord::Refused { .. })),
+                    fresh_events.input_failed.load(Ordering::SeqCst) as u8,
+                    metadata.as_ref().map(|m| m.healthy_pending_opens.to_string()).unwrap_or_else(|| "none".into()),
+                    metadata.as_ref().map(|m| m.retiring_channels.to_string()).unwrap_or_else(|| "none".into()),
+                    metadata.as_ref().map(|m| m.unique_cleanup_debt.to_string()).unwrap_or_else(|| "none".into()),
+                    metadata.as_ref().is_some_and(|m| m.leader_unconfirmed) as u8,
+                    metadata.as_ref().is_some_and(|m| m.cleanup_unconfirmed) as u8,
+                    metadata.as_ref().map(|m| m.observed_unconfirmed_owners.to_string()).unwrap_or_else(|| "none".into()));
+                publish_bytes(&body_actor_directory.join("fresh-receipt"), receipt.as_bytes());
+                drop(records);
                 fresh.close();
                 fresh_result?;
             }
@@ -1169,6 +1206,17 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
             Err(_)=>Err("connected body panicked or was cancelled"),
         }
     };
+    let failure_code = match result {
+        Err("fresh link observation failed") => "FRESH_LINK",
+        Err("fresh enqueue failed") => "FRESH_ENQUEUE",
+        Err("fresh exit observation failed") => "FRESH_EXIT",
+        Err(_) => "BODY_ERROR",
+        Ok(()) => "BODY_OK",
+    };
+    publish_bytes(
+        &actor_directory.join("failure-code"),
+        failure_code.as_bytes(),
+    );
     // This is the manager-stop seam, not a claim about the wire STOP
     // endpoint. Always retain and await the real lifecycle drain.
     if let Some(directory) = signal_directory {
@@ -1273,7 +1321,9 @@ fn darwin223_native_connected_close_stop_rebind_and_fresh_session() {
         assert_eq!(
             output.status.success(),
             !expected_failure,
-            "connected fixture mode={mode}"
+            "connected fixture mode={mode} stage={} facts={}",
+            bounded_fixture_receipt(&actors.path().join("failure-code")),
+            bounded_fixture_receipt(&actors.path().join("fresh-receipt"))
         );
         assert!(actors.path().join("manager-joined").exists());
         if !expected_failure {
@@ -1503,10 +1553,14 @@ fn bootstrap_command(
     use std::os::unix::process::CommandExt;
     let cache = home.join("qsh");
     let expected_control = cache.join("control.sock");
-    assert_eq!(
-        listener.local_addr().unwrap().as_pathname(),
-        Some(expected_control.as_path())
-    );
+    // bind_private publishes by rename; local_addr retains the .cPID/s bind
+    // name. Handover carries the published endpoint, not that kernel address.
+    use std::os::unix::fs::FileTypeExt;
+    assert!(std::fs::symlink_metadata(&expected_control)
+        .unwrap()
+        .file_type()
+        .is_socket());
+    assert!(listener.local_addr().unwrap().as_pathname().is_some());
     let inherited = [
         udp.as_raw_fd(),
         listener.as_raw_fd(),
@@ -1528,10 +1582,7 @@ fn bootstrap_command(
         .env("QSH_DARWIN223_GATE", inherited[2].to_string())
         .env("QSH_DARWIN223_DESTINATION", destination)
         .env("QSH_DARWIN223_CACHE", &cache)
-        .env(
-            "QSH_DARWIN223_CONTROL_PATH",
-            listener.local_addr().unwrap().as_pathname().unwrap(),
-        )
+        .env("QSH_DARWIN223_CONTROL_PATH", &expected_control)
         .env(
             "QSH_DARWIN223_CLIENT",
             crate::handover::encode_allowlist(&[client]).pop().unwrap(),
@@ -1615,6 +1666,55 @@ fn fixture_gate_controls() {
         assert_eq!(bootstrap_gate(&mut child).is_ok(), expected);
     }
 }
+fn fixture_socket_publication_controls() {
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "qsh223-socket-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let staging = root.join(format!(".c{}", std::process::id()));
+    let published = root.join("control.sock");
+    struct RemoveOwnedSocket {
+        root: std::path::PathBuf,
+        staging: std::path::PathBuf,
+        published: std::path::PathBuf,
+    }
+    impl Drop for RemoveOwnedSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.published);
+            let _ = std::fs::remove_file(self.staging.join("s"));
+            let _ = std::fs::remove_dir(&self.staging);
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
+    let _cleanup = RemoveOwnedSocket {
+        root,
+        staging: staging.clone(),
+        published: published.clone(),
+    };
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .unwrap();
+    let bound = staging.join("s");
+    let listener = std::os::unix::net::UnixListener::bind(&bound).unwrap();
+    std::fs::rename(&bound, &published).unwrap();
+    assert_eq!(
+        listener.local_addr().unwrap().as_pathname(),
+        Some(bound.as_path())
+    );
+    assert_ne!(bound, published);
+    assert!(std::fs::symlink_metadata(&published)
+        .unwrap()
+        .file_type()
+        .is_socket());
+}
 fn bootstrap_actor() {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -1654,10 +1754,10 @@ fn bootstrap_actor() {
     assert_eq!(client.len(), 44);
     crate::handover::decode_allowlist(std::slice::from_ref(&client)).unwrap();
     let port = udp.local_addr().unwrap().port();
-    assert_eq!(
-        listener.local_addr().unwrap().as_pathname(),
-        Some(control.as_path())
-    );
+    assert_eq!(control, cache.join("control.sock"));
+    // The actual startup validator separately checks the kernel's original
+    // private bind address. It deliberately differs from this published path.
+    assert!(listener.local_addr().unwrap().as_pathname().is_some());
     bootstrap_gate(&mut gate).unwrap();
     drop(gate);
     let staged = destination.with_file_name(format!(".qshd-update-{}-a223", std::process::id()));
@@ -1699,6 +1799,7 @@ fn darwin223_owned_signal_server() {
     if std::env::var_os("QSH_DARWIN223_COMMAND_CONTROLS").is_some() {
         fixture_command_controls();
         fixture_gate_controls();
+        fixture_socket_publication_controls();
         return;
     }
     let mode = std::env::var("QSH_DARWIN223_CONNECTED_SERVER").ok();
