@@ -628,12 +628,11 @@ jobs:
     env:
       HISTFILE: /dev/null
       # Line tables only in the test profile: backtraces keep their file
-      # and line, debuggers lose variables and types. With full debuginfo
-      # the test build left 16.4 GB in target/, 12.75 GiB of it DWARF in
-      # the 97 test executables -- more than the 14 GB of storage a standard
-      # Linux runner is documented with, and an AWS-hosted runner of the
-      # multi-cloud pool ran out of space linking them (#462). With line
-      # tables: 6.4 GB. Set for the job, so rust-cache's key includes it.
+      # and line, debuggers lose variables and types. Full DWARF is most of
+      # what the test executables weigh, and the whole test build has to fit
+      # in a standard runner's storage (#462). Set for the job rather than a
+      # step: rust-cache hashes CARGO* variables into its key, so cached
+      # artifacts always match the profile they were built with.
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # The integration tests bring up real daemons; a hang there (or
     # anywhere else in this job) would otherwise burn the default 360
