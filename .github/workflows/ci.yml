@@ -627,6 +627,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       HISTFILE: /dev/null
+      # Line tables only in the test profile: backtraces keep their file
+      # and line, debuggers lose variables and types. Full DWARF is most of
+      # what the test executables weigh, and the whole test build has to fit
+      # in a standard runner's storage (#462). Set for the job rather than a
+      # step: rust-cache hashes CARGO* variables into its key, so cached
+      # artifacts always match the profile they were built with.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # The integration tests bring up real daemons; a hang there (or
     # anywhere else in this job) would otherwise burn the default 360
     # minutes before GitHub kills it.
@@ -641,6 +648,11 @@ jobs:
           actual=$(git rev-parse HEAD)
           echo "Source commit: $actual (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
           test "$actual" = "$GITHUB_SHA"
+
+      # Disk observations (#462): runner baseline, then restored caches,
+      # toolchains and native dependencies, then build output.
+      - name: Disk usage at job start
+        run: df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
 
       - name: Install the toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
@@ -753,11 +765,19 @@ jobs:
           prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Disk usage after setup and cache restoration
+        run: |
+          df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
+          du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
       - name: Formatting
         run: cargo fmt --all --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --features qshd/system -- -D warnings
+      - name: Disk usage before the test build
+        run: |
+          df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
+          du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
 
       # Each test gets its own process, isolating PAM's descriptor changes.
       # nextest.toml keeps daemon port-selection suites serial while allowing
@@ -774,6 +794,11 @@ jobs:
           python3 scripts/run-nextest-ci.py --
           cargo nextest run --profile ci --workspace --lib --bins --tests --example three_channel305
           --locked --features qshd/system
+      - name: Disk usage after the test build and run
+        if: ${{ !cancelled() }}
+        run: |
+          df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
+          du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
 
       # nextest does not run doctests.
       - name: Doc tests
@@ -799,6 +824,8 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.98.1"
       HISTFILE: /dev/null
+      # The same test build as the `check` job's, on the same runner pool.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # The suites themselves take about two minutes all told, measured in
     # these same containers; the rest is the toolchain and the build.
     timeout-minutes: 45
@@ -858,6 +885,10 @@ jobs:
           prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Disk usage after setup and cache restoration
+        run: |
+          df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
+          du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
       - name: Allocation bounds on the package compiler
         run: cargo test -p qshd --lib --locked screen_budget::allocation_bounds -- --nocapture
 
@@ -878,6 +909,11 @@ jobs:
         run: |
           cargo test --workspace --features qshd/system --locked --no-run \
             --message-format=json > "$RUNNER_TEMP/build.json"
+      - name: Disk usage after the test build
+        if: ${{ !cancelled() }}
+        run: |
+          df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
+          du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
 
       # `scripts/check-pam-linkage.sh` ran only by hand until now. Given a
       # PATH it builds nothing and reads one already-built file: does it
