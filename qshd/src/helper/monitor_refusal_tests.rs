@@ -306,6 +306,253 @@ mod queued_refusal {
         ).assert_clean(0);
     }
 
+    #[test]
+    fn refusal404_blocked_seal_worker_eof_owned_drain_returns() {
+        crate::test_borrowed_scope::run_exact(
+            "helper::server::tests::queued_refusal::refusal404_blocked_seal_worker_eof_owned_drain_returns",
+            0,
+            blocked_seal_worker_eof_body,
+        )
+        .assert_clean(0);
+    }
+
+    fn blocked_seal_worker_eof_body() {
+        use super::shutdown_checkpoint::{Note, Phase, SeamEnd};
+        use std::io::{Read as _, Write as _};
+        let checkpoint = |stage: &str| {
+            if let Some(path) = std::env::var_os("QSH_TEST_REFUSAL404_REPORT") {
+                std::fs::write(path, stage).unwrap();
+            }
+        };
+        checkpoint("prepare");
+        let view = crate::process_scope::prepare().unwrap();
+        let (parent, producer) = super::super::super::worker_control::pair().unwrap();
+        nix::sys::socket::setsockopt(&parent, nix::sys::socket::sockopt::SndBuf, &2048).unwrap();
+        let effective =
+            nix::sys::socket::getsockopt(&parent, nix::sys::socket::sockopt::SndBuf).unwrap();
+        assert!(
+            (2048..8192).contains(&effective),
+            "bounded Linux send buffer: {effective}"
+        );
+        let (mut gate, gate_child) = UnixStream::pair().unwrap();
+        gate.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        gate.set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let _release_gate = RefusalGate(gate.try_clone().unwrap());
+        let raw = producer.as_raw_fd();
+        let gate_raw = gate_child.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "helper::monitor_owner::tests::monitor40_private_producer_body",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("QSH_TEST_MONITOR_OWNER_MODE", "refused-gated-shutdown-tail")
+            .env("QSH_TEST_MONITOR_OWNER_FD", raw.to_string())
+            .env("QSH_TEST_MONITOR_GATE_FD", gate_raw.to_string())
+            .env(
+                "QSH_TEST_MONITOR_OWNER_PARENT",
+                std::process::id().to_string(),
+            )
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [raw, gate_raw] {
+                    if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        checkpoint("spawn");
+        let mut child = command.spawn().unwrap();
+        drop(gate_child);
+        drop(producer);
+        let mut native = super::super::super::monitor_owner::NativeMonitor::new(
+            std::num::NonZeroU32::new(child.id()).unwrap(),
+            view,
+            parent,
+        );
+        let mut mark = [0];
+        gate.read_exact(&mut mark).unwrap();
+        assert_eq!(&mark, b"S");
+        checkpoint("established");
+        let stage = native.advance(Instant::now());
+        assert!(stage.event.is_none() && stage.failure.is_none());
+        let login = [209; 16];
+        let mut state = state_with_login(&my_account(), login);
+        let owner = owner_for(&state, login);
+        state.live.insert(209, ChannelSlot::Starting(owner));
+        state.pending.insert(Pending {
+            deadline: Instant::now() + Duration::from_secs(3),
+            what: PendingWhat::Channel {
+                id: 209,
+                master: tempfile::tempfile().unwrap().into(),
+                login,
+                uid: my_uid(),
+                cancelled: false,
+            },
+        });
+        state.monitors.insert(
+            owner,
+            Monitor {
+                process: MonitorProcess::Native(native),
+                pid: Pid::from_raw(child.id() as i32),
+                reaped: false,
+                write_closed: false,
+                stop_attempted: false,
+                refusal_seal: None,
+                refusal_budget: STARTUP_REPORT_TIMEOUT,
+                completion: None,
+                seam_closed: false,
+                wait_lost: false,
+                failure: None,
+                signal_failure: None,
+            },
+        );
+        let (channels, receiver) = channel::pair().unwrap();
+        let (auth, auth_peer) = channel::pair().unwrap();
+        let seams = Seams {
+            channels: &channels,
+            auth: &auth,
+        };
+        checkpoint("enqueue");
+        let mut request = open_request(210, my_uid().as_raw(), login);
+        if let Request::Open { command, .. } = &mut request {
+            *command = "x".repeat(4200);
+        }
+        let encoded = encode(&request).unwrap();
+        assert!(encoded.len() <= super::super::super::protocol::MAX_MESSAGE_LEN);
+        channel::send(&receiver, &encoded, None).unwrap();
+        assert!(matches!(
+            serve_channel_seam(&channels, &mut state, &test_config(), UNPRIVILEGED),
+            Next::Continue
+        ));
+        assert!(state.live.contains_key(&210) && state.monitors[&owner].failure.is_none());
+        checkpoint("admitted");
+        gate.write_all(b"X").unwrap();
+        gate.read_exact(&mut mark).unwrap();
+        assert_eq!(&mark, b"R");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.monitors[&owner].refusal_seal.is_none() {
+            assert!(Instant::now() < deadline, "original refusal did not arrive");
+            serve_ready_monitors(seams, &mut state, &[]);
+        }
+        let (until, packet) = match &state.monitors[&owner].refusal_seal {
+            Some(RefusalSeal::Pending { until, packet }) => (*until, packet.clone()),
+            _ => panic!("first refusal must retain its original pending marker"),
+        };
+        let blocked =
+            channel::try_send_before(state.monitors[&owner].seam(), &packet, until).unwrap_err();
+        assert_eq!(
+            blocked.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "valid single Open must establish actual marker backpressure; effective={effective}"
+        );
+        checkpoint("blocked");
+        while state.live.contains_key(&209) {
+            assert!(
+                Instant::now() < deadline,
+                "original NoChild receipt missing"
+            );
+            serve_ready_monitors(seams, &mut state, &[]);
+        }
+        checkpoint("original-receipted");
+        assert!(
+            matches!(state.monitors[&owner].refusal_seal,Some(RefusalSeal::Pending{until:kept,..}) if kept==until)
+        );
+        checkpoint("pending-retained");
+        assert!(state.live.contains_key(&210) && state.monitors[&owner].failure.is_none());
+        checkpoint("charge-retained");
+        // Consume replies that were delivered before EOF; closing a Unix peer
+        // with unread replies can establish reset instead of the requested EOF.
+        receiver.set_nonblocking(true).unwrap();
+        while let Ok(Some((bytes, fd))) = channel::recv_once(&receiver) {
+            assert!(fd.is_none());
+            match decode::<Response>(&bytes).unwrap() {
+                Response::Failed { id: 209 | 210, .. } => {}
+                Response::LoginEnded { login, incarnation }
+                    if login == owner.login && incarnation == owner.incarnation => {}
+                Response::CleanupComplete {
+                    id: 209,
+                    kind: super::super::super::protocol::CleanupKind::NoChild,
+                } => {}
+                _ => {
+                    checkpoint("unexpected-reply");
+                    panic!("unexpected pre-EOF reply");
+                }
+            }
+        }
+        checkpoint("pre-eof");
+        drop(receiver);
+        drop(auth_peer);
+        assert!(matches!(
+            serve_channel_seam(&channels, &mut state, &test_config(), UNPRIVILEGED),
+            Next::Eof
+        ));
+        assert!(matches!(
+            serve_auth_seam(seams, &mut state, &test_config(), UNPRIVILEGED),
+            Next::Eof
+        ));
+        checkpoint("eof");
+        let note = std::sync::Arc::new(Note::default());
+        let observe = note.clone();
+        let mut shutdown = HelperShutdown::new(state);
+        shutdown.channels_open = false;
+        shutdown.auth_open = false;
+        shutdown.checkpoint = Some(note.clone());
+        shutdown.checkpoint(Phase::SeamEnded, Some(SeamEnd::ChannelEof));
+        shutdown.checkpoint(Phase::SeamEnded, Some(SeamEnd::AuthEof));
+        std::thread::scope(|scope| {
+            let release = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    let snapshot = *observe.inner.lock().unwrap();
+                    if matches!(snapshot.phase, Phase::Retiring | Phase::BeforePass)
+                        && snapshot.seal_pending > 0
+                    {
+                        gate.write_all(b"X").unwrap();
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "shutdown did not reach its pending-marker checkpoint"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            shutdown.end_the_monitors(seams, &test_config());
+            release.join().unwrap();
+        });
+        checkpoint("returned");
+        let returned = *note.inner.lock().unwrap();
+        assert_eq!(returned.phase, Phase::Returned);
+        assert_eq!(
+            (
+                returned.monitors,
+                returned.retired,
+                returned.live,
+                returned.verifying,
+                returned.orphans,
+                returned.wait_lost
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert!(!returned.sticky_monitor_failure && !returned.cleanup_failure);
+        assert!(shutdown.state.pending.is_empty() && shutdown.state.live.is_empty());
+        assert!(shutdown.state.logins.is_empty() && shutdown.state.verified.is_empty());
+        assert_eq!(shutdown.first_monitor_failure, None);
+        assert_eq!(shutdown.state.pam_cleanup, PamCompletion::NotOpened);
+        assert!(
+            matches!(child.try_wait(),Err(error) if error.raw_os_error()==Some(nix::libc::ECHILD))
+        );
+    }
+
     fn queued_refusal_body(mode: &str) {
         queued_refusal_body_with_stop(mode, true);
     }

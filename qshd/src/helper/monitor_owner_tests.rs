@@ -150,6 +150,63 @@ fn monitor40_private_producer_body() {
         )
         .unwrap();
     }
+    if mode == "refused-gated-shutdown-tail" {
+        use std::io::{Read as _, Write as _};
+        let gate = after_gate.as_mut().unwrap();
+        gate.write_all(b"R").unwrap();
+        gate.read_exact(&mut [0u8; 1]).unwrap();
+        seam.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut admitted = Vec::new();
+        loop {
+            let (bytes, fd) = channel::recv(&seam).unwrap().expect("bounded drain packet");
+            match super::super::protocol::decode::<super::super::protocol::MonitorRequest>(&bytes)
+                .unwrap()
+            {
+                super::super::protocol::MonitorRequest::Open { id, command, .. } => {
+                    assert_eq!(id, 210, "only the exact queued fixture ID is admitted");
+                    assert!(admitted.is_empty(), "duplicate fixture Open");
+                    assert_eq!(command, "x".repeat(4200));
+                    assert!(fd.is_some(), "Open transfers its actual fixture slave");
+                    drop(fd);
+                    admitted.push(id);
+                    channel::send(
+                        &seam,
+                        &encode(&MonitorEvent::CleanupComplete {
+                            id,
+                            kind: super::super::protocol::CleanupKind::NoChild,
+                        })
+                        .unwrap(),
+                        None,
+                    )
+                    .unwrap();
+                }
+                super::super::protocol::MonitorRequest::SealRefused => {
+                    assert!(fd.is_none(), "seal never transfers descriptors");
+                    assert_eq!(admitted, vec![210]);
+                    break;
+                }
+                _ => panic!("unexpected command in the fixed shutdown-tail fixture"),
+            }
+        }
+        channel::send(
+            &seam,
+            &encode(&MonitorEvent::SessionClosed {
+                result: PamCompletion::NotOpened,
+                cleanup_failure: None,
+                request_failure: None,
+            })
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        seam.set_nonblocking(true).unwrap();
+        match channel::recv_once(&seam) {
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            _ => panic!("extra packet after the fixed refusal seal"),
+        }
+        return;
+    }
     if mode.starts_with("refused-gated-after-") {
         use std::io::{Read as _, Write as _};
         let gate = after_gate.as_mut().unwrap();
