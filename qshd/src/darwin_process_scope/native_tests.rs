@@ -1817,20 +1817,36 @@ fn bootstrap_command(
     }
     command
 }
+fn gate_remaining(end: Instant) -> std::io::Result<Duration> {
+    end.checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "bootstrap gate deadline"))
+}
 fn bootstrap_gate(gate: &mut std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    bootstrap_gate_until(gate, Instant::now() + Duration::from_secs(10))
+}
+fn bootstrap_gate_until(
+    gate: &mut std::os::unix::net::UnixStream,
+    end: Instant,
+) -> std::io::Result<()> {
     use std::io::Read;
-    let end = Instant::now() + Duration::from_secs(10);
+    use std::os::fd::AsRawFd;
+    gate_remaining(end)?;
+    let fd = gate.as_raw_fd();
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags < 0
+        || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    gate_remaining(end)?;
     let mut frame = [0; 4];
     let mut used = 0;
     loop {
-        let remaining = end
-            .checked_duration_since(Instant::now())
-            .filter(|value| !value.is_zero())
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "bootstrap gate deadline")
-            })?;
-        gate.set_read_timeout(Some(remaining))?;
-        match gate.read(&mut frame[used..]) {
+        gate_remaining(end)?;
+        let result = gate.read(&mut frame[used..]);
+        gate_remaining(end)?;
+        match result {
             Ok(0) if used == 3 && &frame[..3] == b"GO\n" => return Ok(()),
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -1854,23 +1870,63 @@ fn bootstrap_gate(gate: &mut std::os::unix::net::UnixStream) -> std::io::Result<
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(gate_remaining(end)?.min(Duration::from_millis(1)));
+            }
             Err(error) => return Err(error),
         }
     }
 }
 fn fixture_gate_controls() {
     use std::io::Write;
-    for (frame, expected) in [
-        (b"GO\n".as_slice(), true),
-        (b"NO\n".as_slice(), false),
-        (b"GO\nX".as_slice(), false),
-        (b"".as_slice(), false),
-    ] {
+    use std::os::fd::AsRawFd;
+    for full_close in [false, true] {
+        for (frame, expected) in [
+            (b"GO\n".as_slice(), true),
+            (b"NO\n".as_slice(), false),
+            (b"GO\nX".as_slice(), false),
+            (b"".as_slice(), false),
+            (b"G".as_slice(), false),
+            (b"GO".as_slice(), false),
+        ] {
+            let (mut parent, mut child) = std::os::unix::net::UnixStream::pair().unwrap();
+            let before = unsafe { nix::libc::fcntl(child.as_raw_fd(), nix::libc::F_GETFL) };
+            assert!(before >= 0);
+            parent.write_all(frame).unwrap();
+            parent.shutdown(std::net::Shutdown::Write).unwrap();
+            let _parent = if full_close {
+                drop(parent);
+                None
+            } else {
+                Some(parent)
+            };
+            assert_eq!(bootstrap_gate(&mut child).is_ok(), expected);
+            let after = unsafe { nix::libc::fcntl(child.as_raw_fd(), nix::libc::F_GETFL) };
+            assert_eq!(after, before | nix::libc::O_NONBLOCK);
+        }
+    }
+    for frame in [b"GO\n".as_slice(), b"G".as_slice()] {
         let (mut parent, mut child) = std::os::unix::net::UnixStream::pair().unwrap();
         parent.write_all(frame).unwrap();
-        parent.shutdown(std::net::Shutdown::Write).unwrap();
-        assert_eq!(bootstrap_gate(&mut child).is_ok(), expected);
+        let end = Instant::now() + Duration::from_millis(15);
+        let error = bootstrap_gate_until(&mut child, end).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= end);
+        drop(parent);
     }
+    fixture_expired_gate_control();
+}
+fn fixture_expired_gate_control() {
+    use std::io::Write;
+    let (mut parent, mut child) = std::os::unix::net::UnixStream::pair().unwrap();
+    parent.write_all(b"GO\n").unwrap();
+    parent.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(parent);
+    let end = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        bootstrap_gate_until(&mut child, end).unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
 }
 fn fixture_socket_publication_controls() {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
