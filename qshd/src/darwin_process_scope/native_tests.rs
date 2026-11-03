@@ -758,6 +758,32 @@ impl ConnectedActorAuthority {
     }
     fn observe(&mut self) {
         if self.bound.is_some() {
+            // Only the parent owns this real watch. Do not publish this proof
+            // until the helper has actually enqueued CLOSE, and never infer it
+            // from a zero registry snapshot or subsequent manager shutdown.
+            if self.path().join("close-enqueued").exists()
+                && !self.path().join("close-observed").exists()
+            {
+                let expected_pid: i32 = std::fs::read_to_string(self.path().join("actor-pid"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let bound = self.bound.as_mut().unwrap();
+                if let Some(event) = NativeOps
+                    .observe_exit(&mut bound.watch)
+                    .expect("bound CLOSE actor watch")
+                {
+                    assert_eq!(event.pid, expected_pid);
+                    assert!(
+                        event.process_filter
+                            && event.note_exit
+                            && !event.error
+                            && event.cookie == 1
+                    );
+                    bound.normal_exit = true;
+                    publish(&self.path().join("close-observed"));
+                }
+            }
             return;
         }
         let Ok(value) = std::fs::read_to_string(self.path().join("actor-pid")) else {
@@ -932,6 +958,42 @@ fn connected_authority_controls() {
             "only confirmed completion permits directory removal"
         );
     }
+    {
+        let mut authority = ConnectedActorAuthority::new();
+        let path = authority.path().to_path_buf();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "darwin_process_scope::native_tests::darwin223_owned_actor",
+                "--nocapture",
+            ])
+            .env("QSH_DARWIN223_ACTOR", &path)
+            .env("QSH_DARWIN223_CONNECTED_ACTOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+        until(|| path.join("actor-pid").exists());
+        authority.observe();
+        assert!(authority.bound.is_some());
+        publish(&path.join("close-enqueued"));
+        authority.observe();
+        assert!(
+            !path.join("close-observed").exists(),
+            "an active actor cannot satisfy CLOSE proof"
+        );
+        authority.abort();
+        until(|| {
+            authority.observe();
+            path.join("close-observed").exists()
+        });
+        assert!(owner
+            .finish(Instant::now() + Duration::from_secs(3))
+            .unwrap()
+            .success());
+        authority.finish(true);
+    }
     // No actor/no manager receipt is not a successful expected-actor finish.
     let mut authority = ConnectedActorAuthority::new();
     publish(&authority.path().join("manager-joined"));
@@ -1068,10 +1130,15 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
             if mode != "manager-stop" && mode != "signal" {
                 client.send_bytes(CONTROL_STREAM, encode_client(&ClientRecord::Close { stream: FIRST_CHANNEL_STREAM }))
                     .map_err(|_| "close enqueue failed")?;
-                connected_until(|| events.records.lock().unwrap().iter().any(|record| {
+                // An adopted active channel may already have registry counts0.
+                // Require the independent parent's actual bound actor NOTE_EXIT
+                // after enqueue, then registry0, before any manager shutdown.
+                publish(&body_actor_directory.join("close-enqueued"));
+                connected_until(|| body_actor_directory.join("close-observed").exists()).await?;
+                connected_until(|| registry.outstanding() == 0 && registry.retiring_count() == 0).await?;
+                if events.records.lock().unwrap().iter().any(|record| {
                     matches!(record, ServerRecord::Exit { stream, .. } if *stream == FIRST_CHANNEL_STREAM)
-                })).await?;
-                connected_until(|| registry.outstanding() == 0).await?;
+                }) { return Err("unexpected Exit after client CLOSE"); }
             }
             if mode == "fresh-session" {
                 client.close();
@@ -1434,6 +1501,12 @@ fn bootstrap_command(
 ) -> Command {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
+    let cache = home.join("qsh");
+    let expected_control = cache.join("control.sock");
+    assert_eq!(
+        listener.local_addr().unwrap().as_pathname(),
+        Some(expected_control.as_path())
+    );
     let inherited = [
         udp.as_raw_fd(),
         listener.as_raw_fd(),
@@ -1454,7 +1527,7 @@ fn bootstrap_command(
         .env("QSH_DARWIN223_CONTROL", inherited[1].to_string())
         .env("QSH_DARWIN223_GATE", inherited[2].to_string())
         .env("QSH_DARWIN223_DESTINATION", destination)
-        .env("QSH_DARWIN223_CACHE", home)
+        .env("QSH_DARWIN223_CACHE", &cache)
         .env(
             "QSH_DARWIN223_CONTROL_PATH",
             listener.local_addr().unwrap().as_pathname().unwrap(),
@@ -1833,7 +1906,16 @@ struct DirectDaemonGuard {
 }
 impl DirectDaemonGuard {
     fn arm(&mut self) {
-        until(|| daemon_status(&self.socket).is_some());
+        until(|| {
+            assert!(
+                self.owner
+                    .poll()
+                    .expect("bootstrap child observation")
+                    .is_none(),
+                "owned handover bootstrap exited before STATUS"
+            );
+            daemon_status(&self.socket).is_some()
+        });
         let status = daemon_status(&self.socket).unwrap();
         assert_eq!(status.pid, self.owner.child.id());
         assert!(self.owner.poll().unwrap().is_none());
@@ -2213,7 +2295,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     let port = udp.local_addr().unwrap().port();
     let listener = crate::control::bind_private(&socket).unwrap();
     let server_pub =
-        crate::load_or_create_transport_key(&home.path().join("transport_server_key.bin"))
+        crate::load_or_create_transport_key(&home.path().join("qsh/transport_server_key.bin"))
             .unwrap()
             .public;
     for frame in [b"NO\n".as_slice(), b"".as_slice(), b"GO\n".as_slice()] {
