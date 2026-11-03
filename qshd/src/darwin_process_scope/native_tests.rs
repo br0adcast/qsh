@@ -1977,6 +1977,724 @@ fn fixture_socket_publication_controls() {
         .file_type()
         .is_socket());
 }
+const PROOF_LIMIT: u64 = 512 * 1024 * 1024;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameProof {
+    case: String,
+    checksum_errno: String,
+    checksum_matches: Option<bool>,
+    checksum_result: String,
+    copied_bytes: u64,
+    current_exe_errno: String,
+    current_exe_location: String,
+    fixture: String,
+    kind: String,
+    new_hash_matches: bool,
+    old_absent: bool,
+    request: String,
+    same_inode: bool,
+    schema: u32,
+    source_sha256: String,
+    status_checksum_matches: Option<bool>,
+    status_errno: String,
+    status_result: String,
+}
+const PROOF_ERRNOS: [&str; 13] = [
+    "ENOENT",
+    "EACCES",
+    "EPERM",
+    "EIO",
+    "EINVAL",
+    "EBADF",
+    "EMFILE",
+    "ENFILE",
+    "ENOMEM",
+    "ENOSPC",
+    "EFBIG",
+    "ETIMEDOUT",
+    "UNKNOWN",
+];
+fn proof_errno(error: &anyhow::Error) -> &'static str {
+    let value = error.chain().take(8).find_map(|item| {
+        item.downcast_ref::<std::io::Error>()
+            .and_then(|e| e.raw_os_error())
+    });
+    match value {
+        Some(nix::libc::ENOENT) => "ENOENT",
+        Some(nix::libc::EACCES) => "EACCES",
+        Some(nix::libc::EPERM) => "EPERM",
+        Some(nix::libc::EIO) => "EIO",
+        Some(nix::libc::EINVAL) => "EINVAL",
+        Some(nix::libc::EBADF) => "EBADF",
+        Some(nix::libc::EMFILE) => "EMFILE",
+        Some(nix::libc::ENFILE) => "ENFILE",
+        Some(nix::libc::ENOMEM) => "ENOMEM",
+        Some(nix::libc::ENOSPC) => "ENOSPC",
+        Some(nix::libc::EFBIG) => "EFBIG",
+        Some(nix::libc::ETIMEDOUT) => "ETIMEDOUT",
+        _ => "UNKNOWN",
+    }
+}
+fn proof_json(record: &RenameProof) -> Vec<u8> {
+    // Field declarations are lexical: all admitted strings are ASCII tokens.
+    let mut bytes = serde_json::to_vec(record).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+fn proof_result_valid(result: &str, matched: Option<bool>, errno: &str) -> bool {
+    match result {
+        "ok" => matched.is_some() && errno == "NONE",
+        "error" => matched.is_none() && PROOF_ERRNOS.contains(&errno),
+        "not_called" => matched.is_none() && errno == "NONE",
+        _ => false,
+    }
+}
+fn parse_proof_record(
+    raw: &[u8],
+    case: &str,
+    request: &str,
+    sha: &str,
+    size: u64,
+) -> Result<RenameProof, &'static str> {
+    if raw.is_empty() || raw.len() > 1024 {
+        return Err("PROOF_RECORD");
+    }
+    let record: RenameProof = serde_json::from_slice(raw).map_err(|_| "PROOF_RECORD")?;
+    let lower_hex = |value: &str, len| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if proof_json(&record) != raw
+        || record.schema != 1
+        || record.kind != "darwin-rename-checksum-proof"
+        || !matches!(record.case.as_str(), "baseline" | "renamed")
+        || record.case != case
+        || !lower_hex(&record.request, 32)
+        || record.request != request
+        || !lower_hex(&record.source_sha256, 64)
+        || record.source_sha256 != sha
+        || !(1..=PROOF_LIMIT).contains(&record.copied_bytes)
+        || record.copied_bytes != size
+        || !matches!(record.fixture.as_str(), "ready" | "refused")
+        || !matches!(
+            record.current_exe_location.as_str(),
+            "old" | "new" | "other" | "unavailable"
+        )
+        || (if record.current_exe_location == "unavailable" {
+            !PROOF_ERRNOS.contains(&record.current_exe_errno.as_str())
+        } else {
+            record.current_exe_errno != "NONE"
+        })
+        || !proof_result_valid(
+            &record.checksum_result,
+            record.checksum_matches,
+            &record.checksum_errno,
+        )
+        || !proof_result_valid(
+            &record.status_result,
+            record.status_checksum_matches,
+            &record.status_errno,
+        )
+    {
+        return Err("PROOF_RECORD");
+    }
+    if record.fixture == "ready"
+        && (!record.same_inode
+            || !record.new_hash_matches
+            || record.old_absent != (case == "renamed")
+            || record.checksum_result == "not_called"
+            || record.status_result == "not_called")
+    {
+        return Err("PROOF_PRECONDITION");
+    }
+    Ok(record)
+}
+fn proof_refused(case: &str, request: &str, sha: &str, size: u64) -> RenameProof {
+    RenameProof {
+        case: case.into(),
+        checksum_errno: "NONE".into(),
+        checksum_matches: None,
+        checksum_result: "not_called".into(),
+        copied_bytes: size,
+        current_exe_errno: "UNKNOWN".into(),
+        current_exe_location: "unavailable".into(),
+        fixture: "refused".into(),
+        kind: "darwin-rename-checksum-proof".into(),
+        new_hash_matches: false,
+        old_absent: false,
+        request: request.into(),
+        same_inode: false,
+        schema: 1,
+        source_sha256: sha.into(),
+        status_checksum_matches: None,
+        status_errno: "NONE".into(),
+        status_result: "not_called".into(),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProofFileIdentity {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    links: u64,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    modified: i64,
+    modified_ns: i64,
+    changed: i64,
+    changed_ns: i64,
+}
+fn proof_identity(info: &std::fs::Metadata) -> ProofFileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    ProofFileIdentity {
+        dev: info.dev(),
+        ino: info.ino(),
+        mode: info.mode(),
+        links: info.nlink(),
+        uid: info.uid(),
+        gid: info.gid(),
+        size: info.len(),
+        modified: info.mtime(),
+        modified_ns: info.mtime_nsec(),
+        changed: info.ctime(),
+        changed_ns: info.ctime_nsec(),
+    }
+}
+fn proof_require_absent(path: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => anyhow::bail!("PROOF_PREEXISTING"),
+        Err(error) => Err(error.into()),
+    }
+}
+fn proof_open(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let info = file.metadata()?;
+    anyhow::ensure!(
+        info.is_file() && (1..=PROOF_LIMIT).contains(&info.len()),
+        "PROOF_INPUT"
+    );
+    anyhow::ensure!(
+        proof_identity(&std::fs::symlink_metadata(path)?) == proof_identity(&info),
+        "PROOF_ROUTE"
+    );
+    Ok(file)
+}
+fn proof_hash(file: &mut std::fs::File, size: u64, end: Instant) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    gate_remaining(end)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut value = Sha256::new();
+    let mut total = 0;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        gate_remaining(end)?;
+        let limit = ((size - total + 1).min(buffer.len() as u64)) as usize;
+        let count = file.read(&mut buffer[..limit])?;
+        gate_remaining(end)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        anyhow::ensure!(total <= size, "PROOF_SIZE");
+        value.update(&buffer[..count]);
+    }
+    anyhow::ensure!(total == size, "PROOF_SIZE");
+    Ok(hex::encode(value.finalize()))
+}
+fn proof_source_bound(
+    file: &std::fs::File,
+    path: &Path,
+    expected: ProofFileIdentity,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        proof_identity(&file.metadata()?) == expected
+            && proof_identity(&std::fs::symlink_metadata(path)?) == expected,
+        "PROOF_SOURCE_DRIFT"
+    );
+    Ok(())
+}
+fn proof_copy(
+    source: &mut std::fs::File,
+    source_path: &Path,
+    source_identity: ProofFileIdentity,
+    destination: &Path,
+    end: Instant,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    gate_remaining(end)?;
+    proof_source_bound(source, source_path, source_identity)?;
+    source.seek(SeekFrom::Start(0))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)?;
+    let mut total = 0;
+    let mut value = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        gate_remaining(end)?;
+        let limit = ((source_identity.size - total + 1).min(buffer.len() as u64)) as usize;
+        let count = source.read(&mut buffer[..limit])?;
+        gate_remaining(end)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        anyhow::ensure!(total <= source_identity.size, "PROOF_SIZE");
+        output.write_all(&buffer[..count])?;
+        value.update(&buffer[..count]);
+    }
+    anyhow::ensure!(total == source_identity.size, "PROOF_SIZE");
+    output.sync_all()?;
+    use std::os::unix::fs::PermissionsExt;
+    output.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    drop(output);
+    proof_source_bound(source, source_path, source_identity)?;
+    let expected = hex::encode(value.finalize());
+    let mut copied = proof_open(destination)?;
+    let before = proof_identity(&copied.metadata()?);
+    anyhow::ensure!(
+        proof_hash(&mut copied, source_identity.size, end)? == expected,
+        "PROOF_COPY_HASH"
+    );
+    proof_source_bound(&copied, destination, before)?;
+    Ok(expected)
+}
+
+fn proof_control_record() -> RenameProof {
+    let mut record = proof_refused("baseline", &"1".repeat(32), &"a".repeat(64), 7);
+    record.fixture = "ready".into();
+    record.same_inode = true;
+    record.new_hash_matches = true;
+    record.current_exe_location = "old".into();
+    record.current_exe_errno = "NONE".into();
+    record.checksum_result = "ok".into();
+    record.checksum_matches = Some(true);
+    record.status_result = "ok".into();
+    record.status_checksum_matches = Some(true);
+    record
+}
+fn proof_control_actor(mode: &str) {
+    let mut bytes = proof_json(&proof_control_record());
+    if mode == "oversize" {
+        bytes.resize(1025, b' ');
+    }
+    use std::io::Write;
+    std::io::stderr().write_all(&bytes).unwrap();
+    if mode == "nonzero" {
+        std::process::exit(7);
+    }
+}
+fn fixture_proof_schema_controls() {
+    let record = proof_control_record();
+    assert!(proof_checksums_usable(&record));
+    let mut invalid_baseline = record.clone();
+    invalid_baseline.checksum_matches = Some(false);
+    assert!(!proof_checksums_usable(&invalid_baseline));
+    let raw = proof_json(&record);
+    let parse =
+        |raw: &[u8]| parse_proof_record(raw, "baseline", &"1".repeat(32), &"a".repeat(64), 7);
+    assert!(parse(&raw).is_ok());
+    let mut spaced = raw.clone();
+    spaced.insert(1, b' ');
+    assert!(parse(&spaced).is_err());
+    assert!(parse(&vec![b' '; 1025]).is_err());
+    assert!(parse(&raw[..raw.len() - 1]).is_err());
+    let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    for key in value
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove(&key);
+        assert!(parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    }
+    value["unknown"] = serde_json::json!(true);
+    assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    let duplicate = String::from_utf8(raw.clone())
+        .unwrap()
+        .replace("\"schema\":1", "\"schema\":1,\"schema\":1");
+    assert!(parse(duplicate.as_bytes()).is_err());
+    for field in ["same_inode", "new_hash_matches"] {
+        let mut bad = record.clone();
+        if field == "same_inode" {
+            bad.same_inode = false;
+        } else {
+            bad.new_hash_matches = false;
+        }
+        assert!(parse(&proof_json(&bad)).is_err());
+    }
+    let mut bad = record.clone();
+    bad.old_absent = true;
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.current_exe_location = "unavailable".into();
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.checksum_errno = "ENOENT".into();
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.status_checksum_matches = None;
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.request = "2".repeat(32);
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.source_sha256 = "b".repeat(64);
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.copied_bytes = 8;
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.case = "renamed".into();
+    assert!(parse(&proof_json(&bad)).is_err());
+    let mut bad = record.clone();
+    bad.checksum_result = "not_called".into();
+    bad.checksum_matches = None;
+    assert!(parse(&proof_json(&bad)).is_err());
+    let refused = proof_refused("baseline", &"1".repeat(32), &"a".repeat(64), 7);
+    assert_eq!(parse(&proof_json(&refused)).unwrap().fixture, "refused");
+    let bool_schema = String::from_utf8(raw.clone())
+        .unwrap()
+        .replace("\"schema\":1", "\"schema\":true");
+    assert!(parse(bool_schema.as_bytes()).is_err());
+    let mut renamed = record.clone();
+    renamed.case = "renamed".into();
+    renamed.old_absent = true;
+    renamed.current_exe_location = "old".into();
+    renamed.checksum_result = "error".into();
+    renamed.checksum_matches = None;
+    renamed.checksum_errno = "ENOENT".into();
+    renamed.status_result = "error".into();
+    renamed.status_checksum_matches = None;
+    renamed.status_errno = "ENOENT".into();
+    assert!(parse_proof_record(
+        &proof_json(&renamed),
+        "renamed",
+        &"1".repeat(32),
+        &"a".repeat(64),
+        7
+    )
+    .is_ok());
+}
+fn fixture_proof_copy_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-sibling");
+    proof_require_absent(&missing).unwrap();
+    std::os::unix::fs::symlink("absent-target", &missing).unwrap();
+    assert!(proof_require_absent(&missing).is_err());
+    assert!(std::fs::symlink_metadata(&missing)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let source = dir.path().join("source");
+    std::fs::write(&source, b"inert source bytes").unwrap();
+    let mut file = proof_open(&source).unwrap();
+    let identity = proof_identity(&file.metadata().unwrap());
+    let end = Instant::now() + Duration::from_secs(2);
+    let expected = proof_hash(&mut file, identity.size, end).unwrap();
+    let copy = dir.path().join("copy");
+    assert_eq!(
+        proof_copy(&mut file, &source, identity, &copy, end).unwrap(),
+        expected
+    );
+    let mut output = proof_open(&copy).unwrap();
+    assert_eq!(
+        proof_hash(&mut output, identity.size, end).unwrap(),
+        expected
+    );
+    assert!(proof_copy(&mut file, &source, identity, &copy, end).is_err());
+    let mut wrong = identity;
+    wrong.size -= 1;
+    assert!(proof_copy(&mut file, &source, wrong, &dir.path().join("wrong"), end).is_err());
+    assert!(proof_hash(&mut file, 1, end).is_err());
+    assert!(proof_hash(
+        &mut file,
+        identity.size,
+        Instant::now() - Duration::from_millis(1)
+    )
+    .is_err());
+    std::os::unix::fs::symlink(&source, dir.path().join("link")).unwrap();
+    assert!(proof_open(&dir.path().join("link")).is_err());
+    std::fs::write(&source, b"changed contents!").unwrap();
+    assert!(proof_source_bound(&file, &source, identity).is_err());
+}
+fn fixture_proof_owner_controls() {
+    for mode in ["good", "oversize", "nonzero"] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "darwin_process_scope::native_tests::darwin223_owned_signal_server",
+                "--nocapture",
+            ])
+            .env("QSH_DARWIN223_SIGNAL_SERVER", "/private-fixture-canary")
+            .env("QSH_DARWIN223_PROOF_CONTROL", mode)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+        owner.capture_stderr().unwrap();
+        let status = owner
+            .finish(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert!(owner.captured_stderr.is_none());
+        let parsed = if status.success() {
+            parse_proof_record(
+                &owner.stderr_bytes,
+                "baseline",
+                &"1".repeat(32),
+                &"a".repeat(64),
+                7,
+            )
+            .ok()
+        } else {
+            None
+        };
+        assert_eq!(parsed.is_some(), mode == "good");
+        assert!(owner.status.is_some());
+    }
+}
+
+fn rename_proof_actor() {
+    // This entry is selected in a fresh dedicated libtest process, before any
+    // code that can warm the production checksum cache.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| eprintln!("QSH223_PROOF FIXTURE_REFUSED")));
+    let case = std::env::var("QSH_DARWIN223_RENAME_PROOF").unwrap();
+    let request = std::env::var("QSH_DARWIN223_PROOF_REQUEST").unwrap();
+    let sha = std::env::var("QSH_DARWIN223_PROOF_SHA256").unwrap();
+    let size: u64 = std::env::var("QSH_DARWIN223_PROOF_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut record = proof_refused(&case, &request, &sha, size);
+    // Validate all output-bound strings before they can enter a record.
+    parse_proof_record(&proof_json(&record), &case, &request, &sha, size).unwrap();
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+            let old = std::path::PathBuf::from(
+                std::env::var_os("QSH_DARWIN223_PROOF_OLD")
+                    .ok_or_else(|| anyhow::anyhow!("PROOF_INPUT"))?,
+            );
+            let new = old.with_file_name("renamed-image");
+            anyhow::ensure!(old.is_absolute(), "PROOF_INPUT");
+            proof_require_absent(&new)?;
+            let millis: u64 = std::env::var("QSH_DARWIN223_PROOF_MILLIS")?.parse()?;
+            anyhow::ensure!((1..=10_000).contains(&millis), "PROOF_DEADLINE");
+            let end = Instant::now() + Duration::from_millis(millis);
+            let mut image = proof_open(&old)?;
+            let before = proof_identity(&image.metadata()?);
+            anyhow::ensure!(
+                before.size == size && proof_hash(&mut image, size, end)? == sha,
+                "PROOF_SOURCE"
+            );
+            proof_source_bound(&image, &old, before)?;
+            let launched = std::env::current_exe()?;
+            let launched_identity = proof_identity(&std::fs::metadata(&launched)?);
+            anyhow::ensure!(
+                (launched_identity.dev, launched_identity.ino) == (before.dev, before.ino),
+                "PROOF_LAUNCH"
+            );
+            if case == "renamed" {
+                gate_remaining(end)?;
+                std::fs::rename(&old, &new)?;
+            }
+            // Both production calls below are deliberately AFTER the rename.
+            let selected = if case == "renamed" { &new } else { &old };
+            let after = proof_identity(&std::fs::symlink_metadata(selected)?);
+            record.same_inode = (after.dev, after.ino) == (before.dev, before.ino);
+            record.old_absent = match std::fs::symlink_metadata(&old) {
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            };
+            record.new_hash_matches = proof_hash(&mut image, size, end)? == sha;
+            proof_source_bound(&image, selected, after)?;
+            anyhow::ensure!(
+                record.same_inode
+                    && record.new_hash_matches
+                    && record.old_absent == (case == "renamed"),
+                "PROOF_PRECONDITION"
+            );
+            match std::env::current_exe() {
+                Ok(path) => {
+                    record.current_exe_location = if path == old {
+                        "old"
+                    } else if path == new {
+                        "new"
+                    } else {
+                        "other"
+                    }
+                    .into();
+                    record.current_exe_errno = "NONE".into();
+                }
+                Err(error) => {
+                    record.current_exe_location = "unavailable".into();
+                    record.current_exe_errno = proof_errno(&error.into()).into();
+                }
+            }
+            gate_remaining(end)?;
+            match crate::state::self_checksum() {
+                Ok(value) => {
+                    record.checksum_result = "ok".into();
+                    record.checksum_matches = Some(value == sha);
+                    record.checksum_errno = "NONE".into();
+                }
+                Err(error) => {
+                    record.checksum_result = "error".into();
+                    record.checksum_matches = None;
+                    record.checksum_errno = proof_errno(&error).into();
+                }
+            }
+            gate_remaining(end)?;
+            match crate::transport_daemon::transport_status_response(&[], 0, None) {
+                Ok(value) => {
+                    record.status_result = "ok".into();
+                    record.status_checksum_matches = Some(value.checksum == sha);
+                    record.status_errno = "NONE".into();
+                }
+                Err(error) => {
+                    record.status_result = "error".into();
+                    record.status_checksum_matches = None;
+                    record.status_errno = proof_errno(&error).into();
+                }
+            }
+            gate_remaining(end)?;
+            anyhow::ensure!(
+                proof_hash(&mut image, size, end)? == sha,
+                "PROOF_FINAL_HASH"
+            );
+            proof_source_bound(&image, selected, after)?;
+            record.fixture = "ready".into();
+            Ok(())
+        }));
+    if !matches!(result, Ok(Ok(()))) {
+        record.fixture = "refused".into();
+    }
+    std::panic::set_hook(previous);
+    let raw = proof_json(&record);
+    assert!(raw.len() <= 1024);
+    use std::io::Write;
+    std::io::stderr().write_all(&raw).unwrap();
+}
+fn proof_checksums_usable(record: &RenameProof) -> bool {
+    record.checksum_result == "ok"
+        && record.checksum_matches == Some(true)
+        && record.status_result == "ok"
+        && record.status_checksum_matches == Some(true)
+}
+fn run_rename_proof() {
+    eprintln!("darwin223 original_update_reached=false");
+    let end = Instant::now() + Duration::from_secs(30);
+    let source_path = std::env::current_exe().unwrap();
+    let mut source = proof_open(&source_path).expect("FIXTURE_REFUSED");
+    let source_identity = proof_identity(&source.metadata().unwrap());
+    let source_sha = proof_hash(&mut source, source_identity.size, end).expect("FIXTURE_REFUSED");
+    let baseline_directory = tempfile::tempdir().unwrap();
+    let rename_directory = tempfile::tempdir().unwrap();
+    let baseline_path = baseline_directory.path().join("proof-image");
+    let rename_path = rename_directory.path().join("proof-image");
+    // Both copies and the original descriptor stay owned until both children settle.
+    for path in [&baseline_path, &rename_path] {
+        assert_eq!(
+            proof_copy(&mut source, &source_path, source_identity, path, end)
+                .expect("FIXTURE_REFUSED"),
+            source_sha
+        );
+    }
+    let mut records = Vec::new();
+    let mut requests = Vec::new();
+    for (case, path) in [("baseline", &baseline_path), ("renamed", &rename_path)] {
+        gate_remaining(end).expect("FIXTURE_REFUSED");
+        let request = hex::encode(&transport::handshake::generate_keypair().public[..16]);
+        assert!(!requests.contains(&request));
+        requests.push(request.clone());
+        let actor_end = end.min(Instant::now() + Duration::from_secs(10));
+        let millis = gate_remaining(actor_end)
+            .expect("FIXTURE_REFUSED")
+            .as_millis()
+            .min(10_000);
+        assert!(millis > 0);
+        let mut command = Command::new(path);
+        command
+            .args([
+                "--exact",
+                "darwin_process_scope::native_tests::darwin223_owned_signal_server",
+                "--nocapture",
+            ])
+            .env("QSH_DARWIN223_SIGNAL_SERVER", path.parent().unwrap())
+            .env("QSH_DARWIN223_RENAME_PROOF", case)
+            .env("QSH_DARWIN223_PROOF_REQUEST", &request)
+            .env("QSH_DARWIN223_PROOF_SHA256", &source_sha)
+            .env(
+                "QSH_DARWIN223_PROOF_BYTES",
+                source_identity.size.to_string(),
+            )
+            .env("QSH_DARWIN223_PROOF_OLD", path)
+            .env("QSH_DARWIN223_PROOF_MILLIS", millis.to_string())
+            .env("HISTFILE", "/dev/null")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        gate_remaining(actor_end).expect("FIXTURE_REFUSED");
+        let mut owner = OwnedCommand::spawn(&mut command).expect("FIXTURE_REFUSED");
+        owner.capture_stderr().expect("FIXTURE_REFUSED");
+        let status = owner.finish(actor_end).expect("FIXTURE_REFUSED");
+        gate_remaining(actor_end).expect("FIXTURE_REFUSED");
+        assert!(
+            status.success() && owner.status.is_some() && owner.captured_stderr.is_none(),
+            "FIXTURE_REFUSED"
+        );
+        let record = parse_proof_record(
+            &owner.stderr_bytes,
+            case,
+            &request,
+            &source_sha,
+            source_identity.size,
+        )
+        .expect("FIXTURE_REFUSED");
+        records.push(record);
+        // No success is inferred from failure-only Drop rescue.
+        drop(owner);
+    }
+    proof_source_bound(&source, &source_path, source_identity).expect("FIXTURE_REFUSED");
+    gate_remaining(end).expect("FIXTURE_REFUSED");
+    for record in &records {
+        eprint!(
+            "darwin223 rename_proof={}",
+            std::str::from_utf8(&proof_json(record)).unwrap()
+        );
+    }
+    assert!(
+        records.iter().all(|record| record.fixture == "ready"),
+        "FIXTURE_REFUSED"
+    );
+    assert!(
+        proof_checksums_usable(&records[0]),
+        "FIXTURE_REFUSED_BASELINE"
+    );
+    assert!(
+        proof_checksums_usable(&records[1]),
+        "Darwin rename checksum/STATUS regression"
+    );
+    eprintln!("darwin223 original_update_reached=true");
+}
+
 fn bootstrap_failure_control(mode: &str) {
     let previous = bootstrap_hook();
     let result = std::panic::catch_unwind(|| {
@@ -2101,6 +2819,14 @@ fn darwin223_owned_signal_server() {
         return;
     };
     let directory = std::path::PathBuf::from(directory);
+    if std::env::var_os("QSH_DARWIN223_RENAME_PROOF").is_some() {
+        rename_proof_actor();
+        return;
+    }
+    if let Ok(mode) = std::env::var("QSH_DARWIN223_PROOF_CONTROL") {
+        proof_control_actor(&mode);
+        return;
+    }
     if let Ok(mode) = std::env::var("QSH_DARWIN223_BOOTSTRAP_CONTROL") {
         bootstrap_failure_control(&mode);
     }
@@ -2112,6 +2838,9 @@ fn darwin223_owned_signal_server() {
         fixture_command_controls();
         fixture_stderr_controls();
         fixture_diagnostic_controls();
+        fixture_proof_schema_controls();
+        fixture_proof_copy_controls();
+        fixture_proof_owner_controls();
         fixture_gate_controls();
         fixture_socket_publication_controls();
         return;
@@ -2303,13 +3032,23 @@ fn hash_path(path: &Path) -> [u8; 32] {
     }
     hash.finalize().into()
 }
-fn daemon_status(path: &Path) -> Option<crate::control::StatusResponse> {
+fn daemon_status_observation(
+    path: &Path,
+) -> (Option<crate::control::StatusResponse>, &'static str) {
     match crate::control::client_request(path, &crate::control::ControlRequest::Status) {
         Ok(crate::control::ControlReply::Answered(line)) => {
-            crate::control::StatusResponse::from_line(&line).ok()
+            match crate::control::StatusResponse::from_line(&line) {
+                Ok(value) => (Some(value), "VALID_STATUS"),
+                Err(_) => (None, "PARSE_REFUSED"),
+            }
         }
-        _ => None,
+        Ok(crate::control::ControlReply::NoDaemon) => (None, "NO_DAEMON"),
+        Ok(crate::control::ControlReply::TimedOut) => (None, "TIMED_OUT"),
+        Err(_) => (None, "REQUEST_ERROR"),
     }
+}
+fn daemon_status(path: &Path) -> Option<crate::control::StatusResponse> {
+    daemon_status_observation(path).0
 }
 struct DirectDaemonGuard {
     owner: OwnedCommand,
@@ -2347,12 +3086,13 @@ impl DirectDaemonGuard {
                     if record.is_some_and(|v| v.1 != "UNKNOWN") { "TYPED" } else { "UNKNOWN" }
                 );
             }
-            if daemon_status(&self.socket).is_some() {
+            let (status, control_family) = daemon_status_observation(&self.socket);
+            if status.is_some() {
                 break;
             }
             assert!(
                 Instant::now() < end,
-                "owned bootstrap STATUS observation deadline"
+                "owned bootstrap STATUS observation deadline control={control_family}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2848,6 +3588,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         UpdateOffer, UpdateResult, CONTROL_STREAM, FIRST_CHANNEL_STREAM, UPDATE_STREAM,
     };
     prepare().expect("production runtime admission");
+    run_rename_proof();
     let original = std::path::PathBuf::from(
         std::env::var_os("QSH_DARWIN223_DAEMON").expect("required source-bound Cargo daemon path"),
     );
