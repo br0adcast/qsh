@@ -24,7 +24,7 @@ RUNTIME_MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','observer',
     'reference_loader','package_state','module_install','first_activation',
-    'consumer_activation','phase'))+('stop_guard.py',)
+    'consumer_activation','phase','rpm_query'))+('stop_guard.py',)
 TRUST={'provider_version':'fixture','manifest_sha256':'a'*64,'pp_sha256':'b'*64}
 
 
@@ -273,21 +273,45 @@ else:
             expected={name:hashlib.sha256((SOURCE/name).read_bytes()).hexdigest() for name in RUNTIME_MODULES}
             expected.update({path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (pp,artifact,pam)})
             out=base/'payload';inventory=builder.assemble_payload(SOURCE,pp,artifact,pam,expected,out,1000000000)
-            self.assertEqual(len(inventory),24)
+            self.assertEqual(len(expected),24)
+            self.assertEqual(len(inventory),25)
             installed=out/'usr/libexec/qshd-selinux'
-            poison=base/'poison';poison.mkdir();(poison/'qshd_selinux_consumer_activation.py').write_text('raise AssertionError("source fallback")')
+            poison=base/'poison';poison.mkdir()
+            for name in ('qshd_selinux_consumer_activation.py','qshd_selinux_rpm_query.py'):
+                (poison/name).write_text('raise AssertionError("source fallback")')
             code="""import importlib.util,sys,pathlib
 from unittest.mock import patch
 root=pathlib.Path(sys.argv[1]);mode=sys.argv[2]
 # This is a real module loaded from the delivered file, not a fabricated module.
 spec=importlib.util.spec_from_file_location('qshd_selinux_phase',root/'qshd_selinux_phase.py')
 phase=importlib.util.module_from_spec(spec);sys.modules[spec.name]=phase;spec.loader.exec_module(phase)
+if mode=='preloaded-query':
+ finder=phase._FixedFinder(root);sys.meta_path.insert(0,finder)
+ import qshd_selinux_rpm_query as query
+ assert pathlib.Path(query.__file__).parent==root
+ # Retain the actual query module alone, so this specifically proves its guard.
+ for name in list(sys.modules):
+  if name in phase._MODULES and name not in ('qshd_selinux_phase','qshd_selinux_rpm_query'):
+   del sys.modules[name]
+ sys.meta_path.remove(finder)
+ try:phase._install_loader()
+ except phase.PhaseError as error:assert str(error)=='MODULE_PRESENT'
+ else:raise AssertionError('preloaded delivered query admitted')
+ raise SystemExit(0)
 before=list(sys.path);phase._install_loader();assert before==sys.path
+if mode=='missing-query':
+ try:import qshd_selinux_rpm_query
+ except (ModuleNotFoundError,FileNotFoundError):pass
+ else:raise AssertionError('missing delivered query used fallback')
+ assert 'qshd_selinux_rpm_query' not in sys.modules
+ raise SystemExit(0)
 import qshd_selinux_phase
 assert qshd_selinux_phase is phase
 import qshd_selinux_consumer_activation as consumer
 import qshd_selinux_first_activation as first
 import qshd_selinux_package_state as package
+import qshd_selinux_rpm_query as query
+assert pathlib.Path(query.__file__).parent==root
 from qshd_selinux_activation import Activation,TrustedArtifact,ModuleIdentity,Completion,ContextBinding
 state=phase._PHASES[mode];trust=TrustedArtifact('fixture','a'*64,'b'*64)
 completion=Completion('normal-install-reload-v1',trust.pp_sha256,ContextBinding('d'*64,'e'*64)) if state=='COMPLETE' else None
@@ -309,16 +333,18 @@ for name,module in list(sys.modules.items()):
 assert str(root) not in sys.path
 """
             env=os.environ|dict(PYTHONPATH=str(poison),HOME=directory,XDG_CONFIG_HOME=directory,XDG_CACHE_HOME=directory,HISTFILE='/dev/null')
-            for mode in PHASES:
+            for mode in (*PHASES,'preloaded-query','missing-query'):
+                if mode=='missing-query':
+                    (installed/'qshd_selinux_rpm_query.py').unlink()
                 with self.subTest(mode=mode):
                     result=subprocess.run([sys.executable,'-I','-B','-c',code,str(installed),mode],cwd=poison,env=env,capture_output=True,timeout=10)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,b'')
 
-    def test_exact_offline_payload_twenty_modules_twentyfour_files_no_renderer(self):
+    def test_exact_offline_payload_twenty_one_modules_twentyfive_files_no_renderer(self):
         spec=importlib.util.spec_from_file_location('phase_payload_builder',SOURCE/'assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
-        self.assertEqual(set(builder.MODULES),set(RUNTIME_MODULES));self.assertEqual(len(builder.MODULES),20)
+        self.assertEqual(set(builder.MODULES),set(RUNTIME_MODULES));self.assertEqual(len(builder.MODULES),21)
         with tempfile.TemporaryDirectory() as directory:
             base=Path(directory);source=base/'source';source.mkdir()
             for name in RUNTIME_MODULES:shutil.copy2(SOURCE/name,source/name)
@@ -329,7 +355,7 @@ assert str(root) not in sys.path
             expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in RUNTIME_MODULES}
             expected.update({path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (pp,artifact,pam)})
             out=base/'out';inventory=builder.assemble_payload(source,pp,artifact,pam,expected,out,1000000000)
-            self.assertEqual(len(inventory),24)
+            self.assertEqual(len(inventory),25)
             actual={str(path.relative_to(out)) for path in out.rglob('*') if path.is_file()}
             self.assertEqual(actual,{'usr/libexec/qshd-selinux/'+name for name in RUNTIME_MODULES}|{
                 'usr/share/qshd-selinux/'+name for name in ('qshd.pp','artifact.json','qshd.fedora-selinux','reference.json')})

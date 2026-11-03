@@ -22,7 +22,7 @@ _MODULES=tuple('qshd_selinux_'+name for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','observer',
     'reference_loader','package_state','module_install','first_activation',
-    'consumer_activation','phase'))+('stop_guard',)
+    'consumer_activation','phase','rpm_query'))+('stop_guard',)
 _PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
          'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE'}
 _SCRIPT='/usr/libexec/qshd-selinux/qshd_selinux_phase.py'

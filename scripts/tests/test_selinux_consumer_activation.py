@@ -804,4 +804,266 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
         self.assertEqual(self.module_calls,[]);self.assertNotIn('module enter',self.b.events)
 
 
+class ConsumerEraseTests(unittest.TestCase):
+    coordinator=ConsumerTests.coordinator
+    inventory=ConsumerTests.inventory
+    modules=OwnedEraseAdmissionTests.modules
+
+    def setUp(self):
+        import qshd_selinux_rpm_query as rpm
+        OwnedEraseAdmissionTests.setUp(self)
+        self.b.installed_files();(self.b.root/'run/qshd').rmdir()
+        for name in ('usr/share/qshd','usr/lib/sysimage/rpm'):
+            (self.b.root/name).mkdir(parents=True,exist_ok=True)
+        for name in ('usr/share','usr/share/qshd','usr/lib/sysimage','usr/lib/sysimage/rpm'):
+            (self.b.root/name).chmod(0o755)
+        (self.b.root/'usr/bin/rpm').write_bytes(b'inert fixture tool; never executed')
+        (self.b.root/'usr/bin/rpm').chmod(0o755)
+        (self.b.root/'usr/lib/sysimage/rpm/rpmdb.sqlite').write_bytes(b'opaque fixture database')
+        (self.b.root/'usr/lib/sysimage/rpm/rpmdb.sqlite').chmod(0o644)
+        self.authority=rpm.ConsumerRpmAuthority(1,rpm.RpmPackage('qshd',0,'0.6.0','1','x86_64'),tuple(
+            rpm.RpmFileAuthority(path,len(data),hashlib.sha256(data).hexdigest(),mode,'root','root',flags)
+            for path,data,mode,flags in (
+                ('/etc/pam.d/qshd',self.b.expected_pam,0o100644,17),
+                ('/usr/bin/qshd',(self.b.root/'usr/bin/qshd').read_bytes(),0o100755,0))))
+        self.manifest=self.b.root/'usr/share/qshd/consumer-rpm.json'
+        self.manifest.write_bytes(canonical(asdict(self.authority))+b'\n');self.manifest.chmod(0o644)
+        self.query_calls=[];outer=self
+        class Owner:
+            _last=None
+            def _run(owner,argv,cwd,*,deadline):
+                from qshd_selinux_process import _Outcome,_Streams
+                outer.b.point('rpm command');outer.query_calls.append((argv,deadline))
+                package=outer.authority.package
+                header=('P\t'+json.dumps(package.name)+'\t'+str(package.epoch)+'\t'+json.dumps(package.version)+'\t'+json.dumps(package.release)+'\t'+json.dumps(package.arch)+'\n').encode()
+                if '-qf' in argv:
+                    record=next(f for f in outer.authority.files if f.path==argv[-1])
+                    header+=b'A\t8\n'+('F\t'+json.dumps(record.path)+f'\t{record.size}\t{record.mode}\t{record.flags}\t"root"\t"root"\t'+json.dumps(record.sha256)+'\t""\t0\nE\n').encode()
+                owner._last=_Outcome(b'',b'',0,None,True)
+                if hasattr(outer,'query_change'):header=outer.query_change(header,argv)
+                return _Streams(header,b'')
+        self.b.consumer_authority=lambda deadline:self.b.track('authority',rpm.ConsumerAuthorityReader(_root=self.b.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.b.now).inspection(deadline=deadline))
+        self.b.rpm_query=lambda deadline:self.b.track('rpm',rpm.RpmQuery(_root=self.b.root,_uid=os.getuid(),_owner=Owner(),_clock=lambda:self.b.now).inspection(deadline=deadline))
+        self.b.erase_files=self.erase_files
+        self.b.window=self.window
+
+    @contextmanager
+    def window(self):
+        self.assertTrue(self.b.busy(self.b.common/'selinux-package.lock'))
+        self.assertTrue(self.b.busy(self.b.common/'selinux-activation/lock'))
+        self.assertNotIn('window',self.b.active)
+        with self.b.track('window',_value_scope(True)) as value:yield value
+
+    @contextmanager
+    def erase_files(self,expected_pam):
+        outer=self
+        class Api:
+            @contextmanager
+            def file_defaults(self):yield self
+            def lookup(self,path,kind):return next(row[2] for row in files._PATHS if row[0]==path)
+            def file_context(self,fd):
+                physical=Path(os.readlink('/proc/self/fd/'+str(fd)))
+                return self.lookup('/'+str(physical.relative_to(outer.b.root)),None)
+        with self.b.track('erase files',files._testing(expected_pam,self.b.root,Api(),os.getuid()).erase_inspection()) as value:
+            # Real filesystem reader validates this unprivileged fixture UID.
+            # Map only fixture ownership to the root-owned production evidence.
+            class View:
+                original=None
+                seen=None
+                def capture(view):
+                    outer.b.point('files capture');view.original=value.capture()
+                    view.seen=replace(view.original,paths=tuple(replace(item,metadata=(item.metadata[:2]+(0,0)+item.metadata[4:])) if item.metadata is not None else item for item in view.original.paths))
+                    if hasattr(outer,'view_change'):view.seen=outer.view_change(view.seen)
+                    return view.seen
+                def recheck(view,observed):
+                    assert observed is view.seen
+                    outer.b.point('files recheck');value.recheck(view.original)
+            yield View()
+
+    def run_erase(self):return self.coordinator().invalidate_installed_consumer_erase(deadline=1000)
+
+    def test_complete_and_pending_canonical_erase_with_absent_runtime(self):
+        for pending in (False,True):
+            if pending:self.b.matching_pending()
+            old=self.b.record();self.b.events=[];self.query_calls=[];self.module_calls=[]
+            original=slot._Writer.begin_pending;tokens=[]
+            def publish(writer,document,token):
+                self.assertIs(token,writer._initial);tokens.append(token)
+                self.assertFalse({'window','erase files','module','registry'} & self.b.active)
+                self.assertEqual(self.b.events.count('files recheck'),1)
+                self.assertEqual(len(self.query_calls),6)
+                return original(writer,document,token)
+            with patch.object(slot._Writer,'begin_pending',publish):result=self.run_erase()
+            self.assertEqual(len(tokens),1)
+            self.assertEqual(result.state,'PENDING');self.assertNotEqual(result.operation_id,old.operation_id)
+            self.assertEqual(result,self.b.record());self.assertEqual(len(self.query_calls),6)
+            self.assertEqual(self.b.events.count('package enter'),1)
+            self.assertEqual(self.b.events.count('activation enter'),1)
+            self.assertEqual(self.b.events.count('window enter'),2)
+            self.assertLess(self.b.events.index('module exit'),self.b.events.index('erase files enter'))
+            self.assertLess(self.b.events.index('erase files exit'),self.b.events.index('publish PENDING'))
+            self.assertFalse(self.b.active);self.assertFalse((self.b.root/'run/qshd').exists())
+            self.assertNotIn('policy child',self.b.events);self.assertEqual(self.b.loads,0)
+            self.assertEqual(self.module_calls,[('list',330),('extract',330),('list',330),('extract',330)])
+            self.assertEqual(self.b.events[-1],'package exit')
+
+    def test_safe_present_runtime_and_public_entrypoint(self):
+        (self.b.root/'run/qshd').mkdir(mode=0o700)
+        with patch.object(consumer,'_Production',return_value=self.b) as factory:
+            self.assertEqual(consumer.invalidate_installed_consumer_erase(deadline=time.monotonic()+220).state,'PENDING')
+        factory.assert_called_once_with()
+
+    def test_manifest_product_predicates_refuse_before_query_or_write(self):
+        for mode in ('arch','binary-mode','binary-flags','binary-size','pam-mode','pam-flags','pam-size','pam-hash','owner'):
+            with self.subTest(mode=mode):
+                authority=self.authority
+                if mode=='arch':authority=replace(authority,package=replace(authority.package,arch='other'))
+                else:
+                    field,value={'binary-mode':('mode',0o100700),'binary-flags':('flags',1),
+                        'binary-size':('size',0),'pam-mode':('mode',0o100600),'pam-flags':('flags',1),
+                        'pam-size':('size',1),'pam-hash':('sha256','a'*64),'owner':('group','foreign')}[mode]
+                    path='/usr/bin/qshd' if mode.startswith('binary') else '/etc/pam.d/qshd'
+                    authority=replace(authority,files=tuple(replace(item,**{field:value}) if item.path==path else item for item in authority.files))
+                self.manifest.write_bytes(canonical(asdict(authority))+b'\n')
+                initial=self.b.record();self.b.events=[]
+                with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                self.assertEqual(self.b.record(),initial);self.assertNotIn('rpm command',self.b.events)
+                self.assertNotIn('activation enter',self.b.events);self.assertFalse(self.b.active)
+
+    def test_selected_live_metadata_and_phase_join_is_required(self):
+        for mode in ('phase','gid','mode','size','pam-hash'):
+            with self.subTest(mode=mode):
+                def change(view):
+                    if mode=='phase':return replace(view,phase='managed-prestart')
+                    result=[]
+                    for item in view.paths:
+                        if item.path=='/etc/pam.d/qshd':
+                            if mode=='pam-hash':item=replace(item,pam_sha256='a'*64)
+                            else:
+                                index={'gid':3,'mode':4,'size':6}[mode];values=list(item.metadata);values[index]+=1
+                                item=replace(item,metadata=tuple(values))
+                        result.append(item)
+                    return replace(view,paths=tuple(result))
+                self.view_change=change;before=self.b.record();self.b.events=[]
+                with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                self.assertEqual(self.b.record(),before);self.assertNotIn('publish COMPLETE',self.b.events)
+                self.assertFalse(self.b.active)
+        del self.view_change
+
+    def test_final_query_guard_and_files_window_close_precede_mutation(self):
+        for mode in ('rpm-final','guard-final','files recheck','erase files exit','final-window'):
+            with self.subTest(mode=mode):
+                self.b.events=[];before=self.b.record();point=self.b.point;counts={}
+                def failure(name):
+                    point(name);counts[name]=counts.get(name,0)+1
+                    if ((mode=='rpm-final' and name=='rpm command' and counts[name]==4)
+                            or (mode=='guard-final' and name=='guard' and counts[name]==2)
+                            or (mode=='final-window' and name=='window exit' and counts[name]==2)
+                            or name==mode):raise RuntimeError('controlled before-publication failure')
+                self.b.point=failure
+                try:
+                    with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                    self.assertEqual(self.b.record(),before);self.assertFalse(self.b.active)
+                finally:self.b.point=point
+
+    def test_query_evr_foreign_state_and_errors_refuse_before_write(self):
+        for mode in ('evr','foreign','state','malformed'):
+            with self.subTest(mode=mode):
+                def change(header,argv):
+                    if mode=='evr':return header.replace(b'"0.6.0"',b'"different"')
+                    if mode=='foreign':return header.replace(b'"qshd"',b'"foreign"')
+                    if mode=='state' and '-qf' in argv:return header.replace(b'\t0\nE\n',b'\t1\nE\n')
+                    return b'invalid' if mode=='malformed' else header
+                self.query_change=change;before=self.b.record();self.b.events=[]
+                with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                self.assertEqual(self.b.record(),before);self.assertNotIn('publish PENDING',self.b.events)
+                self.assertFalse(self.b.active)
+        del self.query_change
+
+    def test_manifest_route_and_live_pam_refusals_preserve_slot(self):
+        original=self.manifest.read_bytes();pam=self.b.root/'etc/pam.d/qshd'
+        for mode in ('missing','writable','malformed','custom-pam','missing-binary'):
+            with self.subTest(mode=mode):
+                before=self.b.record();binary=self.b.root/'usr/bin/qshd';binary_bytes=binary.read_bytes()
+                if mode=='missing':self.manifest.unlink()
+                elif mode=='writable':self.manifest.chmod(0o666)
+                elif mode=='malformed':self.manifest.write_bytes(b'{bad')
+                elif mode=='custom-pam':pam.write_bytes(b'custom unsupported PAM')
+                else:binary.unlink()
+                try:
+                    with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                    self.assertEqual(self.b.record(),before);self.assertFalse(self.b.active)
+                finally:
+                    self.manifest.write_bytes(original);self.manifest.chmod(0o644)
+                    pam.write_bytes(self.b.expected_pam);pam.chmod(0o644)
+                    if not binary.exists():binary.write_bytes(binary_bytes);binary.chmod(0o755)
+
+    def test_owned_admission_guard_and_stale_slot_refuse_without_publication(self):
+        for mode in ('journal','module','guard','slot-drift'):
+            with self.subTest(mode=mode):
+                before=self.b.record();self.b.events=[];point=self.b.point
+                journal=self.b.common/'selinux-contexts/journal'
+                if mode=='journal':journal.write_bytes(b'unknown preserve');journal.chmod(0o600)
+                elif mode=='module':self.module_listing=b'100 base cil\n'
+                elif mode=='guard':self.b.failure='guard'
+                else:
+                    def drift(name):
+                        point(name)
+                        if name=='erase files exit':
+                            path=self.b.common/'selinux-activation/activation.json'
+                            path.write_bytes(canonical(asdict(replace(before,operation_id='e'*32))))
+                    self.b.point=drift
+                try:
+                    expected=slot.OutcomeUncertain if mode=='slot-drift' else consumer.CoordinatorError
+                    with self.assertRaises(expected):self.run_erase()
+                    self.assertNotIn('publish COMPLETE',self.b.events)
+                    if mode!='slot-drift':self.assertEqual(self.b.record(),before)
+                    self.assertFalse(self.b.active)
+                finally:
+                    if journal.exists():self.assertEqual(journal.read_bytes(),b'unknown preserve');journal.unlink()
+                    self.module_listing=b'100 base cil\n400 qshd pp\n';self.b.failure=None;self.b.point=point
+
+    def test_post_attempt_failures_are_uncertain(self):
+        for mode in ('begin','readback','authority exit','references exit','rpm exit','package exit','late','manifest-final-recheck'):
+            with self.subTest(mode=mode):
+                self.b.events=[];point=self.b.point;original=slot._Writer.begin_pending
+                def failure(name):
+                    point(name)
+                    if mode=='late' and name=='package exit':self.b.now=340
+                    if mode=='manifest-final-recheck' and name=='rpm exit':self.manifest.write_bytes(self.manifest.read_bytes()+b' ')
+                self.b.point=failure
+                self.b.failure=mode if mode.endswith(' exit') else None
+                def begin(writer,*args):
+                    if mode=='begin':raise slot.SlotError('controlled before write')
+                    result=original(writer,*args)
+                    if mode=='readback':
+                        path=self.b.common/'selinux-activation/activation.json';record=self.b.record()
+                        path.write_bytes(canonical(asdict(replace(record,operation_id='f'*32))))
+                    return result
+                try:
+                    with patch.object(slot._Writer,'begin_pending',begin),self.assertRaises(slot.OutcomeUncertain):self.run_erase()
+                    self.assertFalse(self.b.active)
+                finally:
+                    self.b.point=point;self.b.failure=None;self.b.now=100
+                    self.manifest.write_bytes(canonical(asdict(self.authority))+b'\n')
+
+    def test_deadline_reserves_single_use_and_operation_reuse_refuse(self):
+        for stage,now in (('rpm enter',170),('activation enter',210),('module exit',280),('erase files exit',330)):
+            with self.subTest(stage=stage):
+                point=self.b.point;before=self.b.record();self.b.events=[]
+                def late(name):
+                    point(name)
+                    if name==stage:self.b.now=now
+                self.b.point=late
+                try:
+                    with self.assertRaises(consumer.CoordinatorError):self.run_erase()
+                    self.assertEqual(self.b.record(),before)
+                finally:self.b.now=100;self.b.point=point
+        item=self.coordinator();self.assertEqual(item.invalidate_installed_consumer_erase(deadline=1000).state,'PENDING')
+        with self.assertRaises(consumer.CoordinatorError):item.invalidate_installed_consumer_erase(deadline=1000)
+        before=self.b.record()
+        with patch.object(consumer.secrets,'token_hex',return_value=before.operation_id),self.assertRaises(consumer.CoordinatorError):self.run_erase()
+        self.assertEqual(self.b.record(),before)
+
+
 if __name__=='__main__':unittest.main()
