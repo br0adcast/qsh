@@ -46,6 +46,266 @@ class FileTests(unittest.TestCase):
         self.assertEqual(len(os.listdir('/proc/self/fd')),self.fds)
         self.tmp.cleanup()
     def files(self):return m._testing(PAM,self.root,self.api,os.getuid())
+    def test_erase_absent_runtime_preserves_startup_refusal_and_absent_children(self):
+        (self.root/'run/qshd').rmdir()
+        before=set(self.root.rglob('*'))
+        files=self.files()
+        with self.assertRaises(m.FilesError):
+            with files.inspection() as lease:
+                lease.capture()
+        self.api.lookups.clear()
+        with files.erase_inspection() as lease:
+            result=lease.capture()
+            self.assertEqual(result.phase,'consumer-erase')
+            self.assertEqual(tuple(row.path for row in result.paths),tuple(row[0] for row in m._PATHS))
+            self.assertTrue(all(not row.present for row in result.paths[-3:]))
+            lease.recheck(result)
+        self.assertEqual(set(self.root.rglob('*')),before)
+        self.assertIn(('/run/qshd',m.stat.S_IFDIR),self.api.lookups)
+        self.assertIn(('/run/qshd/helper-status.sock.lock',m.stat.S_IFREG),self.api.lookups)
+        expected=[(path,kind) for path,kind,context,required,role in m._PATHS if context is not None]
+        self.assertEqual(self.api.lookups,expected*2)
+
+    def test_erase_present_runtime_matches_every_startup_path_field(self):
+        files=self.files()
+        with files.inspection() as lease:
+            startup=lease.capture()
+            lease.recheck(startup)
+        with files.erase_inspection() as lease:
+            erase=lease.capture()
+            lease.recheck(erase)
+        self.assertEqual(startup.phase,'managed-prestart')
+        self.assertEqual(erase.phase,'consumer-erase')
+        self.assertEqual(startup.paths,erase.paths)
+        with self.assertRaises(Exception):
+            erase.phase='managed-prestart'
+
+    def test_erase_runtime_appearance_disappearance_and_replacement_refuse(self):
+        runtime=self.root/'run/qshd'
+        for change in ('appearance','disappearance','replacement'):
+            if change=='appearance':
+                runtime.rmdir()
+            held=runtime.with_name('held')
+            try:
+                with self.subTest(change=change),self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        result=lease.capture()
+                        if change=='appearance':
+                            runtime.mkdir(mode=0o700)
+                        elif change=='disappearance':
+                            runtime.rmdir()
+                        else:
+                            runtime.rename(held)
+                            runtime.mkdir(mode=0o700)
+                        lease.recheck(result)
+            finally:
+                if held.exists():
+                    runtime.rmdir()
+                    held.rename(runtime)
+                elif not runtime.exists():
+                    runtime.mkdir(mode=0o700)
+
+    def test_erase_runtime_mode_uid_type_and_dangling_link_refuse(self):
+        runtime=self.root/'run/qshd'
+        parent=self.root/'run'
+        parent.chmod(0o000)
+        try:
+            with self.assertRaises(m.FilesError):
+                with self.files().erase_inspection() as lease:
+                    lease.capture()
+        finally:
+            parent.chmod(0o755)
+        runtime.chmod(0o755)
+        with self.assertRaises(m.FilesError):
+            with self.files().erase_inspection() as lease:
+                lease.capture()
+        runtime.chmod(0o700)
+        native_fstat=os.fstat
+        def wrong_uid(fd):
+            info=native_fstat(fd)
+            if os.readlink('/proc/self/fd/'+str(fd))==str(runtime):
+                values=list(info)
+                values[4]=info.st_uid+1
+                return os.stat_result(values)
+            return info
+        with patch.object(m.os,'fstat',side_effect=wrong_uid):
+            with self.assertRaises(m.FilesError):
+                with self.files().erase_inspection() as lease:
+                    lease.capture()
+        runtime.rmdir()
+        for kind in ('regular','dangling-link','fifo'):
+            if kind=='regular':
+                runtime.write_bytes(b'not a directory')
+            elif kind=='dangling-link':
+                runtime.symlink_to(runtime.with_name('absent'))
+            else:
+                os.mkfifo(runtime)
+            try:
+                with self.subTest(kind=kind),self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        lease.capture()
+            finally:
+                runtime.unlink()
+        runtime.mkdir(mode=0o700)
+
+    def test_erase_absent_runtime_defaults_and_present_actual_labels_still_required(self):
+        runtime=self.root/'run/qshd'
+        runtime.rmdir()
+        original=self.api.lookup
+        for target in ('/run/qshd','/run/qshd/helper-status.sock.lock'):
+            def lookup(path,kind):
+                return 'system_u:object_r:wrong_t:s0' if path==target else original(path,kind)
+            with patch.object(self.api,'lookup',side_effect=lookup):
+                with self.subTest(target=target),self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        lease.capture()
+        runtime.mkdir(mode=0o700)
+        self.api.labels['/run/qshd']='system_u:object_r:wrong_t:s0'
+        with self.assertRaises(m.FilesError):
+            with self.files().erase_inspection() as lease:
+                lease.capture()
+
+    def test_erase_private_contents_unread_no_mutators_and_socket_never_opened(self):
+        for name in ('etc/qshd','var/log/qshd'):
+            (self.root/name).mkdir(mode=0o700)
+        for name,data,mode in [('etc/qshd/host_key',b'x'*64,0o400),
+                               ('var/log/qshd/qshd.log',b'synthetic private log',0o600),
+                               ('run/qshd/helper-status.sock.lock',b'synthetic lock',0o600)]:
+            path=self.root/name
+            path.write_bytes(data)
+            path.chmod(mode)
+        native_read=os.read
+        def read(fd,size):
+            path=os.readlink('/proc/self/fd/'+str(fd))
+            if path.endswith(('host_key','qshd.log','qshd.log.1','helper-status.sock.lock')):
+                raise AssertionError('private content read')
+            return native_read(fd,size)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(m.os,'read',side_effect=read))
+            for name in ('mkdir','write','unlink','rename','chmod','fchmod','chown','fchown','setxattr','removexattr'):
+                stack.enter_context(patch.object(m.os,name,side_effect=AssertionError('erase observer mutation')))
+            with self.files().erase_inspection() as lease:
+                result=lease.capture()
+                lease.recheck(result)
+        self.assertNotIn(b'synthetic private',repr(result).encode())
+        expected=[(path,kind) for path,kind,context,required,role in m._PATHS if context is not None]
+        self.assertEqual(self.api.lookups,expected*2)
+        path=self.root/'run/qshd/helper-status.sock'
+        native_open=os.open
+        def opening(name,*args,**kwargs):
+            if str(name).endswith('helper-status.sock'):
+                raise AssertionError('socket opened')
+            return native_open(name,*args,**kwargs)
+        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as sock:
+            sock.bind(str(path))
+            with patch.object(m.os,'open',side_effect=opening):
+                with self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        lease.capture()
+        path.unlink()
+
+    def test_erase_required_binary_pam_and_optional_metadata_remain_strict(self):
+        (self.root/'run/qshd').rmdir()
+        for name in ('usr/bin/qshd','etc/pam.d/qshd'):
+            path=self.root/name
+            held=path.with_name('held')
+            path.rename(held)
+            try:
+                with self.subTest(missing=name),self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        lease.capture()
+            finally:
+                held.rename(path)
+        pam=self.root/'etc/pam.d/qshd'
+        pam.write_bytes(b'custom PAM')
+        with self.assertRaises(m.FilesError):
+            with self.files().erase_inspection() as lease:
+                lease.capture()
+        pam.write_bytes(PAM)
+        for name in ('etc/qshd','var/log/qshd','run/qshd'):
+            (self.root/name).mkdir(mode=0o700)
+        cases=[('etc/qshd/host_key',b'x'*63,0o400),
+               ('var/log/qshd/qshd.log',b'log',0o644),
+               ('run/qshd/helper-status.sock.lock',b'',0o644)]
+        for name,data,mode in cases:
+            path=self.root/name
+            path.write_bytes(data)
+            path.chmod(mode)
+            try:
+                with self.subTest(optional=name),self.assertRaises(m.FilesError):
+                    with self.files().erase_inspection() as lease:
+                        lease.capture()
+            finally:
+                path.unlink()
+
+    def test_erase_exact_token_sequence_and_cross_method_nesting(self):
+        files=self.files()
+        for outer,inner in ((files.inspection,files.erase_inspection),(files.erase_inspection,files.inspection)):
+            with outer() as lease:
+                result=lease.capture()
+                with self.assertRaises(m.FilesError):
+                    with inner():
+                        self.fail('cross-method nested lease admitted')
+                lease.recheck(result)
+        with self.assertRaises(m.FilesError):
+            with files.erase_inspection() as lease:
+                lease.capture()
+        with files.erase_inspection() as lease:
+            result=lease.capture()
+            lease.recheck(result)
+        with self.assertRaises(m.FilesError):
+            lease.recheck(result)
+        with self.assertRaises(m.FilesError):
+            with files.erase_inspection() as other:
+                other.capture()
+                other.recheck(result)
+        with self.assertRaises(m.FilesError):
+            with files.erase_inspection() as other:
+                token=other.capture()
+                other.recheck(type(token)(token.phase,token.paths))
+        with self.assertRaises(m.FilesError):
+            with files.erase_inspection() as other:
+                other.capture()
+                other.capture()
+        with self.assertRaises(m.FilesError):
+            with files.inspection() as other:
+                other.capture()
+                other.recheck(result)
+
+    def test_erase_interruption_final_readback_and_close_fault_release_descriptors(self):
+        files=self.files()
+        with self.assertRaises(KeyboardInterrupt):
+            with files.erase_inspection() as lease:
+                lease.capture()
+                raise KeyboardInterrupt()
+        self.assertEqual(len(os.listdir('/proc/self/fd')),self.fds)
+        with self.assertRaises(m.FilesError):
+            with files.erase_inspection() as lease:
+                result=lease.capture()
+                self.api.override='system_u:object_r:wrong_t:s0'
+                lease.recheck(result)
+        self.api.override=None
+        original=self.api.file_defaults
+        closes=0
+        @contextmanager
+        def close_failure():
+            nonlocal closes
+            with original() as defaults:
+                yield defaults
+            closes+=1
+            if closes==2:
+                raise RuntimeError('synthetic final native close failure')
+        with patch.object(self.api,'file_defaults',close_failure):
+            with self.assertRaises(m.FilesError):
+                with files.erase_inspection() as lease:
+                    result=lease.capture()
+                    lease.recheck(result)
+        self.assertEqual(closes,2)
+        with files.erase_inspection() as lease:
+            result=lease.capture()
+            lease.recheck(result)
+
+
     def test_required_and_optional_absence_defaults_fresh_endpoints(self):
         before=set(self.root.rglob('*'))
         with self.files().inspection() as lease:
