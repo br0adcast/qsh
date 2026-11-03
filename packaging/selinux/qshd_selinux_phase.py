@@ -24,7 +24,8 @@ _MODULES=tuple('qshd_selinux_'+name for name in (
     'reference_loader','package_state','module_install','first_activation',
     'consumer_activation','phase','rpm_query'))+('stop_guard',)
 _PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
-         'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE'}
+         'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
+         'consumer-preun-final':'PENDING'}
 _SCRIPT='/usr/libexec/qshd-selinux/qshd_selinux_phase.py'
 _CHILD='_phase_child_v1'
 
@@ -143,7 +144,12 @@ def _dispatch(phase,*,deadline):
         return activate_installed_pristine_pending_first(deadline=deadline)
     if phase in ('consumer-pre-fresh','consumer-pre-installed'):
         return consumer.invalidate_installed_consumer_pre(fresh=phase=='consumer-pre-fresh',deadline=deadline)
-    return consumer.finalize_installed_owned_pending_consumer(deadline=deadline)
+    if phase=='consumer-post-owned':
+        return consumer.finalize_installed_owned_pending_consumer(deadline=deadline)
+    if phase=='consumer-preun-final':
+        # The coordinator owns the guard and leases; final removal is not here.
+        return consumer.invalidate_installed_consumer_erase(deadline=deadline)
+    raise PhaseError('PHASE')
 
 
 def _owner():
