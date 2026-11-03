@@ -87,6 +87,10 @@ impl WorkerOwner {
     pub(super) fn terminal_received(&self) -> bool {
         self.receipt.is_some() || self.init_failed
     }
+    #[cfg(test)]
+    pub(super) fn first_failure(&self) -> Option<WorkerFailure> {
+        self.failure
+    }
     pub(super) fn send_stop(
         &self,
         pending: &mut worker_control::PendingFrame,
