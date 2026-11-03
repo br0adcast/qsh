@@ -7,6 +7,7 @@ resources or custody. Only explicit execution configures its dedicated owner.
 import time
 _ENTRY_STARTED=time.monotonic() if __name__=='__main__' else None
 
+import errno
 import hashlib
 import importlib.abc
 import importlib.util
@@ -120,6 +121,80 @@ def _response(record,request):
     return raw
 
 
+_STAGES=frozenset(('INPUT','PROCESS','PACKAGE','REFERENCES','ACTIVATION','ROUTING','PENDING',
+    'CONTEXT_PRISTINE','INSTALL','RECONCILE','OBSERVATION','COMPLETE','FINALIZE','PREFLIGHT',
+    'POLICY','CONSUMER','RPM','RPM_RECHECK','FILES','RELOAD','GUARD',
+    'AUTHORITY','ERASE_FILES','OWNED_CONTEXTS','POLICY_CONTEXT','READBACK'))
+_COMMAND_CODES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TOOL_FAILURE','COMMAND_UNSETTLED',
+    'OUTPUT_INCOMPLETE','PROCESS_THREADS','PROCESS_SIGNALS','PROCESS_CHILDREN','PROCESS_LIMITS',
+    'PROCESS_SUBREAPER','PROCESS_OWNER','COMMAND_LIMITS','COMMAND_INPUT','COMMAND_KIND',
+    'COMMAND_BUDGET','COMMAND_STDERR','COMMAND_OUTPUT'))
+_ERRNO_CODES={getattr(errno,name):'OS_'+name for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM')}
+_CODES=frozenset(_ERRNO_CODES.values())|_COMMAND_CODES|frozenset('COORDINATOR_'+name for name in _STAGES)|frozenset((
+    'UNKNOWN','INSTALL_REFUSED','REGISTRY_REFUSED','CONTEXT_REFUSED','SLOT_REFUSED','SELINUX_REFUSED'))
+
+
+def _parse_failure(raw,request):
+    if type(raw) is not bytes or not 0<len(raw)<=1024:raise PhaseError('FAILURE')
+    expected=_parse_request(request)
+    try:
+        value=json.loads(raw,object_pairs_hook=_pairs)
+        if (type(value) is not dict or set(value)!={'version','request','codes','command'}
+                or type(value['version']) is not int or value['version']!=1
+                or value['request']!=expected or type(value['request']) is not dict
+                or _json(value['request'])!=request
+                or type(value['codes']) is not list or not 1<=len(value['codes'])<=8
+                or any(type(code) is not str or code not in _CODES for code in value['codes'])
+                or _json(value)+b'\n'!=raw):raise PhaseError('FAILURE')
+        command=value['command']
+        if command is not None:
+            from qshd_selinux_process import _FailureSummary
+            if type(command) is not dict or set(command)!={'profile','failure','exit_code','settled','unreaped'}:
+                raise PhaseError('FAILURE')
+            _FailureSummary(**command)
+        return value
+    except (ValueError,TypeError,RecursionError,UnicodeError):raise PhaseError('FAILURE') from None
+
+
+def _failure(error,request):
+    from dataclasses import asdict
+    from qshd_selinux_process import _CommandError,_FailureSummary
+    from qshd_selinux_first_activation import CoordinatorError as FirstError
+    from qshd_selinux_consumer_activation import CoordinatorError as ConsumerError
+    from qshd_selinux_module_install import InstallError
+    from qshd_selinux_registry import RegistryError
+    from qshd_selinux_fs import Conflict
+    from qshd_selinux_activation_state import SlotError,OutcomeUncertain
+    from qshd_selinux_api import SelinuxError
+    codes=[];command=None;seen=set()
+    while error is not None and len(codes)<8 and id(error) not in seen:
+        seen.add(id(error));kind=type(error);code='UNKNOWN'
+        if kind in (OSError,PermissionError):
+            number=OSError.errno.__get__(error)
+            if type(number) is int:code=_ERRNO_CODES.get(number,'UNKNOWN')
+        elif kind in (FirstError,ConsumerError):
+            args=BaseException.args.__get__(error)
+            if len(args)==1 and type(args[0]) is str and args[0] in _STAGES:code='COORDINATOR_'+args[0]
+        elif kind is _CommandError:
+            args=BaseException.args.__get__(error)
+            if len(args)==1 and type(args[0]) is str and args[0] in _COMMAND_CODES:code=args[0]
+            summary=error.summary
+            if command is None and type(summary) is _FailureSummary:
+                try:summary.__post_init__();command=asdict(summary)
+                except ValueError:pass
+        elif kind is InstallError:code='INSTALL_REFUSED'
+        elif kind is RegistryError:code='REGISTRY_REFUSED'
+        elif kind in (SlotError,OutcomeUncertain):code='SLOT_REFUSED'
+        elif kind is Conflict:code='CONTEXT_REFUSED'
+        elif kind is SelinuxError:code='SELINUX_REFUSED'
+        codes.append(code)
+        cause=BaseException.__cause__.__get__(error)
+        error=cause if cause is not None else BaseException.__context__.__get__(error)
+    raw=_json(dict(version=1,request=_parse_request(request),codes=codes or ['UNKNOWN'],command=command))+b'\n'
+    _parse_failure(raw,request)
+    return raw
+
+
 def _resources(*,configure):
     import resource
     from qshd_selinux_process import _children,_preconditions
@@ -168,7 +243,13 @@ def _child_main(args):
     except (ValueError,UnicodeError):raise PhaseError('ARGUMENTS') from None
     _resources(configure=False)
     if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
-    record=_dispatch(_parse_request(request)['phase'],deadline=work_end)
+    try:record=_dispatch(_parse_request(request)['phase'],deadline=work_end)
+    except BaseException as error:
+        if not isinstance(error,Exception):raise
+        raw=_failure(error,request)
+        if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
+        sys.stderr.buffer.write(raw);sys.stderr.buffer.flush()
+        return 1
     raw=_response(record,request)
     if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
     sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()
@@ -185,8 +266,21 @@ def _parent(phase,started):
         if time.monotonic()>=started+240:raise PhaseError('DEADLINE')
         owner=_owner()
         if time.monotonic()>=started+240:raise PhaseError('DEADLINE')
-        streams=owner._run(('/usr/bin/python3','-I','-B',_SCRIPT,_CHILD,
-            request.decode('ascii'),repr(started),repr(started+240)),'/',deadline=started+250)
+        from qshd_selinux_process import _CommandError,_Outcome
+        try:
+            streams=owner._run(('/usr/bin/python3','-I','-B',_SCRIPT,_CHILD,
+                request.decode('ascii'),repr(started),repr(started+240)),'/',deadline=started+250)
+        except _CommandError as error:
+            outcome=owner._last
+            if (error.args!=('TOOL_FAILURE',) or type(outcome) is not _Outcome
+                    or outcome.failure is not None or type(outcome.exit_code) is not int or outcome.exit_code!=1
+                    or outcome.settled is not True or type(outcome.unreaped) is not tuple or outcome.unreaped or type(outcome.stdout) is not bytes or outcome.stdout
+                    or type(outcome.stderr) is not bytes or time.monotonic()>=started+250):
+                raise PhaseError('OWNER') from None
+            _parse_failure(outcome.stderr,request)
+            if time.monotonic()>=started+250:raise PhaseError('DEADLINE')
+            sys.stderr.buffer.write(outcome.stderr);sys.stderr.buffer.flush()
+            return 1
         outcome=owner._last
         if (outcome is None or outcome.failure is not None or outcome.exit_code!=0
                 or not outcome.settled or outcome.unreaped or streams.stderr):raise PhaseError('OWNER')

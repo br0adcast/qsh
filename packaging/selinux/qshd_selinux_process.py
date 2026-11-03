@@ -22,6 +22,13 @@ _CLEANUP_SECONDS = 10
 
 class _CommandError(RuntimeError):
     """Fixed bounded refusal; raw command output never enters its message."""
+    def __init__(self, code, *, summary=None):
+        super().__init__(code)
+        self._summary=summary
+
+    @property
+    def summary(self):return self._summary
+
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,38 @@ class _Outcome:
     failure: str | None
     settled: bool
     unreaped: tuple[int, ...] = ()
+
+
+_FAILURES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TOOL_FAILURE','COMMAND_UNSETTLED','OUTPUT_INCOMPLETE'))
+_PROFILES={(5,16384):'guard5',(5,4*1024**2):'rpm5',(15,4*1024**2):'rpm15',
+           (15,1024**2):'module15',(75,1024**2):'module75',(30,4096):'capsule30',
+           (60,4096):'observer60',(250,4096):'phase250'}
+
+
+@dataclass(frozen=True)
+class _FailureSummary:
+    profile: str
+    failure: str | None
+    exit_code: int | None
+    settled: bool
+    unreaped: int
+
+    def __post_init__(self):
+        if (type(self.profile) is not str or self.profile not in frozenset(_PROFILES.values())|{'OTHER'}
+                or self.failure is not None and (type(self.failure) is not str or self.failure not in _FAILURES)
+                or self.exit_code is not None and (type(self.exit_code) is not int or not -255<=self.exit_code<=255)
+                or type(self.settled) is not bool or type(self.unreaped) is not int or not 0<=self.unreaped<=64):
+            raise ValueError('COMMAND_SUMMARY')
+
+
+def _failure_summary(outcome,limits):
+    if type(outcome) is not _Outcome or type(limits) is not _Limits:return None
+    if (type(outcome.stdout) is not bytes or type(outcome.stderr) is not bytes
+            or type(outcome.unreaped) is not tuple):return None
+    try:
+        return _FailureSummary(_PROFILES.get((limits.execution_seconds,limits.output_bytes),'OTHER'),
+            outcome.failure,outcome.exit_code,outcome.settled,len(outcome.unreaped))
+    except ValueError:return None
 
 
 def _children():
@@ -130,7 +169,7 @@ class _Owner:
         deadline = min(now + self._limits.execution_seconds, deadline) if deadline is not None else now + self._limits.execution_seconds
         if deadline <= now:
             self._last = _Outcome(b'', b'', None, 'COMMAND_TIMEOUT', True)
-            raise _CommandError('COMMAND_TIMEOUT')
+            raise _CommandError('COMMAND_TIMEOUT',summary=_failure_summary(self._last,self._limits))
         env = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C',
                'HOME': cwd, 'XDG_CONFIG_HOME': cwd, 'XDG_CACHE_HOME': cwd,
                'HISTFILE': '/dev/null'}
@@ -281,9 +320,9 @@ class _Owner:
                 self._last = _Outcome(*captured(), None if proc is None else proc.returncode,
                                       'OUTPUT_LIMIT' if overflow else failure, True)
         if self._unsettled:
-            raise _CommandError('COMMAND_UNSETTLED') from None
+            raise _CommandError('COMMAND_UNSETTLED',summary=_failure_summary(self._last,self._limits)) from None
         if pending is not None:
             raise pending
         if self._last.failure or self._last.exit_code != 0:
-            raise _CommandError(self._last.failure or 'TOOL_FAILURE') from None
+            raise _CommandError(self._last.failure or 'TOOL_FAILURE',summary=_failure_summary(self._last,self._limits)) from None
         return _Streams(self._last.stdout, self._last.stderr)
