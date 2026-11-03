@@ -151,6 +151,19 @@ class _Production:
         return production(expected_pam,self._api).inspection()
 
 
+    def erase_files(self,expected_pam):
+        from qshd_selinux_files import production
+        return production(expected_pam,self._api).erase_inspection()
+
+    def consumer_authority(self,deadline):
+        from qshd_selinux_rpm_query import production_consumer_authority
+        return production_consumer_authority().inspection(deadline=deadline)
+
+    def rpm_query(self,deadline):
+        from qshd_selinux_rpm_query import production_query
+        return production_query().inspection(deadline=deadline)
+
+
 def invalidate_installed_consumer_pre(*,fresh,deadline):
     """Matching COMPLETE to fresh PENDING; no payload mutation or migration.
 
@@ -168,6 +181,15 @@ def finalize_installed_owned_pending_consumer(*,deadline):
     any later failure is OutcomeUncertain. No rollback or retry is performed.
     """
     return _Coordinator(_Production()).finalize_installed_owned_pending_consumer(deadline=deadline)
+
+
+def invalidate_installed_consumer_erase(*,deadline):
+    """Fresh PENDING before canonical owned consumer removal, never payload erase.
+
+    Caller retains maintenance exclusion and an external hard process owner.
+    Any failure after the publication attempt is outcome-uncertain.
+    """
+    return _Coordinator(_Production()).invalidate_installed_consumer_erase(deadline=deadline)
 
 
 @dataclass(frozen=True)
@@ -320,6 +342,80 @@ class _Coordinator:
         except BaseException as error:
             if not isinstance(error,Exception) or isinstance(error,CoordinatorError):raise
             raise CoordinatorError('OWNED_ERASE_ADMISSION') from None
+
+    def _erase_authority(self,authority,expected_pam):
+        from qshd_selinux_rpm_query import ConsumerRpmAuthority
+        if type(authority) is not ConsumerRpmAuthority:
+            raise CoordinatorError('ERASE_AUTHORITY')
+        authority.__post_init__()
+        if authority.package.arch not in ('x86_64','aarch64'):
+            raise CoordinatorError('ERASE_ARCH')
+        selected={item.path:item for item in authority.files}
+        binary=selected['/usr/bin/qshd'];pam=selected['/etc/pam.d/qshd']
+        if (binary.mode!=0o100755 or binary.flags!=0 or not 0<binary.size<=128*1024**2
+                or pam.mode!=0o100644 or pam.flags!=17 or pam.size!=len(expected_pam)
+                or pam.sha256!=PAM_SHA256 or hashlib.sha256(expected_pam).hexdigest()!=PAM_SHA256
+                or any(item.owner!='root' or item.group!='root' for item in authority.files)):
+            raise CoordinatorError('ERASE_AUTHORITY')
+
+    def _erase_paths(self,observed,authority):
+        from qshd_selinux_files import FilesObservation
+        if type(observed) is not FilesObservation or observed.phase!='consumer-erase':
+            raise CoordinatorError('ERASE_FILES')
+        for item in authority.files:
+            selected=[value for value in observed.paths if value.path==item.path]
+            if len(selected)!=1:raise CoordinatorError('ERASE_FILES')
+            value=selected[0];metadata=value.metadata
+            if (not value.present or metadata is None
+                    or (metadata[2],metadata[3],metadata[4],metadata[6])!=(0,0,item.mode,item.size)
+                    or (item.path=='/etc/pam.d/qshd' and value.pam_sha256!=item.sha256)):
+                raise CoordinatorError('ERASE_FILES')
+
+    def invalidate_installed_consumer_erase(self,*,deadline):
+        if self._used:raise CoordinatorError('COORDINATOR_USED')
+        self._used=True
+        try:
+            self._start(deadline);b=self._bindings;self._stage='PACKAGE'
+            with b.package():
+                self._stage='REFERENCES'
+                with b.references() as references:
+                    captured=references.capture();self._check(170)
+                    self._stage='AUTHORITY'
+                    with b.consumer_authority(self._end) as manifest:
+                        authority=manifest.capture();self._erase_authority(authority,captured.expected_pam)
+                        self._check(170);self._stage='RPM'
+                        with b.rpm_query(self._end) as query:
+                            self._check(170);owned=query.capture_owned(authority);self._check(130)
+                            self._stage='ACTIVATION'
+                            with b.activation() as writer:
+                                self._check(130)
+                                admission=self._admit_owned_erase(writer,captured.artifact);self._check(60)
+                                self._stage='ERASE_FILES'
+                                with b.window():
+                                    with b.erase_files(captured.expected_pam) as deployed:
+                                        paths=deployed.capture();self._erase_paths(paths,authority)
+                                        references.recheck(captured);manifest.recheck(authority);self._check(60)
+                                        self._stage='RPM_RECHECK';query.recheck(owned);self._check()
+                                        self._stage='GUARD';b.guard(self._end);self._check()
+                                        deployed.recheck(paths);self._check()
+                                references.recheck(captured);manifest.recheck(authority);self._check(10)
+                                pending=self._pending(captured.artifact)
+                                if pending.operation_id==admission.slot.record.operation_id:
+                                    raise CoordinatorError('ERASE_OPERATION')
+                                document=_json(asdict(pending));self._stage='PENDING';self._uncertain=True
+                                writer.begin_pending(document,admission.slot);self._check()
+                            self._stage='READBACK'
+                            with b.slot_object().inspection() as reader:
+                                value=reader.capture();reader.recheck(value)
+                                if value.record!=pending or value.document!=document:
+                                    raise CoordinatorError('PENDING_READBACK')
+                                self._check()
+                            references.recheck(captured);manifest.recheck(authority);self._check()
+            self._check();return pending
+        except BaseException as error:
+            if self._uncertain:raise OutcomeUncertain('CONSUMER_OUTCOME_UNCERTAIN') from None
+            if not isinstance(error,Exception) or isinstance(error,CoordinatorError):raise
+            raise CoordinatorError(self._stage) from None
 
     def finalize_installed_owned_pending_consumer(self,*,deadline):
         if self._used:raise CoordinatorError('COORDINATOR_USED')

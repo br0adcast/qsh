@@ -155,7 +155,7 @@ activation is integrated.
 
 ## Installed maintenance phase entrypoint
 
-The staging payload includes 20 Python modules and four public data files. Its
+The staging payload includes 21 Python modules and four public data files. Its
 fixed entrypoint is `/usr/bin/python3 -I -B
 /usr/libexec/qshd-selinux/qshd_selinux_phase.py MODE`, where `MODE` is exactly
 `provider-post-pristine`, `consumer-pre-fresh`, `consumer-pre-installed`, or
