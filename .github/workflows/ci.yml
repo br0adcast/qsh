@@ -332,6 +332,13 @@ jobs:
           done
           grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then exit 1; fi
+          cargo test --locked -p qshd --lib state::tests:: -- \
+            --test-threads=1 --color=never 2>&1 | tee "$runtime/state-results.log"
+          for name in pidpath_answers_are_validated_byte_for_byte darwin_image_path_names_this_image \
+            self_checksum_is_64_hex self_checksum_second_call_does_not_recompute; do
+            grep -Fx "test state::tests::$name ... ok" "$runtime/state-results.log"
+          done
+          grep -F 'test result: ok. 11 passed; 0 failed; 0 ignored;' "$runtime/state-results.log"
       - name: Native control peer-account tests
         shell: bash
         run: |
