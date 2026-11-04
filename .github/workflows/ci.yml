@@ -256,7 +256,7 @@ jobs:
           export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
           export HISTFILE=/dev/null
           mkdir -m 700 -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
-          cargo test -p qsh --lib --locked cache_authority_ -- --nocapture --test-threads=1 \
+          cargo test -p qsh --lib --locked releases::cache::storage::tests::cache_authority_ -- --nocapture --test-threads=1 \
             2>&1 | tee "$runtime/storage.log"
           for name in \
             releases::cache::storage::tests::cache_authority_lock_policy_and_binding_are_checked \
@@ -269,11 +269,11 @@ jobs:
           done
           if grep -q 'SKIPPED' "$runtime/storage.log"; then exit 1; fi
           grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$runtime/storage.log"
-          cargo test -p qsh --test releases --locked cache_authority_ -- --nocapture --test-threads=1 \
+          cargo test -p qsh --lib --locked releases::tests::cache_authority_ -- --nocapture --test-threads=1 \
             2>&1 | tee "$runtime/releases.log"
           for name in \
-            cache_authority_rejects_writable_cache_but_keeps_verified_online_install \
-            cache_authority_preserves_safe_public_modes_and_root_aliases; do
+            releases::tests::cache_authority_rejects_writable_cache_but_keeps_verified_online_install \
+            releases::tests::cache_authority_preserves_safe_public_modes_and_root_aliases; do
             grep -F "test $name ... ok" "$runtime/releases.log"
           done
           if grep -q 'SKIPPED' "$runtime/releases.log"; then exit 1; fi
@@ -908,6 +908,23 @@ jobs:
           python3 -I -B scripts/test_three_channel_functional.py
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
 
+      # Release signing orchestration, including the real native verifier's
+      # rejections; none of these controls may be skipped.
+      - name: Release attestation controls
+        env:
+          AWS_LC_SYS_USE_SYSTEM: '0'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          cargo build --locked -p release-auth --example verify-release
+          export QSH_TEST_RELEASE_VERIFIER="$PWD/target/debug/examples/verify-release"
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_release_attestation.py')
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count and result.wasSuccessful() and not result.skipped else 1)
+          PY
+
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -940,14 +957,18 @@ jobs:
       # independent tests to overlap. Root-only tests still run below in
       # disposable containers. Exact exclusions and source-declared ignores
       # are reported separately; any executed test emitting SKIPPED fails.
+      - name: Build the exact test daemon artifact
+        run: |
+          cargo build -p qshd --bin qshd --locked --features system \
+            --message-format=json > "$RUNNER_TEMP/qshd-artifacts.json"
       - name: Unit and integration tests
-        # The workspace build supplies this before tests start. Shared bringup
-        # fixtures must not replace it with their standalone feature build.
+        # The runner supplies the exact daemon from the preceding Cargo JSON.
+        # Shared fixtures must not discover siblings or start nested Cargo builds.
         env:
-          QSH_TEST_QSHD: ${{ github.workspace }}/target/debug/qshd
           QSH_REQUIRE_TEST_SHELLS: "1"
         run: >-
-          python3 scripts/run-nextest-ci.py --
+          python3 scripts/run-nextest-ci.py
+          --daemon-artifacts "$RUNNER_TEMP/qshd-artifacts.json" --require-install-fixtures --
           cargo nextest run --profile ci --workspace --lib --bins --tests --example three_channel305
           --locked --features qshd/system
       - name: Disk usage after the test build and run
@@ -1160,7 +1181,7 @@ jobs:
           # which share a target name.
           binary() {
             package=$qshd_package
-            if [ "$1" = test ] && { [ "$2" = release_cache_authority_privilege ] || [ "$2" = ssh_known_hosts_authority_privilege ]; }; then
+            if [ "$1" = test ] && [ "$2" = ssh_known_hosts_authority_privilege ]; then
               package=$qsh_package
             fi
             jq -r --arg package "$package" --arg kind "$1" --arg name "$2" \
@@ -1225,7 +1246,7 @@ jobs:
             # all" is a different answer from "which failed", and a broken
             # run is exactly when both are worth having.
             scripts/no-silent-skips.sh "$logs/$name.log" "$@" || bad=1
-            if [ "$name" = release_cache_authority_privilege ] || [ "$name" = ssh_known_hosts_authority_privilege ]; then
+            if [ "$name" = ssh_known_hosts_authority_privilege ]; then
               grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$logs/$name.log" || bad=1
             fi
             failures=$((failures + bad))
@@ -1250,8 +1271,35 @@ jobs:
           # scripts/no-silent-skips.sh for what --require checks and why a
           # plain `grep -q "test NAME ... ok"` does not work under
           # --nocapture.
-          run_suite test release_cache_authority_privilege \
-            --require release_cache_root_readonly_and_foreign_owner_boundaries
+          # Only this exact qsh library fixture runs as root. Never run the whole library.
+          run_qsh_cache_privilege() {
+            cache_privilege=releases::cache::privilege_tests::release_cache_root_readonly_and_foreign_owner_boundaries
+            cache_bin=$(jq -ser --arg package "$qsh_package" '
+              [.[] | select(.reason == "compiler-artifact" and .profile.test == true
+                and .package_id == $package and .target.name == "qsh"
+                and (.target.kind | index("lib"))) | .executable] | unique |
+              if length == 1 and .[0] != null then .[0] else error("expected one exact qsh library artifact") end
+            ' "$RUNNER_TEMP/build.json")
+            if [ -z "$cache_bin" ] || [ ! -x "$cache_bin" ]; then
+              echo "::error::no exact qsh library cache ownership test binary was built"
+              failures=$((failures + 1))
+              return
+            fi
+            bad=0
+            if docker run --rm --init -e QSHD_TEST_DISPOSABLE_HOST=1 \
+              -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
+              ubuntu:24.04 sh -c 'exec "$@" 2>&1' sh "$cache_bin" \
+              --exact "$cache_privilege" --test-threads=1 --nocapture \
+              2>&1 | tee "$logs/release_cache_authority_privilege.log"
+            then :; else bad=1; fi
+            python3 scripts/run-nextest-ci.py \
+              --check-exact-libtest "$logs/release_cache_authority_privilege.log" \
+              --require-exact-test "$cache_privilege" || bad=1
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' \
+              "$logs/release_cache_authority_privilege.log" || bad=1
+            failures=$((failures + bad))
+          }
+          run_qsh_cache_privilege
           run_suite test ssh_known_hosts_authority_privilege \
             --require ssh_known_hosts_real_owner_read_and_append_boundaries
           run_suite test serve_system_split \

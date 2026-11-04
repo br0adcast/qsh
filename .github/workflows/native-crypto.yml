@@ -13,14 +13,18 @@ on:
       - 'vendor/vte/**'
       - 'vendor/alacritty_terminal/**'
       - '.github/workflows/ci.yml'
+      - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
       - 'crates/sshauth/**'
+      - 'crates/release-auth/**'
       - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
+      - 'scripts/check-native-verifier-paths.py'
+      - 'scripts/tests/test_native_verifier_paths.py'
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
@@ -41,14 +45,18 @@ on:
       - 'vendor/vte/**'
       - 'vendor/alacritty_terminal/**'
       - '.github/workflows/ci.yml'
+      - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
       - 'crates/sshauth/**'
+      - 'crates/release-auth/**'
       - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
+      - 'scripts/check-native-verifier-paths.py'
+      - 'scripts/tests/test_native_verifier_paths.py'
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
@@ -215,28 +223,105 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: native-products-${{ matrix.target }}
+      - name: Qualify offline release authentication
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          python3 -I -B -m unittest discover -s scripts/tests -p test_native_verifier_paths.py
+          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          # Darwin's linker records object paths separately from compiler source paths.
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          cargo test --locked -p release-auth --all-targets --target "$NATIVE_TARGET"
+          cargo build --locked -p release-auth --example verify-release --target "$NATIVE_TARGET"
+          verifier="target/$NATIVE_TARGET/debug/examples/verify-release"
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "$verifier")
+            if grep -q NEEDED <<< "$dynamic"; then
+              echo 'musl release verifier imports dynamic libraries' >&2
+              exit 1
+            fi
+          else
+            dynamic=$(otool -L "$verifier")
+            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
+              echo 'release verifier imports a dynamic crypto backend' >&2
+              exit 1
+            fi
+          fi
+          python3 -I -B scripts/check-native-verifier-paths.py \
+            "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
       - name: Qualify the linked products and generated RSA operations
         shell: bash
         env:
           NATIVE_TARGET: ${{ matrix.target }}
         run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
-          cargo build --locked -p qsh -p qshd --target "$NATIVE_TARGET"
+          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
           cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
             --test rsa_file_signing --test native_rsa_backend -- --include-ignored
           if [ "$RUNNER_OS" = Linux ]; then
-            dynamic=$(readelf -d "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
             if grep -q NEEDED <<< "$dynamic"; then
               echo 'musl products import dynamic libraries' >&2
               exit 1
             fi
           else
-            dynamic=$(otool -L "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            dynamic=$(otool -L "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
             if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
               echo 'products import an unqualified dynamic native backend' >&2
               exit 1
             fi
           fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          if [ "$RUNNER_OS" = Linux ]; then
+            strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
+          else
+            strip "target/$NATIVE_TARGET/release/qsh"
+            strip "target/$NATIVE_TARGET/release/qshd"
+          fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B - "$binary" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          binary = Path(sys.argv[1])
+          data = binary.read_bytes()
+          print(json.dumps(dict(schema=1, kind='native-product-path-qualification',
+                                target=sys.argv[2], program=binary.name, profile='release',
+                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
+                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
+          PY
+            done
+          done
 
       - name: Qualify the production Intel Darwin process owner
         if: matrix.target == 'x86_64-apple-darwin'

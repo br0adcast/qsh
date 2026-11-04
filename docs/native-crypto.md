@@ -164,3 +164,26 @@ sysroot. Each floor job also runs the existing server package builder for both
 architectures, including linked system-daemon, glibc and PAM checks. Generated
 qualification packages stay within that job; no release is published.
 Passing one local target is not evidence that the complete CI matrix passed.
+
+
+## Release verification and AWS-LC notices
+
+The qsh client also links the offline `release-auth` verifier, with the reviewed
+Sigstore 0.15.1 dependencies and their AWS-LC provider; this is separate from the
+OpenSSL private-RSA prerequisite above. Its dependency versions and native build
+requirements are pinned in Cargo.lock and the existing native qualification
+workflow. Verification has no runtime signing, TUF or root-refresh feature.
+
+Redistribution preserves the unmodified upstream notices in
+[`aws-lc-rs.txt`](licenses/aws-lc-rs.txt) and [`aws-lc.txt`](licenses/aws-lc.txt),
+including their retained authors, attribution and license terms. Combined archives
+carry them as `LICENSE-AWS-LC-RS.txt` and `LICENSE-AWS-LC.txt`; qsh DEB/RPM packages
+place those files in `/usr/share/doc/qsh/`. The server-only qshd package does not
+link this client verifier and retains its existing notices.
+
+Before shipping, qualify the actual client link edge on musl x86_64/aarch64 and
+Darwin x86_64/aarch64, scan the complete resulting artifacts for personal paths,
+and check exact notice bytes in each package/archive. Earlier helper-only
+cryptographic interoperability and static-link tests do not qualify the new
+client artifact. See [release authentication](release-security.md) for the
+compiled authority, root-update process and historical-evidence limits.

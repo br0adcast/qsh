@@ -1,6 +1,9 @@
 mod storage;
 
-use super::{archive, Budget, ImageError, ARCHIVE_LIMIT, IMAGE_LIMIT};
+use super::{
+    archive, Authentication, Budget, Evidence, ImageError, ARCHIVE_LIMIT, BUNDLE_LIMIT,
+    IMAGE_LIMIT, SUMS_LIMIT,
+};
 use bringup::{DaemonImage, ImageRequest};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
@@ -22,6 +25,7 @@ struct Receipt {
 
 pub(super) struct Cache {
     authority: storage::Authority,
+    pub(super) authentication: Authentication,
     #[cfg(test)]
     hook: std::cell::RefCell<Option<PhaseHook>>,
 }
@@ -43,6 +47,8 @@ struct Cached {
     sha: [u8; 32],
     repair: bool,
     generation: std::sync::Arc<storage::Directory>,
+    receipt: storage::CheckedRead,
+    manifest: Vec<u8>,
     required: Vec<storage::CheckedRead>,
 }
 
@@ -94,9 +100,42 @@ impl Cache {
         let authority = storage::Authority::open(root, request, budget)?;
         Ok(Self {
             authority,
+            authentication: Authentication::Production,
             #[cfg(test)]
             hook: std::cell::RefCell::new(None),
         })
+    }
+
+    #[cfg(test)]
+    fn open_test(
+        root: &Path,
+        request: &ImageRequest,
+        budget: &Budget<'_>,
+    ) -> Result<Self, CacheError> {
+        let mut cache = Self::open(root, request, budget)?;
+        cache.authentication = Authentication::Test(super::test_support::verify);
+        Ok(cache)
+    }
+    #[cfg(test)]
+    fn publish_test(
+        &self,
+        request: &ImageRequest,
+        bytes: &[u8],
+        sha: &[u8; 32],
+        image: &DaemonImage,
+        budget: &Budget<'_>,
+    ) -> Result<(), CacheError> {
+        let evidence = super::test_support::evidence(request, sha);
+        self.publish(request, bytes, &evidence, image, budget)
+    }
+    #[cfg(test)]
+    fn load_test(
+        &self,
+        request: &ImageRequest,
+        budget: &Budget<'_>,
+        publication: Duration,
+    ) -> Result<Option<DaemonImage>, ImageError> {
+        self.load(request, None, None, budget, publication)
     }
 
     #[cfg(test)]
@@ -109,11 +148,22 @@ impl Cache {
     pub(super) fn load(
         &self,
         request: &ImageRequest,
-        expected_sha: Option<&[u8; 32]>,
+        evidence: Option<&Evidence>,
+        required_manifest: Option<&[u8]>,
         budget: &Budget<'_>,
         publication: Duration,
     ) -> Result<Option<DaemonImage>, ImageError> {
         let result = self.load_checked(request, budget);
+        let expected_sha = evidence.map(|e| e.archive_hash(request)).transpose()?;
+        // A fresh authenticated hash may qualify an existing unsigned archive;
+        // never derive authority from its old receipt. Publish all five objects
+        // through the same stage, then reopen/reverify the complete generation.
+        let result = match (result, evidence) {
+            (Err(_), Some(evidence)) => {
+                self.authenticate_archive(request, evidence, budget, publication)
+            }
+            (result, _) => result,
+        };
         budget.check()?;
         // Corrupt and incomplete local data are cache misses, never images.
         let mut cached = match result {
@@ -121,6 +171,9 @@ impl Cache {
             Err(ImageError::Cancelled) => return Err(ImageError::Cancelled),
             Err(_) => return Ok(None),
         };
+        if required_manifest.is_some_and(|manifest| cached.manifest != manifest) {
+            return Ok(None);
+        }
         if expected_sha.is_some_and(|expected| expected != &cached.sha) {
             return Ok(None);
         }
@@ -149,7 +202,7 @@ impl Cache {
                 )?;
                 owned_receipt.bytes = receipt;
                 // Retain the exact token before any fallible post-publication sync.
-                cached.required[1] = owned_receipt;
+                cached.receipt = owned_receipt;
                 self.authority.sync(&cached.generation, &publication)
             })();
             optional(repair, &publication)?;
@@ -163,6 +216,7 @@ impl Cache {
     fn validate_cached(&self, cached: &Cached, budget: &Budget<'_>) -> Result<(), CacheError> {
         self.authority.validate(budget)?;
         cached.generation.validate().map_err(unavailable)?;
+        cached.receipt.validate().map_err(unavailable)?;
         for read in &cached.required {
             read.validate().map_err(unavailable)?;
         }
@@ -192,6 +246,18 @@ impl Cache {
             .objects
             .child(std::ffi::OsStr::new(&current.archive_sha256), false, budget)
             .map_err(storage_error)?;
+        let manifest = generation
+            .read("SHA256SUMS", SUMS_LIMIT, budget)
+            .map_err(storage_error)?;
+        let bundle = generation
+            .read("SHA256SUMS.sigstore.json", BUNDLE_LIMIT, budget)
+            .map_err(storage_error)?;
+        let evidence =
+            self.authentication
+                .verify(request, &manifest.bytes, &bundle.bytes, budget)?;
+        if evidence.archive_hash(request)? != &sha {
+            return Err(failure("authenticated archive hash differs from pointer"));
+        }
         let receipt_read = generation
             .read("receipt.json", 4096, budget)
             .map_err(storage_error)?;
@@ -218,7 +284,9 @@ impl Cache {
             || cached.as_ref().ok().map(|r| r.bytes.as_slice()) != Some(image.bytes.as_ref());
         self.authority.validate(budget).map_err(storage_error)?;
         generation.validate().map_err(failure)?;
-        let required = vec![pointer, receipt_read, archive_read];
+        receipt_read.validate().map_err(failure)?;
+        let manifest_bytes = manifest.bytes.clone();
+        let required = vec![pointer, manifest, bundle, archive_read];
         for read in &required {
             read.validate().map_err(failure)?;
         }
@@ -227,25 +295,81 @@ impl Cache {
             sha,
             repair,
             generation,
+            receipt: receipt_read,
+            manifest: manifest_bytes,
             required,
         })
+    }
+
+    fn authenticate_archive(
+        &self,
+        request: &ImageRequest,
+        evidence: &Evidence,
+        budget: &Budget<'_>,
+        publication: Duration,
+    ) -> Result<Cached, ImageError> {
+        self.authority.validate(budget).map_err(storage_error)?;
+        let pointer = self
+            .authority
+            .target
+            .read("current.json", 4096, budget)
+            .map_err(storage_error)?;
+        let current: Current = serde_json::from_slice(&pointer.bytes).map_err(failure)?;
+        let sha = evidence.archive_hash(request)?;
+        if current.archive_sha256 != archive::hex(sha) {
+            return Err(failure("different archive generation"));
+        }
+        let generation = self
+            .authority
+            .objects
+            .child(std::ffi::OsStr::new(&current.archive_sha256), false, budget)
+            .map_err(storage_error)?;
+        let archive = generation
+            .read("archive", ARCHIVE_LIMIT, budget)
+            .map_err(storage_error)?;
+        let image = archive::verified_image(request, &archive.bytes, sha, budget)?;
+        self.authority.validate(budget).map_err(storage_error)?;
+        pointer.validate().map_err(failure)?;
+        archive.validate().map_err(failure)?;
+        generation.validate().map_err(failure)?;
+        let publication = Budget::new(publication, budget.cancel);
+        self.publish(request, &archive.bytes, evidence, &image, &publication)
+            .map_err(storage_error)?;
+        // Our publication deliberately replaces names. Retain the old read FDs
+        // until the fully published replacement is opened and authenticated.
+        let cached = self.load_checked(request, budget)?;
+        drop((pointer, archive, generation));
+        Ok(cached)
     }
 
     pub(super) fn publish(
         &self,
         request: &ImageRequest,
         bytes: &[u8],
-        sha: &[u8; 32],
+        evidence: &Evidence,
         image: &DaemonImage,
         budget: &Budget<'_>,
     ) -> Result<(), CacheError> {
         self.authority.validate(budget)?;
+        let sha = evidence.archive_hash(request)?;
         let name = archive::hex(sha);
         // Capture an existing generation before staging; never adopt a replacement.
         let existing = self.authority.generation(&name, budget)?;
         let mut staging = storage::Stage::new(&self.authority, budget)?;
         staging.write(&self.authority, "archive", bytes, budget)?;
         staging.write(&self.authority, "image", &image.bytes, budget)?;
+        staging.write(
+            &self.authority,
+            "SHA256SUMS",
+            evidence.manifest_bytes(),
+            budget,
+        )?;
+        staging.write(
+            &self.authority,
+            "SHA256SUMS.sigstore.json",
+            evidence.bundle_bytes(),
+            budget,
+        )?;
         staging.write(
             &self.authority,
             "receipt.json",
@@ -300,3 +424,6 @@ fn receipt_bytes(
     })
     .map_err(failure)
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod privilege_tests;
