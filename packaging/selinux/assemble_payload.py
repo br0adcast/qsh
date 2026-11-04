@@ -21,10 +21,11 @@ MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','observer','reference_loader','package_state','module_install','first_activation',
     'consumer_activation','phase','rpm_query'))+('stop_guard.py',)
-_KEYS=frozenset(MODULES+('qshd.pp','artifact.json','qshd.fedora-selinux'))
+_KEYS=frozenset(MODULES+('qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux'))
 _PAM_SHA='61dc7f9dc6ada9a612a66b1bfda1f8d1802ec9734a9325edc4f600b0e55622c7'
-_SCHEMA=dict(name='qshd-selinux',architecture='noarch',policy_module='qshd',
-    module_priority=400,authored_source_license='AGPL-3.0-only',
+_ROLES={role:dict(name=name,priority=400,store='targeted',format='pp',file=name+'.pp')
+        for role,name in (('core','qshd'),('contexts','qshd_contexts'))}
+_SCHEMA=dict(schema=2,name='qshd-selinux',architecture='noarch',modules=_ROLES,authored_source_license='AGPL-3.0-only',
     reference_policy_source_license='GPL-2.0-or-later',
     combined_artifact_license='AGPL-3.0-only AND GPL-2.0-or-later',
     reference_policy_selected_terms='GPL-3.0 (GPL-2.0-or-later option; GNU GPLv3 section 13 combination)',
@@ -83,8 +84,13 @@ def _artifact(data):
     if type(value) is not dict or set(value)!=set(_SCHEMA)|{'policy_version'}:_fail('ARTIFACT_SCHEMA')
     for key,expected in _SCHEMA.items():
         if type(value[key]) is not type(expected) or value[key]!=expected:_fail('ARTIFACT_SCHEMA')
+    for role,identity in _ROLES.items():
+        actual=value['modules'][role]
+        if type(actual) is not dict or set(actual)!=set(identity):_fail('ARTIFACT_SCHEMA')
+        for key,expected in identity.items():
+            if type(actual[key]) is not type(expected) or actual[key]!=expected:_fail('ARTIFACT_SCHEMA')
     version=value['policy_version']
-    if type(version) is not str or re.fullmatch('[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}',version) is None:
+    if type(version) is not str or version!='0.3.0':
         _fail('ARTIFACT_SCHEMA')
     return version
 
@@ -103,12 +109,12 @@ def _imports(name,data):
             if (imported.startswith('qshd_selinux_') or imported=='stop_guard' or imported.startswith('stop_guard.')) and imported not in allowed:_fail('SOURCE_IMPORT')
 
 
-def _references(version,artifact,pp,pam):
+def _references(version,artifact,core_pp,contexts_pp,pam):
     try:text=pam.decode('utf-8')
     except UnicodeError:_fail('PAM_UTF8')
     if not 0<len(pam)<=4096:_fail('PAM_LIMIT')
-    values=dict(provider_version=version,manifest_sha256=hashlib.sha256(artifact).hexdigest(),
-                pp_sha256=hashlib.sha256(pp).hexdigest(),pam_sha256=_PAM_SHA,expected_pam=text)
+    values=dict(schema=2,provider_version=version,manifest_sha256=hashlib.sha256(artifact).hexdigest(),
+                core_pp_sha256=hashlib.sha256(core_pp).hexdigest(),contexts_pp_sha256=hashlib.sha256(contexts_pp).hexdigest(),pam_sha256=_PAM_SHA,expected_pam=text)
     return json.dumps(values,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n'
 
 
@@ -142,7 +148,7 @@ def _write_file(path,data,epoch):
     finally:os.close(fd)
 
 
-def assemble_payload(source,pp,artifact,pam,expected,output,epoch):
+def assemble_payload(source,core_pp,contexts_pp,artifact,pam,expected,output,epoch):
     """Return sorted relative-path/hash/size/mode records after complete staging.
 
     All inputs are validated before mkdir. Later IO errors leave partial staging
@@ -154,12 +160,12 @@ def assemble_payload(source,pp,artifact,pam,expected,output,epoch):
         expected=_expected(expected)
         source=Path(source)
         paths={name:source/name for name in MODULES}
-        paths.update({'qshd.pp':Path(pp),'artifact.json':Path(artifact),'qshd.fedora-selinux':Path(pam)})
+        paths.update({'qshd.pp':Path(core_pp),'qshd_contexts.pp':Path(contexts_pp),'artifact.json':Path(artifact),'qshd.fedora-selinux':Path(pam)})
         if len({str(path.resolve(strict=True)) for path in paths.values()})!=len(paths):_fail('INPUT_ALIAS')
         out=_output(source,paths.values(),output)
         data={}
         for name,path in paths.items():
-            limit=16*1024**2 if name=='qshd.pp' else 4096 if name=='qshd.fedora-selinux' else 65536
+            limit=16*1024**2 if name in ('qshd.pp','qshd_contexts.pp') else 4096 if name=='qshd.fedora-selinux' else 65536
             value=_read(path,limit)
             if hashlib.sha256(value).hexdigest()!=expected[name]:_fail('HASH_MISMATCH')
             data[name]=value
@@ -167,8 +173,8 @@ def assemble_payload(source,pp,artifact,pam,expected,output,epoch):
         if hashlib.sha256(data['qshd.fedora-selinux']).hexdigest()!=_PAM_SHA:_fail('CANONICAL_PAM')
         for name in MODULES:_imports(name,data[name])
         staged={'usr/libexec/qshd-selinux/'+name:data[name] for name in MODULES}
-        staged['usr/share/qshd-selinux/reference.json']=_references(version,data['artifact.json'],data['qshd.pp'],data['qshd.fedora-selinux'])
-        staged.update({'usr/share/qshd-selinux/'+name:data[name] for name in ('qshd.pp','artifact.json','qshd.fedora-selinux')})
+        staged['usr/share/qshd-selinux/reference.json']=_references(version,data['artifact.json'],data['qshd.pp'],data['qshd_contexts.pp'],data['qshd.fedora-selinux'])
+        staged.update({'usr/share/qshd-selinux/'+name:data[name] for name in ('qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux')})
         directories={out}
         for name in staged:
             parent=(out/name).parent
@@ -188,12 +194,12 @@ def assemble_payload(source,pp,artifact,pam,expected,output,epoch):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    for name in ('source','pp','artifact','pam','expected','output'):parser.add_argument('--'+name,type=Path,required=True)
+    for name in ('source','core-pp','contexts-pp','artifact','pam','expected','output'):parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--epoch',type=int,required=True)
     args=parser.parse_args()
     try:
         expected=json.loads(_read(args.expected,16384),object_pairs_hook=_pairs)
-        result=assemble_payload(args.source,args.pp,args.artifact,args.pam,expected,args.output,args.epoch)
+        result=assemble_payload(args.source,args.core_pp,args.contexts_pp,args.artifact,args.pam,expected,args.output,args.epoch)
         print(json.dumps(result,sort_keys=True,separators=(',',':')))
     except (ValueError,OSError,UnicodeError,RecursionError):
         parser.exit(1,'PAYLOAD_ASSEMBLY_REFUSED\n')

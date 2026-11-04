@@ -16,9 +16,9 @@ from qshd_selinux_activation import TrustedArtifact
 from qshd_selinux_fs import SafeFiles
 
 _SHARE='usr/share/qshd-selinux'
-_LIMITS={'reference.json':16384,'qshd.pp':16*1024**2,
+_LIMITS={'reference.json':16384,'qshd.pp':16*1024**2,'qshd_contexts.pp':16*1024**2,
          'artifact.json':65536,'qshd.fedora-selinux':4096}
-_KEYS={'provider_version','manifest_sha256','pp_sha256','pam_sha256','expected_pam'}
+_KEYS={'schema','provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256','pam_sha256','expected_pam'}
 
 
 class ReferenceError(ValueError):
@@ -39,9 +39,10 @@ def _pairs(items):
 def _document(raw):
     try:value=json.loads(raw.decode('utf-8'),object_pairs_hook=_pairs)
     except (ValueError,UnicodeError,RecursionError):raise ReferenceError('REFERENCE_JSON') from None
-    if type(value) is not dict or set(value)!=_KEYS or any(type(item) is not str for item in value.values()):
+    if (type(value) is not dict or set(value)!=_KEYS or type(value.get('schema')) is not int
+            or value['schema']!=2 or any(type(item) is not str for key,item in value.items() if key!='schema')):
         _fail('REFERENCE_SCHEMA')
-    artifact=TrustedArtifact(value['provider_version'],value['manifest_sha256'],value['pp_sha256'])
+    artifact=TrustedArtifact(value['provider_version'],value['manifest_sha256'],value['core_pp_sha256'],value['contexts_pp_sha256'])
     digest=value['pam_sha256']
     if len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):_fail('REFERENCE_DIGEST')
     try:pam=value['expected_pam'].encode('utf-8')
@@ -55,7 +56,8 @@ def _document(raw):
 class InstalledReferences:
     """Trusted assembled identities and copied bytes; not current installed state."""
     artifact: TrustedArtifact
-    pp_bytes: bytes
+    core_pp_bytes: bytes
+    contexts_pp_bytes: bytes
     expected_pam: bytes
 
 
@@ -103,12 +105,12 @@ class References(SafeFiles):
             if not value['data']:_fail('REFERENCE_EMPTY')
             snapshots[name]=value
         artifact,pam_digest,pam=_document(snapshots['reference.json']['data'])
-        for name,digest in [('qshd.pp',artifact.pp_sha256),('artifact.json',artifact.manifest_sha256),
+        for name,digest in [('qshd.pp',artifact.core_pp_sha256),('qshd_contexts.pp',artifact.contexts_pp_sha256),('artifact.json',artifact.manifest_sha256),
                             ('qshd.fedora-selinux',pam_digest)]:
             if hashlib.sha256(snapshots[name]['data']).hexdigest()!=digest:_fail('REFERENCE_HASH')
         if snapshots['qshd.fedora-selinux']['data']!=pam:_fail('PAM_BYTES')
         self._validate_directory_routes()
-        return InstalledReferences(artifact,snapshots['qshd.pp']['data'],pam),snapshots
+        return InstalledReferences(artifact,snapshots['qshd.pp']['data'],snapshots['qshd_contexts.pp']['data'],pam),snapshots
 
     def capture(self):
         if self._state!='open':

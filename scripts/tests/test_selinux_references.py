@@ -24,11 +24,12 @@ class ReferenceTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('builder',ROOT/'packaging/selinux/assemble_payload.py')
         self.builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.builder)
         self.pp=self.root/'qshd.pp';self.pp.write_bytes(b'inert synthetic reference PP\n')
+        self.contexts_pp=self.root/'qshd_contexts.pp';self.contexts_pp.write_bytes(b'inert contexts PP\n')
         self.artifact=ROOT/'packaging/selinux/artifact.json';self.pam=ROOT/'packaging/pam.d/qshd.fedora-selinux'
         source=ROOT/'packaging/selinux'
         expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in self.builder.MODULES}
-        expected.update({name:hashlib.sha256(path.read_bytes()).hexdigest() for name,path in [('qshd.pp',self.pp),('artifact.json',self.artifact),('qshd.fedora-selinux',self.pam)]})
-        self.builder.assemble_payload(source,self.pp,self.artifact,self.pam,expected,self.out,1000000000)
+        expected.update({name:hashlib.sha256(path.read_bytes()).hexdigest() for name,path in [('qshd.pp',self.pp),('qshd_contexts.pp',self.contexts_pp),('artifact.json',self.artifact),('qshd.fedora-selinux',self.pam)]})
+        self.builder.assemble_payload(source,self.pp,self.contexts_pp,self.artifact,self.pam,expected,self.out,1000000000)
         self.share=self.out/'usr/share/qshd-selinux'
     def reader(self):return m._testing_references(self.out)
     def document(self):return json.loads((self.share/'reference.json').read_bytes())
@@ -37,23 +38,24 @@ class ReferenceTests(unittest.TestCase):
     def test_actual_assembly_frozen_values_and_live_recheck(self):
         with self.reader() as reader:
             value=reader.capture();reader.recheck(value);reader.recheck(value)
-            self.assertEqual(value.artifact.provider_version,'0.2.0')
+            self.assertEqual(value.artifact.provider_version,'0.3.0')
             self.assertEqual(value.artifact.manifest_sha256,self.document()['manifest_sha256'])
-            self.assertEqual(value.pp_bytes,self.pp.read_bytes())
+            self.assertEqual(value.core_pp_bytes,self.pp.read_bytes())
+            self.assertEqual(value.contexts_pp_bytes,self.contexts_pp.read_bytes())
             self.assertEqual(value.expected_pam,self.pam.read_bytes())
-            with self.assertRaises(FrozenInstanceError):value.pp_bytes=b'changed'
+            with self.assertRaises(FrozenInstanceError):value.core_pp_bytes=b'changed'
         for action in (reader.capture,lambda:reader.recheck(value)):
             with self.assertRaises(m.ReferenceError):action()
     def test_each_reference_mismatch_refuses_without_minting_new_hashes(self):
-        for name in ('qshd.pp','artifact.json','qshd.fedora-selinux'):
+        for name in ('qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux'):
             path=self.share/name;original=path.read_bytes();path.write_bytes(original+b'changed')
             try:
                 with self.assertRaises(m.ReferenceError):
                     with self.reader() as reader:reader.capture()
             finally:path.write_bytes(original)
-    def test_strict_five_json_fields_scalars_duplicates_and_utf8(self):
+    def test_strict_pair_json_fields_scalars_duplicates_and_utf8(self):
         original=(self.share/'reference.json').read_bytes();valid=self.document()
-        invalid=[valid|{'extra':1},{k:v for k,v in valid.items() if k!='pp_sha256'},
+        invalid=[valid|{'extra':1},{k:v for k,v in valid.items() if k!='contexts_pp_sha256'},
                  valid|{'provider_version':True},valid|{'manifest_sha256':'not a digest'},
                  valid|{'expected_pam':['wrong']},valid|{'expected_pam':'\ud800'},
                  valid|{'expected_pam':'x'*4097}]
@@ -169,5 +171,37 @@ class ReferenceTests(unittest.TestCase):
         with patch.object(m.os,'fstat',side_effect=fault),self.assertRaises(m.ReferenceError):
             with self.reader() as reader:reader.capture()
         self.assertEqual(len(failed),1);self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+
+    def test_companion_absence_swap_replacement_and_legacy_reference_refuse(self):
+        path=self.share/'qshd_contexts.pp';original=path.read_bytes()
+        path.unlink()
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:reader.capture()
+        path.write_bytes(original);path.chmod(0o644)
+        core=self.share/'qshd.pp';core_bytes=core.read_bytes()
+        core.write_bytes(original);path.write_bytes(core_bytes)
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:reader.capture()
+        core.write_bytes(core_bytes);path.write_bytes(original)
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:
+                value=reader.capture();new=path.with_suffix('.new');new.write_bytes(original);new.chmod(0o644);new.replace(path)
+                reader.recheck(value)
+        value=self.document();value.pop('schema');value['pp_sha256']=value.pop('core_pp_sha256');value.pop('contexts_pp_sha256')
+        self.write_document(value)
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:reader.capture()
+
+    def test_companion_metadata_and_per_file_bound_without_large_read(self):
+        path=self.share/'qshd_contexts.pp';original=path.read_bytes()
+        path.chmod(0o666)
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:reader.capture()
+        path.chmod(0o644)
+        with path.open('wb') as stream:stream.truncate(16*1024**2+1)
+        with self.assertRaises(m.ReferenceError):
+            with self.reader() as reader:reader.capture()
+        path.write_bytes(original)
+        self.assertEqual(m._LIMITS['qshd.pp']+m._LIMITS['qshd_contexts.pp'],32*1024**2)
 
 if __name__=='__main__':unittest.main()

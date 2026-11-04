@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Authored qshd policy calls old-floor reference-policy interfaces; it does not
 # incorporate their implementations. One qshd_t covers daemon, helper and worker.
-policy_module(qshd, 0.2.0)
+policy_module(qshd, 0.3.0)
 
 type qshd_t;
 type qshd_exec_t;

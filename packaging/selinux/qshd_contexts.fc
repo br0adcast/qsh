@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+/usr/bin/qshd -- gen_context(system_u:object_r:qshd_exec_t,s0)
+/etc/qshd(/.*)? gen_context(system_u:object_r:qshd_config_t,s0)
+/var/log/qshd(/.*)? gen_context(system_u:object_r:qshd_log_t,s0)
+/run/qshd(/.*)? gen_context(system_u:object_r:qshd_runtime_t,s0)
+/var/run/qshd(/.*)? gen_context(system_u:object_r:qshd_runtime_t,s0)

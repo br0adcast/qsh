@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+policy_module(qshd_contexts, 0.3.0)
+
+gen_require(`
+    type qshd_exec_t;
+    type qshd_config_t;
+    type qshd_log_t;
+    type qshd_runtime_t;
+')

@@ -1,9 +1,9 @@
 # qshd SELinux policy source
 
 The authored files and build script are licensed under AGPL-3.0-only, like qsh.
-The policy source version is independently maintained at `0.2.0`; the eventual
+The policy source version is independently maintained at `0.3.0`; the eventual
 `qshd-selinux` noarch package version follows the source workspace version.
-The qualified module priority is **400**. This recipe compiles a module; it does
+The qualified module priority is **400**. This recipe compiles the fixed core/context pair; it does
 not install policy, change auditing, label files, modify PAM, or start services.
 
 The source implements the reviewed daemon, helper and worker domain contract.
@@ -101,16 +101,19 @@ Obtain `SOURCE_DATE_EPOCH` from the source commit, and `WORKSPACE_VERSION` from
 exist or overlap each other or the source directory. The selected RPM is freshly
 extracted and its Makefile is invoked with explicit `SHAREDIR`, `NAME=targeted`,
 `TYPE=mcs`, `DIRECT_INITRC=n`, explicit make/m4/gawk tool paths, `LC_ALL=C`,
-`TZ=UTC`, and the sole target `qshd.pp`. A minimal environment excludes inherited
+`TZ=UTC`, and the two explicit targets `qshd.pp` and `qshd_contexts.pp`. A minimal environment excludes inherited
 make macros (including `M4PARAM`), loader overrides and shell startup hooks.
 The pinned Makefile still supplies its own required MCS macro flags. Compilation never
 falls back to the host include tree. The builder validates PP v1, module format
-19, name/version and the exact embedded file-context rules. A semantic source
+19, MCS flags, exact role/name/version and the exact reviewed expanded file-context bytes.
+The core has no canonical mappings; its generated support comments/whitespace
+remain exact build inputs, not a permissive parser fallback. The require-only
+companion imports the four mapped core types without adding access rules. A semantic source
 fingerprint prevents unnoticed rule additions, including permissive/debug rules.
 Intentional policy changes require review and updating that maintained contract.
 
-Outputs are `qshd.pp`, expanded `qshd.fc`, and a source archive containing authored
-source, recipe (including the environment Dockerfile), pin manifest, project license, exact signed reference-policy source
+Outputs are `qshd.pp`, `qshd_contexts.pp`, expanded `qshd_contexts.fc`, and a source archive containing authored
+source (both `.te/.fc/.if` triplets), recipe (including the environment Dockerfile), pin manifest, project license, exact signed reference-policy source
 and devel RPMs, and applicable GPLv3 text. Compiler RPMs are pinned with upstream URLs but are
 external build tools and are not redistributed in this policy source archive. Archive order, ownership, modes, gzip
 header and mtimes are fixed. This controls the source archive format; it does not
@@ -146,7 +149,7 @@ source. `artifact.json` records the combined expression
 remain in the exact source RPM. Compiler binaries are not part of this combined
 artifact and are not included in the source archive.
 
-This recipe builds the module and corresponding source; RPM lifecycle
+This recipe builds the pair and corresponding source; RPM lifecycle
 integration is separate. It does not supply an RPM spec or runtime dependency
 capability names.
 The native RPM's Fedora 44 targeted-policy bounds and phase-specific dependency
@@ -155,34 +158,34 @@ activation is integrated.
 
 ## Installed maintenance phase entrypoint
 
-The staging payload includes 21 Python modules and four public data files. Its
-fixed entrypoint is `/usr/bin/python3 -I -B
-/usr/libexec/qshd-selinux/qshd_selinux_phase.py MODE`, where `MODE` is exactly
-`provider-post-pristine`, `consumer-pre-fresh`, `consumer-pre-installed`,
-`consumer-post-owned`, or `consumer-preun-final`. The first four select the
-maintained pristine bridge, fresh or installed consumer invalidation, and owned
-consumer completion respectively. They do not authorize service startup or
-supply RPM hooks.
+Task1 stages exactly 21 existing Python modules and five public data files
+(26 files total), including the core and contexts PPs. The independently
+reviewed assembly map has 25 hash inputs. `artifact.json` schema 2 fixes the two
+roles, names, priority 400, targeted store, PP format and policy version 0.3.0.
+Generated `reference.json` schema 2 binds both complete PP hashes and the
+canonical PAM file; protected readers copy and recheck both files separately.
+Neither a runtime-computed digest nor filesystem ownership creates trust.
 
-`consumer-preun-final` prepares final consumer removal: it validates the
-canonical installed consumer and publishes a fresh, read-back PENDING record,
-invalidating readiness. It does not itself remove files or policy. Choosing it
-for a final uninstall rather than for an old instance during an upgrade belongs
-to the future RPM recipe; the entrypoint does not interpret RPM arguments.
+Activation schema 2 uses `fedora44-targeted-pair-v2`, ABI 2 and query profile 1.
+It rejects old single-module records. COMPLETE binds both extracted HLL hashes
+and contexts; PENDING has no completion. A finite nonrecursive historical basis
+is separate from current readiness. Parsing this evidence never proves live
+module or policy state, and historical basis does not authorize repair.
 
-Execution requires the administrator's stop/drain and maintenance exclusion,
-trusted installed code and reference files, root, one thread, default SIGCHLD,
-and no existing children. Imports alone do not alter resource limits or custody.
-The dedicated entry process fixes CORE to zero, FSIZE to 16 MiB, AS to 1 GiB,
-NOFILE to 128 and CPU to 260 seconds. It loads only the explicit sibling module
-map, without adding the installation directory to Python's search path.
+The existing five-mode phase entry and single-module lifecycle callers have
+not yet been migrated to this pair authority. This Task1 staging cutpoint is
+not an operational installed payload: do not invoke it as a shipping lifecycle
+or wire RPM hooks until pair observation, install/reload, erase and final phase
+integration are complete. No placeholder modules are delivered to imply that
+future functionality exists. The existing phase deadlines/resources and its
+fixed sibling-import map remain unchanged in this stage.
 
-The original entry timestamp bounds library work to 240 seconds and the owned
-child to 250 seconds, with the existing ten-second cleanup allowance. Loading
-and setup consume that same budget. Only a normal settled child with the exact
-request-bound canonical response can succeed. Pre phases, including
-`consumer-preun-final`, return PENDING; post phases return COMPLETE after their
-maintained finalizers. Source controls do not establish installed-package or
-native lifecycle qualification; that remains a separate acceptance step. This
-is a staging payload, not a complete redistributable package or a replacement
-for its license/source-offer assets.
+Actual pinned pair construction and role/import/export inspection are a
+separate qualification gate. Synthetic header and staging tests are not compiler,
+link, load or HLL equality evidence. The small-base mechanism control cannot
+link the real core's many imports and is not full-pair qualification. Runtime
+acceptance still requires the supported Fedora 44 targeted environment, stopped
+and drained system service, stable policy/native windows and qualified normal
+cleanup. RPM recipes, service startup, migration and publication remain separate;
+the staging tree is not a complete redistributable package or a replacement for
+its license and source-offer assets.

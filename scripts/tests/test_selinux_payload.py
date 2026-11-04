@@ -22,11 +22,11 @@ class ImportClosureTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('payload',TOOL)
         self.m=importlib.util.module_from_spec(spec);spec.loader.exec_module(self.m)
 
-    def test_exact_twenty_one_code_modules_and_twenty_four_hash_keys(self):
+    def test_exact_twenty_one_code_modules_and_twenty_five_hash_keys(self):
         self.assertEqual(self.m.MODULES,NAMES)
         self.assertEqual(len(NAMES),21)
-        expected={name:'a'*64 for name in (*NAMES,'qshd.pp','artifact.json','qshd.fedora-selinux')}
-        self.assertEqual(len(expected),24)
+        expected={name:'a'*64 for name in (*NAMES,'qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux')}
+        self.assertEqual(len(expected),25)
         self.assertEqual(self.m._expected(expected),expected)
 
     def test_direct_stop_guard_imports_share_the_explicit_module_boundary(self):
@@ -49,14 +49,15 @@ class PayloadTests(unittest.TestCase):
         self.base=Path(self.tmp.name);self.source=self.base/'source';self.source.mkdir()
         for name in NAMES:shutil.copy2(ROOT/'packaging/selinux'/name,self.source/name)
         self.pp=self.base/'qshd.pp';self.pp.write_bytes(b'PUBLIC SYNTHETIC PP FOR INTEGRITY ONLY\n')
+        self.contexts_pp=self.base/'qshd_contexts.pp';self.contexts_pp.write_bytes(b'PUBLIC SYNTHETIC CONTEXTS PP FOR INTEGRITY ONLY\n')
         self.artifact=self.base/'artifact.json';shutil.copy2(ROOT/'packaging/selinux/artifact.json',self.artifact)
         self.pam=self.base/'qshd.fedora-selinux';shutil.copy2(ROOT/'packaging/pam.d/qshd.fedora-selinux',self.pam)
         self.expected={name:hashlib.sha256((self.source/name).read_bytes()).hexdigest() for name in NAMES}
-        self.expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (self.pp,self.artifact,self.pam)})
+        self.expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (self.pp,self.contexts_pp,self.artifact,self.pam)})
         self.output=self.base/'out'
 
     def assemble(self,output=None,expected=None,epoch=1000000000):
-        return self.m.assemble_payload(self.source,self.pp,self.artifact,self.pam,self.expected if expected is None else expected,self.output if output is None else output,epoch)
+        return self.m.assemble_payload(self.source,self.pp,self.contexts_pp,self.artifact,self.pam,self.expected if expected is None else expected,self.output if output is None else output,epoch)
 
     def tree(self,root):
         return {str(p.relative_to(root)):(p.read_bytes(),p.stat().st_mode&0o777,int(p.stat().st_mtime)) for p in root.rglob('*') if p.is_file()}
@@ -66,25 +67,27 @@ class PayloadTests(unittest.TestCase):
         (self.source/'__pycache__').mkdir();(self.source/'__pycache__/cache.pyc').write_bytes(b'decoy')
         before={p:(p.read_bytes(),p.stat().st_mode) for p in self.source.iterdir() if p.is_file()}
         inventory=self.assemble();other=self.base/'second';self.assertEqual(inventory,self.assemble(other))
-        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),25)
+        tree=self.tree(self.output);self.assertEqual(tree,self.tree(other));self.assertEqual(len(tree),26)
         prefix='usr/libexec/qshd-selinux/'
-        self.assertEqual(len(self.expected),24)
+        self.assertEqual(len(self.expected),25)
         self.assertEqual(set(tree),{prefix+name for name in NAMES}|{
             'usr/share/qshd-selinux/'+name for name in
-            ('reference.json','qshd.pp','artifact.json','qshd.fedora-selinux')})
+            ('reference.json','qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux')})
         self.assertEqual({item['path'] for item in inventory},set(tree))
         for item in inventory:
             value=tree[item['path']][0]
             self.assertEqual((item['sha256'],item['size'],item['mode']),
                              (hashlib.sha256(value).hexdigest(),len(value),0o644))
         for name in NAMES:self.assertEqual(tree[prefix+name][0],(self.source/name).read_bytes())
-        for path in (self.pp,self.artifact,self.pam):self.assertEqual(tree['usr/share/qshd-selinux/'+path.name][0],path.read_bytes())
+        for path in (self.pp,self.contexts_pp,self.artifact,self.pam):self.assertEqual(tree['usr/share/qshd-selinux/'+path.name][0],path.read_bytes())
         generated=tree['usr/share/qshd-selinux/reference.json'][0]
         constants=json.loads(generated)
-        self.assertEqual(set(constants),{'provider_version','manifest_sha256','pp_sha256','pam_sha256','expected_pam'})
-        self.assertEqual(constants['provider_version'],'0.2.0')
+        self.assertEqual(set(constants),{'schema','provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256','pam_sha256','expected_pam'})
+        self.assertEqual(constants['provider_version'],'0.3.0')
         self.assertEqual(constants['manifest_sha256'],self.expected['artifact.json'])
-        self.assertEqual(constants['pp_sha256'],self.expected['qshd.pp'])
+        self.assertEqual(constants['core_pp_sha256'],self.expected['qshd.pp'])
+        self.assertEqual(constants['schema'],2)
+        self.assertEqual(constants['contexts_pp_sha256'],self.expected['qshd_contexts.pp'])
         self.assertEqual(constants['pam_sha256'],hashlib.sha256(self.pam.read_bytes()).hexdigest())
         self.assertEqual(constants['expected_pam'].encode('utf-8'),self.pam.read_bytes())
         self.assertNotIn(prefix+'qshd_selinux_reference.py',tree)
@@ -166,6 +169,28 @@ class PayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'^SOURCE_IMPORT$'):self.assemble()
         self.assertFalse(self.output.exists())
 
+    def test_pair_role_hash_absence_and_manifest_schema_refuse_before_output(self):
+        core=self.pp.read_bytes();contexts=self.contexts_pp.read_bytes()
+        self.pp.write_bytes(contexts);self.contexts_pp.write_bytes(core)
+        with self.assertRaisesRegex(ValueError,'^HASH_MISMATCH$'):self.assemble()
+        self.assertFalse(self.output.exists())
+        self.pp.write_bytes(core);self.contexts_pp.write_bytes(contexts)
+        self.contexts_pp.unlink()
+        with self.assertRaises(ValueError):self.assemble()
+        self.assertFalse(self.output.exists());self.contexts_pp.write_bytes(contexts)
+        original=self.artifact.read_bytes()
+        for mutate in (lambda x:x.update(schema=1),lambda x:x['modules']['contexts'].update(name='qshd'),
+                       lambda x:x['modules']['core'].update(priority=400.0),
+                       lambda x:x['modules'].update(future=x['modules']['core']),
+                       lambda x:x.update(policy_module='qshd')):
+            value=json.loads(original);mutate(value);self.artifact.write_text(json.dumps(value))
+            self.expected['artifact.json']=hashlib.sha256(self.artifact.read_bytes()).hexdigest()
+            with self.assertRaisesRegex(ValueError,'^ARTIFACT_SCHEMA$'):self.assemble()
+            self.assertFalse(self.output.exists())
+        self.artifact.write_bytes(original);self.expected['artifact.json']=hashlib.sha256(original).hexdigest()
+        for source in (b'import qshd_selinux_retained_labels',b'import qshd_selinux_provider_erase'):
+            with self.assertRaisesRegex(ValueError,'^SOURCE_IMPORT$'):self.m._imports('qshd_selinux_phase.py',source)
+
     def test_output_existing_overlap_and_symlink_ancestor_into_input_refuse(self):
         self.output.mkdir()
         with self.assertRaises(ValueError):self.assemble()
@@ -196,8 +221,8 @@ class PayloadTests(unittest.TestCase):
     def test_restrictive_umask_and_cli_do_not_mutate_process_globals(self):
         expected=self.base/'expected.json';expected.write_text(json.dumps(self.expected))
         code="import os,runpy,sys;os.umask(0o077);sys.argv=sys.argv[1:];runpy.run_path(sys.argv[0],run_name='__main__')"
-        p=subprocess.run([sys.executable,'-I','-B','-c',code,str(TOOL),'--source',str(self.source),'--pp',str(self.pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
-        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),25)
+        p=subprocess.run([sys.executable,'-I','-B','-c',code,str(TOOL),'--source',str(self.source),'--core-pp',str(self.pp),'--contexts-pp',str(self.contexts_pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
+        self.assertEqual(p.returncode,0,p.stderr);self.assertEqual(len(json.loads(p.stdout)),26)
         self.assertTrue(all(v[1]==0o644 for v in self.tree(self.output).values()))
         self.assertTrue(all(p.stat().st_mode&0o777==0o755 for p in [self.output,*[p for p in self.output.rglob('*') if p.is_dir()]]))
 
@@ -206,7 +231,7 @@ class PayloadTests(unittest.TestCase):
             with self.subTest(epoch=epoch),self.assertRaises(ValueError):self.assemble(epoch=epoch)
             self.assertFalse(self.output.exists())
         expected=self.base/'expected.json';expected.write_text('{"qshd.pp":"'+('a'*64)+'","qshd.pp":"'+('b'*64)+'"}')
-        p=subprocess.run([sys.executable,'-I','-B',str(TOOL),'--source',str(self.source),'--pp',str(self.pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
+        p=subprocess.run([sys.executable,'-I','-B',str(TOOL),'--source',str(self.source),'--core-pp',str(self.pp),'--contexts-pp',str(self.contexts_pp),'--artifact',str(self.artifact),'--pam',str(self.pam),'--expected',str(expected),'--output',str(self.output),'--epoch','1000000000'],capture_output=True,text=True,timeout=10)
         self.assertEqual(p.returncode,1);self.assertEqual(p.stdout,'')
         self.assertEqual(p.stderr,'PAYLOAD_ASSEMBLY_REFUSED\n');self.assertFalse(self.output.exists())
 
