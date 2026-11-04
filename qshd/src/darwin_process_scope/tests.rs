@@ -629,35 +629,6 @@ fn darwin223_leader_exit_racing_token_waits_for_next_actual_observation() {
 }
 
 #[test]
-fn darwin223_runtime_row_requires_exact_patched_build_and_native_architecture() {
-    let version =
-        "Darwin Kernel Version 24.6.0: date; root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
-    assert!(runtime_contract("24.6.0", version, "24H232", "arm64", "aarch64").is_some());
-    for (release, version, build, machine, arch) in [
-        ("24.6.1", version, "24H232", "arm64", "aarch64"),
-        ("24.6.0", version, "24H233", "arm64", "aarch64"),
-        ("24.6.0", version, "24H232", "x86_64", "x86_64"),
-        ("24.6.0", version, "24H232", "arm64", "x86_64"),
-        (
-            "24.6.0",
-            "root:xnu-11417.140.69.713.47~20/RELEASE_ARM64_VMAPPLE",
-            "24H232",
-            "arm64",
-            "aarch64",
-        ),
-        (
-            "24.6.0",
-            "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE root:xnu-other",
-            "24H232",
-            "arm64",
-            "aarch64",
-        ),
-    ] {
-        assert!(runtime_contract(release, version, build, machine, arch).is_none());
-    }
-}
-
-#[test]
 fn darwin223_completion_exposes_same_call_capacity_evidence() {
     let mut model = Model::new(vec![process(10, 100, 10)]);
     let mut scope = owner();
@@ -675,91 +646,6 @@ fn darwin223_candidate_receipt_is_published_only_after_actual_reap() {
     model.remove(11);
     assert_eq!(scope.step(&mut model), Progress::Complete(0));
     assert_eq!(scope.discharged_for_test(), (1, 0));
-}
-
-#[test]
-fn darwin223_runtime_intel_candidate_requires_exact_cross_row_identity() {
-    let intel = "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64";
-    let arm = "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
-    assert!(runtime_contract("24.6.0", intel, "24G830", "x86_64", "x86_64").is_some());
-    for version in [arm, intel] {
-        for build in ["24H232", "24G830"] {
-            for machine in ["arm64", "x86_64"] {
-                for arch in ["aarch64", "x86_64"] {
-                    let expected = (version == arm
-                        && build == "24H232"
-                        && machine == "arm64"
-                        && arch == "aarch64")
-                        || (version == intel
-                            && build == "24G830"
-                            && machine == "x86_64"
-                            && arch == "x86_64");
-                    assert_eq!(
-                        runtime_contract("24.6.0", version, build, machine, arch).is_some(),
-                        expected
-                    );
-                }
-            }
-        }
-    }
-    for (release, version, build, machine, arch) in [
-        ("24.6.1", intel, "24G830", "x86_64", "x86_64"),
-        ("24.6.0", intel, "24G831", "x86_64", "x86_64"),
-        (
-            "24.6.0",
-            "root:xnu-11417.140.69.711.44~10/RELEASE_X86_64",
-            "24G830",
-            "x86_64",
-            "x86_64",
-        ),
-        (
-            "24.6.0",
-            "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-other",
-            "24G830",
-            "x86_64",
-            "x86_64",
-        ),
-        (
-            "24.6.0",
-            "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
-            "24G830",
-            "x86_64",
-            "x86_64",
-        ),
-    ] {
-        assert!(runtime_contract(release, version, build, machine, arch).is_none());
-    }
-}
-
-#[test]
-fn darwin223_runtime_receipt_uses_selected_fixed_row() {
-    let arm = runtime_contract(
-        "24.6.0",
-        "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE",
-        "24H232",
-        "arm64",
-        "aarch64",
-    )
-    .unwrap();
-    let intel = runtime_contract(
-        "24.6.0",
-        "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
-        "24G830",
-        "x86_64",
-        "x86_64",
-    )
-    .unwrap();
-    assert_ne!(arm.id, intel.id);
-    assert_eq!(
-        arm.receipt(),
-        "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional"
-    );
-    assert_eq!(
-        intel.receipt(),
-        "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional"
-    );
-    assert!(!intel.receipt().contains("ARM64"));
-    assert!(intel.receipt().len() < 1024);
 }
 
 // Mirrors the production post-handshake constructor with original child custody.
@@ -1047,4 +933,215 @@ fn darwin223_mismatching_consuming_status_permanently_loses_wait_authority() {
     assert_eq!(scope.step(&mut model), Progress::Unknown);
     assert_eq!(model.reaps, 1);
     assert!(model.signals.is_empty());
+}
+
+#[test]
+fn darwin223_family_accepts_observed_non_ci_hardware_build() {
+    let version = "Darwin Kernel Version 24.5.1: controlled date root:xnu-11417.140.69.999~3/RELEASE_ARM64_T6000";
+    assert!(runtime_contract("24.5.1", version, "24F123", "arm64", "aarch64").is_some());
+}
+
+fn observed_version(release: &str, kernel: &str) -> String {
+    format!("Darwin Kernel Version {release}: controlled build description root:xnu-{kernel}")
+}
+#[test]
+fn darwin223_family_exact_bases_vendor_revisions_and_native_architectures() {
+    for (base, release, build, id) in [
+        (
+            "10063.141.1",
+            "23.6.0",
+            "23G123",
+            "xnu-10063.141.1-conditional-v1",
+        ),
+        (
+            "11417.140.69",
+            "24.5.1",
+            "24F123",
+            "xnu-11417.140.69-conditional-v1",
+        ),
+    ] {
+        for (machine, arch, flavor) in [
+            ("arm64", "aarch64", "ARM64"),
+            ("x86_64", "x86_64", "X86_64"),
+        ] {
+            for revision in ["", ".1", ".999.04"] {
+                for hardware in ["", "_VMAPPLE", "_T6000_123"] {
+                    let token = format!("{base}{revision}~3/RELEASE_{flavor}{hardware}");
+                    let observed = runtime_contract(
+                        release,
+                        &observed_version(release, &token),
+                        build,
+                        machine,
+                        arch,
+                    )
+                    .unwrap();
+                    assert_eq!(observed.family.id, id);
+                    assert_eq!(observed.family.public_source, format!("xnu-{base}"));
+                    assert_eq!(observed.kernel_token, token);
+                    assert!(observed.receipt().len() < 1024);
+                }
+            }
+        }
+    }
+    assert_ne!(SOURCE_FAMILIES[0].id, SOURCE_FAMILIES[1].id);
+}
+#[test]
+fn darwin223_family_refuses_malformed_uncovered_or_injected_observations() {
+    let release = "24.6.0";
+    let token = "11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
+    let version = observed_version(release, token);
+    let baseline = [
+        release.to_string(),
+        version.clone(),
+        "24H232".into(),
+        "arm64".into(),
+        "aarch64".into(),
+    ];
+    let rejected = |fields: &[String; 5]| {
+        assert!(
+            runtime_contract(&fields[0], &fields[1], &fields[2], &fields[3], &fields[4]).is_none(),
+            "{fields:?}"
+        )
+    };
+    for (field, maximum) in [(0, 63), (1, 511), (2, 63), (3, 31)] {
+        for replacement in [
+            String::new(),
+            "x".repeat(maximum + 1),
+            " nonempty".into(),
+            "nonempty ".into(),
+            "é".into(),
+        ] {
+            let mut fields = baseline.clone();
+            fields[field] = replacement;
+            rejected(&fields);
+        }
+        for control in [0u8, 9, 10, 13, 27, 31, 127] {
+            let mut fields = baseline.clone();
+            fields[field].push(char::from(control));
+            rejected(&fields);
+        }
+    }
+    // Preserve otherwise-valid syntax so description validation and caps are causal.
+    for description in [
+        "private\tcanary",
+        "private\ncanary",
+        "private\0canary",
+        "privateécanary",
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = format!("Darwin Kernel Version {release}: {description} root:xnu-{token}");
+        rejected(&fields);
+    }
+    let mut fields = baseline.clone();
+    let prefix = format!("Darwin Kernel Version {release}: ");
+    let tail = format!(" root:xnu-{token}");
+    fields[1] = format!(
+        "{prefix}{}{tail}",
+        "X".repeat(512 - prefix.len() - tail.len())
+    );
+    assert_eq!(fields[1].len(), 512);
+    rejected(&fields);
+    fields = baseline.clone();
+    fields[0] = format!("24.{}.0", "1".repeat(59));
+    fields[1] = observed_version(&fields[0], token);
+    assert_eq!(fields[0].len(), 64);
+    rejected(&fields);
+    fields = baseline.clone();
+    fields[2] = format!("24A{}", "X".repeat(61));
+    assert_eq!(fields[2].len(), 64);
+    rejected(&fields);
+    for release in [
+        "24", "24.6", "24.6.0.1", "24..0", "24.a.0", "23.6.0", "25.0.0", "024.6.0", "24.6.1",
+    ] {
+        let mut fields = baseline.clone();
+        fields[0] = release.into();
+        rejected(&fields);
+    }
+    for build in ["24", "24G", "24g123", "23G123", "24G1-", "24G 123"] {
+        let mut fields = baseline.clone();
+        fields[2] = build.into();
+        rejected(&fields);
+    }
+    for token in [
+        "11417.140.690~2/RELEASE_ARM64",
+        "11417.140.68~2/RELEASE_ARM64",
+        "11417.141.69~2/RELEASE_ARM64",
+        "10063.141.10~2/RELEASE_ARM64",
+        "10063.141.1~2/RELEASE_ARM64",
+        "11417.140.69.~2/RELEASE_ARM64",
+        "11417.140.69..1~2/RELEASE_ARM64",
+        "11417.140.69.a~2/RELEASE_ARM64",
+        "11417.140.69/RELEASE_ARM64",
+        "11417.140.69~/RELEASE_ARM64",
+        "11417.140.69~a/RELEASE_ARM64",
+        "11417.140.69~2~3/RELEASE_ARM64",
+        "11417.140.69~2/RELEASE_ARM64/EXTRA",
+        "11417.140.69~2/DEBUG_ARM64",
+        "11417.140.69~2/DEVELOPMENT_ARM64",
+        "11417.140.69~2/RELEASE_ARM640",
+        "11417.140.69~2/RELEASE_ARM64_",
+        "11417.140.69~2/RELEASE_ARM64__T6000",
+        "11417.140.69~2/RELEASE_ARM64_T6000_",
+        "11417.140.69~2/RELEASE_ARM64_vmapple",
+        "11417.140.69~2/RELEASE_X86_64",
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = observed_version(release, token);
+        rejected(&fields);
+    }
+    for version in [
+        format!("root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}:  root:xnu-{token}"),
+        format!("{version} trailing"),
+        format!("{version} root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: embedded-root:xnu-other root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: description embedded-root:xnu-{token}"),
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = version;
+        rejected(&fields);
+    }
+    for (machine, arch) in [
+        ("arm64", "x86_64"),
+        ("x86_64", "aarch64"),
+        ("x86_64", "x86_64"),
+        ("arm64e", "aarch64"),
+        ("arm64", "unknown"),
+    ] {
+        let mut fields = baseline.clone();
+        fields[3] = machine.into();
+        fields[4] = arch.into();
+        rejected(&fields);
+    }
+}
+#[test]
+fn darwin223_family_receipt_owns_actual_metadata_and_preserves_ci_text() {
+    for (build, kernel, machine, arch, expected) in [
+        ("24H232", "11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE", "arm64", "aarch64", "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional"),
+        ("24G830", "11417.140.69.711.44~1/RELEASE_X86_64", "x86_64", "x86_64", "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional"),
+    ] {
+        let observed=runtime_contract("24.6.0", &observed_version("24.6.0",kernel),build,machine,arch).unwrap();
+        assert_eq!(observed.receipt(),expected);
+    }
+    let mut version="Darwin Kernel Version 23.6.1: PRIVATE_DESCRIPTION_CANARY root:xnu-10063.141.1.999~7/RELEASE_ARM64_T8103".to_string();
+    let observed = runtime_contract("23.6.1", &version, "23G456a", "arm64", "aarch64").unwrap();
+    version.clear();
+    assert_eq!(observed.receipt(), "darwin223 public_source=xnu-10063.141.1 runtime_release=23.6.1 os_build=23G456a kernel_build=10063.141.1.999~7/RELEASE_ARM64_T8103 machine=arm64 native_arch=aarch64 premise=conditional");
+    assert!(!observed.receipt().contains("PRIVATE_DESCRIPTION_CANARY"));
+    assert!(!observed.receipt().contains("24H232"));
+    let release = format!("24.{}.0", "1".repeat(58));
+    assert_eq!(release.len(), 63);
+    let prefix = format!("Darwin Kernel Version {release}: ");
+    let token = "root:xnu-11417.140.69~1/RELEASE_ARM64";
+    let version = format!(
+        "{prefix}{} {token}",
+        "X".repeat(511 - prefix.len() - 1 - token.len())
+    );
+    let build = format!("24A{}", "X".repeat(60));
+    assert_eq!(version.len(), 511);
+    assert_eq!(build.len(), 63);
+    let maximal = runtime_contract(&release, &version, &build, "arm64", "aarch64").unwrap();
+    assert!(maximal.receipt().len() < 1024);
+    assert!(!maximal.receipt().contains(&"X".repeat(100)));
 }

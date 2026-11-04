@@ -106,44 +106,57 @@ pub(crate) use native::{own_child, prepare};
 #[cfg(all(test, target_os = "macos"))]
 mod native_tests;
 
-/// Finite reviewed runtime candidates, pending actual production-path CI. The
-/// public source tag and observed patched builds are deliberately separate.
+/// Reviewed public source bases under the conditional semantic-preservation premise.
+/// Observed host metadata is evidence, never a replacement for this static authority.
 #[derive(Debug, PartialEq, Eq)]
-struct RuntimeContract {
+struct SourceFamily {
     id: &'static str,
-    release: &'static str,
-    build: &'static str,
-    kernel_token: &'static str,
-    machine: &'static str,
-    native_arch: &'static str,
+    public_source: &'static str,
+    base: &'static str,
+    major: &'static str,
 }
-const RUNTIME_CONTRACTS: [RuntimeContract; 2] = [
-    RuntimeContract {
-        id: "xnu-11417.140.69-darwin24.6.0-24H232-arm64-vmapple",
-        release: "24.6.0",
-        build: "24H232",
-        kernel_token: "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE",
-        machine: "arm64",
-        native_arch: "aarch64",
+const SOURCE_FAMILIES: [SourceFamily; 2] = [
+    SourceFamily {
+        id: "xnu-10063.141.1-conditional-v1",
+        public_source: "xnu-10063.141.1",
+        base: "10063.141.1",
+        major: "23",
     },
-    RuntimeContract {
-        id: "xnu-11417.140.69-darwin24.6.0-24G830-x86_64",
-        release: "24.6.0",
-        build: "24G830",
-        kernel_token: "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
-        machine: "x86_64",
-        native_arch: "x86_64",
+    SourceFamily {
+        id: "xnu-11417.140.69-conditional-v1",
+        public_source: "xnu-11417.140.69",
+        base: "11417.140.69",
+        major: "24",
     },
 ];
+#[derive(Debug, PartialEq, Eq)]
+struct ObservedRuntime {
+    family: &'static SourceFamily,
+    release: String,
+    build: String,
+    kernel_token: String,
+    machine: String,
+    native_arch: String,
+}
 #[cfg(test)]
-impl RuntimeContract {
+impl ObservedRuntime {
     fn receipt(&self) -> String {
         format!(
-            "darwin223 public_source=xnu-11417.140.69 runtime_release={} os_build={} kernel_build={} machine={} native_arch={} premise=conditional",
-            self.release, self.build, self.kernel_token.trim_start_matches("root:xnu-"),
-            self.machine, self.native_arch,
+            "darwin223 public_source={} runtime_release={} os_build={} kernel_build={} machine={} native_arch={} premise=conditional",
+            self.family.public_source, self.release, self.build,
+            self.kernel_token, self.machine, self.native_arch,
         )
     }
+}
+fn bounded_text(value: &str, limit: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= limit
+        && value.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+        && !value.starts_with(' ')
+        && !value.ends_with(' ')
+}
+fn decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 fn runtime_contract(
     release: &str,
@@ -151,19 +164,70 @@ fn runtime_contract(
     build: &str,
     machine: &str,
     native_arch: &str,
-) -> Option<&'static RuntimeContract> {
-    let mut tokens = version
-        .split_ascii_whitespace()
-        .filter(|word| word.starts_with("root:xnu-"));
-    let token = tokens.next()?;
-    if tokens.next().is_some() {
+) -> Option<ObservedRuntime> {
+    if !bounded_text(release, 63)
+        || !bounded_text(version, 511)
+        || !bounded_text(build, 63)
+        || !bounded_text(machine, 31)
+        || !matches!(native_arch, "aarch64" | "x86_64")
+    {
         return None;
     }
-    RUNTIME_CONTRACTS.iter().find(|row| {
-        release == row.release
-            && build == row.build
-            && token == row.kernel_token
-            && machine == row.machine
-            && native_arch == row.native_arch
+    let release_parts: Vec<_> = release.split('.').collect();
+    if release_parts.len() != 3 || !release_parts.iter().all(|part| decimal(part)) {
+        return None;
+    }
+    let prefix = format!("Darwin Kernel Version {release}: ");
+    let rest = version.strip_prefix(&prefix)?;
+    let (description, token) = rest.rsplit_once(' ')?;
+    if description.trim().is_empty() || version.matches("root:xnu-").count() != 1 {
+        return None;
+    }
+    let kernel = token.strip_prefix("root:xnu-")?;
+    let (revision, flavor) = kernel.split_once('/')?;
+    let (revision, build_number) = revision.split_once('~')?;
+    if !decimal(build_number) {
+        return None;
+    }
+    let parts: Vec<_> = revision.split('.').collect();
+    if parts.len() < 3 || !parts.iter().all(|part| decimal(part)) {
+        return None;
+    }
+    let family = SOURCE_FAMILIES
+        .iter()
+        .find(|family| family.base == parts[..3].join(".") && family.major == release_parts[0])?;
+    let build_suffix = build.strip_prefix(family.major)?;
+    if build_suffix.len() < 2
+        || !build_suffix.as_bytes()[0].is_ascii_uppercase()
+        || !build_suffix[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let suffix = if machine == "arm64" && native_arch == "aarch64" {
+        flavor.strip_prefix("RELEASE_ARM64")?
+    } else if machine == "x86_64" && native_arch == "x86_64" {
+        flavor.strip_prefix("RELEASE_X86_64")?
+    } else {
+        return None;
+    };
+    if !suffix.is_empty()
+        && !suffix.strip_prefix('_')?.split('_').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some(ObservedRuntime {
+        family,
+        release: release.into(),
+        build: build.into(),
+        kernel_token: kernel.into(),
+        machine: machine.into(),
+        native_arch: native_arch.into(),
     })
 }

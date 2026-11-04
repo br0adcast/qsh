@@ -134,7 +134,7 @@ pub(crate) fn prepare() -> Result<QualifiedDarwin, AdmissionError> {
     #[cfg(test)]
     eprintln!("{}", contract.receipt());
     Ok(QualifiedDarwin {
-        contract: contract.id,
+        contract: contract.family.id,
     })
 }
 pub(super) struct Watch {
