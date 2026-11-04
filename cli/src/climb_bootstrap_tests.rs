@@ -27,11 +27,17 @@ fn fixture(keys: &[[u8; 32]]) -> (tempfile::TempDir, fake::FakeServer, Setup) {
         ssh_key::Algorithm::Ed25519,
     )
     .unwrap();
-    std::fs::write(
-        &identity,
-        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&identity)
+        .unwrap()
+        .write_all(key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes())
+        .unwrap();
     let hosts = KnownHosts::new(home.path().join("ssh_known_hosts"), None);
     hosts
         .add(

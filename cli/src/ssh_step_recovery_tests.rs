@@ -26,14 +26,22 @@ fn attempt_sources(
         ssh_key::Algorithm::Ed25519,
     )
     .unwrap();
-    std::fs::write(
-        &identity,
-        private
-            .to_openssh(ssh_key::LineEnding::LF)
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&identity)
+        .unwrap()
+        .write_all(
+            private
+                .to_openssh(ssh_key::LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
     let known = KnownHosts::new(home.join("known_hosts"), None);
     let tty = Tty::at(home.join("no-tty"));
     let step = SshStep {

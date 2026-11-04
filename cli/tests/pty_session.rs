@@ -220,7 +220,7 @@ fn an_unauthorised_key_is_refused_with_code_twelve() {
     )
     .expect("generate");
     let stranger_path = config.path().join("stranger");
-    std::fs::write(
+    support::write_private(
         &stranger_path,
         stranger
             .to_openssh(ssh_key::LineEnding::LF)
@@ -309,7 +309,7 @@ fn ctrl_c_at_a_passphrase_question_leaves_echo_on() {
     )
     .expect("encrypt");
     let locked = config.path().join("locked");
-    std::fs::write(
+    support::write_private(
         &locked,
         key.to_openssh(ssh_key::LineEnding::LF)
             .expect("encode")

@@ -63,7 +63,7 @@ fn key(home: &Path) -> (PathBuf, String) {
     )
     .unwrap();
     let path = home.join("identity");
-    std::fs::write(
+    support::write_private(
         &path,
         key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
     )

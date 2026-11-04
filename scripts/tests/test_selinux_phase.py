@@ -291,6 +291,27 @@ class FailureSafetyTests(unittest.TestCase):
             newer=Private('PRIVATE');newer.__context__=current;current=newer
         self.assertEqual(len(self.phase._parse_failure(self.phase._failure(current,self.request),self.request)['codes']),8)
 
+    def test_unknown_launch_census_keeps_null_command_and_known_count_is_bounded(self):
+        import qshd_selinux_process as process
+        limits = process._Limits(15, 1024**2)
+        for children in (None, (98765,)):
+            with self.subTest(known=children is not None):
+                outcome = process._Outcome(b'PRIVATE_STDOUT', b'PRIVATE_STDERR',
+                    None, 'COMMAND_UNSETTLED', False, children)
+                summary = process._failure_summary(outcome, limits)
+                error = process._CommandError('COMMAND_UNSETTLED', summary=summary)
+                raw = self.phase._failure(error, self.request)
+                parsed = self.phase._parse_failure(raw, self.request)
+                self.assertEqual(parsed['codes'], ['COMMAND_UNSETTLED'])
+                if children is None:
+                    self.assertIsNone(summary)
+                    self.assertIsNone(parsed['command'])
+                else:
+                    self.assertEqual(parsed['command']['unreaped'], 1)
+                    self.assertFalse(parsed['command']['settled'])
+                self.assertNotIn(b'98765', raw)
+                self.assertNotIn(b'PRIVATE', raw)
+
     def test_actual_summary_types_and_outcome_categories_cannot_leak_streams(self):
         from dataclasses import FrozenInstanceError
         import qshd_selinux_process as process
