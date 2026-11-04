@@ -59,6 +59,20 @@ account on the machine can log in with its own key, the way `sshd` does.
 See "System mode" further down for the whole difference; until then, "the
 daemon" below means the personal one.
 
+## Personal-mode file creation permissions
+
+A personal daemon inherits the umask of the process that launches it on the
+server. Shell and Command channels inherit that mask; a shell's startup files
+or the command itself may change it. An SSH exec launcher's policy may differ
+from an interactive login shell's policy.
+
+Reusing a running daemon and updating it through exec preserve its established
+mask. A genuine fresh launch adopts its new launcher's mask. Older detached
+daemons that forced `027` retain `027` through updates; stop them and start a
+fresh daemon to adopt another launcher mask. Private host keys, logs and control
+artifacts retain their explicit permissions even with a permissive mask. System
+mode continues to use its separate account and PAM session policy.
+
 ## Command line
 
 ```
