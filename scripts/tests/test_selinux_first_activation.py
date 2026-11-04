@@ -785,3 +785,68 @@ class ProviderUpgradeTests(unittest.TestCase):
         self.replace_references(incoming);self.b.hll_override='1'*64
         with self.assertRaises(c.CoordinatorError):self.coordinator().activate_installed_owned_provider(deadline=1000)
         self.assertEqual(len(self.calls),1);self.assertEqual(self.b.record().state,'PENDING')
+
+
+class OwnedPostRegistryLifecycleTests(unittest.TestCase):
+    """Actual Registry/Transaction admission, stopped before any policy reload."""
+    def setUp(self):
+        from scripts.tests.test_selinux_provider_erase import RegistryBridgeTests,EraseBindings
+        RegistryBridgeTests.setUp(self);self.b=EraseBindings(self)
+        self.reloads=[]
+        from qshd_selinux_first_activation import _pending
+        with self.b.package_engine().operation():
+            with self.b.slot_engine().writer() as writer:
+                current=writer.capture_current()
+                pending=_pending(self.b.trust,'provider-refresh',c.HistoricalBasis(self.b.trust,current.record.completion))
+                writer.begin_pending(c._json(asdict(pending)),current)
+        # Optional installed-consumer manifest is actually absent on this layout.
+        (self.root/'usr/share').mkdir(mode=0o755,exist_ok=True)
+        import qshd_selinux_rpm_query as rpm
+        self.b.consumer_selection=lambda deadline:rpm.ConsumerAuthorityReader(_root=self.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.b.now).selection(deadline=deadline)
+        test=self
+        class ReloadBoundary(BaseException):pass
+        self.ReloadBoundary=ReloadBoundary
+        class Reload:
+            def reload(inner,*,deadline,old_check):
+                test.assertEqual(deadline,test.b.end)
+                test.assertTrue(callable(old_check))
+                test.assertEqual(test.b.active,{'package','references','activation','contexts','consumer','rpm','install retained'})
+                test.reloads.append(deadline)
+                raise ReloadBoundary()
+        self.b.reloader=lambda *args:Reload()
+        self.b.events=[]
+
+    def test_real_fresh_registry_lease_is_routed_and_rechecked_before_reload_boundary(self):
+        import qshd_selinux_registry as registry
+        import qshd_selinux_transaction as transaction
+        self.assertTrue(Path(registry.__file__).is_relative_to(Path(__file__).resolve().parents[2]))
+        self.assertTrue(Path(transaction.__file__).is_relative_to(Path(__file__).resolve().parents[2]))
+        with self.assertRaises(self.ReloadBoundary):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_owned_provider(deadline=self.b.end)
+        self.assertEqual(self.reloads,[self.b.end])
+        self.assertEqual(self.b.registry_count,2)
+        self.assertEqual(sum(kind=='registry1' for kind,end,start in self.b.commands),9)
+        self.assertEqual(sum(kind=='registry2' for kind,end,start in self.b.commands),9)
+        self.assertEqual(self.b.record().state,'PENDING')
+        self.assertEqual(self.b.record().intent,'provider-refresh')
+        self.assertIn('registry2 exit',self.b.events)
+        self.assertEqual(self.b.shared,[]) # No native owner was entered or claimed.
+        self.assertEqual(self.b.active,set())
+        self.assertTrue(all(end<=self.b.end for kind,end,start in self.b.commands))
+
+    def test_real_second_lease_routing_change_refuses_before_pending_refresh_or_reload(self):
+        before=self.b.record()
+        def change(event):
+            if event=='registry2 enter':self.runner.mapping[self.paths[1]]='container-selinux'
+        self.b.action=change
+        with self.assertRaises(c.CoordinatorError) as caught:
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_owned_provider(deadline=self.b.end)
+        error=caught.exception;chain=[]
+        while error is not None:
+            chain.append((type(error).__name__,error.args))
+            error=error.__cause__ if error.__cause__ is not None else error.__context__
+        self.assertIn(('CoordinatorError',('ROUTING_DRIFT',)),chain)
+        self.assertEqual(self.reloads,[])
+        self.assertEqual(self.b.record(),before)
+        self.assertEqual(self.b.shared,[])
+        self.assertEqual(self.b.active,set())

@@ -372,6 +372,7 @@ class _Coordinator:
                                     # Current non-mutating row eligibility precedes new generation.
                                     with writer.inspection(identities) as contexts:
                                         with b.registry(deadline=self._end) as registry:
+                                            if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                                             discovered,context=self._views(registry,contexts,routing,owned=True)
                                             if (discovered,context)!=preflight:raise CoordinatorError('OWNED_STATE_DRIFT')
                                             binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
