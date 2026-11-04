@@ -349,6 +349,9 @@ qsh 'user@home.example.org,ssh=2222,knock=tcp:7000+200ms+udp:8000:open'
 `tcp:PORT` attempts a TCP connection. `udp:PORT[:DATA]` sends a UDP datagram;
 DATA may be text, including `:` but not `+` or `,`, or hex prefixed with `0x`.
 Pauses such as `200ms` and `1s` need a unit and follow the previous step.
+Name resolution has its own 10-second limit. After it, the knock with its
+pauses and the TCP connection share one 10-second limit: a sequence that does
+not fit stops there, and no connection is attempted.
 The client logs the number of knock steps, never their ports or payloads.
 Replace real knock sequences before sharing a command or report.
 

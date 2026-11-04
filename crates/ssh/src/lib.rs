@@ -23,8 +23,9 @@ extern crate self as ssh;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use host_key::host_key_info;
 pub use session::{connect, SshConnection, SshSubstrate};
@@ -57,9 +58,12 @@ pub struct SshParams {
     /// The remembered host keys for host:port in SSH wire format; empty =
     /// nothing is known. Their algorithms are offered first.
     pub known_host_keys: Vec<Vec<u8>>,
-    /// Bounds the TCP connect, the SSH greeting with key exchange, and each
-    /// network wait of the login separately; time spent asking a person is
-    /// not counted.
+    /// Once the host name has resolved (within `knock::RESOLVE_BUDGET`, a
+    /// ceiling of its own), one deadline this far ahead bounds the knock
+    /// steps, their pauses and the TCP connect together; nothing restarts
+    /// it. It also bounds the SSH greeting with key exchange, and each
+    /// network wait of the login, separately; time spent asking a person
+    /// is not counted.
     pub connect_timeout: Duration,
     /// Zero disables keepalive.
     pub keepalive_interval: Duration,
@@ -376,9 +380,9 @@ async fn establish_kex(
     credits: Arc<write_budget::WriteCredits>,
     cancel: &knock::Cancel,
 ) -> Result<VerifiedConnection, SshError> {
-    let target = open_target(params, bind.as_ref(), events, cancel)?;
+    let (target, deadline) = open_target(params, bind.as_ref(), events, cancel)?;
     events.on_connect_stage(SshConnectStage::Connecting);
-    let stream = tcp_connect(target, params, bind.as_ref(), cancel).await?;
+    let stream = tcp_connect(target, deadline, params, bind.as_ref(), cancel).await?;
     let stream = write_budget::TrackedIo::new(stream, credits);
     let mut config = russh::client::Config::default();
     if !params.keepalive_interval.is_zero() {
@@ -476,26 +480,54 @@ fn compression_preference(on: bool) -> Vec<russh::compression::Name> {
 }
 
 /// Knock if asked, and say which address to dial: the knocked one, or the
-/// one the name resolves to -- the same single resolution either way.
+/// one the name resolves to -- the same single resolution either way -- and
+/// the deadline the knock and the TCP connect share.
 fn open_target(
     params: &SshParams,
     bind: &dyn knock::SocketBind,
     events: &dyn SshEvents,
     cancel: &knock::Cancel,
-) -> Result<std::net::SocketAddr, SshError> {
-    let ip = knock::resolve(&params.host, cancel).map_err(knock_error)?;
+) -> Result<(SocketAddr, knock::Deadline), SshError> {
+    open_target_with(
+        params,
+        events,
+        cancel,
+        knock::resolve,
+        &mut knock::SystemClock,
+        &mut knock::SocketKnockSender::new(BindRef(bind)),
+    )
+}
+
+/// [`open_target`] with the resolver, the clock and the knock sender handed
+/// in. Resolution keeps its own ceiling; the deadline is set when it is
+/// over, before anything is knocked or dialled.
+fn open_target_with(
+    params: &SshParams,
+    events: &dyn SshEvents,
+    cancel: &knock::Cancel,
+    resolve: impl FnOnce(&str, &knock::Cancel) -> Result<IpAddr, knock::KnockError>,
+    clock: &mut impl knock::Clock,
+    sender: &mut impl knock::BoundedKnockSender,
+) -> Result<(SocketAddr, knock::Deadline), SshError> {
+    let ip = resolve(&params.host, cancel).map_err(knock_error)?;
+    let target = SocketAddr::new(ip, params.port);
+    let deadline =
+        knock::Deadline::after(clock.now(), params.connect_timeout).ok_or_else(|| {
+            SshError::Connect(if params.connect_timeout.is_zero() {
+                format!("{target}: a zero connect timeout leaves no time to connect")
+            } else {
+                format!(
+                    "{target}: the connect timeout {:?} is out of range",
+                    params.connect_timeout
+                )
+            })
+        })?;
     if !params.knock.is_empty() {
         events.on_connect_stage(SshConnectStage::Knocking);
-        knock::run(
-            ip,
-            &params.knock,
-            &mut knock::SocketKnockSender::new(BindRef(bind)),
-            &mut knock::SleepPause,
-            cancel,
-        )
-        .map_err(knock_error)?;
+        knock::run_within(ip, &params.knock, sender, clock, deadline, cancel)
+            .map_err(|stopped| stopped_error(stopped, target, params))?;
     }
-    Ok(std::net::SocketAddr::new(ip, params.port))
+    Ok((target, deadline))
 }
 
 struct BindRef<'a>(&'a dyn knock::SocketBind);
@@ -512,8 +544,32 @@ fn knock_error(e: knock::KnockError) -> SshError {
     }
 }
 
+fn stopped_error(stopped: knock::Stopped, target: SocketAddr, params: &SshParams) -> SshError {
+    match stopped {
+        knock::Stopped::Cancelled => SshError::Cancelled,
+        knock::Stopped::Expired => connect_expired(target, params),
+    }
+}
+
+/// The shared deadline was reached before the TCP connection was made.
+/// Names the dialled target, never the knock's ports or data.
+fn connect_expired(target: SocketAddr, params: &SshParams) -> SshError {
+    SshError::Connect(if params.knock.is_empty() {
+        format!(
+            "{target} did not answer within {:?}",
+            params.connect_timeout
+        )
+    } else {
+        format!(
+            "{target}: the knock and the connection did not finish within {:?}",
+            params.connect_timeout
+        )
+    })
+}
+
 async fn tcp_connect(
-    target: std::net::SocketAddr,
+    target: SocketAddr,
+    deadline: knock::Deadline,
     params: &SshParams,
     bind: &dyn knock::SocketBind,
     cancel: &knock::Cancel,
@@ -533,32 +589,44 @@ async fn tcp_connect(
     }
     #[cfg(not(unix))]
     let _ = bind;
+    // The binder is a synchronous callback that nothing here can cut short:
+    // look at the deadline and `cancel` again before dialling.
+    deadline
+        .check(Instant::now(), cancel)
+        .map_err(|stopped| stopped_error(stopped, target, params))?;
     socket
         .set_nonblocking(true)
         .map_err(|e| SshError::Connect(format!("{target}: {e}")))?;
     let std_stream: std::net::TcpStream = socket.into();
     let tokio_socket = tokio::net::TcpSocket::from_std_stream(std_stream);
-    let connect = tokio::time::timeout(params.connect_timeout, tokio_socket.connect(target));
-    let stream = match with_cancel(connect, cancel).await? {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let stream = match until_deadline(deadline, cancel, tokio_socket.connect(target)).await? {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
             return Err(SshError::Unreachable {
                 target,
                 kind: e.kind(),
                 os_error: e.to_string(),
             })
         }
-        Err(_) => {
-            return Err(SshError::Connect(format!(
-                "{target} did not answer within {:?}",
-                params.connect_timeout
-            )))
-        }
+        None => return Err(connect_expired(target, params)),
     };
     if params.tcp_nodelay {
         let _ = stream.set_nodelay(true);
     }
     Ok(stream)
+}
+
+/// Runs `fut` until it finishes or `deadline` is reached (`None`), whichever
+/// comes first; a cancel wins over both.
+async fn until_deadline<F: std::future::Future>(
+    deadline: knock::Deadline,
+    cancel: &knock::Cancel,
+    fut: F,
+) -> Result<Option<F::Output>, SshError> {
+    let at = tokio::time::Instant::from_std(deadline.instant());
+    Ok(with_cancel(tokio::time::timeout_at(at, fut), cancel)
+        .await?
+        .ok())
 }
 
 /// Runs `fut` until it finishes or `cancel` is set, checking every
@@ -606,6 +674,284 @@ mod tests {
             &cancel,
         ));
         assert!(matches!(result, Err(SshError::Cancelled)), "{result:?}");
+    }
+
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    /// Simulated time, shared by the resolver, the clock and the sender
+    /// below, so a slow lookup or a long pause costs no real time.
+    #[derive(Clone)]
+    struct SimClock(Rc<Cell<Instant>>);
+
+    impl knock::Clock for SimClock {
+        fn now(&self) -> Instant {
+            self.0.get()
+        }
+        fn sleep(&mut self, d: Duration) {
+            self.0.set(self.0.get() + d);
+        }
+    }
+
+    /// Records when each knock went out and the deadline it was given.
+    struct SimSender {
+        clock: SimClock,
+        sent: Rc<RefCell<Vec<(Instant, u16, knock::Deadline)>>>,
+    }
+
+    impl knock::BoundedKnockSender for SimSender {
+        fn udp_within(
+            &mut self,
+            to: SocketAddr,
+            _: &[u8],
+            deadline: knock::Deadline,
+            _: &knock::Cancel,
+        ) -> Result<(), knock::Stopped> {
+            self.sent
+                .borrow_mut()
+                .push((self.clock.0.get(), to.port(), deadline));
+            Ok(())
+        }
+        fn tcp_within(
+            &mut self,
+            to: SocketAddr,
+            payload: &[u8],
+            deadline: knock::Deadline,
+            cancel: &knock::Cancel,
+        ) -> Result<(), knock::Stopped> {
+            self.udp_within(to, payload, deadline, cancel)
+        }
+    }
+
+    #[derive(Default)]
+    struct Stages(Mutex<Vec<SshConnectStage>>);
+
+    impl SshEvents for Stages {
+        fn on_connect_stage(&self, stage: SshConnectStage) {
+            self.0.lock().unwrap().push(stage);
+        }
+        fn on_channel(&self, _: client::channel::SubstrateEvent) {}
+        fn on_closed(&self, _: String) {}
+    }
+
+    fn udp(port: u16, delay_after_ms: u32) -> knock::KnockStep {
+        knock::KnockStep {
+            protocol: knock::KnockProtocol::Udp,
+            port,
+            payload: b"secret".to_vec(),
+            delay_after_ms,
+        }
+    }
+
+    fn sim_params(connect_timeout: Duration, knock: Vec<knock::KnockStep>) -> SshParams {
+        SshParams {
+            host: "h.example".into(),
+            port: 2222,
+            username: "u".into(),
+            known_host_keys: Vec::new(),
+            connect_timeout,
+            keepalive_interval: Duration::ZERO,
+            compression: false,
+            tcp_nodelay: true,
+            knock,
+        }
+    }
+
+    struct Acquired {
+        result: Result<(SocketAddr, knock::Deadline), SshError>,
+        start: Instant,
+        sent: Vec<(Duration, u16, knock::Deadline)>,
+        stages: Vec<SshConnectStage>,
+        now: Instant,
+    }
+
+    /// Runs [`open_target_with`] on simulated time; the lookup takes
+    /// `lookup` of it and then answers 192.0.2.7.
+    fn acquire(params: &SshParams, lookup: Duration, cancel: &knock::Cancel) -> Acquired {
+        let start = Instant::now();
+        let clock = SimClock(Rc::new(Cell::new(start)));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut sender = SimSender {
+            clock: clock.clone(),
+            sent: Rc::clone(&sent),
+        };
+        let stages = Stages::default();
+        let in_lookup = clock.clone();
+        let result = open_target_with(
+            params,
+            &stages,
+            cancel,
+            |_, _| {
+                in_lookup.0.set(in_lookup.0.get() + lookup);
+                Ok("192.0.2.7".parse().unwrap())
+            },
+            &mut clock.clone(),
+            &mut sender,
+        );
+        let sent = sent
+            .borrow()
+            .iter()
+            .map(|(at, port, d)| (*at - start, *port, *d))
+            .collect();
+        Acquired {
+            result,
+            start,
+            sent,
+            stages: stages.0.into_inner().unwrap(),
+            now: clock.0.get(),
+        }
+    }
+
+    /// The lookup keeps its own ceiling: an 8 s lookup under a 10 s timeout
+    /// still leaves 10 s, set when it ends, for the knock and the connect.
+    #[test]
+    fn the_deadline_starts_when_the_lookup_ends() {
+        let p = sim_params(
+            Duration::from_secs(10),
+            vec![udp(7000, 9_000), udp(7001, 0)],
+        );
+        let a = acquire(&p, Duration::from_secs(8), &knock::Cancel::new());
+        let (target, deadline) = a.result.expect("the knock fits");
+        assert_eq!(target, "192.0.2.7:2222".parse().unwrap());
+        assert_eq!(deadline.instant(), a.start + Duration::from_secs(18));
+        let at: Vec<_> = a.sent.iter().map(|(at, port, _)| (*at, *port)).collect();
+        assert_eq!(
+            at,
+            vec![
+                (Duration::from_secs(8), 7000),
+                (Duration::from_secs(17), 7001)
+            ]
+        );
+        assert!(
+            a.sent.iter().all(|(_, _, d)| *d == deadline),
+            "one deadline"
+        );
+        assert_eq!(deadline.remaining(a.now), Some(Duration::from_secs(1)));
+        assert_eq!(a.stages, vec![SshConnectStage::Knocking]);
+    }
+
+    /// Without a knock the connect keeps the whole timeout after the lookup.
+    #[test]
+    fn without_a_knock_the_connect_gets_the_whole_timeout() {
+        let p = sim_params(Duration::from_secs(10), Vec::new());
+        let a = acquire(&p, Duration::from_secs(8), &knock::Cancel::new());
+        let (_, deadline) = a.result.unwrap();
+        assert_eq!(deadline.remaining(a.now), Some(Duration::from_secs(10)));
+        assert!(a.sent.is_empty() && a.stages.is_empty());
+    }
+
+    /// Pauses that do not fit end at the deadline as a connection error --
+    /// not a resolver one -- naming neither a knocked port nor its data.
+    #[test]
+    fn a_knock_that_does_not_fit_is_a_connect_error() {
+        let p = sim_params(
+            Duration::from_secs(10),
+            vec![udp(7000, 6_000), udp(7001, 5_000), udp(7002, 0)],
+        );
+        let a = acquire(&p, Duration::from_secs(8), &knock::Cancel::new());
+        match a.result {
+            Err(SshError::Connect(m)) => {
+                assert!(m.contains("192.0.2.7:2222") && m.contains("knock"), "{m}");
+                assert!(!m.contains("700") && !m.contains("secret"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(a.sent.len(), 2, "the third step never goes");
+        assert_eq!(a.now, a.start + Duration::from_secs(18));
+    }
+
+    #[test]
+    fn a_zero_or_out_of_range_timeout_knocks_nothing() {
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let p = sim_params(timeout, vec![udp(7000, 0)]);
+            let a = acquire(&p, Duration::from_secs(1), &knock::Cancel::new());
+            assert!(
+                matches!(a.result, Err(SshError::Connect(_))),
+                "{:?}",
+                a.result
+            );
+            assert!(a.sent.is_empty() && a.stages.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_lookup_failure_stays_a_resolve_error() {
+        let p = sim_params(Duration::from_secs(10), vec![udp(7000, 0)]);
+        let r = open_target_with(
+            &p,
+            &Stages::default(),
+            &knock::Cancel::new(),
+            |_, _| Err(knock::KnockError::Resolve("h.example: no such host".into())),
+            &mut knock::SystemClock,
+            &mut SimSender {
+                clock: SimClock(Rc::new(Cell::new(Instant::now()))),
+                sent: Rc::default(),
+            },
+        );
+        assert!(matches!(r, Err(SshError::Resolve(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_cancel_before_the_knock_sends_nothing() {
+        let cancel = knock::Cancel::new();
+        cancel.cancel();
+        let p = sim_params(Duration::from_secs(10), vec![udp(7000, 0)]);
+        let a = acquire(&p, Duration::ZERO, &cancel);
+        assert!(
+            matches!(a.result, Err(SshError::Cancelled)),
+            "{:?}",
+            a.result
+        );
+        assert!(a.sent.is_empty());
+    }
+
+    fn paused() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    /// The TCP connect gets only what the knock left of the deadline.
+    #[test]
+    fn the_connect_gets_only_the_rest_of_the_deadline() {
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let deadline =
+                knock::Deadline::after(start.into_std(), Duration::from_secs(10)).unwrap();
+            // The knock's share.
+            tokio::time::advance(Duration::from_secs(7)).await;
+            let dial = tokio::time::Instant::now();
+            let r = until_deadline(
+                deadline,
+                &knock::Cancel::new(),
+                std::future::pending::<()>(),
+            )
+            .await;
+            assert!(matches!(r, Ok(None)), "{r:?}");
+            let took = dial.elapsed();
+            assert!(
+                took >= Duration::from_secs(3)
+                    && took <= Duration::from_secs(3) + Duration::from_millis(1),
+                "took {took:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancel_wins_over_a_connect_that_is_ready() {
+        paused().block_on(async {
+            let deadline = knock::Deadline::after(Instant::now(), Duration::from_secs(10)).unwrap();
+            let cancel = knock::Cancel::new();
+            let r = until_deadline(deadline, &cancel, async {
+                cancel.cancel();
+            })
+            .await;
+            assert!(matches!(r, Err(SshError::Cancelled)), "{r:?}");
+            let r = until_deadline(deadline, &knock::Cancel::new(), async { 7 }).await;
+            assert!(matches!(r, Ok(Some(7))), "{r:?}");
+        });
     }
 
     #[test]
