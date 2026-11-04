@@ -607,6 +607,37 @@ class FedoraRecipeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'budget-consumed\n')
 
+    def test_provider_install_places_exact_hooks_in_effective_build_directory(self):
+        spec = (SOURCE / 'qshd-selinux.spec').read_text()
+        install = spec.split('\n%install\n', 1)[1].split('\n%pre ', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / 'stage'; stage.mkdir()
+            (stage / 'inert-payload').write_bytes(b'reviewed payload')
+            hooks = root / 'reviewed-hooks'; hooks.mkdir()
+            expected = {}
+            for index, name in enumerate(NAMES[:4]):
+                data = ('#!/bin/sh\n# stored only ' + str(index) + '\nexit 73\n').encode()
+                path = hooks / name; path.write_bytes(data); path.chmod(0o644)
+                expected[name] = (data, 0o644)
+            # RPM 4 uses BUILD directly; RPM 6 creates its package build dir.
+            for layout in ('rpm4/BUILD', 'rpm6/BUILD/qshd-selinux-0.5.0-build'):
+                cwd = root / layout; cwd.mkdir(parents=True)
+                buildroot = cwd / 'BUILDROOT'
+                command = install.replace('%{buildroot}', str(buildroot)).replace(
+                    '%{qsh_stage}', str(stage)).replace('%{qsh_hooks_source}', str(hooks))
+                result = subprocess.run(['bash', '-e', '-c', command], cwd=cwd,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                copied = cwd / 'qsh-provider-hooks'
+                self.assertTrue(copied.is_dir(), 'relative -f hooks missing from effective builddir')
+                self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mode & 0o777)
+                                  for path in copied.iterdir()}, expected)
+                self.assertEqual({path.name for path in buildroot.iterdir()}, {'inert-payload'})
+                self.assertEqual((buildroot / 'inert-payload').read_bytes(), b'reviewed payload')
+                if 'rpm6' in layout:
+                    self.assertFalse((cwd.parent / 'qsh-provider-hooks').exists())
+
     def test_rpm_capsule_transport_keeps_macro_like_bytes_inert_and_hash_bound(self):
         builder = self.builder()
         self.assertTrue(hasattr(builder, 'rpm_capsule'), 'macro-inert RPM capsule transport missing')

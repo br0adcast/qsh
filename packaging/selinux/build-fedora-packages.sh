@@ -309,14 +309,12 @@ def main(repo, arguments):
         (work / 'build-inputs.json').write_bytes(document(receipt))
         top = work / 'rpmbuild'; top.mkdir()
         for directory in ('BUILD', 'BUILDROOT', 'RPMS', 'SOURCES', 'SPECS', 'SRPMS'): (top / directory).mkdir()
-        rpm_hooks = top / 'BUILD/qsh-provider-hooks'; rpm_hooks.mkdir()
-        for name in ('provider-pre', 'provider-post', 'provider-preun', 'provider-postun'):
-            shutil.copyfile(hooks / name, rpm_hooks / name)
         run(['rpmbuild', '-bb', '--define', '_topdir ' + str(top), '--define', '_builddir ' + str(top / 'BUILD'), '--define', '_tmppath ' + str(output / 'tmp'),
              '--define', '_buildhost reproducible.invalid',
              '--define', '_binary_filedigest_algorithm 8',
              '--define', 'qsh_version ' + version, '--define', 'qsh_release ' + args.release,
-             '--define', 'qsh_stage ' + str(stage), '--define', 'qsh_hooks qsh-provider-hooks', source / 'qshd-selinux.spec'])
+             '--define', 'qsh_stage ' + str(stage), '--define', 'qsh_hooks_source ' + str(hooks),
+             '--define', 'qsh_hooks qsh-provider-hooks', source / 'qshd-selinux.spec'])
         provider = output / ('qshd-selinux-' + version + '-' + args.release + '.noarch.rpm')
         shutil.copyfile(top / 'RPMS/noarch' / provider.name, provider)
         provider_inspection = provider_headers(provider, wanted, version, args.release, hooks)

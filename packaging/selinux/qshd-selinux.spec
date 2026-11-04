@@ -34,6 +34,8 @@ Corresponding reference-policy source and notices accompany the derived pair.
 %install
 mkdir -p "%{buildroot}"
 cp -a "%{qsh_stage}/." "%{buildroot}/"
+mkdir -p qsh-provider-hooks
+cp -a "%{qsh_hooks_source}/." qsh-provider-hooks/
 
 %pre -f %{qsh_hooks}/provider-pre
 %post -f %{qsh_hooks}/provider-post
