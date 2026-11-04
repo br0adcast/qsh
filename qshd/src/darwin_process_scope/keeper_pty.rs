@@ -385,6 +385,8 @@ pub(crate) fn spawn_prepared(
         end,
         custody,
         screen,
+        #[cfg(all(test, feature = "test-darwin-keeper"))]
+        None,
     )?
     .finish()
 }
@@ -417,6 +419,8 @@ impl super::keeper::KeeperOwner {
             end,
             custody,
             screen,
+            #[cfg(feature = "test-darwin-keeper")]
+            None,
         )
     }
 
@@ -427,6 +431,9 @@ impl super::keeper::KeeperOwner {
         end: std::time::Instant,
         custody: &OpenCustody,
         screen: Box<dyn SessionScreen>,
+        #[cfg(all(test, feature = "test-darwin-keeper"))] observer: Option<
+            std::sync::Arc<FixtureIoObservation>,
+        >,
     ) -> Result<Created, SpawnFailure> {
         let LaunchOptions {
             command,
@@ -530,8 +537,17 @@ impl super::keeper::KeeperOwner {
             .spawn()
             .map_err(|_| before("keeper session could not be executed"))?;
         let (owner, driver) = Self::created(session, qs, qb, launch, end, admission);
-        let mut created =
-            Created::driven(Box::new(master), Box::new(owner), driver, custody, screen);
+        #[cfg(all(test, feature = "test-darwin-keeper"))]
+        let owner: Box<dyn ChannelWait> = match observer {
+            Some(observation) => Box::new(ObservedFixtureWait {
+                inner: Box::new(owner),
+                observation,
+            }),
+            None => Box::new(owner),
+        };
+        #[cfg(not(all(test, feature = "test-darwin-keeper")))]
+        let owner: Box<dyn ChannelWait> = Box::new(owner);
+        let mut created = Created::driven(Box::new(master), owner, driver, custody, screen);
         // The permit still excludes our updater here; any observed source drift
         // is recorded only after protection, never returned as a bare Err.
         if image.recheck().is_err() {
@@ -556,5 +572,267 @@ struct MasterReader(File);
 impl Read for MasterReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         master_read_result(self.0.read(buffer))
+    }
+}
+
+/// Only libtests may choose a separately source-bound daemon image or inject a
+/// descriptor failure. Ordinary compatibility daemons still use Current.
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+#[derive(Clone)]
+pub(crate) struct KeeperFixture {
+    pub(super) path: std::path::PathBuf,
+    pub(super) sha256: String,
+    pub(super) pause_after_admit: Option<bool>,
+    pub(super) reader_failure: Option<bool>,
+    pub(super) eof_deadline: Option<std::time::Instant>,
+    observations: std::sync::Arc<std::sync::Mutex<Vec<FixtureObservation>>>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+#[derive(Clone)]
+pub(super) struct FixtureObservation {
+    pub authority: super::keeper::FixtureAuthority,
+    pub gate: Option<std::sync::Arc<super::keeper::FixtureAdmissionGate>>,
+    pub io: std::sync::Arc<FixtureIoObservation>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl KeeperFixture {
+    pub(super) fn new(path: std::path::PathBuf, sha256: String) -> Self {
+        Self {
+            path,
+            sha256,
+            pause_after_admit: None,
+            reader_failure: None,
+            eof_deadline: None,
+            observations: Default::default(),
+        }
+    }
+    pub(super) fn observation(&self, index: usize) -> Option<FixtureObservation> {
+        self.observations.lock().unwrap().get(index).cloned()
+    }
+    pub(super) fn count(&self) -> usize {
+        self.observations.lock().unwrap().len()
+    }
+    pub(super) fn assert_settled(&self, count: usize) {
+        assert_eq!(
+            self.count(),
+            count,
+            "every selected channel must create a real keeper"
+        );
+        for observation in self.observations.lock().unwrap().iter() {
+            let snapshot = observation
+                .authority
+                .snapshot()
+                .expect("actual keeper snapshot");
+            assert!(
+                !snapshot.custody_lost
+                    && snapshot.consumed
+                    && snapshot.drained
+                    && snapshot.broker_terminal
+                    && snapshot.census
+            );
+            assert_eq!(snapshot.session_wait, Some(0));
+        }
+    }
+    pub(crate) fn spawn(
+        &self,
+        admission: super::native::KeeperAdmission,
+        options: (Option<&[u8]>, PtySize, Option<&str>, u8),
+        end: std::time::Instant,
+        custody: &OpenCustody,
+        screen: Box<dyn SessionScreen>,
+    ) -> Result<UninstalledChannel, SpawnFailure> {
+        let (command, size, term, stream) = options;
+        eprintln!(
+            "keeper223 route=keeper source=compiled-missing image={} pid={} stream={}",
+            self.sha256,
+            std::process::id(),
+            stream
+        );
+        let io = std::sync::Arc::new(FixtureIoObservation::new(
+            if stream == transport::channel::FIRST_CHANNEL_STREAM {
+                self.eof_deadline
+            } else {
+                None
+            },
+        ));
+        let mut created = super::keeper::KeeperOwner::create(
+            admission,
+            ImageSource::Fixture {
+                path: self.path.clone(),
+                sha256: self.sha256.clone(),
+            },
+            LaunchOptions {
+                command,
+                size,
+                term,
+            },
+            end,
+            custody,
+            screen,
+            Some(io.clone()),
+        )?;
+        let authority = created.fixture_authority().expect("created actual driver");
+        let gate = self
+            .pause_after_admit
+            .map(|after| authority.pause_admission(after));
+        created.master = Box::new(FailingFixtureMaster {
+            inner: created.master,
+            reader: self.reader_failure,
+            observation: io.clone(),
+        });
+        self.observations.lock().unwrap().push(FixtureObservation {
+            authority,
+            gate,
+            io,
+        });
+        created.finish()
+    }
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+struct FailingFixtureMaster {
+    inner: Box<dyn MasterPty + Send>,
+    reader: Option<bool>,
+    observation: std::sync::Arc<FixtureIoObservation>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl MasterPty for FailingFixtureMaster {
+    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+        self.inner.resize(size)
+    }
+    fn get_size(&self) -> anyhow::Result<PtySize> {
+        self.inner.get_size()
+    }
+    fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+        if self.reader == Some(true) {
+            anyhow::bail!("injected keeper reader setup failure");
+        }
+        Ok(Box::new(ObservedFixtureReader {
+            inner: self.inner.try_clone_reader()?,
+            observation: self.observation.clone(),
+        }))
+    }
+    fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+        if self.reader.is_some() {
+            anyhow::bail!("injected keeper writer setup failure");
+        }
+        self.inner.take_writer()
+    }
+    fn process_group_leader(&self) -> Option<i32> {
+        self.inner.process_group_leader()
+    }
+    fn as_raw_fd(&self) -> Option<i32> {
+        self.inner.as_raw_fd()
+    }
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        self.inner.tty_name()
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+pub(super) struct FixtureIoObservation {
+    pub eof: std::sync::atomic::AtomicBool,
+    pub reader_drop: std::sync::atomic::AtomicBool,
+    pub reader_drop_finished: std::sync::atomic::AtomicBool,
+    pub retiring_running: std::sync::atomic::AtomicBool,
+    release: std::sync::atomic::AtomicBool,
+    deadline: Option<std::time::Instant>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl FixtureIoObservation {
+    fn new(deadline: Option<std::time::Instant>) -> Self {
+        Self {
+            eof: false.into(),
+            reader_drop: false.into(),
+            reader_drop_finished: false.into(),
+            retiring_running: false.into(),
+            release: false.into(),
+            deadline,
+        }
+    }
+    pub fn release_reader(&self) {
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+struct ObservedFixtureReader {
+    inner: Box<dyn Read + Send>,
+    observation: std::sync::Arc<FixtureIoObservation>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl Read for ObservedFixtureReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let actual = self.inner.read(bytes);
+        if matches!(actual, Ok(0)) {
+            self.observation
+                .eof
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        actual // never replace/withhold the real EOF result
+    }
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl Drop for ObservedFixtureReader {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.observation.eof.load(Ordering::SeqCst) {
+            return;
+        }
+        // channel_reader_loop has already blocking_send(None)'d the actual EOF.
+        // Hold only worker completion, outside Core/custody/registry locks.
+        self.observation.reader_drop.store(true, Ordering::SeqCst);
+        if let Some(end) = self.observation.deadline {
+            while !self.observation.release.load(Ordering::SeqCst)
+                && std::time::Instant::now() < end
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        self.observation
+            .reader_drop_finished
+            .store(true, Ordering::SeqCst);
+    }
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+struct ObservedFixtureWait {
+    inner: Box<dyn ChannelWait>,
+    observation: std::sync::Arc<FixtureIoObservation>,
+}
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+impl ChannelWait for ObservedFixtureWait {
+    fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
+        let actual = self.inner.poll_exit();
+        if self
+            .observation
+            .eof
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(actual, transport::channel_server::ChildStatus::Running)
+        {
+            self.observation
+                .retiring_running
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        actual
+    }
+    fn poll_leader_status(&mut self) -> Option<transport::channel_server::LeaderStatus> {
+        self.inner.poll_leader_status()
+    }
+    fn active_observation(&self) -> transport::channel_server::ActiveObservation {
+        self.inner.active_observation()
+    }
+    fn set_reap_notifier(&mut self, n: transport::channel_server::ReapNotifier) {
+        self.inner.set_reap_notifier(n);
+    }
+    fn kill(&mut self) {
+        self.inner.kill();
+    }
+    fn wait(self: Box<Self>) -> i32 {
+        self.inner.wait()
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        a: &transport::channel_open::CleanupAuthority<'_>,
+    ) -> transport::channel_open::CleanupStatus {
+        self.inner.cleanup_uninstalled(a)
     }
 }

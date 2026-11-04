@@ -324,6 +324,123 @@ impl ApplicationDebt {
     }
 }
 
+// Observation-only records; these never supply admission or signal authority.
+#[cfg(any(test, all(target_os = "macos", feature = "test-darwin-keeper")))]
+pub(super) fn fixture_debt_request(nonce: &str, bytes: &[u8]) -> Option<super::Identity> {
+    if bytes.len() > 128
+        || nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?.strip_suffix('\n')?;
+    let fields: Vec<_> = text.split(' ').collect();
+    if fields.len() != 4 || fields[0] != nonce {
+        return None;
+    }
+    let identity = super::Identity {
+        pid: fields[1].parse().ok()?,
+        unique: fields[2].parse().ok()?,
+        version: fields[3].parse().ok()?,
+    };
+    if !identity.valid()
+        || identity.version == 0
+        || bytes
+            != format!(
+                "{nonce} {} {} {}\n",
+                identity.pid, identity.unique, identity.version
+            )
+            .as_bytes()
+    {
+        return None;
+    }
+    Some(identity)
+}
+#[cfg(any(test, all(target_os = "macos", feature = "test-darwin-keeper")))]
+fn fixture_debt_record(members: &[super::Identity], nonce: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let requested = fixture_debt_request(nonce, bytes)?;
+    // ApplicationDebt deliberately retains its first version across exec.
+    // Emit that actual stored identity, never fabricate a refreshed version.
+    let stored = members
+        .iter()
+        .find(|member| member.same_process(requested))?;
+    Some(
+        format!(
+            "{nonce} {} {} {}\n",
+            stored.pid, stored.unique, stored.version
+        )
+        .into_bytes(),
+    )
+}
+#[cfg(test)]
+mod fixture_debt_tests {
+    use super::*;
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    #[test]
+    fn keeper_fixture_receipt_requires_actual_exact_ledger_insertion() {
+        let identity = super::super::Identity {
+            pid: 71,
+            unique: 99,
+            version: 3,
+        };
+        let record = b"0123456789abcdef0123456789abcdef 71 99 3\n";
+        assert_eq!(fixture_debt_record(&[], NONCE, record), None);
+        assert_eq!(
+            fixture_debt_record(&[identity], NONCE, record),
+            Some(record.to_vec())
+        );
+        for foreign in [
+            super::super::Identity {
+                pid: 72,
+                ..identity
+            },
+            super::super::Identity {
+                unique: 100,
+                ..identity
+            },
+        ] {
+            assert_eq!(
+                fixture_debt_record(&[foreign], NONCE, record),
+                None,
+                "PID match alone must not open the escape gate"
+            );
+        }
+        for malformed in [
+            b"0123456789abcdef0123456789abcdef 071 99 3\n".as_slice(),
+            b"0123456789abcdef0123456789abcdef 71 99 3",
+            b"../ 71 99 3\n",
+            b"0123456789abcdef0123456789abcdef 0 99 3\n",
+            b"0123456789abcdef0123456789abcdef 71 99 0\n",
+            b"ffffffffffffffffffffffffffffffff 71 99 3\n",
+            b"0123456789abcdef0123456789abcdef 71 99 3\nextra",
+        ] {
+            assert_eq!(fixture_debt_record(&[identity], NONCE, malformed), None);
+        }
+    }
+    #[test]
+    fn keeper_fixture_exec_receipt_emits_stored_v0_for_real_same_process_v1() {
+        let stored = super::super::Identity {
+            pid: 71,
+            unique: 99,
+            version: 3,
+        };
+        let request = b"0123456789abcdef0123456789abcdef 71 99 4\n";
+        assert_eq!(
+            fixture_debt_request(NONCE, request),
+            Some(super::super::Identity {
+                version: 4,
+                ..stored
+            })
+        );
+        assert_eq!(
+            fixture_debt_record(&[stored], NONCE, request),
+            Some(b"0123456789abcdef0123456789abcdef 71 99 3\n".to_vec())
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod roles {
     use super::super::keeper::Operation;
@@ -332,6 +449,116 @@ mod roles {
     use nix::libc;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     const INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    /// Observe an actual ledger insertion; no wait or signal runs here. This
+    /// entire path is absent from ordinary builds and only selected by a private
+    /// fixture directory inherited by a compatibility-feature helper.
+    #[cfg(feature = "test-darwin-keeper")]
+    fn fixture_debt_observe(
+        debt: &ApplicationDebt,
+        snapshot: &[super::super::Classified],
+    ) -> io::Result<()> {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Some(path) = std::env::var_os("QSH_KEEPER_TEST_DEBT_DIRECTORY") else {
+            return Ok(());
+        };
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(protocol());
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let meta = directory.metadata()?;
+        if !meta.is_dir()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o777 != 0o700
+        {
+            return Err(protocol());
+        }
+        let read = |name: &[u8]| -> io::Result<Option<Vec<u8>>> {
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr().cast(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = error();
+                return if e.kind() == io::ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(e)
+                };
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let m = file.metadata()?;
+            if !m.is_file()
+                || m.uid() != meta.uid()
+                || m.mode() & 0o077 != 0
+                || m.nlink() != 1
+                || m.len() > 128
+            {
+                return Err(protocol());
+            }
+            let mut bytes = Vec::new();
+            file.take(129).read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        };
+        let Some(bytes) = read(b"target\0")? else {
+            return Ok(());
+        };
+        let Some(nonce) = read(b"instance\0")? else {
+            return Err(protocol());
+        };
+        let nonce = std::str::from_utf8(&nonce).map_err(|_| protocol())?;
+        let Some(record) = fixture_debt_record(&debt.members, nonce, &bytes) else {
+            return Ok(());
+        };
+        let publish = |name: &[u8]| -> io::Result<()> {
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr().cast(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                if error().kind() == io::ErrorKind::AlreadyExists {
+                    return if read(name)?.as_deref() == Some(record.as_slice()) {
+                        Ok(())
+                    } else {
+                        Err(protocol())
+                    };
+                }
+                return Err(error());
+            }
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            file.write_all(&record)?;
+            file.sync_all()
+        };
+        publish(b"ledger-recorded\0")?;
+        let target = debt
+            .members
+            .iter()
+            .find(|id| fixture_debt_record(&[**id], nonce, &bytes).is_some())
+            .ok_or_else(protocol)?;
+        let sid = unsafe { libc::getsid(0) };
+        if snapshot.iter().any(|p| {
+            p.identity.same_process(*target)
+                && matches!(p.class,Class::Session(other) if other!=sid)
+        }) {
+            publish(b"foreign-observed\0")?;
+        }
+        Ok(())
+    }
     fn error() -> io::Error {
         io::Error::last_os_error()
     }
@@ -1193,6 +1420,8 @@ mod roles {
                     })
                     .collect();
                 application_debt.reconcile(&application_members, Ok(&snapshot));
+                #[cfg(feature = "test-darwin-keeper")]
+                fixture_debt_observe(&application_debt, &snapshot)?;
                 if application_debt.can_close(
                     decision == super::super::keeper::AdmissionDecision::Abort
                         || app.as_ref().is_some_and(|a| a.wait.is_some()),

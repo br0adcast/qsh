@@ -114,7 +114,7 @@ pub(crate) type PreparedPersonalOwner =
 #[cfg(target_os = "macos")]
 pub(crate) fn prepare_personal() -> Result<PreparedPersonalOwner, native::AdmissionError> {
     personal::select(
-        native::modern_signal_available(),
+        native::modern_signal_available() && !cfg!(feature = "test-darwin-keeper"),
         native::prepare,
         native::keeper_prepare,
     )
@@ -261,3 +261,8 @@ mod keeper_tests;
 pub(crate) fn keeper_helper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
     keeper_helper::entry(args)
 }
+
+#[cfg(test)]
+mod keeper_integration_tests;
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+pub(crate) use keeper_pty::KeeperFixture;

@@ -45,14 +45,26 @@ use terminal_size::TerminalSize;
 pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
+    #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+    keeper_fixture: Option<crate::darwin_process_scope::KeeperFixture>,
 }
 
 impl PtyChannelSpawner {
     pub fn new(budget: Arc<ScreenBudget>) -> Self {
         Self {
             budget,
+            #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+            keeper_fixture: None,
             opens: ChannelOpenRegistry::new(Default::default()),
         }
+    }
+    #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+    pub(crate) fn with_keeper_fixture(
+        mut self,
+        fixture: crate::darwin_process_scope::KeeperFixture,
+    ) -> Self {
+        self.keeper_fixture = Some(fixture);
+        self
     }
 }
 
@@ -110,6 +122,24 @@ impl ChannelSpawner for PtyChannelSpawner {
                     ChannelKind::Shell => None,
                     ChannelKind::Command => Some(req.command.as_slice()),
                 };
+                #[cfg(all(test, feature = "test-darwin-keeper"))]
+                if let Some(fixture) = &self.keeper_fixture {
+                    return fixture.spawn(
+                        admission,
+                        (command, size, term, req.stream),
+                        keeper_end,
+                        custody,
+                        screen,
+                    );
+                }
+                #[cfg(feature = "test-darwin-keeper")]
+                eprintln!(
+                    "keeper223 route=keeper source=compiled-missing image={} pid={} stream={}",
+                    crate::state::self_checksum().map_err(|_| custody
+                        .refuse_before_creation("fixture source checksum unavailable".into()))?,
+                    std::process::id(),
+                    req.stream
+                );
                 crate::darwin_process_scope::spawn_prepared(
                     admission, command, size, term, keeper_end, custody, screen,
                 )

@@ -868,13 +868,15 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
 }
 
 #[derive(Default)]
-struct ConnectedEvents {
-    live: AtomicBool,
-    input_failed: AtomicBool,
+pub(super) struct ConnectedEvents {
+    pub(super) live: AtomicBool,
+    pub(super) input_failed: AtomicBool,
     deframer: Mutex<transport::shell_frame::RecordDeframer>,
-    records: Mutex<Vec<transport::channel::ServerRecord>>,
+    pub(super) records: Mutex<Vec<transport::channel::ServerRecord>>,
     shell: Mutex<transport::shell_frame::ShellDeframer>,
-    output: Mutex<Vec<u8>>,
+    #[cfg(feature = "test-darwin-keeper")]
+    pub(super) geometries: Mutex<Vec<transport::channel_geometry::GeometryRecord>>,
+    pub(super) output: Mutex<Vec<u8>>,
 }
 impl transport::driver_std::ClientEvents for ConnectedEvents {
     fn on_bytes(&self, stream: u8, data: Vec<u8>) {
@@ -886,6 +888,10 @@ impl transport::driver_std::ClientEvents for ConnectedEvents {
             }
         } else if stream == transport::channel::FIRST_CHANNEL_STREAM {
             for record in self.shell.lock().unwrap().push(&data) {
+                #[cfg(feature = "test-darwin-keeper")]
+                if let transport::shell_frame::ShellRecord::Geometry(geometry) = &record {
+                    self.geometries.lock().unwrap().push(*geometry);
+                }
                 if let transport::shell_frame::ShellRecord::Data(bytes) = record {
                     let mut output = self.output.lock().unwrap();
                     if output.len() + bytes.len() > 4096 {
@@ -908,7 +914,7 @@ impl transport::driver_std::ClientEvents for ConnectedEvents {
         self.input_failed.store(true, Ordering::SeqCst);
     }
 }
-struct ConnectedBinder;
+pub(super) struct ConnectedBinder;
 impl transport::driver_std::Binder for ConnectedBinder {
     fn bind(&self, _: i32) -> bool {
         true
@@ -2639,6 +2645,9 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     let allowlist = Arc::new(Mutex::new(vec![client_keys.public]));
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
+    #[cfg(feature = "test-darwin-keeper")]
+    let (backend, keeper_fixture) = super::keeper_integration_tests::native::backend();
+    #[cfg(not(feature = "test-darwin-keeper"))]
     let backend = Arc::new(crate::channel_backend::ChannelSessionBackend::new(
         Arc::new(crate::screen_budget::ScreenBudget::new(
             crate::screen_budget::BudgetLimits::default(),
@@ -2736,7 +2745,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
         let mode = mode.to_owned();
         match tokio::spawn(async move {
             connected_until(|| events.live.load(Ordering::SeqCst)).await?;
-            if mode == "no-channel" { return Ok::<(), &'static str>(()); }
+            if mode == "no-channel" || mode == "no-channel-signal" { return Ok::<(), &'static str>(()); }
             let open = OpenRequest {
                 stream: FIRST_CHANNEL_STREAM, kind: ChannelKind::Command,
                 cols: 80, rows: 24, screen: false, command: actor_command,
@@ -2874,6 +2883,14 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     client.close();
     assert_eq!(registry.outstanding(), 0);
     assert_eq!(registry.retiring_count(), 0);
+    #[cfg(feature = "test-darwin-keeper")]
+    keeper_fixture.assert_settled(if mode == "fresh-session" {
+        2
+    } else if mode == "no-channel" || mode == "no-channel-signal" {
+        0
+    } else {
+        1
+    });
     if let Some(directory) = signal_directory {
         signal_checkpoint_write(
             directory,
@@ -2951,6 +2968,17 @@ fn darwin223_native_connected_close_stop_rebind_and_fresh_session() {
         )
         .unwrap();
         let expected_failure = matches!(mode, "body-failure" | "observation-timeout");
+        #[cfg(feature = "test-darwin-keeper")]
+        super::keeper_integration_tests::native::assert_routes(
+            &output.stderr,
+            if mode == "fresh-session" {
+                2
+            } else if mode == "no-channel" {
+                0
+            } else {
+                1
+            },
+        );
         if !output.status.success() {
             actors.abort();
         }
@@ -4283,7 +4311,15 @@ fn darwin223_owned_signal_server() {
         .build()
         .unwrap()
         .block_on(connected_case(
-            mode.as_deref().unwrap_or("signal"),
+            mode.as_deref().unwrap_or(
+                if cfg!(feature = "test-darwin-keeper")
+                    && std::env::var_os("QSH_KEEPER_TEST_NO_CHANNEL_SIGNAL").is_some()
+                {
+                    "no-channel-signal"
+                } else {
+                    "signal"
+                },
+            ),
             if mode.is_some() {
                 None
             } else {
@@ -4294,6 +4330,9 @@ fn darwin223_owned_signal_server() {
 }
 #[test]
 fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
+    signal_cases(false);
+}
+fn signal_cases(no_channel: bool) {
     for signal in [nix::libc::SIGTERM, nix::libc::SIGINT] {
         let directory = tempfile::tempdir().unwrap();
         let mut actors = ConnectedActorAuthority::new();
@@ -4306,7 +4345,17 @@ fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
             .env("QSH_DARWIN223_SIGNAL_SERVER", directory.path())
             .env("QSH_DARWIN223_CONNECTED_ACTORS", actors.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .env_remove("QSH_KEEPER_TEST_NO_CHANNEL_SIGNAL")
+            .envs(if no_channel {
+                vec![("QSH_KEEPER_TEST_NO_CHANNEL_SIGNAL", "1")]
+            } else {
+                Vec::new()
+            })
+            .stderr(if cfg!(feature = "test-darwin-keeper") {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .unwrap();
         let parent_stage = std::cell::Cell::new(SignalParentStage::WaitReady);
@@ -4337,6 +4386,45 @@ fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
                 std::thread::sleep(Duration::from_millis(10));
             };
             assert!(status.success());
+            #[cfg(feature = "test-darwin-keeper")]
+            {
+                use std::io::Read;
+                use std::os::fd::AsRawFd;
+                let mut pipe = child.stderr.take().expect("fixture stderr pipe");
+                let fd = pipe.as_raw_fd();
+                let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+                assert!(
+                    flags >= 0
+                        && unsafe {
+                            nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK)
+                        } == 0
+                );
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    match pipe.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            bytes.extend_from_slice(&buffer[..n]);
+                            assert!(bytes.len() <= 64 * 1024);
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) =>
+                        {
+                            assert!(Instant::now() < end, "original owned signal deadline");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("signal receipt read {e}"),
+                    }
+                }
+                super::keeper_integration_tests::native::assert_routes(
+                    &bytes,
+                    usize::from(!no_channel),
+                );
+            }
             parent_stage.set(SignalParentStage::AssertJoin);
             assert!(directory.path().join("signal-observed").exists());
             assert!(directory.path().join("signal-joined").exists());
@@ -4358,7 +4446,7 @@ fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        actors.finish(true);
+        actors.finish(!no_channel);
         result.unwrap();
     }
 }
@@ -5565,6 +5653,124 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         Some(&fresh_events),
     )));
     assert_eq!(daemon.rescues, 0);
+    #[cfg(feature = "test-darwin-keeper")]
+    {
+        let routes = super::keeper_integration_tests::route_images(&daemon.owner.stderr_bytes)
+            .expect("actual daemon compiled route receipts");
+        assert!(
+            routes.iter().any(|hash| *hash == hex::encode(old_hash)),
+            "parked channel did not select keeper in old image"
+        );
+        assert!(
+            routes.iter().any(|hash| *hash == hex::encode(new_hash)),
+            "fresh channel did not select keeper after real exec"
+        );
+        eprintln!(
+            "keeper223 replacement_routes old_image={} new_image={} source=compiled-missing",
+            hex::encode(old_hash),
+            hex::encode(new_hash)
+        );
+    }
     assert_eq!(hash_path(&original), original_hash);
     eprintln!("darwin223 actual_update=exec same_pid=true execution_version=fresh parked_leader=reaped descendant=exited fresh_channel=completed wire_STOP=normal rescue=false");
+}
+
+#[cfg(feature = "test-darwin-keeper")]
+pub(super) fn keeper_connected_suite() {
+    super::keeper_integration_tests::native::fixture();
+    darwin223_native_connected_close_stop_rebind_and_fresh_session();
+    keeper_stop_control_case();
+}
+#[cfg(feature = "test-darwin-keeper")]
+pub(super) fn keeper_signal_suite() {
+    super::keeper_integration_tests::native::fixture();
+    signal_cases(false);
+    signal_cases(true);
+}
+#[cfg(feature = "test-darwin-keeper")]
+pub(super) fn keeper_replacement_suite() {
+    super::keeper_integration_tests::native::fixture();
+    darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session();
+}
+#[cfg(feature = "test-darwin-keeper")]
+fn keeper_stop_control_case() {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    use transport::channel::{
+        encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, CONTROL_STREAM,
+        FIRST_CHANNEL_STREAM,
+    };
+    let fixture = super::keeper_integration_tests::native::fixture();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(home.path().join("qsh"))
+        .unwrap();
+    let socket = home.path().join("qsh/control.sock");
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port();
+    let listener = crate::control::bind_private(&socket).unwrap();
+    let server =
+        crate::load_or_create_transport_key(&home.path().join("qsh/transport_server_key.bin"))
+            .unwrap()
+            .public;
+    let client_key = transport::handshake::generate_keypair();
+    let (mut gate, child_gate) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut command = bootstrap_command(
+        &udp,
+        &listener,
+        &child_gate,
+        home.path(),
+        &fixture.path,
+        client_key.public,
+        "",
+    );
+    let mut owner = OwnedCommand::spawn(&mut command).unwrap();
+    owner.capture_stderr().unwrap();
+    let mut daemon = DirectDaemonGuard {
+        owner,
+        socket: socket.clone(),
+        identity: None,
+        watch: None,
+        normal: false,
+        rescues: 0,
+    };
+    drop((udp, listener, child_gate));
+    gate.set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    gate.write_all(b"GO\n").unwrap();
+    gate.shutdown(std::net::Shutdown::Write).unwrap();
+    drop(gate);
+    daemon.arm();
+    let mut actors = ConnectedActorAuthority::new();
+    let (client, events) = actual_connect(port, server, client_key.private, [3; 16]);
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: ConnectedActorAuthority::command(actors.path()),
+            })),
+        )
+        .unwrap();
+    until(|| {
+        actors.observe();
+        events
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, ServerRecord::Opened { .. }))
+            && actors.path().join("controller-bound").exists()
+    });
+    daemon.stop_normally();
+    client.close();
+    actors.finish(true);
+    super::keeper_integration_tests::native::assert_routes(&daemon.owner.stderr_bytes, 1);
+    assert_eq!(daemon.rescues, 0);
+    eprintln!("keeper223 wire_STOP=ack_then_actual_exit_watch_and_consumed_wait actors=joined rescue=false");
 }
