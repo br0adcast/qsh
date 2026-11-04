@@ -26,8 +26,11 @@ _MODULES=tuple('qshd_selinux_'+name for name in (
 _PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
          'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
          'consumer-preun-final':'PENDING'}
+_INTENTS={'provider-post-pristine':'provider-fresh','consumer-pre-fresh':'consumer-install',
+          'consumer-pre-installed':'consumer-install','consumer-post-owned':'consumer-install',
+          'consumer-preun-final':'consumer-erase'}
 _SCRIPT='/usr/libexec/qshd-selinux/qshd_selinux_phase.py'
-_CHILD='_phase_child_v1'
+_CHILD='_phase_child_pair_v2'
 
 
 class PhaseError(RuntimeError):
@@ -74,7 +77,7 @@ def _install_loader():
 
 def _request(phase):
     if type(phase) is not str or phase not in _PHASES:raise PhaseError('PHASE')
-    return _json(dict(schema=1,phase=phase))
+    return _json(dict(schema=2,phase=phase))
 
 
 def _parse_request(raw):
@@ -82,7 +85,7 @@ def _parse_request(raw):
     try:
         value=json.loads(raw,object_pairs_hook=_pairs)
         if (type(value) is not dict or set(value)!={'schema','phase'}
-                or type(value['schema']) is not int or value['schema']!=1
+                or type(value['schema']) is not int or value['schema']!=2
                 or _request(value['phase'])!=raw):raise PhaseError('REQUEST')
         return value
     except (ValueError,TypeError,RecursionError):raise PhaseError('REQUEST') from None
@@ -96,12 +99,12 @@ def _parse_response(raw,request):
         value=json.loads(raw,object_pairs_hook=_pairs)
         if (type(value) is not dict or set(value)!=
                 {'schema','phase','request_sha256','operation_id','state','artifact'}
-                or type(value['schema']) is not int or value['schema']!=1
+                or type(value['schema']) is not int or value['schema']!=2
                 or value['phase']!=expected['phase'] or value['state']!=_PHASES[expected['phase']]
                 or value['request_sha256']!=hashlib.sha256(request).hexdigest()
                 or type(value['operation_id']) is not str or re.fullmatch('[0-9a-f]{32}',value['operation_id']) is None
                 or type(value['artifact']) is not dict or set(value['artifact'])!=
-                   {'provider_version','manifest_sha256','pp_sha256'}
+                   {'provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256'}
                 or _json(value)+b'\n'!=raw):raise PhaseError('RESPONSE')
         TrustedArtifact(**value['artifact'])
         return value
@@ -112,9 +115,9 @@ def _response(record,request):
     from dataclasses import asdict
     from qshd_selinux_activation import Activation
     phase=_parse_request(request)['phase']
-    if type(record) is not Activation or record.state!=_PHASES[phase]:raise PhaseError('RESULT')
+    if type(record) is not Activation or (record.state!=_PHASES[phase] or record.intent!=_INTENTS[phase]):raise PhaseError('RESULT')
     record.__post_init__()
-    raw=_json(dict(schema=1,phase=phase,request_sha256=hashlib.sha256(request).hexdigest(),
+    raw=_json(dict(schema=2,phase=phase,request_sha256=hashlib.sha256(request).hexdigest(),
         operation_id=record.operation_id,state=record.state,artifact=asdict(record.artifact)))+b'\n'
     _parse_response(raw,request)
     return raw
@@ -203,7 +206,7 @@ def _resources(*,configure):
     if (os.geteuid()!=0 or len(list(Path('/proc/self/task').iterdir()))!=1
             or signal.getsignal(signal.SIGCHLD)!=signal.SIG_DFL or _children()):raise PhaseError('PROCESS')
     for key,target in ((resource.RLIMIT_CORE,0),(resource.RLIMIT_FSIZE,16*1024**2),
-                       (resource.RLIMIT_AS,1024**3),(resource.RLIMIT_NOFILE,128),(resource.RLIMIT_CPU,260)):
+                       (resource.RLIMIT_AS,1024**3),(resource.RLIMIT_NOFILE,128),(resource.RLIMIT_CPU,450)):
         soft,hard=resource.getrlimit(key)
         if configure:
             if hard!=resource.RLIM_INFINITY and hard<target:raise PhaseError('LIMITS')
@@ -231,7 +234,7 @@ def _dispatch(phase,*,deadline):
 
 def _owner():
     from qshd_selinux_process import _Owner,_Limits
-    return _Owner(_Limits(250,4096))
+    return _Owner(_Limits(440,4096))
 
 
 def _child_main(args):
@@ -240,7 +243,7 @@ def _child_main(args):
         request=args[0].encode('ascii');_parse_request(request)
         started=float(args[1]);work_end=float(args[2]);now=time.monotonic()
         if (not math.isfinite(started) or not math.isfinite(work_end)
-                or started<0 or started>now or work_end!=started+240 or now>=work_end):
+                or started<0 or started>now or work_end!=started+430 or now>=work_end):
             raise PhaseError('DEADLINE')
     except (ValueError,UnicodeError):raise PhaseError('ARGUMENTS') from None
     _resources(configure=False)
@@ -265,29 +268,30 @@ def _parent(phase,started):
         def interrupted(signum,frame):raise _Interrupted()
         for signum in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT):
             handlers[signum]=signal.signal(signum,interrupted)
-        if time.monotonic()>=started+240:raise PhaseError('DEADLINE')
+        if time.monotonic()>=started+430:raise PhaseError('DEADLINE')
         owner=_owner()
-        if time.monotonic()>=started+240:raise PhaseError('DEADLINE')
-        from qshd_selinux_process import _CommandError,_Outcome
+        if time.monotonic()>=started+430:raise PhaseError('DEADLINE')
+        from qshd_selinux_process import _CommandError,_Outcome,_Streams,_normal_outcome
         try:
             streams=owner._run(('/usr/bin/python3','-I','-B',_SCRIPT,_CHILD,
-                request.decode('ascii'),repr(started),repr(started+240)),'/',deadline=started+250)
+                request.decode('ascii'),repr(started),repr(started+430)),'/',deadline=started+440)
         except _CommandError as error:
             outcome=owner._last
             if (error.args!=('TOOL_FAILURE',) or type(outcome) is not _Outcome
                     or outcome.failure is not None or type(outcome.exit_code) is not int or outcome.exit_code!=1
-                    or outcome.settled is not True or type(outcome.unreaped) is not tuple or outcome.unreaped or type(outcome.stdout) is not bytes or outcome.stdout
-                    or type(outcome.stderr) is not bytes or time.monotonic()>=started+250):
+                    or not _normal_outcome(outcome) or outcome.settled is not True or type(outcome.unreaped) is not tuple or outcome.unreaped or type(outcome.stdout) is not bytes or outcome.stdout
+                    or type(outcome.stderr) is not bytes or time.monotonic()>=started+440):
                 raise PhaseError('OWNER') from None
             _parse_failure(outcome.stderr,request)
-            if time.monotonic()>=started+250:raise PhaseError('DEADLINE')
+            if time.monotonic()>=started+440:raise PhaseError('DEADLINE')
             sys.stderr.buffer.write(outcome.stderr);sys.stderr.buffer.flush()
             return 1
         outcome=owner._last
-        if (outcome is None or outcome.failure is not None or outcome.exit_code!=0
+        if (type(streams) is not _Streams or type(streams.stdout) is not bytes or type(streams.stderr) is not bytes
+                or not _normal_outcome(outcome) or outcome.exit_code!=0
                 or not outcome.settled or outcome.unreaped or streams.stderr):raise PhaseError('OWNER')
         _parse_response(streams.stdout,request)
-        if time.monotonic()>=started+250:raise PhaseError('DEADLINE')
+        if time.monotonic()>=started+440:raise PhaseError('DEADLINE')
         sys.stdout.buffer.write(streams.stdout);sys.stdout.buffer.flush()
         return 0
     finally:

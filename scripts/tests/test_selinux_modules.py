@@ -11,21 +11,33 @@ import qshd_selinux_modules as model
 class ModuleTests(unittest.TestCase):
     def test_padded_listing_and_immutable_selection(self):
         entries=model.parse_full_listing(b'100 example-base  cil          \n400 qshd          pp           \n200 sample_other pp disabled \n')
-        owned=model.select_owned(entries)
+        owned=model.select_owned(entries,role='core')
         self.assertEqual((owned.priority,owned.name,owned.language,owned.enabled),(400,'qshd','pp',True))
         self.assertFalse(entries[2].enabled)
         with self.assertRaises(FrozenInstanceError):owned.enabled=False
         self.assertFalse(hasattr(owned,'ready'))
-        self.assertEqual(model.select_owned([owned]),owned)
+        self.assertEqual(model.select_owned([owned],role='core'),owned)
 
     def test_absence_and_conflicts(self):
         for raw in (b'',b'No modules.\n',b'100 other pp\n'):
-            with self.assertRaises(model.ModuleError):model.select_owned(model.parse_full_listing(raw))
+            with self.assertRaises(model.ModuleError):model.select_owned(model.parse_full_listing(raw),role='core')
         for raw in (b'400 qshd pp disabled\n',b'100 qshd pp\n',b'400 qshd cil\n',
                     b'400 qshd pp\n100 qshd pp\n',b'400 qshd pp\n500 qshd pp\n',
                     b'400 qshd pp\n400 qshd pp\n'):
             with self.subTest(raw=raw),self.assertRaises(model.ModuleError):
-                model.select_owned(model.parse_full_listing(raw))
+                model.select_owned(model.parse_full_listing(raw),role='core')
+
+    def test_fixed_pair_roles(self):
+        entries=model.parse_full_listing(b'400 qshd pp\n400 qshd_contexts pp\n')
+        self.assertEqual(model.select_owned(entries,role='contexts').name,'qshd_contexts')
+        for role in ('qshd','unknown',True,None):
+            with self.assertRaises(model.ModuleError):model.select_owned(entries,role=role)
+        for suffix in (b'500 qshd pp\n',b'500 qshd_contexts pp\n',b'400 qshd_contexts cil\n'):
+            with self.assertRaises(model.ModuleError):model.select_owned(model.parse_full_listing(b'400 qshd pp\n'+suffix),role='core')
+
+    def test_conflict_on_other_reserved_name_never_hides_behind_core(self):
+        entries=model.parse_full_listing(b'400 qshd pp\n500 qshd_contexts pp\n')
+        with self.assertRaises(model.ModuleError):model.select_owned(entries,role='core')
 
     def test_malformed_and_bounded_listing(self):
         bad=(b'400 qshd pp',b'\n',b'400 qshd pp\n\n',b'No modules. \n',b'No modules.\n400 qshd pp\n',
@@ -49,8 +61,8 @@ class ModuleTests(unittest.TestCase):
             with self.assertRaises(model.ModuleError):model.ModuleEntry(*args)
         good=model.ModuleEntry(400,'qshd','pp',True)
         for entries in (None,'qshd',{good},[good,object()],(x for x in [good]),[good]*4097):
-            with self.assertRaises(model.ModuleError):model.select_owned(entries)
-        with self.assertRaises(model.ModuleError):model.select_owned([good,good])
+            with self.assertRaises(model.ModuleError):model.select_owned(entries,role='core')
+        with self.assertRaises(model.ModuleError):model.select_owned([good,good],role='core')
 
     def test_exact_hll_and_digest_bounds(self):
         data=b'synthetic public module bytes\x00\xff';digest=hashlib.sha256(data).hexdigest()

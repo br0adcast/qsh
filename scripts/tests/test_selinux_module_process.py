@@ -23,11 +23,23 @@ if case=='observer-profile':
     assert m._Limits(30,4096).execution_seconds==30
     assert m._Limits(75,1024**2).execution_seconds==75
     assert m._Limits(250,4096).execution_seconds==250
+    assert m._Limits(120,4096).execution_seconds==120
+    assert m._Limits(440,4096).execution_seconds==440
     assert m._Limits(15,4*1024**2).execution_seconds==15
-    for pair in ((16,4096),(29,4096),(31,4096),(30,4095),(30,4097),(59,4096),(60,4097),(60,1024**2),(249,4096),(251,4096),(250,4095),(250,4097),(260,4096)):
+    for pair in ((16,4096),(29,4096),(31,4096),(30,4095),(30,4097),(59,4096),(60,4097),(60,1024**2),(249,4096),(251,4096),(250,4095),(250,4097),(260,4096),(119,4096),(121,4096),(120,8192),(439,4096),(441,4096),(440,4095)):
         try:m._Limits(*pair)
         except m._CommandError:pass
         else:raise AssertionError('unapproved observer profile')
+elif case=='natural-orphan':
+    owner=m._Owner(m._Limits(2,4096));m._TERM_SECONDS=.1
+    source='import os,signal,time; p=os.fork();\nif p==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(30)\nelse:os._exit(0)'
+    with tempfile.TemporaryDirectory() as directory:
+        try:owner._run((sys.executable,'-I','-B','-c',source),directory)
+        except m._CommandError:pass
+        else:raise AssertionError('rescued orphan was accepted as natural success')
+    assert owner._last.settled and not owner._last.unreaped and not m._children()
+    assert owner._last.natural is False
+    assert owner._last.group_term_attempts>0 or owner._last.adopted_term_attempts>0
 elif case=='launch-error':
     import errno
     owner=m._Owner(m._Limits(15,1024**2))
@@ -192,7 +204,7 @@ else:
                     if case=='lease-cleanup':m._TERM_SECONDS=.25
                     owner=m._Owner(m._Limits(5,1024**2));start=time.monotonic()
                     try:owner._run(('/usr/bin/semodule','--store-path','/var/lib/selinux','-s','targeted','-lfull'),temporary,deadline=start+.15)
-                    except m._CommandError as exc:assert str(exc)=='COMMAND_TIMEOUT'
+                    except m._CommandError as exc:assert str(exc) in ('COMMAND_TIMEOUT','COMMAND_CUSTODY')
                     else:raise AssertionError('remaining lease ignored')
                     assert time.monotonic()-start<1.5
                 elif case=='expired':
@@ -212,11 +224,11 @@ else:
                     except m._CommandError as exc:assert str(exc)=='COMMAND_KIND'
                     else:raise AssertionError('arbitrary operation admitted')
                     assert seen==[]
-                    for operation in ('list','extract','list','extract'):owner._run(operation,temporary)
+                    for operation in ('list','extract-core','extract-contexts','list','extract-core','extract-contexts'):owner._run(operation,temporary)
                     try:owner._run('list',temporary)
                     except m._CommandError as exc:assert str(exc)=='COMMAND_BUDGET'
                     else:raise AssertionError('fifth command admitted')
-                else:result=owner._run('extract' if case=='extract-output' else 'list',temporary)
+                else:result=owner._run('extract-core' if case=='extract-output' else 'list',temporary)
             except (m._CommandError,KeyboardInterrupt) as exc:error=exc
             if case=='short-tail':assert result.stdout==b'abcdefghij'*20 and result.stderr==b'tail'*25 and error is None
             elif case=='tail-overflow':assert isinstance(error,m._CommandError) and str(error)=='OUTPUT_LIMIT'
@@ -224,7 +236,8 @@ else:
             elif case=='streams':assert result.stdout==b'out\xff' and result.stderr==b'err\x00' and error is None
             elif case=='profile':assert result.stdout==b'x'*(2*1024**2) and result.stderr==b'' and error is None
             elif case=='stderr-finite':assert isinstance(error,m._CommandError) and str(error)=='COMMAND_STDERR'
-            elif case in ('pipe','detached','binding','expired','remaining','lease-cleanup'):assert error is None
+            elif case in ('pipe','detached'):assert isinstance(error,m._CommandError) and str(error)=='COMMAND_CUSTODY'
+            elif case in ('binding','expired','remaining','lease-cleanup'):assert error is None
             elif case=='anchor':assert isinstance(error,m._CommandError) and str(error)=='COMMAND_CUSTODY'
             elif case=='extract-output':assert isinstance(error,m._CommandError) and str(error)=='COMMAND_OUTPUT'
             elif case in ('interrupt','cleanup-interrupt'):assert isinstance(error,KeyboardInterrupt)
@@ -236,10 +249,15 @@ else:
                 expected={'nonzero':'TOOL_FAILURE','timeout':'COMMAND_TIMEOUT','stdout':'OUTPUT_LIMIT','stderr':'OUTPUT_LIMIT','combined':'OUTPUT_LIMIT'}[case]
                 assert isinstance(error,m._CommandError) and str(error)==expected,(case,error)
             prefix=('/usr/bin/semodule','--store-path','/var/lib/selinux','-s','targeted')
-            listing=prefix+('-lfull',);extract=prefix+('-X','400','--hll','-E','qshd')
-            assert seen==([] if case=='expired' else [listing,extract,listing,extract] if case=='binding' else [extract] if case=='extract-output' else [listing])
-            if case in ('anchor','expired'):assert not any(event[0]=='group' for event in events),events
-            else:assert events[0]==('group',signal.SIGTERM) and sum(event[0]=='group' for event in events)==(4 if case=='binding' else 1),events
+            listing=prefix+('-lfull',);extract=prefix+('-X','400','--hll','-E','qshd');contexts=prefix+('-X','400','--hll','-E','qshd_contexts')
+            assert seen==([] if case=='expired' else [listing,extract,contexts,listing,extract,contexts] if case=='binding' else [extract] if case=='extract-output' else [listing])
+            natural_cases=('normal','short-tail','streams','profile','binding','nonzero','stderr-finite','extract-output')
+            if case in natural_cases or case in ('anchor','expired'):
+                assert not any(event[0]=='group' for event in events),events
+                if case in natural_cases:
+                    assert owner._last.natural and owner._last.stdout_eof and owner._last.stderr_eof
+                    assert owner._last.group_term_attempts==owner._last.adopted_term_attempts==owner._last.kill_attempts==0
+            else:assert sum(event[0]=='group' for event in events)==1,events
             if case in ('expired','nonzero','timeout','interrupt','cleanup-interrupt','unsettled'):
                 assert getattr(error,'launch_code',None) is None
                 assert owner._last.launch_code is None
@@ -276,6 +294,8 @@ class ProcessTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"passed": true', result.stdout)
+
+    def test_exit_zero_orphan_cannot_be_rescued_into_success(self): self.control('natural-orphan')
 
     def test_launch_error_preserves_only_closed_errno(self): self.control('launch-error')
 

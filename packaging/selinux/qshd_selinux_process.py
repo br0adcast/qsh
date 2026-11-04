@@ -36,19 +36,25 @@ class _CommandError(RuntimeError):
 
 
 
+def _finite_number(value):
+    try:return type(value) in (int,float) and math.isfinite(value)
+    except OverflowError:return False
+
+
 @dataclass(frozen=True)
 class _Limits:
     execution_seconds: float
     output_bytes: int
 
     def __post_init__(self):
-        if (type(self.execution_seconds) not in (int, float)
-                or not math.isfinite(self.execution_seconds)
+        if (not _finite_number(self.execution_seconds)
                 or not (0 < self.execution_seconds <= 15 or
                         (self.execution_seconds == 30 and self.output_bytes == 4096) or
                         (self.execution_seconds == 60 and self.output_bytes == 4096) or
                         (self.execution_seconds == 75 and self.output_bytes == 1024 * 1024) or
-                        (self.execution_seconds == 250 and self.output_bytes == 4096))
+                        (self.execution_seconds == 250 and self.output_bytes == 4096) or
+                        (self.execution_seconds == 120 and self.output_bytes == 4096) or
+                        (self.execution_seconds == 440 and self.output_bytes == 4096))
                 or type(self.output_bytes) is not int
                 or not 0 < self.output_bytes <= 4 * 1024 * 1024):
             raise _CommandError('COMMAND_LIMITS')
@@ -69,6 +75,12 @@ class _Outcome:
     settled: bool
     unreaped: tuple[int, ...] = ()
     launch_code: str | None = None
+    natural: bool = False
+    stdout_eof: bool = False
+    stderr_eof: bool = False
+    group_term_attempts: int = 0
+    adopted_term_attempts: int = 0
+    kill_attempts: int = 0
 
 
 _ERRNO_CODES={getattr(errno,name):'OS_'+name for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM')}
@@ -84,7 +96,8 @@ def _launch_code(outcome):
 _FAILURES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TOOL_FAILURE','COMMAND_UNSETTLED','OUTPUT_INCOMPLETE'))
 _PROFILES={(5,16384):'guard5',(5,4*1024**2):'rpm5',(15,4*1024**2):'rpm15',
            (15,1024**2):'module15',(75,1024**2):'module75',(30,4096):'capsule30',
-           (60,4096):'observer60',(250,4096):'phase250'}
+           (60,4096):'observer60',(250,4096):'phase250',(120,4096):'pair-observer120',
+           (440,4096):'pair-phase440'}
 
 
 @dataclass(frozen=True)
@@ -156,6 +169,36 @@ def _reap_adopted():
             return _children()
 
 
+def _natural_terminal(pid):
+    """Before signals/reap: terminal reserved leader is the only possible child.
+
+    Exactly one caller task, enabled subreaper, full child census and WNOWAIT
+    retain the leader's identity. Repeated proof immediately precedes skipping
+    rescue; terminal leader plus no other producer cannot fork a future child.
+    """
+    tasks=tuple(Path('/proc/self/task').iterdir())
+    if len(tasks)!=1 or tasks[0].name!=str(os.getpid()):raise _CommandError('COMMAND_CUSTODY')
+    libc=ctypes.CDLL(None,use_errno=True);get=libc.prctl
+    get.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong];get.restype=ctypes.c_int
+    value=ctypes.c_int()
+    if get(37,ctypes.byref(value),0,0,0)!=0 or value.value!=1:raise _CommandError('COMMAND_CUSTODY')
+    children=[]
+    for task in tasks:children.extend(int(x) for x in (task/'children').read_text().split())
+    if children!=[pid]:raise _CommandError('COMMAND_CUSTODY')
+    status=os.waitid(os.P_PID,pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
+    if status is None or status.si_pid!=pid or status.si_code!=os.CLD_EXITED:raise _CommandError('COMMAND_CUSTODY')
+    return status
+
+
+def _normal_outcome(outcome):
+    return (type(outcome) is _Outcome and outcome.natural is True
+            and outcome.stdout_eof is True and outcome.stderr_eof is True
+            and all(type(x) is int and x==0 for x in (outcome.group_term_attempts,outcome.adopted_term_attempts,outcome.kill_attempts))
+            and outcome.settled is True and type(outcome.unreaped) is tuple and not outcome.unreaped
+            and outcome.failure is None and type(outcome.exit_code) is int
+            and type(outcome.stdout) is bytes and type(outcome.stderr) is bytes)
+
+
 class _Owner:
     """Internal mechanism; only trusted consumers construct fixed argument tuples."""
 
@@ -178,7 +221,7 @@ class _Owner:
                 any(type(arg) is not str or '\0' in arg for arg in argv)
                 or not Path(cwd).is_absolute() or '\0' in cwd):
             raise _CommandError('COMMAND_INPUT')
-        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        if deadline is not None and (not _finite_number(deadline)):
             raise _CommandError('COMMAND_INPUT')
         lease_deadline = deadline
         now = time.monotonic()
@@ -198,11 +241,13 @@ class _Owner:
         failure = None
         pending = None
         launch_code = None
+        natural = False
+        group_term_attempts = adopted_term_attempts = kill_attempts = 0
 
         def custody_error(error):
             nonlocal failure, pending
             failure = failure or 'COMMAND_CUSTODY'
-            if not isinstance(error, (OSError, ValueError)):
+            if not isinstance(error,(OSError,ValueError,_CommandError)):
                 pending = pending or error
 
         def captured():
@@ -243,8 +288,16 @@ class _Owner:
                     failure = 'OUTPUT_LIMIT'
                 elif time.monotonic() >= deadline:
                     failure = 'COMMAND_TIMEOUT'
-                if failure or ended is not None:
-                    break
+                if failure:break
+                if ended is not None:
+                    try:
+                        # A terminal leader with a descendant is already not
+                        # natural completion, even if rescue later drains EOF.
+                        _natural_terminal(proc.pid)
+                    except BaseException as error:
+                        custody_error(error);break
+                    if not readable:
+                        natural=True;break
                 select.select([pipes[index] for index in readable], [], [], min(.02, max(0, deadline-time.monotonic())))
         except BaseException as error:
             if proc is None and type(error) in (OSError,PermissionError):
@@ -255,22 +308,21 @@ class _Owner:
                 pending = error
         finally:
             if proc is not None:
-                # Verify the child is still waitable immediately before using
-                # its group ID. Failed ownership proof never permits killpg.
-                try:
-                    os.waitid(os.P_PID, proc.pid,
-                              os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                except BaseException as error:
-                    failure = 'COMMAND_CUSTODY'
-                    custody_error(error)
-                else:
-                    # Exactly one group signal, before any poll/wait reaps it.
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                # Recheck the certificate at the last pre-signal point.
+                if natural and failure is None and pending is None and not overflow and time.monotonic()<deadline:
+                    try:_natural_terminal(proc.pid)
+                    except BaseException as error:natural=False;custody_error(error)
+                else:natural=False
+                if not natural:
+                    # Rescue is physical cleanup only, never successful work.
+                    try:os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)
                     except BaseException as error:
-                        custody_error(error)
+                        failure='COMMAND_CUSTODY';custody_error(error)
+                    else:
+                        group_term_attempts+=1
+                        try:os.killpg(proc.pid,signal.SIGTERM)
+                        except ProcessLookupError:pass
+                        except BaseException as error:custody_error(error)
                 if not nonblocking:
                     for pipe in pipes:
                         try:
@@ -296,6 +348,7 @@ class _Owner:
                     for pid in ids or ():
                         # These direct/adopted children remain unreaped while signalled.
                         if pid != proc.pid and pid not in term:
+                            adopted_term_attempts+=1
                             try:
                                 os.kill(pid, signal.SIGTERM)
                             except ProcessLookupError:
@@ -304,6 +357,7 @@ class _Owner:
                                 custody_error(error)
                             term.add(pid)
                         if time.monotonic() - start >= _TERM_SECONDS and pid not in killed:
+                            kill_attempts+=1
                             try:
                                 os.kill(pid, signal.SIGKILL)
                             except ProcessLookupError:
@@ -323,7 +377,9 @@ class _Owner:
                         self._unsettled = True
                         self._last = _Outcome(*captured(), proc.returncode,
                                               'COMMAND_UNSETTLED', False,
-                                              tuple(ids) if ids is not None else (proc.pid,))
+                                              tuple(ids) if ids is not None else (proc.pid,),
+                                              natural=False,stdout_eof=0 not in readable,stderr_eof=1 not in readable,
+                                              group_term_attempts=group_term_attempts,adopted_term_attempts=adopted_term_attempts,kill_attempts=kill_attempts)
                         break
                     try:
                         time.sleep(.01)
@@ -337,8 +393,13 @@ class _Owner:
             if not self._unsettled:
                 if lease_deadline is not None and time.monotonic() >= lease_deadline and failure is None:
                     failure = 'COMMAND_TIMEOUT'
-                self._last = _Outcome(*captured(), None if proc is None else proc.returncode,
-                                      'OUTPUT_LIMIT' if overflow else failure, True, launch_code=launch_code)
+                if (group_term_attempts or adopted_term_attempts or kill_attempts) and failure is None:
+                    failure='COMMAND_CUSTODY'
+                natural=bool(natural and failure is None and pending is None and not readable)
+                self._last = _Outcome(*captured(),None if proc is None else proc.returncode,
+                                      'OUTPUT_LIMIT' if overflow else failure,True,launch_code=launch_code,
+                                      natural=natural,stdout_eof=0 not in readable,stderr_eof=1 not in readable,
+                                      group_term_attempts=group_term_attempts,adopted_term_attempts=adopted_term_attempts,kill_attempts=kill_attempts)
         if self._unsettled:
             raise _CommandError('COMMAND_UNSETTLED',summary=_failure_summary(self._last,self._limits)) from None
         if pending is not None:

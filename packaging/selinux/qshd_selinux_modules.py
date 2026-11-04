@@ -91,11 +91,14 @@ def parse_full_listing(data: bytes) -> tuple[ModuleEntry, ...]:
     return tuple(entries)
 
 
-def select_owned(entries) -> ModuleEntry:
-    """Require the sole enabled priority400/pp qshd store entry, not kernel identity."""
+def select_owned(entries, *, role) -> ModuleEntry:
+    """Select a closed pair role, rejecting conflicts on either reserved name."""
     if type(entries) not in (list, tuple) or len(entries) > MAX_ROWS:
         _fail('INVALID_ENTRIES')
+    roles={'core':'qshd','contexts':'qshd_contexts'}
+    if type(role) is not str or role not in roles:_fail('INVALID_ROLE')
     seen, owned = set(), []
+    reserved={name:[] for name in roles.values()}
     for entry in entries:
         if type(entry) is not ModuleEntry:
             _fail('INVALID_ENTRY')
@@ -105,8 +108,11 @@ def select_owned(entries) -> ModuleEntry:
         if key in seen:
             _fail('DUPLICATE_MODULE')
         seen.add(key)
-        if entry.name == 'qshd':
-            owned.append(entry)
+        if entry.name in reserved:reserved[entry.name].append(entry)
+        if entry.name==roles[role]:owned.append(entry)
+    for values in reserved.values():
+        if len(values)>1 or values and (values[0].priority!=400 or values[0].language!='pp' or not values[0].enabled):
+            _fail('OWNED_MODULE_CONFLICT')
     if len(owned) != 1:
         _fail('OWNED_MODULE_COUNT')
     entry = owned[0]

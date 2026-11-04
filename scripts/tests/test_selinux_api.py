@@ -332,5 +332,144 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(closes, [True])
 
 
+
+
+class SharedStatus:
+    """Two library handles share the real native mapping/counter shape."""
+    def __init__(self):
+        self.mapped = False
+        self.events = []
+        self.updated = 0
+        self.counter = 7
+        self.enforcing = 1
+        self.close_error = False
+
+    def library(self):
+        lib = Library()
+        def opened(fallback):
+            self.events.append('open')
+            self.mapped = True
+            return 0
+        def closed():
+            self.events.append('close')
+            if self.close_error:
+                raise RuntimeError('synthetic close failure')
+            self.mapped = False
+        def updated():
+            self.events.append('updated')
+            return self.updated if self.mapped else -1
+        lib.selinux_status_open.impl = opened
+        lib.selinux_status_close.impl = closed
+        lib.selinux_status_updated.impl = updated
+        lib.selinux_status_getenforce.impl = lambda: self.enforcing
+        lib.selinux_status_policyload.impl = lambda: self.counter
+        return lib
+
+
+class StatusOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        # A fresh loaded module represents a fresh helper process, including
+        # permanent close-error poisoning; no production reset is provided.
+        spec = importlib.util.spec_from_file_location('status_api_fixture', PATH)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.shared = SharedStatus()
+        self.first = self.module.SelinuxApi(self.shared.library())
+        self.second = self.module.SelinuxApi(self.shared.library())
+
+    def test_cross_instance_owner_refused_before_any_native_call(self):
+        with self.first.status_observation():
+            before = list(self.shared.events)
+            with self.assertRaises(self.module.SelinuxError):
+                with self.second.status_observation():
+                    pass
+            self.assertEqual(self.shared.events, before)
+            self.assertTrue(self.shared.mapped)
+        self.assertEqual(self.shared.events, ['open', 'updated', 'updated', 'close'])
+
+    def test_live_token_borrowing_and_closed_token_survives_later_owner(self):
+        with self.first.status_observation() as token:
+            before = list(self.shared.events)
+            self.assertIs(token.require_open(), self.first)
+            self.assertIs(token.require_open(), self.first)
+            with self.assertRaises(self.module.SelinuxError):
+                token.require_closed()
+            self.assertEqual(self.shared.events, before)
+        self.assertIs(token.require_closed(), self.first)
+        with self.second.status_observation() as later:
+            self.assertIs(token.require_closed(), self.first)
+            with self.assertRaises(self.module.SelinuxError):
+                token.require_open()
+            self.assertIs(later.require_open(), self.second)
+        self.assertIs(later.require_closed(), self.second)
+        self.assertEqual(self.shared.events.count('open'), 2)
+        self.assertEqual(self.shared.events.count('updated'), 4)
+        self.assertEqual(self.shared.events.count('close'), 2)
+
+    def test_copied_handmade_wrong_pid_and_serialized_tokens_refuse(self):
+        import pickle
+        with self.first.status_observation() as token:
+            copied = object.__new__(self.module._StatusToken)
+            copied._record = token._record
+            handmade = self.module._StatusToken(object())
+            for invalid in (copied, handmade):
+                for method in (invalid.require_open, invalid.require_closed):
+                    with self.assertRaises(self.module.SelinuxError):
+                        method()
+            with patch.object(self.module.os, 'getpid', return_value=os.getpid()+1):
+                with self.assertRaises(self.module.SelinuxError):
+                    token.require_open()
+            with self.assertRaises(TypeError):
+                pickle.dumps(token)
+        with self.assertRaises(self.module.SelinuxError):
+            copied.require_closed()
+        with patch.object(self.module.os, 'getpid', return_value=os.getpid()+1):
+            with self.assertRaises(self.module.SelinuxError):
+                token.require_closed()
+
+    def test_body_and_final_drift_fail_tokens_but_release_clean_owner(self):
+        for failure in ('body', 'updated', 'counter', 'mode'):
+            with self.subTest(failure=failure):
+                self.shared.updated = 0
+                self.shared.counter = 7
+                self.shared.enforcing = 1
+                with self.assertRaises((self.module.SelinuxError, ValueError)):
+                    with self.first.status_observation() as token:
+                        if failure == 'body':
+                            raise ValueError('synthetic body failure')
+                        if failure == 'updated': self.shared.updated = 1
+                        if failure == 'counter': self.shared.counter = 8
+                        if failure == 'mode': self.shared.enforcing = 0
+                for method in (token.require_open, token.require_closed):
+                    with self.assertRaises(self.module.SelinuxError): method()
+                self.assertFalse(self.shared.mapped)
+        self.shared.updated = 0
+        self.shared.enforcing = 1
+        with self.second.status_observation() as recovered:
+            self.assertIs(recovered.require_open(), self.second)
+        recovered.require_closed()
+
+    def test_cleanup_reserves_owner_and_close_failure_poison_is_permanent(self):
+        native_close = self.first._lib.selinux_status_close.impl
+        def closing():
+            before = list(self.shared.events)
+            with self.assertRaises(self.module.SelinuxError):
+                with self.second.status_observation(): pass
+            self.assertEqual(self.shared.events, before)
+            native_close()
+        self.first._lib.selinux_status_close.impl = closing
+        self.shared.close_error = True
+        with self.assertRaises(RuntimeError):
+            with self.first.status_observation() as token: pass
+        with self.assertRaises(self.module.SelinuxError): token.require_closed()
+        self.shared.close_error = False
+        before = list(self.shared.events)
+        for owner in (self.first, self.second):
+            with self.assertRaises(self.module.SelinuxError):
+                with owner.status_observation(): pass
+        self.assertEqual(self.shared.events, before)
+        self.assertEqual(self.shared.events.count('close'), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

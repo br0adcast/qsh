@@ -23,7 +23,7 @@ import qshd_selinux_transaction as tx
 from qshd_selinux_activation import TrustedArtifact
 from qshd_selinux_modules import HllIdentity
 
-PP=b'inert canonical test PP';TRUST=TrustedArtifact('fixture','a'*64,hashlib.sha256(PP).hexdigest())
+PP=b'inert canonical test PP';TRUST=TrustedArtifact('fixture','a'*64,hashlib.sha256(PP).hexdigest(),hashlib.sha256(b'inert contexts test PP').hexdigest())
 
 class Bindings:
     def __init__(self,root):
