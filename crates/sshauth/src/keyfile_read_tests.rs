@@ -243,13 +243,28 @@ fn private_key_read_preserves_explicit_links_and_file_modes() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("target");
-    let alias = dir.path().join("identity");
-    std::fs::write(&target, text()).unwrap();
+    let relative = dir.path().join("relative");
+    let absolute = dir.path().join("absolute");
+    let encoded = text();
+    std::fs::write(&target, &encoded).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    symlink("target", &relative).unwrap();
+    symlink(&target, &absolute).unwrap();
+    let expected = decode(&encoded).unwrap();
+    for alias in [&relative, &absolute] {
+        assert_eq!(read(alias).unwrap().public_key(), expected.public_key());
+    }
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
-    symlink("target", &alias).unwrap();
+    for alias in [&relative, &absolute] {
+        permission_denied(read(alias));
+        assert!(std::fs::symlink_metadata(alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     assert!(
-        read(&alias).is_ok(),
-        "this slice must not tighten existing trust policy"
+        std::fs::read_to_string(&target).unwrap() == encoded,
+        "refusal must preserve key bytes"
     );
     assert_eq!(
         std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
@@ -375,4 +390,173 @@ fn private_key_read_errors_do_not_disclose_a_partial_prefix() {
     assert!(matches!(error, KeyFileError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
     assert!(!error.to_string().contains("synthetic-secret"));
     assert_eq!(invalid.position(), 17);
+}
+
+#[cfg(unix)]
+fn permission_denied<T>(result: Result<T, KeyFileError>) -> KeyFileError {
+    match result {
+        Err(error @ KeyFileError::Io(_)) => {
+            assert!(
+                matches!(&error, KeyFileError::Io(e) if e.kind() == io::ErrorKind::PermissionDenied)
+            );
+            error
+        }
+        Err(_) => panic!("expected permission refusal, got another classification"),
+        Ok(_) => panic!("unsafe private file was accepted"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_read_enforces_unix_owner_and_mode_policy() {
+    use std::os::unix::fs::PermissionsExt;
+    for effective_uid in [1000, 0] {
+        for owner in [0, 1000, 2000] {
+            for mode in [
+                0o600, 0o400, 0o700, 0o640, 0o620, 0o610, 0o604, 0o602, 0o601,
+            ] {
+                let allowed = (owner == 0 || owner == effective_uid) && mode & 0o077 == 0;
+                assert_eq!(
+                    validate_unix_owner_mode(owner, mode, effective_uid).is_ok(),
+                    allowed,
+                    "synthetic owner={owner} mode={mode:o} effective_uid={effective_uid}"
+                );
+            }
+        }
+    }
+    // Actual current-owned files complement the synthetic root/foreign-owner cases.
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(text().as_bytes()).unwrap();
+    for mode in [
+        0o600, 0o400, 0o700, 0o640, 0o620, 0o610, 0o604, 0o602, 0o601,
+    ] {
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        if mode & 0o077 == 0 {
+            assert!(read(file.path()).is_ok());
+        } else {
+            permission_denied(read(file.path()));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_read_rejects_unsafe_mode_before_read_or_decode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"synthetic-private-marker\x1b[31m\xff")
+        .unwrap();
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o666))
+        .unwrap();
+    let mut called = false;
+    let error = permission_denied(read_opened_with(file.as_file_mut(), |_| {
+        called = true;
+        Ok(Zeroizing::new(String::new()))
+    }));
+    assert!(!called, "unsafe input must be rejected before reading");
+    permission_denied(read(file.path()));
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(!rendered.contains("synthetic-private-marker"));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains("\\x1b"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_read_revalidates_held_file_after_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(text().as_bytes()).unwrap();
+    let mut held = file.reopen().unwrap();
+    assert!(read_opened_with(&mut held, read_bounded).is_ok());
+    let mut held = file.reopen().unwrap();
+    permission_denied(read_opened_with(&mut held, |file| {
+        let text = read_bounded(file)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        Ok(text)
+    }));
+    assert_eq!(held.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_read_keeps_selected_descriptor_when_path_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    for change_mode in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity");
+        let aside = dir.path().join("selected");
+        let a = text();
+        let b = text();
+        let mut held = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        held.write_all(a.as_bytes()).unwrap();
+        let (_, initial) = held.keep().unwrap();
+        std::fs::rename(initial, &path).unwrap();
+        let mut held = std::fs::File::open(&path).unwrap();
+        let result = read_opened_with(&mut held, |file| {
+            std::fs::rename(&path, &aside).unwrap();
+            std::fs::write(&path, &b).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let text = read_bounded(file)?;
+            if change_mode {
+                file.set_permissions(std::fs::Permissions::from_mode(0o640))
+                    .unwrap();
+            }
+            Ok(text)
+        });
+        if change_mode {
+            permission_denied(result);
+        } else {
+            assert_eq!(
+                decode(&result.unwrap()).unwrap().public_key(),
+                decode(&a).unwrap().public_key()
+            );
+        }
+        assert_eq!(
+            read(&path).unwrap().public_key(),
+            decode(&b).unwrap().public_key()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_key_read_preserves_parent_and_hardlink_compatibility() {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let parent = dir.path().join("writable");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let leaf = parent.join("key");
+    std::fs::write(&leaf, text()).unwrap();
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let alias = dir.path().join("alias");
+    symlink("writable", &alias).unwrap();
+    let hard = dir.path().join("hard");
+    std::fs::hard_link(&leaf, &hard).unwrap();
+    for path in [&leaf, &alias.join("key"), &hard] {
+        assert!(read(path).is_ok());
+    }
+    assert_eq!(
+        std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    assert_eq!(std::fs::metadata(&leaf).unwrap().nlink(), 2);
+    assert!(std::fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let broken = dir.path().join("broken");
+    symlink("absent", &broken).unwrap();
+    let looped = dir.path().join("looped");
+    symlink("looped", &looped).unwrap();
+    for path in [&broken, &looped] {
+        assert!(matches!(read(path), Err(KeyFileError::Io(_))));
+    }
 }

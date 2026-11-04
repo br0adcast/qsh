@@ -2,6 +2,7 @@
 #[path = "../../crates/ssh/tests/support/fake_server.rs"]
 #[allow(dead_code)]
 mod fake;
+mod support;
 
 use qsh::{
     climb::{Climb, Climbed, Mode, Setup},
@@ -56,9 +57,9 @@ fn verify_bootstrap_key(pkcs8: bool) {
     )
     .unwrap();
     if pkcs8 {
-        russh::keys::encode_pkcs8_pem(&key, std::fs::File::create(&identity).unwrap()).unwrap();
+        russh::keys::encode_pkcs8_pem(&key, support::private_file(&identity).unwrap()).unwrap();
     } else {
-        std::fs::write(
+        support::write_private(
             &identity,
             key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
         )

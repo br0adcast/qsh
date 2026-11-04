@@ -1,5 +1,6 @@
 #[path = "support/recovery_ssh.rs"]
 mod fake;
+mod support;
 use qsh::{known_hosts::KnownHosts, prompt::Tty, ssh_step::SshStep};
 use std::{
     path::Path,
@@ -12,7 +13,7 @@ fn attempt(home: &Path, server: &fake::Server) {
         ssh_key::Algorithm::Ed25519,
     )
     .unwrap();
-    std::fs::write(
+    support::write_private(
         &identity,
         key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
     )
