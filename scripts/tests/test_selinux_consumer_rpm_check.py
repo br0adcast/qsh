@@ -583,7 +583,9 @@ class NativeTests(unittest.TestCase):
             'cp "%{_sourcedir}/manifest" "%{buildroot}/usr/share/qshd/consumer-rpm.json"\n'
             '%files\n%defattr(-,root,root,-)\n%attr(0755,root,root) /usr/bin/qshd\n'
             '%config(noreplace) %attr(0644,root,root) /etc/pam.d/qshd\n'
-            '%attr(0644,root,root) /usr/share/qshd/consumer-rpm.json\n')
+            '%attr(0644,root,root) /usr/share/qshd/consumer-rpm.json\n'
+            '%changelog\n* Thu Jan 01 2026 Synthetic fixture <fixture@example.invalid> - '+version+'-1\n'
+            '- Opaque selected-content regression fixture.\n')
         outcome=self.invoke({'worker':'--_builder-worker','spec':str(spec),'top':str(top)},'builder-'+label)
         self.assertEqual(outcome['exit'],0)
         self.assertEqual(base64.b64decode(outcome['stdout']),b'BUILT\n')
