@@ -309,6 +309,29 @@ jobs:
           grep -F 'validated 10 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
+      - name: Native cold executable checksum regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-cold-checksum.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -m 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test --locked -p qshd --test darwin_self_checksum -- \
+            --exact unchanged_image_keeps_cold_checksum renamed_image_keeps_cold_checksum \
+            --test-threads=1 --nocapture --color=never 2>&1 | tee "$runtime/results.log"
+          for name in unchanged_image_keeps_cold_checksum renamed_image_keeps_cold_checksum; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 { seen++; pending=1; if ($0 == expected "ok") { passed++; pending=0 }; next }
+              pending && $0 == "ok" { passed++; pending=0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
+          done
+          grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          if grep -Fq 'SKIPPED' "$runtime/results.log"; then exit 1; fi
       - name: Native control peer-account tests
         shell: bash
         run: |
