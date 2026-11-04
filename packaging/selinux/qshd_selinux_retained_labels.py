@@ -30,10 +30,23 @@ _CHILDREN={'/etc/qshd':frozenset(('host_key',)),
            '/run/qshd':frozenset(('helper-status.sock.lock',))}
 _LABEL='security.selinux'
 _NO_TOKEN=object()
+_RAW_ROLES={'/etc/qshd':'CONFIG_DIR','/etc/qshd/host_key':'HOST_KEY',
+            '/var/log/qshd':'LOG_DIR','/var/log/qshd/qshd.log':'LOG_CURRENT',
+            '/var/log/qshd/qshd.log.1':'LOG_ROTATED','/run/qshd':'RUNTIME_DIR',
+            '/run/qshd/helper-status.sock.lock':'STATUS_LOCK'}
+_RAW_REASONS=frozenset(('ABSENT','INVALID_TYPE','OVERSIZE','UNLABELED_LITERAL','OTHER_BYTES'))
 
 
 class RetainedLabelError(ValueError):
     """Fixed refusal category; no protected content or native diagnostic."""
+
+
+class RetainedLabelRawError(RetainedLabelError):
+    """Closed sampled-byte category; never raw bytes or a kernel-cause claim."""
+    def __init__(self,role,reason):
+        if (type(role) is not str or role not in _RAW_ROLES.values()
+                or type(reason) is not str or reason not in _RAW_REASONS):_fail()
+        super().__init__('RAW_LABEL_REFUSED',role,reason)
 
 
 class RetainedLabelOutcomeUncertain(RetainedLabelError):
@@ -174,10 +187,18 @@ class _Inspection(SafeFiles):
         return _stat(before)+(tuple(attrs),)
 
     @staticmethod
-    def _raw(metadata,context):
+    def _raw(metadata,context,role):
+        if type(role) is not str or role not in _RAW_ROLES.values():_fail()
         values=dict(metadata[-1]);raw=values.get(_LABEL)
         expected=context.encode('ascii')
-        if type(raw) is not bytes or len(raw)>4096 or raw not in (expected,expected+b'\0'):_fail()
+        if type(raw) is not bytes or len(raw)>4096 or raw not in (expected,expected+b'\0'):
+            if _LABEL not in values:reason='ABSENT'
+            elif type(raw) is not bytes:reason='INVALID_TYPE'
+            elif len(raw)>4096:reason='OVERSIZE'
+            elif raw in (b'system_u:object_r:unlabeled_t:s0',b'system_u:object_r:unlabeled_t:s0\0'):
+                reason='UNLABELED_LITERAL'
+            else:reason='OTHER_BYTES'
+            raise RetainedLabelRawError(role,reason)
         return raw
 
     def _sample(self,*,initial=False,api=None,targets=None):
@@ -202,7 +223,7 @@ class _Inspection(SafeFiles):
                 fd=self._objects[path]
             before=self._metadata(fd,parent,name,kind,role)
             context=targets[path] if targets is not None else managed
-            raw=self._raw(before,context)
+            raw=self._raw(before,context,_RAW_ROLES[path])
             if api is not None:
                 if api.file_context(fd)!=context:_fail()
                 self._check()
@@ -290,7 +311,7 @@ class _Inspection(SafeFiles):
                 parent=self._parents[str(Path(item.path).parent)];name=Path(item.path).name
                 kind,role=next((row[1],row[2]) for row in _ITEMS if row[0]==item.path)
                 updated=self._metadata(fd,parent,name,kind,role)
-                raw=self._raw(updated,targets[item.path])
+                raw=self._raw(updated,targets[item.path],_RAW_ROLES[item.path])
                 if not self._preserved(item.metadata,updated) or api.file_context(fd)!=targets[item.path]:_fail()
                 self._check();os.fsync(fd);self._check()
                 if self._metadata(fd,parent,name,kind,role)!=updated:_fail()

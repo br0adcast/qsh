@@ -195,6 +195,106 @@ class FixtureTests(unittest.TestCase):
                 scope.restore_defaults(observed)
         self.assertEqual(self.set_count,0)
 
+    def test_raw_refusal_discriminates_old_sample(self):
+        self.labels[self.key_for_path('/etc/qshd')]=b'system_u:object_r:unlabeled_t:s0\0'
+        with self.assertRaises(self.m.RetainedLabelError) as caught:
+            with self.factory.inspection(deadline=120) as scope:scope.capture()
+        self.assertEqual(self.set_count,0)
+        chain=[];error=caught.exception
+        while error is not None:
+            chain.append(error);error=error.__context__
+        claims=[error for error in chain if type(error).__name__=='RetainedLabelRawError']
+        self.assertEqual(len(claims),1,'actual raw refusal must retain its closed role/reason')
+        self.assertEqual(claims[0].args,('RAW_LABEL_REFUSED','CONFIG_DIR','UNLABELED_LITERAL'))
+
+    def raw_claim(self,error):
+        claims=[]
+        while error is not None:
+            if type(error) is self.m.RetainedLabelRawError:claims.append(error)
+            error=error.__context__
+        self.assertEqual(len(claims),1)
+        return claims[0].args
+
+    def raw_metadata_before(self):
+        result={}
+        for path,kind,role,label in self.m._ITEMS:
+            physical=self.root/path[1:];info=physical.stat()
+            result[path]=(self.m._stat(info),os.getxattr(physical,'user.fixture'),
+                          physical.read_bytes() if physical.is_file() else None)
+        return result
+
+    def test_raw_refusal_table_at_real_restore_sample(self):
+        cases=((None,'ABSENT'),(b'x'*4097,'OVERSIZE'),
+               (b'system_u:object_r:unlabeled_t:s0','UNLABELED_LITERAL'),
+               (b'system_u:object_r:unlabeled_t:s0\0','UNLABELED_LITERAL'),
+               (b'system_u:object_r:unlabeled_t:s0\0\0','OTHER_BYTES'),
+               (b'private-byte-canary','OTHER_BYTES'))
+        for path,role in (('/etc/qshd','CONFIG_DIR'),('/run/qshd/helper-status.sock.lock','STATUS_LOCK')):
+            managed=next(row[3] for row in self.m._ITEMS if row[0]==path).encode('ascii')
+            for value,reason in cases+((managed+b'\0\0','OTHER_BYTES'),):
+                with self.subTest(role=role,reason=reason,value=value):
+                    self.setUp();key=self.key_for_path(path);before=self.raw_metadata_before()
+                    with self.assertRaises(self.m.RetainedLabelError) as caught:
+                        with self.factory.inspection(deadline=120) as scope:
+                            observed=self.ready(scope)
+                            if value is None:
+                                original=self.factory._list
+                                self.factory._list=lambda fd:[name for name in original(fd)
+                                    if name!='security.selinux' or self.key(fd)!=key]
+                            else:self.labels[key]=value
+                            scope.restore_defaults(observed)
+                    self.assertIs(type(caught.exception),self.m.RetainedLabelError)
+                    self.assertEqual(self.raw_claim(caught.exception),('RAW_LABEL_REFUSED',role,reason))
+                    self.assertEqual(self.set_count,0)
+                    self.assertEqual(self.raw_metadata_before(),before)
+                    self.assertNotIn('private-byte-canary',repr(self.raw_claim(caught.exception)))
+
+    def test_raw_refusal_managed_bytes_with_optional_nul_still_restore(self):
+        for path in ('/etc/qshd','/run/qshd/helper-status.sock.lock'):
+            for suffix in (b'',b'\0'):
+                with self.subTest(path=path,suffix=suffix):
+                    self.setUp();context=next(row[3] for row in self.m._ITEMS if row[0]==path)
+                    self.labels[self.key_for_path(path)]=context.encode('ascii')+suffix
+                    with self.factory.inspection(deadline=120) as scope:
+                        observed=self.ready(scope);self.complete(scope,observed)
+                    self.assertEqual(self.set_count,7)
+
+    def test_raw_refusal_closed_args_and_metadata_type_precedence(self):
+        m=self.m;context=m._CONFIG
+        with self.assertRaises(m.RetainedLabelRawError) as caught:
+            m._Inspection._raw(((('security.selinux',bytearray(b'canary')),),),context,'HOST_KEY')
+        self.assertEqual(caught.exception.args,('RAW_LABEL_REFUSED','HOST_KEY','INVALID_TYPE'))
+        for role,reason in (('private-role-canary','OTHER_BYTES'),('CONFIG_DIR','private-reason-canary')):
+            with self.assertRaises(m.RetainedLabelError) as invalid:m.RetainedLabelRawError(role,reason)
+            self.assertIs(type(invalid.exception),m.RetainedLabelError)
+            self.assertNotIn('canary',str(invalid.exception))
+        with self.assertRaises(m.RetainedLabelError) as invalid:
+            m._Inspection._raw(((('security.selinux',context.encode()),),),context,'private-role-canary')
+        self.assertIs(type(invalid.exception),m.RetainedLabelError)
+        self.labels[self.key_for_path('/etc/qshd')]=bytearray(b'canary')
+        with self.assertRaises(m.RetainedLabelError) as caught:
+            with self.factory.inspection(deadline=120) as scope:scope.capture()
+        error=caught.exception
+        while error is not None:
+            self.assertIsNot(type(error),m.RetainedLabelRawError);error=error.__context__
+        self.assertEqual(self.set_count,0)
+
+    def test_raw_refusal_postset_error_preserves_uncertainty(self):
+        for path,role,attempts in (('/etc/qshd','CONFIG_DIR',1),
+                ('/run/qshd/helper-status.sock.lock','STATUS_LOCK',7)):
+            with self.subTest(role=role):
+                self.setUp();original=self.factory._set;target=self.key_for_path(path)
+                def corrupt(fd,name,value,flags):
+                    original(fd,name,value,flags)
+                    if self.key(fd)==target:self.labels[target]=b'private-postset-canary'
+                self.factory._set=corrupt;returned=[]
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain) as caught:
+                    with self.factory.inspection(deadline=120) as scope:
+                        observed=self.ready(scope);returned.append(scope.restore_defaults(observed))
+                self.assertEqual(returned,[]);self.assertEqual(self.set_count,attempts)
+                self.assertEqual(self.raw_claim(caught.exception),('RAW_LABEL_REFUSED',role,'OTHER_BYTES'))
+                self.assertNotIn('private-postset-canary',str(caught.exception))
+
     def test_obsolete_raw_conversion_refuses_without_current_validation(self):
         with self.assertRaises(self.m.RetainedLabelError):
             with self.factory.inspection(deadline=120) as scope:
