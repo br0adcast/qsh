@@ -126,9 +126,9 @@ class _Production:
         return _ConsumerPaths(expected_pam).inspection(fresh=fresh)
 
 
-    def registry(self):
+    def registry(self, *, deadline):
         from qshd_selinux_registry import production
-        return production().inspection()
+        return production().inspection(deadline=deadline)
     def context_inspection(self,paths,identities):
         from qshd_selinux_transaction import production
         return production(paths).inspection(identities)
@@ -296,7 +296,7 @@ class _Coordinator:
 
     def _readonly_owned(self):
         b=self._bindings;self._stage='PREFLIGHT'
-        with b.registry() as registry:
+        with b.registry(deadline=self._end) as registry:
             routing,identities=self._routing(registry);self._check(170)
             with b.context_inspection(sorted(identities),identities) as contexts:
                 with b.window():
@@ -318,7 +318,7 @@ class _Coordinator:
             if record!=current.record or record.artifact!=trusted_artifact:
                 raise CoordinatorError('ERASE_SLOT')
             b=self._bindings
-            with b.registry() as registry:
+            with b.registry(deadline=self._end) as registry:
                 routing,identities=self._routing(registry);self._check(70)
                 with b.context_inspection(sorted(identities),identities) as contexts:
                     self._check(70)
@@ -437,7 +437,7 @@ class _Coordinator:
                         # outside the documented administrator maintenance boundary.
                         self._stage='OWNED_CONTEXTS'
                         with b.contexts(sorted(identities)) as writer:
-                            with b.registry() as registry:
+                            with b.registry(deadline=self._end) as registry:
                                 if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                                 with writer.inspection(identities) as contexts:
                                     with b.window():
@@ -452,7 +452,7 @@ class _Coordinator:
                             if loaded.artifact!=captured.artifact or loaded.pp_sha256!=captured.artifact.pp_sha256:
                                 raise CoordinatorError('RELOAD_BINDING')
                             self._check(60);self._stage='OBSERVATION'
-                            with b.registry() as registry:
+                            with b.registry(deadline=self._end) as registry:
                                 if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                                 with writer.inspection(identities) as contexts:
                                     with b.modules(captured.artifact) as modules:
