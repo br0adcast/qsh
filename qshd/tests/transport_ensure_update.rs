@@ -50,6 +50,7 @@ use executable_copy::copy_executable;
 
 mod daemon_guard;
 use daemon_guard::DaemonGuard;
+mod personal_umask;
 
 /// Serialised for the same reason as `transport_ensure.rs`: real ports
 /// picked by binding and closing.
@@ -182,7 +183,20 @@ fn start_daemon_mode(
     labels: &str,
     restart_only: bool,
 ) -> [u8; 32] {
-    let mut child = Command::new(bin)
+    start_daemon_with_mask(bin, home, port, client_pub, labels, restart_only, None)
+}
+
+fn start_daemon_with_mask(
+    bin: &Path,
+    home: &Path,
+    port: u16,
+    client_pub: [u8; 32],
+    labels: &str,
+    restart_only: bool,
+    mask: Option<nix::libc::mode_t>,
+) -> [u8; 32] {
+    let mut command = Command::new(bin);
+    command
         .args([
             "transport-ensure",
             "--name",
@@ -198,14 +212,21 @@ fn start_daemon_mode(
             vec![]
         })
         .env("XDG_CACHE_HOME", home)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env("SHELL", "/bin/sh")
+        .env_remove("ENV")
+        .env_remove("BASH_ENV")
         .env("HISTFILE", "/dev/null")
         .env("TMUX_TMPDIR", home)
         .env_remove("TMUX")
         .env(TEST_BUILD_LABELS_ENV, labels)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("transport-ensure starts");
+        .stderr(Stdio::piped());
+    if let Some(mask) = mask {
+        personal_umask::set_child_umask(&mut command, mask);
+    }
+    let mut child = command.spawn().expect("transport-ensure starts");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut line1 = String::new();
     reader.read_line(&mut line1).expect("first line");
@@ -386,13 +407,23 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
     let port = free_udp_port();
     // Before the daemon exists: whatever fails from here on, it is stopped.
     let _guard = DaemonGuard::new(sock.clone());
-    let server_pub = start_daemon(&bins.bin, home.path(), port, first.public, &labels);
+    let server_pub = start_daemon_with_mask(
+        &bins.bin,
+        home.path(),
+        port,
+        first.public,
+        &labels,
+        false,
+        Some(0o077),
+    );
     assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
     // A key that only ever reached the daemon live, the way a phone's does
     // over SSH: nothing but the daemon's memory holds it.
     client_request(&sock, &ControlRequest::AddClient(second.public)).expect("ADD-CLIENT");
     let before = status(&sock).expect("STATUS");
     assert_eq!(before.build, old_build);
+    #[cfg(target_os = "linux")]
+    assert_eq!(personal_umask::process_umask(before.pid), 0o077);
     assert_ne!(before.pid, 0);
 
     // A phone that opened a shell and went to sleep: its session is parked,
@@ -471,6 +502,8 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
         daemon_log(home.path())
     );
     let after = status(&sock).expect("STATUS");
+    #[cfg(target_os = "linux")]
+    assert_eq!(personal_umask::process_umask(after.pid), 0o077);
     // Spec §4.12: the socket the old binary bound and the new one took over
     // were each sized, and each said so.
     let sized = daemon_log(home.path())
@@ -639,11 +672,22 @@ fn a_resumed_daemon_takes_a_second_update_in_a_row() {
     let added = generate_keypair();
     let port = free_udp_port();
     let _guard = DaemonGuard::new(sock.clone());
-    let server_pub = start_daemon(&bins.bin, home.path(), port, first.public, &labels);
+    // Models a mask established by an old daemon, without building an old release.
+    let server_pub = start_daemon_with_mask(
+        &bins.bin,
+        home.path(),
+        port,
+        first.public,
+        &labels,
+        false,
+        Some(0o027),
+    );
     assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
     client_request(&sock, &ControlRequest::AddClient(added.public)).expect("ADD-CLIENT");
     let before = status(&sock).expect("STATUS");
     assert_eq!(before.build, old_build);
+    #[cfg(target_os = "linux")]
+    assert_eq!(personal_umask::process_umask(before.pid), 0o027);
 
     update_once(
         home.path(),
@@ -655,6 +699,8 @@ fn a_resumed_daemon_takes_a_second_update_in_a_row() {
         second_build,
     );
     let between = status(&sock).expect("STATUS");
+    #[cfg(target_os = "linux")]
+    assert_eq!(personal_umask::process_umask(between.pid), 0o027);
     assert_eq!(between.pid, before.pid);
     assert_eq!(between.checksum, hex::encode(sha256(&second_image)));
 
@@ -670,6 +716,8 @@ fn a_resumed_daemon_takes_a_second_update_in_a_row() {
         third_build,
     );
     let after = status(&sock).expect("STATUS");
+    #[cfg(target_os = "linux")]
+    assert_eq!(personal_umask::process_umask(after.pid), 0o027);
     assert_eq!(after.pid, before.pid, "still the same process");
     assert_eq!(after.checksum, hex::encode(sha256(&third_image)));
     assert_eq!(std::fs::read(&bins.bin).expect("read"), third_image);

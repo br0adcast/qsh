@@ -65,12 +65,15 @@ fn main() {
         !socket.exists(),
         "the failed child's publication guard must clean up"
     );
-    for closed in [-1, 0, 1, 2] {
-        detached_case(closed);
+    for mask in [0o002, 0o022, 0o027, 0o077] {
+        detached_case(-1, mask);
     }
-    println!("validated 10 isolated detachment cases");
-    detached_case(-3);
-    detached_case(-4);
+    for closed in [0, 1, 2] {
+        detached_case(closed, 0o027);
+    }
+    println!("validated 13 isolated detachment cases");
+    detached_case(-3, 0o027);
+    detached_case(-4, 0o027);
     println!("validated bounded parent wait and partial-ready cleanup");
     for mask in 0..8 {
         runtime_precondition(mask);
@@ -185,6 +188,10 @@ fn worker(args: &[String]) {
     let report: i32 = args[1].parse().unwrap();
     let release: i32 = args[2].parse().unwrap();
     let closed: i32 = args[3].parse().unwrap();
+    let caller_mask: libc::mode_t = args[6].parse().unwrap();
+    let probe = std::path::Path::new(&args[7]);
+    // SAFETY: this fresh worker has no threads and owns its process mask.
+    unsafe { libc::umask(caller_mask) };
     if closed >= 0 {
         // SAFETY: standard descriptor belongs only to this isolated worker.
         unsafe {
@@ -235,7 +242,6 @@ fn worker(args: &[String]) {
             // SAFETY: process-local queries, no concurrent threads changing state.
             unsafe {
                 assert_ne!(libc::getsid(0), libc::getpid());
-                assert_eq!(libc::umask(0o027), 0o027);
                 for fd in 0..=2 {
                     let mut st: libc::stat = std::mem::zeroed();
                     assert_eq!(libc::fstat(fd, &mut st), 0);
@@ -246,6 +252,16 @@ fn worker(args: &[String]) {
                     );
                 }
             }
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            let file = probe.join("file");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(&file)
+                .unwrap();
+            let dir = probe.join("directory");
+            std::fs::DirBuilder::new().mode(0o777).create(&dir).unwrap();
             report
                 .write_all(if closed == -4 { b"r" } else { b"ready" })
                 .unwrap();
@@ -380,7 +396,7 @@ fn acquire_lock_before(
     }
 }
 
-fn detached_case(closed: i32) {
+fn detached_case(closed: i32, caller_mask: libc::mode_t) {
     let directory = tempfile::tempdir().unwrap();
     let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let listener =
@@ -415,6 +431,8 @@ fn detached_case(closed: i32) {
             &closed.to_string(),
             &udp.as_raw_fd().to_string(),
             &listener.as_raw_fd().to_string(),
+            &caller_mask.to_string(),
+            directory.path().to_str().unwrap(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -446,6 +464,20 @@ fn detached_case(closed: i32) {
     }
     read_exact_before(&mut custody.report, &mut ready, deadline).unwrap();
     assert_eq!(&ready, b"ready");
+    // Observe the detached child's creations here so assertion diagnostics survive
+    // its redirected stderr, while custody still guarantees failure cleanup.
+    for (name, requested) in [("file", 0o666), ("directory", 0o777)] {
+        assert_eq!(
+            u64::from(
+                std::fs::metadata(directory.path().join(name))
+                    .unwrap()
+                    .mode()
+                    & 0o777
+            ),
+            u64::from(requested & !caller_mask & 0o777),
+            "detachment must preserve caller umask {caller_mask:03o}"
+        );
+    }
     let status = wait_before(&mut custody.child, deadline);
     if closed == -3 {
         assert_eq!(status.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
