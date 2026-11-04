@@ -100,6 +100,13 @@ jobs:
 
       - name: Build the pinned native backend and products
         run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           uapi="$RUNNER_TEMP/kernel-uapi"
           mkdir -p "$uapi"
           ln -s /usr/include/linux "$uapi/linux"
@@ -115,7 +122,38 @@ jobs:
             echo 'musl products unexpectedly import dynamic libraries' >&2
             exit 1
           fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
           strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B - "$binary" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          binary = Path(sys.argv[1])
+          data = binary.read_bytes()
+          print(json.dumps(dict(schema=1, kind='release-product-path-qualification',
+                                target=sys.argv[2], program=binary.name, profile='release',
+                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
+                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
+          PY
+            done
+          done
 
       - name: Package
         run: |
@@ -233,16 +271,55 @@ jobs:
 
       - name: Build both architectures
         run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           cargo build --release --locked -p qsh -p qshd --target aarch64-apple-darwin
           cargo build --release --locked -p qsh -p qshd --target x86_64-apple-darwin
 
       # macOS strip has no GNU-style -o flag, so it strips the binary in place.
       - name: Strip
         run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
           strip target/aarch64-apple-darwin/release/qsh
           strip target/aarch64-apple-darwin/release/qshd
           strip target/x86_64-apple-darwin/release/qsh
           strip target/x86_64-apple-darwin/release/qshd
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B - "$binary" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          binary = Path(sys.argv[1])
+          data = binary.read_bytes()
+          print(json.dumps(dict(schema=1, kind='release-product-path-qualification',
+                                target=sys.argv[2], program=binary.name, profile='release',
+                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
+                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
+          PY
+            done
+          done
 
       - name: Package
         run: |

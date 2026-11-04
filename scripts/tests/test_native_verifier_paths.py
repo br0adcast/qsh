@@ -1,4 +1,4 @@
-"""Synthetic byte and nm controls; never build or inspect a real product."""
+"""Whole-byte controls and literal workflow shells over inert products only."""
 import contextlib
 import hashlib
 import importlib.util
@@ -242,6 +242,282 @@ class NativeVerifierPathTests(unittest.TestCase):
                 status, _, run, _ = self.invoke(data)
                 self.assertEqual(status, expected)
                 run.assert_not_called()
+
+
+class NativeProductWorkflowTests(unittest.TestCase):
+    TARGETS = (
+        ('ubuntu-24.04', 'x86_64-unknown-linux-musl'),
+        ('ubuntu-24.04-arm', 'aarch64-unknown-linux-musl'),
+        ('macos-15', 'aarch64-apple-darwin'),
+        ('macos-15-intel', 'x86_64-apple-darwin'),
+    )
+    NATIVE = 'Qualify the linked products and generated RSA operations'
+    LINUX = 'Build the pinned native backend and products'
+    DARWIN = ('aarch64-apple-darwin', 'x86_64-apple-darwin')
+
+    @staticmethod
+    def body(workflow, job, step):
+        # Scope both job and exact step; preserve the literal shell indentation.
+        lines = (ROOT / '.github/workflows' / workflow).read_text().splitlines()
+        start = lines.index('  ' + job + ':') + 1
+        end = next((i for i in range(start, len(lines))
+                    if lines[i].startswith('  ') and not lines[i].startswith('   ')
+                    and lines[i].strip() and not lines[i].lstrip().startswith('#')), len(lines))
+        lines = lines[start:end]
+        start = lines.index('      - name: ' + step) + 1
+        end = next((i for i in range(start, len(lines)) if lines[i].startswith('      - ')), len(lines))
+        lines = lines[start:end]
+        start = lines.index('        run: |') + 1
+        result = []
+        for line in lines[start:]:
+            if line and not line.startswith('          '):
+                break
+            result.append(line[10:] if line else '')
+        if not result:
+            raise AssertionError('missing literal workflow shell')
+        return '\n'.join(result) + '\n'
+
+    @contextlib.contextmanager
+    def fixture(self, target, *, explicit_cargo=True, before='', after=''):
+        with tempfile.TemporaryDirectory(prefix='product-shell-control-') as directory:
+            work = Path(directory) / 'work'
+            work.mkdir()
+            scripts = work / 'scripts'
+            scripts.mkdir()
+            # The actual scanner, unchanged, handles every byte decision.
+            scanner = ROOT / 'scripts/check-native-verifier-paths.py'
+            (scripts / scanner.name).write_bytes(scanner.read_bytes())
+            (scripts / 'build-openssl.sh').write_text('printf "%s\\n" "$FIXTURE_NATIVE_PREFIX"\n')
+            tools = Path(directory) / 'tools'
+            tools.mkdir()
+            shim = tools / 'shim'
+            shim.write_text('#!' + sys.executable + ' -I\n' + r'''
+import hashlib, json, os
+from pathlib import Path
+import sys
+name = Path(sys.argv[0]).name
+args = sys.argv[1:]
+keys = ('RUSTFLAGS', 'AWS_LC_SYS_USE_SYSTEM', 'AWS_LC_SYS_CFLAGS', 'CC',
+        'OPENSSL_DIR', 'OPENSSL_STATIC', 'AARCH64_APPLE_DARWIN_OPENSSL_DIR',
+        'AARCH64_APPLE_DARWIN_OPENSSL_STATIC', 'X86_64_APPLE_DARWIN_OPENSSL_DIR',
+        'X86_64_APPLE_DARWIN_OPENSSL_STATIC')
+entry = {'tool': name, 'args': args, 'env': {k: os.environ.get(k) for k in keys}}
+if name == 'python3':
+    scanner = next((a for a in args if a.endswith('/check-native-verifier-paths.py')), None)
+    if scanner:
+        index = args.index(scanner)
+        entry['data_sha256'] = hashlib.sha256(Path(args[index + 1]).read_bytes()).hexdigest()
+    else:
+        entry = None
+if entry:
+    with open(os.environ['FIXTURE_LOG'], 'a') as output:
+        output.write(json.dumps(entry) + '\n')
+if name == 'cargo' and args[0] == 'build':
+    target = args[args.index('--target') + 1]
+    profile = 'release' if '--release' in args else 'debug'
+    for role in ('qsh', 'qshd'):
+        path = Path('target') / target / profile / role
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'inert-unstripped-' + role.encode() +
+                         (os.fsencode(os.environ['GITHUB_WORKSPACE']) if os.environ['FIXTURE_BEFORE'] == role and target == os.environ['FIXTURE_FAULT_TARGET'] else b''))
+elif name == 'strip':
+    for arg in args:
+        path = Path(arg)
+        path.write_bytes(b'inert-stripped-' + path.name.encode() +
+                         (os.fsencode(os.environ['GITHUB_WORKSPACE']) if os.environ['FIXTURE_AFTER'] == path.name and path.parts[1] == os.environ['FIXTURE_FAULT_TARGET'] else b''))
+elif name == 'gcc':
+    print('fixture-unknown-linux-gnu')
+elif name == 'python3':
+    os.execv(sys.executable, [sys.executable, *args])
+''')
+            shim.chmod(0o700)
+            for name in ('cargo', 'readelf', 'otool', 'strip', 'gcc', 'python3'):
+                (tools / name).symlink_to(shim)
+            env = dict(os.environ)
+            for key in ('RUSTFLAGS', 'AWS_LC_SYS_USE_SYSTEM', 'AWS_LC_SYS_CFLAGS', 'CC',
+                        'CARGO_HOME', 'CARGO_TARGET_DIR', 'SSH_AUTH_SOCK', 'SSH_AGENT_PID'):
+                env.pop(key, None)
+            home, temp = Path(directory) / 'home', Path(directory) / 'temp'
+            home.mkdir()
+            temp.mkdir()
+            env.update(HOME=str(home), XDG_CACHE_HOME=str(home / 'cache'),
+                       XDG_CONFIG_HOME=str(home / 'config'), TMPDIR=str(temp),
+                       HISTFILE='/dev/null', PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                       GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp), NATIVE_TARGET=target,
+                       RUNNER_OS='macOS' if 'darwin' in target else 'Linux',
+                       FIXTURE_LOG=str(Path(directory) / 'calls.jsonl'),
+                       FIXTURE_BEFORE=before, FIXTURE_AFTER=after, FIXTURE_FAULT_TARGET=target,
+                       FIXTURE_NATIVE_PREFIX=str(Path(directory) / 'native'),
+                       OPENSSL_DIR=str(Path(directory) / 'native'), OPENSSL_STATIC='1')
+            for arch in self.DARWIN:
+                scoped = arch.upper().replace('-', '_')
+                env[scoped + '_OPENSSL_DIR'] = str(Path(directory) / arch)
+                env[scoped + '_OPENSSL_STATIC'] = '1'
+            if explicit_cargo:
+                env['CARGO_HOME'] = str(Path(directory) / 'cargo')
+            yield work, env
+
+    def execute(self, body, work, env):
+        # The marker represents the next step, never an executable or packager.
+        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                                 body + '\nprintf complete > "$GITHUB_WORKSPACE/completed"\n'],
+                                cwd=work, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        log = Path(env['FIXTURE_LOG'])
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
+        return result, calls, records
+
+    def environment(self, calls, env, targets, *, linux):
+        builds = [c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build']
+        self.assertEqual(len(builds), len(targets))
+        cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
+        rust = (f'--remap-path-prefix={env["GITHUB_WORKSPACE"]}=/qsh '
+                f'--remap-path-prefix={cargo_home}=/cargo '
+                f'--remap-path-prefix={env["RUNNER_TEMP"]}=/build')
+        if not linux:
+            rust += f' -C link-arg=-Wl,-oso_prefix,{env["GITHUB_WORKSPACE"]}/'
+        cflags = (f'-ffile-prefix-map={env["GITHUB_WORKSPACE"]}=/qsh '
+                  f'-ffile-prefix-map={cargo_home}=/cargo '
+                  f'-ffile-prefix-map={env["RUNNER_TEMP"]}=/build')
+        for build, target in zip(builds, targets):
+            self.assertEqual(build['args'], ['build', '--release', '--locked', '-p', 'qsh', '-p', 'qshd', '--target', target])
+            self.assertEqual(build['env']['RUSTFLAGS'], rust)
+            self.assertEqual(build['env']['AWS_LC_SYS_CFLAGS'], cflags)
+            self.assertEqual(build['env']['AWS_LC_SYS_USE_SYSTEM'], '0')
+            self.assertEqual(build['env']['CC'], 'musl-gcc' if linux else None)
+            if linux:
+                self.assertEqual(build['env']['OPENSSL_DIR'], env['FIXTURE_NATIVE_PREFIX'])
+                self.assertEqual(build['env']['OPENSSL_STATIC'], '1')
+            else:
+                for arch in self.DARWIN:
+                    for suffix in ('_OPENSSL_DIR', '_OPENSSL_STATIC'):
+                        key = arch.upper().replace('-', '_') + suffix
+                        self.assertEqual(build['env'][key], env[key])
+
+    def products(self, calls, records, work, env, targets, kind, *, linkage=False):
+        paths = [f'target/{target}/release/{role}' for target in targets for role in ('qsh', 'qshd')]
+        scans = [c for c in calls if c['tool'] == 'python3']
+        self.assertEqual(len(scans), 2 * len(paths))
+        effective_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
+        for call, path in zip(scans, paths * 2):
+            self.assertEqual(call['args'], ['-I', '-B', 'scripts/check-native-verifier-paths.py', path,
+                                           env['GITHUB_WORKSPACE'], effective_home, env['RUNNER_TEMP']])
+        stripped = [arg for c in calls if c['tool'] == 'strip' for arg in c['args']]
+        self.assertEqual(stripped, paths)
+        first_strip = next(i for i, c in enumerate(calls) if c['tool'] == 'strip')
+        self.assertEqual(sum(c['tool'] == 'python3' for c in calls[:first_strip]), len(paths))
+        last_strip = max(i for i, c in enumerate(calls) if c['tool'] == 'strip')
+        self.assertEqual(sum(c['tool'] == 'python3' for c in calls[last_strip + 1:]), len(paths))
+        self.assertEqual(len(records), len(paths))
+        for record, path in zip(records, paths):
+            data = (work / path).read_bytes()
+            self.assertEqual(scans[len(paths) + paths.index(path)]['data_sha256'], hashlib.sha256(data).hexdigest())
+            self.assertNotEqual(scans[paths.index(path)]['data_sha256'], hashlib.sha256(data).hexdigest())
+            self.assertEqual(record, dict(schema=1, kind=kind, target=Path(path).parts[1],
+                                          program=Path(path).name, profile='release', stage='stripped',
+                                          sha256=hashlib.sha256(data).hexdigest(), bytes=len(data)))
+        if linkage:
+            links = [c for c in calls if c['tool'] in ('readelf', 'otool')]
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0]['tool'], 'readelf' if env['RUNNER_OS'] == 'Linux' else 'otool')
+            self.assertEqual(links[0]['args'], ['-d' if env['RUNNER_OS'] == 'Linux' else '-L', *paths])
+
+    def test_native_product_build_receives_scoped_release_environment(self):
+        body = self.body('native-crypto.yml', 'portable', self.NATIVE)
+        for index, (_, target) in enumerate(self.TARGETS):
+            with self.subTest(target=target), self.fixture(target, explicit_cargo=index % 2 == 0) as (work, env):
+                result, calls, _ = self.execute(body, work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.environment(calls, env, [target], linux='linux' in target)
+                tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
+                self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
+                                         '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])
+
+    def test_native_product_checks_cover_both_roles_before_and_after_strip(self):
+        body = self.body('native-crypto.yml', 'portable', self.NATIVE)
+        for _, target in self.TARGETS:
+            with self.subTest(target=target), self.fixture(target) as (work, env):
+                result, calls, records = self.execute(body, work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.products(calls, records, work, env, [target], 'native-product-path-qualification', linkage=True)
+
+    def refusal(self, body, target, *, prepopulate=()):
+        for stage in ('before', 'after'):
+            for role in ('qsh', 'qshd'):
+                with self.subTest(target=target, stage=stage, role=role), self.fixture(target, **{stage: role}) as (work, env):
+                    for arch in prepopulate:
+                        for program in ('qsh', 'qshd'):
+                            p = work / 'target' / arch / 'release' / program
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_bytes(b'inert-unstripped' + (os.fsencode(env['GITHUB_WORKSPACE']) if stage == 'before' and role == program and arch == target else b''))
+                    result, calls, records = self.execute(body, work, env)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((work / 'completed').exists())
+                    self.assertEqual(records, [])
+                    diagnostic = json.loads(result.stderr.splitlines()[-1])
+                    self.assertGreater(diagnostic['workspace_occurrences'], 0)
+                    self.assertNotIn(env['GITHUB_WORKSPACE'], result.stdout + result.stderr)
+                    if stage == 'before':
+                        self.assertFalse(any(c['tool'] == 'strip' for c in calls))
+
+    def test_native_product_path_refusal_stops_step(self):
+        body = self.body('native-crypto.yml', 'portable', self.NATIVE)
+        for _, target in self.TARGETS:
+            self.refusal(body, target)
+
+    def test_release_builds_receive_same_scoped_environment(self):
+        for _, target in self.TARGETS[:2]:
+            with self.subTest(target=target), self.fixture(target, explicit_cargo=False) as (work, env):
+                result, calls, _ = self.execute(self.body('release.yml', 'linux', self.LINUX), work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.environment(calls, env, [target], linux=True)
+        with self.fixture(self.DARWIN[0]) as (work, env):
+            result, calls, _ = self.execute(self.body('release.yml', 'macos', 'Build both architectures'), work, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.environment(calls, env, self.DARWIN, linux=False)
+
+    def test_release_poststrip_path_refusal_precedes_packaging(self):
+        for _, target in self.TARGETS[:2]:
+            body = self.body('release.yml', 'linux', self.LINUX)
+            with self.subTest(target=target), self.fixture(target, explicit_cargo=False) as (work, env):
+                result, calls, records = self.execute(body, work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.products(calls, records, work, env, [target], 'release-product-path-qualification', linkage=True)
+                self.assertTrue((work / 'completed').exists())
+            self.refusal(body, target)
+        body = self.body('release.yml', 'macos', 'Strip')
+        with self.fixture(self.DARWIN[0], explicit_cargo=False) as (work, env):
+            for target in self.DARWIN:
+                for role in ('qsh', 'qshd'):
+                    path = work / 'target' / target / 'release' / role
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'inert-unstripped')
+            result, calls, records = self.execute(body, work, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.products(calls, records, work, env, self.DARWIN, 'release-product-path-qualification')
+            self.assertTrue((work / 'completed').exists())
+        for target in self.DARWIN:
+            self.refusal(body, target, prepopulate=self.DARWIN)
+
+    def test_four_native_targets_and_required_workflow_consumers_remain_wired(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        import re
+        self.assertEqual(re.findall(r'          - runner: (\S+)\n            target: (\S+)', native), list(self.TARGETS))
+        self.assertEqual(native.count("      - 'cli/Cargo.toml'"), 2)
+        helper = self.body('native-crypto.yml', 'portable', 'Qualify offline release authentication')
+        self.assertIn('-p test_native_verifier_paths.py', helper)
+        self.assertIn('scripts/check-native-verifier-paths.py', helper)
+        product = self.body('native-crypto.yml', 'portable', self.NATIVE)
+        self.assertNotIn('/debug/', product)
+        self.assertIn('/release/', product)
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('    uses: ./.github/workflows/native-crypto.yml', release)
+        linux = release.split('  linux:\n', 1)[1].split('  macos:\n', 1)[0]
+        macos = release.split('  macos:\n', 1)[1].split('  server-packages:\n', 1)[0]
+        self.assertLess(linux.index('- name: ' + self.LINUX), linux.index('- name: Package'))
+        self.assertLess(macos.index('- name: Build both architectures'), macos.index('- name: Strip'))
+        self.assertLess(macos.index('- name: Strip'), macos.index('- name: Package'))
 
 
 if __name__ == "__main__":

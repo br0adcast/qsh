@@ -5,6 +5,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
@@ -28,6 +29,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
@@ -243,23 +245,67 @@ jobs:
         env:
           NATIVE_TARGET: ${{ matrix.target }}
         run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
-          cargo build --locked -p qsh -p qshd --target "$NATIVE_TARGET"
+          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
           cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
             --test rsa_file_signing --test native_rsa_backend -- --include-ignored
           if [ "$RUNNER_OS" = Linux ]; then
-            dynamic=$(readelf -d "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
             if grep -q NEEDED <<< "$dynamic"; then
               echo 'musl products import dynamic libraries' >&2
               exit 1
             fi
           else
-            dynamic=$(otool -L "target/$NATIVE_TARGET/debug/qsh" "target/$NATIVE_TARGET/debug/qshd")
+            dynamic=$(otool -L "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
             if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
               echo 'products import an unqualified dynamic native backend' >&2
               exit 1
             fi
           fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          if [ "$RUNNER_OS" = Linux ]; then
+            strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
+          else
+            strip "target/$NATIVE_TARGET/release/qsh"
+            strip "target/$NATIVE_TARGET/release/qshd"
+          fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B - "$binary" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          binary = Path(sys.argv[1])
+          data = binary.read_bytes()
+          print(json.dumps(dict(schema=1, kind='native-product-path-qualification',
+                                target=sys.argv[2], program=binary.name, profile='release',
+                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
+                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
+          PY
+            done
+          done
 
   system-floors:
     name: Native system floor (${{ matrix.format }})
