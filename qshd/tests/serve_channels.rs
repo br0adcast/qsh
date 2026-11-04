@@ -95,8 +95,6 @@ impl Drop for Daemon {
     }
 }
 
-/// Generates an ed25519 key pair, writes the private half to `dir/name` in
-/// OpenSSH format, and returns the key (for its public half) and the path.
 fn write_private(
     path: impl AsRef<std::path::Path>,
     bytes: impl AsRef<[u8]>,
@@ -112,6 +110,8 @@ fn write_private(
         .write_all(bytes.as_ref())
 }
 
+/// Generates an ed25519 key pair, writes the private half to `dir/name` in
+/// OpenSSH format, and returns the key (for its public half) and the path.
 fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathBuf) {
     let key = PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),

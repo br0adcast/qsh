@@ -3,6 +3,7 @@
 //! `QSH_OLD_QSH=<v0.5.0 qsh> QSH_OLD_QSHD=<v0.5.0 qshd> cargo test -p qsh --test mixed_versions -- --ignored --nocapture --test-threads=1`
 //! Incompatible peers must never start a shell; compatible pairs prove the
 //! shell-start counter and real I/O. Current-peer flood/paste coverage stays active.
+mod support;
 
 use std::io::{Read, Write};
 use std::net::UdpSocket;
@@ -205,7 +206,7 @@ fn start_daemon_with_ready_timeout(qshd: &Path, timeout: Duration) -> (Daemon, P
     )
     .expect("generate");
     let key_path = home.path().join("id_ed25519");
-    std::fs::write(
+    support::write_private(
         &key_path,
         key.to_openssh(ssh_key::LineEnding::LF)
             .expect("encode")

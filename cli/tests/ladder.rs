@@ -116,7 +116,7 @@ fn client_key(dir: &Path) -> (PathBuf, String) {
     )
     .expect("generate");
     let path = dir.join("id_test");
-    std::fs::write(
+    support::write_private(
         &path,
         key.to_openssh(ssh_key::LineEnding::LF)
             .expect("encode")
