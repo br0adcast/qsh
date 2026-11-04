@@ -291,7 +291,8 @@ jobs:
           for name in \
             darwin_process_scope::keeper_tests::keeper_native_exit37_and_pty_eof \
             darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork \
-            darwin_process_scope::keeper_tests::keeper_native_broker_group_intrusion
+            darwin_process_scope::keeper_tests::keeper_native_broker_group_intrusion \
+            darwin_process_scope::keeper_tests::keeper_native_cancel_before_admit_no_application
           do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 {
@@ -304,7 +305,11 @@ jobs:
             ' "$runtime/keeper-results.log"
           done
           if grep -F 'SKIPPED' "$runtime/keeper-results.log"; then exit 1; fi
-          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/keeper-results.log"
+          grep -F 'test result: ok. 4 passed; 0 failed; 0 ignored;' "$runtime/keeper-results.log"
+          if grep -F 'rescue=true' "$runtime/keeper-results.log"; then exit 1; fi
+          test "$(grep -Fc 'case=cancel after_admit=false expired=false noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
+          test "$(grep -Fc 'case=cancel after_admit=true expired=false noapp=false app=Some(' "$runtime/keeper-results.log")" -eq 1
+          test "$(grep -Fc 'case=cancel after_admit=false expired=true noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
 
   system-floors:
     name: Native system floor (${{ matrix.format }})

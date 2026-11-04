@@ -21,6 +21,8 @@ pub(super) enum Operation {
     KeeperSpawned = 16,
     BrokerParent = 17,
     KeeperTerminal = 18,
+    AbortBeforeAdmit = 19,
+    AppNotStarted = 20,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Frame {
@@ -77,6 +79,8 @@ impl Decoder {
             16 => Some(Operation::KeeperSpawned),
             17 => Some(Operation::BrokerParent),
             18 => Some(Operation::KeeperTerminal),
+            19 => Some(Operation::AbortBeforeAdmit),
+            20 => Some(Operation::AppNotStarted),
             _ => None,
         };
         if &data[..8] != MAGIC
@@ -93,6 +97,14 @@ impl Decoder {
         let mut fields = [0; 4];
         for (i, value) in fields.iter_mut().enumerate() {
             *value = i64::from_be_bytes(data[40 + i * 8..48 + i * 8].try_into().unwrap());
+        }
+        if matches!(
+            operation,
+            Some(Operation::AbortBeforeAdmit | Operation::AppNotStarted)
+        ) && fields != [0; 4]
+        {
+            self.failed = true;
+            return Err(ProtocolError);
         }
         self.sequence = sequence;
         self.buffer.clear();
@@ -116,10 +128,78 @@ pub(super) fn encode(instance: [u8; 16], sequence: u64, frame: Frame) -> [u8; FR
     bytes
 }
 
+/// The private admission decision is committed only after its frame is queued.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) enum AdmissionDecision {
+    #[default]
+    Pending,
+    Admit,
+    Abort,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingAdmission {
+    None,
+    Abort,
+    GuardedAdmit,
+}
+impl AdmissionDecision {
+    pub fn pending(
+        self,
+        bound: bool,
+        stopped: bool,
+        expired: bool,
+        authority: bool,
+    ) -> PendingAdmission {
+        if self != Self::Pending || !bound {
+            PendingAdmission::None
+        } else if stopped || expired || !authority {
+            PendingAdmission::Abort
+        } else {
+            PendingAdmission::GuardedAdmit
+        }
+    }
+    pub fn commit(&mut self, decision: Self) -> Result<(), ProtocolError> {
+        if *self != Self::Pending || decision == Self::Pending {
+            return Err(ProtocolError);
+        }
+        *self = decision;
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) enum AppDisposition {
+    #[default]
+    Pending,
+    NotStarted,
+    Waited(i32),
+}
+impl AppDisposition {
+    pub fn status(self) -> Option<i32> {
+        match self {
+            Self::Waited(code) => Some(code),
+            _ => None,
+        }
+    }
+    pub fn not_started(
+        &mut self,
+        decision: AdmissionDecision,
+        app_started: bool,
+    ) -> Result<(), ProtocolError> {
+        if decision != AdmissionDecision::Abort || app_started || *self != Self::Pending {
+            return Err(ProtocolError);
+        }
+        *self = Self::NotStarted;
+        Ok(())
+    }
+    pub fn settled(self) -> bool {
+        self != Self::Pending
+    }
+}
+
 /// App status and reservation wait are intentionally independent receipts.
 #[derive(Default)]
 pub(super) struct Completion {
-    pub app_status: Option<i32>,
+    pub application: AppDisposition,
     pub session_wait: Option<i32>,
     pub broker_terminal: bool,
     pub final_census: bool,
@@ -130,11 +210,89 @@ impl Completion {
         use transport::channel_server::ChildStatus;
         if self.session_wait.is_some() && self.broker_terminal && self.final_census && self.drained
         {
-            if let Some(code) = self.app_status {
-                return ChildStatus::Reaped { code: Some(code) };
+            match self.application {
+                AppDisposition::Waited(code) => return ChildStatus::Reaped { code: Some(code) },
+                AppDisposition::NotStarted => return ChildStatus::Reaped { code: None },
+                AppDisposition::Pending => {}
             }
         }
         ChildStatus::Running
+    }
+}
+
+/// Portable test-only gate used by the actual native startup driver. A Core
+/// request is not an arrival acknowledgement: the driver acknowledges only
+/// after its Core guard has been released, then holds progress and completion.
+#[cfg(test)]
+pub(super) struct FixtureAdmissionGate {
+    after_admit: bool,
+    requested: std::sync::atomic::AtomicBool,
+    reached: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    held_polls: std::sync::atomic::AtomicUsize,
+    #[cfg(target_os = "macos")]
+    expire: std::sync::atomic::AtomicBool,
+    #[cfg(target_os = "macos")]
+    resumed: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
+impl FixtureAdmissionGate {
+    pub fn new(after_admit: bool) -> Self {
+        Self {
+            after_admit,
+            requested: false.into(),
+            reached: false.into(),
+            released: false.into(),
+            held_polls: 0.into(),
+            #[cfg(target_os = "macos")]
+            expire: false.into(),
+            #[cfg(target_os = "macos")]
+            resumed: false.into(),
+        }
+    }
+    pub fn after_admit(&self) -> bool {
+        self.after_admit
+    }
+    pub fn pause(&self) -> bool {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        !self.released()
+    }
+    pub fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn held_polls(&self) -> usize {
+        self.held_polls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Call only outside Core, custody and registry locks. This is the sole
+    /// arrival acknowledgement, and neither ordering may complete while held.
+    pub fn hold_until_release(&self, end: std::time::Instant) -> bool {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        while !self.released() && std::time::Instant::now() < end {
+            self.held_polls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.released()
+    }
+    #[cfg(target_os = "macos")]
+    pub fn expire_startup(&self) {
+        self.expire.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(target_os = "macos")]
+    pub fn resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -178,13 +336,15 @@ mod owner {
         completion: Completion,
         startup: Startup,
         deadline: Instant,
-        admitted: bool,
+        decision: AdmissionDecision,
         failed: bool,
         broker_closed: bool,
         session_closed: bool,
         exit_broker: bool,
         exit_session: bool,
         stop_sent: i32,
+        #[cfg(test)]
+        admission_gate: Option<Arc<FixtureAdmissionGate>>,
     }
     struct Shared {
         core: Mutex<Core>,
@@ -214,25 +374,68 @@ mod owner {
         }
         pub fn complete(mut self, custody: &OpenCustody) -> Startup {
             loop {
-                if custody.is_cancelled() {
+                let cancelled = custody.is_cancelled();
+                if cancelled {
                     self.shared.stop.get_or_init(Instant::now);
                 }
-                let state = {
+                let stop = self.shared.stop.get().copied();
+                #[cfg(test)]
+                let paused;
+                #[allow(unused_mut)]
+                let mut state = {
                     let Ok(mut core) = self.shared.core.lock() else {
                         return Startup::Failed("keeper owner lock is poisoned".into());
                     };
-                    core.advance(self.shared.stop.get().copied());
-                    if core.completion.app_status.is_some() {
+                    core.advance(stop, Some(custody));
+                    #[cfg(test)]
+                    {
+                        paused = core
+                            .admission_gate
+                            .as_ref()
+                            .filter(|gate| gate.requested() && !gate.released())
+                            .cloned();
+                    }
+                    if core.completion.application.status().is_some() {
                         self.shared.stop.get_or_init(Instant::now);
                     }
                     if Instant::now() >= self.shared.deadline {
                         core.startup = Startup::Failed("keeper startup deadline expired".into());
                         self.shared.stop.get_or_init(Instant::now);
                         core.startup.clone()
+                    } else if cancelled && matches!(core.startup, Startup::Ready) {
+                        Startup::Failed("keeper startup was cancelled after admission".into())
                     } else {
                         core.startup.clone()
                     }
                 };
+                #[cfg(test)]
+                if let Some(gate) = paused {
+                    // The Core guard is gone before this acknowledgement/wait.
+                    // Hold BOTH orderings, including an already Ready startup,
+                    // so controller cancellation cannot race driver completion.
+                    if !gate.hold_until_release(self.shared.deadline) {
+                        self.shared.stop.get_or_init(Instant::now);
+                        return Startup::Failed(
+                            "keeper fixture gate exceeded original deadline".into(),
+                        );
+                    }
+                    if !gate.after_admit() {
+                        // Keep the initial cancellation/stop snapshot: the real
+                        // custody seam, not another poll, must detect cancel.
+                        let Ok(mut core) = self.shared.core.lock() else {
+                            return Startup::Failed("keeper owner lock is poisoned".into());
+                        };
+                        if gate.expire.load(std::sync::atomic::Ordering::SeqCst) {
+                            core.deadline = core.deadline.min(Instant::now());
+                        }
+                        core.commit_pending_admission(stop, Some(custody));
+                        gate.resumed.store(
+                            core.decision != AdmissionDecision::Pending,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        state = core.startup.clone();
+                    }
+                }
                 match state {
                     Startup::Pending => std::thread::sleep(INTERVAL),
                     other => {
@@ -279,13 +482,15 @@ mod owner {
                     completion: Completion::default(),
                     startup: Startup::Pending,
                     deadline,
-                    admitted: false,
+                    decision: AdmissionDecision::Pending,
                     failed: false,
                     broker_closed: false,
                     session_closed: false,
                     exit_broker: false,
                     exit_session: false,
                     stop_sent: 0,
+                    #[cfg(test)]
+                    admission_gate: None,
                 }),
                 stop: OnceLock::new(),
                 deadline,
@@ -304,8 +509,8 @@ mod owner {
             let Ok(mut core) = self.shared.core.lock() else {
                 return ChildStatus::Unknown("keeper owner lock is poisoned".into());
             };
-            core.advance(self.shared.stop.get().copied());
-            if core.completion.app_status.is_some() {
+            core.advance(self.shared.stop.get().copied(), None);
+            if core.completion.application.status().is_some() {
                 self.shared.stop.get_or_init(Instant::now);
             }
             if core.failed {
@@ -326,7 +531,7 @@ mod owner {
                     "keeper owner lock is poisoned".into(),
                 ));
             };
-            Some(match (status, core.completion.app_status) {
+            Some(match (status, core.completion.application.status()) {
                 (ChildStatus::Unknown(reason), _) => LeaderStatus::Unknown(reason),
                 (_, Some(code)) => LeaderStatus::Exited { code: Some(code) },
                 _ => LeaderStatus::Running,
@@ -391,7 +596,7 @@ mod owner {
             match frame.operation {
                 Operation::Ready
                     if self.broker_ready.is_none()
-                        && !self.admitted
+                        && self.decision == AdmissionDecision::Pending
                         && frame.fields[2] == self.sid as i64
                         && frame.fields[3] == 0 =>
                 {
@@ -408,7 +613,7 @@ mod owner {
                     true
                 }
                 Operation::AppStarted | Operation::AppFailed
-                    if self.admitted && self.app.is_none() =>
+                    if self.decision == AdmissionDecision::Admit && self.app.is_none() =>
                 {
                     let Ok(app) = i32::try_from(frame.fields[0]) else {
                         return false;
@@ -436,7 +641,7 @@ mod owner {
                 }
                 Operation::AppWait
                     if self.app.is_some_and(|pid| pid as i64 == frame.fields[0])
-                        && self.completion.app_status.is_none()
+                        && self.completion.application == AppDisposition::Pending
                         && frame.fields[2..] == [0; 2] =>
                 {
                     let Ok(code) = i32::try_from(frame.fields[1]) else {
@@ -445,11 +650,11 @@ mod owner {
                     if !(0..=255).contains(&code) {
                         return false;
                     }
-                    self.completion.app_status = Some(code);
+                    self.completion.application = AppDisposition::Waited(code);
                     true
                 }
                 Operation::KeeperSpawned
-                    if self.admitted
+                    if self.decision == AdmissionDecision::Admit
                         && !self.completion.drained
                         && self.keepers.len() < 8
                         && frame.fields[1..] == [0; 3] =>
@@ -477,7 +682,7 @@ mod owner {
                     true
                 }
                 Operation::KeeperCreated
-                    if self.admitted
+                    if self.decision == AdmissionDecision::Admit
                         && !self.completion.drained
                         && frame.fields[3] > 0
                         && frame.fields[3] <= i32::MAX as i64 =>
@@ -500,7 +705,9 @@ mod owner {
                     true
                 }
                 Operation::KeeperTerminal
-                    if self.admitted && !self.completion.drained && frame.fields[2..] == [0; 2] =>
+                    if self.decision == AdmissionDecision::Admit
+                        && !self.completion.drained
+                        && frame.fields[2..] == [0; 2] =>
                 {
                     let Ok(pid) = i32::try_from(frame.fields[0]) else {
                         return false;
@@ -537,7 +744,9 @@ mod owner {
                     true
                 }
                 Operation::KeeperWait
-                    if self.admitted && !self.completion.drained && frame.fields[2..] == [0; 2] =>
+                    if self.decision == AdmissionDecision::Admit
+                        && !self.completion.drained
+                        && frame.fields[2..] == [0; 2] =>
                 {
                     let Ok(pid) = i32::try_from(frame.fields[0]) else {
                         return false;
@@ -562,7 +771,7 @@ mod owner {
                     true
                 }
                 Operation::BrokerMoved
-                    if self.admitted
+                    if self.decision == AdmissionDecision::Admit
                         && !self.completion.drained
                         && self
                             .broker
@@ -580,10 +789,15 @@ mod owner {
                     self.moves.push(frame.fields[1] as i32);
                     true
                 }
+                Operation::AppNotStarted if frame.fields == [0; 4] => self
+                    .completion
+                    .application
+                    .not_started(self.decision, self.app.is_some())
+                    .is_ok(),
                 Operation::Drained
-                    if self.admitted
+                    if self.decision != AdmissionDecision::Pending
                         && !self.completion.drained
-                        && self.completion.app_status.is_some()
+                        && self.completion.application.settled()
                         && frame.fields == [self.keepers.len() as i64, 0, 0, 0]
                         && self.keepers.iter().all(|k| k.wait.is_some()) =>
                 {
@@ -593,7 +807,63 @@ mod owner {
                 _ => false,
             }
         }
-        fn advance(&mut self, stop: Option<Instant>) {
+        fn queue_decision(&mut self, decision: AdmissionDecision) -> bool {
+            if self.send_broker(Frame {
+                operation: if decision == AdmissionDecision::Abort {
+                    Operation::AbortBeforeAdmit
+                } else {
+                    Operation::Admit
+                },
+                fields: [0; 4],
+            }) {
+                self.decision.commit(decision).expect("pending admission");
+                if decision == AdmissionDecision::Abort {
+                    self.startup =
+                        Startup::Failed("keeper startup was aborted before admission".into());
+                }
+                true
+            } else {
+                false
+            }
+        }
+        fn commit_pending_admission(
+            &mut self,
+            stop: Option<Instant>,
+            admission: Option<&OpenCustody>,
+        ) {
+            use transport::channel_open::InitialAdmissionError;
+            match self.decision.pending(
+                self.broker.is_some(),
+                stop.is_some(),
+                Instant::now() >= self.deadline,
+                admission.is_some(),
+            ) {
+                PendingAdmission::None => {}
+                PendingAdmission::Abort => {
+                    self.queue_decision(AdmissionDecision::Abort);
+                }
+                PendingAdmission::GuardedAdmit => {
+                    // Core -> Custody. Only in-memory queue+commit runs under
+                    // this lock; all native validation and fixture waits precede it.
+                    match admission
+                        .expect("driver authority")
+                        .try_commit_initial_admission(|| {
+                            if Instant::now() >= self.deadline {
+                                None
+                            } else {
+                                Some(self.queue_decision(AdmissionDecision::Admit))
+                            }
+                        }) {
+                        Ok(Some(_)) => {} // WouldBlock keeps the decision Pending.
+                        Ok(None) | Err(InitialAdmissionError::Cancelled) => {
+                            self.queue_decision(AdmissionDecision::Abort);
+                        }
+                        Err(InitialAdmissionError::Unavailable) => self.refuse(),
+                    }
+                }
+            }
+        }
+        fn advance(&mut self, stop: Option<Instant>, admission: Option<&OpenCustody>) {
             if self.failed || self.completion.session_wait.is_some() {
                 return;
             }
@@ -601,8 +871,16 @@ mod owner {
                 self.refuse();
                 return;
             }
-            if !self.admitted && stop.is_some() {
-                self.refuse();
+            // The post-decision fixture barrier must also stop later polls
+            // before flushing Admit/receiving AppStarted. Otherwise a ready
+            // startup could escape the barrier while its observer is paused.
+            #[cfg(test)]
+            if self.decision == AdmissionDecision::Admit
+                && self
+                    .admission_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.after_admit && gate.pause())
+            {
                 return;
             }
             let mut ops = native::NativeOps;
@@ -704,8 +982,8 @@ mod owner {
                     }
                 }
             }
-            if self.broker.is_none() && !self.admitted {
-                if session_status.is_some() || Instant::now() >= self.deadline || stop.is_some() {
+            if self.broker.is_none() && self.decision == AdmissionDecision::Pending {
+                if session_status.is_some() || Instant::now() >= self.deadline {
                     self.refuse();
                     return;
                 }
@@ -750,21 +1028,29 @@ mod owner {
                     self.broker = Some(binding);
                 }
             }
-            if !self.admitted
-                && self.broker.is_some()
-                && stop.is_none()
-                && Instant::now() < self.deadline
-            {
+            if self.decision == AdmissionDecision::Pending && self.broker.is_some() {
                 if ops.keeper_child_status(self.sid) != Ok(None) {
                     self.refuse();
                     return;
                 }
-                if self.send_broker(Frame {
-                    operation: Operation::Admit,
-                    fields: [0; 4],
-                }) {
-                    self.admitted = true;
+                #[cfg(test)]
+                if self
+                    .admission_gate
+                    .as_ref()
+                    .is_some_and(|gate| !gate.after_admit && gate.pause())
+                {
+                    return;
                 }
+                self.commit_pending_admission(stop, admission);
+            }
+            #[cfg(test)]
+            if self.decision == AdmissionDecision::Admit
+                && self
+                    .admission_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.after_admit && gate.pause())
+            {
+                return;
             }
             if let Some(binding) = &mut self.broker {
                 match ops.observe_exit(&mut binding.handle) {
@@ -786,7 +1072,7 @@ mod owner {
             }
             if let Some(started) = stop {
                 let signal = if started.elapsed() >= GRACE { 9 } else { 1 };
-                if self.admitted
+                if self.decision == AdmissionDecision::Admit
                     && !self.completion.drained
                     && self.stop_sent != signal
                     && self.send_broker(Frame {
@@ -851,6 +1137,9 @@ mod owner {
         pub sid: i32,
         pub app: Option<i32>,
         pub app_status: Option<i32>,
+        pub not_started: bool,
+        pub decision: AdmissionDecision,
+        pub custody_lost: bool,
         pub session_status: Option<i32>,
         pub session_wait: Option<i32>,
         pub broker: Option<Identity>,
@@ -872,12 +1161,22 @@ mod owner {
     }
     #[cfg(test)]
     impl FixtureAuthority {
+        pub fn pause_admission(&self, after_admit: bool) -> Arc<FixtureAdmissionGate> {
+            let gate = Arc::new(FixtureAdmissionGate::new(after_admit));
+            let mut core = self.shared.core.lock().unwrap();
+            assert_eq!(core.decision, AdmissionDecision::Pending);
+            core.admission_gate = Some(Arc::clone(&gate));
+            gate
+        }
         pub fn snapshot(&self) -> Option<FixtureSnapshot> {
             let core = self.shared.core.try_lock().ok()?;
             Some(FixtureSnapshot {
                 sid: core.sid,
                 app: core.app,
-                app_status: core.completion.app_status,
+                app_status: core.completion.application.status(),
+                not_started: core.completion.application == AppDisposition::NotStarted,
+                decision: core.decision,
+                custody_lost: core.failed,
                 session_status: core.session_terminal_observed,
                 session_wait: core.completion.session_wait,
                 broker: core.broker.as_ref().map(|b| b.identity),

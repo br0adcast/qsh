@@ -499,69 +499,78 @@ mod roles {
             },
         )?;
         let mut slave_closed = false;
+        let mut foreground_done = false;
         loop {
-            if !slave_closed {
+            if !foreground_done {
                 if let Some(frame) = foreground.receive()? {
-                    if frame.operation != Operation::Foreground || frame.fields[1..] != [0; 3] {
-                        return Err(protocol());
-                    }
-                    let pid = i32::try_from(frame.fields[0]).map_err(|_| protocol())?;
-                    // The authenticated B endpoint describes its gated,
-                    // exclusively unreaped direct A child. Its PID cannot be
-                    // reused here, and the trusted gate cannot exec or move
-                    // until this reply. This is not a kernel signal token.
-                    if pid <= 0
-                        || unsafe { libc::getpgid(pid) } != pid
-                        || unsafe { libc::getsid(pid) } != sid
-                    {
-                        return Err(protocol());
-                    }
-                    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-                    let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
-                    ignore.sa_sigaction = libc::SIG_IGN;
-                    if unsafe { libc::sigemptyset(&mut ignore.sa_mask) } < 0
-                        || unsafe { libc::sigaction(libc::SIGTTOU, &ignore, &mut old) } < 0
-                    {
-                        return Err(error());
-                    }
-                    let result = unsafe { libc::tcsetpgrp(0, pid) };
-                    let restore =
-                        unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
-                    if result < 0
-                        || restore < 0
-                        || unsafe { libc::getpgid(pid) } != pid
-                        || unsafe { libc::getsid(pid) } != sid
-                    {
-                        return Err(error());
-                    }
-                    send(
-                        &mut foreground,
-                        Frame {
-                            operation: Operation::ForegroundReady,
-                            fields: frame.fields,
-                        },
-                    )?;
-                    // B acknowledges actual A exec or an explicit owned startup failure.
-                    loop {
-                        match foreground.receive()? {
-                            Some(ack)
-                                if matches!(
-                                    ack.operation,
-                                    Operation::AppStarted | Operation::AppFailed
-                                ) && ack.fields == frame.fields =>
-                            {
-                                break
-                            }
-                            Some(_) => return Err(protocol()),
-                            None => std::thread::sleep(INTERVAL),
+                    if frame.operation == Operation::AppNotStarted && frame.fields == [0; 4] {
+                        // B has permanently frozen admission. Retain S's slave
+                        // until the existing terminal-B/final-Exit handshake,
+                        // without treating the later foreground EOF as loss.
+                        foreground_done = true;
+                    } else {
+                        if frame.operation != Operation::Foreground || frame.fields[1..] != [0; 3] {
+                            return Err(protocol());
                         }
-                    }
-                    for fd in 0..3 {
-                        if unsafe { libc::close(fd) } < 0 {
+                        let pid = i32::try_from(frame.fields[0]).map_err(|_| protocol())?;
+                        // The authenticated B endpoint describes its gated,
+                        // exclusively unreaped direct A child. Its PID cannot be
+                        // reused here, and the trusted gate cannot exec or move
+                        // until this reply. This is not a kernel signal token.
+                        if pid <= 0
+                            || unsafe { libc::getpgid(pid) } != pid
+                            || unsafe { libc::getsid(pid) } != sid
+                        {
+                            return Err(protocol());
+                        }
+                        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+                        let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+                        ignore.sa_sigaction = libc::SIG_IGN;
+                        if unsafe { libc::sigemptyset(&mut ignore.sa_mask) } < 0
+                            || unsafe { libc::sigaction(libc::SIGTTOU, &ignore, &mut old) } < 0
+                        {
                             return Err(error());
                         }
+                        let result = unsafe { libc::tcsetpgrp(0, pid) };
+                        let restore =
+                            unsafe { libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut()) };
+                        if result < 0
+                            || restore < 0
+                            || unsafe { libc::getpgid(pid) } != pid
+                            || unsafe { libc::getsid(pid) } != sid
+                        {
+                            return Err(error());
+                        }
+                        send(
+                            &mut foreground,
+                            Frame {
+                                operation: Operation::ForegroundReady,
+                                fields: frame.fields,
+                            },
+                        )?;
+                        // B acknowledges actual A exec or an explicit owned startup failure.
+                        loop {
+                            match foreground.receive()? {
+                                Some(ack)
+                                    if matches!(
+                                        ack.operation,
+                                        Operation::AppStarted | Operation::AppFailed
+                                    ) && ack.fields == frame.fields =>
+                                {
+                                    break
+                                }
+                                Some(_) => return Err(protocol()),
+                                None => std::thread::sleep(INTERVAL),
+                            }
+                        }
+                        for fd in 0..3 {
+                            if unsafe { libc::close(fd) } < 0 {
+                                return Err(error());
+                            }
+                        }
+                        slave_closed = true;
+                        foreground_done = true;
                     }
-                    slave_closed = true;
                 }
             }
             if let Some(frame) = upstream.receive()? {
@@ -1042,6 +1051,7 @@ mod roles {
         )?;
         let mut parent_reported = unsafe { libc::getppid() };
         let mut app: Option<Application> = None;
+        let mut decision = super::super::keeper::AdmissionDecision::Pending;
         let mut phase = None;
         let mut keepers = Vec::new();
         let mut application_debt = ApplicationDebt::default();
@@ -1062,11 +1072,15 @@ mod roles {
             if let Some(frame) = upstream.receive()? {
                 match frame.operation {
                     Operation::Admit
-                        if app.is_none()
+                        if decision == super::super::keeper::AdmissionDecision::Pending
+                            && app.is_none()
                             && phase.is_none()
                             && !closing
                             && frame.fields == [0; 4] =>
                     {
+                        decision
+                            .commit(super::super::keeper::AdmissionDecision::Admit)
+                            .map_err(|_| protocol())?;
                         let (created, refused) =
                             start_application(&mut foreground, &launch, instance, sid)?;
                         send(
@@ -1086,6 +1100,38 @@ mod roles {
                             },
                         )?;
                         app = Some(created);
+                    }
+                    Operation::AbortBeforeAdmit
+                        if decision == super::super::keeper::AdmissionDecision::Pending
+                            && app.is_none()
+                            && phase.is_none()
+                            && !closing
+                            && frame.fields == [0; 4] =>
+                    {
+                        decision
+                            .commit(super::super::keeper::AdmissionDecision::Abort)
+                            .map_err(|_| protocol())?;
+                        // B's unused slave copies are no longer needed. S retains
+                        // its own slave until the existing final Exit handshake.
+                        for fd in [0, 1, 2] {
+                            if unsafe { libc::close(fd) } < 0 {
+                                return Err(error());
+                            }
+                        }
+                        send(
+                            &mut foreground,
+                            Frame {
+                                operation: Operation::AppNotStarted,
+                                fields: [0; 4],
+                            },
+                        )?;
+                        send(
+                            &mut upstream,
+                            Frame {
+                                operation: Operation::AppNotStarted,
+                                fields: [0; 4],
+                            },
+                        )?;
                     }
                     Operation::Stop
                         if frame.fields[1..] == [0; 3] && matches!(frame.fields[0], 1 | 9) =>
@@ -1147,7 +1193,10 @@ mod roles {
                     })
                     .collect();
                 application_debt.reconcile(&application_members, Ok(&snapshot));
-                if application_debt.can_close(app.as_ref().is_some_and(|a| a.wait.is_some())) {
+                if application_debt.can_close(
+                    decision == super::super::keeper::AdmissionDecision::Abort
+                        || app.as_ref().is_some_and(|a| a.wait.is_some()),
+                ) {
                     // No uncontrolled member can fork now; only B could create
                     // another keeper, and its admission is closed first.
                     closing = true;
@@ -1323,7 +1372,8 @@ mod roles {
                     }
                 }
                 if keepers.iter().all(|k| k.waited)
-                    && app.as_ref().is_some_and(|a| a.wait.is_some())
+                    && (decision == super::super::keeper::AdmissionDecision::Abort
+                        || app.as_ref().is_some_and(|a| a.wait.is_some()))
                 {
                     send(
                         &mut upstream,

@@ -145,6 +145,9 @@ impl Created {
             Startup::Pending => return Err(custody.failure("keeper startup is incomplete".into())),
             Startup::Ready => {}
         }
+        if custody.is_cancelled() {
+            return Err(custody.failure("keeper startup was cancelled".into()));
+        }
         let reader = master
             .try_clone_reader()
             .map_err(|_| custody.failure("keeper PTY reader is unavailable".into()))?;

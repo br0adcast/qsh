@@ -64,13 +64,22 @@ fn keeper_control_all_operations_remain_source_bound() {
         Operation::KeeperSpawned,
         Operation::BrokerParent,
         Operation::KeeperTerminal,
+        Operation::AbortBeforeAdmit,
+        Operation::AppNotStarted,
     ]
     .into_iter()
     .enumerate()
     {
         let frame = Frame {
             operation,
-            fields: [i as i64, 37, -1, 0],
+            fields: if matches!(
+                operation,
+                Operation::AbortBeforeAdmit | Operation::AppNotStarted
+            ) {
+                [0; 4]
+            } else {
+                [i as i64, 37, -1, 0]
+            },
         };
         assert_eq!(
             decoder.feed(&encode(instance, i as u64 + 1, frame)),
@@ -114,10 +123,11 @@ fn keeper_created_failure_retains_owner_before_refusal() {
             }
         }
     }
-    for startup in [
-        Startup::Pending,
-        Startup::Failed("injected watch refusal".into()),
-        Startup::Ready,
+    for (startup, cancelled) in [
+        (Startup::Pending, false),
+        (Startup::Failed("injected watch refusal".into()), false),
+        (Startup::Ready, false),
+        (Startup::Ready, true),
     ] {
         let allow = Arc::new(AtomicBool::new(false));
         let drops = Arc::new(AtomicUsize::new(0));
@@ -133,7 +143,13 @@ fn keeper_created_failure_retains_owner_before_refusal() {
             &custody,
             Box::new(transport::shell_server::NoScreen),
         );
+        if cancelled {
+            custody.cancel();
+        }
         let outcome = created.finish();
+        if cancelled {
+            assert!(outcome.is_err(), "cancelled Created became installable");
+        }
         let failure = match outcome {
             Err(failure) => failure,
             Ok(channel) => {
@@ -161,7 +177,7 @@ fn keeper_created_failure_retains_owner_before_refusal() {
 fn keeper_completion_reports_application_not_reservation_status() {
     use transport::channel_server::ChildStatus;
     let complete = Completion {
-        app_status: Some(37),
+        application: AppDisposition::Waited(37),
         session_wait: Some(0),
         broker_terminal: true,
         final_census: true,
@@ -173,14 +189,14 @@ fn keeper_completion_reports_application_not_reservation_status() {
     ));
     for missing in 0..5 {
         let mut proof = Completion {
-            app_status: Some(37),
+            application: AppDisposition::Waited(37),
             session_wait: Some(0),
             broker_terminal: true,
             final_census: true,
             drained: true,
         };
         match missing {
-            0 => proof.app_status = None,
+            0 => proof.application = AppDisposition::Pending,
             1 => proof.session_wait = None,
             2 => proof.broker_terminal = false,
             3 => proof.final_census = false,
@@ -1217,6 +1233,208 @@ mod native_fixture {
             }
         }
     }
+    pub fn cancel_no_application() {
+        use transport::channel_open::{CleanupStatus, OpenIdentity, OpenRequestSnapshot};
+        let _serial = ENVIRONMENT.lock().unwrap_or_else(|p| p.into_inner());
+        let original_deadline = Deadline::new();
+        for scenario in 0..3 {
+            let after_admit = scenario == 1;
+            let expired = scenario == 2;
+            let deadline = Deadline {
+                raw: original_deadline.raw,
+                end: original_deadline.end,
+            };
+            let mut nonce = [0; 16];
+            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+            let nonce = hex::encode(nonce);
+            let mut environment = Environment::set("cancel", &nonce, deadline.raw);
+            let directory = tempfile::Builder::new()
+                .prefix("qsh-keeper-native-")
+                .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+                .unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            environment.directory(directory.path());
+            exclusive(&directory.path().join("instance"), nonce.as_bytes()).unwrap();
+            let image = PathBuf::from(
+                std::env::var_os("QSH_DARWIN223_DAEMON").expect("source-bound Cargo daemon"),
+            );
+            let sha256 = std::env::var("QSH_DARWIN223_DAEMON_SHA256").expect("Cargo daemon digest");
+            let authority = Arc::new(Mutex::new(None));
+            let spawner = Spawner {
+                registry: ChannelOpenRegistry::new(OpenLimits::default()),
+                authority: Arc::clone(&authority),
+                end: deadline.end,
+                image,
+                sha256,
+            };
+            let mut case = Case {
+                authority,
+                channel: None,
+                io: None,
+                complete: false,
+                deadline,
+                nonce,
+                directory,
+                _spawner: spawner,
+                _environment: environment,
+            };
+            let marker = case.directory.path().join("application-started");
+            let marker_text = marker.to_str().unwrap();
+            assert!(!marker_text.contains('\''));
+            let request = OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Command,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: format!(
+                    "/bin/sh -c 'echo started > \"{marker_text}\"; exec /bin/sleep 45'"
+                )
+                .into_bytes(),
+            };
+            let owner = Principal {
+                uid: unsafe { libc::geteuid() },
+                name: "keeper-fixture".into(),
+                identity: "keeper-fixture".into(),
+                incarnation: 0,
+            };
+            let registry = Arc::clone(&case._spawner.registry);
+            let session = registry.session().unwrap();
+            let job = registry
+                .try_reserve(
+                    &session,
+                    OpenRequestSnapshot {
+                        owner,
+                        login: [0; 16],
+                        request: request.clone(),
+                        term: Some("xterm-256color".into()),
+                        identity: OpenIdentity {
+                            session: session.id(),
+                            instance: transport::channel_geometry::ChannelInstance::new(1).unwrap(),
+                            stream: 16,
+                            generation: 0,
+                            invalidation_epoch: 0,
+                        },
+                    },
+                )
+                .unwrap();
+            assert_eq!(registry.outstanding(), 1);
+            let created = KeeperOwner::spawn(
+                ImageSource::Fixture {
+                    path: case._spawner.image.clone(),
+                    sha256: case._spawner.sha256.clone(),
+                },
+                Some(&request.command),
+                portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                Some("xterm-256color"),
+                case.deadline.end,
+                job.custody(),
+                Box::new(transport::shell_server::NoScreen),
+            )
+            .unwrap_or_else(|failure| panic!("keeper creation refused: {}", failure.reason));
+            let master_fd = created.fixture_master_fd().unwrap();
+            let authority = created.fixture_authority().unwrap();
+            *case.authority.lock().unwrap() = Some(authority.clone());
+            let gate = authority.pause_admission(after_admit);
+            let worker = std::thread::spawn(move || created.finish().is_err());
+            while !gate.reached() {
+                assert!(case.deadline.valid());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // reached acknowledges the driver is outside every metadata lock.
+            // Observe repeated held polls, not a controller scheduling sleep.
+            while gate.held_polls() < 3 {
+                assert!(case.deadline.valid());
+                assert!(
+                    !worker.is_finished(),
+                    "driver completed through a held gate"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!worker.is_finished());
+            assert_eq!(
+                authority.snapshot().unwrap().decision,
+                if after_admit {
+                    super::AdmissionDecision::Admit
+                } else {
+                    super::AdmissionDecision::Pending
+                }
+            );
+            // cancel() takes the actual registered custody mutex. The barrier
+            // must leave this operation free to complete before it is released.
+            if expired {
+                gate.expire_startup();
+            } else {
+                job.cancel();
+                assert!(job.custody().is_cancelled());
+            }
+            gate.release();
+            while !worker.is_finished() {
+                assert!(case.deadline.valid());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                worker.join().unwrap(),
+                "aborted Created became an installable channel"
+            );
+            if !after_admit {
+                assert!(
+                    gate.resumed(),
+                    "decision did not resume in original driver iteration"
+                );
+            }
+            let cleanup_registry = Arc::clone(&registry);
+            let cleanup_id = job.id();
+            let cleanup = std::thread::spawn(move || cleanup_registry.cleanup(cleanup_id));
+            while !cleanup.is_finished() && case.deadline.valid() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !cleanup.is_finished() {
+                // Failure-only fixture settlement, never a product certificate.
+                eprintln!("KEEPER_FIXTURE_CLEANUP_TIMEOUT rescue=true");
+                let rescue_end = Instant::now() + Duration::from_secs(10);
+                let _ = authority.rescue(rescue_end);
+                while !cleanup.is_finished() && Instant::now() < rescue_end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !cleanup.is_finished() {
+                    std::process::abort();
+                }
+                let _ = cleanup.join();
+                panic!("keeper cancellation exceeded original fixture deadline");
+            }
+            assert!(
+                matches!(cleanup.join().unwrap(), CleanupStatus::Confirmed(_)),
+                "healthy cancellation lost custody"
+            );
+            assert!(case.deadline.valid());
+            let proof = authority.snapshot().unwrap();
+            assert!(!proof.custody_lost);
+            assert!(proof.broker_terminal && proof.drained && proof.census && proof.consumed);
+            assert_eq!(proof.session_wait, Some(0));
+            if after_admit {
+                assert!(proof.app.is_some() && proof.app_status.is_some());
+                assert!(!proof.not_started);
+            } else {
+                assert!(proof.not_started);
+                assert_eq!(proof.app, None);
+                assert_eq!(proof.app_status, None);
+                assert!(!marker.exists());
+            }
+            assert_eq!(unsafe { libc::fcntl(master_fd, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            assert_eq!(registry.outstanding(), 0);
+            assert_eq!(session.occupied(), 0);
+            case.complete = true;
+            eprintln!("keeper223 case=cancel after_admit={after_admit} expired={expired} noapp={} app={:?} session=0 broker_exit=true pty_closed=true credits=0 rescue=false",proof.not_started,proof.app_status);
+        }
+    }
     pub fn normal() {
         let _serial = ENVIRONMENT.lock().unwrap_or_else(|p| p.into_inner());
         let mut case = Case::new(
@@ -1422,5 +1640,193 @@ fn keeper_observed_debt_requires_positive_full_census_exclusion() {
             "A's actual wait remains independently required"
         );
         assert!(debt.can_close(true));
+    }
+}
+
+#[test]
+fn keeper_abort_no_application_requires_full_receipt() {
+    let proof = Completion {
+        application: AppDisposition::NotStarted,
+        session_wait: Some(0),
+        broker_terminal: true,
+        final_census: true,
+        drained: true,
+    };
+    assert!(matches!(
+        proof.status(),
+        transport::channel_server::ChildStatus::Reaped { code: None }
+    ));
+}
+
+#[test]
+fn keeper_abort_cannot_follow_admit_or_fabricate_status() {
+    let mut decision = AdmissionDecision::Pending;
+    decision.commit(AdmissionDecision::Admit).unwrap();
+    assert!(decision.commit(AdmissionDecision::Abort).is_err());
+    let mut app = AppDisposition::Pending;
+    assert!(app.not_started(decision, false).is_err());
+    assert_eq!(app, AppDisposition::Pending);
+    let mut decision = AdmissionDecision::Pending;
+    decision.commit(AdmissionDecision::Abort).unwrap();
+    assert!(decision.commit(AdmissionDecision::Admit).is_err());
+    assert!(app.not_started(decision, true).is_err());
+    app.not_started(decision, false).unwrap();
+    assert_eq!(app.status(), None);
+    assert!(app.not_started(decision, false).is_err());
+    let mut waited = AppDisposition::Waited(37);
+    assert!(waited.not_started(decision, false).is_err());
+    assert_eq!(waited.status(), Some(37));
+}
+
+#[test]
+fn keeper_cancel_keeps_progress_separate_from_custody_loss() {
+    // A cancellation asks for an admission outcome. It provides none of the
+    // independent receipts and must never synthesize an application exit code.
+    let mut decision = AdmissionDecision::Pending;
+    let requested = AdmissionDecision::Abort;
+    assert_eq!(requested, AdmissionDecision::Abort);
+    decision.commit(requested).unwrap();
+    for _ in 0..3 {
+        assert!(decision.commit(AdmissionDecision::Admit).is_err());
+    }
+    let mut proof = Completion::default();
+    proof.application.not_started(decision, false).unwrap();
+    assert!(matches!(
+        proof.status(),
+        transport::channel_server::ChildStatus::Running
+    ));
+    assert_eq!(proof.application.status(), None);
+    assert!(proof.application.settled());
+    for missing in 0..4 {
+        let proof = Completion {
+            application: AppDisposition::NotStarted,
+            session_wait: if missing == 0 { None } else { Some(0) },
+            broker_terminal: missing != 1,
+            final_census: missing != 2,
+            drained: missing != 3,
+        };
+        assert!(matches!(
+            proof.status(),
+            transport::channel_server::ChildStatus::Running
+        ));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn keeper_native_cancel_before_admit_no_application() {
+    native_fixture::cancel_no_application();
+}
+
+#[test]
+fn keeper_abort_frames_require_zero_fields_and_exact_sequence() {
+    for operation in [Operation::AbortBeforeAdmit, Operation::AppNotStarted] {
+        let instance = [77; 16];
+        let mut decoder = Decoder::new(instance);
+        let frame = Frame {
+            operation,
+            fields: [0; 4],
+        };
+        assert_eq!(decoder.feed(&encode(instance, 1, frame)), Ok(Some(frame)));
+        assert!(decoder.feed(&encode(instance, 1, frame)).is_err());
+        for index in 0..4 {
+            let mut bad = frame;
+            bad.fields[index] = 1;
+            let mut decoder = Decoder::new(instance);
+            assert!(decoder.feed(&encode(instance, 1, bad)).is_err());
+            assert!(decoder.feed(&encode(instance, 1, frame)).is_err());
+        }
+    }
+}
+
+#[test]
+fn keeper_expired_pending_admission_requests_abort() {
+    assert_eq!(
+        AdmissionDecision::Pending.pending(true, false, true, true),
+        PendingAdmission::Abort
+    );
+    assert_eq!(
+        AdmissionDecision::Pending.pending(true, false, false, true),
+        PendingAdmission::GuardedAdmit
+    );
+    assert_eq!(
+        AdmissionDecision::Pending.pending(true, true, false, true),
+        PendingAdmission::Abort
+    );
+    assert_eq!(
+        AdmissionDecision::Pending.pending(true, false, false, false),
+        PendingAdmission::Abort
+    );
+    assert_eq!(
+        AdmissionDecision::Admit.pending(true, true, true, false),
+        PendingAdmission::None
+    );
+    assert_eq!(
+        AdmissionDecision::Abort.pending(true, false, false, true),
+        PendingAdmission::None
+    );
+    assert_eq!(
+        AdmissionDecision::Pending.pending(false, false, true, true),
+        PendingAdmission::None
+    );
+}
+
+#[test]
+fn keeper_fixture_gate_holds_ready_completion_until_release() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::{Duration, Instant};
+    // Exercise the same gate method used by the real macOS driver for BOTH
+    // orderings, with a Ready result poised to complete after the hold.
+    for after_admit in [false, true] {
+        let end = Instant::now() + Duration::from_secs(60);
+        let gate = Arc::new(FixtureAdmissionGate::new(after_admit));
+        let core = Arc::new(Mutex::new(()));
+        let complete = Arc::new(AtomicBool::new(false));
+        let (driver_gate, driver_core, driver_complete) =
+            (Arc::clone(&gate), Arc::clone(&core), Arc::clone(&complete));
+        let worker = std::thread::spawn(move || {
+            let ready = super::keeper_pty::Startup::Ready;
+            {
+                let _core = driver_core.lock().unwrap();
+                assert_eq!(driver_gate.after_admit(), after_admit);
+                assert!(driver_gate.pause());
+                assert!(driver_gate.requested());
+                assert!(
+                    !driver_gate.reached(),
+                    "Core request was published as a driver arrival"
+                );
+            }
+            assert!(driver_gate.hold_until_release(end));
+            assert!(matches!(ready, super::keeper_pty::Startup::Ready));
+            driver_complete.store(true, Ordering::SeqCst);
+        });
+        while !gate.reached() {
+            assert!(Instant::now() < end);
+            assert!(
+                !complete.load(Ordering::SeqCst),
+                "Ready escaped before arrival acknowledgement"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            core.try_lock().is_ok(),
+            "arrival acknowledged while Core remained locked"
+        );
+        while gate.held_polls() < 3 {
+            assert!(Instant::now() < end);
+            assert!(
+                !complete.load(Ordering::SeqCst),
+                "Ready escaped a held gate"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!worker.is_finished());
+        assert!(!complete.load(Ordering::SeqCst));
+        gate.release();
+        worker.join().unwrap();
+        assert!(complete.load(Ordering::SeqCst));
     }
 }

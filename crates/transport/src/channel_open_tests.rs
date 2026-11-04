@@ -874,3 +874,109 @@ fn cleanup143_try_snapshot_discards_partial_counts_on_capsule_contention() {
     };
     assert!(registry.finish_cleanup(job.id(), &proof));
 }
+
+#[test]
+fn initial_admission_cancel_before_commit_skips_callback() {
+    let (custody, _guard, _) = protected();
+    let stale = custody.is_cancelled();
+    assert!(!stale);
+    custody.cancel(); // Completes between the initial read and queue commitment.
+    let called = AtomicBool::new(false);
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Cancelled)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+#[test]
+fn initial_admission_commit_before_cancel_is_preserved() {
+    let (custody, _guard, _) = protected();
+    let committed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&committed);
+    let cancel_custody = custody.clone();
+    let cancel = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        cancel_custody.cancel();
+    });
+    let result = custody.try_commit_initial_admission(|| {
+        assert!(matches!(
+            custody.inner.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        committed.store(true, Ordering::SeqCst);
+        37
+    });
+    assert_eq!(result, Ok(37));
+    cancel.join().unwrap();
+    assert!(custody.is_cancelled());
+    assert_eq!(
+        custody.try_commit_initial_admission(|| panic!("second admission")),
+        Err(InitialAdmissionError::Cancelled)
+    );
+}
+
+#[test]
+fn initial_admission_queue_refusal_preserves_custody() {
+    let (custody, _guard, observation) = protected();
+    assert_eq!(
+        custody.try_commit_initial_admission(|| Err::<(), _>(std::io::ErrorKind::WouldBlock)),
+        Ok(Err(std::io::ErrorKind::WouldBlock))
+    );
+    assert!(!custody.is_cancelled());
+    assert_eq!(observation.waits.load(Ordering::SeqCst), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(custody.try_commit_initial_admission(|| true), Ok(true));
+}
+
+#[test]
+fn initial_admission_requires_healthy_construction() {
+    let called = AtomicBool::new(false);
+    let missing = OpenCustody::new();
+    assert_eq!(
+        missing.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    let (custody, guard, _) = protected();
+    let channel = guard.finish(
+        Box::new(std::io::empty()),
+        Box::new(std::io::sink()),
+        Box::new(Resize),
+    );
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    drop(channel);
+    for field in 0..4 {
+        let (custody, _guard, _) = protected();
+        {
+            let mut state = custody.inner.state.lock().unwrap();
+            match field {
+                0 => state.constructing = false,
+                1 => state.leased = true,
+                2 => state.adopted = true,
+                _ => state.terminal = Some(ProofKind::NoChild),
+            }
+        }
+        assert_eq!(
+            custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+            Err(InitialAdmissionError::Unavailable)
+        );
+    }
+    let (custody, _guard, _) = protected();
+    let poisoned = custody.clone();
+    assert!(std::thread::spawn(move || {
+        let _lock = poisoned.inner.state.lock().unwrap();
+        panic!("controlled capsule poison");
+    })
+    .join()
+    .is_err());
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+}
