@@ -221,6 +221,12 @@ static int runtime_string(const char *name, char *value, size_t capacity, struct
     if (!size || size > capacity || value[size - 1] != '\0' || strlen(value) + 1 != size) return invalid(error);
     return 0;
 }
+/* This probe reports only the loaded atomic-signal symbol. Admission and
+ * observation errors belong to their selected backend and never trigger fallback. */
+int qsh_scope_modern_signal_available(void) {
+    pthread_once(&symbols_once, load_symbols);
+    return exact_signal != NULL;
+}
 int qsh_scope_prepare(struct qsh_scope_runtime *runtime, struct qsh_scope_error *error) {
     pthread_once(&symbols_once, load_symbols);
     if (!exact_signal) return failure(error, 1, ENOSYS);

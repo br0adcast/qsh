@@ -1,4 +1,5 @@
 //! Identity-bound Darwin process ownership and personal PTY cleanup.
+mod personal;
 mod scope;
 
 pub(super) const CAPACITY: usize = 4096;
@@ -102,7 +103,25 @@ mod tests;
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
-pub(crate) use native::{own_child, prepare};
+pub(crate) use native::own_child;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use native::prepare;
+
+#[cfg(target_os = "macos")]
+pub(crate) type PreparedPersonalOwner =
+    personal::Prepared<QualifiedDarwin, native::KeeperAdmission>;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare_personal() -> Result<PreparedPersonalOwner, native::AdmissionError> {
+    personal::select(
+        native::modern_signal_available(),
+        native::prepare,
+        native::keeper_prepare,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) use keeper_pty::spawn_prepared;
 #[cfg(all(test, target_os = "macos"))]
 mod native_tests;
 

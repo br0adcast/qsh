@@ -75,6 +75,11 @@ impl ChannelSpawner for PtyChannelSpawner {
         term: Option<&str>,
         custody: &OpenCustody,
     ) -> Result<UninstalledChannel, SpawnFailure> {
+        #[cfg(target_os = "macos")]
+        let keeper_end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        if custody.is_cancelled() {
+            return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
+        }
         if req.cols == 0 || req.rows == 0 {
             return Err(custody.refuse_before_creation(
                 "a channel without a terminal is not supported yet".to_string(),
@@ -86,7 +91,7 @@ impl ChannelSpawner for PtyChannelSpawner {
         let process_view = crate::process_scope::prepare()
             .map_err(|error| custody.refuse_before_creation(error))?;
         #[cfg(target_os = "macos")]
-        let process_view = crate::darwin_process_scope::prepare()
+        let prepared = crate::darwin_process_scope::prepare_personal()
             .map_err(|error| custody.refuse_before_creation(error.to_string()))?;
         let screen = make_screen(req, owner, Arc::clone(&self.budget))
             .map_err(|e| custody.refuse_before_creation(e))?;
@@ -96,38 +101,80 @@ impl ChannelSpawner for PtyChannelSpawner {
             pixel_width: 0,
             pixel_height: 0,
         };
-        // Never inside a replacement's exec window: this child would inherit
-        // the descriptors it makes inheritable (see `crate::update`). Held
-        // until the spawn has returned -- the child has exec'd by then.
-        let permit = crate::update::spawn_permit();
-        let (master, child) = match req.kind {
-            // Kernel echo stays ON: a full-screen program puts its own
-            // terminal into raw mode, so kernel echo neither helps nor
-            // hinders, same as a `tmux attach` client today.
-            ChannelKind::Shell => pty::spawn_shell(size, term),
-            // Echo OFF, unconditionally: today every command channel is the
-            // app's `tmux -C` control-mode client, which must not see its
-            // own writes echoed back. `spawn_command_no_echo` is the whole
-            // channel, hard-coded rather than decided per request -- there
-            // is no way here yet for a command channel to ask for echo ON.
-            ChannelKind::Command => pty::spawn_command_no_echo(
-                size,
-                command_builder(&req.command).map_err(|e| custody.refuse_before_creation(e))?,
-                term,
-            ),
-        }
-        .map_err(|e| custody.refuse_before_creation(format!("could not open channel: {e:#}")))?;
-        // portable-pty has completed its owned setsid/exec handshake. Retain
-        // the unreaped leader before any fallible descriptor preparation.
-        #[cfg(target_os = "linux")]
-        let wait = crate::process_scope::own_child(child, process_view);
         #[cfg(target_os = "macos")]
-        let wait = crate::darwin_process_scope::own_child(child, process_view);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
-        drop(permit);
-        finish_personal_spawn(master, wait, screen, custody)
+        return prepared.spawn(
+            screen,
+            |qualified, screen| spawn_personal_pty(req, size, term, custody, screen, qualified),
+            |admission, screen| {
+                let command = match req.kind {
+                    ChannelKind::Shell => None,
+                    ChannelKind::Command => Some(req.command.as_slice()),
+                };
+                crate::darwin_process_scope::spawn_prepared(
+                    admission, command, size, term, keeper_end, custody, screen,
+                )
+            },
+        );
+        #[cfg(not(target_os = "macos"))]
+        spawn_personal_pty(
+            req,
+            size,
+            term,
+            custody,
+            screen,
+            #[cfg(target_os = "linux")]
+            process_view,
+        )
     }
+}
+
+/// Portable PTY creation for a selected modern/Linux owner.
+fn spawn_personal_pty(
+    req: &OpenRequest,
+    size: PtySize,
+    term: Option<&str>,
+    custody: &OpenCustody,
+    screen: Box<dyn SessionScreen>,
+    #[cfg(target_os = "linux")] process_view: crate::process_scope::QualifiedProc,
+    #[cfg(target_os = "macos")] process_view: crate::darwin_process_scope::QualifiedDarwin,
+) -> Result<UninstalledChannel, SpawnFailure> {
+    if custody.is_cancelled() {
+        return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
+    }
+    // Never inside a replacement's exec window: this child would inherit
+    // the descriptors it makes inheritable (see `crate::update`). Held
+    // until the spawn has returned -- the child has exec'd by then.
+    let permit = crate::update::spawn_permit();
+    if custody.is_cancelled() {
+        return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
+    }
+    let (master, child) = match req.kind {
+        // Kernel echo stays ON: a full-screen program puts its own
+        // terminal into raw mode, so kernel echo neither helps nor
+        // hinders, same as a `tmux attach` client today.
+        ChannelKind::Shell => pty::spawn_shell(size, term),
+        // Echo OFF, unconditionally: today every command channel is the
+        // app's `tmux -C` control-mode client, which must not see its
+        // own writes echoed back. `spawn_command_no_echo` is the whole
+        // channel, hard-coded rather than decided per request -- there
+        // is no way here yet for a command channel to ask for echo ON.
+        ChannelKind::Command => pty::spawn_command_no_echo(
+            size,
+            command_builder(&req.command).map_err(|e| custody.refuse_before_creation(e))?,
+            term,
+        ),
+    }
+    .map_err(|e| custody.refuse_before_creation(format!("could not open channel: {e:#}")))?;
+    // portable-pty has completed its owned setsid/exec handshake. Retain
+    // the unreaped leader before any fallible descriptor preparation.
+    #[cfg(target_os = "linux")]
+    let wait = crate::process_scope::own_child(child, process_view);
+    #[cfg(target_os = "macos")]
+    let wait = crate::darwin_process_scope::own_child(child, process_view);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
+    drop(permit);
+    finish_personal_spawn(master, wait, screen, custody)
 }
 
 /// Assemble the spawned PTY at the descriptor-preparation boundary.
@@ -464,6 +511,60 @@ impl SessionBackend for ChannelSessionBackend {
 mod tests {
     include!("channel_backend_open_tests.rs");
     use super::*;
+    #[test]
+    fn personal_cancel_before_create_is_no_child() {
+        use transport::channel_open::{CleanupStatus, SpawnCleanup};
+        let spawner = spawner();
+        let custody = OpenCustody::new();
+        custody.cancel();
+        let owner = owner();
+        let request = request(ChannelKind::Command, 80, 24, b"/bin/true");
+        let result = ChannelSpawner::spawn(&spawner, &owner, [1; 16], &request, None, &custody);
+        let refused = result.is_err();
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(channel) => {
+                drop(channel);
+                custody.failure("unexpected creation".into())
+            }
+        };
+        let no_child = matches!(failure.cleanup, SpawnCleanup::NoChild(_));
+        if let SpawnCleanup::Pending(ticket) = failure.cleanup {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(ticket.cleanup(), CleanupStatus::Confirmed(_)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < end,
+                    "unexpected child did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            refused && no_child,
+            "canceled factory created a child instead of NoChild"
+        );
+    }
+
+    #[test]
+    fn personal_command_refusal_preserves_no_child_and_screen_credits() {
+        use transport::channel_open::SpawnCleanup;
+        let budget = budget();
+        let spawner = PtyChannelSpawner::new(budget.clone());
+        for command in [b"".as_slice(), b"'", &[0xff]] {
+            let custody = OpenCustody::new();
+            let mut req = request(ChannelKind::Command, 80, 24, command);
+            req.screen = true;
+            let failure = ChannelSpawner::spawn(&spawner, &owner(), login(), &req, None, &custody)
+                .err()
+                .expect("malformed command was admitted");
+            assert!(matches!(failure.cleanup, SpawnCleanup::NoChild(_)));
+            assert_eq!(budget.used(), crate::screen_budget::Usage::default());
+        }
+    }
+
     fn budget() -> Arc<ScreenBudget> {
         Arc::new(ScreenBudget::new(
             crate::screen_budget::BudgetLimits::default(),

@@ -267,9 +267,14 @@ impl ImageMetadata {
 }
 #[cfg(target_os = "macos")]
 impl ImageSource {
-    fn verify(self, end: std::time::Instant) -> Result<VerifiedImage, String> {
+    fn verify(
+        self,
+        end: std::time::Instant,
+        custody: &OpenCustody,
+    ) -> Result<VerifiedImage, String> {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        super::personal::check_startup(end, custody.is_cancelled())?;
         let (path, expected) = match self {
             Self::Current => (
                 super::native::keeper_image_path()
@@ -308,9 +313,7 @@ impl ImageSource {
         let mut remaining = before.len();
         let mut buffer = [0; 64 * 1024];
         while remaining > 0 {
-            if std::time::Instant::now() >= end {
-                return Err("keeper startup deadline expired".into());
-            }
+            super::personal::check_startup(end, custody.is_cancelled())?;
             let count = remaining.min(buffer.len() as u64) as usize;
             let n = file
                 .read(&mut buffer[..count])
@@ -353,9 +356,44 @@ impl VerifiedImage {
 }
 
 #[cfg(target_os = "macos")]
+struct LaunchOptions<'a> {
+    command: Option<&'a [u8]>,
+    size: PtySize,
+    term: Option<&'a str>,
+}
+
+/// Consume the selected admission once. This path owns its own spawn permit and
+/// protects the original S child exactly once before returning any post-S error.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_prepared(
+    admission: super::native::KeeperAdmission,
+    command: Option<&[u8]>,
+    size: PtySize,
+    term: Option<&str>,
+    end: std::time::Instant,
+    custody: &OpenCustody,
+    screen: Box<dyn SessionScreen>,
+) -> Result<UninstalledChannel, SpawnFailure> {
+    super::keeper::KeeperOwner::create(
+        admission,
+        ImageSource::Current,
+        LaunchOptions {
+            command,
+            size,
+            term,
+        },
+        end,
+        custody,
+        screen,
+    )?
+    .finish()
+}
+
+#[cfg(target_os = "macos")]
 impl super::keeper::KeeperOwner {
-    /// A non-default constructor. Every post-creation result is already protected
-    /// by the caller's one fresh, registered OpenCustody before it is returned.
+    /// Native fixtures retain real admission and image validation; production
+    /// consumes the factory's admission through `spawn_prepared` instead.
+    #[cfg(test)]
     pub(super) fn spawn(
         image: ImageSource,
         command: Option<&[u8]>,
@@ -365,17 +403,48 @@ impl super::keeper::KeeperOwner {
         custody: &OpenCustody,
         screen: Box<dyn SessionScreen>,
     ) -> Result<Created, SpawnFailure> {
+        let admission = super::native::keeper_prepare().map_err(|_| {
+            custody.refuse_before_creation("keeper process ownership is unavailable".into())
+        })?;
+        Self::create(
+            admission,
+            image,
+            LaunchOptions {
+                command,
+                size,
+                term,
+            },
+            end,
+            custody,
+            screen,
+        )
+    }
+
+    fn create(
+        admission: super::native::KeeperAdmission,
+        image: ImageSource,
+        options: LaunchOptions<'_>,
+        end: std::time::Instant,
+        custody: &OpenCustody,
+        screen: Box<dyn SessionScreen>,
+    ) -> Result<Created, SpawnFailure> {
+        let LaunchOptions {
+            command,
+            size,
+            term,
+        } = options;
         use super::keeper_helper::{Channel, Launch, ENTRY};
         use rand_core::RngCore;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::CommandExt;
         let before = |reason: &str| custody.refuse_before_creation(reason.to_owned());
+        super::personal::check_startup(end, custody.is_cancelled()).map_err(before)?;
         let reservations = StandardReservations::acquire()
             .map_err(|_| before("keeper standard descriptors cannot be reserved"))?;
-        let admission = super::native::keeper_prepare()
-            .map_err(|_| before("keeper process ownership is unavailable"))?;
-        let image = image.verify(end).map_err(|reason| before(&reason))?;
+        let image = image
+            .verify(end, custody)
+            .map_err(|reason| before(&reason))?;
         if size.rows == 0 || size.cols == 0 {
             return Err(before("keeper terminal size is invalid"));
         }
@@ -456,9 +525,7 @@ impl super::keeper::KeeperOwner {
         }
         let permit = crate::update::spawn_permit();
         image.recheck().map_err(|reason| before(&reason))?;
-        if std::time::Instant::now() >= end {
-            return Err(before("keeper startup deadline expired"));
-        }
+        super::personal::check_startup(end, custody.is_cancelled()).map_err(before)?;
         let session = executable
             .spawn()
             .map_err(|_| before("keeper session could not be executed"))?;

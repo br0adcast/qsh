@@ -50,6 +50,7 @@ pub(super) struct Token {
     words: [u32; 8],
 }
 unsafe extern "C" {
+    fn qsh_scope_modern_signal_available() -> i32;
     fn qsh_scope_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
     fn qsh_scope_keeper_pre_exec(slave: i32, session: i32, broker: i32) -> i32;
     fn qsh_scope_keeper_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
@@ -116,6 +117,9 @@ fn runtime_text(value: &[std::ffi::c_char]) -> Result<&str, AdmissionError> {
         .map_err(|_| AdmissionError::Native(Failure::Invalid))?
         .to_str()
         .map_err(|_| AdmissionError::Native(Failure::Invalid))
+}
+pub(super) fn modern_signal_available() -> bool {
+    unsafe { qsh_scope_modern_signal_available() != 0 }
 }
 pub(crate) fn prepare() -> Result<QualifiedDarwin, AdmissionError> {
     let mut error = Error::default();
@@ -467,8 +471,8 @@ pub(super) fn classification_matches_for_test(before: Classified, after: Classif
 }
 
 /// A distinct admission type: it cannot be passed to the modern exact-signal owner.
-pub(super) struct KeeperAdmission {
-    pub contract: &'static str,
+pub(crate) struct KeeperAdmission {
+    pub(super) contract: &'static str,
 }
 pub(super) fn keeper_prepare() -> Result<KeeperAdmission, AdmissionError> {
     let mut error = Error::default();
