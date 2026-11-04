@@ -783,6 +783,23 @@ jobs:
           python3 -I -B scripts/test_three_channel_functional.py
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
 
+      # Release signing orchestration, including the real native verifier's
+      # rejections; none of these controls may be skipped.
+      - name: Release attestation controls
+        env:
+          AWS_LC_SYS_USE_SYSTEM: '0'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          cargo build --locked -p release-auth --example verify-release
+          export QSH_TEST_RELEASE_VERIFIER="$PWD/target/debug/examples/verify-release"
+          python3 - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_release_attestation.py')
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count and result.wasSuccessful() and not result.skipped else 1)
+          PY
+
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

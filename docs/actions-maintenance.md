@@ -68,7 +68,42 @@ or PR merge-ref success is not substituted for this qualification.
 
 Branch package dispatches still assemble, scan and upload artifacts without
 running another full ordinary suite. They cannot publish. Only the separate
-tag-only publication job has `contents: write`, and it requires successful
-ordinary CI and artifact assembly. Failed or skipped qualification prevents
-publication; do not add `always()` or `continue-on-error` to bypass that gate.
-An ordinary CI dispatch can qualify a branch explicitly without packaging.
+tag-only publication job has `contents: write`, `id-token: write` and
+`attestations: write`, and it requires successful ordinary CI and artifact
+assembly. Failed or skipped qualification prevents publication; do not add
+`always()` or `continue-on-error` to bypass that gate. An ordinary CI dispatch
+can qualify a branch explicitly without packaging.
+
+## Signed release manifest
+
+A tag publication adds one asset to the twelve products and `SHA256SUMS`:
+`SHA256SUMS.sigstore.json`, a Sigstore bundle for the manifest's exact bytes.
+The `release-verifier` job builds the `release-auth` example `verify-release`
+from the tag's commit with `--locked`, without signing authority or a restored
+cache. The `publish` job then runs `scripts/prepare-release-attestation.py`:
+
+- **Preflight.** It reads the tag, the release and both metadata assets and
+  changes nothing.
+  - A published manifest must equal the assembled one.
+  - A published bundle is reused, byte for byte, if the verifier accepts it for
+    that manifest and the tag's commit.
+  - Otherwise `actions/attest` signs the manifest once, and the new bundle is
+    verified before anything else uses it.
+- **Hard stops.** Any of these stops publication, and nothing is deleted or
+  replaced: invalid evidence, a conflicting manifest, a duplicate, incomplete or
+  oversized asset, or a GitHub API, authentication or network failure. An API
+  failure is never read as an absent asset.
+- **Upload.** The uploader gets exactly fourteen files, with the bundle before
+  the manifest.
+
+A publication interrupted after the bundle was uploaded is completed by
+rerunning the failed jobs of the same run. That reuses its `dist` artifact, and
+so its manifest bytes. A new run rebuilds the products, and its different
+manifest conflicts with what is published.
+
+A second publication of the same tag waits until a running one finishes instead
+of racing it, and a running publication is never cancelled. GitHub keeps only
+one waiting publication per tag: a newer one replaces an older waiting one.
+
+`v0.5.0` was published before this signing existed. Its release is refused
+rather than signed after the fact, and its tag and assets are left as they are.

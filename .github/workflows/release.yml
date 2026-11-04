@@ -542,29 +542,114 @@ jobs:
           name: dist
           path: dist/
 
-  # Default needs propagation blocks publication on failure or skipped CI.
-  # Keep this separate so branch assembly does not depend on skipped tag CI.
-  publish:
-    if: github.ref_type == 'tag'
-    needs: [release, ordinary-ci, released-peer-acceptance]
+  # The native release verifier for `publish`, built from this exact
+  # checkout. A job of its own without signing or write authority, so the
+  # build scripts of its dependencies never run where an OIDC token can be
+  # requested. No cache is restored into it.
+  release-verifier:
+    if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    timeout-minutes: 15
+      contents: read
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Verify the exact source commit
         shell: bash
         run: |
           actual=$(git rev-parse HEAD)
           echo "Source commit: $actual (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
           test "$actual" = "$GITHUB_SHA"
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          scripts/check-qualified-rust.sh
+
+      - name: Validate the shipped pair version
+        id: version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --format-version 1 --no-deps \
+            | python3 scripts/check-release-version.py \
+                --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the native release verifier
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-verifier-build
+          AWS_LC_SYS_USE_SYSTEM: '0'
+        run: |
+          cargo build --locked -p release-auth --example verify-release
+          mkdir "$RUNNER_TEMP/release-verifier"
+          cp "$CARGO_TARGET_DIR/debug/examples/verify-release" "$RUNNER_TEMP/release-verifier/"
+
+      # A tool for `publish`, never a release asset.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-verifier
+          path: ${{ runner.temp }}/release-verifier/verify-release
+          if-no-files-found: error
+
+  # Default needs propagation blocks publication on failure or skipped CI.
+  # Keep this separate so branch assembly does not depend on skipped tag CI.
+  # The only job that may write the release or sign: it signs the assembled
+  # SHA256SUMS once, or reuses a published signature that the native
+  # verifier accepts, and uploads the fourteen release files.
+  publish:
+    if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
+    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    # One publication per tag at a time: another run waits for this one
+    # rather than racing it, and a running publication is never cancelled.
+    # GitHub keeps one waiting run per group; a newer one replaces it.
+    concurrency:
+      group: qsh-release-${{ github.ref }}
+      cancel-in-progress: false
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ needs.release-verifier.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact source commit
+        shell: bash
+        run: |
+          actual=$(git rev-parse HEAD)
+          echo "Source commit: $actual (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
+          test "$actual" = "$GITHUB_SHA"
+      - name: Require the release repository and tag
+        shell: bash
+        run: |
+          test "$GITHUB_REPOSITORY" = br0adcast/qsh
+          test "$GITHUB_REF_TYPE" = tag
+          test -n "$RELEASE_VERSION"
+          test "$GITHUB_REF" = "refs/tags/v$RELEASE_VERSION"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-verifier
+          path: ${{ runner.temp }}/release-verifier
+      # Artifacts do not keep file modes.
+      - name: Prepare the native verifier
+        run: |
+          chmod 0755 "$RUNNER_TEMP/release-verifier/verify-release"
+          echo "RELEASE_VERIFIER=$RUNNER_TEMP/release-verifier/verify-release" >> "$GITHUB_ENV"
+          echo "ATTESTATION_WORK=$RUNNER_TEMP/release-attestation" >> "$GITHUB_ENV"
 
       # The changelog section for this version, taken verbatim. The heading
       # separates version from date with an em dash, so the end of the
@@ -590,11 +675,72 @@ jobs:
           EOF
           cat notes.md
 
+      # Read-only: the tag, the release and both metadata assets. A
+      # published bundle is reused only after native verification; a
+      # conflict, invalid evidence or an API failure stops publication.
+      - name: Check the published release metadata
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/prepare-release-attestation.py preflight \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            --version "$RELEASE_VERSION" --source-commit "$GITHUB_SHA" \
+            --dist dist --verifier "$RELEASE_VERIFIER" \
+            --work "$ATTESTATION_WORK" --github-output "$GITHUB_OUTPUT"
+
+      - name: Sign the release manifest
+        id: attest
+        if: steps.preflight.outputs.sign == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: SHA256SUMS
+          subject-digest: sha256:${{ steps.preflight.outputs.digest }}
+          predicate-type: https://github.com/br0adcast/qsh/release-manifest/v1
+          predicate-path: ${{ steps.preflight.outputs.predicate }}
+
+      - name: Verify the new signature
+        if: steps.preflight.outputs.sign == 'true'
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python3 scripts/prepare-release-attestation.py capture \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            --version "$RELEASE_VERSION" --source-commit "$GITHUB_SHA" \
+            --dist dist --verifier "$RELEASE_VERIFIER" \
+            --work "$ATTESTATION_WORK" --bundle-path "$BUNDLE_PATH"
+
+      # The packages were scanned in `release`; the two metadata files are
+      # scanned here, where the bundle first exists.
+      - name: Check release metadata for secrets
+        run: |
+          scanner="$RUNNER_TEMP/gitleaks"
+          audit="$RUNNER_TEMP/release-metadata-audit"
+          mkdir -p "$scanner" "$audit"
+          curl --fail --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$scanner/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $scanner/gitleaks.tar.gz" | sha256sum --check
+          tar -xzf "$scanner/gitleaks.tar.gz" -C "$scanner"
+          cp dist/SHA256SUMS dist/SHA256SUMS.sigstore.json "$audit/"
+          printf '[extend]\nuseDefault = true\n' > "$scanner/config.toml"
+          "$scanner/gitleaks" dir "$audit" --config "$scanner/config.toml" \
+            --redact=100 --ignore-gitleaks-allow
+
+      # Exactly the twelve products, the bundle and the manifest, rechecked
+      # and verified once more; nothing else in a directory reaches the
+      # release.
       - name: Publish the release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          listed=$(python3 scripts/prepare-release-attestation.py final \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            --version "$RELEASE_VERSION" --source-commit "$GITHUB_SHA" \
+            --dist dist --verifier "$RELEASE_VERIFIER")
+          mapfile -t assets <<< "$listed"
+          test "${#assets[@]}" -eq 14
           python3 scripts/upload-release-assets.py \
             --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
-            --notes-file notes.md dist/*
+            --notes-file notes.md "${assets[@]}"
