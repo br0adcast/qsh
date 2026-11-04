@@ -1,6 +1,7 @@
 use super::{FetchError, FetchLimits, ReleaseTransport};
 use bringup::{BringUpObserver, ImageError};
 use knock::Cancel;
+use std::cell::Cell;
 
 pub(super) struct HttpsTransport;
 impl ReleaseTransport for HttpsTransport {
@@ -41,6 +42,7 @@ fn fetch(
             .build()
             .map_err(|error| rejected(clean(&error.to_string())))?,
     ));
+    let body_started = Cell::new(false);
     runtime
         .0
         .as_ref()
@@ -48,21 +50,29 @@ fn fetch(
         .block_on(with_deadline(
             limits,
             cancel,
-            download(builder, url, limits, observer),
+            &body_started,
+            download(builder, url, limits, observer, &body_started),
         ))
 }
 
 async fn with_deadline<T>(
     limits: FetchLimits,
     cancel: &Cancel,
+    body_started: &Cell<bool>,
     download: impl std::future::Future<Output = Result<T, FetchError>>,
 ) -> Result<T, FetchError> {
     // One deadline surrounds DNS, connect, redirects, headers and body.
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         _ = cancelled(cancel) => Err(FetchError::Rejected(ImageError::Cancelled)),
         _ = tokio::time::sleep(limits.total) => Err(FetchError::TemporarilyUnavailable("release download deadline exceeded".into())),
         result = download => result,
+    };
+    match result {
+        Err(FetchError::TemporarilyUnavailable(reason)) if body_started.get() => {
+            Err(FetchError::InterruptedResponse(reason))
+        }
+        other => other,
     }
 }
 
@@ -71,6 +81,7 @@ async fn download(
     url: &str,
     limits: FetchLimits,
     observer: &dyn BringUpObserver,
+    body_started: &Cell<bool>,
 ) -> Result<Vec<u8>, FetchError> {
     let client = builder
         .https_only(true)
@@ -116,6 +127,9 @@ async fn download(
             })?
             .map_err(download_error)?;
         let Some(chunk) = chunk else { break };
+        if !chunk.is_empty() {
+            body_started.set(true);
+        }
         if chunk.len() > limits.max_bytes.saturating_sub(bytes.len()) {
             return Err(rejected("release download exceeds its size limit".into()));
         }
@@ -455,19 +469,66 @@ while True:
         let cancel = Cancel::new();
         for path in ["/headers", "/stall"] {
             let start = Instant::now();
-            assert!(
-                matches!(server.get(path, FetchLimits { idle: Duration::from_millis(80), ..limits() }, &cancel), Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("idle"))
-            );
+            assert!(match server.get(
+                path,
+                FetchLimits {
+                    idle: Duration::from_millis(80),
+                    ..limits()
+                },
+                &cancel
+            ) {
+                Err(FetchError::TemporarilyUnavailable(reason)) if path == "/headers" =>
+                    reason.contains("idle"),
+                Err(FetchError::InterruptedResponse(reason)) if path == "/stall" =>
+                    reason.contains("idle"),
+                _ => false,
+            });
             assert!(start.elapsed() < Duration::from_millis(500));
         }
         for path in ["/drip", "/slowredirect/4"] {
             let start = Instant::now();
-            assert!(
-                matches!(server.get(path, FetchLimits { total: Duration::from_millis(130), idle: Duration::from_secs(1), ..limits() }, &cancel), Err(FetchError::TemporarilyUnavailable(reason)) if reason.contains("deadline"))
-            );
+            assert!(match server.get(
+                path,
+                FetchLimits {
+                    total: Duration::from_millis(130),
+                    idle: Duration::from_secs(1),
+                    ..limits()
+                },
+                &cancel
+            ) {
+                Err(FetchError::TemporarilyUnavailable(reason)) if path == "/slowredirect/4" =>
+                    reason.contains("deadline"),
+                Err(FetchError::InterruptedResponse(reason)) if path == "/drip" =>
+                    reason.contains("deadline"),
+                _ => false,
+            });
             assert!(start.elapsed() < Duration::from_millis(400));
         }
     }
+    #[test]
+    fn a_partial_body_outage_cannot_claim_zero_received_bytes() {
+        let server = Server::start();
+        for (path, total, idle) in [
+            ("/stall", Duration::from_secs(1), Duration::from_millis(80)),
+            ("/drip", Duration::from_millis(130), Duration::from_secs(1)),
+        ] {
+            let result = server.get(
+                path,
+                FetchLimits {
+                    total,
+                    idle,
+                    ..limits()
+                },
+                &Cancel::new(),
+            );
+            assert!(result.is_err());
+            assert!(
+                matches!(result, Err(FetchError::InterruptedResponse(_))),
+                "received body bytes must reach idle and total classification: {path}"
+            );
+        }
+    }
+
     #[test]
     fn https_redirect_chains_and_relative_locations_reach_the_body() {
         let server = Server::start();
@@ -502,6 +563,7 @@ while True:
         with_deadline(
             limits,
             &cancel,
+            &Cell::new(false),
             request_following_redirects(
                 reqwest::Url::parse("https://releases.invalid/redirect/4").unwrap(),
                 limits.idle,
@@ -546,6 +608,83 @@ while True:
     }
 
     #[tokio::test(start_paused = true)]
+    async fn total_timeout_keeps_body_progress_when_it_drops_download() {
+        for nonempty in [false, true] {
+            let cancel = Cancel::new();
+            let body_started = Cell::new(false);
+            let result = with_deadline(
+                FetchLimits {
+                    total: Duration::from_millis(130),
+                    ..limits()
+                },
+                &cancel,
+                &body_started,
+                async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if nonempty {
+                        body_started.set(true);
+                    }
+                    std::future::pending::<Result<(), FetchError>>().await
+                },
+            )
+            .await;
+            assert_eq!(body_started.get(), nonempty);
+            assert!(if nonempty {
+                matches!(result, Err(FetchError::InterruptedResponse(_)))
+            } else {
+                matches!(result, Err(FetchError::TemporarilyUnavailable(_)))
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn temporary_read_failure_keeps_progress_but_hard_rejection_and_cancel_win() {
+        for started in [false, true] {
+            let cancel = Cancel::new();
+            let body_started = Cell::new(false);
+            let result = with_deadline(limits(), &cancel, &body_started, async {
+                if started {
+                    body_started.set(true);
+                }
+                Err::<(), _>(FetchError::TemporarilyUnavailable("read timed out".into()))
+            })
+            .await;
+            assert!(if started {
+                matches!(result, Err(FetchError::InterruptedResponse(_)))
+            } else {
+                matches!(result, Err(FetchError::TemporarilyUnavailable(_)))
+            });
+        }
+        let cancel = Cancel::new();
+        let started = Cell::new(true);
+        let result = with_deadline(
+            limits(),
+            &cancel,
+            &started,
+            std::future::ready(Err::<(), _>(rejected("hard body/TLS rejection".into()))),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FetchError::Rejected(ImageError::Download(_)))
+        ));
+        cancel.cancel();
+        let result = with_deadline(
+            limits(),
+            &cancel,
+            &started,
+            std::future::ready(Err::<(), _>(FetchError::TemporarilyUnavailable(
+                "ready outage".into(),
+            ))),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FetchError::Rejected(ImageError::Cancelled))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_request_without_headers_exhausts_its_own_idle_budget() {
         let started = tokio::time::Instant::now();
         let result = request_following_redirects(
@@ -573,6 +712,7 @@ while True:
                 ..limits()
             },
             &cancel,
+            &Cell::new(false),
             std::future::ready(Ok(b"abcd")),
         )
         .await;
@@ -591,6 +731,7 @@ while True:
                 ..limits()
             },
             &cancel,
+            &Cell::new(false),
             async {
                 tokio::time::sleep(Duration::from_millis(130)).await;
                 Ok(b"abcd")
@@ -717,7 +858,6 @@ while True:
 
     fn seeded_release_cache() -> (tempfile::TempDir, bringup::ImageRequest) {
         use bringup::ImageSource;
-        use sha2::Digest;
         let request = bringup::ImageRequest::new(
             bringup::Platform::from_uname("Linux", "x86_64").unwrap(),
             "0.4.0",
@@ -734,34 +874,14 @@ while True:
         let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut gzip, &tar.into_inner().unwrap()).unwrap();
         let archive = gzip.finish().unwrap();
-        let sums = format!("{:x}  {stem}.tar.gz\n", sha2::Sha256::digest(&archive)).into_bytes();
-        struct Seed {
-            sums: Vec<u8>,
-            archive: Vec<u8>,
-        }
-        impl ReleaseTransport for Seed {
-            fn fetch(
-                &self,
-                url: &str,
-                _: FetchLimits,
-                _: &Cancel,
-                _: &dyn BringUpObserver,
-            ) -> Result<Vec<u8>, FetchError> {
-                Ok(if url.ends_with("SHA256SUMS") {
-                    self.sums.clone()
-                } else {
-                    self.archive.clone()
-                })
-            }
-        }
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        crate::releases::GitHubImages::with_transport(
+        crate::releases::GitHubImages::fixture(
             root.path().into(),
-            Arc::new(Seed { sums, archive }),
+            crate::releases::test_support::Fake::new(archive),
         )
         .load(
             &request,
@@ -802,7 +922,7 @@ while True:
                 fetch(builder, &self.url, limits, cancel, observer)
             }
         }
-        crate::releases::GitHubImages::with_transport(
+        crate::releases::GitHubImages::fixture(
             root.into(),
             Arc::new(Endpoint {
                 url: format!("https://localhost:{}/headers", server.port),

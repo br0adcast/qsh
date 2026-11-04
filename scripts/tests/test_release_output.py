@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import tomllib
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -157,6 +158,11 @@ class ReleaseOutputTests(unittest.TestCase):
                     tar.addfile(info)
                 else:
                     tar.add(str(directory / program), arcname=stage + '/' + program)
+            for document in output.DOCUMENTS:
+                data = (ROOT / 'docs/licenses' / output.NOTICES[document]).read_bytes() if document in output.NOTICES else b'inert document'
+                (directory / document).write_bytes(data)
+                info = tarfile.TarInfo(stage + '/' + document); info.size = len(data); info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
             if directory_alias:
                 info = tarfile.TarInfo(stage + '/alias')
                 info.type = tarfile.SYMTYPE
@@ -204,6 +210,7 @@ class ReleaseOutputTests(unittest.TestCase):
     def test_actual_debian_metadata_and_extracted_client_version(self):
         payload = self.root / 'payload'
         (payload / 'DEBIAN').mkdir(parents=True)
+        (payload / 'DEBIAN').chmod(0o755)
         (payload / 'usr/bin').mkdir(parents=True)
         path = self.root / 'qsh_0.5.0-1_amd64.deb'
         for metadata_version, binary_version, accepted in [
@@ -548,6 +555,127 @@ class DarwinMetadataTests(unittest.TestCase):
             upload_lines.append(line.strip())
         self.assertIn('retention-days: 7',upload_lines)
         self.assertIn('path: ${{ runner.temp }}/darwin-producer-evidence/*.json',upload_lines)
+
+
+CLIENT_NOTICES = {'LICENSE-AWS-LC-RS.txt': 'aws-lc-rs.txt', 'LICENSE-AWS-LC.txt': 'aws-lc.txt'}
+
+
+def notice_checker():
+    spec = importlib.util.spec_from_file_location('release_notice_output', ROOT / 'scripts/check-release-output.py')
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+class ReleaseNoticeTests(unittest.TestCase):
+    def test_archive_notice_validation_has_no_new_repository_resource_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive, inputs = self.archive(Path(directory))
+            value = notice_checker()
+            with mock.patch.object(value, 'check_binary'), mock.patch.object(Path, 'read_bytes',
+                    side_effect=AssertionError('isolated checker has no repository notice files')):
+                value.check_archive(archive, inputs, '0.5.0', 'fixture-target')
+
+    @unittest.skipUnless(shutil.which('cargo-deb') and shutil.which('dpkg-deb'),
+                         'native Debian packaging fixture tools unavailable')
+    def test_generated_client_deb_contains_exact_maintained_notices(self):
+        # Use the actual client metadata with an inert file, never a Rust build
+        # or executable. The small wrapper has no dependencies or build script.
+        with tempfile.TemporaryDirectory(prefix='qsh-notice-package-') as directory:
+            root = Path(directory)
+            (root / 'src').mkdir()
+            (root / 'src/main.rs').write_text('fn main() {}\n')
+            binary = root / 'inert-client'
+            binary.write_bytes(b'controlled non-executable client package fixture\0')
+            manifest = (ROOT / 'cli/Cargo.toml').read_text()
+            section = manifest.split('[package.metadata.deb]', 1)[1].split('[package.metadata.deb.variants.qshd]', 1)[0]
+            section = section.replace('"target/release/qsh"', json.dumps(str(binary)))
+            metadata = tomllib.loads(manifest)['package']['metadata']['deb']
+            for source in [asset[0] for asset in metadata['assets']] + [metadata['license-file'][0]]:
+                if source.startswith('../'):
+                    section = section.replace(json.dumps(source), json.dumps(str((ROOT / 'cli' / source).resolve())))
+            (root / 'Cargo.toml').write_text('[package]\nname="qsh"\nversion="0.5.0"\nedition="2021"\nlicense="AGPL-3.0-only"\n[package.metadata.deb]\n' + section)
+            package = root / 'qsh_0.5.0-1_fixture.deb'
+            result = subprocess.run(['cargo', 'deb', '--manifest-path', str(root / 'Cargo.toml'),
+                                     '--no-build', '--no-strip', '--no-dbgsym', '--offline',
+                                     '--output', str(package)], cwd=root, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr.decode()[-1500:])
+            header = subprocess.run(['dpkg-deb', '-f', str(package), 'Package', 'Version', 'Architecture'],
+                                    capture_output=True, check=True, timeout=10).stdout.decode()
+            self.assertIn('Package: qsh\n', header)
+            self.assertIn('Version: 0.5.0-1\n', header)
+            self.assertRegex(header, r'Architecture: (?:amd64|arm64)\n')
+            payload = subprocess.run(['dpkg-deb', '--fsys-tarfile', str(package)], capture_output=True,
+                                     check=True, timeout=10).stdout
+            self.assertLess(len(payload), 4 * 1024**2)
+            with tarfile.open(fileobj=io.BytesIO(payload), mode='r:') as data:
+                for filename, source in CLIENT_NOTICES.items():
+                    members = [m for m in data.getmembers() if m.name.removeprefix('./') == 'usr/share/doc/qsh/' + filename]
+                    self.assertEqual(len(members), 1)
+                    self.assertEqual((members[0].mode, members[0].uid, members[0].gid), (0o644, 0, 0))
+                    self.assertEqual(data.extractfile(members[0]).read(), (ROOT / 'docs/licenses' / source).read_bytes())
+
+    def test_pinned_archive_notice_digests_match_maintained_files(self):
+        value = notice_checker()
+        self.assertEqual(set(value.NOTICE_SHA256), set(value.NOTICES))
+        for filename, source in value.NOTICES.items():
+            self.assertEqual(value.NOTICE_SHA256[filename], hashlib.sha256((ROOT / 'docs/licenses' / source).read_bytes()).hexdigest())
+
+    def test_both_notices_are_client_only_deb_and_rpm_assets(self):
+        package = tomllib.loads((ROOT / 'cli/Cargo.toml').read_text())['package']['metadata']
+        for filename, source in CLIENT_NOTICES.items():
+            self.assertIn(['../docs/licenses/' + source, 'usr/share/doc/qsh/' + filename, '644'], package['deb']['assets'])
+            self.assertIn({'source': '../docs/licenses/' + source, 'dest': '/usr/share/doc/qsh/' + filename,
+                           'mode': '644', 'doc': True}, package['generate-rpm']['assets'])
+            for fmt in ('deb', 'generate-rpm'):
+                self.assertNotIn(source, str(package[fmt]['variants']['qshd']['assets']))
+
+    def archive(self, root, *, omit=None, alter=None, extra=None):
+        stage = 'qsh-0.5.0-fixture-target'
+        inputs = root / 'inputs'; inputs.mkdir()
+        entries = {'qsh': b'inert client', 'qshd': b'inert server',
+                   'README.md': b'inert readme', 'LICENSE': b'inert license', 'CHANGELOG.md': b'inert changes'}
+        for filename, source in dict({'LICENSE-OPENSSL.txt': 'openssl.txt'}, **CLIENT_NOTICES).items():
+            entries[filename] = (ROOT / 'docs/licenses' / source).read_bytes()
+        if alter is not None: entries[alter] += b'altered notice'
+        if extra is not None: entries[extra] = b'unexpected bytes'
+        archive = root / (stage + '.tar.gz')
+        with tarfile.open(archive, 'w:gz', format=tarfile.USTAR_FORMAT) as out:
+            directory = tarfile.TarInfo(stage); directory.type = tarfile.DIRTYPE; out.addfile(directory)
+            for name, raw in entries.items():
+                (inputs / name).write_bytes(raw)
+                if name == omit: continue
+                info = tarfile.TarInfo(stage + '/' + name); info.size = len(raw)
+                info.mode = 0o755 if name in ('qsh', 'qshd') else 0o644
+                out.addfile(info, io.BytesIO(raw))
+        return archive, inputs
+
+    def test_current_notices_in_archive_are_exact_source_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive, inputs = self.archive(Path(directory))
+            value = notice_checker()
+            with mock.patch.object(value, 'check_binary'):
+                value.check_archive(archive, inputs, '0.5.0', 'fixture-target')
+            with tarfile.open(archive) as data:
+                for filename, source in CLIENT_NOTICES.items():
+                    self.assertEqual(data.extractfile('qsh-0.5.0-fixture-target/' + filename).read(),
+                                     (ROOT / 'docs/licenses' / source).read_bytes())
+
+    def test_missing_or_altered_crypto_notice_is_refused(self):
+        for filename in CLIENT_NOTICES:
+            for option in ('omit', 'alter'):
+                with self.subTest(filename=filename, option=option), tempfile.TemporaryDirectory() as directory:
+                    archive, inputs = self.archive(Path(directory), **{option: filename})
+                    value = notice_checker()
+                    with mock.patch.object(value, 'check_binary'), self.assertRaises(ValueError):
+                        value.check_archive(archive, inputs, '0.5.0', 'fixture-target')
+
+    def test_notice_inventory_does_not_admit_extra_archive_members(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive, inputs = self.archive(Path(directory), extra='LICENSE-UNREVIEWED.txt')
+            value = notice_checker()
+            with mock.patch.object(value, 'check_binary'), self.assertRaises(ValueError):
+                value.check_archive(archive, inputs, '0.5.0', 'fixture-target')
 
 
 if __name__ == '__main__':

@@ -99,7 +99,9 @@ impl ReleaseTransport for Fake {
     }
 }
 
-/// Seeds the production cache with a real daemon, without contacting a release server.
+/// Seeds legacy unsigned cache bait with a real local daemon.
+/// It has no authenticated manifest or bundle and must be refused by production
+/// image loading; background/recovery controls retain it to prove it is unused.
 #[allow(dead_code)] // Shared with release-only targets that do not install a real daemon.
 pub fn seed_release_cache(
     root: &std::path::Path,

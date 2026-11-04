@@ -64,12 +64,92 @@ class ReportTests(unittest.TestCase):
 
     def test_cache_authority_privilege_exclusion_has_exact_owner_and_identity(self):
         expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
-        key = ("qsh::release_cache_authority_privilege", "release_cache_root_readonly_and_foreign_owner_boundaries")
-        self.assertEqual(expected[key]["owner"], "CI container job: run_suite test release_cache_authority_privilege")
-        self.assertEqual([entry for entry in expected if "release_cache_authority" in entry[0]], [key])
+        name = "releases::cache::privilege_tests::release_cache_root_readonly_and_foreign_owner_boundaries"
+        key = ("qsh", name)
+        self.assertEqual(expected[key]["owner"], "CI container job: exact qsh library cache privilege fixture")
+        self.assertEqual([entry for entry in expected if entry[1] == name], [key])
         expression = self.module.exclusion_filter({key: expected[key]})
-        self.assertIn("binary_id(=qsh::release_cache_authority_privilege)", expression)
-        self.assertIn("test(=release_cache_root_readonly_and_foreign_owner_boundaries)", expression)
+        self.assertIn("binary_id(=qsh)", expression)
+        self.assertIn(f"test(={name})", expression)
+        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
+        self.assertIn('run_qsh_cache_privilege', workflow)
+        self.assertIn(f'--exact "$cache_privilege"', workflow)
+        self.assertIn(f'cache_privilege={name}', workflow)
+        self.assertIn('--check-exact-libtest', workflow)
+        self.assertIn('--require-exact-test', workflow)
+
+    def test_private_install_fixture_cases_have_explicit_linux_owner_and_counts(self):
+        spec = importlib.util.spec_from_file_location("nextest_runner", SCRIPTS / "run-nextest-ci.py")
+        runner = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            spec.loader.exec_module(runner)
+        finally:
+            sys.path.pop(0)
+        root = ET.Element("testsuites")
+        suite = ET.SubElement(root, "testsuite", name="qsh")
+        for name in runner.INSTALL_FIXTURES:
+            ET.SubElement(suite, "testcase", name=name)
+        ET.ElementTree(root).write(self.report)
+        self.assertEqual(runner.require_install_fixtures(self.report), 4)
+        removed = list(suite)[0]
+        suite.remove(removed)
+        ET.ElementTree(root).write(self.report)
+        with self.assertRaisesRegex(ValueError, "required Linux CLI fixture"):
+            runner.require_install_fixtures(self.report)
+        suite.append(removed)
+        ET.SubElement(removed, "skipped")
+        ET.ElementTree(root).write(self.report)
+        with self.assertRaisesRegex(ValueError, "required Linux CLI fixture"):
+            runner.require_install_fixtures(self.report)
+        config = (SCRIPTS.parent / '.config/nextest.toml').read_text()
+        self.assertIn('test(/install_fixture_tests::/)', config)
+        workflow = (SCRIPTS.parent / '.github/workflows/ci.yml').read_text()
+        self.assertIn('--require-install-fixtures --', workflow)
+        self.assertIn('--daemon-artifacts', workflow)
+
+
+    def test_focused_exact_library_gate_requires_one_named_success_without_runtime_skip(self):
+        spec = importlib.util.spec_from_file_location("nextest_runner", SCRIPTS / "run-nextest-ci.py")
+        runner = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            spec.loader.exec_module(runner)
+        finally:
+            sys.path.pop(0)
+        name = "releases::cache::privilege_tests::release_cache_root_readonly_and_foreign_owner_boundaries"
+        good = f"running 1 test\ntest {name} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 779 filtered out; finished in 0.1s\n"
+        self.report.write_text(good)
+        runner.check_exact_libtest(self.report, name)
+        for changed in (good.replace(name, "wrong"), good.replace("1 passed", "0 passed"),
+                        good.replace("0 ignored", "1 ignored"), good + "SKIPPED\n",
+                        good.replace("running 1 test", "running 0 tests"), good + good):
+            self.report.write_text(changed)
+            with self.assertRaises(ValueError):
+                runner.check_exact_libtest(self.report, name)
+
+    def test_daemon_artifact_uses_exact_cargo_record_and_refuses_test_or_foreign_targets(self):
+        spec = importlib.util.spec_from_file_location("nextest_runner", SCRIPTS / "run-nextest-ci.py")
+        runner = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            spec.loader.exec_module(runner)
+        finally:
+            sys.path.pop(0)
+        artifact = {"reason": "compiler-artifact",
+                    "manifest_path": str(SCRIPTS.parent / "qshd/Cargo.toml"),
+                    "target": {"name": "qshd", "kind": ["bin"]},
+                    "profile": {"test": False}, "executable": sys.executable}
+        records = self.report.with_suffix(".json")
+        records.write_text(json.dumps(artifact) + "\n")
+        self.assertEqual(runner.daemon_artifact(records), Path(sys.executable))
+        for field, value in (("profile", {"test": True}),
+                             ("manifest_path", str(SCRIPTS.parent / "cli/Cargo.toml")),
+                             ("target", {"name": "qshd", "kind": ["lib"]})):
+            changed = dict(artifact); changed[field] = value
+            records.write_text(json.dumps(changed) + "\n")
+            with self.assertRaisesRegex(ValueError, "expected one exact qshd"):
+                runner.daemon_artifact(records)
 
     def test_ssh_host_authority_exclusion_has_one_exact_root_owner(self):
         expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")

@@ -28,6 +28,30 @@ use crate::prompt::Tty;
 use crate::recovery::Recovery;
 use crate::session::UiEvent;
 use crate::ssh_step::{SshStep, SshStepError};
+
+// Each fixture child sets its provider once before starting any CLI workers.
+// This state and setter do not exist in production builds.
+#[cfg(all(test, target_os = "linux"))]
+static TEST_IMAGES: std::sync::OnceLock<Arc<dyn bringup::ImageSource>> = std::sync::OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn set_test_images(images: Arc<dyn bringup::ImageSource>) {
+    assert!(
+        TEST_IMAGES.set(images).is_ok(),
+        "fixture image provider already set"
+    );
+}
+
+fn daemon_images() -> Arc<dyn bringup::ImageSource> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(images) = TEST_IMAGES.get() {
+        return Arc::clone(images);
+    }
+    Arc::new(crate::releases::GitHubImages::new(
+        crate::paths::cache_dir().ok(),
+    ))
+}
+
 use crate::{keys, log, report, status, trust};
 
 #[path = "climb_recovery.rs"]
@@ -390,9 +414,7 @@ impl Setup {
             tty: &self.tty,
             background,
             install_policy,
-            images: Arc::new(crate::releases::GitHubImages::new(
-                crate::paths::cache_dir().ok(),
-            )),
+            images: daemon_images(),
         }
     }
 

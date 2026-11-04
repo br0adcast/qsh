@@ -107,3 +107,21 @@ one waiting publication per tag: a newer one replaces an older waiting one.
 
 `v0.5.0` was published before this signing existed. Its release is refused
 rather than signed after the fact, and its tag and assets are left as they are.
+
+
+## Enforcing clients and packaged notices
+
+Automatic loaders require the signed manifest/bundle for the exact version;
+[release authentication](release-security.md) describes outage, cache and legacy
+compatibility rules. Before distributing an enforcing client, the next separately
+authorized tag must pass production verification of its own signed evidence before
+upload. Do not publish a checksum-only exception for v0.5.0 or replace its assets.
+
+Combined client/daemon archives and client DEB/RPM packages must retain the exact
+`LICENSE-AWS-LC-RS.txt` and `LICENSE-AWS-LC.txt` notices, in addition to existing
+notices. Server-only packages do not gain the client's AWS-LC edge. Archive checks
+require the fixed document inventory and original maintained notice bytes; this
+does not change the twelve-product allowlist or fourteen-asset publication set.
+Qualify the actual qsh client on all four shipping targets, including native
+linkage, complete artifact path scanning and notice layout. A successful verifier
+example alone is only a prerequisite for those product checks.

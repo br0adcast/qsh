@@ -127,6 +127,8 @@ jobs:
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
             cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
+            cp docs/licenses/aws-lc-rs.txt "$stage/LICENSE-AWS-LC-RS.txt"
+            cp docs/licenses/aws-lc.txt "$stage/LICENSE-AWS-LC.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
             # Probes both actual stripped inputs, then checks archived bytes.
             python3 scripts/check-release-output.py archive --version "$VERSION" \
@@ -254,6 +256,8 @@ jobs:
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
             cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
+            cp docs/licenses/aws-lc-rs.txt "$stage/LICENSE-AWS-LC-RS.txt"
+            cp docs/licenses/aws-lc.txt "$stage/LICENSE-AWS-LC.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
             # Probes both actual stripped inputs, then checks archived bytes.
             scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')

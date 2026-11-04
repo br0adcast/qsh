@@ -23,6 +23,18 @@ _spec = importlib.util.spec_from_file_location(
 _version = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_version)
 LIMIT = 8192
+DOCUMENT_LIMIT = 4 * 1024**2
+# These combined client/daemon archives redistribute the client's AWS-LC edge.
+# The server-only DEB/RPM payload remains a separate package role.
+NOTICES = {'LICENSE-OPENSSL.txt': 'openssl.txt',
+           'LICENSE-AWS-LC-RS.txt': 'aws-lc-rs.txt', 'LICENSE-AWS-LC.txt': 'aws-lc.txt'}
+# Pinned to the maintained notice bytes; isolated tools need no source-tree data.
+NOTICE_SHA256 = {
+    'LICENSE-OPENSSL.txt': '7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a',
+    'LICENSE-AWS-LC-RS.txt': 'b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7',
+    'LICENSE-AWS-LC.txt': '728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e',
+}
+DOCUMENTS = ('README.md', 'LICENSE', 'CHANGELOG.md', *NOTICES)
 
 
 def parse_version(data, program, expected=None):
@@ -402,6 +414,17 @@ def check_archive(path, inputs, version, target, *, darwin_metadata=None, native
                     or name in names or (name == root and not member.isdir())):
                 raise ValueError('archive member paths are not canonical and unique')
             names.add(name)
+        expected = {root + '/' + leaf for leaf in ('qsh', 'qshd') + DOCUMENTS}
+        if not expected <= names or names - expected - {root}:
+            raise ValueError('archive members differ from the fixed product/document inventory')
+        for document in DOCUMENTS:
+            member = archive.getmember(root + '/' + document)
+            if not member.isfile() or member.size > DOCUMENT_LIMIT:
+                raise ValueError('archive document is not a bounded regular file')
+            if document in NOTICES:
+                with archive.extractfile(member) as stream:
+                    if digest(stream).hex() != NOTICE_SHA256[document]:
+                        raise ValueError('archive notice differs from the maintained source bytes')
         for program in ('qsh', 'qshd'):
             matches = [member for member in members if member.name == root + '/' + program]
             if len(matches) != 1 or not matches[0].isfile():

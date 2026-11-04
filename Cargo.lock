@@ -2290,6 +2290,7 @@ dependencies = [
  "qshd",
  "rand 0.8.7",
  "rand_core 0.6.4",
+ "release-auth",
  "render",
  "reqwest",
  "russh",
