@@ -104,8 +104,6 @@ mod tests;
 mod native;
 #[cfg(target_os = "macos")]
 pub(crate) use native::own_child;
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use native::prepare;
 
 #[cfg(target_os = "macos")]
 pub(crate) type PreparedPersonalOwner =

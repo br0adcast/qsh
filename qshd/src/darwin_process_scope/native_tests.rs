@@ -4642,6 +4642,7 @@ impl DirectDaemonGuard {
         assert_eq!(daemon_status(&self.socket).unwrap().pid, status.pid);
         self.identity = Some(identity);
     }
+    #[cfg(feature = "test-darwin-keeper")]
     fn stop_normally(&mut self) {
         self.stop_normally_tagged(None);
     }
@@ -5147,6 +5148,7 @@ fn fixture_tool(program: &str, args: &[&std::ffi::OsStr]) {
     .expect("bounded fixture transform");
     assert!(output.status.success(), "required fixture transform failed");
 }
+#[cfg(feature = "test-darwin-keeper")]
 fn actual_connect(
     port: u16,
     server_pub: [u8; 32],

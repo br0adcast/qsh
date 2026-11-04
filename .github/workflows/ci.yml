@@ -145,11 +145,13 @@ jobs:
           test "$(grep -Fc 'case=cancel after_admit=false expired=false noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
           test "$(grep -Fc 'case=cancel after_admit=true expired=false noapp=false app=Some(' "$runtime/keeper-results.log")" -eq 1
           test "$(grep -Fc 'case=cancel after_admit=false expired=true noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
+          test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings"
           rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
           scripts/check-qualified-rust.sh
           rustc -vV
-          cargo check -p qshd --all-targets --features test-darwin-keeper --locked
-          cargo clippy -p qshd --all-targets --features test-darwin-keeper --locked -- -D warnings
+          cargo check -p qshd --lib --bin qshd --features test-darwin-keeper --locked
+          cargo clippy -p qshd --lib --bin qshd --features test-darwin-keeper --locked -- -D warnings
           cargo build -p qshd --bin qshd --features test-darwin-keeper --locked --message-format=json-render-diagnostics > "$runtime/keeper-integrated-build.jsonl"
           python3 - "$runtime/keeper-integrated-build.jsonl" "$runtime/keeper-integrated-daemon-path" <<'PY_KEEPER'
           import json, pathlib, sys

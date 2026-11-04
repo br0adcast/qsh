@@ -640,7 +640,7 @@ mod native_fixture {
         file.write_all(bytes)
     }
     fn read_gate(path: &Path) -> io::Result<Vec<u8>> {
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
