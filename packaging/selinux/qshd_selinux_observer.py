@@ -246,7 +246,7 @@ def _compose(trust,pam,*,deadline):
     bindings=RuntimeBindings();pending=False
     with _within(bindings.retained(deadline=deadline),deadline) as labels:
         with _within(bindings.slot_object().inspection(),deadline) as slot:
-            with _within(bindings.registry(),deadline) as registry:
+            with _within(bindings.registry(deadline=deadline),deadline) as registry:
                 routing=registry.routing()
                 identities=json.loads(routing,object_pairs_hook=_pairs)
                 with _within(bindings.context_inspection(list(identities),identities),deadline) as contexts:
@@ -437,7 +437,7 @@ def _compose_policy_context(trust,*,deadline):
     bindings=RuntimeBindings();pending=False
     with _within(bindings.retained(deadline=deadline),deadline) as labels:
         with _within(bindings.slot_object().inspection(),deadline) as slot:
-            with _within(bindings.registry(),deadline) as registry:
+            with _within(bindings.registry(deadline=deadline),deadline) as registry:
                 routing=registry.routing()
                 identities=json.loads(routing,object_pairs_hook=_pairs)
                 with _within(bindings.context_inspection(list(identities),identities),deadline) as contexts:

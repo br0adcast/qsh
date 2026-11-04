@@ -166,7 +166,7 @@ class _Coordinator(_PairCoordinator):
                 completion=record.basis.completion
             else:completion=record.completion
             b=self._bindings
-            with b.registry() as registry:
+            with b.registry(deadline=self._end) as registry:
                 routing,identities=self._routing(registry);self._check(140)
                 with b.context_inspection(sorted(identities),identities) as contexts:
                     with b.retained(deadline=self._end) as retained:

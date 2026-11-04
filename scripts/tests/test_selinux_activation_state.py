@@ -51,6 +51,210 @@ class SlotTests(unittest.TestCase):
         return writer.publish_complete(data or encoded('COMPLETE'),token,
             trusted_artifact=kwargs.get('artifact',TRUST),trusted_context_binding=kwargs.get('binding',BINDING))
 
+    def erase_pending(self,writer):
+        pending=document()
+        pending['intent']='provider-erase'
+        old=document('COMPLETE')
+        pending['basis']={key:old[key] for key in ('artifact','completion')}
+        return writer.begin_pending(json.dumps(pending).encode(),writer.capture_current())
+
+    def test_exact_erase_pending_retires_only_document_and_keeps_lock(self):
+        lock=self.directory/'lock';identity=(lock.stat().st_dev,lock.stat().st_ino)
+        with self.slot().writer() as writer:
+            token=self.erase_pending(writer)
+            self.assertTrue(callable(getattr(writer,'retire_erased',None)),
+                            'missing exact same-writer provider-erase retirement')
+            absent=writer.retire_erased(token)
+            self.assertEqual(absent,state.SlotObservation(None,None,None))
+            self.assertFalse(self.path.exists())
+            self.assertEqual((lock.stat().st_dev,lock.stat().st_ino),identity)
+            self.assertEqual(sorted(p.name for p in self.directory.iterdir()),['lock'])
+        with self.slot().inspection() as reader:
+            observed=reader.capture();self.assertEqual(observed,absent);reader.recheck(observed)
+
+    def test_retirement_wrong_copy_foreign_reused_and_closed_tokens_are_consumed(self):
+        for kind in ('copy','foreign','old-lease','complete','other-intent'):
+            with self.subTest(kind=kind):
+                self.write(encoded('COMPLETE','a'*32))
+                if kind=='old-lease':
+                    with self.slot().writer() as old_writer:old_token=self.erase_pending(old_writer)
+                with self.slot().writer() as writer:
+                    if kind=='old-lease':
+                        pending=document();pending['operation_id']='c'*32;pending['intent']='provider-erase'
+                        pending['basis']={key:document('COMPLETE')[key] for key in ('artifact','completion')}
+                        token=writer.begin_pending(json.dumps(pending).encode(),writer.capture_current())
+                    else:token=self.erase_pending(writer)
+                    supplied=replace(token) if kind=='copy' else object() if kind=='foreign' else old_token if kind=='old-lease' else token
+                    if kind=='complete':
+                        complete=document('COMPLETE');complete['intent']='provider-erase'
+                        self.complete(writer,token,json.dumps(complete).encode())
+                    elif kind=='other-intent':
+                        # The exact token must still carry its issued validated record.
+                        object.__setattr__(token,'observation',replace(token.observation,record=replace(token.observation.record,intent='consumer-erase')))
+                    before=self.path.read_bytes()
+                    with patch.object(state.os,'unlink',side_effect=AssertionError('unlink before admission')):
+                        with self.assertRaises(state.SlotError) as caught:writer.retire_erased(supplied)
+                    self.assertNotIsInstance(caught.exception,state.OutcomeUncertain)
+                    self.assertEqual(self.path.read_bytes(),before)
+                    for attempt in (lambda:writer.retire_erased(token),lambda:writer.capture_current(),
+                                    lambda:writer.begin_pending(encoded(),writer._initial),lambda:self.complete(writer,token)):
+                        with self.assertRaises(state.SlotError):attempt()
+                with self.assertRaises(state.SlotError):writer.retire_erased(token)
+
+    def test_retirement_other_intents_and_mismatched_basis_preserve_pending(self):
+        for intent in ('provider-fresh','provider-refresh','consumer-install','consumer-erase','provider-erase'):
+            with self.subTest(intent=intent):
+                self.write(encoded('COMPLETE','a'*32));pending=document();pending['intent']=intent
+                if intent!='provider-fresh':
+                    old=document('COMPLETE')
+                    if intent=='provider-erase':old['artifact']['manifest_sha256']='8'*64
+                    pending['basis']={key:old[key] for key in ('artifact','completion')}
+                with self.slot().writer() as writer:
+                    token=writer.begin_pending(json.dumps(pending).encode(),writer.capture_current())
+                    before=self.path.read_bytes()
+                    with self.assertRaises(state.SlotError) as caught:writer.retire_erased(token)
+                    self.assertNotIsInstance(caught.exception,state.OutcomeUncertain)
+                    self.assertEqual(self.path.read_bytes(),before)
+
+    def test_retirement_requires_no_stages_or_unknown_entries_and_rechecks_entry_races(self):
+        for change in ('unknown','owned-stage','late-entry','document','inode','lock'):
+            with self.subTest(change=change):
+                self.write(encoded('COMPLETE','a'*32));enabled=[False];unknown=self.directory/'.qshd-unknown'
+                if unknown.exists():unknown.unlink()
+                def hook(event):
+                    if enabled[0] and event=='before_slot_unlink':
+                        if change=='late-entry':unknown.write_bytes(b'foreign')
+                        elif change=='document':self.path.write_bytes(self.path.read_bytes()+b' ')
+                        elif change=='inode':
+                            data=self.path.read_bytes();self.path.unlink();self.write(data)
+                        elif change=='lock':
+                            lock=self.directory/'lock';lock.unlink();lock.write_bytes(b'');lock.chmod(0o600)
+                slot=self.slot(hook)
+                with self.assertRaises(state.SlotError) as caught:
+                    with slot.writer() as writer:
+                        token=self.erase_pending(writer);before=self.path.read_bytes()
+                        if change=='unknown':unknown.write_bytes(b'foreign')
+                        if change=='owned-stage':
+                            stage=slot._create(slot.state_fd,b'owned stage',None,state=True)
+                            slot._stages[stage['name']]=stage
+                        enabled[0]=True
+                        writer.retire_erased(token)
+                self.assertNotIsInstance(caught.exception,state.OutcomeUncertain)
+                self.assertTrue(self.path.exists())
+                if change!='document':self.assertEqual(self.path.read_bytes(),before)
+                if change in ('unknown','late-entry'):self.assertEqual(unknown.read_bytes(),b'foreign')
+                if unknown.exists():unknown.unlink()
+
+    def test_retirement_rechecks_the_real_directory_route_before_unlink(self):
+        moved=self.root/'moved';enabled=[False]
+        def hook(event):
+            if enabled[0] and event=='before_slot_unlink':self.directory.rename(moved)
+        with self.assertRaises(state.SlotError) as caught:
+            with self.slot(hook).writer() as writer:
+                token=self.erase_pending(writer);before=self.path.read_bytes();enabled[0]=True
+                writer.retire_erased(token)
+        self.assertNotIsInstance(caught.exception,state.OutcomeUncertain)
+        self.assertEqual((moved/'activation.json').read_bytes(),before)
+        self.assertFalse(self.directory.exists())
+
+    def test_retirement_hook_faults_distinguish_before_and_after_actual_unlink(self):
+        for event in ('before_slot_unlink','slot_unlink','slot_retire_directory_sync','slot_retire_readback'):
+            with self.subTest(event=event):
+                self.write(encoded('COMPLETE','a'*32));enabled=[False]
+                def hook(current):
+                    if enabled[0] and current==event:raise OSError(errno.EIO,'private fixture path')
+                with self.slot(hook).writer() as writer:
+                    token=self.erase_pending(writer);before=self.path.read_bytes();enabled[0]=True
+                    expected=state.SlotError if event=='before_slot_unlink' else state.OutcomeUncertain
+                    with self.assertRaises(expected) as caught:writer.retire_erased(token)
+                    self.assertNotIn('private',str(caught.exception));enabled[0]=False
+                    outcome=writer.observe_outcome()
+                    if event=='before_slot_unlink':
+                        self.assertNotIsInstance(caught.exception,state.OutcomeUncertain)
+                        self.assertEqual(outcome.document,before)
+                    else:self.assertEqual(outcome,state.SlotObservation(None,None,None))
+                    with self.assertRaises(state.SlotError):writer.retire_erased(token)
+
+    def test_real_unlink_rejection_lost_ack_and_directory_sync_are_uncertain(self):
+        for failure in ('reject','lost-ack','fsync'):
+            with self.subTest(failure=failure):
+                self.write(encoded('COMPLETE','a'*32));slot=self.slot()
+                with slot.writer() as writer:
+                    token=self.erase_pending(writer);before=self.path.read_bytes()
+                    unlink,sync=os.unlink,os.fsync;attempts=[]
+                    def remove(name,**kwargs):
+                        self.assertEqual(name,'activation.json');self.assertEqual(kwargs,dict(dir_fd=slot.state_fd));attempts.append(name)
+                        if failure=='reject':raise OSError(errno.EIO,'private unlink')
+                        unlink(name,**kwargs)
+                        if failure=='lost-ack':raise OSError(errno.EIO,'private lost acknowledgment')
+                    def fsync(fd):
+                        self.assertEqual(fd,slot.state_fd)
+                        raise OSError(errno.EIO,'private directory sync')
+                    with patch.object(state.os,'unlink',side_effect=remove),patch.object(state.os,'fsync',side_effect=fsync if failure=='fsync' else sync), \
+                            patch.object(slot,'_create',side_effect=AssertionError('recreated state')):
+                        with self.assertRaises(state.OutcomeUncertain):writer.retire_erased(token)
+                    self.assertEqual(attempts,['activation.json'])
+                    outcome=writer.observe_outcome()
+                    self.assertEqual(outcome.document,before if failure=='reject' else None)
+
+    def test_retirement_actual_double_read_absence_and_late_reappearance(self):
+        slot=self.slot()
+        with slot.writer() as writer:
+            token=self.erase_pending(writer)
+            with patch.object(slot,'_once',wraps=slot._once) as reads:writer.retire_erased(token)
+            self.assertEqual(reads.call_count,8)
+        enabled=[False];injected=encoded('PENDING','a'*32)
+        def hook(event):
+            if enabled[0] and event=='observation_read' and not self.path.exists():self.write(injected)
+        with self.slot(hook).writer() as writer:
+            token=self.erase_pending(writer);enabled[0]=True
+            with self.assertRaises(state.OutcomeUncertain):writer.retire_erased(token)
+            self.assertEqual(self.path.read_bytes(),injected)
+
+    def test_retirement_unknown_entry_after_unlink_is_preserved_but_uncertain(self):
+        unknown=self.directory/'.qshd-foreign';enabled=[False]
+        def hook(event):
+            if enabled[0] and event=='slot_unlink':unknown.write_bytes(b'preserve')
+        with self.slot(hook).writer() as writer:
+            token=self.erase_pending(writer);enabled[0]=True
+            with self.assertRaises(state.OutcomeUncertain):writer.retire_erased(token)
+        self.assertFalse(self.path.exists());self.assertEqual(unknown.read_bytes(),b'preserve')
+
+    def test_retirement_success_still_requires_normal_writer_validation_and_fd_close(self):
+        for failure in ('validation','close','caller'):
+            with self.subTest(failure=failure):
+                slot=self.slot();enabled=[False];target=[None];closed=[]
+                validate,close=slot._validate,os.close
+                def validation():
+                    validate()
+                    if enabled[0] and failure=='validation':raise OSError(errno.EIO,'private final validation')
+                def closing(fd):
+                    close(fd)
+                    if enabled[0] and fd==target[0]:
+                        closed.append(fd)
+                        if failure=='close':raise OSError(errno.EIO,'private close acknowledgment')
+                with self.assertRaises(state.OutcomeUncertain) as caught:
+                    with patch.object(slot,'_validate',side_effect=validation),patch.object(state.os,'close',side_effect=closing):
+                        with slot.writer() as writer:
+                            token=self.erase_pending(writer);target[0]=slot.lock_fd
+                            writer.retire_erased(token);enabled[0]=True
+                            if failure=='caller':raise RuntimeError('private caller failure')
+                self.assertFalse(self.path.exists());self.assertNotIn('private',str(caught.exception))
+                self.assertEqual(closed,[target[0]])
+
+    def test_retirement_success_consumes_writer_and_later_lease_can_issue_new_generation(self):
+        slot=self.slot()
+        with slot.writer() as writer:
+            token=self.erase_pending(writer);writer.retire_erased(token)
+            for attempt in (lambda:writer.retire_erased(token),lambda:writer.capture_current(),
+                            lambda:writer.begin_pending(encoded(),writer._initial),lambda:self.complete(writer,token)):
+                with self.assertRaises(state.SlotError):attempt()
+            self.assertFalse(self.path.exists())
+        with slot.writer() as next_writer:
+            initial=next_writer.capture_current();self.assertIsNone(initial.record)
+            fresh=next_writer.begin_pending(encoded(),initial)
+            self.assertEqual(fresh.observation.record.intent,'provider-fresh')
+
     def test_reader_absence_baseline_immutable_no_write_and_closed_use(self):
         before=set(os.listdir('/proc/self/fd'))
         mutations=('mkdir','write','rename','unlink','fsync','fchmod','fchown','setxattr','removexattr')

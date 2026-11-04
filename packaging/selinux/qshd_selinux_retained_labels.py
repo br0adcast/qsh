@@ -3,7 +3,7 @@
 Caller owns maintenance exclusion, policy removal and the original hard owner.
 Private contents are never read. Successful return requires normal scope exit.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import math
 import os
@@ -159,6 +159,7 @@ class _Inspection(SafeFiles):
         self._factory=factory;self._end=deadline;self._fds=[];self._parents={};self._objects={}
         self._state='open';self._observed=None;self._restored=None;self._expected=None
         self._attempted=False;self._post=None;self._post_api=None
+        self._erase_mode=None;self._pair_status=None;self._core_status=None;self._final_status=None
 
     def _check(self):
         if self._factory._clock()>=self._end:_fail()
@@ -277,9 +278,26 @@ class _Inspection(SafeFiles):
             if not isinstance(error,Exception):raise
             raise RetainedLabelError('RETAINED_LABEL_REFUSED') from None
 
-    def _old(self,*,initial=False):
-        api=self._factory._api_factory();self._check()
-        with api.status_observation():
+    def _borrowed_api(self,status):
+        from qshd_selinux_api import _StatusToken
+        if type(status) is not _StatusToken:_fail()
+        api=status.require_open();self._check();return api
+
+    def _erase_custody(self,status,*,pair=False):
+        if self._erase_mode=='borrowed':
+            if status is None or (pair and status is not self._pair_status):_fail()
+            return self._borrowed_api(status)
+        if self._erase_mode!='owning' or status is not None:_fail()
+
+    def _restoration_api(self):
+        self._check()
+        if self._erase_mode=='borrowed' and self._borrowed_api(self._core_status) is not self._post_api:_fail()
+        return self._post_api
+
+    def _old(self,*,initial=False,status=None):
+        api=self._factory._api_factory() if status is None else self._borrowed_api(status)
+        self._check()
+        with api.status_observation() if status is None else nullcontext():
             self._check()
             with api.file_defaults() as defaults:
                 paths,alias=self._sample(initial=initial,api=api)
@@ -287,19 +305,24 @@ class _Inspection(SafeFiles):
                     if item.present:
                         path,kind,role,managed=next(row for row in _ITEMS if row[0]==item.path)
                         if defaults.lookup(path,kind)!=managed:_fail()
+                        if status is not None:api.check_context(managed)
                         self._check()
             self._check()
+        if status is not None and self._borrowed_api(status) is not api:_fail()
         self._check();return RetainedLabelObservation(paths,alias)
 
-    def capture(self):
+    def capture(self,*,status=None):
         with self._errors():
-            self._operation('open');value=self._old(initial=True)
+            self._operation('open')
+            self._erase_mode='owning' if status is None else 'borrowed'
+            self._pair_status=status;self._erase_custody(status,pair=True)
+            value=self._old(initial=True,status=status)
             self._observed=value;self._expected=value;self._state='captured';return value
 
-    def recheck_before_removal(self,observation):
+    def recheck_before_removal(self,observation,*,status=None):
         with self._errors():
-            self._operation('captured',observation)
-            if self._old()!=observation:_fail()
+            self._operation('captured',observation);self._erase_custody(status,pair=True)
+            if self._old(status=status)!=observation:_fail()
             self._state='checked-before'
 
     def _targets(self,api,paths):
@@ -320,21 +343,29 @@ class _Inspection(SafeFiles):
                 and tuple(pair for pair in before[-1] if pair[0]!=_LABEL)
                 ==tuple(pair for pair in after[-1] if pair[0]!=_LABEL))
 
-    def restore_defaults(self,observation):
+    def restore_defaults(self,observation,*,status=None):
         with self._errors():
-            self._operation('checked-before',observation);self._state='restoring'
-            api=self._factory._api_factory();self._check();self._post_api=api
-            post=api.status_observation();post.__enter__();self._post=post;self._check()
-            paths,alias=self._sample()
+            self._operation('checked-before',observation);self._erase_custody(status)
+            self._state='restoring'
+            if self._erase_mode=='borrowed':
+                self._pair_status.require_closed()
+                if status is self._pair_status:_fail()
+                api=self._borrowed_api(status);self._core_status=status
+            else:
+                api=self._factory._api_factory();self._check()
+                post=api.status_observation();post.__enter__();self._post=post;self._check()
+            self._post_api=api
+            paths,alias=self._sample(api=api if self._erase_mode=='borrowed' else None)
             if RetainedLabelObservation(paths,alias)!=observation:_fail()
-            targets=self._targets(api,paths)
+            targets=self._targets(api,paths);self._restoration_api()
             current=observation
             active_targets={item.path:next(row[3] for row in _ITEMS if row[0]==item.path)
                             for item in paths if item.present}
             for index,item in enumerate(paths):
                 if not item.present:continue
-                if RetainedLabelObservation(*self._sample(targets=active_targets))!=current:_fail()
-                self._check();self._attempted=True
+                if RetainedLabelObservation(*self._sample(targets=active_targets,
+                        api=api if self._erase_mode=='borrowed' else None))!=current:_fail()
+                self._restoration_api();self._attempted=True
                 fd=self._objects[item.path]
                 self._factory._set(fd,_LABEL,targets[item.path].encode('ascii')+b'\0',os.XATTR_REPLACE)
                 self._check()
@@ -348,23 +379,50 @@ class _Inspection(SafeFiles):
                 new_item=RetainedPath(item.path,True,updated,raw)
                 current=RetainedLabelObservation(current.paths[:index]+(new_item,)+current.paths[index+1:],alias)
                 self._expected=current;active_targets[item.path]=targets[item.path]
-            self._check();result=RestoredLabelObservation(current.paths,alias,tuple(targets.items()))
+            self._restoration_api();result=RestoredLabelObservation(current.paths,alias,tuple(targets.items()))
             self._restored=result;self._expected=result;self._state='restored';return result
 
     def recheck_restored(self,restored):
         with self._errors():
             self._check()
             if self._state!='restored' or restored is not self._restored:_fail()
-            self._state='failed';targets=dict(restored.targets)
-            if self._targets(self._post_api,restored.paths)!=targets:_fail()
-            if self._sample(api=self._post_api,targets=targets)!=(restored.paths,restored.alias):_fail()
-            post=self._post;self._post=None;post.__exit__(None,None,None);self._check()
+            self._state='failed';targets=dict(restored.targets);api=self._restoration_api()
+            if self._targets(api,restored.paths)!=targets:_fail()
+            if self._sample(api=api,targets=targets)!=(restored.paths,restored.alias):_fail()
+            self._restoration_api()
+            if self._erase_mode=='owning':
+                post=self._post;self._post=None;post.__exit__(None,None,None);self._check()
             self._state='checked-after'
+
+    def _final_sample(self,status):
+        api=self._borrowed_api(status);restored=self._restored;targets=dict(restored.targets)
+        # Every call obtains a fresh current default handle after core removal.
+        if self._targets(api,restored.paths)!=targets:_fail()
+        if self._sample(api=api,targets=targets)!=(restored.paths,restored.alias):_fail()
+        if self._borrowed_api(status) is not api:_fail()
+
+    @contextmanager
+    def final_policy(self,restored,*,status):
+        view=None
+        with self._errors():
+            self._check()
+            if (self._erase_mode!='borrowed' or self._state!='checked-after'
+                    or restored is not self._restored):_fail()
+            self._core_status.require_closed()
+            if status is self._core_status or status is self._pair_status:_fail()
+            self._borrowed_api(status);self._state='final-live';view=_FinalPolicy(self,status)
+            try:
+                yield view
+                view._finish()
+            finally:view._state='closed'
 
     def _finish(self):
         with self._errors():
             self._check()
-            if self._state!='checked-after':_fail()
+            if self._erase_mode=='borrowed':
+                if self._state!='checked-final' or self._final_status is None:_fail()
+                self._final_status.require_closed()
+            elif self._state!='checked-after':_fail()
             if self._sample(targets=dict(self._restored.targets))!=(self._restored.paths,self._restored.alias):_fail()
             self._check()
 
@@ -384,6 +442,30 @@ class _Inspection(SafeFiles):
         except BaseException:failure=True
         self._cleanup_failed=failure
         return failure
+
+
+class _FinalPolicy:
+    """Single final data capture/recheck; the removal session owns native closure."""
+    def __init__(self,labels,status):
+        self._labels=labels;self._status=status;self._state='open'
+
+    def _operation(self,expected):
+        labels=self._labels;labels._check()
+        if labels._state!='final-live' or self._state!=expected:_fail()
+        self._state='failed';labels._borrowed_api(self._status)
+
+    def capture(self):
+        with self._labels._errors():
+            self._operation('open');self._labels._final_sample(self._status);self._state='captured'
+
+    def recheck(self):
+        with self._labels._errors():
+            self._operation('captured');self._labels._final_sample(self._status);self._state='checked'
+
+    def _finish(self):
+        with self._labels._errors():
+            self._operation('checked')
+            self._labels._final_status=self._status;self._labels._state='checked-final'
 
 
 class _ManagedInspection(_Inspection):

@@ -216,10 +216,10 @@ class RegistryTests(unittest.TestCase):
 
     def test_total_deadline_includes_routing_and_commands(self):
         now=[0.0]
-        with self.lease(clock=lambda:now[0]) as lease:
+        with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'), self.lease(clock=lambda:now[0]) as lease:
             now[0]=61
             with self.assertRaises(reg.RegistryError):lease.routing()
-        with self.lease(clock=lambda:now[0]) as lease:
+        with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'), self.lease(clock=lambda:now[0]) as lease:
             lease.routing();now[0]+=61
             with self.assertRaises(reg.RegistryError):lease.capture()
     def test_cleanup_close_error_attempts_all_and_resets(self):
@@ -254,6 +254,62 @@ class RegistryTests(unittest.TestCase):
                     try:os.fstat(fd)
                     except OSError:continue
                     close(fd)
+    def test_parent_deadline_bounds_all_queries_and_refuses_equal_or_after(self):
+        now=[520.0];ends=[];original=self.runner._run
+        def run(*a,**kw):
+            ends.append(kw['deadline']);return original(*a,**kw)
+        engine=reg.Registry(self.contexts,anchor=self.root,uid=os.geteuid(),owner=self.runner,clock=lambda:now[0])
+        with patch.object(self.runner,'_run',side_effect=run):
+            with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'):
+                with engine.inspection(deadline=530) as lease:
+                    lease.routing();record=lease.capture();lease.recheck(record)
+                    now[0]=530;lease.recheck(record)
+        self.assertEqual(ends,[530]*9)
+        for instant in (530,531):
+            now[0]=instant
+            with patch.object(engine,'_directory',side_effect=AssertionError('filesystem setup')):
+                with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'):
+                    with engine.inspection(deadline=530):self.fail('entered expired scope')
+        self.assertEqual(len(ends),9)
+
+    def test_parent_deadline_validation_and_local_ceiling(self):
+        engine=reg.Registry(self.contexts,anchor=self.root,uid=os.geteuid(),owner=self.runner,clock=lambda:520)
+        for value in (True,False,'530',float('nan'),float('inf'),-float('inf'),10**1000):
+            with self.subTest(value=type(value).__name__),patch.object(engine,'_directory',side_effect=AssertionError('filesystem setup')):
+                with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'):
+                    with engine.inspection(deadline=value):self.fail('entered invalid scope')
+        original=self.runner._run;ends=[]
+        def run(*a,**kw):ends.append(kw['deadline']);return original(*a,**kw)
+        with patch.object(self.runner,'_run',side_effect=run):
+            for end in (None,1000):
+                with engine.inspection(deadline=end) as lease:lease.routing()
+        self.assertEqual(ends,[580]*6)
+
+    def test_parent_deadline_returned_query_and_final_cleanup(self):
+        now=[520.0];original=self.runner._run
+        engine=reg.Registry(self.contexts,anchor=self.root,uid=os.geteuid(),owner=self.runner,clock=lambda:now[0])
+        def late(*a,**kw):
+            result=original(*a,**kw);now[0]=530;return result
+        with patch.object(self.runner,'_run',side_effect=late):
+            with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'):
+                with engine.inspection(deadline=530) as lease:lease.routing()
+        self.assertEqual(len(self.runner.calls),1)
+        for during_close in (False,True):
+            now[0]=520;closed=[];close=os.close
+            def late_close(fd):close(fd);closed.append(fd);now[0]=530
+            with self.assertRaisesRegex(reg.RegistryError,'REGISTRY_DEADLINE'):
+                with engine.inspection(deadline=530) as lease:
+                    lease.routing()
+                    if during_close:
+                        injection=patch.object(reg.os,'close',side_effect=late_close);injection.start()
+                    else:now[0]=530
+            if during_close:injection.stop();self.assertTrue(closed)
+            self.assertFalse(engine._active);self.assertFalse(lease._active)
+        now[0]=520;failure=ValueError('original')
+        with self.assertRaises(ValueError) as caught:
+            with engine.inspection(deadline=530):now[0]=531;raise failure
+        self.assertIs(caught.exception,failure)
+
     def test_command_failure_bounded_and_cleanup(self):
         before=len(list(Path('/proc/self/fd').iterdir()));self.runner.fail=True
         for _ in range(3):

@@ -118,7 +118,8 @@ class Bindings:
                 else:raise AssertionError('coordinator lost exclusion')
             finally:os.close(fd)
     @contextmanager
-    def registry(self):
+    def registry(self,*,deadline):
+        assert deadline==self.expected_registry_deadline
         self.registry_count+=1;number=self.registry_count
         self.point('registry enter');self.active.add('registry')
         binding=self
@@ -133,11 +134,12 @@ class Bindings:
         try:yield View()
         finally:self.active.remove('registry')
         self.point('registry exit')
-    def guard(self,deadline):self.point('guard')
+    def guard(self,deadline):self.expected_registry_deadline=deadline;self.point('guard')
     def consumer_paths(self,pam,*,fresh):
         from qshd_selinux_consumer_activation import _ConsumerPaths
         return _ConsumerPaths(pam,_root=self.root,_uid=os.getuid()).inspection(fresh=fresh)
     def retained(self,*,deadline,pristine=False):
+        self.expected_registry_deadline=deadline
         import qshd_selinux_retained_labels as retained
         value=retained.RetainedLabels(_root=self.root,_uid=os.getuid(),_clock=lambda:self.now)
         return value.pristine_install(deadline=deadline) if pristine else value.managed_inspection(deadline=deadline)
@@ -190,6 +192,16 @@ class CoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.b=Bindings(Path(self.temp.name))
+    def test_runtime_registry_requires_and_forwards_original_absolute_end(self):
+        import qshd_selinux_registry as registry
+        end=731.25;scope=object();factory=Mock();factory.inspection.return_value=scope
+        with patch.object(registry,'production',return_value=factory) as production:
+            with self.assertRaises(TypeError):c.RuntimeBindings().registry()
+            production.assert_not_called()
+            self.assertIs(c.RuntimeBindings().registry(deadline=end),scope)
+        factory.inspection.assert_called_once_with(deadline=end)
+        self.assertIs(factory.inspection.call_args.kwargs['deadline'],end)
+
     def run_coordinator(self,trust=TRUST,pp=PP,deadline=1000):
         return c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(trust,pp,CONTEXTS_PP,deadline=deadline)
     def installed(self):
@@ -393,9 +405,10 @@ class CoordinatorTests(unittest.TestCase):
                                          ('qshd_selinux_registry','registry','inspection',()),
                                          ('qshd_selinux_transaction','contexts','writer',(['/contexts'],))]:
             target=importlib.import_module(module);value=Mock();getattr(value,facade).return_value=sentinel
+            kwargs={'deadline':self.b.now+430} if method=='registry' else {}
             with patch.object(target,'production',return_value=value) as factory:
-                self.assertIs(getattr(production,method)(*args),sentinel)
-            factory.assert_called_once_with(*args);getattr(value,facade).assert_called_once_with()
+                self.assertIs(getattr(production,method)(*args,**kwargs),sentinel)
+            factory.assert_called_once_with(*args);getattr(value,facade).assert_called_once_with(**kwargs)
         target=importlib.import_module('qshd_selinux_module_install')
         with patch.object(target,'production_installer',return_value=sentinel) as factory:
             self.assertIs(production.installer(TRUST,PP,CONTEXTS_PP),sentinel)

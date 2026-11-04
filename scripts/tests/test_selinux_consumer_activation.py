@@ -41,7 +41,7 @@ class Bindings:
         self.target.write_bytes(b'system_r:sshd_t:s0 user_r:user_t:s0\n');self.target.chmod(0o640)
         self.identities={'/context':dict(path='/context',source_type='sshd_t',original_package='fixture')}
         self.routing=canonical(self.identities)
-        self.events=[];self.active=set();self.failure=None;self.now=100.0;self.loads=0;self.phase_active=False
+        self.events=[];self.active=set();self.failure=None;self.now=100.0;self.loads=0;self.phase_active=False;self.expected_registry_deadline=1000
         self.registry_snapshot=b'fixed directory'
         self.expected_pam=(ROOT/'packaging/pam.d/qshd.fedora-selinux').read_bytes()
         for name in ('usr/bin','etc/pam.d','var/lib','var/log','run'):(root/name).mkdir(parents=True,exist_ok=True)
@@ -75,7 +75,7 @@ class Bindings:
         if self.failure==name:raise RuntimeError('controlled '+name)
 
     def preconditions(self):self.point('preconditions')
-    def guard(self,deadline):self.point('guard')
+    def guard(self,deadline):self.expected_registry_deadline=deadline;self.point('guard')
     def package_object(self):return package.PackageState(self.common,uid=os.getuid(),anchor=self.root)
     def slot_object(self):return slot.ActivationSlot(self.common/'selinux-activation',uid=os.getuid(),anchor=self.root,hook=self.slot_hook)
     def transaction_object(self):return transaction.Transaction(self.common/'selinux-contexts',{'/context':self.target},uid=os.getuid(),anchor=self.root)
@@ -138,7 +138,8 @@ class Bindings:
                 yield writer
 
     @contextmanager
-    def registry(self):
+    def registry(self,*,deadline):
+        assert deadline==self.expected_registry_deadline
         binding=self
         class Registry:
             def routing(self):binding.point('routing');return binding.routing
@@ -791,7 +792,7 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
     @contextmanager
     def held(self):
         from contextlib import ExitStack
-        item=self.coordinator();item._end=340
+        item=self.coordinator();item._end=340;self.b.expected_registry_deadline=item._end
         with self.b.package(),self.b.references() as refs,self.b.activation() as writer:
             captured=refs.capture();trust=captured.artifact
             with ExitStack() as forbidden:

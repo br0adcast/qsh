@@ -22,10 +22,10 @@ _MODULES=tuple('qshd_selinux_'+name for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','retained_labels','observer',
     'reference_loader','package_state','module_install','first_activation',
-    'consumer_activation','phase','rpm_query'))+('stop_guard',)
+    'consumer_activation','provider_erase','phase','rpm_query'))+('stop_guard',)
 _PHASES={'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE','provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
          'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
-         'consumer-preun-final':'PENDING'}
+         'consumer-preun-final':'PENDING','provider-preun-final':'ERASED'}
 _INTENTS={'provider-pre-owned':'provider-refresh','provider-post-owned':'provider-refresh','provider-post-pristine':'provider-fresh','consumer-pre-fresh':'consumer-install',
           'consumer-pre-installed':'consumer-install','consumer-post-owned':'consumer-install',
           'consumer-preun-final':'consumer-erase'}
@@ -131,9 +131,10 @@ def _parse_response(raw,request):
         from qshd_selinux_activation import TrustedArtifact
         value=json.loads(raw,object_pairs_hook=_pairs)
         if (type(value) is not dict or set(value)!=
-                {'schema','phase','request_sha256','operation_id','state','artifact'}
+                {'schema','phase','request_sha256','operation_id','artifact',
+                 'result' if expected['phase']=='provider-preun-final' else 'state'}
                 or type(value['schema']) is not int or value['schema']!=2
-                or value['phase']!=expected['phase'] or value['state']!=_PHASES[expected['phase']]
+                or value['phase']!=expected['phase'] or value.get('result' if expected['phase']=='provider-preun-final' else 'state')!=_PHASES[expected['phase']]
                 or value['request_sha256']!=hashlib.sha256(request).hexdigest()
                 or type(value['operation_id']) is not str or re.fullmatch('[0-9a-f]{32}',value['operation_id']) is None
                 or type(value['artifact']) is not dict or set(value['artifact'])!=
@@ -150,10 +151,15 @@ def _response(record,request):
     from dataclasses import asdict
     from qshd_selinux_activation import Activation
     phase=_parse_request(request)['phase']
-    if type(record) is not Activation or (record.state!=_PHASES[phase] or record.intent!=_INTENTS[phase]):raise PhaseError('RESULT')
-    record.__post_init__()
+    if phase=='provider-preun-final':
+        from qshd_selinux_provider_erase import ErasureResult
+        if type(record) is not ErasureResult:raise PhaseError('RESULT')
+        record.__post_init__();outcome=dict(result=record.result)
+    else:
+        if type(record) is not Activation or (record.state!=_PHASES[phase] or record.intent!=_INTENTS[phase]):raise PhaseError('RESULT')
+        record.__post_init__();outcome=dict(state=record.state)
     raw=_json(dict(schema=2,phase=phase,request_sha256=hashlib.sha256(request).hexdigest(),
-        operation_id=record.operation_id,state=record.state,artifact=asdict(record.artifact)))+b'\n'
+        operation_id=record.operation_id,artifact=asdict(record.artifact),**outcome))+b'\n'
     _parse_response(raw,request)
     return raw
 
@@ -161,13 +167,14 @@ def _response(record,request):
 _STAGES=frozenset(('INPUT','PROCESS','PACKAGE','REFERENCES','ACTIVATION','ROUTING','PENDING',
     'CONTEXT_PRISTINE','INSTALL','RECONCILE','OBSERVATION','COMPLETE','FINALIZE','PREFLIGHT',
     'POLICY','CONSUMER','RPM','RPM_RECHECK','FILES','RELOAD','GUARD',
-    'AUTHORITY','ERASE_FILES','OWNED_CONTEXTS','POLICY_CONTEXT','READBACK'))
+    'AUTHORITY','ERASE_FILES','OWNED_CONTEXTS','POLICY_CONTEXT','READBACK',
+    'CONTEXT_REMOVE','CONTEXTS_UNLOAD','RESTORE','CORE_UNLOAD','ABSENT','RETIRE'))
 _COMMAND_CODES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TOOL_FAILURE','COMMAND_UNSETTLED',
     'OUTPUT_INCOMPLETE','PROCESS_THREADS','PROCESS_SIGNALS','PROCESS_CHILDREN','PROCESS_LIMITS',
     'PROCESS_SUBREAPER','PROCESS_OWNER','COMMAND_LIMITS','COMMAND_INPUT','COMMAND_KIND',
     'COMMAND_BUDGET','COMMAND_STDERR','COMMAND_OUTPUT'))
 _CODES=_COMMAND_CODES|frozenset('COORDINATOR_'+name for name in _STAGES)|frozenset((
-    'UNKNOWN','INSTALL_REFUSED','REGISTRY_REFUSED','CONTEXT_REFUSED','SLOT_REFUSED','SELINUX_REFUSED'))
+    'ERASE_UNCERTAIN','UNKNOWN','INSTALL_REFUSED','REGISTRY_REFUSED','CONTEXT_REFUSED','SLOT_REFUSED','SELINUX_REFUSED'))
 
 
 def _parse_failure(raw,request):
@@ -204,6 +211,8 @@ def _failure(error,request):
     from qshd_selinux_fs import Conflict
     from qshd_selinux_activation_state import SlotError,OutcomeUncertain
     from qshd_selinux_api import SelinuxError
+    from qshd_selinux_retained_labels import RetainedLabelOutcomeUncertain
+    erase=_parse_request(request)['phase']=='provider-preun-final'
     codes=[];command=None;seen=set()
     while error is not None and len(codes)<8 and id(error) not in seen:
         seen.add(id(error));kind=type(error);code='UNKNOWN'
@@ -224,6 +233,7 @@ def _failure(error,request):
                 except ValueError:pass
         elif kind is InstallError:code='INSTALL_REFUSED'
         elif kind is RegistryError:code='REGISTRY_REFUSED'
+        elif erase and kind in (OutcomeUncertain,RetainedLabelOutcomeUncertain):code='ERASE_UNCERTAIN'
         elif kind in (SlotError,OutcomeUncertain):code='SLOT_REFUSED'
         elif kind is Conflict:code='CONTEXT_REFUSED'
         elif kind is SelinuxError:code='SELINUX_REFUSED'
@@ -258,6 +268,9 @@ def _dispatch(phase,*,deadline,incoming_artifact=None):
     if phase=='provider-post-owned':
         from qshd_selinux_first_activation import activate_installed_owned_provider
         return activate_installed_owned_provider(deadline=deadline)
+    if phase=='provider-preun-final':
+        from qshd_selinux_provider_erase import erase_installed_provider
+        return erase_installed_provider(deadline=deadline)
     import qshd_selinux_consumer_activation as consumer
     if phase=='provider-post-pristine':
         from qshd_selinux_first_activation import activate_installed_pristine_pending_first
@@ -290,22 +303,28 @@ def _child_main(args):
     if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
     dispatch_args=dict(deadline=work_end)
     if parsed['phase']=='provider-pre-owned':dispatch_args['incoming_artifact']=_artifact(parsed['artifact'])
-    try:record=_dispatch(parsed['phase'],**dispatch_args)
-    except BaseException as error:
-        if not isinstance(error,Exception):raise
-        raw=_failure(error,request)
+    erased=False;dispatched=False
+    try:
+        record=_dispatch(parsed['phase'],**dispatch_args)
+        dispatched=True;erased=parsed['phase']=='provider-preun-final'
+        raw=_response(record,request)
         if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
+        sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()
+        return 0
+    except BaseException as error:
+        if erased:
+            from qshd_selinux_activation_state import OutcomeUncertain
+            uncertain=OutcomeUncertain('ERASE_OUTPUT_UNCERTAIN');uncertain.__cause__=error;error=uncertain
+        elif dispatched or not isinstance(error,Exception):raise
+        raw=_failure(error,request)
+        if not erased and time.monotonic()>=work_end:raise PhaseError('DEADLINE')
         sys.stderr.buffer.write(raw);sys.stderr.buffer.flush()
         return 1
-    raw=_response(record,request)
-    if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
-    sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()
-    return 0
 
 
 def _parent(phase,started,*,incoming_artifact=None):
     request=_request(phase,incoming_artifact);_resources(configure=True)
-    handlers={}
+    handlers={};erased=False
     try:
         def interrupted(signum,frame):raise _Interrupted()
         for signum in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT):
@@ -333,11 +352,23 @@ def _parent(phase,started,*,incoming_artifact=None):
                 or not _normal_outcome(outcome) or outcome.exit_code!=0
                 or not outcome.settled or outcome.unreaped or streams.stderr):raise PhaseError('OWNER')
         _parse_response(streams.stdout,request)
+        erased=phase=='provider-preun-final'
         if time.monotonic()>=started+440:raise PhaseError('DEADLINE')
         sys.stdout.buffer.write(streams.stdout);sys.stdout.buffer.flush()
         return 0
+    except BaseException as error:
+        if erased:
+            from qshd_selinux_activation_state import OutcomeUncertain
+            raise OutcomeUncertain('ERASE_OUTPUT_UNCERTAIN') from error
+        raise
     finally:
-        for signum,handler in handlers.items():signal.signal(signum,handler)
+        try:
+            for signum,handler in handlers.items():signal.signal(signum,handler)
+        except BaseException as error:
+            if erased:
+                from qshd_selinux_activation_state import OutcomeUncertain
+                raise OutcomeUncertain('ERASE_OUTPUT_UNCERTAIN') from error
+            raise
 
 
 def main():

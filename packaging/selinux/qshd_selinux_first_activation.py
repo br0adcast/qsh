@@ -61,9 +61,9 @@ class RuntimeBindings:
         from qshd_selinux_activation_state import production
         return production()
     def activation(self):return self.slot_object().writer()
-    def registry(self):
+    def registry(self,*,deadline):
         from qshd_selinux_registry import production
-        return production().inspection()
+        return production().inspection(deadline=deadline)
     def contexts(self,paths):
         from qshd_selinux_transaction import production
         return production(paths).writer()
@@ -215,7 +215,7 @@ class _Coordinator:
                         or record.basis is not None or record.artifact!=trust):raise CoordinatorError('PENDING_IDENTITY')
             elif record is not None:raise CoordinatorError('ACTIVATION_EXISTS')
             self._stage='ROUTING'
-            with b.registry() as registry:routing,identities=self._routing(registry)
+            with b.registry(deadline=self._end) as registry:routing,identities=self._routing(registry)
             self._check(270)
             pending=_pending(trust,'provider-fresh');self._stage='PENDING'
             token=activation.begin_pending(_json(asdict(pending)),initial)
@@ -235,7 +235,7 @@ class _Coordinator:
                         self._stage='INSTALL';b.installer(trust,core,contexts_pp).install(deadline=self._end)
                         self._check(140);self._stage='RECONCILE';writer.reconcile(identities)
                         self._stage='OBSERVATION'
-                        with b.registry() as registry:
+                        with b.registry(deadline=self._end) as registry:
                             if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                             with writer.inspection(identities) as contexts:
                                 with b.modules(trust,deadline=self._end) as modules:
@@ -313,7 +313,7 @@ class _Coordinator:
                         with self._eligibility(captured,required=self._consumer_erase) as authority:
                             self._check(165 if authority is None else 195)
                             if fresh is not None and fresh!=(authority is None):raise CoordinatorError('CONSUMER_MODE')
-                            with b.registry() as registry:
+                            with b.registry(deadline=self._end) as registry:
                                 routing,identities=self._routing(registry)
                                 with b.context_inspection(sorted(identities),identities) as contexts:
                                     with b.retained(deadline=self._end) as retained:
@@ -359,7 +359,7 @@ class _Coordinator:
                         basis=record.basis
                         if intent=='consumer-install' and basis.artifact!=target:raise CoordinatorError('BASIS_ARTIFACT')
                         self._stage='PREFLIGHT'
-                        with b.registry() as registry:
+                        with b.registry(deadline=self._end) as registry:
                             routing,identities=self._routing(registry)
                             with b.context_inspection(sorted(identities),identities) as contexts:
                                 preflight=self._views(registry,contexts,routing,owned=True)
@@ -371,7 +371,7 @@ class _Coordinator:
                                 with b.retained(deadline=self._end) as retained:
                                     # Current non-mutating row eligibility precedes new generation.
                                     with writer.inspection(identities) as contexts:
-                                        with b.registry() as registry:
+                                        with b.registry(deadline=self._end) as registry:
                                             discovered,context=self._views(registry,contexts,routing,owned=True)
                                             if (discovered,context)!=preflight:raise CoordinatorError('OWNED_STATE_DRIFT')
                                             binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
@@ -384,7 +384,7 @@ class _Coordinator:
                                     def old_check(status):
                                         nonlocal labels,old_files
                                         with b.queries(status):
-                                            with b.registry() as registry:
+                                            with b.registry(deadline=self._end) as registry:
                                                 if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                                                 with writer.inspection(identities) as contexts:
                                                     discovered,context=self._views(registry,contexts,routing,owned=True)
@@ -401,7 +401,7 @@ class _Coordinator:
                                     if (loaded.artifact!=target or loaded.core_pp_sha256!=target.core_pp_sha256
                                             or loaded.contexts_pp_sha256!=target.contexts_pp_sha256):raise CoordinatorError('RELOAD_BINDING')
                                     self._check(155 if authority is None else 185);self._stage='OBSERVATION'
-                                    with b.registry() as registry:
+                                    with b.registry(deadline=self._end) as registry:
                                         if self._routing(registry)!=(routing,identities):raise CoordinatorError('ROUTING_DRIFT')
                                         with writer.inspection(identities) as contexts:
                                             with b.modules(target,deadline=self._end) as modules:

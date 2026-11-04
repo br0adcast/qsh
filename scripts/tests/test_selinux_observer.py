@@ -111,7 +111,7 @@ class ProtocolTests(unittest.TestCase):
 # Private sibling production-factory fixtures run through the real fixed child.
 COMMON=r'''
 from contextlib import contextmanager
-import fcntl,json,os,time
+import fcntl,json,os,sys,time
 from pathlib import Path
 from types import SimpleNamespace as N
 from qshd_selinux_activation import *
@@ -135,7 +135,12 @@ class Lease:
   event('exit-'+self.name)
   if hasattr(self,'fd'):os.close(self.fd)
   if case('exit-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
- def inspection(self,*args):return self
+ def inspection(self,*args,**kwargs):
+  if self.name=='registry':
+   assert not args and set(kwargs)=={'deadline'}
+   assert kwargs['deadline']==float(sys.argv[4])
+  else:assert not kwargs
+  return self
  def managed_inspection(self,**kwargs):return self
  def routing(self):event('routing');return ROUTING
  def capture(self,*,status=None):
@@ -674,11 +679,12 @@ class BorrowedRetainedTests(unittest.TestCase):
                         if drift:
                             path=fixture.root/'etc/qshd/host_key';info=path.stat()
                             fixture.labels[(info.st_dev,info.st_ino)]=b'system_u:object_r:unlabeled_t:s0\0'
+                    deadline=__import__('time').monotonic()+110;b.expected_registry_deadline=deadline
                     factory=__import__('types').SimpleNamespace(managed_inspection=lambda **kw:fixture.make_factory().managed_inspection(**kw))
                     with self.patch.object(retained,'production',return_value=factory),self.patch.object(first.RuntimeBindings,'queries',queries):
                         if drift:
-                            with self.assertRaises(retained.RetainedLabelError):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
-                        else:self.assertEqual(self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110),binding)
+                            with self.assertRaises(retained.RetainedLabelError):self.m._compose_policy_context(trust,deadline=deadline)
+                        else:self.assertEqual(self.m._compose_policy_context(trust,deadline=deadline),binding)
                     self.assertEqual(fixture.set_count,0)
                     self.assertEqual({str(p):(p.stat(),p.read_bytes() if p.is_file() else None)for p in paths},before)
                     self.assertEqual(b.status_shared.events,['open','updated','updated','close'])

@@ -664,4 +664,385 @@ class FixtureTests(unittest.TestCase):
             with factory.inspection(deadline=120) as scope:scope.capture()
 
 
+class BorrowedEraseTests(unittest.TestCase):
+    key=FixtureTests.key
+    key_for_path=FixtureTests.key_for_path
+    make_factory=FixtureTests.make_factory
+    names=FixtureTests.names
+    get=FixtureTests.get
+    api=FixtureTests.api
+
+    def setUp(self):
+        FixtureTests.setUp(self)
+        import qshd_selinux_api as native
+        from scripts.tests.test_selinux_api import SharedStatus
+        self.shared=SharedStatus();self.native=native.SelinuxApi(self.shared.library())
+        self.policy='pair';self.core_removed=False;self.default_calls=[];self.setter_fds=[]
+        self.translated_override=None;self.default_override=None;self.fail_default_exit=None
+        self.native.file_defaults=self.defaults
+        self.native.file_context=self.file_context
+        self.native.check_context=self.check_context
+        self.factory._api_factory=lambda:(_ for _ in ()).throw(AssertionError('borrower constructed status API'))
+
+    def set(self,fd,name,value,flags):
+        self.assertFalse(self.core_removed,'setter after core removal')
+        self.setter_fds.append(fd);FixtureTests.set(self,fd,name,value,flags)
+
+    @contextmanager
+    def defaults(self):
+        phase=self.policy;self.events.append(('defaults enter',phase))
+        outer=self
+        class Defaults:
+            def lookup(inner,path,kind):
+                outer.default_calls.append((outer.policy,path,kind))
+                if outer.bad_default==path:raise RuntimeError('controlled missing current default')
+                if outer.default_override is not None:return outer.default_override
+                if outer.policy=='pair':return next(row[3] for row in outer.m._ITEMS if row[0]==path)
+                return 'system_u:object_r:etc_t:s0'
+        yield Defaults()
+        self.events.append(('defaults exit',phase))
+        if self.fail_default_exit==phase:raise RuntimeError('controlled default handle close')
+
+    def file_context(self,fd):
+        if self.translated_override is not None:return self.translated_override
+        return self.labels[self.key(fd)].removesuffix(b'\0').decode()
+
+    def check_context(self,value):
+        self.m._context(value)
+        if self.core_removed and value.split(':',3)[2].startswith('qshd_'):
+            raise RuntimeError('obsolete type after core removal')
+
+    def remove_contexts(self):
+        self.assertFalse(self.shared.mapped);self.after=True;self.policy='core-only';self.shared.counter+=1
+
+    def remove_core(self):
+        self.assertFalse(self.shared.mapped);self.after=True;self.policy='absent';self.core_removed=True;self.shared.counter+=1
+        for key,raw in self.labels.items():
+            if raw.removesuffix(b'\0').decode().split(':',3)[2].startswith('qshd_'):
+                self.labels[key]=b'system_u:object_r:unlabeled_t:s0\0'
+
+    def pair(self,scope):
+        with self.native.status_observation() as status:
+            old=scope.capture(status=status);scope.recheck_before_removal(old,status=status)
+        return old
+
+    def restored(self,scope):
+        old=self.pair(scope);self.remove_contexts()
+        with self.native.status_observation() as status:
+            restored=scope.restore_defaults(old,status=status)
+            self.assertIsNone(scope.recheck_restored(restored))
+            self.assertIs(status.require_open(),self.native)
+        return old,restored
+
+    def final(self,scope,restored):
+        with self.native.status_observation() as status:
+            with scope.final_policy(restored,status=status) as final:
+                self.assertIsNone(final.capture());self.assertIsNone(final.recheck())
+            self.assertIs(status.require_open(),self.native)
+
+    def test_borrowed_three_windows_same_fds_current_post_core_defaults_and_metadata(self):
+        private={path:(self.root/path[1:]).read_bytes() for path,kind,role,label in self.m._ITEMS if kind!=__import__('stat').S_IFDIR}
+        with self.factory.inspection(deadline=530) as scope:
+            old,restored=self.restored(scope);held=dict(scope._objects)
+            self.assertEqual(self.set_count,7);self.assertEqual(set(self.setter_fds),set(held.values()))
+            self.assertTrue(all(self.m._Inspection._preserved(a.metadata,b.metadata) for a,b in zip(old.paths,restored.paths)))
+            self.remove_core();before=len(self.default_calls);self.final(scope,restored)
+            self.assertEqual(len(self.default_calls)-before,14)
+            self.assertEqual(scope._objects,held)
+        self.assertEqual(self.shared.events,['open','updated','updated','close']*3)
+        self.assertEqual(len(self.default_calls),42)
+        self.assertEqual([phase for kind,phase in self.events if kind=='defaults enter'],['pair','pair','core-only','core-only','absent','absent'])
+        for fd in held.values():
+            with self.assertRaises(OSError):os.fstat(fd)
+        self.assertEqual(private,{path:(self.root/path[1:]).read_bytes() for path in private})
+
+    def test_original_owning_old_window_cannot_nest_inside_real_pair_owner(self):
+        self.factory._api_factory=lambda:self.native
+        with self.native.status_observation():
+            with self.assertRaises(self.m.RetainedLabelError):
+                with self.factory.inspection(deadline=530) as scope:scope.capture()
+            self.assertEqual(self.shared.events,['open','updated'])
+        self.assertEqual(self.shared.events,['open','updated','updated','close'])
+
+    def test_old_single_module_unload_loses_raw_labels_before_restore_but_pair_order_succeeds(self):
+        with self.assertRaises(self.m.RetainedLabelError) as caught:
+            with self.factory.inspection(deadline=530) as scope:
+                old=self.pair(scope);self.remove_core()
+                with self.native.status_observation() as status:scope.restore_defaults(old,status=status)
+        self.assertEqual(self.set_count,0)
+        self.assertEqual(FixtureTests.raw_claim(self,caught.exception),('RAW_LABEL_REFUSED','CONFIG_DIR','UNLABELED_LITERAL'))
+
+
+    def test_borrowed_initial_exact_status_pid_same_pair_and_mode_custody(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        import qshd_selinux_api as native
+        for fault in ('wrong-type','unissued','pid','copied-data','mix-owning','closed-pair','new-pair'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelError):
+                    with self.factory.inspection(deadline=530) as scope:
+                        with self.native.status_observation() as pair:
+                            if fault in ('wrong-type','unissued'):
+                                scope.capture(status=object() if fault=='wrong-type' else native._StatusToken(pair._record))
+                            elif fault=='pid':
+                                pid=os.getpid()
+                                with patch.object(native.os,'getpid',return_value=pid+1):scope.capture(status=pair)
+                            else:
+                                old=scope.capture(status=pair)
+                                if fault=='copied-data':scope.recheck_before_removal(replace(old),status=pair)
+                                elif fault=='mix-owning':scope.recheck_before_removal(old)
+                        if fault=='closed-pair':scope.recheck_before_removal(old,status=pair)
+                        elif fault=='new-pair':
+                            with self.native.status_observation() as changed:scope.recheck_before_removal(old,status=changed)
+                self.assertEqual(self.set_count,0)
+                self.assertFalse(self.shared.mapped)
+
+    def test_owning_inspection_cannot_switch_to_borrowed_recheck(self):
+        self.factory._api_factory=self.api
+        with self.assertRaises(self.m.RetainedLabelError):
+            with self.factory.inspection(deadline=530) as scope:
+                old=scope.capture()
+                with self.native.status_observation() as status:scope.recheck_before_removal(old,status=status)
+        self.assertEqual(self.set_count,0)
+
+    def test_pair_owner_must_close_normally_before_restore_and_calls_cannot_mix(self):
+        for fault in ('still-open','failed-close','mix-owning','copied-data'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelError):
+                    with self.factory.inspection(deadline=530) as scope:
+                        if fault=='still-open':
+                            with self.native.status_observation() as pair:
+                                old=scope.capture(status=pair);scope.recheck_before_removal(old,status=pair)
+                                scope.restore_defaults(old,status=pair)
+                        else:
+                            try:
+                                with self.native.status_observation() as pair:
+                                    old=scope.capture(status=pair);scope.recheck_before_removal(old,status=pair)
+                                    if fault=='failed-close':self.shared.counter+=1
+                            except Exception:
+                                if fault!='failed-close':raise
+                            self.remove_contexts()
+                            with self.native.status_observation() as core:
+                                from dataclasses import replace
+                                scope.restore_defaults(replace(old) if fault=='copied-data' else old,
+                                    **({} if fault=='mix-owning' else {'status':core}))
+                self.assertEqual(self.set_count,0)
+
+    def test_borrowed_complete_target_vector_and_setter_failure_boundaries(self):
+        from unittest.mock import patch
+        for fault in ('last-target','qshd-target','setter','evm','sync','readback','metadata'):
+            with self.subTest(fault=fault):
+                self.setUp();expected=self.m.RetainedLabelError if fault in ('last-target','qshd-target','metadata') else self.m.RetainedLabelOutcomeUncertain
+                with self.assertRaises(expected):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old=self.pair(scope);self.remove_contexts()
+                        if fault=='last-target':self.bad_default=self.m._ITEMS[-1][0]
+                        elif fault=='qshd-target':self.default_override='system_u:object_r:qshd_config_t:s0'
+                        elif fault=='setter':self.fail_set=1
+                        elif fault=='evm':self.evm=True
+                        elif fault=='metadata':os.setxattr(self.root/'etc/qshd','user.fixture',b'changed')
+                        elif fault=='readback':
+                            original=self.factory._set
+                            def changed(fd,*args):
+                                original(fd,*args);self.labels[self.key(fd)]=b'bad readback'
+                            self.factory._set=changed
+                        with self.native.status_observation() as core:
+                            if fault=='sync':
+                                with patch.object(self.m.os,'fsync',side_effect=OSError('controlled sync')):scope.restore_defaults(old,status=core)
+                            else:scope.restore_defaults(old,status=core)
+                self.assertEqual(self.set_count,0 if fault in ('last-target','qshd-target','metadata') else 1)
+
+    def test_final_policy_fresh_changed_default_raw_translation_and_metadata_refuse(self):
+        for fault in ('default','raw','translated','metadata','alias','membership'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core();calls=len(self.default_calls)
+                        if fault=='default':self.default_override='system_u:object_r:changed_t:s0'
+                        elif fault=='raw':self.labels[self.key_for_path('/etc/qshd')]=b'system_u:object_r:custom_t:s0'
+                        elif fault=='translated':self.translated_override='system_u:object_r:custom_t:s0'
+                        elif fault=='metadata':os.setxattr(self.root/'etc/qshd','user.fixture',b'post-core drift')
+                        elif fault=='alias':
+                            (self.root/'var/run').unlink();(self.root/'var/run').symlink_to('/run')
+                        else:(self.root/'etc/qshd/unknown').write_bytes(b'unexpected child')
+                        self.final(scope,restored)
+                self.assertGreater(len(self.default_calls),calls,'post-core proof must use actual current defaults')
+                self.assertEqual(self.set_count,7)
+
+    def test_final_policy_requires_checked_restoration_new_live_owner_and_exact_data(self):
+        from dataclasses import replace
+        import qshd_selinux_api as native
+        for fault in ('unchecked','core-open','core-token','closed-token','unissued','copied-data'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        if fault in ('unchecked','core-open'):
+                            old=self.pair(scope);self.remove_contexts()
+                            with self.native.status_observation() as core:
+                                restored=scope.restore_defaults(old,status=core)
+                                if fault=='core-open':scope.recheck_restored(restored)
+                                with scope.final_policy(restored,status=core):pass
+                        else:
+                            old,restored=self.restored(scope);self.remove_core()
+                            with self.native.status_observation() as absent:pass
+                            closed=absent
+                            with self.native.status_observation() as absent:
+                                token=(scope._core_status if fault=='core-token' else closed if fault=='closed-token'
+                                    else native._StatusToken(absent._record) if fault=='unissued' else absent)
+                                with scope.final_policy(replace(restored) if fault=='copied-data' else restored,status=token):pass
+                self.assertEqual(self.set_count,7)
+
+    def test_final_view_exactly_one_capture_and_recheck_and_no_missing_proof(self):
+        for fault in ('missing','capture-missing','recheck-missing','double-capture','double-recheck','reverse'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core()
+                        if fault!='missing':
+                            with self.native.status_observation() as absent:
+                                with scope.final_policy(restored,status=absent) as final:
+                                    if fault=='reverse':final.recheck()
+                                    if fault!='capture-missing':final.capture()
+                                    if fault=='double-capture':final.capture()
+                                    if fault not in ('capture-missing','recheck-missing'):final.recheck()
+                                    if fault=='double-recheck':final.recheck()
+                self.assertEqual(self.set_count,7)
+
+    def test_outer_finish_requires_final_owner_closed_and_never_closes_lender(self):
+        manager=self.factory.inspection(deadline=530);scope=manager.__enter__()
+        old,restored=self.restored(scope);self.remove_core()
+        with self.native.status_observation() as absent:
+            with scope.final_policy(restored,status=absent) as final:final.capture();final.recheck()
+            before=list(self.shared.events)
+            with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):manager.__exit__(None,None,None)
+            self.assertEqual(self.shared.events,before)
+            self.assertIs(absent.require_open(),self.native)
+        self.assertEqual(self.shared.events,['open','updated','updated','close']*3)
+
+    def test_no_setter_is_usable_after_core_removal(self):
+        with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+            with self.factory.inspection(deadline=530) as scope:
+                old,restored=self.restored(scope);self.remove_core();count=self.set_count
+                with self.native.status_observation() as absent:scope.restore_defaults(old,status=absent)
+        self.assertEqual(self.set_count,count)
+
+    def test_final_owner_exit_failure_cannot_be_swallowed_into_success(self):
+        import qshd_selinux_api as native
+        from unittest.mock import patch
+        for fault in ('counter','close'):
+            with self.subTest(fault=fault),patch.object(native,'_STATUS_POISONED',False):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core()
+                        try:
+                            with self.native.status_observation() as absent:
+                                with scope.final_policy(restored,status=absent) as final:final.capture();final.recheck()
+                                if fault=='counter':self.shared.counter+=1
+                                else:self.shared.close_error=True
+                        except Exception:pass
+                self.assertEqual(self.shared.events.count('close'),3)
+                self.assertEqual(self.set_count,7)
+
+    def test_all_missing_and_mixed_inventory_remain_absent_with_three_owners(self):
+        for mode in ('mixed','missing'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                for path in ('var/log/qshd/qshd.log','var/log/qshd/qshd.log.1'):(self.root/path).unlink()
+                if mode=='missing':
+                    for path in ('etc/qshd/host_key','run/qshd/helper-status.sock.lock'):(self.root/path).unlink()
+                    for path in ('etc/qshd','var/log/qshd','run/qshd'):(self.root/path).rmdir()
+                with self.factory.inspection(deadline=530) as scope:
+                    old,restored=self.restored(scope);self.remove_core();self.final(scope,restored)
+                self.assertEqual(self.set_count,5 if mode=='mixed' else 0)
+                self.assertEqual(self.shared.events,['open','updated','updated','close']*3)
+                self.assertFalse((self.root/'var/log/qshd/qshd.log').exists())
+
+
+    def test_restoration_callback_uses_exact_live_core_owner_and_actual_defaults(self):
+        for fault in ('closed-core','changed-default','failed-core-close'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old=self.pair(scope);self.remove_contexts()
+                        try:
+                            with self.native.status_observation() as core:
+                                restored=scope.restore_defaults(old,status=core)
+                                if fault=='changed-default':self.default_override='system_u:object_r:changed_t:s0'
+                                if fault!='closed-core':scope.recheck_restored(restored)
+                                if fault=='failed-core-close':self.shared.counter+=1
+                        except Exception:
+                            if fault!='failed-core-close':raise
+                        if fault=='closed-core':
+                            with self.native.status_observation():scope.recheck_restored(restored)
+                        elif fault=='failed-core-close':
+                            self.remove_core();self.final(scope,restored)
+                self.assertEqual(self.set_count,7)
+
+    def test_every_defaults_handle_must_close_normally_without_borrowed_status_closure(self):
+        for phase in ('pair','core-only','absent'):
+            with self.subTest(phase=phase):
+                self.setUp();self.fail_default_exit=phase
+                expected=self.m.RetainedLabelOutcomeUncertain if phase=='absent' else self.m.RetainedLabelError
+                with self.assertRaises(expected):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core();self.final(scope,restored)
+                self.assertEqual(self.set_count,7 if phase=='absent' else 0)
+                self.assertEqual(self.shared.events.count('open'),self.shared.events.count('close'))
+
+    def test_final_recheck_uses_second_current_handle_and_late_inventory_is_not_accepted(self):
+        for fault in ('default-after-capture','late-metadata','appeared'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                if fault=='appeared':(self.root/'var/log/qshd/qshd.log.1').unlink()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core()
+                        with self.native.status_observation() as absent:
+                            with scope.final_policy(restored,status=absent) as final:
+                                final.capture();calls=len(self.default_calls)
+                                if fault=='default-after-capture':self.default_override='system_u:object_r:changed_t:s0'
+                                elif fault=='appeared':
+                                    path=self.root/'var/log/qshd/qshd.log.1';path.write_bytes(b'new unexpected leaf');path.chmod(0o600)
+                                final.recheck()
+                        if fault=='late-metadata':os.setxattr(self.root/'etc/qshd','user.fixture',b'after final owner closed')
+                if fault!='late-metadata':self.assertGreater(len(self.default_calls),calls)
+                self.assertEqual(self.set_count,6 if fault=='appeared' else 7)
+
+    def test_final_fd_closure_failure_attempts_all_retained_fds_and_keeps_uncertainty(self):
+        from unittest.mock import patch
+        manager=self.factory.inspection(deadline=530);scope=manager.__enter__()
+        old,restored=self.restored(scope);self.remove_core();self.final(scope,restored)
+        owned=set(scope._fds+scope.anchors+[row[2] for row in scope.routes]);closed=[];native_close=os.close
+        def close(fd):
+            self.assertEqual(self.shared.events.count('close'),3)
+            native_close(fd);closed.append(fd)
+            if len(closed)==1:raise OSError('controlled after actual retained close')
+        with patch.object(self.m.os,'close',close),self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+            manager.__exit__(None,None,None)
+        self.assertEqual(set(closed),owned)
+        for fd in owned:
+            with self.assertRaises(OSError):os.fstat(fd)
+
+    def test_original_deadline_refuses_slow_final_proof_and_final_close(self):
+        for fault in ('proof','close'):
+            with self.subTest(fault=fault):
+                self.setUp()
+                with self.assertRaises(self.m.RetainedLabelOutcomeUncertain):
+                    with self.factory.inspection(deadline=530) as scope:
+                        old,restored=self.restored(scope);self.remove_core();self.assertEqual(scope._end,530)
+                        if fault=='proof':self.now=530
+                        else:self.final(scope,restored)
+                        self.now=530
+                        if fault=='proof':self.final(scope,restored)
+                self.assertEqual(self.set_count,7)
+
+
+
 if __name__=='__main__':unittest.main()
