@@ -1,4 +1,5 @@
-//! The personal daemon's fixed Unix detachment sequence, before any threads exist.
+//! The personal daemon's Unix detachment sequence, preserving its caller's umask.
+//! Runs before any threads exist.
 use nix::libc;
 use std::io;
 
@@ -7,7 +8,7 @@ pub(crate) enum Outcome {
     Child(io::Result<()>),
 }
 
-/// Detach the personal daemon, retaining its already-bound descriptors.
+/// Detach the personal daemon, retaining its caller umask and already-bound descriptors.
 ///
 /// # Safety
 /// The caller must be single-threaded, before logger/runtime/background worker
@@ -42,11 +43,11 @@ pub(crate) unsafe fn detach_at(directory: &std::ffi::CStr) -> Outcome {
 
 fn detach_child(directory: &std::ffi::CStr) -> io::Result<()> {
     // SAFETY: the constant is a terminated path; only this single-threaded child
-    // changes its own cwd/session/umask. The second fork has the same contract.
+    // changes its own cwd/session; the caller umask stays inherited.
+    // The second fork has the same contract.
     unsafe {
         cvt(libc::chdir(directory.as_ptr()))?;
         cvt(libc::setsid())?;
-        libc::umask(0o027);
         let pid = libc::fork();
         if pid < 0 {
             return Err(io::Error::last_os_error());

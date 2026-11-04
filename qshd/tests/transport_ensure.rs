@@ -37,6 +37,7 @@ use qshd::control::{client_request, ControlReply, ControlRequest};
 
 mod daemon_guard;
 use daemon_guard::{DaemonGuard, DAEMON_STATUS_TIMEOUT};
+mod personal_umask;
 
 /// Serialises the tests in this file. Each of them spawns a REAL daemon that
 /// binds a REAL port chosen by `free_udp_port`, which picks its number by
@@ -99,8 +100,20 @@ fn spawn_transport_ensure_with(
     client_pubkey_b64: &str,
     extra_args: &[&str],
 ) -> EnsureRun {
+    spawn_transport_ensure_with_mask(home, name, port, client_pubkey_b64, extra_args, None)
+}
+
+fn spawn_transport_ensure_with_mask(
+    home: &std::path::Path,
+    name: &str,
+    port: u16,
+    client_pubkey_b64: &str,
+    extra_args: &[&str],
+    mask: Option<nix::libc::mode_t>,
+) -> EnsureRun {
     let bin = env!("CARGO_BIN_EXE_qshd");
-    let mut child: Child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
             "transport-ensure",
             "--name",
@@ -112,13 +125,15 @@ fn spawn_transport_ensure_with(
         ])
         .args(extra_args)
         .env("XDG_CACHE_HOME", home)
-        // The daemon opens a real login shell in a pseudo-terminal, and this test types
-        // probe commands into it. Without this the shell appends every one of them to the
-        // history of whoever ran the suite -- these tests do not set HOME, so that is the
-        // developer's own `~/.bash_history`.
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
         .env("HISTFILE", "/dev/null")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(mask) = mask {
+        personal_umask::set_child_umask(&mut command, mask);
+    }
+    let mut child: Child = command
         .spawn()
         .expect("`qshd transport-ensure` process spawns");
 
@@ -310,6 +325,71 @@ fn transport_ensure_second_invocation_reuses_live_daemon() {
         !sock_path.exists(),
         "the stopped daemon removes its control socket"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn personal_umask_survives_reuse_and_changes_only_on_fresh_launch() {
+    use daemon_guard::Finished;
+    use qshd::control::StatusResponse;
+    use std::os::unix::fs::MetadataExt;
+
+    let _serial = serialised();
+    let home = private_temp_home().expect("private home");
+    let cache = home.path().join("qsh");
+    let socket = cache.join("control.sock");
+    let daemon = DaemonGuard::new(socket.clone());
+    let port = free_udp_port();
+    let launch = |mask, key| {
+        let run = spawn_transport_ensure_with_mask(
+            home.path(),
+            "umask",
+            port,
+            &BASE64.encode([key; 32]),
+            &[],
+            Some(mask),
+        );
+        assert!(run.status.success(), "{}", run.stderr);
+        assert!(wait_for_status(&socket, DAEMON_STATUS_TIMEOUT));
+        let Ok(ControlReply::Answered(line)) = client_request(&socket, &ControlRequest::Status)
+        else {
+            panic!("fixture STATUS must answer")
+        };
+        (
+            run.server_pubkey,
+            StatusResponse::from_line(&line).expect("STATUS"),
+        )
+    };
+    let (key, before) = launch(0o077, 1);
+    assert_eq!(personal_umask::process_umask(before.pid), 0o077);
+    let (reused_key, reused) = launch(0o002, 2);
+    assert_eq!(reused.pid, before.pid, "reuse retains the running process");
+    assert_eq!(reused_key, key);
+    assert_eq!(personal_umask::process_umask(reused.pid), 0o077);
+    assert_eq!(daemon.finish(), Finished::Stopped);
+    assert!(!socket.exists(), "completed stop removes the old socket");
+
+    // A completed stop, rather than a different numeric pid, proves freshness.
+    let fresh_daemon = DaemonGuard::new(socket.clone());
+    let (fresh_key, fresh) = launch(0o002, 3);
+    assert_eq!(fresh_key, key, "the persisted host identity remains stable");
+    assert_eq!(personal_umask::process_umask(fresh.pid), 0o002);
+    // Names follow default_transport_key_path, EnsureLock and log::prepare.
+    for path in [
+        socket.clone(),
+        socket.with_extension("sock.lock"),
+        cache.join("transport_server_key.bin"),
+        cache.join("qshd.log"),
+    ] {
+        assert_eq!(
+            std::fs::metadata(&path).expect("private artifact").mode() & 0o777,
+            0o600,
+            "private artifact {}",
+            path.display()
+        );
+    }
+    assert_eq!(fresh_daemon.finish(), Finished::Stopped);
+    assert!(!socket.exists(), "fresh daemon cleanup completed");
 }
 
 /// Owns the fake busy daemon until its worker has been joined.
