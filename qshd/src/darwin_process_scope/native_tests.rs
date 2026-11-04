@@ -112,6 +112,186 @@ static ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
 extern "C" fn acknowledge(_: i32) {
     ACKNOWLEDGED.store(true, Ordering::Relaxed);
 }
+// Closed fixture metadata only. A checkpoint is the last complete recorded
+// stage; its registry sample and the later marker observations are not atomic.
+const SIGNAL_RECORD_LIMIT: usize = 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SignalCheckpointStage {
+    Ready,
+    SignalObserved,
+    ObservationTimeout,
+    ManagerJoined,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalSnapshot {
+    pending: usize,
+    retiring: usize,
+    debt: usize,
+    unconfirmed: usize,
+    leader_unknown: bool,
+    cleanup_unknown: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalCheckpoint {
+    schema: u8,
+    stage: SignalCheckpointStage,
+    snapshot: Option<SignalSnapshot>,
+}
+fn signal_checkpoint(
+    stage: SignalCheckpointStage,
+    sample: impl FnOnce() -> Option<transport::channel_open::CleanupSnapshot>,
+) -> SignalCheckpoint {
+    let snapshot = sample().and_then(|value| {
+        // Pending includes both healthy and canceled registered opens.
+        Some(SignalSnapshot {
+            pending: value
+                .healthy_pending_opens
+                .checked_add(value.canceled_opens)?,
+            retiring: value.retiring_channels,
+            debt: value.unique_cleanup_debt,
+            unconfirmed: value.observed_unconfirmed_owners,
+            leader_unknown: value.leader_unconfirmed,
+            cleanup_unknown: value.cleanup_unconfirmed,
+        })
+    });
+    SignalCheckpoint {
+        schema: 1,
+        stage,
+        snapshot,
+    }
+}
+fn signal_record_bytes(value: &impl serde::Serialize) -> Option<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).ok()?;
+    bytes.push(b'\n');
+    (bytes.len() <= SIGNAL_RECORD_LIMIT).then_some(bytes)
+}
+fn signal_checkpoint_parse(raw: &[u8]) -> Option<SignalCheckpoint> {
+    if raw.len() > SIGNAL_RECORD_LIMIT {
+        return None;
+    }
+    let record: SignalCheckpoint = serde_json::from_slice(raw).ok()?;
+    if record.schema != 1 || signal_record_bytes(&record)?.as_slice() != raw {
+        return None;
+    }
+    Some(record)
+}
+fn signal_checkpoint_write(directory: &Path, record: SignalCheckpoint) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(bytes) = signal_record_bytes(&record) else {
+        return;
+    };
+    let pending = directory.join("signal-checkpoint.pending");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(&pending)
+    else {
+        return;
+    };
+    let complete = file.write_all(&bytes).is_ok();
+    drop(file);
+    if complete && std::fs::rename(&pending, directory.join("signal-checkpoint.json")).is_ok() {
+        return;
+    }
+    // A successful rename relinquishes this name; never remove a later writer's file.
+    let _ = std::fs::remove_file(pending);
+}
+fn signal_checkpoint_read(directory: &Path) -> Option<SignalCheckpoint> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(directory.join("signal-checkpoint.json"))
+        .ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() || before.len() > SIGNAL_RECORD_LIMIT as u64 {
+        return None;
+    }
+    let mut raw = Vec::new();
+    (&file)
+        .take((SIGNAL_RECORD_LIMIT + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if before.len() != after.len() || raw.len() as u64 != after.len() {
+        return None;
+    }
+    signal_checkpoint_parse(&raw)
+}
+fn signal_marker(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        _ => None,
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SignalParentStage {
+    WaitReady,
+    Ready,
+    SignalSent,
+    WaitExit,
+    Exited,
+    AssertJoin,
+}
+#[derive(serde::Serialize)]
+struct SignalMarkers {
+    signal_ready: Option<bool>,
+    signal_observed: Option<bool>,
+    signal_joined: Option<bool>,
+    manager_joined: Option<bool>,
+}
+#[derive(serde::Serialize)]
+struct SignalFailure {
+    schema: u8,
+    kind: &'static str,
+    signal: &'static str,
+    parent_stage: SignalParentStage,
+    exit_code: Option<i32>,
+    markers: SignalMarkers,
+    checkpoint: Option<SignalCheckpoint>,
+}
+fn signal_fixture_failure(
+    signal: i32,
+    stage: SignalParentStage,
+    exit_code: Option<i32>,
+    directory: &Path,
+    actor_directory: &Path,
+) -> Option<Vec<u8>> {
+    let signal = match signal {
+        nix::libc::SIGTERM => "TERM",
+        nix::libc::SIGINT => "INT",
+        _ => return None,
+    };
+    let mut record = SignalFailure {
+        schema: 1,
+        kind: "darwin-signal-fixture-failure",
+        signal,
+        parent_stage: stage,
+        exit_code,
+        markers: SignalMarkers {
+            signal_ready: signal_marker(&directory.join("signal-ready")),
+            signal_observed: signal_marker(&directory.join("signal-observed")),
+            signal_joined: signal_marker(&directory.join("signal-joined")),
+            manager_joined: signal_marker(&actor_directory.join("manager-joined")),
+        },
+        checkpoint: signal_checkpoint_read(directory),
+    };
+    if let Some(bytes) = signal_record_bytes(&record) {
+        return Some(bytes);
+    }
+    record.checkpoint = None;
+    signal_record_bytes(&record)
+}
+
 fn publish_bytes(path: &Path, bytes: &[u8]) {
     let pending = path.with_extension("pending");
     std::fs::write(&pending, bytes).unwrap();
@@ -1262,6 +1442,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     );
     let actor_command = ConnectedActorAuthority::command(&actor_directory);
     let body_actor_directory = actor_directory.clone();
+    let signal_registry = registry.clone();
     let mut manager = if let Some(directory) = signal_directory {
         let directory = directory.to_path_buf();
         let mut signals = crate::transport_daemon::PersonalSignals::register()
@@ -1275,6 +1456,12 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 LoginEndedReports::none(),
                 async {
                     signals.requested().await?;
+                    signal_checkpoint_write(
+                        &directory,
+                        signal_checkpoint(SignalCheckpointStage::SignalObserved, || {
+                            signal_registry.try_cleanup_snapshot()
+                        }),
+                    );
                     publish(&directory.join("signal-observed"));
                     Ok(())
                 },
@@ -1426,6 +1613,12 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     // This is the manager-stop seam, not a claim about the wire STOP
     // endpoint. Always retain and await the real lifecycle drain.
     if let Some(directory) = signal_directory {
+        signal_checkpoint_write(
+            directory,
+            signal_checkpoint(SignalCheckpointStage::Ready, || {
+                registry.try_cleanup_snapshot()
+            }),
+        );
         publish(&directory.join("signal-ready"));
     } else {
         shutdown.request();
@@ -1445,6 +1638,14 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     let settled = match joined {
         Ok(value) => value,
         Err(_) => {
+            if let Some(directory) = signal_directory {
+                signal_checkpoint_write(
+                    directory,
+                    signal_checkpoint(SignalCheckpointStage::ObservationTimeout, || {
+                        registry.try_cleanup_snapshot()
+                    }),
+                );
+            }
             // Never drop/abort the manager handle or its runtime on observation
             // timeout. Cooperative actor authority predates the Open request.
             publish(&actor_directory.join("abort"));
@@ -1457,6 +1658,14 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
     client.close();
     assert_eq!(registry.outstanding(), 0);
     assert_eq!(registry.retiring_count(), 0);
+    if let Some(directory) = signal_directory {
+        signal_checkpoint_write(
+            directory,
+            signal_checkpoint(SignalCheckpointStage::ManagerJoined, || {
+                registry.try_cleanup_snapshot()
+            }),
+        );
+    }
     publish(&actor_directory.join("manager-joined"));
     assert!(
         !observation_timed_out,
@@ -2878,11 +3087,14 @@ fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let parent_stage = std::cell::Cell::new(SignalParentStage::WaitReady);
+        let mut observed_exit = None;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             until(|| {
                 actors.observe();
                 directory.path().join("signal-ready").exists()
             });
+            parent_stage.set(SignalParentStage::Ready);
             assert!(
                 child.try_wait().unwrap().is_none(),
                 "signal fixture exited before the owned signal"
@@ -2890,19 +3102,34 @@ fn darwin223_native_term_and_interrupt_join_real_manager_and_workers() {
             // The exact direct Child is still unreaped and reserves this PID.
             // This fixture operation is not a metadata-derived production fallback.
             assert_eq!(unsafe { nix::libc::kill(child.id() as i32, signal) }, 0);
+            parent_stage.set(SignalParentStage::SignalSent);
+            parent_stage.set(SignalParentStage::WaitExit);
             let end = Instant::now() + Duration::from_secs(35);
             let status = loop {
                 if let Some(status) = child.try_wait().unwrap() {
+                    observed_exit = status.code();
+                    parent_stage.set(SignalParentStage::Exited);
                     break status;
                 }
                 assert!(Instant::now() < end, "owned signal helper deadline");
                 std::thread::sleep(Duration::from_millis(10));
             };
             assert!(status.success());
+            parent_stage.set(SignalParentStage::AssertJoin);
             assert!(directory.path().join("signal-observed").exists());
             assert!(directory.path().join("signal-joined").exists());
         }));
         if result.is_err() {
+            if let Some(bytes) = signal_fixture_failure(
+                signal,
+                parent_stage.get(),
+                observed_exit,
+                directory.path(),
+                actors.path(),
+            ) {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(&bytes);
+            }
             actors.abort();
         }
         if result.is_err() && matches!(child.try_wait(), Ok(None)) {
