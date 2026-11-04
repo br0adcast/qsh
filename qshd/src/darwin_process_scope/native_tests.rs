@@ -300,10 +300,19 @@ fn publish_bytes(path: &Path, bytes: &[u8]) {
 fn publish(path: &Path) {
     publish_bytes(path, b"ready");
 }
-fn until(mut check: impl FnMut() -> bool) {
+fn until(check: impl FnMut() -> bool) {
+    until_tagged(check, None);
+}
+fn until_tagged(mut check: impl FnMut() -> bool, diagnostic: Option<ReplacementDiagnostic<'_>>) {
     let end = Instant::now() + Duration::from_secs(10);
     while !check() {
-        assert!(Instant::now() < end, "owned native fixture deadline");
+        let within = Instant::now() < end;
+        if !within {
+            if let Some(context) = diagnostic {
+                replacement_failure(context);
+            }
+        }
+        assert!(within, "owned native fixture deadline");
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -742,8 +751,14 @@ struct DescendantGuard {
 }
 impl DescendantGuard {
     fn finish(&mut self) {
+        self.finish_tagged(None);
+    }
+    fn finish_tagged(&mut self, diagnostic: Option<ReplacementDiagnostic<'_>>) {
         let mut ops = NativeOps;
-        until(|| ops.observe_exit(&mut self.watch).unwrap().is_some());
+        until_tagged(
+            || ops.observe_exit(&mut self.watch).unwrap().is_some(),
+            diagnostic,
+        );
         self.normal_exit = true;
     }
 }
@@ -1286,6 +1301,442 @@ fn retain_bootstrap_stderr(bytes: &[u8]) {
         let _ = file.write_all(bytes);
     }
 }
+// Fixed private observations only; a failure record never certifies cleanup.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ConnectedMode {
+    ChannelClose,
+    ManagerStop,
+    NoChannel,
+    Rebind,
+    FreshSession,
+    BodyFailure,
+    ObservationTimeout,
+}
+impl ConnectedMode {
+    fn from_mode(mode: &str) -> Self {
+        match mode {
+            "channel-close" => Self::ChannelClose,
+            "manager-stop" => Self::ManagerStop,
+            "no-channel" => Self::NoChannel,
+            "rebind" => Self::Rebind,
+            "fresh-session" => Self::FreshSession,
+            "body-failure" => Self::BodyFailure,
+            "observation-timeout" => Self::ObservationTimeout,
+            _ => unreachable!("closed connected fixture mode"),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FixtureStage {
+    Spawn,
+    PipeSetup,
+    Observe,
+    StdoutRead,
+    StderrRead,
+    Cap,
+    Poll,
+    Deadline,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReplacementSite {
+    ParkedLink,
+    ParkedOpened,
+    DescendantReady,
+    ParkedDetached,
+    UpdateLink,
+    UpdateAccept,
+    NewBuildStatus,
+    OldLeaderExit,
+    OldDescendantExit,
+    FreshLink,
+    FreshExit,
+    FinalStop,
+}
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FailureCode {
+    FixtureTrueAdmission,
+    FreshLink,
+    FreshEnqueue,
+    FreshExit,
+    BodyError,
+    BodyOk,
+}
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FailureError {
+    Timeout,
+    Io,
+    OutputLimit,
+    Unknown,
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum Terminal {
+    Unknown,
+    Exited,
+    Signaled,
+}
+#[derive(serde::Serialize)]
+struct CachedStatus {
+    terminal: Terminal,
+    exit: Option<i32>,
+    signal: Option<i32>,
+}
+impl CachedStatus {
+    fn from_status(status: Option<std::process::ExitStatus>) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        let terminal = match status {
+            None => Terminal::Unknown,
+            Some(s) if s.signal().is_some() => Terminal::Signaled,
+            Some(_) => Terminal::Exited,
+        };
+        Self {
+            terminal,
+            exit: status.and_then(|s| s.code()),
+            signal: status.and_then(|s| s.signal()),
+        }
+    }
+}
+struct ConnectedDiagnostic {
+    mode: ConnectedMode,
+    actor: std::path::PathBuf,
+    connected: std::path::PathBuf,
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct ReplacementProgress {
+    open_enqueued: bool,
+    offer_enqueued: bool,
+    accepted: bool,
+    uploaded: bool,
+    restarting: bool,
+}
+#[derive(Clone, Copy)]
+struct ReplacementDiagnostic<'a> {
+    site: ReplacementSite,
+    progress: &'a std::cell::Cell<ReplacementProgress>,
+    events: Option<&'a ConnectedEvents>,
+    actor: &'a Path,
+}
+#[derive(serde::Serialize)]
+struct MarkerFacts {
+    actor_published: Option<bool>,
+    controller_bound: Option<bool>,
+    close_enqueued: Option<bool>,
+    close_observed: Option<bool>,
+    manager_joined: Option<bool>,
+    connected_joined: Option<bool>,
+    failure_code: Option<FailureCode>,
+}
+#[derive(Default, serde::Serialize)]
+struct EventFacts {
+    opened: bool,
+    refused: bool,
+    update_accept: bool,
+    update_reject: bool,
+    restarting: bool,
+    exit0: bool,
+    exitother: bool,
+}
+#[derive(serde::Serialize)]
+#[serde(tag = "case", rename_all = "SCREAMING_SNAKE_CASE")]
+enum FailurePayload {
+    Connected {
+        mode: ConnectedMode,
+        stage: FixtureStage,
+        error: FailureError,
+        #[serde(flatten)]
+        status: CachedStatus,
+        stdout_eof: Option<bool>,
+        stderr_eof: Option<bool>,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+        markers: MarkerFacts,
+    },
+    Replacement {
+        stage: ReplacementSite,
+        progress: ReplacementProgress,
+        events: Option<EventFacts>,
+        markers: MarkerFacts,
+    },
+}
+fn marker_fact(directory: &Path, name: &str) -> Option<bool> {
+    match std::fs::symlink_metadata(directory.join(name)) {
+        Ok(info) if info.is_file() => Some(true),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+fn failure_marker(directory: &Path) -> Option<FailureCode> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(directory.join("failure-code"))
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut raw = Vec::new();
+    file.take(65).read_to_end(&mut raw).ok()?;
+    match raw.as_slice() {
+        b"FIXTURE_TRUE_ADMISSION" => Some(FailureCode::FixtureTrueAdmission),
+        b"FRESH_LINK" => Some(FailureCode::FreshLink),
+        b"FRESH_ENQUEUE" => Some(FailureCode::FreshEnqueue),
+        b"FRESH_EXIT" => Some(FailureCode::FreshExit),
+        b"BODY_ERROR" => Some(FailureCode::BodyError),
+        b"BODY_OK" => Some(FailureCode::BodyOk),
+        _ => None,
+    }
+}
+fn marker_facts(actor: &Path, connected: &Path) -> MarkerFacts {
+    MarkerFacts {
+        actor_published: marker_fact(actor, "actor-pid"),
+        controller_bound: marker_fact(actor, "controller-bound"),
+        close_enqueued: marker_fact(actor, "close-enqueued"),
+        close_observed: marker_fact(actor, "close-observed"),
+        manager_joined: marker_fact(actor, "manager-joined"),
+        connected_joined: marker_fact(connected, "connected-joined"),
+        failure_code: failure_marker(actor),
+    }
+}
+fn event_facts(events: Option<&ConnectedEvents>) -> Option<EventFacts> {
+    use transport::channel::{ServerRecord, UpdateAnswer, UpdateResult};
+    let records = events?.records.try_lock().ok()?;
+    if records.len() > 256 {
+        return None;
+    }
+    let mut facts = EventFacts::default();
+    for record in records.iter() {
+        match record {
+            ServerRecord::Opened { .. } => facts.opened = true,
+            ServerRecord::Refused { .. } => facts.refused = true,
+            ServerRecord::UpdateAnswer(UpdateAnswer::Accept) => facts.update_accept = true,
+            ServerRecord::UpdateAnswer(_) => facts.update_reject = true,
+            ServerRecord::UpdateResult(UpdateResult::Restarting) => facts.restarting = true,
+            ServerRecord::Exit { code: 0, .. } => facts.exit0 = true,
+            ServerRecord::Exit { .. } => facts.exitother = true,
+            _ => {}
+        }
+    }
+    Some(facts)
+}
+fn failure_bytes(payload: &FailurePayload) -> Option<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct Record<'a> {
+        schema: u8,
+        kind: &'static str,
+        phase: &'static str,
+        cleanup: &'static str,
+        #[serde(flatten)]
+        payload: &'a FailurePayload,
+    }
+    let record = Record {
+        schema: 1,
+        kind: "darwin223-fixture-failure",
+        phase: "PRE_RESCUE",
+        cleanup: "UNKNOWN",
+        payload,
+    };
+    // Converting the typed record to a sorted map preserves deterministic keys.
+    let value = serde_json::to_value(record).ok()?;
+    let mut bytes = serde_json::to_vec(&value).ok()?;
+    bytes.push(b'\n');
+    if bytes.len() > 2048 {
+        return None;
+    }
+    Some(bytes)
+}
+fn emit_failure(payload: FailurePayload) {
+    use std::io::Write;
+    if let Some(bytes) = failure_bytes(&payload) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(b"QSH223_FIXTURE_FAILURE ");
+        let _ = stderr.write_all(&bytes);
+    }
+}
+fn replacement_failure(context: ReplacementDiagnostic<'_>) {
+    emit_failure(FailurePayload::Replacement {
+        stage: context.site,
+        progress: context.progress.get(),
+        events: event_facts(context.events),
+        markers: marker_facts(context.actor, context.actor),
+    });
+}
+fn connected_failure(
+    context: &ConnectedDiagnostic,
+    stage: FixtureStage,
+    error: &std::io::Error,
+    status: Option<std::process::ExitStatus>,
+    stdout_eof: Option<bool>,
+    stderr_eof: Option<bool>,
+    out: usize,
+    err: usize,
+) {
+    let category = match error.kind() {
+        std::io::ErrorKind::TimedOut => FailureError::Timeout,
+        std::io::ErrorKind::InvalidData if matches!(stage, FixtureStage::Cap) => {
+            FailureError::OutputLimit
+        }
+        _ => FailureError::Io,
+    };
+    emit_failure(FailurePayload::Connected {
+        mode: context.mode,
+        stage,
+        error: category,
+        status: CachedStatus::from_status(status),
+        stdout_eof,
+        stderr_eof,
+        stdout_bytes: out,
+        stderr_bytes: err,
+        markers: marker_facts(&context.actor, &context.connected),
+    });
+}
+fn fixture_timeout_formatter_controls() {
+    use std::os::unix::process::ExitStatusExt;
+    let contains_canary = |bytes: &[u8]| {
+        bytes
+            .windows(b"PRIVATE_CANARY".len())
+            .any(|w| w == b"PRIVATE_CANARY")
+    };
+    assert!(contains_canary(b"prefix_PRIVATE_CANARY_suffix"));
+    assert!(!contains_canary(b"PRIVATE_CANAR"));
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("PRIVATE_CANARY");
+    for mode in [
+        "channel-close",
+        "manager-stop",
+        "no-channel",
+        "rebind",
+        "fresh-session",
+        "body-failure",
+        "observation-timeout",
+    ] {
+        for status in [
+            None,
+            Some(std::process::ExitStatus::from_raw(0)),
+            Some(std::process::ExitStatus::from_raw(15)),
+        ] {
+            for error in [
+                FailureError::Timeout,
+                FailureError::Io,
+                FailureError::OutputLimit,
+                FailureError::Unknown,
+            ] {
+                let value = FailurePayload::Connected {
+                    mode: ConnectedMode::from_mode(mode),
+                    stage: FixtureStage::Spawn,
+                    error,
+                    status: CachedStatus::from_status(status),
+                    stdout_eof: None,
+                    stderr_eof: Some(false),
+                    stdout_bytes: usize::MAX,
+                    stderr_bytes: usize::MAX,
+                    markers: marker_facts(&private, directory.path()),
+                };
+                let bytes = failure_bytes(&value).unwrap();
+                assert!(bytes.len() <= 2048);
+                assert_eq!(bytes, failure_bytes(&value).unwrap());
+                assert!(!contains_canary(&bytes));
+            }
+        }
+    }
+    let events = ConnectedEvents::default();
+    let locked = events.records.lock().unwrap();
+    assert!(event_facts(Some(&events)).is_none());
+    drop(locked);
+    for site in [
+        ReplacementSite::ParkedLink,
+        ReplacementSite::ParkedOpened,
+        ReplacementSite::DescendantReady,
+        ReplacementSite::ParkedDetached,
+        ReplacementSite::UpdateLink,
+        ReplacementSite::UpdateAccept,
+        ReplacementSite::NewBuildStatus,
+        ReplacementSite::OldLeaderExit,
+        ReplacementSite::OldDescendantExit,
+        ReplacementSite::FreshLink,
+        ReplacementSite::FreshExit,
+        ReplacementSite::FinalStop,
+    ] {
+        let record = FailurePayload::Replacement {
+            stage: site,
+            progress: ReplacementProgress::default(),
+            events: None,
+            markers: marker_facts(&private, directory.path()),
+        };
+        assert!(failure_bytes(&record).unwrap().len() <= 2048);
+    }
+}
+fn fixture_timeout_tag_control() {
+    assert_eq!(
+        serde_json::to_value(ReplacementSite::ParkedLink).unwrap(),
+        "PARKED_LINK"
+    );
+    assert_eq!(
+        serde_json::to_value(ReplacementSite::UpdateAccept).unwrap(),
+        "UPDATE_ACCEPT"
+    );
+    let calls = std::cell::Cell::new(0);
+    until_tagged(
+        || {
+            calls.set(calls.get() + 1);
+            true
+        },
+        None,
+    );
+    assert_eq!(calls.get(), 1);
+    let directory = tempfile::tempdir().unwrap();
+    let progress = std::cell::Cell::new(ReplacementProgress::default());
+    for site in [ReplacementSite::ParkedLink, ReplacementSite::UpdateAccept] {
+        replacement_failure(ReplacementDiagnostic {
+            site,
+            progress: &progress,
+            events: None,
+            actor: directory.path(),
+        });
+    }
+    assert!(!progress.get().offer_enqueued);
+}
+fn fixture_timeout_owner_control() {
+    let directory = tempfile::tempdir().unwrap();
+    let pidfile = directory.path().join("pid");
+    let context = ConnectedDiagnostic {
+        mode: ConnectedMode::ChannelClose,
+        actor: directory.path().to_path_buf(),
+        connected: directory.path().to_path_buf(),
+    };
+    let error = bounded_command_observe_diagnostic(
+        Command::new("/bin/sh").args([
+            "-c",
+            "printf '%s' $$ > \"$1\"; printf ready; exec /bin/sleep 1",
+            "fixture",
+            pidfile.to_str().unwrap(),
+        ]),
+        128,
+        Instant::now() + Duration::from_millis(100),
+        || {},
+        Some(&context),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    let pid: i32 = std::fs::read_to_string(pidfile).unwrap().parse().unwrap();
+    let mut status = 0;
+    assert_eq!(
+        unsafe { nix::libc::waitpid(pid, &mut status, nix::libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(nix::libc::ECHILD)
+    );
+}
+
 fn bounded_fixture_receipt(path: &Path) -> String {
     use std::io::Read;
     let Ok(file) = std::fs::File::open(path) else {
@@ -1721,11 +2172,17 @@ fn darwin223_native_connected_close_stop_rebind_and_fresh_session() {
             ])
             .env("QSH_DARWIN223_CONNECTED_SERVER", mode)
             .env("QSH_DARWIN223_SIGNAL_SERVER", directory.path());
-        let output = bounded_command_observe(
+        let diagnostic = ConnectedDiagnostic {
+            mode: ConnectedMode::from_mode(mode),
+            actor: actors.path().to_path_buf(),
+            connected: directory.path().to_path_buf(),
+        };
+        let output = bounded_command_observe_diagnostic(
             &mut command,
             64 * 1024,
             Instant::now() + Duration::from_secs(90),
             || actors.observe(),
+            Some(&diagnostic),
         )
         .unwrap();
         let expected_failure = matches!(mode, "body-failure" | "observation-timeout");
@@ -3333,11 +3790,14 @@ impl DirectDaemonGuard {
         self.identity = Some(identity);
     }
     fn stop_normally(&mut self) {
+        self.stop_normally_tagged(None);
+    }
+    fn stop_normally_tagged(&mut self, diagnostic: Option<ReplacementDiagnostic<'_>>) {
         crate::control::client_request(&self.socket, &crate::control::ControlRequest::Stop)
             .expect("normal wire STOP request");
         let watch = self.watch.as_mut().expect("bound daemon exit authority");
         let mut ops = NativeOps;
-        until(|| ops.observe_exit(watch).unwrap().is_some());
+        until_tagged(|| ops.observe_exit(watch).unwrap().is_some(), diagnostic);
         assert!(self
             .owner
             .finish(Instant::now() + Duration::from_secs(10))
@@ -3510,76 +3970,122 @@ fn bounded_command_observe(
     command: &mut Command,
     cap: usize,
     end: Instant,
+    observe: impl FnMut(),
+) -> std::io::Result<std::process::Output> {
+    bounded_command_observe_diagnostic(command, cap, end, observe, None)
+}
+fn bounded_command_observe_diagnostic(
+    command: &mut Command,
+    cap: usize,
+    end: Instant,
     mut observe: impl FnMut(),
+    diagnostic: Option<&ConnectedDiagnostic>,
 ) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut owner = OwnedCommand::spawn(command)?;
+    let mut stage = FixtureStage::Spawn;
+    let mut owner = match OwnedCommand::spawn(command) {
+        Ok(owner) => owner,
+        Err(error) => {
+            if let Some(context) = diagnostic {
+                connected_failure(context, stage, &error, None, None, None, 0, 0);
+            }
+            return Err(error);
+        }
+    };
     let mut stdout = owner.child.stdout.take();
     let mut stderr = owner.child.stderr.take();
-    for fd in [
-        stdout.as_ref().unwrap().as_raw_fd(),
-        stderr.as_ref().unwrap().as_raw_fd(),
-    ] {
-        let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
-        if flags < 0
-            || unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK) }
-                < 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
     let mut out = Vec::new();
     let mut err = Vec::new();
-    loop {
-        observe();
-        // Finite work per turn, even for a continuously noisy child.
-        fn drain<R: Read>(pipe: &mut Option<R>, bytes: &mut Vec<u8>) -> std::io::Result<()> {
-            if let Some(stream) = pipe.as_mut() {
-                let mut buffer = [0; 4096];
-                match stream.read(&mut buffer) {
-                    Ok(0) => {
-                        *pipe = None;
+    let mut pipes_ready = false;
+    let result = (|| {
+        stage = FixtureStage::PipeSetup;
+        for fd in [
+            stdout.as_ref().unwrap().as_raw_fd(),
+            stderr.as_ref().unwrap().as_raw_fd(),
+        ] {
+            let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+            if flags < 0
+                || unsafe {
+                    nix::libc::fcntl(fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK)
+                } < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        pipes_ready = true;
+        loop {
+            stage = FixtureStage::Observe;
+            observe();
+            // Finite work per turn, even for a continuously noisy child.
+            fn drain<R: Read>(pipe: &mut Option<R>, bytes: &mut Vec<u8>) -> std::io::Result<()> {
+                if let Some(stream) = pipe.as_mut() {
+                    let mut buffer = [0; 4096];
+                    match stream.read(&mut buffer) {
+                        Ok(0) => {
+                            *pipe = None;
+                        }
+                        Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(error) => return Err(error),
                     }
-                    Ok(n) => bytes.extend_from_slice(&buffer[..n]),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(error) => return Err(error),
+                }
+                Ok(())
+            }
+            stage = FixtureStage::StdoutRead;
+            drain(&mut stdout, &mut out)?;
+            stage = FixtureStage::StderrRead;
+            drain(&mut stderr, &mut err)?;
+            stage = FixtureStage::Cap;
+            if out.len() + err.len() > cap {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture output cap",
+                ));
+            }
+            stage = FixtureStage::Poll;
+            if let Some(status) = owner.poll()? {
+                if stdout.is_none() && stderr.is_none() {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout: std::mem::take(&mut out),
+                        stderr: std::mem::take(&mut err),
+                    });
                 }
             }
-            Ok(())
-        }
-        drain(&mut stdout, &mut out)?;
-        drain(&mut stderr, &mut err)?;
-        if out.len() + err.len() > cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "fixture output cap",
-            ));
-        }
-        if let Some(status) = owner.poll()? {
-            if stdout.is_none() && stderr.is_none() {
-                return Ok(std::process::Output {
-                    status,
-                    stdout: out,
-                    stderr: err,
-                });
+            stage = FixtureStage::Deadline;
+            if Instant::now() >= end {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fixture output deadline",
+                ));
             }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        if Instant::now() >= end {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "fixture output deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
+    })();
+    if let (Err(error), Some(context)) = (&result, diagnostic) {
+        connected_failure(
+            context,
+            stage,
+            error,
+            owner.status,
+            pipes_ready.then(|| stdout.is_none()),
+            pipes_ready.then(|| stderr.is_none()),
+            out.len(),
+            err.len(),
+        );
     }
+    result
 }
 fn fixture_command_controls() {
+    fixture_timeout_formatter_controls();
+    fixture_timeout_owner_control();
+    fixture_timeout_tag_control();
     let end = Instant::now() + Duration::from_secs(2);
     let output = bounded_command(
         Command::new("/bin/sh").args(["-c", "printf ready; printf diagnostic >&2"]),
@@ -3786,6 +4292,15 @@ fn actual_connect(
     client_priv: [u8; 32],
     token: [u8; 16],
 ) -> (transport::driver_std::StdClient, Arc<ConnectedEvents>) {
+    actual_connect_tagged(port, server_pub, client_priv, token, None)
+}
+fn actual_connect_tagged(
+    port: u16,
+    server_pub: [u8; 32],
+    client_priv: [u8; 32],
+    token: [u8; 16],
+    diagnostic: Option<ReplacementDiagnostic<'_>>,
+) -> (transport::driver_std::StdClient, Arc<ConnectedEvents>) {
     let events = Arc::new(ConnectedEvents::default());
     let client = transport::driver_std::StdClient::connect(
         ([127, 0, 0, 1], port).into(),
@@ -3804,7 +4319,7 @@ fn actual_connect(
         events.clone(),
         None,
     );
-    until(|| events.live.load(Ordering::SeqCst));
+    until_tagged(|| events.live.load(Ordering::SeqCst), diagnostic);
     (client, events)
 }
 #[test]
@@ -4023,7 +4538,20 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     // Installed before Open enqueue; leader retains its real child until the
     // controller binds both watches, and observes abort even before Opened.
     let _actor_abort = AbortActor(actor_directory.path());
-    let (parked, parked_events) = actual_connect(port, server_pub, parked_key.private, [9; 16]);
+    let progress = std::cell::Cell::new(ReplacementProgress::default());
+    let diagnostic = |site, events| ReplacementDiagnostic {
+        site,
+        progress: &progress,
+        events,
+        actor: actor_directory.path(),
+    };
+    let (parked, parked_events) = actual_connect_tagged(
+        port,
+        server_pub,
+        parked_key.private,
+        [9; 16],
+        Some(diagnostic(ReplacementSite::ParkedLink, None)),
+    );
     let executable = std::env::current_exe().unwrap();
     assert!(!executable.to_str().unwrap().contains('\''));
     assert!(!actor_directory.path().to_str().unwrap().contains('\''));
@@ -4041,15 +4569,31 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             })),
         )
         .unwrap();
-    until(|| {
-        parked_events
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|record| matches!(record, ServerRecord::Opened { .. }))
+    progress.set(ReplacementProgress {
+        open_enqueued: true,
+        ..progress.get()
     });
-    until(|| actor_directory.path().join("descendant-ready").exists());
+    until_tagged(
+        || {
+            parked_events
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record| matches!(record, ServerRecord::Opened { .. }))
+        },
+        Some(diagnostic(
+            ReplacementSite::ParkedOpened,
+            Some(&parked_events),
+        )),
+    );
+    until_tagged(
+        || actor_directory.path().join("descendant-ready").exists(),
+        Some(diagnostic(
+            ReplacementSite::DescendantReady,
+            Some(&parked_events),
+        )),
+    );
     let descendant_pid = std::fs::read_to_string(actor_directory.path().join("descendant-pid"))
         .unwrap()
         .parse::<i32>()
@@ -4077,8 +4621,20 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     };
     publish(&actor_directory.path().join("controller-bound"));
     parked.detach();
-    until(|| daemon_status(&socket).is_some_and(|status| status.total_connections == 0));
-    let (client, events) = actual_connect(port, server_pub, first.private, [1; 16]);
+    until_tagged(
+        || daemon_status(&socket).is_some_and(|status| status.total_connections == 0),
+        Some(diagnostic(
+            ReplacementSite::ParkedDetached,
+            Some(&parked_events),
+        )),
+    );
+    let (client, events) = actual_connect_tagged(
+        port,
+        server_pub,
+        first.private,
+        [1; 16],
+        Some(diagnostic(ReplacementSite::UpdateLink, None)),
+    );
     assert_eq!(
         ops.classify(sid).unwrap().identity.unique,
         leader.identity.unique
@@ -4098,13 +4654,24 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             })),
         )
         .unwrap();
-    until(|| {
-        events
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|record| *record == ServerRecord::UpdateAnswer(UpdateAnswer::Accept))
+    progress.set(ReplacementProgress {
+        offer_enqueued: true,
+        ..progress.get()
+    });
+    until_tagged(
+        || {
+            events
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record| *record == ServerRecord::UpdateAnswer(UpdateAnswer::Accept))
+        },
+        Some(diagnostic(ReplacementSite::UpdateAccept, Some(&events))),
+    );
+    progress.set(ReplacementProgress {
+        accepted: true,
+        ..progress.get()
     });
     let upload_end = Instant::now() + Duration::from_secs(60);
     for chunk in image.chunks(64 * 1024) {
@@ -4115,6 +4682,10 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             .send_bytes_bounded(UPDATE_STREAM, chunk.to_vec(), remaining)
             .unwrap();
     }
+    progress.set(ReplacementProgress {
+        uploaded: true,
+        ..progress.get()
+    });
     let restart_end = Instant::now() + Duration::from_secs(60);
     while !events
         .records
@@ -4129,8 +4700,15 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    progress.set(ReplacementProgress {
+        restarting: true,
+        ..progress.get()
+    });
     client.detach();
-    until(|| daemon_status(&socket).is_some_and(|status| status.build == new_build));
+    until_tagged(
+        || daemon_status(&socket).is_some_and(|status| status.build == new_build),
+        Some(diagnostic(ReplacementSite::NewBuildStatus, Some(&events))),
+    );
     let after = daemon_status(&socket).unwrap();
     assert_eq!(after.pid, before.pid);
     assert_eq!(after.ports, before.ports);
@@ -4140,15 +4718,27 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     let original_identity = daemon.identity.unwrap();
     assert!(resumed.identity.same_process(original_identity.identity));
     assert_ne!(resumed.identity.version, original_identity.identity.version);
-    leader_guard.finish();
-    desc_guard.finish();
+    leader_guard.finish_tagged(Some(diagnostic(
+        ReplacementSite::OldLeaderExit,
+        Some(&events),
+    )));
+    desc_guard.finish_tagged(Some(diagnostic(
+        ReplacementSite::OldDescendantExit,
+        Some(&events),
+    )));
     assert!(
         !ops.identity(sid)
             .is_ok_and(|value| value.same_process(leader.identity)),
         "old direct leader must be physically reaped before exec"
     );
     admit_fixture_true(Path::new(FIXTURE_TRUE)).expect("FIXTURE_TRUE_ADMISSION");
-    let (fresh, fresh_events) = actual_connect(port, server_pub, first.private, [2; 16]);
+    let (fresh, fresh_events) = actual_connect_tagged(
+        port,
+        server_pub,
+        first.private,
+        [2; 16],
+        Some(diagnostic(ReplacementSite::FreshLink, None)),
+    );
     fresh
         .send_bytes(
             CONTROL_STREAM,
@@ -4162,16 +4752,22 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             })),
         )
         .unwrap();
-    until(|| {
-        fresh_events
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|record| matches!(record, ServerRecord::Exit { code: 0, .. }))
-    });
+    until_tagged(
+        || {
+            fresh_events
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|record| matches!(record, ServerRecord::Exit { code: 0, .. }))
+        },
+        Some(diagnostic(ReplacementSite::FreshExit, Some(&fresh_events))),
+    );
     fresh.close();
-    daemon.stop_normally();
+    daemon.stop_normally_tagged(Some(diagnostic(
+        ReplacementSite::FinalStop,
+        Some(&fresh_events),
+    )));
     assert_eq!(daemon.rescues, 0);
     assert_eq!(hash_path(&original), original_hash);
     eprintln!("darwin223 actual_update=exec same_pid=true execution_version=fresh parked_leader=reaped descendant=exited fresh_channel=completed wire_STOP=normal rescue=false");
