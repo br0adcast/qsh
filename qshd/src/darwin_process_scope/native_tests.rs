@@ -1349,6 +1349,7 @@ enum ReplacementSite {
     UpdateLink,
     UpdateAccept,
     NewBuildStatus,
+    RestartingReceipt,
     OldLeaderExit,
     OldDescendantExit,
     FreshLink,
@@ -1411,7 +1412,8 @@ struct ReplacementProgress {
     open_enqueued: bool,
     offer_enqueued: bool,
     accepted: bool,
-    uploaded: bool,
+    // All local whole-record admissions returned; not remote verification.
+    upload_enqueued: bool,
     restarting: bool,
 }
 #[derive(Clone, Copy)]
@@ -1421,6 +1423,7 @@ struct ReplacementDiagnostic<'a> {
     events: Option<&'a ConnectedEvents>,
     actor: &'a Path,
     status_wait: Option<&'a std::cell::Cell<StatusWaitObservation>>,
+    update_wait: Option<UpdateWaitSnapshot>,
 }
 #[derive(serde::Serialize)]
 struct MarkerFacts {
@@ -1463,6 +1466,7 @@ enum FailurePayload {
         events: Option<EventFacts>,
         markers: MarkerFacts,
         status_wait: Option<StatusWaitObservation>,
+        update_wait: Option<UpdateWaitSnapshot>,
     },
 }
 #[derive(Clone, Copy, Default, serde::Serialize)]
@@ -1602,7 +1606,7 @@ fn fixture_status_projection_controls() {
             open_enqueued: true,
             offer_enqueued: true,
             accepted: true,
-            uploaded: true,
+            upload_enqueued: true,
             restarting: true,
         },
         events: Some(EventFacts {
@@ -1616,6 +1620,7 @@ fn fixture_status_projection_controls() {
         }),
         markers: marker_facts(directory.path(), directory.path()),
         status_wait: Some(state.get()),
+        update_wait: None,
     };
     let bytes = failure_bytes(&record).unwrap();
     assert!(bytes.len() <= 2048);
@@ -1673,6 +1678,409 @@ fn fixture_status_single_request_controls() {
     state.set(maximum);
     status_wait_predicate(&state, 10, 20, || (None, "REQUEST_ERROR"));
     assert_eq!(state.get().completed_calls, u32::MAX);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ObservedUpdateOutcome {
+    Waiting,
+    Restarting,
+    Rejected,
+    Busy,
+    UnknownResult,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ObservedRejectCode {
+    Other,
+    SizeMismatch,
+    ChecksumMismatch,
+    SelfCheckFailed,
+    VersionNotAccepted,
+    DiskError,
+    ExecFailed,
+    TransferStalled,
+    ControlBusy,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct UpdateObservation {
+    outcome: ObservedUpdateOutcome,
+    reject_code: Option<ObservedRejectCode>,
+}
+fn observed_reject_code(code: transport::channel::RejectCode) -> ObservedRejectCode {
+    use transport::channel::RejectCode;
+    match code {
+        RejectCode::Other => ObservedRejectCode::Other,
+        RejectCode::SizeMismatch => ObservedRejectCode::SizeMismatch,
+        RejectCode::ChecksumMismatch => ObservedRejectCode::ChecksumMismatch,
+        RejectCode::SelfCheckFailed => ObservedRejectCode::SelfCheckFailed,
+        RejectCode::VersionNotAccepted => ObservedRejectCode::VersionNotAccepted,
+        RejectCode::DiskError => ObservedRejectCode::DiskError,
+        RejectCode::ExecFailed => ObservedRejectCode::ExecFailed,
+        RejectCode::TransferStalled => ObservedRejectCode::TransferStalled,
+        RejectCode::ControlBusy => ObservedRejectCode::ControlBusy,
+        RejectCode::Unknown(_) => ObservedRejectCode::Unknown,
+    }
+}
+fn observed_update_result(records: &[transport::channel::ServerRecord]) -> UpdateObservation {
+    use transport::channel::{ServerRecord, UpdateResult};
+    let mut restarting = false;
+    for record in records {
+        match record {
+            ServerRecord::UpdateResult(UpdateResult::Restarting) => restarting = true,
+            ServerRecord::UpdateResult(UpdateResult::Rejected { code, .. }) => {
+                return UpdateObservation {
+                    outcome: ObservedUpdateOutcome::Rejected,
+                    reject_code: Some(observed_reject_code(*code)),
+                }
+            }
+            ServerRecord::UpdateResult(UpdateResult::Busy { .. }) => {
+                return UpdateObservation {
+                    outcome: ObservedUpdateOutcome::Busy,
+                    reject_code: None,
+                }
+            }
+            ServerRecord::UpdateResult(UpdateResult::Unknown(_)) => {
+                return UpdateObservation {
+                    outcome: ObservedUpdateOutcome::UnknownResult,
+                    reject_code: None,
+                }
+            }
+            _ => {}
+        }
+    }
+    UpdateObservation {
+        outcome: if restarting {
+            ObservedUpdateOutcome::Restarting
+        } else {
+            ObservedUpdateOutcome::Waiting
+        },
+        reject_code: None,
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum UpdateWaitFailure {
+    TerminalResult,
+    InputFailure,
+    Deadline,
+}
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct UpdateWaitSnapshot {
+    #[serde(flatten)]
+    observed: UpdateObservation,
+    input_failed: bool,
+    failure: UpdateWaitFailure,
+}
+enum UpdateWaitDecision {
+    Waiting,
+    Restarting,
+    Refused(UpdateWaitSnapshot),
+}
+fn update_wait_decision(
+    observed: UpdateObservation,
+    input_failed: bool,
+    within_deadline: impl FnOnce() -> bool,
+) -> UpdateWaitDecision {
+    let failure = if matches!(
+        observed.outcome,
+        ObservedUpdateOutcome::Rejected
+            | ObservedUpdateOutcome::Busy
+            | ObservedUpdateOutcome::UnknownResult
+    ) {
+        UpdateWaitFailure::TerminalResult
+    } else if input_failed {
+        UpdateWaitFailure::InputFailure
+    } else if observed.outcome == ObservedUpdateOutcome::Restarting {
+        return UpdateWaitDecision::Restarting;
+    } else if within_deadline() {
+        return UpdateWaitDecision::Waiting;
+    } else {
+        UpdateWaitFailure::Deadline
+    };
+    UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+        observed,
+        input_failed,
+        failure,
+    })
+}
+// Controls use the real encoder, deframer, enum and callback implementation.
+fn fixture_update_records(records: &[transport::channel::ServerRecord]) -> ConnectedEvents {
+    use transport::driver_std::ClientEvents;
+    let events = ConnectedEvents::default();
+    for record in records {
+        let encoded = transport::channel::encode_server(record);
+        for part in encoded.chunks(7) {
+            events.on_bytes(transport::channel::CONTROL_STREAM, part.to_vec());
+        }
+    }
+    events
+}
+fn fixture_update_terminal_controls() {
+    use transport::channel::{RejectCode, ServerRecord, UpdateAnswer, UpdateResult};
+    let rejected = |code| {
+        ServerRecord::UpdateResult(UpdateResult::Rejected {
+            code,
+            detail: "PRIVATE_CANARY".into(),
+        })
+    };
+    let events = fixture_update_records(&[rejected(RejectCode::SelfCheckFailed)]);
+    let records = events.records.lock().unwrap();
+    assert!(!records
+        .iter()
+        .any(|record| *record == ServerRecord::UpdateResult(UpdateResult::Restarting)));
+    assert_eq!(
+        observed_update_result(&records).outcome,
+        ObservedUpdateOutcome::Rejected
+    );
+    assert_eq!(
+        observed_update_result(&records).reject_code,
+        Some(ObservedRejectCode::SelfCheckFailed)
+    );
+    drop(records);
+    for initial in [
+        vec![],
+        vec![ServerRecord::UpdateAnswer(UpdateAnswer::Accept)],
+    ] {
+        let events = fixture_update_records(&initial);
+        assert_eq!(
+            observed_update_result(&events.records.lock().unwrap()).outcome,
+            ObservedUpdateOutcome::Waiting
+        );
+    }
+    for (code, expected) in [
+        (RejectCode::Other, ObservedRejectCode::Other),
+        (RejectCode::SizeMismatch, ObservedRejectCode::SizeMismatch),
+        (
+            RejectCode::ChecksumMismatch,
+            ObservedRejectCode::ChecksumMismatch,
+        ),
+        (
+            RejectCode::SelfCheckFailed,
+            ObservedRejectCode::SelfCheckFailed,
+        ),
+        (
+            RejectCode::VersionNotAccepted,
+            ObservedRejectCode::VersionNotAccepted,
+        ),
+        (RejectCode::DiskError, ObservedRejectCode::DiskError),
+        (RejectCode::ExecFailed, ObservedRejectCode::ExecFailed),
+        (
+            RejectCode::TransferStalled,
+            ObservedRejectCode::TransferStalled,
+        ),
+        (RejectCode::ControlBusy, ObservedRejectCode::ControlBusy),
+        (RejectCode::Unknown(233), ObservedRejectCode::Unknown),
+    ] {
+        let events = fixture_update_records(&[rejected(code)]);
+        let observed = observed_update_result(&events.records.lock().unwrap());
+        assert_eq!(observed.reject_code, Some(expected));
+        assert!(matches!(
+            update_wait_decision(observed, false, || panic!("terminal must not query clock")),
+            UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+                failure: UpdateWaitFailure::TerminalResult,
+                ..
+            })
+        ));
+    }
+    for (result, expected) in [
+        (UpdateResult::Restarting, ObservedUpdateOutcome::Restarting),
+        (
+            UpdateResult::Busy { others: 444444 },
+            ObservedUpdateOutcome::Busy,
+        ),
+        (
+            UpdateResult::Unknown(234),
+            ObservedUpdateOutcome::UnknownResult,
+        ),
+    ] {
+        let events = fixture_update_records(&[ServerRecord::UpdateResult(result)]);
+        assert_eq!(
+            observed_update_result(&events.records.lock().unwrap()).outcome,
+            expected
+        );
+    }
+    for initial in [
+        vec![
+            ServerRecord::UpdateResult(UpdateResult::Restarting),
+            rejected(RejectCode::SelfCheckFailed),
+            rejected(RejectCode::DiskError),
+        ],
+        vec![
+            rejected(RejectCode::SelfCheckFailed),
+            ServerRecord::UpdateResult(UpdateResult::Restarting),
+        ],
+    ] {
+        let events = fixture_update_records(&initial);
+        assert_eq!(
+            observed_update_result(&events.records.lock().unwrap()).reject_code,
+            Some(ObservedRejectCode::SelfCheckFailed)
+        );
+    }
+    let reversed = fixture_update_records(&[
+        rejected(RejectCode::DiskError),
+        rejected(RejectCode::SelfCheckFailed),
+    ]);
+    assert_eq!(
+        observed_update_result(&reversed.records.lock().unwrap()).reject_code,
+        Some(ObservedRejectCode::DiskError)
+    );
+}
+fn fixture_update_decision_controls() {
+    use transport::driver_std::ClientEvents;
+    let events = ConnectedEvents::default();
+    let waiting = observed_update_result(&[]);
+    let end = 10;
+    assert!(matches!(
+        update_wait_decision(waiting, false, || 9 < end),
+        UpdateWaitDecision::Waiting
+    ));
+    assert!(matches!(
+        update_wait_decision(waiting, false, || 10 < end),
+        UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+            failure: UpdateWaitFailure::Deadline,
+            ..
+        })
+    ));
+    let negative = UpdateObservation {
+        outcome: ObservedUpdateOutcome::Rejected,
+        reject_code: Some(ObservedRejectCode::DiskError),
+    };
+    assert!(matches!(
+        update_wait_decision(negative, true, || panic!("negative precedence")),
+        UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+            failure: UpdateWaitFailure::TerminalResult,
+            ..
+        })
+    ));
+    assert!(matches!(
+        update_wait_decision(waiting, false, || true),
+        UpdateWaitDecision::Waiting
+    ));
+    assert!(matches!(
+        update_wait_decision(waiting, false, || false),
+        UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+            failure: UpdateWaitFailure::Deadline,
+            ..
+        })
+    ));
+    events.on_input_failure(transport::driver_std::InputFailure::DriverUnavailable);
+    assert!(matches!(
+        update_wait_decision(
+            waiting,
+            events.input_failed.load(Ordering::SeqCst),
+            || panic!("input failure must not query clock")
+        ),
+        UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+            failure: UpdateWaitFailure::InputFailure,
+            ..
+        })
+    ));
+    let restarting = UpdateObservation {
+        outcome: ObservedUpdateOutcome::Restarting,
+        reject_code: None,
+    };
+    assert!(matches!(
+        update_wait_decision(restarting, false, || panic!("success must not query clock")),
+        UpdateWaitDecision::Restarting
+    ));
+    assert!(matches!(
+        update_wait_decision(restarting, true, || panic!(
+            "input failure must not query clock"
+        )),
+        UpdateWaitDecision::Refused(UpdateWaitSnapshot {
+            failure: UpdateWaitFailure::InputFailure,
+            ..
+        })
+    ));
+}
+fn fixture_update_record_controls() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut status = StatusWaitObservation::new(CachedAtWaitEntry {
+        status: CachedStatus::from_status(None),
+        stderr_eof: false,
+        stderr_bytes: usize::MAX,
+    });
+    status.completed_calls = u32::MAX;
+    for (observed, failure) in [
+        (
+            UpdateObservation {
+                outcome: ObservedUpdateOutcome::Waiting,
+                reject_code: None,
+            },
+            UpdateWaitFailure::Deadline,
+        ),
+        (
+            UpdateObservation {
+                outcome: ObservedUpdateOutcome::Rejected,
+                reject_code: Some(ObservedRejectCode::Unknown),
+            },
+            UpdateWaitFailure::TerminalResult,
+        ),
+        (
+            UpdateObservation {
+                outcome: ObservedUpdateOutcome::UnknownResult,
+                reject_code: None,
+            },
+            UpdateWaitFailure::TerminalResult,
+        ),
+        (
+            UpdateObservation {
+                outcome: ObservedUpdateOutcome::Busy,
+                reject_code: None,
+            },
+            UpdateWaitFailure::TerminalResult,
+        ),
+    ] {
+        let record = FailurePayload::Replacement {
+            stage: ReplacementSite::RestartingReceipt,
+            progress: ReplacementProgress::default(),
+            events: Some(EventFacts::default()),
+            markers: marker_facts(directory.path(), directory.path()),
+            status_wait: Some(status),
+            update_wait: Some(UpdateWaitSnapshot {
+                observed,
+                input_failed: true,
+                failure,
+            }),
+        };
+        let bytes = failure_bytes(&record).unwrap();
+        assert!(bytes.len() <= 2048);
+        assert!(!bytes
+            .windows(b"PRIVATE_CANARY".len())
+            .any(|b| b == b"PRIVATE_CANARY"));
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["stage"], "RESTARTING_RECEIPT");
+        assert_eq!(value["update_wait"].as_object().unwrap().len(), 4);
+        assert_eq!(
+            value["update_wait"]["failure"],
+            serde_json::to_value(failure).unwrap()
+        );
+        assert_eq!(
+            value["update_wait"]["reject_code"],
+            serde_json::to_value(observed.reject_code).unwrap()
+        );
+        assert_eq!(
+            value["update_wait"]["outcome"],
+            serde_json::to_value(observed.outcome).unwrap()
+        );
+        assert!(value["update_wait"].get("detail").is_none());
+        assert!(value["update_wait"].get("others").is_none());
+    }
+    let record = FailurePayload::Replacement {
+        stage: ReplacementSite::ParkedLink,
+        progress: ReplacementProgress::default(),
+        events: None,
+        markers: marker_facts(directory.path(), directory.path()),
+        status_wait: None,
+        update_wait: None,
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&failure_bytes(&record).unwrap()).unwrap()
+            ["update_wait"],
+        serde_json::Value::Null
+    );
 }
 
 fn marker_fact(directory: &Path, name: &str) -> Option<bool> {
@@ -1779,6 +2187,7 @@ fn replacement_failure(context: ReplacementDiagnostic<'_>) {
         events: event_facts(context.events),
         markers: marker_facts(context.actor, context.actor),
         status_wait: context.status_wait.map(|value| value.get()),
+        update_wait: context.update_wait,
     });
 }
 fn connected_failure(
@@ -1883,6 +2292,7 @@ fn fixture_timeout_formatter_controls() {
             events: None,
             markers: marker_facts(&private, directory.path()),
             status_wait: None,
+            update_wait: None,
         };
         assert!(failure_bytes(&record).unwrap().len() <= 2048);
     }
@@ -1914,6 +2324,7 @@ fn fixture_timeout_tag_control() {
             events: None,
             actor: directory.path(),
             status_wait: None,
+            update_wait: None,
         });
     }
     assert!(!progress.get().offer_enqueued);
@@ -4298,6 +4709,9 @@ fn bounded_command_observe_diagnostic(
     result
 }
 fn fixture_command_controls() {
+    fixture_update_terminal_controls();
+    fixture_update_decision_controls();
+    fixture_update_record_controls();
     fixture_status_projection_controls();
     fixture_status_single_request_controls();
     fixture_timeout_formatter_controls();
@@ -4544,7 +4958,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     use std::ffi::OsStr;
     use transport::channel::{
         encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, UpdateAnswer,
-        UpdateOffer, UpdateResult, CONTROL_STREAM, FIRST_CHANNEL_STREAM, UPDATE_STREAM,
+        UpdateOffer, CONTROL_STREAM, FIRST_CHANNEL_STREAM, UPDATE_STREAM,
     };
     prepare().expect("production runtime admission");
     run_rename_proof();
@@ -4762,6 +5176,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         events,
         actor: actor_directory.path(),
         status_wait: None,
+        update_wait: None,
     };
     let (parked, parked_events) = actual_connect_tagged(
         port,
@@ -4901,22 +5316,30 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             .unwrap();
     }
     progress.set(ReplacementProgress {
-        uploaded: true,
+        upload_enqueued: true,
         ..progress.get()
     });
     let restart_end = Instant::now() + Duration::from_secs(60);
-    while !events
-        .records
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|record| *record == ServerRecord::UpdateResult(UpdateResult::Restarting))
-    {
-        assert!(
-            Instant::now() < restart_end,
-            "actual replacement receipt deadline"
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    loop {
+        let observed = observed_update_result(&events.records.lock().unwrap());
+        let input_failed = events.input_failed.load(Ordering::SeqCst);
+        match update_wait_decision(observed, input_failed, || Instant::now() < restart_end) {
+            UpdateWaitDecision::Restarting => break,
+            UpdateWaitDecision::Waiting => std::thread::sleep(Duration::from_millis(20)),
+            UpdateWaitDecision::Refused(snapshot) => {
+                replacement_failure(ReplacementDiagnostic {
+                    update_wait: Some(snapshot),
+                    ..diagnostic(ReplacementSite::RestartingReceipt, Some(&events))
+                });
+                match snapshot.failure {
+                    UpdateWaitFailure::Deadline => panic!("actual replacement receipt deadline"),
+                    UpdateWaitFailure::TerminalResult => {
+                        panic!("actual replacement terminal result")
+                    }
+                    UpdateWaitFailure::InputFailure => panic!("fixture input failure observed"),
+                }
+            }
+        }
     }
     progress.set(ReplacementProgress {
         restarting: true,
