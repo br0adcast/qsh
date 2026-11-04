@@ -44,6 +44,9 @@ pub(crate) fn judge(offered: &[u8], known: &[Vec<u8>]) -> Verdict {
     }
 }
 
+/// RSA with SHA-1: the `ssh-rsa` signature algorithm, refused on SSH as on QSH.
+pub(crate) const LEGACY_RSA: russh::keys::Algorithm = russh::keys::Algorithm::Rsa { hash: None };
+
 /// Host-key algorithms to offer: those of the known keys first (in list
 /// order), then the remaining defaults. An RSA host key is used only through
 /// SHA-2 signatures (`rsa-sha2-512`, `rsa-sha2-256`): legacy `ssh-rsa`
@@ -51,9 +54,6 @@ pub(crate) fn judge(offered: &[u8], known: &[Vec<u8>]) -> Verdict {
 /// handshake (see `negotiation_error`). An unrecognised known key, or one of
 /// a type russh does not offer by default (`ssh-dss`, security keys), is
 /// skipped.
-/// RSA with SHA-1: the `ssh-rsa` signature algorithm, refused on SSH as on QSH.
-pub(crate) const LEGACY_RSA: russh::keys::Algorithm = russh::keys::Algorithm::Rsa { hash: None };
-
 pub(crate) fn host_key_preference(known: &[Vec<u8>]) -> Vec<russh::keys::Algorithm> {
     use russh::keys::{Algorithm, HashAlg, PublicKey};
     let defaults = russh::Preferred::default().key;
@@ -95,12 +95,17 @@ pub(crate) fn host_key_preference(known: &[Vec<u8>]) -> Vec<russh::keys::Algorit
 /// server offered. SHA-1 is named as the reason only when the server's
 /// host-key offer itself contains `ssh-rsa`: the offer is the only evidence
 /// of what the server can do, and says nothing of what else it would accept.
-/// `None` for any other error.
+/// The names come from the unauthenticated peer and may hold ASCII control
+/// characters, so they are shown escaped. `None` for any other error.
 pub(crate) fn negotiation_error(error: &russh::Error) -> Option<String> {
     let russh::Error::NoCommonAlgo { kind, theirs, .. } = error else {
         return None;
     };
-    let offered = theirs.join(",");
+    let offered = theirs
+        .iter()
+        .map(|name| name.escape_debug().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     Some(match kind {
         russh::AlgorithmKind::Key if theirs.iter().any(|a| a == LEGACY_RSA.as_str()) => format!(
             "no common host-key algorithm (offered: {offered}): legacy ssh-rsa (SHA-1) host \
@@ -151,6 +156,33 @@ mod tests {
             );
         }
         assert_eq!(negotiation_error(&russh::Error::Disconnect), None);
+    }
+
+    /// The peer's names are shown escaped: no raw control byte reaches the
+    /// message, and ordinary names stay as they are.
+    #[test]
+    fn a_failed_negotiation_shows_the_offer_without_control_bytes() {
+        for kind in [russh::AlgorithmKind::Key, russh::AlgorithmKind::Cipher] {
+            let message = negotiation_error(&no_common(
+                kind,
+                &[
+                    "ssh-rsa",
+                    "x\u{1b}]0;title\u{7}\r\nforged: line\u{7f}",
+                    "rsa-sha2-512",
+                ],
+            ))
+            .unwrap();
+            assert!(
+                !message.chars().any(|c| c.is_ascii_control()),
+                "{message:?}"
+            );
+            assert!(
+                message.contains(
+                    "ssh-rsa,x\\u{1b}]0;title\\u{7}\\r\\nforged: line\\u{7f},rsa-sha2-512"
+                ),
+                "{message}"
+            );
+        }
     }
 
     /// Wire bytes of a fresh ecdsa-sha2-nistp256 public key.

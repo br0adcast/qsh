@@ -278,11 +278,30 @@ fn an_agent_reply_of_another_rsa_algorithm_is_not_forwarded() {
     assert_eq!(activity.signed_publickey.load(Ordering::SeqCst), 0);
 }
 
+/// The agent fixture's thread ends on drop, also when no client connected
+/// or one is still connected.
+#[test]
+fn the_mismatched_agent_stops_on_drop() {
+    let sources = rsa_sources();
+    let started = std::time::Instant::now();
+    drop(MismatchedAgent::start(sources.key.clone()));
+    let agent = MismatchedAgent::start(sources.key.clone());
+    let client = std::os::unix::net::UnixStream::connect(agent.socket()).unwrap();
+    drop(agent);
+    drop(client);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
 /// A minimal SSH agent holding one RSA key, which always signs with legacy
-/// `ssh-rsa`, whatever the request's flags ask for.
+/// `ssh-rsa`, whatever the request's flags ask for. It serves one client
+/// on its own thread, which dropping it stops and joins, whether or not a
+/// client ever connected.
 struct MismatchedAgent {
     dir: tempfile::TempDir,
     flags: Arc<Mutex<Vec<u32>>>,
+    /// Set on drop; holds the served connection, so drop can end its reads.
+    stop: Arc<Mutex<(bool, Option<std::os::unix::net::UnixStream>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MismatchedAgent {
@@ -294,10 +313,30 @@ impl MismatchedAgent {
         let flags = Arc::new(Mutex::new(Vec::new()));
         let recorded = flags.clone();
         let blob = key.public_key().to_bytes().unwrap();
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(Mutex::new((false, None)));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.lock().unwrap().0 {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("agent accept: {e}"),
+                }
             };
+            stream.set_nonblocking(false).unwrap();
+            {
+                let mut stop = stopped.lock().unwrap();
+                if stop.0 {
+                    return;
+                }
+                stop.1 = Some(stream.try_clone().unwrap());
+            }
             let string = |bytes: &[u8]| {
                 let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
                 out.extend_from_slice(bytes);
@@ -348,10 +387,293 @@ impl MismatchedAgent {
                 }
             }
         });
-        MismatchedAgent { dir, flags }
+        MismatchedAgent {
+            dir,
+            flags,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     fn socket(&self) -> std::path::PathBuf {
         self.dir.path().join("agent.sock")
+    }
+}
+
+impl Drop for MismatchedAgent {
+    fn drop(&mut self) {
+        {
+            let mut stop = self.stop.lock().unwrap();
+            stop.0 = true;
+            if let Some(stream) = stop.1.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let joined = thread.join();
+            if !std::thread::panicking() {
+                joined.expect("agent thread");
+            }
+        }
+    }
+}
+
+/// How a [`RawKexPeer`]'s key exchange ended.
+#[derive(Debug, PartialEq)]
+enum KexEnd {
+    /// The client sent NEWKEYS: it accepted the host signature.
+    Accepted,
+    /// The client closed or disconnected instead.
+    Refused,
+}
+
+/// A peer that runs one unencrypted curve25519-sha256 key exchange by hand,
+/// offering only `negotiated` as its host-key algorithm, and signs the
+/// exchange hash with `key` through `digest`, whatever was negotiated. It
+/// stops at the client's answer: NEWKEYS, or a close.
+struct RawKexPeer {
+    port: u16,
+    thread: Option<std::thread::JoinHandle<KexEnd>>,
+}
+
+impl RawKexPeer {
+    fn start(key: Arc<PreparedKey>, negotiated: &'static str, digest: RsaDigest) -> RawKexPeer {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("no client: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let string = |bytes: &[u8]| [&(bytes.len() as u32).to_be_bytes()[..], bytes].concat();
+            let send = |stream: &mut std::net::TcpStream, payload: &[u8]| {
+                let mut padding = 8 - (5 + payload.len()) % 8;
+                if padding < 4 {
+                    padding += 8;
+                }
+                let length = (1 + payload.len() + padding) as u32;
+                let packet = [
+                    &length.to_be_bytes()[..],
+                    &[padding as u8],
+                    payload,
+                    &vec![0; padding],
+                ]
+                .concat();
+                stream.write_all(&packet).unwrap();
+            };
+            // The next packet's payload; None once the client is gone.
+            let receive = |stream: &mut std::net::TcpStream| -> Option<Vec<u8>> {
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).ok()?;
+                let mut packet = vec![0; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut packet).ok()?;
+                let padding = *packet.first()? as usize;
+                Some(packet.get(1..packet.len().checked_sub(padding)?)?.to_vec())
+            };
+
+            let server_id = b"SSH-2.0-qsh-raw-kex-peer";
+            stream
+                .write_all(&[&server_id[..], b"\r\n"].concat())
+                .unwrap();
+            let mut client_id = Vec::new();
+            let mut byte = [0];
+            while client_id.last() != Some(&b'\n') {
+                if stream.read_exact(&mut byte).is_err() {
+                    return KexEnd::Refused;
+                }
+                client_id.push(byte[0]);
+            }
+            let client_id = client_id.trim_ascii_end().to_vec();
+
+            let mut server_kexinit = vec![20];
+            server_kexinit.extend_from_slice(&[7; 16]);
+            for list in [
+                "curve25519-sha256",
+                negotiated,
+                "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr",
+                "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes256-ctr",
+                "hmac-sha2-256-etm@openssh.com,hmac-sha2-256",
+                "hmac-sha2-256-etm@openssh.com,hmac-sha2-256",
+                "none",
+                "none",
+                "",
+                "",
+            ] {
+                server_kexinit.extend_from_slice(&string(list.as_bytes()));
+            }
+            server_kexinit.extend_from_slice(&[0, 0, 0, 0, 0]);
+            send(&mut stream, &server_kexinit);
+
+            let Some(client_kexinit) = receive(&mut stream) else {
+                return KexEnd::Refused;
+            };
+            assert_eq!(client_kexinit.first(), Some(&20));
+            let Some(init) = receive(&mut stream) else {
+                return KexEnd::Refused;
+            };
+            // KEX_ECDH_INIT: the client's 32-byte X25519 public key.
+            assert_eq!(&init[..5], &[30, 0, 0, 0, 32]);
+            let client_public = init[5..37].to_vec();
+
+            let mut secret = [0; 32];
+            ssh_key::rand_core::TryRng::try_fill_bytes(
+                &mut ssh_key::getrandom::SysRng,
+                &mut secret,
+            )
+            .unwrap();
+            let server_public = curve25519_dalek::MontgomeryPoint::mul_base_clamped(secret).0;
+            let shared =
+                curve25519_dalek::MontgomeryPoint(client_public.clone().try_into().unwrap())
+                    .mul_clamped(secret)
+                    .0;
+            // The shared secret as an SSH mpint.
+            let mut mpint = shared
+                .iter()
+                .copied()
+                .skip_while(|&b| b == 0)
+                .collect::<Vec<u8>>();
+            if mpint.first().is_some_and(|b| b & 0x80 != 0) {
+                mpint.insert(0, 0);
+            }
+
+            let host_key = key.public_key().to_bytes().unwrap();
+            let mut exchange = Vec::new();
+            for part in [
+                &client_id[..],
+                server_id,
+                &client_kexinit,
+                &server_kexinit,
+                &host_key,
+                &client_public,
+                &server_public,
+                &mpint,
+            ] {
+                exchange.extend_from_slice(&string(part));
+            }
+            let hash = <sha2::Sha256 as sha2::Digest>::digest(&exchange);
+            let signature = key.sign(&hash, digest).unwrap();
+            let signature = sshauth::record::encode_signature(&signature).unwrap();
+            send(
+                &mut stream,
+                &[
+                    &[31][..],
+                    &string(&host_key),
+                    &string(&server_public),
+                    &string(&signature),
+                ]
+                .concat(),
+            );
+            match receive(&mut stream) {
+                Some(next) if next.first() == Some(&21) => KexEnd::Accepted,
+                _ => KexEnd::Refused,
+            }
+        });
+        RawKexPeer {
+            port,
+            thread: Some(thread),
+        }
+    }
+
+    /// Waits, bounded by the peer's own timeouts, for how the exchange ended.
+    fn end(mut self) -> KexEnd {
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for RawKexPeer {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The host signature actually received must use the negotiated algorithm:
+/// an exchange that negotiated `rsa-sha2-512` and is signed with `ssh-rsa`
+/// (SHA-1), or with another SHA-2 hash, is refused before NEWKEYS, so before
+/// any host-key check or authentication. Matching signatures, RSA SHA-2 and
+/// Ed25519, are accepted by the same peer, which shows its exchange hash is
+/// right.
+#[test]
+fn a_host_signature_of_another_algorithm_than_negotiated_is_refused() {
+    let sources = rsa_sources();
+    let keys = tempfile::tempdir().unwrap();
+    let (ed25519, _) = keygen_file("ed25519", keys.path());
+    let ed25519 = Arc::new(
+        PreparedKey::from_key(
+            ssh_key::PrivateKey::from_openssh(std::fs::read_to_string(ed25519).unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
+    for (key, negotiated, digest, expected) in [
+        (
+            &sources.key,
+            "rsa-sha2-512",
+            RsaDigest::Sha1,
+            KexEnd::Refused,
+        ),
+        (
+            &sources.key,
+            "rsa-sha2-256",
+            RsaDigest::Sha1,
+            KexEnd::Refused,
+        ),
+        (
+            &sources.key,
+            "rsa-sha2-512",
+            RsaDigest::Sha256,
+            KexEnd::Refused,
+        ),
+        (
+            &sources.key,
+            "rsa-sha2-512",
+            RsaDigest::Sha512,
+            KexEnd::Accepted,
+        ),
+        (
+            &sources.key,
+            "rsa-sha2-256",
+            RsaDigest::Sha256,
+            KexEnd::Accepted,
+        ),
+        (&ed25519, "ssh-ed25519", RsaDigest::Sha512, KexEnd::Accepted),
+    ] {
+        let peer = RawKexPeer::start(key.clone(), negotiated, digest);
+        let result = go(
+            ssh::SshParams {
+                host: "127.0.0.1".into(),
+                port: peer.port,
+                username: "generated".into(),
+                known_host_keys: vec![key.public_key().to_bytes().unwrap()],
+                connect_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(15),
+                compression: false,
+                tcp_nodelay: true,
+                knock: vec![],
+            },
+            vec![ssh::AuthMethod::KeyFile(sources.file.clone())],
+        );
+        let case = format!("{negotiated} signed with {digest:?}");
+        assert_eq!(peer.end(), expected, "{case}: {result:?}");
+        match expected {
+            KexEnd::Refused => assert!(
+                matches!(&result, Err(ssh::SshError::Protocol(m)) if m == "Wrong server signature"),
+                "{case}: {result:?}"
+            ),
+            // The peer stops after the client's NEWKEYS, so no login succeeds.
+            KexEnd::Accepted => assert!(result.is_err(), "{case}: {result:?}"),
+        }
     }
 }

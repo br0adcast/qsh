@@ -1,0 +1,94 @@
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,7 +24,6 @@
+ description = "A client and server SSH library."
+ homepage = "https://github.com/warp-tech/russh"
+ documentation = "https://docs.rs/russh"
+-readme = "README.md"
+ keywords = ["ssh"]
+ license = "Apache-2.0"
+ repository = "https://github.com/warp-tech/russh"
+@@ -57,46 +56,6 @@
+ name = "russh"
+ path = "src/lib.rs"
+ 
+-[[example]]
+-name = "client_exec_interactive"
+-path = "examples/client_exec_interactive.rs"
+-
+-[[example]]
+-name = "client_exec_simple"
+-path = "examples/client_exec_simple.rs"
+-
+-[[example]]
+-name = "client_open_direct_tcpip"
+-path = "examples/client_open_direct_tcpip.rs"
+-
+-[[example]]
+-name = "echoserver"
+-path = "examples/echoserver.rs"
+-
+-[[example]]
+-name = "echoserver_certificates"
+-path = "examples/echoserver_certificates.rs"
+-
+-[[example]]
+-name = "ratatui_app"
+-path = "examples/ratatui_app.rs"
+-
+-[[example]]
+-name = "ratatui_shared_app"
+-path = "examples/ratatui_shared_app.rs"
+-
+-[[example]]
+-name = "sftp_client"
+-path = "examples/sftp_client.rs"
+-
+-[[example]]
+-name = "sftp_server"
+-path = "examples/sftp_server.rs"
+-
+-[[example]]
+-name = "test"
+-path = "examples/test.rs"
+-
+ [[test]]
+ name = "auth_state_reset"
+ path = "tests/auth_state_reset.rs"
+@@ -133,11 +92,6 @@
+ name = "test_server_cert"
+ path = "tests/test_server_cert.rs"
+ 
+-[[bench]]
+-name = "ciphers"
+-path = "benches/ciphers.rs"
+-harness = false
+-
+ [dependencies.aes]
+ version = "0.9"
+ 
+diff -ruN a/src/client/kex.rs b/src/client/kex.rs
+--- a/src/client/kex.rs
++++ b/src/client/kex.rs
+@@ -333,6 +333,20 @@
+                 ensure_end(&signature_reader)?;
+                 ensure_end(r)?;
+ 
++                // The signature must use the negotiated host-key algorithm
++                // (for a certificate, the plain algorithm `names.key` holds).
++                // Verifying it by the algorithm it names would accept, for
++                // example, an `ssh-rsa` (SHA-1) signature on an exchange that
++                // negotiated `rsa-sha2-512`.
++                if signature.algorithm() != names.key {
++                    debug!(
++                        "server sig algorithm {:?} is not the negotiated {:?}",
++                        signature.algorithm(),
++                        names.key
++                    );
++                    return Err(Error::WrongServerSig);
++                }
++
+                 if let Err(e) =
+                     signature::Verifier::verify(&server_host_key, hash.as_ref(), &signature)
+                 {
