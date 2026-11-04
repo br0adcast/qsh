@@ -340,9 +340,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// A real attempt to a fixture-owned silent socket, wrapped as a round's
-    /// published login, and its teardown record.
-    fn published_login(peer: &std::net::UdpSocket) -> (RoundTask, Arc<crate::connect::Events>) {
+    /// A real attempt to a fixture-owned silent socket, as an admitted
+    /// login, and its teardown record.
+    fn admitted_login(peer: &std::net::UdpSocket) -> (Connected, Arc<crate::connect::Events>) {
         use crate::connect::{Attempt, AttemptScope, Login};
         let (tx, _rx) = mpsc::channel();
         let attempt = Attempt::open(
@@ -372,6 +372,12 @@ mod tests {
             port: peer.local_addr().unwrap().port(),
             remote: peer.local_addr().unwrap(),
         };
+        (connected, events)
+    }
+
+    /// [`admitted_login`], published by a round nobody has adopted.
+    fn published_login(peer: &std::net::UdpSocket) -> (RoundTask, Arc<crate::connect::Events>) {
+        let (connected, events) = admitted_login(peer);
         let (_events_tx, events_rx) = mpsc::channel();
         let recovery = Arc::new(Recovery::new(
             RecoveryEpoch {
@@ -410,6 +416,26 @@ mod tests {
         let (task, events) = published_login(&peer);
         drop(task);
         assert_eq!(*events.teardowns.lock().unwrap(), [Teardown::Detach]);
+    }
+
+    /// A signal observed after the login was admitted but before the UI
+    /// started: a hangup detaches that login, keeping a session it may
+    /// already hold, and a close closes it.
+    #[test]
+    fn a_login_admitted_before_the_ui_follows_the_winning_signal() {
+        use crate::connect::Teardown;
+        use crate::signals::Leave;
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for (leave, expected) in [
+            (Leave::Keep, Teardown::Detach),
+            (Leave::Close, Teardown::Close),
+        ] {
+            let (connected, events) = admitted_login(&peer);
+            connected.leave_before_ui(leave);
+            assert_eq!(*events.teardowns.lock().unwrap(), [expected], "{leave:?}");
+            drop(connected);
+            assert_eq!(*events.teardowns.lock().unwrap(), [expected], "{leave:?}");
+        }
     }
 
     #[test]

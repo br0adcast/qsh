@@ -411,7 +411,9 @@ both seen before qsh has decided how to leave, the close wins; a signal that
 arrives after that decision changes nothing. Which signals a closing terminal
 or a logout sends, and in what order, depends on the terminal and the system.
 Before a session is attached (while connecting, or at a trust or password
-question), any of these signals cancels with code 130. Typing `Ctrl-C` or
+question), any of these signals cancels with code 130. If the login was already
+admitted when the signal arrived, a hangup still leaves its session on the
+server, and a closing signal ends it. Typing `Ctrl-C` or
 `Ctrl-Z` in raw mode does not send these operating-system signals to qsh.
 
 After a lost terminal, restoring its settings and printing the closing notice

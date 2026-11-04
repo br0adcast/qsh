@@ -978,9 +978,12 @@ fn a_hangup_mid_paste_keeps_the_session_and_replays_nothing() {
     wait_for_the_line(&screen, &daemon);
     let mark = mark_with_pid(&mut first, &screen);
 
-    // Bounded: the observer ends by itself, with or without input.
+    // Bounded the way the paste test's reader is: with `min 0 time 120`
+    // each read gives up after 12 s without a byte, so the observer ends by
+    // itself 12 s after the last byte it received.
     first.type_line(&format!(
-        "stty raw -echo; echo OBS''READY; timeout 12 cat > '{}'; stty sane; echo OBS''DONE",
+        "stty raw -echo min 0 time 120; echo OBS''READY; dd bs=1 of='{}' 2>/dev/null; \
+         stty sane; echo OBS''DONE",
         capture.display()
     ));
     assert!(
@@ -1004,6 +1007,19 @@ fn a_hangup_mid_paste_keeps_the_session_and_replays_nothing() {
     let mut second = spawn_client(&daemon, &key_path, config.path());
     let screen2 = Screen::of(&second);
     wait_for_the_line(&screen2, &daemon);
+    // The kept screen arrives whole: the observer's start is on it, and its
+    // end is not yet, so the observer was still running when this run
+    // attached.
+    assert!(
+        wait_until(|| screen2.has_row("OBSREADY")),
+        "the kept screen must arrive; screen:\n{}",
+        screen2.dump()
+    );
+    assert!(
+        !screen2.has_row("OBSDONE"),
+        "the observer must outlast the reattachment; screen:\n{}",
+        screen2.dump()
+    );
     // Nothing is typed until the observer has ended.
     assert!(
         wait_for(Duration::from_secs(30), || screen2.has_row("OBSDONE")),

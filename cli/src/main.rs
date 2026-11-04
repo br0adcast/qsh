@@ -138,7 +138,19 @@ fn run(a: args::Args) -> i32 {
         &link_rx,
     );
     let climbed = climb.run();
-    if signals::termination_requested() {
+    if let Some(leave) = signals::requested_leave() {
+        // Exit 130 before the UI either way; what becomes of a session the
+        // login already holds follows the signal.
+        if let Climbed::Connected(connected) = &climbed {
+            connected.leave_before_ui(leave);
+            if leave == signals::Leave::Keep {
+                log::log("hangup before the UI: keeping the admitted session");
+                best_effort_line(&status::left_kept_notice(
+                    &setup.args().addresses[connected.addr].host,
+                    claim.persisted(),
+                ));
+            }
+        }
         return 130;
     }
     let connected = match climbed {

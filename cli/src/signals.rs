@@ -359,7 +359,18 @@ impl Drop for DeferredSuspend {
 /// Whether termination or a hangup was requested, without consuming the
 /// interactive loop's flags: a foreground phase cancels for either.
 pub fn termination_requested() -> bool {
-    TERMINATE.load(Ordering::SeqCst) || HANGUP.load(Ordering::SeqCst)
+    requested_leave().is_some()
+}
+
+/// The exit requested so far ([`Pending::leave`]), without consuming the
+/// interactive loop's flags.
+pub fn requested_leave() -> Option<Leave> {
+    Pending {
+        terminate: TERMINATE.load(Ordering::SeqCst),
+        hangup: HANGUP.load(Ordering::SeqCst),
+        ..Pending::default()
+    }
+    .leave()
 }
 
 /// Keeps a cancellation token synchronized with termination for one foreground operation.
@@ -508,6 +519,7 @@ mod tests {
             termination_requested() && termination_requested(),
             "a foreground phase sees the hangup without consuming it"
         );
+        assert_eq!(requested_leave(), Some(Leave::Keep));
         let pending = take_pending();
         assert!(pending.hangup && !pending.terminate, "{pending:?}");
         assert_eq!(pending.leave(), Some(Leave::Keep));
@@ -515,6 +527,7 @@ mod tests {
 
         raise(Signal::SIGHUP).expect("raise");
         raise(Signal::SIGTERM).expect("raise");
+        assert_eq!(requested_leave(), Some(Leave::Close), "close wins");
         let both = take_pending();
         assert!(both.hangup && both.terminate);
         assert_eq!(both.leave(), Some(Leave::Close), "close wins");

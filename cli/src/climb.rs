@@ -60,6 +60,19 @@ pub struct Connected {
     pub remote: SocketAddr,
 }
 
+impl Connected {
+    /// The run ends before its UI starts, on a signal observed after this
+    /// login was admitted: it may already own the shell. A hangup lets it go
+    /// and keeps the session; a close ends it. Dropping it instead would
+    /// close it implicitly, whatever the signal.
+    pub fn leave_before_ui(&self, leave: crate::signals::Leave) {
+        match leave {
+            crate::signals::Leave::Keep => self.attempt.detach(),
+            crate::signals::Leave::Close => self.attempt.close(),
+        }
+    }
+}
+
 // Returned once per climb, and moved straight into its parts: the size of
 // the large variant costs nothing worth a box.
 #[allow(clippy::large_enum_variant)]
