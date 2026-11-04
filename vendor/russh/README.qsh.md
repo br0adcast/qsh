@@ -19,6 +19,8 @@ benchmark targets removed. Upstream examples, benchmarks, README, lockfile and
 registry metadata are omitted.
 
 `qsh.patch` records the source/manifest changes relative to that archive. The
+two changed files, `Cargo.toml` and `src/client/kex.rs`, each carry a qsh
+modification notice at the top. The
 client verified the server's key-exchange signature by whatever algorithm the
 signature named, without comparing it with the negotiated host-key algorithm.
 With RSA/SHA-1 verification enabled by russh's own `ssh-key/sha1` feature, a

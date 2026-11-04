@@ -1,3 +1,9 @@
+// Modified by qsh: the server's key-exchange signature must use the
+// negotiated host-key algorithm (qsh #150), so an `ssh-rsa` (SHA-1)
+// signature on an `rsa-sha2-*` exchange is refused. The change is marked
+// below; see vendor/russh/README.qsh.md and qsh.patch. Otherwise this file
+// is russh 0.63.3 as published.
+
 use core::fmt;
 use std::cell::RefCell;
 use std::fmt::{Debug, Formatter};
