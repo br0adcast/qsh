@@ -59,13 +59,181 @@ fn key(home: &Path) -> (PathBuf, String) {
     )
     .unwrap();
     let path = home.join("identity");
-    std::fs::write(
-        &path,
-        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.write_all(key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes())
+        .unwrap();
+    drop(file);
     (path, key.public_key().to_openssh().unwrap())
 }
+
+const KEY_MODE_CHILD: &str = "install_fixture_tests::key_mode_child_entry";
+const KEY_MODE_ENV: &str = "QSH_INSTALL_FIXTURE_KEY_MODE_RECORD";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyModeRequest {
+    schema: u8,
+    mask: u32,
+    home: PathBuf,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyModeResult {
+    schema: u8,
+    mask: u32,
+    mode: u32,
+    uid: u32,
+    regular: bool,
+    loaded: bool,
+    public_matches: bool,
+}
+
+struct KeyModeChild(std::process::Child);
+impl Drop for KeyModeChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn fixture_keys_are_private_under_permissive_umasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut results = Vec::new();
+    for mask in [0o022, 0o000] {
+        let home = directory.path().join(format!("mask-{mask:03o}"));
+        std::fs::create_dir(&home).unwrap();
+        let request = home.join("request.json");
+        std::fs::write(
+            &request,
+            serde_json::to_vec(&KeyModeRequest {
+                schema: 1,
+                mask,
+                home: home.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let stdout = home.join("stdout");
+        let stderr = home.join("stderr");
+        // Only this owned child changes its umask; paths are positional args.
+        let mut child = KeyModeChild(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "umask \"$1\"; shift; exec \"$@\"", "fixture-key-mode"])
+                .arg(format!("{mask:03o}"))
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", KEY_MODE_CHILD, "--nocapture", "--test-threads=1"])
+                .env(KEY_MODE_ENV, &request)
+                .env("RUST_BACKTRACE", "0")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let status = wait_for_exit(&mut child.0).expect("key-mode child timed out and was reaped");
+        for path in [&stdout, &stderr, &home.join("result.json")] {
+            assert!(std::fs::metadata(path).unwrap().len() <= 65536);
+        }
+        let output = std::fs::read_to_string(stdout).unwrap();
+        assert!(output.contains("running 1 test\n"));
+        let result: KeyModeResult =
+            serde_json::from_slice(&std::fs::read(home.join("result.json")).unwrap()).unwrap();
+        assert_eq!((result.schema, result.mask), (1, mask));
+        println!("key-mode child: {result:?}; exit={status}");
+        results.push((result, status.success(), output));
+    }
+    assert_eq!(results.len(), 2);
+    for (result, success, output) in results {
+        assert_eq!(result.mode, 0o600, "mask {:03o}", result.mask);
+        assert_eq!(result.uid, unsafe { libc::geteuid() });
+        assert!(result.regular && result.loaded && result.public_matches && success);
+        assert!(output.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    }
+}
+
+/// Discovery alone must never create a key or change any process's umask.
+#[test]
+fn key_mode_child_entry() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(path) = std::env::var_os(KEY_MODE_ENV) else {
+        return;
+    };
+    assert!(std::fs::metadata(&path).unwrap().len() <= 4096);
+    let request: KeyModeRequest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(request.schema, 1);
+    assert!(matches!(request.mask, 0o022 | 0o000));
+    assert!(request.home.is_absolute() && request.home.is_dir());
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let mask = u32::from_str_radix(
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Umask:"))
+            .unwrap()
+            .trim(),
+        8,
+    )
+    .unwrap();
+    assert_eq!(mask, request.mask);
+    let (path, public) = key(&request.home);
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    let loaded = sshauth::sign_file::FileSigner::load(&path, None);
+    let result = KeyModeResult {
+        schema: 1,
+        mask,
+        mode: metadata.mode() & 0o7777,
+        uid: metadata.uid(),
+        regular: metadata.is_file(),
+        loaded: loaded.is_ok(),
+        public_matches: loaded
+            .as_ref()
+            .is_ok_and(|signer| signer.public_key().to_openssh().unwrap() == public),
+    };
+    std::fs::write(
+        request.home.join("result.json"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result.mode, 0o600);
+    assert_eq!(result.uid, unsafe { libc::geteuid() });
+    assert!(result.regular && result.loaded && result.public_matches);
+}
+
+#[test]
+fn fixture_key_creation_refuses_an_existing_path_without_changing_it() {
+    use std::os::unix::fs::MetadataExt;
+    let home = tempfile::tempdir().unwrap();
+    let (path, public) = key(home.path());
+    let bytes = std::fs::read(&path).unwrap();
+    let before = std::fs::symlink_metadata(&path).unwrap();
+    assert!(std::panic::catch_unwind(|| key(home.path())).is_err());
+    assert!(
+        std::fs::read(&path).unwrap() == bytes,
+        "existing key was overwritten"
+    );
+    let after = std::fs::symlink_metadata(&path).unwrap();
+    assert_eq!(
+        (after.mode(), after.uid(), after.ino()),
+        (before.mode(), before.uid(), before.ino())
+    );
+    assert_eq!(after.mode() & 0o7777, 0o600);
+    assert!(
+        sshauth::sign_file::FileSigner::load(&path, None)
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap()
+            == public
+    );
+}
+
 fn trust(home: &Path, sb: &Sandbox) {
     let path = home.join(".ssh");
     std::fs::create_dir_all(&path).unwrap();
