@@ -1373,14 +1373,14 @@ enum FailureError {
     OutputLimit,
     Unknown,
 }
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum Terminal {
     Unknown,
     Exited,
     Signaled,
 }
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 struct CachedStatus {
     terminal: Terminal,
     exit: Option<i32>,
@@ -1420,6 +1420,7 @@ struct ReplacementDiagnostic<'a> {
     progress: &'a std::cell::Cell<ReplacementProgress>,
     events: Option<&'a ConnectedEvents>,
     actor: &'a Path,
+    status_wait: Option<&'a std::cell::Cell<StatusWaitObservation>>,
 }
 #[derive(serde::Serialize)]
 struct MarkerFacts {
@@ -1461,8 +1462,219 @@ enum FailurePayload {
         progress: ReplacementProgress,
         events: Option<EventFacts>,
         markers: MarkerFacts,
+        status_wait: Option<StatusWaitObservation>,
     },
 }
+#[derive(Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StatusResult {
+    #[default]
+    Unobserved,
+    ValidStatus,
+    ParseRefused,
+    NoDaemon,
+    TimedOut,
+    RequestError,
+    Unknown,
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StatusBuild {
+    #[default]
+    Unknown,
+    Expected,
+    Old,
+    Other,
+}
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct SeenStatusResults {
+    valid_status: bool,
+    parse_refused: bool,
+    no_daemon: bool,
+    timed_out: bool,
+    request_error: bool,
+    unknown: bool,
+    expected_build: bool,
+    old_build: bool,
+    other_build: bool,
+}
+#[derive(Clone, Copy, serde::Serialize)]
+struct CachedAtWaitEntry {
+    status: CachedStatus,
+    stderr_eof: bool,
+    stderr_bytes: usize,
+}
+#[derive(Clone, Copy, serde::Serialize)]
+struct StatusWaitObservation {
+    last_result: StatusResult,
+    last_build: StatusBuild,
+    seen: SeenStatusResults,
+    completed_calls: u32,
+    cached_at_wait_entry: CachedAtWaitEntry,
+}
+impl StatusWaitObservation {
+    fn new(cached_at_wait_entry: CachedAtWaitEntry) -> Self {
+        Self {
+            last_result: StatusResult::Unobserved,
+            last_build: StatusBuild::Unknown,
+            seen: SeenStatusResults::default(),
+            completed_calls: 0,
+            cached_at_wait_entry,
+        }
+    }
+}
+fn status_wait_predicate(
+    observation: &std::cell::Cell<StatusWaitObservation>,
+    old: u64,
+    expected: u64,
+    request: impl FnOnce() -> (Option<u64>, &'static str),
+) -> bool {
+    // Exactly one existing request, recorded only after it returns. Its original
+    // build-equality predicate remains the sole success decision.
+    let (build, family) = request();
+    let mut value = observation.get();
+    value.last_result = match family {
+        "VALID_STATUS" => StatusResult::ValidStatus,
+        "PARSE_REFUSED" => StatusResult::ParseRefused,
+        "NO_DAEMON" => StatusResult::NoDaemon,
+        "TIMED_OUT" => StatusResult::TimedOut,
+        "REQUEST_ERROR" => StatusResult::RequestError,
+        _ => StatusResult::Unknown,
+    };
+    value.last_build = match (value.last_result, build) {
+        (StatusResult::ValidStatus, Some(n)) if n == expected => StatusBuild::Expected,
+        (StatusResult::ValidStatus, Some(n)) if n == old => StatusBuild::Old,
+        (StatusResult::ValidStatus, Some(_)) => StatusBuild::Other,
+        _ => StatusBuild::Unknown,
+    };
+    match value.last_build {
+        StatusBuild::Expected => value.seen.expected_build = true,
+        StatusBuild::Old => value.seen.old_build = true,
+        StatusBuild::Other => value.seen.other_build = true,
+        StatusBuild::Unknown => {}
+    }
+    match value.last_result {
+        StatusResult::ValidStatus => value.seen.valid_status = true,
+        StatusResult::ParseRefused => value.seen.parse_refused = true,
+        StatusResult::NoDaemon => value.seen.no_daemon = true,
+        StatusResult::TimedOut => value.seen.timed_out = true,
+        StatusResult::RequestError => value.seen.request_error = true,
+        StatusResult::Unknown => value.seen.unknown = true,
+        StatusResult::Unobserved => {}
+    }
+    value.completed_calls = value.completed_calls.saturating_add(1);
+    observation.set(value);
+    build.is_some_and(|build| build == expected)
+}
+fn fixture_status_projection_controls() {
+    let cache = CachedAtWaitEntry {
+        status: CachedStatus::from_status(None),
+        stderr_eof: false,
+        stderr_bytes: usize::MAX,
+    };
+    let state = std::cell::Cell::new(StatusWaitObservation::new(cache));
+    let initial = serde_json::to_value(state.get()).unwrap();
+    assert_eq!(initial["last_result"], "UNOBSERVED");
+    for (build, family, result, category) in [
+        (Some(20), "VALID_STATUS", "VALID_STATUS", "EXPECTED"),
+        (Some(10), "VALID_STATUS", "VALID_STATUS", "OLD"),
+        (Some(30), "VALID_STATUS", "VALID_STATUS", "OTHER"),
+        (None, "PARSE_REFUSED", "PARSE_REFUSED", "UNKNOWN"),
+        (None, "NO_DAEMON", "NO_DAEMON", "UNKNOWN"),
+        (None, "TIMED_OUT", "TIMED_OUT", "UNKNOWN"),
+        (None, "REQUEST_ERROR", "REQUEST_ERROR", "UNKNOWN"),
+        (None, "PRIVATE_CANARY", "UNKNOWN", "UNKNOWN"),
+    ] {
+        status_wait_predicate(&state, 10, 20, || (build, family));
+        let value = serde_json::to_value(state.get()).unwrap();
+        assert_eq!(value["last_result"], result);
+        assert_eq!(value["last_build"], category);
+    }
+    assert!(serde_json::to_value(state.get()).unwrap()["seen"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|v| *v == true));
+    let directory = tempfile::tempdir().unwrap();
+    let record = FailurePayload::Replacement {
+        stage: ReplacementSite::NewBuildStatus,
+        progress: ReplacementProgress {
+            open_enqueued: true,
+            offer_enqueued: true,
+            accepted: true,
+            uploaded: true,
+            restarting: true,
+        },
+        events: Some(EventFacts {
+            opened: true,
+            refused: true,
+            update_accept: true,
+            update_reject: true,
+            restarting: true,
+            exit0: true,
+            exitother: true,
+        }),
+        markers: marker_facts(directory.path(), directory.path()),
+        status_wait: Some(state.get()),
+    };
+    let bytes = failure_bytes(&record).unwrap();
+    assert!(bytes.len() <= 2048);
+    assert!(!bytes
+        .windows(b"PRIVATE_CANARY".len())
+        .any(|b| b == b"PRIVATE_CANARY"));
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["status_wait"]["cached_at_wait_entry"]["status"]["terminal"],
+        "UNKNOWN"
+    );
+    assert_eq!(
+        value["status_wait"]["cached_at_wait_entry"]["stderr_eof"],
+        false
+    );
+    assert!(value["status_wait"].get("build").is_none());
+    assert!(value["status_wait"].get("pid").is_none());
+}
+fn fixture_status_single_request_controls() {
+    let cache = CachedAtWaitEntry {
+        status: CachedStatus::from_status(None),
+        stderr_eof: false,
+        stderr_bytes: 0,
+    };
+    let state = std::cell::Cell::new(StatusWaitObservation::new(cache));
+    let requests = std::cell::Cell::new(0);
+    for (build, family) in [
+        (Some(10), "VALID_STATUS"),
+        (None, "NO_DAEMON"),
+        (Some(20), "VALID_STATUS"),
+    ] {
+        let before = requests.get();
+        let accepted = status_wait_predicate(&state, 10, 20, || {
+            requests.set(requests.get() + 1);
+            (build, family)
+        });
+        assert_eq!(requests.get(), before + 1);
+        assert_eq!(state.get().completed_calls, requests.get());
+        assert_eq!(accepted, build.is_some_and(|build| build == 20));
+        if family == "NO_DAEMON" {
+            let facts = serde_json::to_value(state.get()).unwrap();
+            assert_eq!(facts["last_build"], "UNKNOWN");
+            assert_eq!(facts["seen"]["old_build"], true);
+        }
+    }
+    let observed = serde_json::to_value(state.get()).unwrap();
+    assert_eq!(observed["seen"]["valid_status"], true);
+    assert_eq!(observed["seen"]["no_daemon"], true);
+    assert_eq!(
+        observed["cached_at_wait_entry"]["status"]["terminal"],
+        "UNKNOWN"
+    );
+    let mut maximum = state.get();
+    maximum.completed_calls = u32::MAX;
+    state.set(maximum);
+    status_wait_predicate(&state, 10, 20, || (None, "REQUEST_ERROR"));
+    assert_eq!(state.get().completed_calls, u32::MAX);
+}
+
 fn marker_fact(directory: &Path, name: &str) -> Option<bool> {
     match std::fs::symlink_metadata(directory.join(name)) {
         Ok(info) if info.is_file() => Some(true),
@@ -1566,6 +1778,7 @@ fn replacement_failure(context: ReplacementDiagnostic<'_>) {
         progress: context.progress.get(),
         events: event_facts(context.events),
         markers: marker_facts(context.actor, context.actor),
+        status_wait: context.status_wait.map(|value| value.get()),
     });
 }
 fn connected_failure(
@@ -1669,6 +1882,7 @@ fn fixture_timeout_formatter_controls() {
             progress: ReplacementProgress::default(),
             events: None,
             markers: marker_facts(&private, directory.path()),
+            status_wait: None,
         };
         assert!(failure_bytes(&record).unwrap().len() <= 2048);
     }
@@ -1699,6 +1913,7 @@ fn fixture_timeout_tag_control() {
             progress: &progress,
             events: None,
             actor: directory.path(),
+            status_wait: None,
         });
     }
     assert!(!progress.get().offer_enqueued);
@@ -4083,6 +4298,8 @@ fn bounded_command_observe_diagnostic(
     result
 }
 fn fixture_command_controls() {
+    fixture_status_projection_controls();
+    fixture_status_single_request_controls();
     fixture_timeout_formatter_controls();
     fixture_timeout_owner_control();
     fixture_timeout_tag_control();
@@ -4544,6 +4761,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         progress: &progress,
         events,
         actor: actor_directory.path(),
+        status_wait: None,
     };
     let (parked, parked_events) = actual_connect_tagged(
         port,
@@ -4705,9 +4923,22 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         ..progress.get()
     });
     client.detach();
+    let status_wait = std::cell::Cell::new(StatusWaitObservation::new(CachedAtWaitEntry {
+        status: CachedStatus::from_status(daemon.owner.status),
+        stderr_eof: daemon.owner.captured_stderr.is_none(),
+        stderr_bytes: daemon.owner.stderr_bytes.len(),
+    }));
     until_tagged(
-        || daemon_status(&socket).is_some_and(|status| status.build == new_build),
-        Some(diagnostic(ReplacementSite::NewBuildStatus, Some(&events))),
+        || {
+            status_wait_predicate(&status_wait, before.build, new_build, || {
+                let (status, family) = daemon_status_observation(&socket);
+                (status.map(|status| status.build), family)
+            })
+        },
+        Some(ReplacementDiagnostic {
+            status_wait: Some(&status_wait),
+            ..diagnostic(ReplacementSite::NewBuildStatus, Some(&events))
+        }),
     );
     let after = daemon_status(&socket).unwrap();
     assert_eq!(after.pid, before.pid);
