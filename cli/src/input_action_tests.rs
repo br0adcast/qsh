@@ -46,6 +46,7 @@ fn input_executor_links() -> (tempfile::TempDir, Links) {
         round_line: None,
         farewell: None,
         stopped: false,
+        persisted: true,
         replacement_at: None,
         tx: tx.into(),
     };

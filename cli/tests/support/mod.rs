@@ -15,6 +15,7 @@ pub mod shell_env;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -457,6 +458,22 @@ pub fn spawn_qsh_os_at(
         None,
     )
     .expect("openpty");
+    // openpty does not mark the master close-on-exec. Without this the
+    // client inherits a copy of its own terminal's master, and the terminal
+    // can never hang up when the test closes its side.
+    // SAFETY: fcntl on a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        flags >= 0
+            && unsafe {
+                libc::fcntl(
+                    pty.master.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags | libc::FD_CLOEXEC,
+                )
+            } == 0,
+        "mark the pseudo-terminal master close-on-exec"
+    );
 
     let slave = pty.slave;
     let mut command = Command::new(env!("CARGO_BIN_EXE_qsh"));

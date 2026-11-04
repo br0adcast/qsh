@@ -877,6 +877,212 @@ fn sigterm_leaves_the_alternate_screen() {
     eprintln!("alt_screen_sigterm: whole test {:?}", started.elapsed());
 }
 
+/// Marks the shell with its own process id and returns the answer row,
+/// `MARKkept-<pid>`: a later run that prints the same mark and the same `$$`
+/// is in this very shell process, not a fresh one.
+fn mark_with_pid(client: &mut Client, screen: &Screen) -> String {
+    client.type_line("export QSH_MARK=kept-$$; echo M'A'RK$QSH_MARK");
+    let mut mark = None;
+    assert!(
+        wait_until(|| {
+            mark = screen.rows().into_iter().find_map(|row| {
+                let row = row.trim();
+                let pid = row.strip_prefix("MARKkept-")?;
+                (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| row.to_string())
+            });
+            mark.is_some()
+        }),
+        "the shell must answer with its mark; screen:\n{}",
+        screen.dump()
+    );
+    mark.expect("checked above")
+}
+
+/// A second run with the same config home answers `mark` and its own `$$`
+/// equal to the marked pid, within `within`, without asking for a new session.
+fn the_marked_shell_answers(
+    client: &mut Client,
+    screen: &Screen,
+    mark: &str,
+    within: Duration,
+) -> bool {
+    let pid = mark.strip_prefix("MARKkept-").expect("a mark");
+    let expected = format!("{mark}-{pid}");
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline && !screen.has("Start a new session?") {
+        client.master.write_all(b"\x15").expect("type ctrl-u");
+        client.type_line("echo M'A'RK$QSH_MARK-$$");
+        if wait_for(Duration::from_secs(1), || screen.has_row(&expected)) {
+            return true;
+        }
+    }
+    screen.has_row(&expected)
+}
+
+/// SIGTERM keeps closing the session: the next run with the same config
+/// home starts a fresh shell, not the marked one.
+#[test]
+fn sigterm_closes_the_session_for_the_next_run() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut first = spawn_client(&daemon, &key_path, config.path());
+    let screen = Screen::of(&first);
+    answer_yes(&mut first, &screen, &daemon);
+    wait_for_the_line(&screen, &daemon);
+    let mark = mark_with_pid(&mut first, &screen);
+
+    send(&first, nix::sys::signal::Signal::SIGTERM);
+    let status = wait_for_exit(&mut first.child).expect("SIGTERM ends the run");
+    assert_eq!(status.code(), Some(0), "client saw: {}", screen.text());
+
+    let mut second = spawn_client(&daemon, &key_path, config.path());
+    let screen2 = Screen::of(&second);
+    wait_for_the_line(&screen2, &daemon);
+    second.type_line("echo M'A'RK$QSH_MARK-$$");
+    let mut fresh = None;
+    assert!(
+        wait_until(|| {
+            fresh = screen2.rows().into_iter().find_map(|row| {
+                let pid = row.trim().strip_prefix("MARK-")?;
+                (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| pid.to_string())
+            });
+            fresh.is_some()
+        }),
+        "a fresh shell, without the mark, must answer; screen:\n{}",
+        screen2.dump()
+    );
+    let pid = mark.strip_prefix("MARKkept-").expect("a mark");
+    assert_ne!(fresh.as_deref(), Some(pid), "a different shell process");
+    exit_cleanly(&mut second, &screen2, &daemon);
+}
+
+/// A hangup inside an unfinished paste keeps the session, and the pasted
+/// local commands stay literal. One observer in the marked shell records
+/// what its terminal receives from before the hangup until after the next
+/// run has attached: exactly the part of the paste the client forwarded --
+/// not the start of an end marker it was still holding, no end marker made
+/// up, nothing replayed.
+#[test]
+fn a_hangup_mid_paste_keeps_the_session_and_replays_nothing() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let observed = tempfile::tempdir().expect("tempdir");
+    let capture = observed.path().join("capture");
+    let mut first = spawn_client_with(&daemon, &key_path, config.path(), &["--predict", "never"]);
+    let screen = Screen::of(&first);
+    answer_yes(&mut first, &screen, &daemon);
+    wait_for_the_line(&screen, &daemon);
+    let mark = mark_with_pid(&mut first, &screen);
+
+    // Bounded the way the paste test's reader is: with `min 0 time 120`
+    // each read gives up after 12 s without a byte, so the observer ends by
+    // itself 12 s after the last byte it received.
+    first.type_line(&format!(
+        "stty raw -echo min 0 time 120; echo OBS''READY; dd bs=1 of='{}' 2>/dev/null; \
+         stty sane; echo OBS''DONE",
+        capture.display()
+    ));
+    assert!(
+        wait_until(|| screen.has_row("OBSREADY")),
+        "the observer must start; screen:\n{}",
+        screen.dump()
+    );
+    let forwarded = b"\x1b[200~ab\x1d.\x1dr\x1ds";
+    first.master.write_all(forwarded).expect("paste");
+    assert!(
+        wait_until(|| std::fs::read(&capture).is_ok_and(|bytes| bytes == forwarded)),
+        "the forwarded part must reach the shell before the hangup; captured {:?}",
+        std::fs::read(&capture)
+    );
+    // The start of an end marker: the client holds it for what follows.
+    first.master.write_all(b"\x1b[20").expect("cut end marker");
+    send(&first, nix::sys::signal::Signal::SIGHUP);
+    let status = wait_for_exit(&mut first.child).expect("SIGHUP ends the run");
+    assert_eq!(status.code(), Some(1), "client saw: {}", screen.text());
+
+    let mut second = spawn_client(&daemon, &key_path, config.path());
+    let screen2 = Screen::of(&second);
+    wait_for_the_line(&screen2, &daemon);
+    // The kept screen arrives whole: the observer's start is on it, and its
+    // end is not yet, so the observer was still running when this run
+    // attached.
+    assert!(
+        wait_until(|| screen2.has_row("OBSREADY")),
+        "the kept screen must arrive; screen:\n{}",
+        screen2.dump()
+    );
+    assert!(
+        !screen2.has_row("OBSDONE"),
+        "the observer must outlast the reattachment; screen:\n{}",
+        screen2.dump()
+    );
+    // Nothing is typed until the observer has ended.
+    assert!(
+        wait_for(Duration::from_secs(30), || screen2.has_row("OBSDONE")),
+        "the observer must end by itself; screen:\n{}",
+        screen2.dump()
+    );
+    assert_eq!(
+        std::fs::read(&capture).expect("capture"),
+        forwarded,
+        "only the forwarded part, nothing held back, made up or replayed"
+    );
+    assert!(
+        the_marked_shell_answers(&mut second, &screen2, &mark, Duration::from_secs(10)),
+        "the next run must reach the same shell; screen:\n{}",
+        screen2.dump()
+    );
+    exit_cleanly(&mut second, &screen2, &daemon);
+}
+
+/// SIGHUP, what a closing terminal sends, leaves the way `Ctrl-] .` does:
+/// exit 1, the terminal back on its own screen before the notice, and the
+/// next run with the same config home is in the same shell process.
+#[test]
+fn sighup_keeps_the_session_and_the_next_run_comes_back() {
+    let _serial = serialised();
+    let started = Instant::now();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut first = spawn_client(&daemon, &key_path, config.path());
+    let screen = Screen::of(&first);
+
+    answer_yes(&mut first, &screen, &daemon);
+    wait_for_the_line(&screen, &daemon);
+    let mark = mark_with_pid(&mut first, &screen);
+
+    send(&first, nix::sys::signal::Signal::SIGHUP);
+    let status = wait_for_exit(&mut first.child).expect("SIGHUP ends the run");
+    let restored = wait_until(|| switches(&screen.bytes()) == vec![true, false]);
+    let kept = wait_until(|| screen.has("qsh: left 127.0.0.1; the session is kept on the server"));
+
+    let mut second = spawn_client(&daemon, &key_path, config.path());
+    let screen2 = Screen::of(&second);
+    wait_for_the_line(&screen2, &daemon);
+    let same_shell =
+        the_marked_shell_answers(&mut second, &screen2, &mark, Duration::from_secs(10));
+    eprintln!(
+        "sighup_keeps: exit {:?}, restored {restored}, kept notice {kept}, same shell {same_shell}",
+        status.code()
+    );
+    assert!(
+        status.code() == Some(1) && restored && kept && same_shell,
+        "SIGHUP must leave with 1, restore the terminal, say the session is kept, and the \
+         next run must reach the same shell; first client saw: {}\nsecond screen:\n{}\ndaemon: {}",
+        screen.text(),
+        screen2.dump(),
+        daemon.output_text()
+    );
+    drawn_on_the_alternate_screen(&screen);
+    assert!(!screen2.has("Key fingerprint"));
+    exit_cleanly(&mut second, &screen2, &daemon);
+    eprintln!("sighup_keeps: whole test {:?}", started.elapsed());
+}
+
 /// SIGTSTP: the terminal goes back to its own screen before the client
 /// stops, and after SIGCONT the session is back on the alternate screen and
 /// drawn in full.
