@@ -14,6 +14,8 @@ on:
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
+      - 'scripts/check-native-verifier-paths.py'
+      - 'scripts/tests/test_native_verifier_paths.py'
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
@@ -35,6 +37,8 @@ on:
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
       - 'scripts/tests/test_build_openssl.py'
+      - 'scripts/check-native-verifier-paths.py'
+      - 'scripts/tests/test_native_verifier_paths.py'
       - '.github/workflows/native-crypto.yml'
       - '.github/workflows/release.yml'
       - 'packaging/Dockerfile.build-*'
@@ -206,6 +210,7 @@ jobs:
         env:
           NATIVE_TARGET: ${{ matrix.target }}
         run: |
+          python3 -I -B -m unittest discover -s scripts/tests -p test_native_verifier_paths.py
           if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
@@ -227,14 +232,8 @@ jobs:
               exit 1
             fi
           fi
-          python3 -I -B - "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP" <<'PY'
-          from pathlib import Path
-          import os
-          import sys
-          data = Path(sys.argv[1]).read_bytes()
-          if any(os.fsencode(path) in data for path in sys.argv[2:]):
-              raise SystemExit('release verifier contains an unremapped build path')
-          PY
+          python3 -I -B scripts/check-native-verifier-paths.py \
+            "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
       - name: Qualify the linked products and generated RSA operations
         shell: bash
         env:
