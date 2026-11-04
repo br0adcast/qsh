@@ -422,7 +422,9 @@ async fn establish_kex(
             if let Some(Err(verdict)) = slot.0.lock().unwrap().take() {
                 return Err(verdict);
             }
-            return Err(SshError::Protocol(e.to_string()));
+            return Err(SshError::Protocol(
+                host_key::negotiation_error(&e).unwrap_or_else(|| e.to_string()),
+            ));
         }
     };
     let host_key = slot.0.lock().unwrap().take().ok_or_else(|| {
