@@ -169,8 +169,8 @@ fn fake_login(
 fn external_rsa_signer_uses_each_peer_selected_algorithm() {
     use russh::keys::HashAlg;
     use std::sync::atomic::Ordering;
+    // A legacy-only peer gets no RSA request at all: see `rsa_policy`.
     for (hash, expected) in [
-        (None, "ssh-rsa"),
         (Some(HashAlg::Sha256), "rsa-sha2-256"),
         (Some(HashAlg::Sha512), "rsa-sha2-512"),
     ] {
@@ -224,21 +224,31 @@ fn wrong_external_rsa_hash_never_reaches_signed_peer_authentication() {
     assert_eq!(activity.signed_publickey.load(Ordering::SeqCst), 0);
 }
 
+/// Fixed-algorithm signers of non-RSA keys keep working against a peer that
+/// advertises legacy `ssh-rsa`; a fixed SHA-1 RSA signer there is not
+/// offered at all, since SHA-1 signatures are refused (#150).
 #[test]
 fn existing_fixed_algorithm_external_signers_remain_compatible() {
     use ssh_key::{Algorithm, EcdsaCurve};
+    let legacy_peer = || {
+        FakeServer::start(FakeAuth {
+            accept_any_key: true,
+            rsa_hash: Some(None),
+            ..Default::default()
+        })
+    };
     for key in [
         prepared(Algorithm::Ed25519),
         prepared(Algorithm::Ecdsa {
             curve: EcdsaCurve::NistP256,
         }),
-        rsa(),
     ] {
-        let server = FakeServer::start(FakeAuth {
-            accept_any_key: true,
-            rsa_hash: Some(None),
-            ..Default::default()
-        });
-        fake_login(&server, Arc::new(LegacySigner(key))).unwrap();
+        fake_login(&legacy_peer(), Arc::new(LegacySigner(key))).unwrap();
+    }
+    match fake_login(&legacy_peer(), Arc::new(LegacySigner(rsa()))) {
+        Err(ssh::SshError::AuthFailed(reason)) => {
+            assert!(reason.contains("only legacy ssh-rsa (SHA-1)"), "{reason}")
+        }
+        other => panic!("expected the RSA key to be skipped, got {other:?}"),
     }
 }

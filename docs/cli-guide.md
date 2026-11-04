@@ -50,8 +50,15 @@ a later selection attempt can read the changed file normally.
 Direct QSH login supports Ed25519, ECDSA P-256/P-384, and RSA with SHA-2
 signatures. It refuses RSA/SHA-1 signatures (`ssh-rsa` as a signature
 algorithm), but accepts RSA public keys whose type is `ssh-rsa` when the
-signature uses SHA-2. SSH login has separate signature negotiation and
-retains legacy RSA/SHA-1 fallback. A personal daemon checks
+signature uses SHA-2. SSH negotiates its own signatures and refuses RSA/SHA-1
+the same way, in both directions: an RSA host key is used only through
+`rsa-sha2-512` or `rsa-sha2-256`, and an RSA key file, agent key or platform key
+signs only with one of those. When a server advertises only legacy `ssh-rsa`
+for RSA keys, qsh skips the RSA key, says why, and goes on with the next one. A
+server that advertises no RSA algorithm, or no signature algorithms at all, gets
+one `rsa-sha2-512` attempt. A server whose host-key offer is only `ssh-rsa`
+fails the handshake with that offer named. Ed25519 and ECDSA keys are
+unaffected. There is no option to allow SHA-1. A personal daemon checks
 `~/.ssh/authorized_keys`; system mode checks the claimed account through a
 privileged helper and PAM.
 

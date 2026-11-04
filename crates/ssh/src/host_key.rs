@@ -45,15 +45,20 @@ pub(crate) fn judge(offered: &[u8], known: &[Vec<u8>]) -> Verdict {
 }
 
 /// Host-key algorithms to offer: those of the known keys first (in list
-/// order), then the remaining defaults. For a known RSA key, SHA-2 host
-/// signatures come first; the default `ssh-rsa` (SHA-1) signature remains
-/// last. An unrecognised known key, or one of a type russh does not offer
-/// by default (`ssh-dss`, security keys), is skipped.
+/// order), then the remaining defaults. An RSA host key is used only through
+/// SHA-2 signatures (`rsa-sha2-512`, `rsa-sha2-256`): legacy `ssh-rsa`
+/// (SHA-1) is never offered, so a server with nothing better fails the
+/// handshake (see `negotiation_error`). An unrecognised known key, or one of
+/// a type russh does not offer by default (`ssh-dss`, security keys), is
+/// skipped.
+/// RSA with SHA-1: the `ssh-rsa` signature algorithm, refused on SSH as on QSH.
+pub(crate) const LEGACY_RSA: russh::keys::Algorithm = russh::keys::Algorithm::Rsa { hash: None };
+
 pub(crate) fn host_key_preference(known: &[Vec<u8>]) -> Vec<russh::keys::Algorithm> {
     use russh::keys::{Algorithm, HashAlg, PublicKey};
     let defaults = russh::Preferred::default().key;
     let push = |a: Algorithm, out: &mut Vec<Algorithm>| {
-        if defaults.contains(&a) && !out.contains(&a) {
+        if a != LEGACY_RSA && defaults.contains(&a) && !out.contains(&a) {
             out.push(a);
         }
     };
@@ -86,9 +91,67 @@ pub(crate) fn host_key_preference(known: &[Vec<u8>]) -> Vec<russh::keys::Algorit
     out
 }
 
+/// A failed algorithm negotiation as the person reads it, naming what the
+/// server offered. SHA-1 is named as the reason only when the server's
+/// host-key offer itself contains `ssh-rsa`: the offer is the only evidence
+/// of what the server can do, and says nothing of what else it would accept.
+/// `None` for any other error.
+pub(crate) fn negotiation_error(error: &russh::Error) -> Option<String> {
+    let russh::Error::NoCommonAlgo { kind, theirs, .. } = error else {
+        return None;
+    };
+    let offered = theirs.join(",");
+    Some(match kind {
+        russh::AlgorithmKind::Key if theirs.iter().any(|a| a == LEGACY_RSA.as_str()) => format!(
+            "no common host-key algorithm (offered: {offered}): legacy ssh-rsa (SHA-1) host \
+             signatures are not accepted; an Ed25519, ECDSA or rsa-sha2 host key on the \
+             server would be"
+        ),
+        russh::AlgorithmKind::Key => format!("no common host-key algorithm (offered: {offered})"),
+        russh::AlgorithmKind::Kex => {
+            format!("no common key-exchange algorithm (offered: {offered})")
+        }
+        russh::AlgorithmKind::Cipher => format!("no common cipher (offered: {offered})"),
+        russh::AlgorithmKind::Mac => format!("no common MAC algorithm (offered: {offered})"),
+        russh::AlgorithmKind::Compression => {
+            format!("no common compression method (offered: {offered})")
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_common(kind: russh::AlgorithmKind, theirs: &[&str]) -> russh::Error {
+        russh::Error::NoCommonAlgo {
+            kind,
+            ours: vec!["ssh-ed25519".into()],
+            theirs: theirs.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// Only a host-key offer that contains `ssh-rsa` is explained by SHA-1;
+    /// other failed negotiations stay generic, naming the server's offer.
+    #[test]
+    fn a_failed_negotiation_names_sha1_only_when_the_offer_shows_it() {
+        let legacy =
+            negotiation_error(&no_common(russh::AlgorithmKind::Key, &["ssh-rsa"])).unwrap();
+        assert!(legacy.contains("(offered: ssh-rsa)") && legacy.contains("legacy ssh-rsa (SHA-1)"));
+        for (kind, theirs) in [
+            (russh::AlgorithmKind::Key, &["ssh-dss"][..]),
+            (russh::AlgorithmKind::Kex, &["ssh-rsa"][..]),
+            (russh::AlgorithmKind::Cipher, &["3des-cbc"][..]),
+        ] {
+            let generic = negotiation_error(&no_common(kind, theirs)).unwrap();
+            assert!(!generic.contains("SHA-1"), "{generic}");
+            assert!(
+                generic.contains(&format!("(offered: {})", theirs[0])),
+                "{generic}"
+            );
+        }
+        assert_eq!(negotiation_error(&russh::Error::Disconnect), None);
+    }
 
     /// Wire bytes of a fresh ecdsa-sha2-nistp256 public key.
     fn ecdsa_wire() -> Vec<u8> {
@@ -110,8 +173,24 @@ mod tests {
         assert_eq!(order[0].as_str(), "ecdsa-sha2-nistp256");
         let mut seen = std::collections::HashSet::new();
         assert!(order.iter().all(|a| seen.insert(a.as_str().to_string())));
-        // The defaults keep SHA-1 `ssh-rsa` last; nothing here moves it up.
-        assert_eq!(order.last().map(|a| a.as_str()), Some("ssh-rsa"));
+        assert!(!order.contains(&LEGACY_RSA), "{order:?}");
+    }
+
+    /// A known RSA host key is offered through SHA-2 only, with SHA-512 first.
+    #[test]
+    fn a_known_rsa_key_never_offers_sha1() {
+        let pair = ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .unwrap();
+        let rsa = ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Rsa(pair), "").unwrap();
+        let wire = rsa.public_key().to_bytes().unwrap();
+        let order = host_key_preference(&[wire]);
+        let names: Vec<&str> = order.iter().map(|a| a.as_str()).collect();
+        assert_eq!(names[..2], ["rsa-sha2-512", "rsa-sha2-256"]);
+        assert!(!names.contains(&"ssh-rsa"), "{names:?}");
+        assert!(!host_key_preference(&[]).contains(&LEGACY_RSA));
     }
 
     #[test]
