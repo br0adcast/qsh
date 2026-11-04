@@ -625,22 +625,78 @@ mod tests {
         );
     }
 
+    /// A TCP knock receiver on its own thread. It waits at most `wait` for
+    /// the connection, so the test can always join it, and then reads what
+    /// was written; `None` when nothing dialled.
+    fn tcp_receiver(
+        wait: Duration,
+    ) -> (
+        SocketAddr,
+        std::thread::JoinHandle<io::Result<Option<Vec<u8>>>>,
+    ) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let a = l.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let end = Instant::now() + wait;
+            let mut s = loop {
+                match l.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e) if e.kind() == Interrupted => {}
+                    Err(e) if e.kind() == WouldBlock && Instant::now() < end => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) if e.kind() == WouldBlock => return Ok(None),
+                    Err(e) => return Err(e),
+                }
+            };
+            // An accepted socket may keep the listener's nonblocking mode.
+            s.set_nonblocking(false)?;
+            s.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut got = Vec::new();
+            s.read_to_end(&mut got)?;
+            Ok(Some(got))
+        });
+        (a, worker)
+    }
+
     #[test]
     fn a_bounded_tcp_knock_writes_the_payload_on_loopback() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let a = l.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let mut got = Vec::new();
-            s.read_to_end(&mut got).unwrap();
-            got
-        });
+        let (a, receiver) = tcp_receiver(Duration::from_secs(5));
         let payload: Vec<u8> = (0..=255).cycle().take(64 * 1024).collect();
-        SocketKnockSender::new(NoBind)
-            .tcp_within(a, &payload, within(Duration::from_secs(5)), &Cancel::new())
-            .unwrap();
-        assert_eq!(server.join().unwrap(), payload);
+        let sent = SocketKnockSender::new(NoBind).tcp_within(
+            a,
+            &payload,
+            within(Duration::from_secs(5)),
+            &Cancel::new(),
+        );
+        let got = receiver.join().expect("the receiver panicked");
+        assert_eq!(sent, Ok(()));
+        assert_eq!(got.unwrap(), Some(payload));
+    }
+
+    /// The control for the test above: a stopped TCP knock makes no
+    /// connection, and the receiver reports that once its wait is over.
+    #[test]
+    fn a_stopped_bounded_tcp_knock_makes_no_connection_on_loopback() {
+        let cancelled = Cancel::new();
+        cancelled.cancel();
+        let expired = Deadline::after(Instant::now(), Duration::from_nanos(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        for (deadline, cancel, why) in [
+            (
+                within(Duration::from_secs(5)),
+                &cancelled,
+                Stopped::Cancelled,
+            ),
+            (expired, &Cancel::new(), Stopped::Expired),
+        ] {
+            let (a, receiver) = tcp_receiver(Duration::from_millis(200));
+            let sent = SocketKnockSender::new(NoBind).tcp_within(a, b"t", deadline, cancel);
+            let got = receiver.join().expect("the receiver panicked");
+            assert_eq!(sent, Err(why));
+            assert_eq!(got.unwrap(), None, "a connection was made");
+        }
     }
 
     #[test]

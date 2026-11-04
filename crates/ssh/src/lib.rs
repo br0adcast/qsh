@@ -510,6 +510,10 @@ fn open_target_with(
     sender: &mut impl knock::BoundedKnockSender,
 ) -> Result<(SocketAddr, knock::Deadline), SshError> {
     let ip = resolve(&params.host, cancel).map_err(knock_error)?;
+    // A cancel that came in during the lookup wins over refusing the budget.
+    if cancel.is_cancelled() {
+        return Err(SshError::Cancelled);
+    }
     let target = SocketAddr::new(ip, params.port);
     let deadline =
         knock::Deadline::after(clock.now(), params.connect_timeout).ok_or_else(|| {
@@ -617,16 +621,43 @@ async fn tcp_connect(
 }
 
 /// Runs `fut` until it finishes or `deadline` is reached (`None`), whichever
-/// comes first; a cancel wins over both.
+/// comes first; a cancel wins over both. Every poll looks at `cancel` and
+/// then the deadline, before it advances `fut` and again before it takes a
+/// result: a future past the deadline is never polled (a first poll may be
+/// what issues the dial), and a result that comes in late is not used.
+/// `tokio::time::timeout_at` polls the future first and would do both.
 async fn until_deadline<F: std::future::Future>(
     deadline: knock::Deadline,
     cancel: &knock::Cancel,
     fut: F,
 ) -> Result<Option<F::Output>, SshError> {
-    let at = tokio::time::Instant::from_std(deadline.instant());
-    Ok(with_cancel(tokio::time::timeout_at(at, fut), cancel)
-        .await?
-        .ok())
+    use std::task::Poll;
+    let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant()));
+    tokio::pin!(fut, timer);
+    // Tokio's clock: the same as `Instant::now()` unless a test pauses it.
+    let stopped = || match deadline.check(tokio::time::Instant::now().into_std(), cancel) {
+        Ok(_) => None,
+        Err(knock::Stopped::Cancelled) => Some(Err(SshError::Cancelled)),
+        Err(knock::Stopped::Expired) => Some(Ok(None)),
+    };
+    let bounded = std::future::poll_fn(|cx| {
+        if let Some(stop) = stopped() {
+            return Poll::Ready(stop);
+        }
+        let out = fut.as_mut().poll(cx);
+        if let Some(stop) = stopped() {
+            return Poll::Ready(stop);
+        }
+        match out {
+            Poll::Ready(v) => Poll::Ready(Ok(Some(v))),
+            // Wake at the deadline too; the timer firing is reaching it.
+            Poll::Pending if std::future::Future::poll(timer.as_mut(), cx).is_ready() => {
+                Poll::Ready(Ok(None))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    });
+    with_cancel(bounded, cancel).await?
 }
 
 /// Runs `fut` until it finishes or `cancel` is set, checking every
@@ -874,6 +905,34 @@ mod tests {
         }
     }
 
+    /// A cancel during a lookup that then answers wins over refusing a zero
+    /// or out-of-range timeout.
+    #[test]
+    fn a_cancel_during_the_lookup_wins_over_a_refused_timeout() {
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let p = sim_params(timeout, vec![udp(7000, 0)]);
+            let cancel = knock::Cancel::new();
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let stages = Stages::default();
+            let r = open_target_with(
+                &p,
+                &stages,
+                &cancel,
+                |_, cancel| {
+                    cancel.cancel();
+                    Ok("192.0.2.7".parse().unwrap())
+                },
+                &mut knock::SystemClock,
+                &mut SimSender {
+                    clock: SimClock(Rc::new(Cell::new(Instant::now()))),
+                    sent: Rc::clone(&sent),
+                },
+            );
+            assert!(matches!(r, Err(SshError::Cancelled)), "{timeout:?}: {r:?}");
+            assert!(sent.borrow().is_empty() && stages.0.lock().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn a_lookup_failure_stays_a_resolve_error() {
         let p = sim_params(Duration::from_secs(10), vec![udp(7000, 0)]);
@@ -951,6 +1010,147 @@ mod tests {
             assert!(matches!(r, Err(SshError::Cancelled)), "{r:?}");
             let r = until_deadline(deadline, &knock::Cancel::new(), async { 7 }).await;
             assert!(matches!(r, Ok(Some(7))), "{r:?}");
+        });
+    }
+
+    /// A connect that counts its polls; ready once tokio's clock reaches
+    /// `ready_at`, after `takes` of real time spent in the poll.
+    struct Counted {
+        polls: Rc<Cell<u32>>,
+        ready_at: tokio::time::Instant,
+        takes: Duration,
+    }
+
+    impl std::future::Future for Counted {
+        type Output = u32;
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<u32> {
+            self.polls.set(self.polls.get() + 1);
+            std::thread::sleep(self.takes);
+            if tokio::time::Instant::now() >= self.ready_at {
+                std::task::Poll::Ready(7)
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// At its deadline and past it, a connect is never polled, ready or not:
+    /// its first poll may be the dial.
+    #[test]
+    fn a_connect_is_not_polled_at_or_past_the_deadline() {
+        for past in [Duration::ZERO, Duration::from_secs(1)] {
+            for ready in [true, false] {
+                paused().block_on(async {
+                    let start = tokio::time::Instant::now();
+                    let deadline =
+                        knock::Deadline::after(start.into_std(), Duration::from_secs(3)).unwrap();
+                    tokio::time::advance(Duration::from_secs(3) + past).await;
+                    let polls = Rc::new(Cell::new(0));
+                    let r = until_deadline(
+                        deadline,
+                        &knock::Cancel::new(),
+                        Counted {
+                            polls: Rc::clone(&polls),
+                            ready_at: if ready {
+                                start
+                            } else {
+                                start + Duration::from_secs(99)
+                            },
+                            takes: Duration::ZERO,
+                        },
+                    )
+                    .await;
+                    assert!(matches!(r, Ok(None)), "{past:?} {ready}: {r:?}");
+                    assert_eq!(polls.get(), 0, "{past:?} {ready}");
+                });
+            }
+        }
+    }
+
+    /// A cancel is looked at first: a cancelled connect is not polled, and
+    /// the cancel wins over an expiry on the same look.
+    #[test]
+    fn a_cancelled_connect_is_not_polled() {
+        for past in [None, Some(Duration::from_secs(3))] {
+            paused().block_on(async {
+                let start = tokio::time::Instant::now();
+                let deadline =
+                    knock::Deadline::after(start.into_std(), Duration::from_secs(3)).unwrap();
+                if let Some(past) = past {
+                    tokio::time::advance(past).await;
+                }
+                let cancel = knock::Cancel::new();
+                cancel.cancel();
+                let polls = Rc::new(Cell::new(0));
+                let r = until_deadline(
+                    deadline,
+                    &cancel,
+                    Counted {
+                        polls: Rc::clone(&polls),
+                        ready_at: start,
+                        takes: Duration::ZERO,
+                    },
+                )
+                .await;
+                assert!(matches!(r, Err(SshError::Cancelled)), "{past:?}: {r:?}");
+                assert_eq!(polls.get(), 0, "{past:?}");
+            });
+        }
+    }
+
+    /// A connect that becomes ready just as the deadline is reached is not
+    /// used: the deadline is looked at before the future is polled again.
+    #[test]
+    fn a_connect_ready_at_the_deadline_is_too_late() {
+        paused().block_on(async {
+            let start = tokio::time::Instant::now();
+            let deadline =
+                knock::Deadline::after(start.into_std(), Duration::from_secs(3)).unwrap();
+            let polls = Rc::new(Cell::new(0));
+            let r = until_deadline(
+                deadline,
+                &knock::Cancel::new(),
+                Counted {
+                    polls: Rc::clone(&polls),
+                    ready_at: start + Duration::from_secs(3),
+                    takes: Duration::ZERO,
+                },
+            )
+            .await;
+            assert!(matches!(r, Ok(None)), "{r:?}");
+            assert!(polls.get() >= 1, "polled while time was left");
+            assert_eq!(start.elapsed(), Duration::from_secs(3));
+        });
+    }
+
+    /// A result that a poll returns only after the deadline passed during
+    /// that poll is not used either.
+    #[test]
+    fn a_connect_result_that_comes_back_late_is_not_used() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let start = tokio::time::Instant::now();
+            let deadline =
+                knock::Deadline::after(start.into_std(), Duration::from_millis(100)).unwrap();
+            let polls = Rc::new(Cell::new(0));
+            let r = until_deadline(
+                deadline,
+                &knock::Cancel::new(),
+                Counted {
+                    polls: Rc::clone(&polls),
+                    ready_at: start,
+                    takes: Duration::from_millis(150),
+                },
+            )
+            .await;
+            assert!(matches!(r, Ok(None)), "{r:?}");
+            assert_eq!(polls.get(), 1);
         });
     }
 
