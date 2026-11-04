@@ -51,7 +51,7 @@ class ProtocolTests(unittest.TestCase):
         return request,result
 
     def test_fixed_five_requests_and_exact_response_binding(self):
-        self.assertEqual(self.phase._PHASES,PHASES|{'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE','provider-preun-final':'ERASED'})
+        self.assertEqual(self.phase._PHASES,PHASES|{'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE','provider-preun-final':'ERASED','managed-prestart':None})
         for phase in PHASES:
             request,frame=self.response(phase)
             self.assertEqual(self.phase._request(phase),request)

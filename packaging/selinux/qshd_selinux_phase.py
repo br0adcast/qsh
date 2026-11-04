@@ -1,8 +1,9 @@
-"""Fixed installed maintenance phases; no scriptlets or start authorization.
+"""Fixed installed phases and a read-only managed prestart observation.
 
-Installation authority, administrator drain/stop and exclusion of concurrent
-starts/privileged writers are caller prerequisites. Imports change no process
-resources or custody. Only explicit execution configures its dedicated owner.
+Maintenance authority, administrator drain/stop and exclusion of concurrent
+starts/privileged writers are caller prerequisites. Managed prestart observes
+current readiness; it does not exclude subsequent maintenance. Imports change
+no process resources or custody. Explicit execution configures a dedicated owner.
 """
 import time
 _ENTRY_STARTED=time.monotonic() if __name__=='__main__' else None
@@ -25,7 +26,7 @@ _MODULES=tuple('qshd_selinux_'+name for name in (
     'consumer_activation','provider_erase','phase','rpm_query'))+('stop_guard',)
 _PHASES={'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE','provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
          'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
-         'consumer-preun-final':'PENDING','provider-preun-final':'ERASED'}
+         'consumer-preun-final':'PENDING','provider-preun-final':'ERASED','managed-prestart':None}
 _INTENTS={'provider-pre-owned':'provider-refresh','provider-post-owned':'provider-refresh','provider-post-pristine':'provider-fresh','consumer-pre-fresh':'consumer-install',
           'consumer-pre-installed':'consumer-install','consumer-post-owned':'consumer-install',
           'consumer-preun-final':'consumer-erase'}
@@ -124,12 +125,31 @@ def _incoming_argument(raw):
     except (ValueError,TypeError,RecursionError,UnicodeError):raise PhaseError('ARGUMENTS') from None
 
 
+def _managed_frame(profile,contexts,request):
+    from qshd_selinux_activation import ContextBinding
+    if (type(profile) is not str or profile!='fedora44-targeted-pair-v2'
+            or type(contexts) is not ContextBinding):raise PhaseError('RESULT')
+    try:contexts.__post_init__()
+    except (ValueError,TypeError):raise PhaseError('RESULT') from None
+    return dict(schema=2,phase='managed-prestart',request_sha256=hashlib.sha256(request).hexdigest(),
+        profile=profile,registry_sha256=contexts.registry_sha256,receipts_sha256=contexts.receipts_sha256)
+
+
 def _parse_response(raw,request):
     if type(raw) is not bytes or not 0<len(raw)<=4096:raise PhaseError('RESPONSE')
     expected=_parse_request(request)
     try:
         from qshd_selinux_activation import TrustedArtifact
         value=json.loads(raw,object_pairs_hook=_pairs)
+        if expected['phase']=='managed-prestart':
+            from qshd_selinux_activation import ContextBinding
+            if (type(value) is not dict or set(value)!=
+                    {'schema','phase','request_sha256','profile','registry_sha256','receipts_sha256'}
+                    or type(value['schema']) is not int or value['schema']!=2):raise PhaseError('RESPONSE')
+            contexts=ContextBinding(value['registry_sha256'],value['receipts_sha256'])
+            frame=_managed_frame(value['profile'],contexts,request)
+            if value!=frame or _json(frame)+b'\n'!=raw:raise PhaseError('RESPONSE')
+            return value
         if (type(value) is not dict or set(value)!=
                 {'schema','phase','request_sha256','operation_id','artifact',
                  'result' if expected['phase']=='provider-preun-final' else 'state'}
@@ -151,6 +171,12 @@ def _response(record,request):
     from dataclasses import asdict
     from qshd_selinux_activation import Activation
     phase=_parse_request(request)['phase']
+    if phase=='managed-prestart':
+        from qshd_selinux_observer import ManagedPrestartObservation
+        if type(record) is not ManagedPrestartObservation:raise PhaseError('RESULT')
+        raw=_json(_managed_frame(record.profile,record.contexts,request))+b'\n'
+        _parse_response(raw,request)
+        return raw
     if phase=='provider-preun-final':
         from qshd_selinux_provider_erase import ErasureResult
         if type(record) is not ErasureResult:raise PhaseError('RESULT')
@@ -262,6 +288,9 @@ def _resources(*,configure):
 
 def _dispatch(phase,*,deadline,incoming_artifact=None):
     _request(phase,incoming_artifact)
+    if phase=='managed-prestart':
+        from qshd_selinux_observer import observe_installed_managed_prestart
+        return observe_installed_managed_prestart(deadline=deadline)
     if phase=='provider-pre-owned':
         from qshd_selinux_first_activation import invalidate_installed_provider_upgrade
         return invalidate_installed_provider_upgrade(incoming_artifact,deadline=deadline)
