@@ -138,6 +138,10 @@ fn help_text() -> String {
 // itself.
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    if let Some(result) = qshd::darwin_keeper_entry(&args) {
+        return result.map_err(Into::into);
+    }
 
     // A process a running daemon started by exec'ing its own replacement: it
     // IS the daemon already. Only this command reads the handover; any other

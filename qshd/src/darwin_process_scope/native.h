@@ -18,4 +18,7 @@ int qsh_scope_exit(int32_t, int32_t, uint64_t, uint32_t *, struct qsh_scope_erro
 int qsh_scope_token(struct qsh_scope_identity, int32_t, struct qsh_scope_token *, struct qsh_scope_error *);
 int qsh_scope_signal(const struct qsh_scope_token *, int32_t, struct qsh_scope_error *);
 int qsh_scope_leader(int32_t, uint32_t *, int32_t *, struct qsh_scope_error *);
+int qsh_scope_keeper_prepare(struct qsh_scope_runtime *, struct qsh_scope_error *);
+int qsh_scope_group(struct qsh_scope_identity, int32_t, int32_t *, struct qsh_scope_error *);
+int qsh_scope_keeper_pre_exec(int32_t, int32_t, int32_t);
 #endif

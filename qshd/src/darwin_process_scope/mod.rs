@@ -231,3 +231,14 @@ fn runtime_contract(
         native_arch: native_arch.into(),
     })
 }
+
+mod keeper;
+mod keeper_helper;
+mod keeper_pty;
+#[cfg(test)]
+mod keeper_tests;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn keeper_helper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
+    keeper_helper::entry(args)
+}

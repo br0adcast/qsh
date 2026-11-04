@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/event.h>
+#include <sys/ioctl.h>
 #include <sys/proc.h>
 #include <sys/proc_info.h>
 #include <sys/sysctl.h>
@@ -240,5 +241,67 @@ int qsh_scope_prepare(struct qsh_scope_runtime *runtime, struct qsh_scope_error 
     if (qsh_scope_classify(getpid(), &self, error)) return -1;
     struct qsh_scope_token token;
     if (qsh_scope_token(self.identity, self.sid, &token, error)) return -1;
+    return 0;
+}
+
+/* Keeper admission shares observation/ABI guards, never modern signal-symbol
+ * admission. The actual broker watch is acquired before application admission. */
+int qsh_scope_keeper_prepare(struct qsh_scope_runtime *runtime, struct qsh_scope_error *error) {
+    struct sigaction action;
+    if (sigaction(SIGCHLD, NULL, &action) < 0) return unix_error(error);
+    if (action.sa_handler == SIG_IGN || (action.sa_flags & SA_NOCLDWAIT)) return invalid(error);
+    struct utsname system;
+    if (uname(&system) < 0) return unix_error(error);
+    if (strcmp(system.sysname, "Darwin")) return invalid(error);
+    memset(runtime, 0, sizeof(*runtime));
+    if (runtime_string("kern.osrelease", runtime->release, sizeof(runtime->release), error) ||
+        runtime_string("kern.version", runtime->version, sizeof(runtime->version), error) ||
+        runtime_string("kern.osversion", runtime->build, sizeof(runtime->build), error)) return -1;
+    size_t machine_size = strnlen(system.machine, sizeof(system.machine));
+    if (machine_size >= sizeof(runtime->machine)) return invalid(error);
+    memcpy(runtime->machine, system.machine, machine_size + 1);
+    struct qsh_scope_class self;
+    return qsh_scope_classify(getpid(), &self, error);
+}
+
+int qsh_scope_group(struct qsh_scope_identity expected, int32_t sid, int32_t *group,
+                    struct qsh_scope_error *error) {
+    struct qsh_scope_class before, after;
+    if (qsh_scope_classify(expected.pid, &before, error)) return -1;
+    if (!same(expected, before.identity) || expected.version != before.identity.version ||
+        before.zombie || before.sid != sid) return invalid(error);
+    pid_t actual = getpgid(expected.pid);
+    if (actual < 0) return unix_error(error);
+    if (qsh_scope_classify(expected.pid, &after, error)) return -1;
+    if (!qsh_scope_classification_matches(before, after) || actual <= 0) return invalid(error);
+    *group = actual;
+    return 0;
+}
+
+
+/* Called only in Command's child pre-exec hook. All descriptors already exist
+ * and remain owned in Q until spawn returns; none can be the subsequently
+ * allocated std exec-error pipe. No fixed descriptor slot is used. */
+int qsh_scope_keeper_pre_exec(int32_t slave, int32_t session, int32_t broker) {
+    if (slave < 3 || session < 3 || broker < 3 || slave == session || slave == broker || session == broker) {
+        errno = EINVAL; return -1;
+    }
+    sigset_t empty;
+    if (sigemptyset(&empty) || sigprocmask(SIG_SETMASK, &empty, NULL)) return -1;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    if (sigemptyset(&action.sa_mask)) return -1;
+    const int signals[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGALRM, SIGPIPE, SIGCHLD, SIGTTIN, SIGTTOU, SIGTSTP};
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i)
+        if (sigaction(signals[i], &action, NULL)) return -1;
+    if (setsid() < 0 || ioctl(slave, TIOCSCTTY, 0) < 0) return -1;
+    for (int fd = 0; fd < 3; ++fd) if (dup2(slave, fd) < 0) return -1;
+    if (close(slave) < 0) return -1;
+    const int inherited[] = {session, broker};
+    for (size_t i = 0; i < sizeof(inherited) / sizeof(inherited[0]); ++i) {
+        int flags = fcntl(inherited[i], F_GETFD);
+        if (flags < 0 || fcntl(inherited[i], F_SETFD, flags & ~FD_CLOEXEC) < 0) return -1;
+    }
     return 0;
 }

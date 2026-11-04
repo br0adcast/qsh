@@ -51,6 +51,10 @@ pub(super) struct Token {
 }
 unsafe extern "C" {
     fn qsh_scope_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
+    fn qsh_scope_keeper_pre_exec(slave: i32, session: i32, broker: i32) -> i32;
+    fn qsh_scope_keeper_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
+    fn qsh_scope_group(expected: WireIdentity, sid: i32, group: *mut i32, error: *mut Error)
+        -> i32;
     fn qsh_scope_identity(pid: i32, identity: *mut WireIdentity, error: *mut Error) -> i32;
     #[cfg(test)]
     fn qsh_scope_classification_matches(before: WireClass, after: WireClass) -> i32;
@@ -460,4 +464,158 @@ pub(super) fn classification_matches_for_test(before: Classified, after: Classif
         }
     }
     unsafe { qsh_scope_classification_matches(wire(before), wire(after)) == 1 }
+}
+
+/// A distinct admission type: it cannot be passed to the modern exact-signal owner.
+pub(super) struct KeeperAdmission {
+    pub contract: &'static str,
+}
+pub(super) fn keeper_prepare() -> Result<KeeperAdmission, AdmissionError> {
+    let mut error = Error::default();
+    let mut runtime = Runtime {
+        release: [0; 64],
+        version: [0; 512],
+        build: [0; 64],
+        machine: [0; 32],
+    };
+    result(
+        unsafe { qsh_scope_keeper_prepare(&mut runtime, &mut error) },
+        error,
+    )
+    .map_err(AdmissionError::Native)?;
+    // This first non-default checkpoint uses the already reviewed source families.
+    // Older-family admission is a separate gate, not inferred from API presence.
+    let contract = runtime_contract(
+        runtime_text(&runtime.release)?,
+        runtime_text(&runtime.version)?,
+        runtime_text(&runtime.build)?,
+        runtime_text(&runtime.machine)?,
+        std::env::consts::ARCH,
+    )
+    .ok_or(AdmissionError::UnsupportedContract)?;
+    Ok(KeeperAdmission {
+        contract: contract.family.id,
+    })
+}
+impl NativeOps {
+    pub(super) fn keeper_group(&mut self, identity: Identity, sid: i32) -> Result<i32, Failure> {
+        let mut group = 0;
+        let mut error = Error::default();
+        result(
+            unsafe { qsh_scope_group(identity.into(), sid, &mut group, &mut error) },
+            error,
+        )?;
+        if group <= 0 {
+            return Err(Failure::Invalid);
+        }
+        Ok(group)
+    }
+    /// Same before/raw/after closure premise as the modern scope. A temporary
+    /// refusal never supplies an empty successful session view.
+    pub(super) fn keeper_census(&mut self, sid: i32) -> Result<Vec<Classified>, Failure> {
+        Ok(self
+            .keeper_full_census()?
+            .into_iter()
+            .filter(|p| p.class == Class::Session(sid))
+            .collect())
+    }
+    /// Preserve the entire successful census for sticky application debt.
+    /// Only this unfiltered view may positively exclude a previously observed PID.
+    pub(super) fn keeper_full_census(&mut self) -> Result<Vec<Classified>, Failure> {
+        let baseline = <Self as Ops<PtyChild>>::baseline(self)?;
+        let mut pids = [0; CAPACITY];
+        let bytes = <Self as Ops<PtyChild>>::raw_all(self, &mut pids)?;
+        if bytes == 0 || !bytes.is_multiple_of(size_of::<i32>()) || bytes > size_of_val(&pids) {
+            return Err(Failure::Invalid);
+        }
+        let raw = &pids[..bytes / size_of::<i32>()];
+        if raw
+            .iter()
+            .enumerate()
+            .any(|(i, pid)| *pid < 0 || raw[..i].contains(pid))
+        {
+            return Err(Failure::Invalid);
+        }
+        let persistent = baseline
+            .iter()
+            .filter(|before| {
+                self.identity(before.identity.pid)
+                    .is_ok_and(|after| after.same_process(before.identity))
+            })
+            .count();
+        if raw.len() >= CAPACITY
+            || !persistent
+                .checked_add(20)
+                .is_some_and(|minimum| raw.len() < minimum)
+        {
+            return Err(Failure::Capacity);
+        }
+        let mut classified = Vec::new();
+        for pid in raw.iter().copied().filter(|pid| *pid > 0) {
+            let after = <Self as Ops<PtyChild>>::classify(self, pid)?;
+            if !baseline.iter().any(|before| {
+                before.identity.same_process(after.identity)
+                    && before.identity.version == after.identity.version
+                    && before.class == after.class
+            }) {
+                return Err(Failure::Invalid);
+            }
+            classified.push(after);
+        }
+        Ok(classified)
+    }
+    pub(super) fn keeper_child_status(&mut self, pid: i32) -> Result<Option<i32>, Failure> {
+        let mut error = Error::default();
+        let mut exited = 0;
+        let mut code = 0;
+        result(
+            unsafe { qsh_scope_leader(pid, &mut exited, &mut code, &mut error) },
+            error,
+        )?;
+        match exited {
+            0 => Ok(None),
+            1 => Ok(Some(code)),
+            _ => Err(Failure::Invalid),
+        }
+    }
+}
+
+/// Safety: only Command's post-fork child may call this with the three distinct
+/// preopened descriptors kept alive by the parent throughout spawn.
+pub(super) unsafe fn keeper_pre_exec(slave: i32, session: i32, broker: i32) -> std::io::Result<()> {
+    if unsafe { qsh_scope_keeper_pre_exec(slave, session, broker) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) fn keeper_image_path() -> Result<std::path::PathBuf, Failure> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = [0u8; nix::libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    nix::errno::Errno::clear();
+    let returned = unsafe {
+        nix::libc::proc_pidpath(
+            nix::libc::getpid(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len() as u32,
+        )
+    };
+    let error = nix::errno::Errno::last_raw();
+    if returned == 0 {
+        return Err(Failure::Errno(if error == 0 {
+            nix::libc::EIO
+        } else {
+            error
+        }));
+    }
+    let size = usize::try_from(returned)
+        .ok()
+        .filter(|n| *n < bytes.len())
+        .ok_or(Failure::Invalid)?;
+    if size == 0 || bytes[size] != 0 || bytes[..size].contains(&0) || bytes[0] != b'/' {
+        return Err(Failure::Invalid);
+    }
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &bytes[..size],
+    )))
 }
