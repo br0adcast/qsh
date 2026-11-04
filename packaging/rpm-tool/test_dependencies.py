@@ -50,15 +50,22 @@ class GeneratedDependencyTests(unittest.TestCase):
             entries, _ = header((end + 7) & ~7)
             return result, list(zip(entries[1049], entries[1048], entries[1050]))
 
-    def test_pre_post_and_automatic_elf_requirements(self):
+    def test_pre_post_preun_and_automatic_elf_requirements(self):
         result, dependencies = self.generate(
             '[package.metadata.generate-rpm.requires]\n"pre-provider"=">= 3"\n'
+            '"policy-abi"="= 2"\n'
             '[package.metadata.generate-rpm.requires-pre]\n"pre-provider"=" * "\n'
-            '[package.metadata.generate-rpm.requires-post]\n"post-provider"=""\n')
+            '[package.metadata.generate-rpm.requires-post]\n"post-provider"=""\n'
+            '[package.metadata.generate-rpm.requires-preun]\n'
+            '"policy-abi"=" * "\n"preun-empty"=""\n')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn((b"pre-provider", 1 << 9, b""), dependencies)
         self.assertIn((b"pre-provider", 12, b"3"), dependencies)
         self.assertIn((b"post-provider", 1 << 10, b""), dependencies)
+        self.assertIn((b"policy-abi", 8, b"2"), dependencies)
+        self.assertIn((b"policy-abi", 1 << 11, b""), dependencies)
+        self.assertIn((b"preun-empty", 1 << 11, b""), dependencies)
+        self.assertFalse(any(b"(preun)" in name for name, _, _ in dependencies))
         self.assertTrue(any(name.startswith(b"libc.so.6") for name, _, _ in dependencies))
         self.assertFalse(any(b"(pre)" in name for name, _, _ in dependencies))
 
@@ -76,6 +83,22 @@ class GeneratedDependencyTests(unittest.TestCase):
                 result, _ = self.generate(
                     '[package.metadata.generate-rpm.requires-pre]\nprovider=' + value + '\n')
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_absent_and_empty_preun_metadata_preserve_dependencies(self):
+        result, absent = self.generate("")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, empty = self.generate('[package.metadata.generate-rpm.requires-preun]\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(absent, empty)
+        self.assertTrue(absent)
+
+    def test_preun_rejects_versions_and_non_strings(self):
+        for value in ['">= 1"', '"= 2"', '1', 'true', '[]', '{}']:
+            with self.subTest(value=value):
+                result, _ = self.generate(
+                    '[package.metadata.generate-rpm.requires-preun]\nprovider=' + value + '\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"Invalid dependency version specified for provider", result.stderr)
 
 
 if __name__ == "__main__":
