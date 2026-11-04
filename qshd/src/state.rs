@@ -221,24 +221,96 @@ pub fn own_binary_path() -> Result<PathBuf> {
 /// does not close it, so the distinction above still matters.
 ///
 /// Linux is the only platform with `/proc`, so it is also the only one
-/// where this trick is available. Everywhere else (macOS, today) there is
-/// no equivalent, and `current_exe()` is the best available answer to
-/// "which file is this process running from" -- without SOME answer,
-/// `self_checksum` cannot run there AT ALL, breaking `STATUS` and version
-/// reconciliation outright (see `self_checksum`'s doc comment for why that
-/// matters for the "app installs the daemon over SSH" path on macOS). That
-/// total failure is why non-Linux gets `current_exe()` rather than being
-/// left unimplemented, even though it carries the narrower self-update
-/// race described above.
+/// where this trick is available. macOS has no descriptor for its own
+/// image, and its `current_exe()` keeps answering with the path the
+/// process was LAUNCHED from: once a valid update renames the running
+/// executable (same inode, same bytes), that name is gone and a cold
+/// checksum fails with `ENOENT`. So macOS asks the kernel for the CURRENT
+/// name of its text vnode instead ([`darwin_image_path`]). That is still a
+/// name looked up at call time and reopened afterwards -- an unlink, or
+/// another file renamed over that name, can make it fail or name a
+/// different file -- so it closes the ordinary-rename gap, not the
+/// self-update race described above. Other non-Linux platforms keep
+/// `current_exe()`: without SOME answer, `self_checksum` cannot run there
+/// AT ALL, breaking `STATUS` and version reconciliation outright.
 fn self_exe_path() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         Ok(PathBuf::from("/proc/self/exe"))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        darwin_image_path()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         std::env::current_exe().context("locating our own executable")
     }
+}
+
+/// The current path of this process's executable, from libproc's
+/// `proc_pidpath`, which the kernel answers from the process's text vnode
+/// rather than from its launch arguments. Apple documents libproc as a
+/// private interface subject to change; nothing here claims more than
+/// this answer.
+#[cfg(target_os = "macos")]
+fn darwin_image_path() -> Result<PathBuf> {
+    use nix::errno::Errno;
+    use nix::libc;
+
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // A zero result without errno would otherwise reuse a stale one.
+    Errno::clear();
+    // SAFETY: `buffer` is initialized and writable for exactly the length
+    // passed, which is within the wrapper's accepted range.
+    let returned = unsafe {
+        libc::proc_pidpath(
+            nix::unistd::getpid().as_raw(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    let errno = Errno::last_raw();
+    pidpath_result(returned, errno, &buffer)
+        .context("locating our own executable with proc_pidpath")
+}
+
+/// Validates one `proc_pidpath` answer: `returned` is the call's result,
+/// `errno` was read immediately after it and `buffer` is what it filled.
+/// libproc returns `strlen` of the NUL-terminated kernel path on success,
+/// and 0 on failure with errno set -- an empty kernel path would also
+/// return 0, but without errno. Anything else is refused rather than
+/// guessed at: a negative or oversized length, a missing terminator, a NUL
+/// before the reported length (a truncated or inconsistent answer), an
+/// empty or relative path. Unix paths are bytes, so a valid non-UTF-8
+/// path is kept exactly.
+#[cfg(any(test, target_os = "macos"))]
+fn pidpath_result(returned: i32, errno: i32, buffer: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if returned == 0 {
+        if errno == 0 {
+            anyhow::bail!("proc_pidpath returned no path and no error");
+        }
+        return Err(std::io::Error::from_raw_os_error(errno)).context("proc_pidpath failed");
+    }
+    let len = usize::try_from(returned)
+        .ok()
+        .filter(|&len| len < buffer.len())
+        .with_context(|| {
+            format!(
+                "proc_pidpath returned length {returned} for a {}-byte buffer",
+                buffer.len()
+            )
+        })?;
+    let path = &buffer[..len];
+    if buffer[len] != 0 || path.contains(&0) {
+        anyhow::bail!("proc_pidpath returned a path inconsistent with its length {len}");
+    }
+    if path[0] != b'/' {
+        anyhow::bail!("proc_pidpath returned a relative path");
+    }
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
 }
 
 /// Plain hex sha256 of our own executable -- the "same byte-for-byte
@@ -398,6 +470,76 @@ mod tests {
                 "streaming digest must match a whole-buffer digest at length {len}"
             );
         }
+    }
+
+    /// The `proc_pidpath` validator, fed answers of every shape the
+    /// wrapper's contract allows or rules out. Runs on every Unix host: it
+    /// is a pure function of the call's result, errno and buffer, so no
+    /// syscall needs to be faked to reach the malformed cases.
+    #[test]
+    fn pidpath_answers_are_validated_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        fn answer(path: &[u8]) -> [u8; 32] {
+            let mut buffer = [0u8; 32];
+            buffer[..path.len()].copy_from_slice(path);
+            buffer
+        }
+        let accepted = |path: &[u8]| {
+            super::pidpath_result(path.len() as i32, 0, &answer(path))
+                .expect("a well-formed answer")
+        };
+
+        assert_eq!(
+            accepted(b"/Users/q/bin/qshd"),
+            std::path::Path::new("/Users/q/bin/qshd")
+        );
+        // The longest path that still leaves room for its terminator.
+        let longest = [b'/'; 31];
+        assert_eq!(accepted(&longest).as_os_str().as_bytes(), &longest[..]);
+        // Unix paths are bytes: a non-UTF-8 name survives exactly.
+        let raw = b"/opt/q\xff\xfe/qshd";
+        let path = accepted(raw);
+        assert_eq!(path.as_os_str().as_bytes(), &raw[..]);
+        assert!(path.to_str().is_none());
+
+        let refused = |returned: i32, errno: i32, buffer: &[u8]| {
+            super::pidpath_result(returned, errno, buffer).expect_err("a malformed answer")
+        };
+        let failed = refused(0, nix::libc::ENOENT, &answer(b""));
+        assert_eq!(
+            failed
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::ENOENT),
+            "the captured errno is kept: {failed:#}"
+        );
+        // Zero without errno is an empty path, not a success.
+        refused(0, 0, &answer(b""));
+        refused(-1, 0, &answer(b"/q"));
+        // No room for the terminator, or a length past the buffer.
+        refused(32, 0, &[b'/'; 32]);
+        refused(33, 0, &answer(b"/q"));
+        // A terminator missing at the reported length (truncated), or a NUL
+        // before it.
+        refused(2, 0, &answer(b"/qshd"));
+        refused(5, 0, &answer(b"/q\0hd"));
+        refused(4, 0, &answer(b"qshd"));
+    }
+
+    /// On macOS the cold checksum's path is the kernel's name for this very
+    /// image: the same file the test runner was launched as, by identity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_image_path_names_this_image() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = super::darwin_image_path().expect("own image path");
+        assert!(path.is_absolute(), "{}", path.display());
+        let own = std::fs::metadata(&path).expect("own image metadata");
+        let launched = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!((own.dev(), own.ino()), (launched.dev(), launched.ino()));
     }
 
     #[test]

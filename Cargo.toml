@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/vte", "vendor/alacritty_terminal"]
+exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh"]
 resolver = "2"
 members = ["crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
 
@@ -24,3 +24,4 @@ overflow-checks = true
 [patch.crates-io]
 vte = { path = "vendor/vte" }
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
+russh = { path = "vendor/russh" }

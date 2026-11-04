@@ -80,45 +80,59 @@ pub fn session_gone_text(host: &str) -> String {
 /// by the first address on the command line, so naming only the address in
 /// use would send the person to another one). `None` otherwise:
 /// a peer's `Close` means the session is gone, and an ordinary exit needs no
-/// comment.
+/// comment. `persisted` is whether this run's token was saved (see
+/// [`way_back`]).
 pub fn kept_session_notice(
     host: &str,
     link_closed: bool,
     closed_gracefully: bool,
+    persisted: bool,
 ) -> Option<String> {
-    (link_closed && !closed_gracefully).then(|| lost_kept_notice(host))
+    (link_closed && !closed_gracefully).then(|| lost_kept_notice(host, persisted))
 }
 
 /// The connection to `host` died and the server kept the session.
-fn lost_kept_notice(host: &str) -> String {
+fn lost_kept_notice(host: &str, persisted: bool) -> String {
     format!(
-        "qsh: connection to {} lost; the session is kept on the server -- \
-         run the same qsh command again to return to it",
-        bracketed(host)
+        "qsh: connection to {} lost; the session is kept on the server{}",
+        bracketed(host),
+        way_back(persisted)
     )
 }
 
 /// The line printed on the way out when the person left with the prefix's
-/// `.`: the link was let go quietly, and the next run of the same command
-/// claims the session back. `host` is the address the link was on.
-pub fn left_kept_notice(host: &str) -> String {
+/// `.`, or the terminal hung up: the link was let go quietly, and the next
+/// run of the same command can claim the session back. `host` is the
+/// address the link was on.
+pub fn left_kept_notice(host: &str, persisted: bool) -> String {
     format!(
-        "qsh: left {}; the session is kept on the server -- \
-         run the same qsh command again to return to it",
-        bracketed(host)
+        "qsh: left {}; the session is kept on the server{}",
+        bracketed(host),
+        way_back(persisted)
     )
+}
+
+/// How to come back, as far as this client knows. Only a saved token lets
+/// a later run claim the session, and only while the server still keeps
+/// it: neither the session's lifetime nor the disk is promised.
+fn way_back(persisted: bool) -> &'static str {
+    if persisted {
+        " -- running the same qsh command again can return to it while the server keeps it"
+    } else {
+        "; its resume token could not be saved, so another qsh run cannot return to it"
+    }
 }
 
 /// The line printed on the way out in the middle of a reconnect, when there
 /// is no live link to ask: the old one was let go quietly, so the server
 /// keeps the session either way. `left` is whether the person left with the
-/// prefix's `.` -- then that is what they are told, not that the connection
-/// was lost.
-pub fn mid_reconnect_notice(host: &str, left: bool) -> String {
+/// prefix's `.` or the terminal hung up -- then that is what they are told,
+/// not that the connection was lost.
+pub fn mid_reconnect_notice(host: &str, left: bool, persisted: bool) -> String {
     if left {
-        left_kept_notice(host)
+        left_kept_notice(host, persisted)
     } else {
-        lost_kept_notice(host)
+        lost_kept_notice(host, persisted)
     }
 }
 
@@ -244,20 +258,20 @@ mod tests {
     #[test]
     fn only_a_connection_lost_under_the_user_says_the_session_is_kept() {
         assert_eq!(
-            kept_session_notice("box", true, false).as_deref(),
+            kept_session_notice("box", true, false, true).as_deref(),
             Some(
                 "qsh: connection to box lost; the session is kept on the server -- \
-                 run the same qsh command again to return to it"
+                 running the same qsh command again can return to it while the server keeps it"
             ),
             "a death is reported"
         );
         assert_eq!(
-            kept_session_notice("box", true, true),
+            kept_session_notice("box", true, true, true),
             None,
             "the peer closed it"
         );
         assert_eq!(
-            kept_session_notice("box", false, false),
+            kept_session_notice("box", false, false, true),
             None,
             "the user left"
         );
@@ -284,9 +298,31 @@ mod tests {
     #[test]
     fn leaving_on_purpose_says_the_session_is_kept() {
         assert_eq!(
-            left_kept_notice("box"),
+            left_kept_notice("box", true),
             "qsh: left box; the session is kept on the server -- \
-             run the same qsh command again to return to it"
+             running the same qsh command again can return to it while the server keeps it"
+        );
+    }
+
+    /// A token that was never saved cannot bring a later run back: the
+    /// notices say the session stays, but promise no way back to it.
+    #[test]
+    fn an_unsaved_token_promises_no_way_back() {
+        let unsaved =
+            "; its resume token could not be saved, so another qsh run cannot return to it";
+        assert_eq!(
+            left_kept_notice("box", false),
+            format!("qsh: left box; the session is kept on the server{unsaved}")
+        );
+        assert_eq!(
+            kept_session_notice("box", true, false, false),
+            Some(format!(
+                "qsh: connection to box lost; the session is kept on the server{unsaved}"
+            ))
+        );
+        assert_eq!(
+            mid_reconnect_notice("box", true, false),
+            left_kept_notice("box", false)
         );
     }
 
@@ -294,18 +330,21 @@ mod tests {
     /// purpose; any other way out then is the connection lost.
     #[test]
     fn leaving_in_the_middle_of_a_reconnect_says_who_left() {
-        assert_eq!(mid_reconnect_notice("box", true), left_kept_notice("box"));
         assert_eq!(
-            Some(mid_reconnect_notice("box", false)),
-            kept_session_notice("box", true, false)
+            mid_reconnect_notice("box", true, true),
+            left_kept_notice("box", true)
+        );
+        assert_eq!(
+            Some(mid_reconnect_notice("box", false, true)),
+            kept_session_notice("box", true, false, true)
         );
     }
 
     /// An IPv6 literal is named the way it is typed: in brackets.
     #[test]
     fn the_notices_bracket_an_ipv6_literal() {
-        assert!(left_kept_notice("::1").starts_with("qsh: left [::1]; "));
-        assert!(kept_session_notice("::1", true, false)
+        assert!(left_kept_notice("::1", true).starts_with("qsh: left [::1]; "));
+        assert!(kept_session_notice("::1", true, false, true)
             .expect("a death is reported")
             .starts_with("qsh: connection to [::1] lost; "));
         assert_eq!(bracketed("box"), "box");

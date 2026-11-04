@@ -19,7 +19,8 @@ ROOT=Path(__file__).resolve().parents[2]
 SOURCE=ROOT/'packaging/selinux'
 SCRIPT=SOURCE/'qshd_selinux_phase.py'
 PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
-        'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE'}
+        'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
+        'consumer-preun-final':'PENDING'}
 RUNTIME_MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
     'process','modules','module_observer','api','queries','files','observer',
@@ -49,12 +50,16 @@ class ProtocolTests(unittest.TestCase):
                     operation_id='c'*32,state=PHASES[phase],artifact=TRUST)
         return request,result
 
-    def test_fixed_four_requests_and_exact_response_binding(self):
+    def test_fixed_five_requests_and_exact_response_binding(self):
+        self.assertEqual(self.phase._PHASES,PHASES)
         for phase in PHASES:
             request,frame=self.response(phase)
             self.assertEqual(self.phase._request(phase),request)
+            self.assertEqual(self.phase._parse_request(request),{'schema':1,'phase':phase})
             self.assertEqual(self.phase._parse_response(canonical(frame)+b'\n',request),frame)
-        for phase in ('','provider-pre','erase','consumer-pre','/private/path','consumer-pre-fresh --deadline 999'):
+        for phase in ('','provider-pre','erase','consumer-pre','/private/path','consumer-pre-fresh --deadline 999',
+                      'consumer-preun','consumer-preun-final ','Consumer-preun-final','consumer-postun-final',
+                      'consumer-preun-upgrade'):
             with self.subTest(phase=phase),self.assertRaises(self.phase.PhaseError):self.phase._request(phase)
 
     def test_wrong_shape_phase_state_digest_type_and_noncanonical_response_refuse(self):
@@ -70,6 +75,22 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(b'['*1500+b']'*1500,request)
         with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(b'x'*4097,request)
 
+    def test_final_erase_preparation_frame_binds_its_own_phase_pending_state_and_digest(self):
+        request,frame=self.response('consumer-preun-final');raw=canonical(frame)+b'\n'
+        self.assertEqual(self.phase._parse_response(raw,request),frame)
+        other,_=self.response('consumer-post-owned')
+        for changes in ({'state':'COMPLETE'},{'phase':'consumer-post-owned'},{'phase':'consumer-pre-installed'},
+                        {'request_sha256':hashlib.sha256(other).hexdigest()}):
+            with self.subTest(changes=changes),self.assertRaises(self.phase.PhaseError):
+                self.phase._parse_response(canonical(frame|changes)+b'\n',request)
+        with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(raw,other)
+        for value in (canonical({'schema':1,'phase':'consumer-preun-final'})+b' ',
+                      b'{"phase":"consumer-preun-final","schema":1,"schema":1}',
+                      b'{"phase":"consumer-preun-final","schema":true}',
+                      b'{"phase":"consumer-preun-final","schema":1,"deadline":340}',
+                      b'{"schema":1,"phase":"consumer-preun-final"}'):
+            with self.subTest(value=value),self.assertRaises(self.phase.PhaseError):self.phase._parse_request(value)
+
     def test_actual_typed_pending_and_complete_records_emit_only_final_frame(self):
         from qshd_selinux_activation import Activation,TrustedArtifact,ModuleIdentity,Completion,ContextBinding
         trust=TrustedArtifact(**TRUST)
@@ -80,6 +101,9 @@ class ProtocolTests(unittest.TestCase):
             frame=self.phase._response(record,request)
             self.assertEqual(self.phase._parse_response(frame,request)['state'],state)
         with self.assertRaises(self.phase.PhaseError):self.phase._response(object(),self.phase._request('consumer-pre-fresh'))
+        completion=Completion('normal-install-reload-v1',trust.pp_sha256,ContextBinding('d'*64,'e'*64))
+        complete=Activation(1,'COMPLETE','c'*32,'fedora44-targeted-v1',1,1,trust,ModuleIdentity('qshd',400,'targeted','pp'),completion)
+        with self.assertRaises(self.phase.PhaseError):self.phase._response(complete,self.phase._request('consumer-preun-final'))
 
     def test_only_exact_250_combined_profile_is_new(self):
         from qshd_selinux_process import _Limits,_CommandError
@@ -91,7 +115,7 @@ class ProtocolTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
-    def test_four_modes_call_only_selected_existing_api_with_no_outer_package_recursion(self):
+    def test_five_modes_call_only_selected_existing_api_with_no_outer_package_recursion(self):
         phase=load_phase()
         import qshd_selinux_first_activation as first
         import qshd_selinux_consumer_activation as consumer
@@ -100,13 +124,55 @@ class DispatchTests(unittest.TestCase):
         def bridge(*,deadline):calls.append(('bridge',deadline));return records['provider-post-pristine']
         def pre(*,fresh,deadline):calls.append(('pre',fresh,deadline));return records['consumer-pre-fresh' if fresh else 'consumer-pre-installed']
         def post(*,deadline):calls.append(('post',deadline));return records['consumer-post-owned']
+        def erase(*,deadline):calls.append(('erase',deadline));return records['consumer-preun-final']
         with patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),\
              patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),\
              patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),\
+             patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),\
              patch.object(consumer._Production,'guard',side_effect=lambda deadline:calls.append(('guard',deadline))),\
              patch.object(package,'production',side_effect=AssertionError('entry must not nest a package lease')):
             for name in PHASES:self.assertIs(phase._dispatch(name,deadline=340.0),records[name])
-        self.assertEqual(calls,[('guard',340.0),('bridge',340.0),('pre',True,340.0),('pre',False,340.0),('post',340.0)])
+        self.assertEqual(calls,[('guard',340.0),('bridge',340.0),('pre',True,340.0),('pre',False,340.0),('post',340.0),
+                                ('erase',340.0)])
+
+    def patched_consumer(self,erase):
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_consumer_activation as consumer
+        import qshd_selinux_package_state as package
+        refuse=lambda name:AssertionError(name+' must not be called for final erase preparation')
+        return (patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),
+                patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=refuse('pre')),
+                patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=refuse('post')),
+                patch.object(first,'activate_installed_pristine_pending_first',side_effect=refuse('bridge')),
+                patch.object(consumer._Production,'guard',side_effect=refuse('another guard')),
+                patch.object(package,'production',side_effect=refuse('another package lease')))
+
+    def test_final_erase_preparation_passes_the_exact_original_deadline_once(self):
+        phase=load_phase();deadline=object();record=object();calls=[]
+        def erase(**kwargs):calls.append(kwargs);return record
+        patches=self.patched_consumer(erase)
+        with patches[0],patches[1],patches[2],patches[3],patches[4],patches[5]:
+            self.assertIs(phase._dispatch('consumer-preun-final',deadline=deadline),record)
+        self.assertEqual(len(calls),1);self.assertEqual(set(calls[0]),{'deadline'})
+        self.assertIs(calls[0]['deadline'],deadline)
+
+    def test_final_erase_preparation_failure_propagates_without_fallback_or_frame(self):
+        import io
+        from types import SimpleNamespace
+        phase=load_phase();request=phase._request('consumer-preun-final').decode()
+        class Failure(Exception):pass
+        failure=Failure('synthetic outcome-uncertain erase preparation');calls=[]
+        def erase(*,deadline):calls.append(deadline);raise failure
+        output=SimpleNamespace(buffer=io.BytesIO())
+        patches=self.patched_consumer(erase)
+        with patches[0],patches[1],patches[2],patches[3],patches[4],patches[5],\
+             patch.object(phase,'_resources'),patch.object(phase.time,'monotonic',return_value=101.0),\
+             patch.object(phase,'_response',side_effect=AssertionError('no frame after a failed operation')),\
+             patch.object(phase.sys,'stdout',output),patch.object(phase.sys,'stderr',SimpleNamespace(buffer=io.BytesIO())) as errors:
+            self.assertEqual(phase._child_main([request,'100.0','340.0']),1)
+            self.assertEqual(phase._parse_failure(errors.buffer.getvalue(),request.encode())['codes'],['UNKNOWN'])
+        self.assertEqual(calls,[340.0])
+        self.assertEqual(output.buffer.getvalue(),b'')
 
 
 class DeadlineTests(unittest.TestCase):
@@ -178,6 +244,200 @@ class ParentTests(unittest.TestCase):
                  patch.object(self.phase.sys,'stdout',output):
                 with self.assertRaises(self.phase.PhaseError):self.phase._parent('consumer-pre-fresh',100.0)
             self.assertEqual(output.buffer.getvalue(),b'')
+
+
+class FailureProtocolTests(unittest.TestCase):
+    def test_install_timeout_retains_only_closed_bound_provenance(self):
+        phase=load_phase()
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_process as process
+        inner=process._CommandError('COMMAND_TIMEOUT')
+        outer=first.CoordinatorError('INSTALL');outer.__context__=inner;outer.__suppress_context__=True
+        request=phase._request('provider-post-pristine')
+        frame=phase._failure(outer,request)
+        value=phase._parse_failure(frame,request)
+        self.assertEqual(value['codes'],['COORDINATOR_INSTALL','COMMAND_TIMEOUT'])
+        self.assertLessEqual(len(frame),1024)
+
+
+class FailureSafetyTests(unittest.TestCase):
+    def setUp(self):self.phase=load_phase();self.request=self.phase._request('provider-post-pristine')
+
+    def test_launch_code_validation_preserves_command_schema(self):
+        import qshd_selinux_process as process
+        for outcome in (None, object(),
+                process._Outcome(b'',b'',0,'TOOL_FAILURE',True,launch_code='OS_EMFILE'),
+                process._Outcome(b'',b'',None,'COMMAND_TIMEOUT',True,launch_code='OS_EMFILE'),
+                process._Outcome(b'',b'',None,'TOOL_FAILURE',True,launch_code='PRIVATE'),
+                process._Outcome(b'',b'',None,'TOOL_FAILURE',True,launch_code=True)):
+            self.assertIsNone(process._launch_code(outcome))
+        for code in ('PRIVATE',True,object(),None):
+            error=process._CommandError('TOOL_FAILURE',_outcome=code)
+            value=self.phase._parse_failure(self.phase._failure(error,self.request),self.request)
+            self.assertEqual(value['codes'],['TOOL_FAILURE'])
+        self.assertEqual(set(self.phase._parse_failure(self.phase._failure(error,self.request),self.request)),
+                         {'version','request','codes','command'})
+
+    def test_unknown_private_text_and_cycles_are_bounded_without_rendering(self):
+        class Private(Exception):
+            def __str__(self):raise AssertionError('must not render exception')
+            def __repr__(self):raise AssertionError('must not render exception')
+        error=Private('PRIVATE_PATH_TOKEN');error.__context__=error
+        raw=self.phase._failure(error,self.request)
+        self.assertNotIn(b'PRIVATE',raw)
+        self.assertEqual(self.phase._parse_failure(raw,self.request)['codes'],['UNKNOWN'])
+        current=error
+        for _ in range(20):
+            newer=Private('PRIVATE');newer.__context__=current;current=newer
+        self.assertEqual(len(self.phase._parse_failure(self.phase._failure(current,self.request),self.request)['codes']),8)
+
+    def test_actual_summary_types_and_outcome_categories_cannot_leak_streams(self):
+        from dataclasses import FrozenInstanceError
+        import qshd_selinux_process as process
+        for failure,exit_code,settled,unreaped in ((None,7,True,()),(None,-25,True,()),('COMMAND_TIMEOUT',-15,True,()),('COMMAND_UNSETTLED',None,False,(98765,))):
+            outcome=process._Outcome(b'PRIVATE_STDOUT',b'PRIVATE_STDERR',exit_code,failure,settled,unreaped)
+            summary=process._failure_summary(outcome,process._Limits(75,1024**2))
+            self.assertEqual(summary.exit_code,exit_code);self.assertEqual(summary.unreaped,len(unreaped))
+            with self.assertRaises(FrozenInstanceError):summary.exit_code=1
+            error=process._CommandError(failure or 'TOOL_FAILURE',summary=summary)
+            raw=self.phase._failure(error,self.request)
+            self.assertNotIn(b'PRIVATE',raw);self.assertNotIn(b'98765',raw)
+            self.assertEqual(self.phase._parse_failure(raw,self.request)['command']['profile'],'module75')
+        self.assertIsNone(process._failure_summary(process._Outcome(b'',b'',True,None,True),process._Limits(5,1)))
+
+    def test_builtin_errno_codes_are_closed_and_custom_canaries_are_unknown(self):
+        import errno
+        class Foreign(OSError):
+            def __str__(self):raise AssertionError('must not stringify private errno')
+        for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM'):
+            error=OSError(getattr(errno,name),'PRIVATE_MESSAGE','PRIVATE_FILENAME')
+            raw=self.phase._failure(error,self.request)
+            self.assertEqual(self.phase._parse_failure(raw,self.request)['codes'],['OS_'+name])
+            self.assertNotIn(b'PRIVATE',raw)
+        for error in (Foreign(errno.EMFILE,'PRIVATE'),OSError(errno.ENOENT,'PRIVATE')):
+            self.assertEqual(self.phase._parse_failure(self.phase._failure(error,self.request),self.request)['codes'],['UNKNOWN'])
+        error=OSError(errno.EMFILE,'PRIVATE');error.errno=True
+        self.assertEqual(self.phase._parse_failure(self.phase._failure(error,self.request),self.request)['codes'],['UNKNOWN'])
+
+    def test_noncanonical_foreign_oversized_and_wrong_typed_frames_refuse(self):
+        value=self.phase._parse_failure(self.phase._failure(ValueError('PRIVATE'),self.request),self.request)
+        bad=[b'x'*1025,canonical(value),canonical(dict(value,version=True))+b'\n',canonical(dict(value,codes=['PRIVATE']))+b'\n',canonical(dict(value,codes=['UNKNOWN']*9))+b'\n']
+        foreign=dict(value,request={'schema':1,'phase':'consumer-pre-fresh'});bad.append(canonical(foreign)+b'\n')
+        command=dict(profile='module75',failure=None,exit_code=True,settled=True,unreaped=0)
+        bad.append(canonical(dict(value,command=command))+b'\n')
+        for raw in bad:
+            with self.subTest(raw=raw[:30]),self.assertRaises(self.phase.PhaseError):self.phase._parse_failure(raw,self.request)
+
+    def test_parent_owner_failure_dominates_even_valid_private_refusal(self):
+        import io
+        from types import SimpleNamespace
+        import qshd_selinux_process as process
+        raw=self.phase._failure(ValueError('PRIVATE'),self.request)
+        for failure,code,settled,unreaped,stdout,stderr,clock in (
+                ('TOOL_FAILURE',1,True,(),b'',raw,101),('COMMAND_TIMEOUT',1,True,(),b'',raw,101),
+                (None,1,False,(),b'',raw,101),(None,1,True,(999,),b'',raw,101),
+                (None,1,True,(),b'other',raw,101),(None,2,True,(),b'',raw,101),
+                (None,1,True,(),b'',b'PRIVATE',101),(None,1,True,(),b'',raw,350)):
+            owner=SimpleNamespace(_last=process._Outcome(stdout,stderr,code,failure,settled,unreaped))
+            def run(*a,**k):raise process._CommandError('TOOL_FAILURE')
+            owner._run=run;output=SimpleNamespace(buffer=io.BytesIO());errors=SimpleNamespace(buffer=io.BytesIO())
+            with patch.object(self.phase,'_resources'),patch.object(self.phase,'_owner',return_value=owner),patch.object(self.phase.time,'monotonic',side_effect=[101,101,clock]),patch.object(self.phase.sys,'stdout',output),patch.object(self.phase.sys,'stderr',errors):
+                with self.assertRaises(self.phase.PhaseError):self.phase._parent('provider-post-pristine',100.0)
+            self.assertEqual(output.buffer.getvalue(),b'');self.assertEqual(errors.buffer.getvalue(),b'')
+
+    def test_child_cancellation_does_not_become_normal_refusal(self):
+        import io
+        from types import SimpleNamespace
+        output=SimpleNamespace(buffer=io.BytesIO());errors=SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(self.phase,'_resources'),patch.object(self.phase.time,'monotonic',return_value=101),patch.object(self.phase,'_dispatch',side_effect=KeyboardInterrupt()),patch.object(self.phase.sys,'stdout',output),patch.object(self.phase.sys,'stderr',errors):
+            with self.assertRaises(KeyboardInterrupt):self.phase._child_main([self.request.decode(),'100','340'])
+        self.assertEqual(output.buffer.getvalue(),b'');self.assertEqual(errors.buffer.getvalue(),b'')
+
+    def test_real_harmless_child_parent_forwards_one_refusal_after_settlement(self):
+        program=r'''
+import importlib.util, pathlib, resource, sys, time
+root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);sys.path.insert(0,str(root))
+for key,value in ((resource.RLIMIT_CORE,0),(resource.RLIMIT_FSIZE,16*1024**2),(resource.RLIMIT_AS,1024**3),(resource.RLIMIT_CPU,15)):
+ resource.setrlimit(key,(value,value))
+spec=importlib.util.spec_from_file_location('actual_phase',root/'qshd_selinux_phase.py');phase=importlib.util.module_from_spec(spec);sys.modules[spec.name]=phase;spec.loader.exec_module(phase)
+phase._resources=lambda **kw:None
+if len(sys.argv)>3:
+ import qshd_selinux_first_activation as first
+ import qshd_selinux_process as process
+ def refuse(*args,**kw):
+  inner=process._CommandError('COMMAND_TIMEOUT',summary=process._FailureSummary('module75','COMMAND_TIMEOUT',-15,True,0))
+  outer=first.CoordinatorError('INSTALL');outer.__context__=inner;raise outer from None
+ phase._dispatch=refuse
+ raise SystemExit(phase._child_main(sys.argv[4:]))
+phase._SCRIPT=str(helper)
+status=phase._parent('provider-post-pristine',time.monotonic())
+import qshd_selinux_process as process
+assert process._children()==[]
+raise SystemExit(status)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);root.chmod(0o700);helper=root/'child.py'
+            helper.write_text(program);helper.chmod(0o600)
+            env=os.environ|dict(HOME=directory,XDG_CACHE_HOME=directory,XDG_CONFIG_HOME=directory,TMPDIR=directory,HISTFILE='/dev/null')
+            # Child script receives the fixed production child selector then original request/times.
+            child_program=program.replace("root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);", "root=pathlib.Path("+repr(str(SOURCE))+ ");helper=pathlib.Path(__file__);").replace('if len(sys.argv)>3:', 'if True:').replace('sys.argv[4:]', 'sys.argv[2:]')
+            helper.write_text(child_program)
+            result=subprocess.run([sys.executable,'-I','-B','-c',program,str(SOURCE),str(helper)],cwd=directory,env=env,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(result.stdout,b'')
+            value=self.phase._parse_failure(result.stderr,self.request)
+            self.assertEqual(value['codes'],['COORDINATOR_INSTALL','COMMAND_TIMEOUT'])
+            self.assertEqual(value['command']['exit_code'],-15)
+
+    def test_real_owner_launch_errno_crosses_child_parent_after_settlement(self):
+        program=r'''
+import importlib.util, pathlib, resource, sys, time
+root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);sys.path.insert(0,str(root))
+for key,value in ((resource.RLIMIT_CORE,0),(resource.RLIMIT_FSIZE,16*1024**2),(resource.RLIMIT_AS,1024**3),(resource.RLIMIT_CPU,15)):
+ resource.setrlimit(key,(value,value))
+spec=importlib.util.spec_from_file_location('actual_phase',root/'qshd_selinux_phase.py');phase=importlib.util.module_from_spec(spec);sys.modules[spec.name]=phase;spec.loader.exec_module(phase)
+phase._resources=lambda **kw:None
+if len(sys.argv)>3:
+ import qshd_selinux_first_activation as first
+ import qshd_selinux_process as process
+ def refuse(*args,**kw):
+  import errno, tempfile
+  from unittest.mock import patch
+  def fail(*a,**k):raise OSError(errno.EMFILE,'PRIVATE_MESSAGE','/private/canary')
+  with tempfile.TemporaryDirectory() as directory,patch.object(process.subprocess,'Popen',side_effect=fail):
+   try:process._Owner(process._Limits(15,1024**2))._run(('/trusted/tool',),directory)
+   except process._CommandError as inner:
+    from qshd_selinux_fs import Conflict
+    try:raise Conflict('PRIVATE') from inner
+    except Conflict as context:raise first.CoordinatorError('OBSERVATION') from context
+ phase._dispatch=refuse
+ raise SystemExit(phase._child_main(sys.argv[4:]))
+phase._SCRIPT=str(helper)
+status=phase._parent('provider-post-pristine',time.monotonic())
+import qshd_selinux_process as process
+assert process._children()==[]
+raise SystemExit(status)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);root.chmod(0o700);helper=root/'child.py'
+            helper.write_text(program);helper.chmod(0o600)
+            env=os.environ|dict(HOME=directory,XDG_CACHE_HOME=directory,XDG_CONFIG_HOME=directory,TMPDIR=directory,HISTFILE='/dev/null')
+            # Child script receives the fixed production child selector then original request/times.
+            child_program=program.replace("root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);", "root=pathlib.Path("+repr(str(SOURCE))+ ");helper=pathlib.Path(__file__);").replace('if len(sys.argv)>3:', 'if True:').replace('sys.argv[4:]', 'sys.argv[2:]')
+            helper.write_text(child_program)
+            result=subprocess.run([sys.executable,'-I','-B','-c',program,str(SOURCE),str(helper)],cwd=directory,env=env,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(result.stdout,b'')
+            value=self.phase._parse_failure(result.stderr,self.request)
+            self.assertEqual(value['codes'],['COORDINATOR_OBSERVATION','CONTEXT_REFUSED','OS_EMFILE'])
+            self.assertIsNone(value['command']['exit_code'])
+            self.assertEqual(value['command']['failure'],'TOOL_FAILURE')
+            self.assertEqual(value['command']['profile'],'module15')
+            self.assertTrue(value['command']['settled'])
+            self.assertEqual(value['command']['unreaped'],0)
+            self.assertLessEqual(len(result.stderr),1024)
+            self.assertNotIn(b'PRIVATE',result.stderr)
+            self.assertNotIn(b'/private',result.stderr)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -263,7 +523,7 @@ else:
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'')
 
-    def test_four_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
+    def test_five_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
         spec=importlib.util.spec_from_file_location('integrated_payload_builder',SOURCE/'assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
         with tempfile.TemporaryDirectory() as directory:
@@ -320,12 +580,14 @@ calls=[]
 def pre(*,fresh,deadline):calls.append(('pre',fresh,deadline));return record
 def post(*,deadline):calls.append(('post',deadline));return record
 def bridge(*,deadline):calls.append(('bridge',deadline));return record
-with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
+def erase(*,deadline):calls.append(('erase',deadline));return record
+assert pathlib.Path(consumer.__file__).parent==root
+with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
  result=phase._dispatch(mode,deadline=1234.0)
  assert result is record
  request=phase._request(mode);frame=phase._response(result,request)
  assert phase._parse_response(frame,request)['state']==state
-expected={'provider-post-pristine':[('guard',1234.0),('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)]}
+expected={'provider-post-pristine':[('guard',1234.0),('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)],'consumer-preun-final':[('erase',1234.0)]}
 assert calls==expected[mode]
 for name,module in list(sys.modules.items()):
  if name in phase._MODULES:

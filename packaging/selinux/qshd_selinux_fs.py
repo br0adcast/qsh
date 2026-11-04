@@ -40,14 +40,24 @@ class SafeFiles:
 
     def _directory(self, path):
         relative = path.relative_to(self.anchor)
-        fd = os.open(self.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        self.anchors.append(fd)
+        if self.anchors:
+            self._validate_directory_routes()
+            fd = self.anchors[0]
+        else:
+            fd = os.open(self.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            self.anchors.append(fd)
         self._dir_mode(fd)
         for part in relative.parts:
-            new = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            self.routes.append((fd, part, new))
-            self._dir_mode(new)
-            fd = new
+            child = next((child for parent, name, child in self.routes
+                          if parent == fd and name == part), None)
+            if child is None:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                self.routes.append((fd, part, child))
+            else:
+                if identity(os.stat(part, dir_fd=fd, follow_symlinks=False)) != identity(os.fstat(child)):
+                    fail('DIRECTORY_BINDING')
+            self._dir_mode(child)
+            fd = child
         return fd
 
     def _dir_mode(self, fd):

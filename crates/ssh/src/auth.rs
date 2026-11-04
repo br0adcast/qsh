@@ -393,8 +393,12 @@ async fn run_method<H: russh::client::Handler>(
             if !offered.insert(canonical(&public)?) {
                 return Ok(vec![Attempt::Duplicate]);
             }
-            let Some(hash) = hash_for(login, &wait, &public).await? else {
-                return Ok(vec![Attempt::Gone]);
+            let hash = match hash_for(login, &wait, &public).await? {
+                Some(Signing::With(hash)) => hash,
+                Some(Signing::LegacyOnly) => {
+                    return Ok(vec![Attempt::Skipped(format!("key store: {LEGACY_ONLY}"))])
+                }
+                None => return Ok(vec![Attempt::Gone]),
             };
             let sent = wait
                 .on(login.handle.authenticate_publickey_with(
@@ -529,19 +533,39 @@ fn canonical(public: &PublicKey) -> Result<Vec<u8>, SshError> {
         .map_err(|e| SshError::AuthFailed(format!("the key is unusable: {e}")))
 }
 
-/// RSA uses the negotiated SHA-256 or SHA-512 digest, or legacy SHA-1 when
-/// the server offers neither. Other key types take none. The outer `None`
+/// How a key may sign, from the server's advertised signature algorithms.
+enum Signing {
+    /// Offer the key with this hash: none for a non-RSA key, SHA-2 for RSA.
+    With(Option<HashAlg>),
+    /// An RSA key whose best advertised algorithm is legacy `ssh-rsa`: not
+    /// offered, since SHA-1 signatures are refused (#150).
+    LegacyOnly,
+}
+
+/// Why an RSA key was not offered: what the advertisement shows, not a
+/// claim about everything the server would accept.
+const LEGACY_ONLY: &str = "RSA key not offered: the server's advertised signature \
+     algorithms offer only legacy ssh-rsa (SHA-1) for RSA keys; an Ed25519 or ECDSA key, \
+     or rsa-sha2 on the server, would be used";
+
+/// The hash an RSA key signs with: the SHA-2 hash the server advertises.
+/// When its best advertised RSA algorithm is legacy `ssh-rsa`, the key is not
+/// offered. Without the extension, or with one naming no RSA algorithm --
+/// russh cannot tell these apart -- the key is offered once with SHA-512,
+/// and a refusal is an ordinary one. Other key types take no hash. `None`
 /// means the session is gone.
 async fn hash_for<H: russh::client::Handler>(
     login: &mut Login<'_, H>,
     wait: &Wait,
     public: &PublicKey,
-) -> Result<Option<Option<HashAlg>>, SshError> {
+) -> Result<Option<Signing>, SshError> {
     if !public.algorithm().is_rsa() {
-        return Ok(Some(None));
+        return Ok(Some(Signing::With(None)));
     }
     match wait.on(login.handle.best_supported_rsa_hash()).await? {
-        Ok(hash) => Ok(Some(hash.flatten())),
+        Ok(Some(Some(hash))) => Ok(Some(Signing::With(Some(hash)))),
+        Ok(Some(None)) => Ok(Some(Signing::LegacyOnly)),
+        Ok(None) => Ok(Some(Signing::With(Some(HashAlg::Sha512)))),
         Err(e) => session_gone(e).map(|()| None),
     }
 }
@@ -556,8 +580,10 @@ async fn offer_private_key<H: russh::client::Handler>(
     if !offered.insert(canonical(key.public_key())?) {
         return Ok(Attempt::Duplicate);
     }
-    let Some(hash) = hash_for(login, wait, key.public_key()).await? else {
-        return Ok(Attempt::Gone);
+    let hash = match hash_for(login, wait, key.public_key()).await? {
+        Some(Signing::With(hash)) => hash,
+        Some(Signing::LegacyOnly) => return Ok(Attempt::Skipped(LEGACY_ONLY.into())),
+        None => return Ok(Attempt::Gone),
     };
     // The built-in private-key method signs again inside russh's session
     // task after PK_OK, outside our cancellation checks. Keep that action in
@@ -596,8 +622,16 @@ async fn offer_locked_key<H: russh::client::Handler>(
     if !offered.insert(canonical(public)?) {
         return Ok(vec![Attempt::Duplicate]);
     }
-    let Some(hash) = hash_for(login, wait, public).await? else {
-        return Ok(vec![Attempt::Gone]);
+    let hash = match hash_for(login, wait, public).await? {
+        Some(Signing::With(hash)) => hash,
+        // Before any passphrase question: the key would not be offered.
+        Some(Signing::LegacyOnly) => {
+            return Ok(vec![Attempt::Skipped(format!(
+                "{}: {LEGACY_ONLY}",
+                path.display()
+            ))])
+        }
+        None => return Ok(vec![Attempt::Gone]),
     };
     let mut signer = keyfile::LazyKeySigner {
         path,
@@ -658,9 +692,16 @@ async fn offer_agent_keys<H: russh::client::Handler>(
             attempts.push(Attempt::Duplicate);
             continue;
         }
-        let Some(hash) = hash_for(login, wait, &key).await? else {
-            attempts.push(Attempt::Gone);
-            break;
+        let hash = match hash_for(login, wait, &key).await? {
+            Some(Signing::With(hash)) => hash,
+            Some(Signing::LegacyOnly) => {
+                attempts.push(Attempt::Skipped(format!("agent: {LEGACY_ONLY}")));
+                continue;
+            }
+            None => {
+                attempts.push(Attempt::Gone);
+                break;
+            }
         };
         let mut signer = AgentSigner {
             agent: &mut agent,

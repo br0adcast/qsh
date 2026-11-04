@@ -53,6 +53,9 @@ pub struct SshdOptions {
     /// More `SetEnv` pairs for every session, after HISTFILE/TMUX_TMPDIR.
     /// Values are quoted for sshd_config, including paths with spaces.
     pub session_env: Vec<(String, String)>,
+    /// More `sshd_config` lines, written first: sshd takes the first value
+    /// of each keyword, so these override the defaults below.
+    pub extra_config: Vec<String>,
 }
 
 impl TestSshd {
@@ -270,15 +273,21 @@ fn write_config(d: &Path, port: u16, host_keys: &[PathBuf], opts: &SshdOptions) 
         .iter()
         .map(|(name, value)| format!(" {}", config_quote(&format!("{name}={value}"))))
         .collect();
-    let cfg = format!(
-        "Port {port}\nListenAddress 127.0.0.1\n{host_key_lines}{max_tries}PidFile {}\n\
+    let extra: String = opts
+        .extra_config
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let cfg = extra
+        + &format!(
+            "Port {port}\nListenAddress 127.0.0.1\n{host_key_lines}{max_tries}PidFile {}\n\
          AuthorizedKeysFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
          PubkeyAuthentication yes\nCompression yes\nLogLevel DEBUG1\nSubsystem sftp internal-sftp\n\
          SetEnv HISTFILE=/dev/null TMUX_TMPDIR={}{more_env}\n",
-        d.join("sshd.pid").display(),
-        d.join("authorized_keys").display(),
-        d.join("tmux").display(),
-    );
+            d.join("sshd.pid").display(),
+            d.join("authorized_keys").display(),
+            d.join("tmux").display(),
+        );
     std::fs::write(d.join("sshd_config"), cfg).unwrap();
 }
 

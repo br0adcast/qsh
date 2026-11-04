@@ -28,6 +28,69 @@ if case=='observer-profile':
         try:m._Limits(*pair)
         except m._CommandError:pass
         else:raise AssertionError('unapproved observer profile')
+elif case=='launch-error':
+    import errno
+    owner=m._Owner(m._Limits(15,1024**2))
+    def refuse(*args,**kwargs):raise OSError(errno.EMFILE,'PRIVATE_MESSAGE','/private/canary')
+    m.subprocess.Popen=refuse
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            try:owner._run(('/trusted/tool',),directory)
+            except m._CommandError as error:
+                assert getattr(error,'launch_code',None)=='OS_EMFILE','launch errno category lost'
+                assert owner._last.launch_code=='OS_EMFILE'
+                assert error.summary.failure=='TOOL_FAILURE' and error.summary.exit_code is None
+                assert error.summary.settled and error.summary.unreaped==0
+                try:error.launch_code='PRIVATE'
+                except AttributeError:pass
+                else:raise AssertionError('launch code property writable')
+                assert 'PRIVATE' not in str(error) and '/private' not in repr(error.__dict__)
+            else:raise AssertionError('launch refusal accepted')
+    finally:m.subprocess.Popen=native_popen
+    assert m._children()==[]
+elif case=='launch-matrix':
+    import errno
+    class Custom(OSError):
+        @property
+        def errno(self):raise AssertionError('custom errno inspected')
+    cases=[(OSError(getattr(errno,name),'PRIVATE','/private'), 'OS_'+name)
+           for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM')]
+    cases += [(OSError(999,'PRIVATE'),None),(Custom(errno.EMFILE,'PRIVATE'),None),
+              (OSError(True,'PRIVATE'),None),(OSError('24','PRIVATE'),None)]
+    owner=m._Owner(m._Limits(15,1024**2))
+    with tempfile.TemporaryDirectory() as directory:
+        for fault,expected in cases:
+            def refuse(*args,**kwargs):raise fault
+            m.subprocess.Popen=refuse
+            try:owner._run(('/trusted/tool',),directory)
+            except m._CommandError as error:
+                assert error.launch_code==expected and owner._last.launch_code==expected
+                assert error.summary.failure=='TOOL_FAILURE' and error.summary.exit_code is None
+                assert error.summary.settled and not error.summary.unreaped
+                assert '/private' not in repr(error.__dict__)
+            else:raise AssertionError('launch error accepted')
+        m.subprocess.Popen=native_popen
+        assert owner._run((sys.executable,'-I','-B','-c','pass'),directory).stdout==b''
+        assert owner._last.launch_code is None
+        try:owner._run((sys.executable,'-I','-B','-c','raise SystemExit(7)'),directory)
+        except m._CommandError as error:
+            assert error.launch_code is None and error.summary.exit_code==7
+        else:raise AssertionError('nonzero accepted')
+        # A post-acquisition read failure must not masquerade as launch errno.
+        original_read=os.read
+        def post_read(*args):
+            os.read=original_read
+            raise OSError(errno.EMFILE,'PRIVATE')
+        def acquired(*args,**kwargs):
+            proc=native_popen(*args,**kwargs);os.read=post_read;return proc
+        m.subprocess.Popen=acquired
+        try:
+            try:owner._run((sys.executable,'-I','-B','-c','pass'),directory)
+            except m._CommandError as error:
+                assert error.launch_code is None and owner._last.launch_code is None
+            else:raise AssertionError('post-spawn error accepted')
+        finally:os.read=original_read;m.subprocess.Popen=native_popen
+    assert m._children()==[]
 elif case=='preconditions':
     before=m._children()
     for option in (resource.RLIMIT_CORE,resource.RLIMIT_FSIZE,resource.RLIMIT_CPU,resource.RLIMIT_AS):
@@ -134,7 +197,13 @@ else:
                     assert time.monotonic()-start<1.5
                 elif case=='expired':
                     try:owner._run('list',temporary,deadline=time.monotonic()-1)
-                    except m._CommandError as exc:assert str(exc)=='COMMAND_TIMEOUT'
+                    except m._CommandError as exc:
+                        assert str(exc)=='COMMAND_TIMEOUT'
+                        assert exc.summary.profile=='OTHER'
+                        assert exc.summary.failure=='COMMAND_TIMEOUT' and exc.summary.exit_code is None
+                        assert exc.summary.settled and exc.summary.unreaped==0 and seen==[]
+                        assert set(vars(exc.summary))=={'profile','failure','exit_code','settled','unreaped'}
+                        assert not hasattr(exc.summary,'stdout') and not hasattr(exc.summary,'stderr')
                     else:raise AssertionError('expired lease launched')
                     assert seen==[]
                     result=b''
@@ -171,6 +240,12 @@ else:
             assert seen==([] if case=='expired' else [listing,extract,listing,extract] if case=='binding' else [extract] if case=='extract-output' else [listing])
             if case in ('anchor','expired'):assert not any(event[0]=='group' for event in events),events
             else:assert events[0]==('group',signal.SIGTERM) and sum(event[0]=='group' for event in events)==(4 if case=='binding' else 1),events
+            if case in ('expired','nonzero','timeout','interrupt','cleanup-interrupt','unsettled'):
+                assert getattr(error,'launch_code',None) is None
+                assert owner._last.launch_code is None
+            if case=='nonzero':
+                assert error.summary.exit_code==7 and error.summary.failure is None and error.summary.settled
+                assert not hasattr(error.summary,'stdout') and not hasattr(error.summary,'stderr')
             if case!='expired':assert len(owner._last.stdout)+len(owner._last.stderr)<=(4*1024**2 if case=='profile' else 1024**2)
             if case not in ('unsettled','expired'):assert owner._last.settled and m._children()==[]
         finally:
@@ -201,6 +276,10 @@ class ProcessTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"passed": true', result.stdout)
+
+    def test_launch_error_preserves_only_closed_errno(self): self.control('launch-error')
+
+    def test_launch_categories_types_and_later_calls_are_isolated(self): self.control('launch-matrix')
 
     def test_exact_observer_profile_only(self): self.control('observer-profile')
 

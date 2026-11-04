@@ -964,6 +964,177 @@ fn udp_recovers_during_a_long_ssh_backoff() {
     exit_cleanly(&mut client, &screen, &daemon);
 }
 
+/// Marks the shell with its own process id and returns that id, read from
+/// the answer `PID<n>`: a later answer `MARKkept-<n>-<n>` comes from this
+/// very shell process, which still knows the mark.
+fn mark_with_pid(client: &mut Client, screen: &Screen) -> String {
+    client.type_line("export QSH_MARK=kept-$$; echo P'I'D$$");
+    let mut pid = None;
+    assert!(
+        wait_until(|| {
+            let text = screen.text();
+            pid = text.match_indices("PID").find_map(|(at, _)| {
+                let digits: String = text[at + 3..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                (!digits.is_empty()).then_some(digits)
+            });
+            pid.is_some()
+        }),
+        "the shell must answer with its pid; client saw: {}",
+        screen.text()
+    );
+    pid.expect("checked above")
+}
+
+/// Asks the shell for its mark and `$$` until the marked process answers,
+/// or `within` runs out.
+fn the_marked_shell_answers(
+    client: &mut Client,
+    screen: &Screen,
+    pid: &str,
+    within: Duration,
+) -> bool {
+    let expected = format!("MARKkept-{pid}-{pid}");
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        client.master.write_all(b"\x15").expect("type ctrl-u");
+        client.type_line("echo MA\\RK$QSH_MARK-$$");
+        if wait_for(Duration::from_secs(1), || screen.has(&expected)) {
+            assert!(!screen.has("Start a new session?"));
+            return true;
+        }
+    }
+    screen.has(&expected)
+}
+
+/// How many pseudo-terminal masters process `pid` holds. A client holding
+/// a copy of its own terminal's master would keep that terminal from ever
+/// hanging up when the test closes its side. Read from `/proc`, so this
+/// diagnostic is Linux-only; the close and the assertions after it are not.
+#[cfg(target_os = "linux")]
+fn masters_held_by(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("the client's descriptors")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            std::fs::read_link(entry.path()).is_ok_and(|target| target.ends_with("ptmx"))
+        })
+        .count()
+}
+
+/// Closing the client's terminal -- its last master descriptor goes, a real
+/// hangup rather than a signal from the test -- keeps the session: the run
+/// ends by itself with 1, and the next run with the same config home is in
+/// the same shell process. A lost terminal can show nothing, so restoration
+/// is not checked here; the client log is the local evidence.
+#[test]
+fn a_closed_terminal_keeps_the_session_and_the_next_run_comes_back() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut first = spawn_to(daemon.port, &key_path, config.path());
+    let (screen, reader) = Screen::owned(&first);
+    answer_yes(&mut first, &screen, &daemon);
+    let pid = mark_with_pid(&mut first, &screen);
+
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        masters_held_by(first.pid()),
+        0,
+        "the client must not hold its own terminal's master"
+    );
+    // The collector's copy goes first, then the test's own: no master
+    // descriptor is left open on this terminal.
+    drop(reader);
+    drop(std::mem::replace(
+        &mut first.master,
+        std::fs::File::open("/dev/null").expect("open /dev/null"),
+    ));
+    let status = wait_for_exit(&mut first.child).expect("a hangup ends the run");
+    let log = verbose_log(config.path());
+
+    let mut second = spawn_to(daemon.port, &key_path, config.path());
+    let screen2 = Screen::of(&second);
+    let same_shell = the_marked_shell_answers(&mut second, &screen2, &pid, Duration::from_secs(15));
+    let kept = log.contains("hangup: keeping the session")
+        && log.contains("leaving; letting the link go, the session stays");
+    eprintln!(
+        "closed_terminal: exit {:?}, kept in log {kept}, panic in log {}, same shell {same_shell}",
+        status.code(),
+        log.contains("panicked")
+    );
+    assert!(
+        status.code() == Some(1) && kept && !log.contains("panicked") && same_shell,
+        "a lost terminal must leave with 1, keep the session and reach the same shell; \
+         log: {log}\nsecond client saw: {}\ndaemon: {}",
+        screen2.text(),
+        daemon.output_text()
+    );
+    exit_cleanly(&mut second, &screen2, &daemon);
+}
+
+/// SIGHUP in the middle of a round leaves at once, as `Ctrl-] .` does: exit
+/// 1, the kept notice, and once the path is back the next run is in the
+/// same shell process.
+#[test]
+fn a_hangup_while_reconnecting_keeps_the_session() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_to(relay.port, &key_path, config.path());
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let pid = mark_with_pid(&mut client, &screen);
+
+    relay.cut();
+    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_until(|| screen.top().contains("reconnecting: 127.0.0.1 [QSH]")),
+        "Ctrl-] r must start a round; top row: {:?}",
+        screen.top()
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(client.pid() as i32),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .expect("send SIGHUP");
+    let sent = Instant::now();
+    let mut status = None;
+    while sent.elapsed() < Duration::from_secs(3) {
+        if let Ok(Some(s)) = client.child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "a hangup mid-round must end the run within 3 s; client saw: {}",
+            screen.text()
+        )
+    });
+    assert_eq!(status.code(), Some(1), "client saw: {}", screen.text());
+    assert!(
+        wait_until(|| screen.has("qsh: left 127.0.0.1; the session is kept on the server")),
+        "client saw: {}",
+        screen.text()
+    );
+
+    relay.restore();
+    let mut second = spawn_to(relay.port, &key_path, config.path());
+    let screen2 = Screen::of(&second);
+    assert!(
+        the_marked_shell_answers(&mut second, &screen2, &pid, Duration::from_secs(15)),
+        "the next run must reach the same shell; client saw: {}\ndaemon: {}",
+        screen2.text(),
+        daemon.output_text()
+    );
+    exit_cleanly(&mut second, &screen2, &daemon);
+}
+
 /// `Ctrl-] .` in the middle of a round leaves at once -- the round is not
 /// waited for -- and says the session is kept on the server.
 #[test]

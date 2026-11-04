@@ -40,7 +40,8 @@ fn local_rsa_files_and_pem_connect_with_each_advertised_ssh_digest() {
     let dir = tempfile::tempdir().unwrap();
     let (plain, _) = support::keygen_file("rsa", dir.path());
     let (locked, _) = support::keygen_with_passphrase("rsa", dir.path(), "generated passphrase");
-    for hash in [None, Some(HashAlg::Sha256), Some(HashAlg::Sha512)] {
+    // Legacy `ssh-rsa` is not offered at all: see `rsa_policy`.
+    for hash in [Some(HashAlg::Sha256), Some(HashAlg::Sha512)] {
         let server = FakeServer::start(FakeAuth {
             accept_any_key: true,
             rsa_hash: Some(hash),
@@ -78,7 +79,7 @@ fn a_refused_native_rsa_identity_does_not_prompt_for_its_passphrase() {
     let dir = tempfile::tempdir().unwrap();
     let (locked, _) = support::keygen_with_passphrase("rsa", dir.path(), "generated passphrase");
     let server = FakeServer::start(FakeAuth {
-        rsa_hash: Some(None),
+        rsa_hash: Some(Some(russh::keys::HashAlg::Sha512)),
         ..Default::default()
     });
     let prompts = Arc::new(CountingPrompter::answering_passphrases(&[

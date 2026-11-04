@@ -158,10 +158,17 @@ activation is integrated.
 The staging payload includes 21 Python modules and four public data files. Its
 fixed entrypoint is `/usr/bin/python3 -I -B
 /usr/libexec/qshd-selinux/qshd_selinux_phase.py MODE`, where `MODE` is exactly
-`provider-post-pristine`, `consumer-pre-fresh`, `consumer-pre-installed`, or
-`consumer-post-owned`. These select the maintained pristine bridge, fresh or
-installed consumer invalidation, and owned consumer completion respectively.
-They do not authorize service startup or supply RPM hooks.
+`provider-post-pristine`, `consumer-pre-fresh`, `consumer-pre-installed`,
+`consumer-post-owned`, or `consumer-preun-final`. The first four select the
+maintained pristine bridge, fresh or installed consumer invalidation, and owned
+consumer completion respectively. They do not authorize service startup or
+supply RPM hooks.
+
+`consumer-preun-final` prepares final consumer removal: it validates the
+canonical installed consumer and publishes a fresh, read-back PENDING record,
+invalidating readiness. It does not itself remove files or policy. Choosing it
+for a final uninstall rather than for an old instance during an upgrade belongs
+to the future RPM recipe; the entrypoint does not interpret RPM arguments.
 
 Execution requires the administrator's stop/drain and maintenance exclusion,
 trusted installed code and reference files, root, one thread, default SIGCHLD,
@@ -173,8 +180,9 @@ map, without adding the installation directory to Python's search path.
 The original entry timestamp bounds library work to 240 seconds and the owned
 child to 250 seconds, with the existing ten-second cleanup allowance. Loading
 and setup consume that same budget. Only a normal settled child with the exact
-request-bound canonical response can succeed. Pre phases return PENDING; post
-phases return COMPLETE after their maintained finalizers. Source controls do
-not establish installed-package or native lifecycle qualification; that remains
-a separate acceptance step. This is a staging payload, not a complete
-redistributable package or a replacement for its license/source-offer assets.
+request-bound canonical response can succeed. Pre phases, including
+`consumer-preun-final`, return PENDING; post phases return COMPLETE after their
+maintained finalizers. Source controls do not establish installed-package or
+native lifecycle qualification; that remains a separate acceptance step. This
+is a staging payload, not a complete redistributable package or a replacement
+for its license/source-offer assets.
