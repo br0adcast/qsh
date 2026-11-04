@@ -214,6 +214,10 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          # Darwin's linker records object paths separately from compiler source paths.
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
           export AWS_LC_SYS_USE_SYSTEM=0
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           cargo test --locked -p release-auth --all-targets --target "$NATIVE_TARGET"
