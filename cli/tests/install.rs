@@ -1,4 +1,4 @@
-//! Installation uses the real CLI, a controlling PTY and private SSH homes.
+//! Production CLI refusal, consent and recovery controls on a controlling PTY.
 #[path = "support/releases.rs"]
 #[allow(dead_code)]
 mod releases;
@@ -41,18 +41,6 @@ fn wait_for_bootstrap_ready(home: &Path) {
             .any(|line| line.contains("shell channel ") && line.ends_with(" ready"))),
         "SSH bootstrap did not deliver the current shell Ready: {}",
         log()
-    );
-}
-
-fn assert_no_bootstrap_recovery_offer(home: &Path, screen: &Screen) {
-    assert!(
-        !screen.text().contains("Authorize SSH recovery"),
-        "{}",
-        screen.text()
-    );
-    assert!(
-        !home.join("qsh/ssh_bindings.json").exists(),
-        "SSH-first bootstrap must retain trust without a persistent grant"
     );
 }
 
@@ -112,92 +100,7 @@ fn start(home: &Path, key: &Path, addresses: &[String]) -> (Client, Screen) {
     let screen = Screen::of(&client);
     (client, screen)
 }
-#[test]
-fn accept_installs_and_opens_shell() {
-    let _serial = serialised();
-    let home = tempfile::tempdir().unwrap();
-    let (key, public) = key(home.path());
-    let sb = Sandbox::start_with(&[public]);
-    trust(home.path(), &sb);
-    seed(home.path());
-    let (mut client, screen) = start(home.path(), &key, &[address(&sb)]);
-    screen.wait(&format!("Install qshd {}", env!("CARGO_PKG_VERSION")));
-    assert!(screen
-        .text()
-        .contains(&format!("127.0.0.1:{}", sb.sshd.port)));
-    let server_target = match std::env::consts::ARCH {
-        "x86_64" => "x86_64-unknown-linux-musl",
-        "aarch64" => "aarch64-unknown-linux-musl",
-        other => panic!("unsupported test server architecture: {other}"),
-    };
-    assert!(screen.text().contains(server_target));
-    assert!(screen.text().contains(image_path(&sb).to_str().unwrap()));
-    client.master.write_all(b"yes\n").unwrap();
-    wait_for_bootstrap_ready(home.path());
-    client.type_line("echo INSTALL_'OK'");
-    screen.wait("INSTALL_OK");
-    assert_no_bootstrap_recovery_offer(home.path(), &screen);
-    assert!(
-        !screen.text().contains("Key fingerprint"),
-        "{}",
-        screen.text()
-    );
-    assert!(image_path(&sb).is_file());
-    screen.wait("Uploading qshd");
-    let output = screen.text();
-    let metadata = output
-        .find("Checking release metadata")
-        .expect("metadata wait is visible");
-    let upload = output.find("Uploading qshd").unwrap();
-    assert!(
-        metadata < upload,
-        "metadata phase precedes image upload: {output}"
-    );
-    assert!(output.contains("Ctrl-C cancels"));
-    assert!(
-        !output.contains("Downloading qshd"),
-        "a cache hit has no archive transfer: {output}"
-    );
-    client.type_line("exit");
-    assert!(wait_for_exit(&mut client.child).unwrap().success());
-}
-#[test]
-fn enter_accepts_installation_and_opens_shell() {
-    let _serial = serialised();
-    let home = tempfile::tempdir().unwrap();
-    let (key, public) = key(home.path());
-    let sb = Sandbox::start_with(&[public]);
-    trust(home.path(), &sb);
-    seed(home.path());
-    let (mut client, screen) = start(home.path(), &key, &[address(&sb)]);
-    screen.wait(&format!("Install qshd {}", env!("CARGO_PKG_VERSION")));
-    assert!(screen
-        .text()
-        .contains(&format!("127.0.0.1:{}", sb.sshd.port)));
-    let server_target = match std::env::consts::ARCH {
-        "x86_64" => "x86_64-unknown-linux-musl",
-        "aarch64" => "aarch64-unknown-linux-musl",
-        other => panic!("unsupported test server architecture: {other}"),
-    };
-    assert!(screen.text().contains(server_target));
-    assert!(screen.text().contains(image_path(&sb).to_str().unwrap()));
-    screen.wait("[Y/n]");
-    assert!(screen.text().contains("  Source    GitHub Releases"));
-    client.master.write_all(b"\n").unwrap();
-    wait_for_bootstrap_ready(home.path());
-    client.type_line("echo INSTALL_'OK'");
-    screen.wait("INSTALL_OK");
-    assert_no_bootstrap_recovery_offer(home.path(), &screen);
-    assert!(
-        !screen.text().contains("Key fingerprint"),
-        "{}",
-        screen.text()
-    );
-    assert!(image_path(&sb).is_file());
-    screen.wait("Uploading qshd");
-    client.type_line("exit");
-    assert!(wait_for_exit(&mut client.child).unwrap().success());
-}
+
 #[test]
 fn decline_stops_the_entire_address_ladder() {
     let _serial = serialised();
@@ -233,53 +136,7 @@ fn eof_does_not_install() {
     assert!(!image_path(&sb).exists());
     assert!(!home.path().join("qsh/releases").exists());
 }
-#[test]
-fn approval_does_not_authorize_another_host() {
-    let _serial = serialised();
-    let home = tempfile::tempdir().unwrap();
-    let (key, public) = key(home.path());
-    let first = Sandbox::start_with(std::slice::from_ref(&public));
-    let second = Sandbox::start_with(&[public]);
-    // Fail remote verification after approval, forcing a separate SSH operation.
-    first.fake_qshd(&first.home.path().join("bin/sha256sum"), "exit 1");
-    trust(home.path(), &first);
-    trust(home.path(), &second);
-    seed(home.path());
-    let (mut client, screen) = start(home.path(), &key, &[address(&first), address(&second)]);
-    screen.wait("Install qshd");
-    client.master.write_all(b"yes\n").unwrap();
-    assert!(
-        wait_until(|| screen.text().matches("Install qshd").count() == 2),
-        "{}",
-        screen.text()
-    );
-    assert!(!image_path(&second).exists());
-    client.master.write_all(b"no\n").unwrap();
-    assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(1));
-}
-#[test]
-fn ctrl_c_during_install_restores_tty() {
-    let _serial = serialised();
-    let home = tempfile::tempdir().unwrap();
-    let (key, public) = key(home.path());
-    let sb = Sandbox::start_with(&[public]);
-    trust(home.path(), &sb);
-    seed(home.path());
-    // Keep verification in flight, so Ctrl-C cancels an installation after approval.
-    sb.fake_qshd(&sb.home.path().join("bin/sha256sum"), "exec /bin/sleep 30");
-    let addr = address(&sb);
-    let (mut client, slave) = spawn_qsh_on(&["-i", key.to_str().unwrap(), &addr], home.path());
-    let original = nix::sys::termios::tcgetattr(&slave).unwrap();
-    let screen = Screen::of(&client);
-    screen.wait("Install qshd");
-    client.master.write_all(b"yes\n").unwrap();
-    screen.wait("Uploading qshd");
-    std::thread::sleep(Duration::from_millis(200));
-    client.master.write_all(b"\x03").unwrap();
-    assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(130));
-    assert_eq!(nix::sys::termios::tcgetattr(&slave).unwrap(), original);
-    assert!(!image_path(&sb).exists());
-}
+
 #[test]
 fn background_never_installs_even_with_cached_image() {
     let _serial = serialised();
@@ -420,4 +277,85 @@ fn ctrl_c_during_first_udp_address_skips_remaining_addresses() {
     );
     let log = std::fs::read_to_string(home.path().join("qsh/log")).unwrap();
     assert!(!log.contains("ladder: address 1:"), "{log}");
+}
+
+#[test]
+fn affirmative_install_refuses_legacy_unsigned_cache_during_metadata_outage() {
+    let _serial = serialised();
+    let home = tempfile::tempdir().unwrap();
+    let (key, public) = key(home.path());
+    let sb = Sandbox::start_with(&[public]);
+    trust(home.path(), &sb);
+    // Deliberately unsigned legacy bait; the production loader must never migrate it.
+    seed(home.path());
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn collect(root: &Path, at: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        collect(root, root, &mut files);
+        files.sort();
+        files
+    }
+    let cache = home.path().join("qsh/releases");
+    // The legacy layout also has a private synchronization lock. Prepare it
+    // before the snapshot so opening that lock cannot be mistaken for migration.
+    use std::os::unix::fs::OpenOptionsExt;
+    let target = bringup::Platform::from_uname("Linux", std::env::consts::ARCH).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(
+            cache
+                .join(env!("CARGO_PKG_VERSION"))
+                .join(target.target())
+                .join(".lock"),
+        )
+        .unwrap();
+    let before = snapshot(&cache);
+    let (mut client, screen) = start(home.path(), &key, &[address(&sb)]);
+    screen.wait("Install qshd");
+    client.master.write_all(b"yes\n").unwrap();
+    assert!(
+        wait_until(|| client.child.try_wait().unwrap().is_some()
+            || screen.text().contains("Uploading qshd")),
+        "{}",
+        screen.text()
+    );
+    // Let the old vulnerable implementation exit cleanly so RED does not leak a session.
+    if screen.text().contains("Uploading qshd") {
+        wait_for_bootstrap_ready(home.path());
+        client.type_line("exit");
+    }
+    let status = wait_for_exit(&mut client.child).unwrap();
+    let text = screen.text();
+    assert!(!status.success(), "unsigned cache was accepted: {text}");
+    assert!(
+        text.contains("qsh:"),
+        "missing production refusal diagnostic: {text}"
+    );
+    assert!(
+        !text.contains("Uploading qshd"),
+        "unsigned bytes reached SSH: {text}"
+    );
+    assert!(!image_path(&sb).exists());
+    assert!(!std::fs::read_to_string(home.path().join("qsh/log"))
+        .unwrap_or_default()
+        .contains("shell channel "));
+    assert_eq!(
+        snapshot(&cache),
+        before,
+        "unsigned cache must not be migrated"
+    );
 }

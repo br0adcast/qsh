@@ -46,8 +46,12 @@ const PROBE_OBSERVER: Duration = Duration::from_millis(20);
 const ROADS_WINDOW_MS: i64 = 500;
 const ROADS_LINE_MS: i64 = 1000;
 
+#[cfg_attr(test, allow(dead_code))]
 fn main() {
-    let argv: Vec<_> = std::env::args_os().skip(1).collect();
+    entry(std::env::args_os().skip(1).collect());
+}
+
+pub(crate) fn entry(argv: Vec<std::ffi::OsString>) {
     let parsed = match args::parse_args_os(&argv) {
         Ok(a) => a,
         Err(args::ArgError::HelpRequested) => {

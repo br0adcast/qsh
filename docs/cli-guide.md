@@ -288,11 +288,13 @@ locations. An existing managed service is reported and reused instead of launchi
 If no daemon is found during an interactive connection:
 
 1. qsh asks permission to install a daemon for the remote OS and architecture.
-2. It fetches `SHA256SUMS` for the **exact client version** from GitHub Releases
-   on every installation attempt. A cached archive is reused only if its bytes
-   match the current checksum; otherwise qsh downloads and verifies it again.
-3. It caches the verified image under `$XDG_CACHE_HOME/qsh/releases`, or
-   `~/.cache/qsh/releases` when that variable is unset, on both Linux and macOS.
+2. It fetches `SHA256SUMS` and `SHA256SUMS.sigstore.json` for the **exact client
+   version** from GitHub Releases. It authenticates the original manifest under
+   the compiled qsh repository/workflow policy before selecting an archive hash.
+3. It retains the signed evidence, verified archive and image under
+   `$XDG_CACHE_HOME/qsh/releases`, or `~/.cache/qsh/releases` when that variable
+   is unset, on both Linux and macOS. Every offline load authenticates the
+   original evidence again and rechecks the archive and extracted image.
 4. It transfers the image over SFTP to a temporary file, checks the remote bytes,
    and atomically renames it into the remote user's cache before starting it.
 
@@ -303,36 +305,44 @@ color. When the total size is known and there is enough room, the bar fills the
 available line width and adapts when the window is resized. Redirected output
 uses plain text without animation.
 
-Linux and Darwin targets support x86_64 and aarch64. Corrupt cached images are
-rejected. If GitHub is temporarily unreachable, qsh can use a previously verified
-cache after checking its integrity again. A missing release, invalid metadata,
-checksum mismatch, unsafe redirect, or TLS verification failure stops installation
-instead of allowing a stale cache. After a new checksum is received, failure to
-download the matching archive also stops installation.
+Linux and Darwin targets support x86_64 and aarch64. Automatic downloads require
+signed metadata; unsigned releases, including the existing v0.5.0, are refused.
+Old unsigned cache generations are misses, without trusting or migrating their
+checksum receipts. Older released clients remain unchanged. A daemon already
+found on the server follows its existing source policy and is not a signing-error
+fallback. See [release authentication](release-security.md) for the trust boundary.
 
-The release metadata check has a 20-second deadline covering DNS, connection,
-redirects, response headers, and body. It runs before local cache lookup, so even
-a previously cached release can wait for this check on a silent network. The
-metadata check, archive download, upload, and startup have separate deadlines.
-Ctrl-C cancels the wait; cancellation does not select the offline cache or approve
-installation. Time spent answering a prompt does not consume a network budget.
+If the manifest request fails temporarily before receiving any body bytes, qsh
+may use a fully reauthenticated cache for that exact version and target. A
+manifest transfer interrupted after body bytes fails. If the complete manifest
+arrives but its bundle transfer is interrupted or temporarily unavailable, cache
+reuse requires byte-identical authenticated manifest evidence. Missing assets,
+TLS rejection, size limits, malformed or unauthenticated metadata, and archive
+hash/download failures stop installation even when another cache exists.
 
-Offline cache verification checks the archive against its last verified checksum
-and extracts the image again. This detects corruption against the stored checksum;
-it does not establish that the published release is still current or has not been
-withdrawn. Cache reuse requires trusted root- or current-account-owned directories
+Both metadata downloads share one 20-second network deadline covering DNS,
+connection, redirects, headers and body. Bounded local signature verification
+checks cancellation and its own budget before and after the synchronous call;
+it cannot be preempted mid-call. Archive download, upload and startup retain
+separate deadlines. Ctrl-C cancels the wait; cancellation does not select the
+offline cache or approve installation. Prompt time does not use a network budget.
+
+Historical signed evidence does not establish current revocation status, latest
+version or that a release has not been withdrawn. Offline authentication uses
+this client's compiled roots at verified signing times; a leaf certificate's
+present-day expiry alone does not invalidate valid historical evidence. Unknown
+roots require an updated client. There is no network root refresh or trust-policy
+override.
+
+Cache reuse still requires trusted root- or current-account-owned directories
 and public data without group or other write access, plus a private current-account
 lock. Safe 0755 directories, 0644 public files and trusted cache-root aliases remain
 supported; aliases below the cache root are refused. Refused storage does not prevent
-installation from freshly downloaded, verified bytes. Existing permissions are not
-repaired. A cache operation retains its original directory and lock identities and
-refuses observed replacement rather than adopting another route.
-
-Root and processes already controlling the same account remain trusted: someone
-able to replace both an archive and its stored checksum can replace that local
-evidence. Filesystem checks do not make pathname publication atomic against those
-actors. The checksum is not a release signature or an independent guarantee of
-origin.
+installation from freshly downloaded, authenticated bytes. Existing permissions
+are not repaired. A cache operation retains its original directory and lock
+identities and refuses observed replacement rather than adopting another route.
+These filesystem checks do not provide atomic pathname publication against root
+or processes controlling the same account; signed evidence must still verify.
 
 Release HTTPS uses bundled WebPKI CA roots. Adding a private or enterprise CA to
 the operating system's trust store does not automatically add it to this client's

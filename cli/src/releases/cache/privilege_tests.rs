@@ -1,9 +1,7 @@
 //! Real ownership qualification, executed only in the existing disposable-root tier.
-#[allow(dead_code)]
-#[path = "support/releases.rs"]
-mod support;
+use super::super::test_support as support;
+use super::super::GitHubImages;
 use bringup::{ImageError, ImageSource, InstallTiming};
-use qsh::releases::GitHubImages;
 use rustix::fs::{chownat, AtFlags, CWD};
 use rustix::process::{Gid, Uid};
 use std::fs;
@@ -19,11 +17,12 @@ const CHILD_UID: u32 = 61001;
 const OTHER_UID: u32 = 61002;
 const ROLE: &str = "QSH_TEST_RELEASE_CACHE_ROLE";
 const ROOT: &str = "QSH_TEST_RELEASE_CACHE_ROOT";
-const TEST: &str = "release_cache_root_readonly_and_foreign_owner_boundaries";
+const TEST: &str =
+    "releases::cache::privilege_tests::release_cache_root_readonly_and_foreign_owner_boundaries";
 
 fn load(root: &Path) -> Result<bringup::DaemonImage, ImageError> {
     let offline = Fake::offline();
-    let result = GitHubImages::with_transport(root.into(), offline.clone()).load(
+    let result = GitHubImages::fixture(root.into(), offline.clone()).load(
         &request(),
         &InstallTiming::default(),
         &knock::Cancel::new(),
@@ -232,6 +231,8 @@ fn release_cache_root_readonly_and_foreign_owner_boundaries() {
         "foreign-current",
         "foreign-receipt",
         "foreign-archive",
+        "foreign-manifest",
+        "foreign-bundle",
         "optional-foreign-image",
         "optional-alias-image",
         "optional-special-image",
@@ -242,7 +243,7 @@ fn release_cache_root_readonly_and_foreign_owner_boundaries() {
             .unwrap();
         let cache = root.path().join("cache");
         let bytes = archive();
-        GitHubImages::with_transport(cache.clone(), Fake::new(bytes.clone()))
+        GitHubImages::fixture(cache.clone(), Fake::new(bytes.clone()))
             .load(
                 &request(),
                 &InstallTiming::default(),
@@ -260,6 +261,8 @@ fn release_cache_root_readonly_and_foreign_owner_boundaries() {
         let receipt = generation.join("receipt.json");
         let archived = generation.join("archive");
         let image = generation.join("image");
+        let manifest = generation.join("SHA256SUMS");
+        let bundle = generation.join("SHA256SUMS.sigstore.json");
         let sentinel = root.path().join("sentinel");
         fs::write(&sentinel, b"unrelated image sentinel").unwrap();
         fs::hard_link(&archived, root.path().join("public-archive-hardlink")).unwrap();
@@ -274,6 +277,8 @@ fn release_cache_root_readonly_and_foreign_owner_boundaries() {
             "foreign-current" => chown(&current, OTHER_UID),
             "foreign-receipt" => chown(&receipt, OTHER_UID),
             "foreign-archive" => chown(&archived, OTHER_UID),
+            "foreign-manifest" => chown(&manifest, OTHER_UID),
+            "foreign-bundle" => chown(&bundle, OTHER_UID),
             "optional-foreign-image" => chown(&image, OTHER_UID),
             "optional-alias-image" => {
                 fs::remove_file(&image).unwrap();
@@ -289,7 +294,9 @@ fn release_cache_root_readonly_and_foreign_owner_boundaries() {
             }
             _ => unreachable!(),
         }
-        let files = [&current, &receipt, &archived, &image, &lock, &sentinel];
+        let files = [
+            &current, &receipt, &archived, &image, &lock, &sentinel, &manifest, &bundle,
+        ];
         let before: Vec<_> = files.iter().map(|path| snapshot(path)).collect();
         run_child(&root, &cache, role);
         let after: Vec<_> = files.iter().map(|path| snapshot(path)).collect();

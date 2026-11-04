@@ -60,7 +60,9 @@ class PrepareTests(unittest.TestCase):
             root=tarfile.TarInfo(self.stage);root.type=tarfile.DIRTYPE;root.mode=0o755;archive.addfile(root)
             entries=dict(self.programs)
             entries.update({'README.md':b'inert readme','LICENSE':b'inert license',
-                            'CHANGELOG.md':b'inert changes','LICENSE-OPENSSL.txt':b'inert license'})
+                            'CHANGELOG.md':b'inert changes'})
+            for name,source in self.adapter().NOTICES.items():
+                entries[name]=(ROOT/'docs/licenses'/source).read_bytes()
             for name,data in entries.items():
                 if name==omit:continue
                 info=tarfile.TarInfo(self.stage+'/'+name);info.size=len(data);info.mode=0o755 if name in self.programs else 0o644
@@ -109,10 +111,31 @@ class PrepareTests(unittest.TestCase):
                 adapter.prepare(self.archive,self.meta,VERSION,TARGET,self.destination,source_commit='a'*40)
             self.assertFalse(self.destination.exists())
 
+    def test_pinned_notice_hashes_equal_maintained_source(self):
+        adapter=self.adapter()
+        self.assertEqual(set(adapter.NOTICE_SHA256),set(adapter.NOTICES))
+        for filename,source in adapter.NOTICES.items():
+            self.assertEqual(adapter.NOTICE_SHA256[filename],digest((ROOT/'docs/licenses'/source).read_bytes()))
+
+    def test_each_required_client_notice_is_present_and_exact(self):
+        adapter=self.adapter()
+        for filename in ('LICENSE-AWS-LC-RS.txt','LICENSE-AWS-LC.txt'):
+            self.archive.write_bytes(self.archive_bytes(omit=filename))
+            with self.subTest(filename=filename,kind='missing'),self.assertRaisesRegex(ValueError,'^TAR_MEMBERS$'):
+                adapter.prepare(self.archive,self.meta,VERSION,TARGET,self.destination,source_commit='a'*40)
+            raw=gzip.decompress(self.archive_bytes())
+            source=(ROOT/'docs/licenses'/adapter.NOTICES[filename]).read_bytes()
+            self.assertIn(source,raw)
+            self.archive.write_bytes(gzip.compress(raw.replace(source,b'x'+source[1:],1)))
+            with self.subTest(filename=filename,kind='altered'),self.assertRaisesRegex(ValueError,'^NOTICE_BYTES$'):
+                adapter.prepare(self.archive,self.meta,VERSION,TARGET,self.destination,source_commit='a'*40)
+            self.assertFalse(self.destination.exists())
+
     def test_header_bounds_checksum_truncation_end_blocks_and_gzip_trailer(self):
         adapter=self.adapter();raw=gzip.decompress(self.archive_bytes())
         end=512+sum(512+((len(data)+511)//512)*512 for data in list(self.programs.values())+
-                    [b'inert readme',b'inert license',b'inert changes',b'inert license'])
+                    [b'inert readme',b'inert license',b'inert changes']+
+                    [(ROOT/'docs/licenses'/source).read_bytes() for source in self.adapter().NOTICES.values()])
         changed=bytearray(raw);changed[0]^=1
         variants=[gzip.compress(raw[:111]),gzip.compress(bytes(changed)),gzip.compress(raw[:end+512]),
                   gzip.compress(raw[:end]+bytes(1024)+b'x'),gzip.compress(raw[:end]+bytes(1024+65537)),

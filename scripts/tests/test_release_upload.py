@@ -132,10 +132,18 @@ class ReleaseUploadTests(unittest.TestCase):
 
     def test_workflow_publish_command_uses_immutable_helper(self):
         # Execute the workflow's actual shell body with the same local boundary.
+        # It hands the uploader only the fourteen files the attestation recheck
+        # lists; test_release_attestation publishes that set. A set the
+        # recheck refuses never reaches GitHub.
         workflow = (ROOT/'.github/workflows/release.yml').read_text()
         block = workflow.split('      - name: Publish the release\n', 1)[1]
         command = block.split('        run: |\n', 1)[1]
-        command = '\n'.join(line[10:] for line in command.splitlines())
+        command = '\n'.join(line[10:] for line in command.splitlines()
+                            if not line or line.startswith('          '))
+        command = command.split('\n\n', 1)[0]
+        self.assertIn('python3 scripts/upload-release-assets.py', command)
+        self.assertIn('"${assets[@]}"', command)
+        self.assertNotIn('--clobber', command)
         (self.base/'scripts').symlink_to(ROOT/'scripts', target_is_directory=True)
         (self.base/'dist').mkdir()
         (self.base/'dist/a.tar.gz').write_text('aaa')
@@ -145,7 +153,7 @@ class ReleaseUploadTests(unittest.TestCase):
         result = subprocess.run(['bash','-e','-c',command], cwd=self.base,
                                 env=env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Conflicting release asset: a.tar.gz', result.stderr)
+        self.assertIn('release attestation: ', result.stderr)
         self.assertEqual(json.loads(self.state.read_text()), initial)
 
     def test_missing_directory_and_empty_inputs_fail_before_mutation(self):

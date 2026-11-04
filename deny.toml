@@ -18,6 +18,7 @@ exceptions = [
     { crate = "prediction@0.5.0", allow = ["AGPL-3.0-only"] },
     { crate = "qsh@0.5.0", allow = ["AGPL-3.0-only"] },
     { crate = "qshd@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "release-auth@0.5.0", allow = ["AGPL-3.0-only"] },
     { crate = "render@0.5.0", allow = ["AGPL-3.0-only"] },
     { crate = "ssh@0.5.0", allow = ["AGPL-3.0-only"] },
     { crate = "sshauth@0.5.0", allow = ["AGPL-3.0-only"] },

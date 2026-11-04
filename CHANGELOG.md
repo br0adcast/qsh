@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Require authenticated exact-version release metadata and reverified signed
+  caches for automatic daemon downloads. Unsigned releases, including v0.5.0,
+  and unsigned cached generations are refused without a checksum-only exception.
+
 ## [0.5.0] — 2026-10-17
 
 ### Changed

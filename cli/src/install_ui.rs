@@ -370,7 +370,7 @@ mod tests {
                 assert!(!text.contains("done"));
                 if !interactive || width == 79 {
                     assert!(text.contains("Checking release metadata"));
-                    assert!(text.contains("Ctrl-C"));
+                    assert!(text.contains("Ctrl-C cancels"));
                 }
                 if interactive {
                     let visible = text.replace("\r\x1b[2K", "");
