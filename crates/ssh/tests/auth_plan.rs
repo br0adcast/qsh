@@ -3,6 +3,25 @@ mod support;
 use std::sync::Arc;
 use support::*;
 
+fn private_file(path: &std::path::Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+}
+
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    private_file(path.as_ref()).write_all(bytes.as_ref())
+}
+
 fn go(params: ssh::SshParams, plan: ssh::SshAuthPlan) -> Result<(), ssh::SshError> {
     ssh::connect(
         params,
@@ -413,7 +432,7 @@ fn ordinary_pkcs8_key_files_authenticate_without_prompting() {
         .unwrap();
         public.push(key.public_key().to_openssh().unwrap());
         let path = keys.path().join(format!("identity-{index}"));
-        russh::keys::encode_pkcs8_pem(&key, std::fs::File::create(&path).unwrap()).unwrap();
+        russh::keys::encode_pkcs8_pem(&key, private_file(&path)).unwrap();
         identities.push(path);
     }
     let sshd = TestSshd::start(&public);
@@ -450,7 +469,7 @@ fn explicit_parameter_sec1_file_retains_upstream_ssh_authentication() {
     .unwrap();
     let named = keys.path().join("named");
     let explicit = keys.path().join("explicit");
-    std::fs::write(
+    write_private(
         &named,
         private
             .to_sec1_pem(ssh_key::LineEnding::LF)
@@ -459,6 +478,10 @@ fn explicit_parameter_sec1_file_retains_upstream_ssh_authentication() {
     )
     .unwrap();
     key_formats::openssl(&named, &explicit, &["ec", "-param_enc", "explicit"]);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&explicit, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let sshd = TestSshd::start(&[key.public_key().to_openssh().unwrap()]);
     let prompter = Arc::new(CountingPrompter::default());
     go(
@@ -497,7 +520,7 @@ fn annotated_pkcs8_and_sec1_files_authenticate_without_prompting() {
         let path = keys.path().join(format!("annotated-{index}"));
         let mut text = b"Bag Attributes\n    friendlyName: generated fixture\nKey Attributes: <No Attributes>\n".to_vec();
         text.extend_from_slice(encoded);
-        std::fs::write(&path, &text).unwrap();
+        write_private(&path, &text).unwrap();
         let prompter = Arc::new(CountingPrompter::default());
         go(
             params(&sshd, vec![wire_of(&sshd.host_public_key_line())]),
@@ -507,4 +530,70 @@ fn annotated_pkcs8_and_sec1_files_authenticate_without_prompting() {
         assert_eq!(prompter.passphrase_asked(), 0);
     }
     assert_eq!(sshd.log().matches("Accepted publickey").count(), 2);
+}
+
+#[test]
+fn unsafe_file_is_skipped_without_prompt_or_offer() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+    use support::fake_server::{FakeAuth, FakeServer, ServerActivity};
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = keygen_with_passphrase("ed25519", dir.path(), "unsafe-passphrase");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let key = russh::keys::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
+    for fallback in [false, true] {
+        let activity = Arc::new(ServerActivity::default());
+        let server = FakeServer::start(FakeAuth {
+            accept_any_key: true,
+            activity: Arc::clone(&activity),
+            ..FakeAuth::default()
+        });
+        let params = ssh::SshParams {
+            host: "127.0.0.1".into(),
+            port: server.port,
+            username: "tester".into(),
+            known_host_keys: vec![server.host_public_key_wire()],
+            connect_timeout: std::time::Duration::from_secs(5),
+            keepalive_interval: std::time::Duration::from_secs(15),
+            compression: false,
+            tcp_nodelay: true,
+            knock: Vec::new(),
+        };
+        let prompter = Arc::new(CountingPrompter::answering_passphrases(&[
+            "unsafe-passphrase",
+        ]));
+        let mut methods = vec![ssh::AuthMethod::KeyFile(path.clone())];
+        if fallback {
+            methods.push(ssh::AuthMethod::PrivateKeyPem(
+                key.to_openssh(ssh_key::LineEnding::LF).unwrap(),
+            ));
+        }
+        let result = go(params, plan_with(methods, Arc::clone(&prompter)));
+        assert_eq!(
+            prompter.passphrase_asked(),
+            0,
+            "unsafe file must never prompt"
+        );
+        if fallback {
+            result.expect("in-memory key remains usable");
+        } else {
+            assert!(
+                matches!(result, Err(ssh::SshError::AuthFailed(ref why)) if why.contains("private key must not grant permissions to group or others"))
+            );
+        }
+        assert_eq!(
+            activity.signed_publickey.load(Ordering::SeqCst),
+            usize::from(fallback)
+        );
+        // Key-only plans do not send a none request: only the memory fallback
+        // may send its public-key probe and signed request.
+        assert_eq!(
+            activity.userauth.load(Ordering::SeqCst),
+            if fallback { 2 } else { 0 }
+        );
+    }
 }

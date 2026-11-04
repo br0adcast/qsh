@@ -5,6 +5,21 @@ mod formats;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use sshauth::{keyfile::KeyFileError, sign_file::FileSigner};
 
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes.as_ref())
+}
+
 fn key() -> PrivateKey {
     PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
@@ -24,7 +39,7 @@ fn locked_openssh_distinguishes_password_request_from_failed_decryption() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("identity");
-    std::fs::write(&file, locked.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+    write_private(&file, locked.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
     assert!(matches!(
         FileSigner::load_classified(&file, None),
         Err(KeyFileError::PassphraseRequired)
@@ -42,7 +57,7 @@ fn invalid_and_unreadable_files_never_become_passphrase_requests() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("identity");
     for bytes in [b"PRIVATE_INPUT_SENTINEL\x1b[2J".as_slice(), &[0xff, 0xfe]] {
-        std::fs::write(&file, bytes).unwrap();
+        write_private(&file, bytes).unwrap();
         let error = FileSigner::load_classified(&file, None)
             .err()
             .expect("invalid key");
@@ -50,7 +65,7 @@ fn invalid_and_unreadable_files_never_become_passphrase_requests() {
         assert!(!format!("{error:?} {error}").contains("PRIVATE_INPUT_SENTINEL"));
         assert!(!format!("{error:?} {error}").contains('\x1b'));
     }
-    std::fs::write(&file, key().public_key().to_openssh().unwrap()).unwrap();
+    write_private(&file, key().public_key().to_openssh().unwrap()).unwrap();
     assert!(matches!(
         FileSigner::load_classified(&file, None),
         Err(KeyFileError::InvalidFormat)
@@ -73,7 +88,7 @@ fn generated_encrypted_pem_and_pkcs8_are_explicitly_unsupported_even_with_passwo
     ));
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
-    std::fs::write(
+    write_private(
         &source,
         private.to_sec1_pem(LineEnding::LF).unwrap().as_bytes(),
     )
@@ -97,9 +112,13 @@ fn generated_encrypted_pem_and_pkcs8_are_explicitly_unsupported_even_with_passwo
     ] {
         let path = dir.path().join(name);
         formats::openssl(&source, &path, &args);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let encoded = std::fs::read_to_string(&path).unwrap();
         for preamble in ["", "Bag Attributes\n    friendlyName: generated fixture\n"] {
-            std::fs::write(&path, format!("{preamble}{encoded}")).unwrap();
+            write_private(&path, format!("{preamble}{encoded}")).unwrap();
             for password in [None, Some("generated-fixture")] {
                 assert!(
                     matches!(
@@ -124,7 +143,7 @@ fn explicit_ec_disposition_never_covers_invalid_or_other_containers() {
     let named = dir.path().join("named");
     let explicit = dir.path().join("explicit");
     let named_text = private.to_sec1_pem(LineEnding::LF).unwrap();
-    std::fs::write(&named, named_text.as_bytes()).unwrap();
+    write_private(&named, named_text.as_bytes()).unwrap();
     formats::openssl(&named, &explicit, &["ec", "-param_enc", "explicit"]);
     let text = std::fs::read_to_string(&explicit).unwrap();
     assert!(matches!(

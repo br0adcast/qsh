@@ -95,6 +95,21 @@ impl Drop for Daemon {
     }
 }
 
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes.as_ref())
+}
+
 /// Generates an ed25519 key pair, writes the private half to `dir/name` in
 /// OpenSSH format, and returns the key (for its public half) and the path.
 fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathBuf) {
@@ -104,7 +119,7 @@ fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathB
     )
     .expect("keygen");
     let path = dir.join(name);
-    std::fs::write(
+    write_private(
         &path,
         key.to_openssh(LineEnding::LF).expect("encode").as_bytes(),
     )

@@ -81,6 +81,21 @@ fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
     false
 }
 
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes.as_ref())
+}
+
 fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathBuf) {
     let key = PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
@@ -88,7 +103,7 @@ fn write_key(dir: &std::path::Path, name: &str) -> (PrivateKey, std::path::PathB
     )
     .expect("keygen");
     let path = dir.join(name);
-    std::fs::write(
+    write_private(
         &path,
         key.to_openssh(LineEnding::LF).expect("encode").as_bytes(),
     )

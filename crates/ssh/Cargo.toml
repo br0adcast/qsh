@@ -30,3 +30,5 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # The X25519 of russh's curve25519-sha256, for a test peer that runs its own key exchange.
 curve25519-dalek = "5"
 tempfile = "3"
+# The shared knock and TCP deadline is tested on tokio's pausable clock.
+tokio = { version = "1", features = ["test-util"] }

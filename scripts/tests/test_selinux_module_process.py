@@ -70,9 +70,19 @@ elif case=='launch-matrix':
     cases += [(OSError(999,'PRIVATE'),None),(Custom(errno.EMFILE,'PRIVATE'),None),
               (OSError(True,'PRIVATE'),None),(OSError('24','PRIVATE'),None)]
     owner=m._Owner(m._Limits(15,1024**2))
+    native_children=m._children;post_censuses=[];launch_refused=[False]
+    def census():
+        result=native_children()
+        if launch_refused[0]:post_censuses.append(tuple(result))
+        return result
+    m._children=census
     with tempfile.TemporaryDirectory() as directory:
         for fault,expected in cases:
-            def refuse(*args,**kwargs):raise fault
+            launch_refused[0]=False
+            before_censuses=len(post_censuses)
+            def refuse(*args,**kwargs):
+                launch_refused[0]=True
+                raise fault
             m.subprocess.Popen=refuse
             try:owner._run(('/trusted/tool',),directory)
             except m._CommandError as error:
@@ -80,7 +90,10 @@ elif case=='launch-matrix':
                 assert error.summary.failure=='TOOL_FAILURE' and error.summary.exit_code is None
                 assert error.summary.settled and not error.summary.unreaped
                 assert '/private' not in repr(error.__dict__)
+                assert post_censuses[before_censuses:]==[()], 'missing fresh empty census'
             else:raise AssertionError('launch error accepted')
+        launch_refused[0]=False
+        m._children=native_children
         m.subprocess.Popen=native_popen
         assert owner._run((sys.executable,'-I','-B','-c','pass'),directory).stdout==b''
         assert owner._last.launch_code is None
@@ -103,6 +116,118 @@ elif case=='launch-matrix':
             else:raise AssertionError('post-spawn error accepted')
         finally:os.read=original_read;m.subprocess.Popen=native_popen
     assert m._children()==[]
+elif case=='launch-empty-pending':
+    owner=m._Owner(m._Limits(15,1024**2))
+    original_children=m._children;events=[]
+    def census():
+        ids=original_children();events.append('census');return ids
+    def refuse(*args,**kwargs):
+        events.append('launch');raise RuntimeError('PRIVATE_PENDING')
+    m._children=census;m.subprocess.Popen=refuse
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            try:owner._run(('/trusted/tool',),directory)
+            except RuntimeError as error:
+                assert type(error) is RuntimeError
+                assert owner._last.settled and owner._last.unreaped==()
+                assert owner._last.failure=='TOOL_FAILURE' and owner._last.exit_code is None
+                assert not owner._unsettled
+            else:raise AssertionError('pending original exception lost')
+        assert events==['census','launch','census']
+    finally:m._children=original_children;m.subprocess.Popen=native_popen
+    assert m._children()==[]
+elif case.startswith('launch-child-'):
+    import errno
+    owner=m._Owner(m._Limits(15,1024**2))
+    native_children=m._children
+    native_calls={name:getattr(os,name) for name in ('kill','killpg','waitpid','waitid')}
+    held=[];attempts=[];post_censuses=[];product_calls=[];scratch=[]
+    entry_fds=set(os.listdir('/proc/self/fd'))
+    unknown=case in ('launch-child-unknown','launch-child-consumer-unknown')
+    consumer=case.startswith('launch-child-consumer')
+    def census():
+        if held:
+            post_censuses.append(True)
+            if unknown:raise OSError(errno.EACCES,'PRIVATE_CENSUS')
+        return native_children()
+    def forbidden(name):
+        def call(*args,**kwargs):
+            product_calls.append(name)
+            raise AssertionError('no-Popen path attempted signal or reap')
+        return call
+    def launched_then_failed(argv,**kwargs):
+        attempts.append(True)
+        child=native_popen([sys.executable,'-I','-B','-c',
+            'import os;os.write(1,b"R");assert os.read(0,1)==b"X"'],
+            **dict(kwargs,stdin=subprocess.PIPE))
+        held.append(child)
+        assert os.read(child.stdout.fileno(),1)==b'R'
+        if consumer:
+            directory=pathlib.Path(kwargs['cwd']);pp=directory/'qshd.pp'
+            scratch.append((directory,[(name,(directory/name).read_bytes(),(directory/name).stat()) for name in ('qshd.pp','qshd_contexts.pp')],directory.stat()))
+        for name in native_calls:setattr(os,name,forbidden(name))
+        if case=='launch-child-pending':raise RuntimeError('PRIVATE_PENDING')
+        raise OSError(errno.EMFILE,'PRIVATE_MESSAGE','/private/canary')
+    m._children=census;m.subprocess.Popen=launched_then_failed
+    fixture=None
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            if consumer:
+                sys.path.insert(0,str(path.parents[2]/'scripts/tests'))
+                import test_selinux_module_install as fixtures
+                fixture=fixtures.InstallTests();fixture.setUp()
+                item=fixtures.m.FirstInstall(fixtures.TRUST,fixtures.PP,fixtures.CONTEXTS_PP,
+                    _root=fixture.root,_uid=os.getuid(),_owner=owner)
+                try:item.install(deadline=time.monotonic()+440)
+                except fixtures.m.InstallError:pass
+                else:raise AssertionError('unsettled install accepted')
+                assert item._uncertain,'actual launcher outcome did not protect scratch'
+                assert len(scratch)==1
+                target,inputs,directory_metadata=scratch[0]
+                assert target.is_dir()
+                for name,data,metadata in inputs:
+                    assert (target/name).read_bytes()==data
+                    after=(target/name).stat()
+                    assert (after.st_dev,after.st_ino,after.st_mode,after.st_size,after.st_mtime_ns,after.st_ctime_ns)==(metadata.st_dev,metadata.st_ino,metadata.st_mode,metadata.st_size,metadata.st_mtime_ns,metadata.st_ctime_ns)
+                after_directory=target.stat()
+                assert (after_directory.st_dev,after_directory.st_ino,after_directory.st_mode,after_directory.st_mtime_ns)==(directory_metadata.st_dev,directory_metadata.st_ino,directory_metadata.st_mode,directory_metadata.st_mtime_ns)
+                assert not item._fds and not item.routes and not item.anchors,'consumer retained owned descriptors'
+            else:
+                try:owner._run(('/trusted/tool',),directory)
+                except m._CommandError as error:
+                    assert str(error)=='COMMAND_UNSETTLED','launcher child was reported safely settled'
+                    assert error.launch_code is None
+                    if unknown:
+                        assert error.summary is None
+                    else:
+                        assert error.summary.unreaped==1 and not error.summary.settled
+                        assert error.summary.failure=='COMMAND_UNSETTLED' and error.summary.exit_code is None
+                    assert 'PRIVATE' not in repr(error.__dict__)
+                else:raise AssertionError('launch exception accepted')
+            assert owner._unsettled and not owner._last.settled
+            assert owner._last.failure=='COMMAND_UNSETTLED' and owner._last.exit_code is None
+            assert owner._last.unreaped is None if unknown else owner._last.unreaped==(held[0].pid,)
+            assert len(post_censuses)==1,'missing fresh post-launch census'
+            try:owner._run(('/trusted/tool',),directory)
+            except m._CommandError as error:assert str(error)=='PROCESS_OWNER'
+            else:raise AssertionError('poisoned owner reused')
+            assert len(attempts)==1 and product_calls==[]
+    finally:
+        m.subprocess.Popen=native_popen;m._children=native_children
+        for name,native in native_calls.items():setattr(os,name,native)
+        for child in held:
+            # Independent test custody, never a product-guessed PID/group.
+            try:
+                out,err=child.communicate(input=b'X',timeout=3)
+                assert child.returncode==0 and out==b'' and err==b''
+            finally:
+                if child.poll() is None:child.kill()
+                child.wait(timeout=3)
+                for pipe in (child.stdin,child.stdout,child.stderr):
+                    if pipe is not None:pipe.close()
+        if fixture is not None:fixture.doCleanups()
+    assert native_children()==[]
+    assert set(os.listdir('/proc/self/fd'))==entry_fds,'test leaked descriptors'
 elif case=='preconditions':
     before=m._children()
     for option in (resource.RLIMIT_CORE,resource.RLIMIT_FSIZE,resource.RLIMIT_CPU,resource.RLIMIT_AS):
@@ -300,6 +425,14 @@ class ProcessTests(unittest.TestCase):
     def test_launch_error_preserves_only_closed_errno(self): self.control('launch-error')
 
     def test_launch_categories_types_and_later_calls_are_isolated(self): self.control('launch-matrix')
+
+    def test_empty_post_launch_census_preserves_pending_original_exception(self): self.control('launch-empty-pending')
+
+    def test_spawn_then_oserror_keeps_actual_child_custody(self): self.control('launch-child-oserror')
+
+    def test_spawn_then_pending_exception_cannot_bypass_custody(self): self.control('launch-child-pending')
+
+    def test_unknown_post_launch_census_poison_has_no_invented_children(self): self.control('launch-child-unknown')
 
     def test_exact_observer_profile_only(self): self.control('observer-profile')
 

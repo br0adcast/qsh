@@ -126,11 +126,18 @@ fn malformed_rsa_file(dir: &std::path::Path, locked: bool) -> (std::path::PathBu
         key
     };
     let path = dir.join("malformed-rsa");
-    std::fs::write(
-        &path,
-        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes())
+            .unwrap();
+    }
     (path, public)
 }
 

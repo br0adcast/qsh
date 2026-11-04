@@ -11,7 +11,7 @@ fn a_pkcs8_identity_reaches_the_authenticated_qsh_shell() {
     let home = tempfile::tempdir().unwrap();
     let key = ssh_key::PrivateKey::read_openssh_file(&openssh).unwrap();
     let identity = home.path().join("identity-pkcs8");
-    russh::keys::encode_pkcs8_pem(&key, std::fs::File::create(&identity).unwrap()).unwrap();
+    russh::keys::encode_pkcs8_pem(&key, support::private_file(&identity).unwrap()).unwrap();
     let host_key = sshauth::discover::discover(
         ([127, 0, 0, 1], daemon.port).into(),
         std::time::Duration::from_secs(1),

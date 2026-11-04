@@ -75,7 +75,7 @@ fn bootstrap() {
     )
     .unwrap();
     let identity = home.path().join("identity");
-    std::fs::write(
+    support::write_private(
         &identity,
         key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
     )

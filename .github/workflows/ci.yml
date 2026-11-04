@@ -306,7 +306,7 @@ jobs:
           # forking; libtest's worker threads cannot provide that contract.
           cargo test -p qshd --test detach_process --locked 2>&1 | tee "$runtime/detach-results.log"
           grep -F 'validated independent EOF and lock-release observations' "$runtime/detach-results.log"
-          grep -F 'validated 10 isolated detachment cases' "$runtime/detach-results.log"
+          grep -F 'validated 13 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
       - name: Native cold executable checksum regression
@@ -498,7 +498,12 @@ jobs:
             private_key_read_rejects_directory_socket_and_device \
             private_key_read_uses_one_fixed_destination_through_the_sentinel \
             private_key_read_retries_interrupted_and_preserves_split_utf8 \
-            private_key_read_errors_do_not_disclose_a_partial_prefix; do
+            private_key_read_errors_do_not_disclose_a_partial_prefix \
+            private_key_read_enforces_unix_owner_and_mode_policy \
+            private_key_read_rejects_unsafe_mode_before_read_or_decode \
+            private_key_read_revalidates_held_file_after_read \
+            private_key_read_keeps_selected_descriptor_when_path_changes \
+            private_key_read_preserves_parent_and_hardlink_compatibility; do
             awk -v expected="test keyfile::read_tests::$test ... " '
               index($0, expected) == 1 { pending=1 }
               pending && /(^|[[:space:]])ok$/ { found=1; exit }
@@ -506,11 +511,12 @@ jobs:
               END { exit !found }
             ' "$runtime/private-key-reader.log"
           done
-          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/private-key-reader.log"
+          grep -F 'test result: ok. 15 passed; 0 failed; 0 ignored;' "$runtime/private-key-reader.log"
           ! grep -F 'SKIPPED' "$runtime/private-key-reader.log"
           cargo test -p ssh --lib --locked keyfile::tests::private_key_read_ -- --nocapture --test-threads=1 2>&1 | tee "$runtime/private-key-caller.log"
           grep -Fx 'test keyfile::tests::private_key_read_uses_the_shared_input_limit ... ok' "$runtime/private-key-caller.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/private-key-caller.log"
+          grep -Fx 'test keyfile::tests::private_key_read_enforces_shared_owner_mode_policy ... ok' "$runtime/private-key-caller.log"
+          grep -F 'test result: ok. 2 passed; 0 failed; 0 ignored;' "$runtime/private-key-caller.log"
           ! grep -F 'SKIPPED' "$runtime/private-key-caller.log"
       - name: Discovery tests
         run: cargo test -p sshauth --lib --locked discover::tests

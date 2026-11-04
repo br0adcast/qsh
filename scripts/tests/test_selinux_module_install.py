@@ -23,6 +23,21 @@ def natural_outcome(*args,**kwargs):
     return replace(value,natural=value.failure is None and value.settled and not value.unreaped,stdout_eof=True,stderr_eof=True)
 
 class InstallTests(unittest.TestCase):
+    def test_actual_launch_exception_preserves_scratch_for_known_and_unknown_census(self):
+        import importlib.util
+        import subprocess
+        path = Path(__file__).with_name('test_selinux_module_process.py')
+        spec = importlib.util.spec_from_file_location('launch_custody_controls', path)
+        controls = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(controls)
+        for case in ('launch-child-consumer', 'launch-child-consumer-unknown'):
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [sys.executable, '-I', '-B', '-c', controls.HARNESS,
+                     str(controls.SOURCE), case],
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('"passed": true', result.stdout)
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)

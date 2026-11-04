@@ -479,7 +479,7 @@ fn controller() {
             .unwrap();
     }
     let key_path = home.path().join("identity");
-    std::fs::write(
+    support::write_private(
         &key_path,
         key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
     )
