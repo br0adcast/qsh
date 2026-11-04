@@ -398,7 +398,7 @@ impl NativeWait {
                 evidence: self.scope.census(),
                 retained: self.scope.retained(),
                 progress: match progress {
-                    scope::Progress::Pending => "pending",
+                    scope::Progress::Pending | scope::Progress::Incomplete => "pending",
                     scope::Progress::Unknown => "unknown",
                     scope::Progress::Complete(_) => "reaped",
                 },

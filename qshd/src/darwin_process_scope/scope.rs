@@ -9,6 +9,7 @@ fn certified_capacity(returned: usize, persistent: usize) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Progress {
     Pending,
+    Incomplete,
     Unknown,
     Complete(i32),
 }
@@ -26,7 +27,7 @@ pub(super) fn leader_status(
 pub(super) fn cleanup_status(progress: Progress) -> transport::channel_server::ChildStatus {
     use transport::channel_server::ChildStatus;
     match progress {
-        Progress::Pending => ChildStatus::Running,
+        Progress::Pending | Progress::Incomplete => ChildStatus::Running,
         Progress::Unknown => {
             ChildStatus::Unknown("Darwin process scope cleanup is unconfirmed".into())
         }
@@ -186,6 +187,10 @@ impl<C, W> Scope<C, W> {
     #[cfg(test)]
     pub(super) fn set_cookie_for_test(&mut self, cookie: u64) {
         self.cookie = cookie;
+    }
+    #[cfg(test)]
+    pub(super) fn set_generation_for_test(&mut self, generation: u64) {
+        self.generation = generation;
     }
     fn remember(&mut self, failure: Failure) {
         self.last_error.get_or_insert(failure);
@@ -581,35 +586,36 @@ impl<C, W> Scope<C, W> {
             }
             new_owner |= self.acquire(ops, *process, generation);
         }
-        let Some(pass) = sweep.final_pass else {
-            return Progress::Unknown;
-        };
-        // Retention failure cannot erase an observed obligation, even on a later pass.
-        if self.resource_lost || leader_signal_failed {
+        // Permanent retention/watcher loss dominates an incomplete same-call census.
+        if self.resource_lost
+            || self
+                .members
+                .iter()
+                .any(|member| matches!(member, Member::Bound(bound) if bound.lost))
+        {
             return Progress::Unknown;
         }
+        let Some(pass) = sweep.final_pass else {
+            return Progress::Incomplete;
+        };
         let leader = self.leader.unwrap();
-        if !pass
-            .classified
-            .iter()
-            .any(|item| item.identity.same_process(leader))
-        {
+        if !pass.classified.iter().any(|item| {
+            item.identity.same_process(leader)
+                && (item.class == Class::Zombie || item.class == Class::Session(leader.pid))
+        }) {
             self.lost_leader = true;
             self.remember(Failure::Leader);
             return Progress::Unknown;
+        }
+        // Evaluate available positive leader contradictions before retryable refusal.
+        if leader_signal_failed {
+            return Progress::Incomplete;
         }
         // Independent of acquisition success: a live descendant forbids final reap.
         let live_descendant = pass
             .classified
             .iter()
             .any(|item| item.class == Class::Session(sid) && !item.identity.same_process(leader));
-        if self
-            .members
-            .iter()
-            .any(|member| matches!(member, Member::Bound(bound) if bound.lost))
-        {
-            return Progress::Unknown;
-        }
         if !prior_exited || new_owner || live_descendant || code.is_none() {
             return Progress::Pending;
         }
@@ -637,7 +643,7 @@ impl<C, W> Scope<C, W> {
             }
         });
         if !discharge {
-            return Progress::Unknown;
+            return Progress::Incomplete;
         }
         #[cfg(test)]
         let discharged = self
