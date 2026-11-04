@@ -13,6 +13,27 @@ pub(super) enum Progress {
     Complete(i32),
 }
 
+pub(super) fn leader_status(
+    result: Result<Option<i32>, Failure>,
+) -> transport::channel_server::LeaderStatus {
+    use transport::channel_server::LeaderStatus;
+    match result {
+        Ok(None) => LeaderStatus::Running,
+        Ok(Some(code)) => LeaderStatus::Exited { code: Some(code) },
+        Err(_) => LeaderStatus::Unknown("Darwin leader custody is unconfirmed".into()),
+    }
+}
+pub(super) fn cleanup_status(progress: Progress) -> transport::channel_server::ChildStatus {
+    use transport::channel_server::ChildStatus;
+    match progress {
+        Progress::Pending => ChildStatus::Running,
+        Progress::Unknown => {
+            ChildStatus::Unknown("Darwin process scope cleanup is unconfirmed".into())
+        }
+        Progress::Complete(code) => ChildStatus::Reaped { code: Some(code) },
+    }
+}
+
 /// Constructed only from this call's capacity evidence; not a closure proof.
 struct CompleteCensus {
     generation: u64,
@@ -61,6 +82,7 @@ impl<W> Member<W> {
 pub(super) struct Scope<C, W> {
     child: C,
     leader: Option<Identity>,
+    bootstrap_pid: Option<i32>,
     qualification: QualifiedDarwin,
     members: Vec<Member<W>>,
     generation: u64,
@@ -82,6 +104,7 @@ impl<C, W> Scope<C, W> {
         Self {
             child,
             leader: leader.filter(|value| value.valid()),
+            bootstrap_pid: None,
             qualification,
             members: Vec::new(),
             generation: 0,
@@ -97,6 +120,44 @@ impl<C, W> Scope<C, W> {
             last_census: None,
             #[cfg(test)]
             discharged: (0, 0),
+        }
+    }
+    /// The caller retains the original exclusive, unreaped post-setsid/exec child.
+    /// This authority permits only its first identity, never replacement of a binding.
+    pub(super) fn post_handshake(
+        child: C,
+        pid: Option<i32>,
+        initial: Result<Classified, Failure>,
+        qualification: QualifiedDarwin,
+    ) -> Self {
+        let mut scope = Self::new(child, None, qualification);
+        if let Some(pid) = pid.filter(|pid| *pid > 0) {
+            scope.bootstrap_pid = Some(pid);
+            scope.admit_initial(initial);
+        }
+        scope
+    }
+    fn admit_initial(&mut self, result: Result<Classified, Failure>) {
+        let Some(pid) = self.bootstrap_pid else {
+            return;
+        };
+        match result {
+            Ok(value)
+                if value.identity.valid()
+                    && value.identity.pid == pid
+                    && matches!(value.class, Class::Zombie | Class::Session(_))
+                    && (value.class == Class::Zombie || value.class == Class::Session(pid)) =>
+            {
+                self.leader = Some(value.identity);
+                self.bootstrap_pid = None;
+            }
+            // A failed strict metadata query supplies no positive contradiction.
+            // Persistent denial retains custody but never authorizes a signal/reap.
+            Err(Failure::Errno(_) | Failure::Mach(_) | Failure::Invalid) => {}
+            _ => {
+                self.bootstrap_pid = None;
+                self.lost_leader = true;
+            }
         }
     }
     pub(super) fn request_stop(&mut self) {
@@ -422,10 +483,19 @@ impl<C, W> Scope<C, W> {
         if let Some(code) = self.completed {
             return Ok(Some(code));
         }
-        if self.lost_leader || self.leader.is_none() {
+        if self.lost_leader || (self.leader.is_none() && self.bootstrap_pid.is_none()) {
             return Err(Failure::Leader);
         }
-        match ops.observe_leader(&mut self.child) {
+        let observed = ops.observe_leader(&mut self.child);
+        if observed.is_ok() {
+            if let Some(pid) = self.bootstrap_pid {
+                self.admit_initial(ops.classify(pid));
+                if self.lost_leader {
+                    return Err(Failure::Leader);
+                }
+            }
+        }
+        match observed {
             Ok(Some(code)) => {
                 self.request_stop();
                 Ok(Some(code))
@@ -442,13 +512,17 @@ impl<C, W> Scope<C, W> {
         if let Some(code) = self.completed {
             return Progress::Complete(code);
         }
-        if self.lost_leader || self.leader.is_none() {
+        if self.lost_leader || (self.leader.is_none() && self.bootstrap_pid.is_none()) {
             return Progress::Unknown;
         }
         let code = match self.poll_leader(ops) {
             Ok(code) => code,
             Err(_) => return Progress::Unknown,
         };
+        if self.leader.is_none() {
+            // Genuine WNOWAIT status may be published, but cleanup is incomplete.
+            return Progress::Pending;
+        }
         let leader_signal_failed = if code.is_none() {
             match self.signal_leader(ops) {
                 Ok(()) => false,

@@ -468,3 +468,77 @@ fn cleanup143_exact_completion_clears_observation_even_without_a_retiring_map_en
 }
 
 include!("channel_reap_deadline_tests.rs");
+
+struct BootstrapPendingWait {
+    inner: ActiveWait,
+    stop: mpsc::SyncSender<()>,
+}
+impl ChannelWait for BootstrapPendingWait {
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        self.inner.poll_leader_status()
+    }
+    fn poll_exit(&mut self) -> ChildStatus {
+        self.inner.poll_exit()
+    }
+    fn kill(&mut self) {
+        let _ = self.stop.try_send(());
+    }
+    fn wait(self: Box<Self>) -> i32 {
+        panic!("exclusive polling owner required")
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        _: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus {
+        crate::channel_open::CleanupStatus::Unknown
+    }
+}
+#[test]
+fn bootstrap223_running_pending_delivers_stop_before_exact_completion() {
+    let runtime = runtime();
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let mut reaps = ReapSet::new(registry.clone());
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered, observed) = mpsc::sync_channel(1);
+    let (stop, stopped) = mpsc::sync_channel(1);
+    runtime.block_on(async {
+        reaps.start_active(
+            16,
+            1,
+            Box::new(BootstrapPendingWait {
+                inner: ActiveWait {
+                    complete: complete.clone(),
+                    entered,
+                },
+                stop,
+            }),
+            None,
+        );
+        reaps.observe_active();
+    });
+    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    let exact_owner = reaps.owners.get(&1).unwrap().clone();
+    reaps.stop_all();
+    let stop_delivered = stopped.recv_timeout(Duration::from_secs(2)).is_ok();
+    let held = !reaps.is_empty() && registry.outstanding() == 1;
+    let early = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_millis(40), reaps.next())
+            .await
+            .is_ok()
+    });
+    // Settle the exact controlled owner before asserting even on causal RED.
+    complete.store(true, Ordering::SeqCst);
+    exact_owner.notify();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), reaps.next())
+            .await
+            .unwrap();
+    });
+    assert!(stop_delivered);
+    assert!(held);
+    assert!(!early);
+    assert_eq!(registry.outstanding(), 0);
+    assert!(reaps.is_empty());
+    drop(reaps);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}

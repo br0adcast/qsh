@@ -700,9 +700,27 @@ fn darwin223_runtime_intel_candidate_requires_exact_cross_row_identity() {
     for (release, version, build, machine, arch) in [
         ("24.6.1", intel, "24G830", "x86_64", "x86_64"),
         ("24.6.0", intel, "24G831", "x86_64", "x86_64"),
-        ("24.6.0", "root:xnu-11417.140.69.711.44~10/RELEASE_X86_64", "24G830", "x86_64", "x86_64"),
-        ("24.6.0", "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-other", "24G830", "x86_64", "x86_64"),
-        ("24.6.0", "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-11417.140.69.711.44~1/RELEASE_X86_64", "24G830", "x86_64", "x86_64"),
+        (
+            "24.6.0",
+            "root:xnu-11417.140.69.711.44~10/RELEASE_X86_64",
+            "24G830",
+            "x86_64",
+            "x86_64",
+        ),
+        (
+            "24.6.0",
+            "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-other",
+            "24G830",
+            "x86_64",
+            "x86_64",
+        ),
+        (
+            "24.6.0",
+            "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
+            "24G830",
+            "x86_64",
+            "x86_64",
+        ),
     ] {
         assert!(runtime_contract(release, version, build, machine, arch).is_none());
     }
@@ -727,8 +745,171 @@ fn darwin223_runtime_receipt_uses_selected_fixed_row() {
     )
     .unwrap();
     assert_ne!(arm.id, intel.id);
-    assert_eq!(arm.receipt(), "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional");
-    assert_eq!(intel.receipt(), "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional");
+    assert_eq!(
+        arm.receipt(),
+        "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional"
+    );
+    assert_eq!(
+        intel.receipt(),
+        "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional"
+    );
     assert!(!intel.receipt().contains("ARM64"));
     assert!(intel.receipt().len() < 1024);
+}
+
+// Mirrors the production post-handshake constructor with original child custody.
+fn post_handshake_owner(model: &mut Model, pid: i32) -> Scope<usize, Watch> {
+    let initial = model.classify(pid);
+    Scope::post_handshake(
+        0,
+        Some(pid),
+        initial,
+        QualifiedDarwin {
+            contract: "model-xnu-contract",
+        },
+    )
+}
+
+#[test]
+fn darwin223_bootstrap_delayed_initial_identity_requires_owned_waitability() {
+    let leader = process(10, 100, 10);
+    let mut model = Model::new(vec![leader]);
+    model.leader = Ok(None);
+    model.after.remove(&10); // Initial classification bracket has no stable result.
+    let mut scope = post_handshake_owner(&mut model, 10);
+    assert!(model.signals.is_empty());
+    assert_eq!(model.reaps, 0);
+    model.after.insert(10, leader);
+    let before = model.events.len();
+    assert_eq!(scope.poll_leader(&mut model), Ok(None));
+    assert_eq!(&model.events[before..], ["leader", "classify"]);
+    assert!(model.signals.is_empty());
+    assert_eq!(model.reaps, 0);
+    scope.request_stop();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.reaps, 0);
+    model.leader = Ok(Some(0));
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_bootstrap_pending_preserves_running_terminal_and_stop() {
+    for terminal in [false, true] {
+        let leader = process(10, 100, 10);
+        let mut model = Model::new(vec![leader]);
+        model.leader = if terminal { Ok(Some(0)) } else { Ok(None) };
+        model.after.remove(&10);
+        let mut scope = post_handshake_owner(&mut model, 10);
+        for _ in 0..3 {
+            let before = model.events.len();
+            assert_eq!(scope.poll_leader(&mut model), model.leader);
+            assert_eq!(&model.events[before..], ["leader", "classify"]);
+            let status = scope::leader_status(scope.poll_leader(&mut model));
+            if terminal {
+                assert!(matches!(
+                    status,
+                    transport::channel_server::LeaderStatus::Exited { code: Some(0) }
+                ));
+            } else {
+                assert!(matches!(
+                    status,
+                    transport::channel_server::LeaderStatus::Running
+                ));
+            }
+            assert!(matches!(
+                scope::cleanup_status(scope.step(&mut model)),
+                transport::channel_server::ChildStatus::Running
+            ));
+            assert!(model.signals.is_empty());
+            assert_eq!(model.reaps, 0);
+        }
+        scope.request_stop();
+        model.after.insert(10, leader);
+        assert_eq!(
+            scope.step(&mut model),
+            if terminal {
+                Progress::Complete(0)
+            } else {
+                Progress::Pending
+            }
+        );
+        if !terminal {
+            assert_eq!(model.signals, [(leader.identity, Signal::Hup)]);
+            model.leader = Ok(Some(0));
+            assert_eq!(scope.step(&mut model), Progress::Complete(0));
+        }
+        assert_eq!(model.reaps, 1);
+    }
+}
+
+#[test]
+fn darwin223_bootstrap_contradiction_or_wait_loss_is_sticky() {
+    for kind in 0..4 {
+        let leader = process(10, 100, 10);
+        let mut model = Model::new(vec![leader]);
+        model.after.remove(&10);
+        let mut scope = post_handshake_owner(&mut model, 10);
+        match kind {
+            0 => model.leader = Err(Failure::Errno(10)),
+            1 => {
+                model.after.insert(10, process(10, 100, 99));
+            }
+            2 => {
+                model.after.insert(10, process(11, 100, 10));
+            }
+            _ => {
+                model.after.insert(10, process(10, 0, 10));
+            }
+        }
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        model.after.insert(10, leader);
+        model.leader = Ok(Some(0));
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
+}
+
+#[test]
+fn darwin223_bootstrap_zombie_still_requires_full_census() {
+    let mut zombie = process(10, 100, 10);
+    zombie.class = Class::Zombie;
+    let mut model = Model::new(vec![zombie]);
+    model.after.remove(&10);
+    let mut scope = post_handshake_owner(&mut model, 10);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.after.insert(10, zombie);
+    model.bytes = Some(0);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 0);
+    model.bytes = None;
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_bootstrap_initial_contradiction_and_invalid_pid_never_recover() {
+    for (pid, initial) in [
+        (Some(10), Ok(process(10, 100, 99))),
+        (Some(10), Ok(process(11, 100, 10))),
+        (Some(10), Ok(process(10, 0, 10))),
+        (None, Err(Failure::Errno(3))),
+        (Some(0), Err(Failure::Invalid)),
+    ] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        let mut scope: Scope<usize, Watch> = Scope::post_handshake(
+            0,
+            pid,
+            initial,
+            QualifiedDarwin {
+                contract: "model-xnu-contract",
+            },
+        );
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.events.is_empty());
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
 }

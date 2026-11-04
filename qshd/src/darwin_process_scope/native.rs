@@ -332,7 +332,7 @@ impl Ops<PtyChild> for NativeOps {
                 Err(error) => {
                     return Err(Failure::Errno(
                         error.raw_os_error().unwrap_or(nix::libc::EIO),
-                    ))
+                    ));
                 }
             }
         }
@@ -366,17 +366,10 @@ pub(super) fn owned_scope(
         .and_then(|pid| i32::try_from(pid).ok())
         .filter(|pid| *pid > 0);
     let mut ops = NativeOps;
-    let identity = pid
-        .and_then(|pid| ops.classify(pid).ok())
-        .filter(|value| {
-            value.class == Class::Session(value.identity.pid) || value.class == Class::Zombie
-        })
-        .map(|value| value.identity);
-    // portable-pty has already completed setsid/exec for this exclusive child.
-    // A now-zombie child still reserves that known SID until our actual wait;
-    // this is not a way to infer a session from arbitrary zombie metadata.
-    // Even missing PID/failed identity keeps the original direct child owned.
-    scope::Scope::new(PtyChild { child, pid }, identity, qualified)
+    let initial = pid.map_or(Err(Failure::Leader), |pid| ops.classify(pid));
+    // portable-pty completed setsid/exec and returned this original exclusive child.
+    // Its unreaped lifetime reserves PID/SID even if the initial exec bracket fails.
+    scope::Scope::post_handshake(PtyChild { child, pid }, pid, initial, qualified)
 }
 pub(crate) fn own_child(
     child: Box<dyn Child + Send + Sync>,
@@ -411,25 +404,16 @@ impl NativeWait {
                 },
             })
         });
-        match progress {
-            scope::Progress::Pending => ChildStatus::Running,
-            scope::Progress::Unknown => {
-                ChildStatus::Unknown("Darwin process scope cleanup is unconfirmed".into())
-            }
-            scope::Progress::Complete(code) => ChildStatus::Reaped { code: Some(code) },
-        }
+        scope::cleanup_status(progress)
     }
 }
 impl ChannelWait for NativeWait {
     fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
-        Some(match self.scope.poll_leader(&mut NativeOps) {
-            Ok(None) => LeaderStatus::Running,
-            Ok(Some(code)) => {
-                self.start_grace();
-                LeaderStatus::Exited { code: Some(code) }
-            }
-            Err(_) => LeaderStatus::Unknown("Darwin leader custody is unconfirmed".into()),
-        })
+        let observed = self.scope.poll_leader(&mut NativeOps);
+        if matches!(observed, Ok(Some(_))) {
+            self.start_grace();
+        }
+        Some(scope::leader_status(observed))
     }
     fn poll_exit(&mut self) -> ChildStatus {
         if matches!(self.poll_leader_status(), Some(LeaderStatus::Unknown(_))) {
