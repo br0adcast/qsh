@@ -132,8 +132,10 @@ pub(crate) fn prepare() -> Result<QualifiedDarwin, AdmissionError> {
     )
     .ok_or(AdmissionError::UnsupportedContract)?;
     #[cfg(test)]
-    eprintln!("darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional");
-    Ok(QualifiedDarwin { contract })
+    eprintln!("{}", contract.receipt());
+    Ok(QualifiedDarwin {
+        contract: contract.id,
+    })
 }
 pub(super) struct Watch {
     fd: OwnedFd,

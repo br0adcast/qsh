@@ -106,28 +106,64 @@ pub(crate) use native::{own_child, prepare};
 #[cfg(all(test, target_os = "macos"))]
 mod native_tests;
 
-/// Finite reviewed runtime candidate, pending actual production-path CI. The
-/// public source tag and observed patched build are deliberately separate.
+/// Finite reviewed runtime candidates, pending actual production-path CI. The
+/// public source tag and observed patched builds are deliberately separate.
+#[derive(Debug, PartialEq, Eq)]
+struct RuntimeContract {
+    id: &'static str,
+    release: &'static str,
+    build: &'static str,
+    kernel_token: &'static str,
+    machine: &'static str,
+    native_arch: &'static str,
+}
+const RUNTIME_CONTRACTS: [RuntimeContract; 2] = [
+    RuntimeContract {
+        id: "xnu-11417.140.69-darwin24.6.0-24H232-arm64-vmapple",
+        release: "24.6.0",
+        build: "24H232",
+        kernel_token: "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE",
+        machine: "arm64",
+        native_arch: "aarch64",
+    },
+    RuntimeContract {
+        id: "xnu-11417.140.69-darwin24.6.0-24G830-x86_64",
+        release: "24.6.0",
+        build: "24G830",
+        kernel_token: "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
+        machine: "x86_64",
+        native_arch: "x86_64",
+    },
+];
+#[cfg(test)]
+impl RuntimeContract {
+    fn receipt(&self) -> String {
+        format!(
+            "darwin223 public_source=xnu-11417.140.69 runtime_release={} os_build={} kernel_build={} machine={} native_arch={} premise=conditional",
+            self.release, self.build, self.kernel_token.trim_start_matches("root:xnu-"),
+            self.machine, self.native_arch,
+        )
+    }
+}
 fn runtime_contract(
     release: &str,
     version: &str,
     build: &str,
     machine: &str,
     native_arch: &str,
-) -> Option<&'static str> {
-    let expected = "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
+) -> Option<&'static RuntimeContract> {
     let mut tokens = version
         .split_ascii_whitespace()
         .filter(|word| word.starts_with("root:xnu-"));
-    let exact_token = tokens.next() == Some(expected) && tokens.next().is_none();
-    if release == "24.6.0"
-        && build == "24H232"
-        && machine == "arm64"
-        && native_arch == "aarch64"
-        && exact_token
-    {
-        Some("xnu-11417.140.69-darwin24.6.0-24H232-arm64-vmapple")
-    } else {
-        None
+    let token = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
     }
+    RUNTIME_CONTRACTS.iter().find(|row| {
+        release == row.release
+            && build == row.build
+            && token == row.kernel_token
+            && machine == row.machine
+            && native_arch == row.native_arch
+    })
 }

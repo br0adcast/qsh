@@ -671,3 +671,64 @@ fn darwin223_candidate_receipt_is_published_only_after_actual_reap() {
     assert_eq!(scope.step(&mut model), Progress::Complete(0));
     assert_eq!(scope.discharged_for_test(), (1, 0));
 }
+
+#[test]
+fn darwin223_runtime_intel_candidate_requires_exact_cross_row_identity() {
+    let intel = "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64";
+    let arm = "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
+    assert!(runtime_contract("24.6.0", intel, "24G830", "x86_64", "x86_64").is_some());
+    for version in [arm, intel] {
+        for build in ["24H232", "24G830"] {
+            for machine in ["arm64", "x86_64"] {
+                for arch in ["aarch64", "x86_64"] {
+                    let expected = (version == arm
+                        && build == "24H232"
+                        && machine == "arm64"
+                        && arch == "aarch64")
+                        || (version == intel
+                            && build == "24G830"
+                            && machine == "x86_64"
+                            && arch == "x86_64");
+                    assert_eq!(
+                        runtime_contract("24.6.0", version, build, machine, arch).is_some(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+    for (release, version, build, machine, arch) in [
+        ("24.6.1", intel, "24G830", "x86_64", "x86_64"),
+        ("24.6.0", intel, "24G831", "x86_64", "x86_64"),
+        ("24.6.0", "root:xnu-11417.140.69.711.44~10/RELEASE_X86_64", "24G830", "x86_64", "x86_64"),
+        ("24.6.0", "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-other", "24G830", "x86_64", "x86_64"),
+        ("24.6.0", "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64 root:xnu-11417.140.69.711.44~1/RELEASE_X86_64", "24G830", "x86_64", "x86_64"),
+    ] {
+        assert!(runtime_contract(release, version, build, machine, arch).is_none());
+    }
+}
+
+#[test]
+fn darwin223_runtime_receipt_uses_selected_fixed_row() {
+    let arm = runtime_contract(
+        "24.6.0",
+        "root:xnu-11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE",
+        "24H232",
+        "arm64",
+        "aarch64",
+    )
+    .unwrap();
+    let intel = runtime_contract(
+        "24.6.0",
+        "root:xnu-11417.140.69.711.44~1/RELEASE_X86_64",
+        "24G830",
+        "x86_64",
+        "x86_64",
+    )
+    .unwrap();
+    assert_ne!(arm.id, intel.id);
+    assert_eq!(arm.receipt(), "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional");
+    assert_eq!(intel.receipt(), "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional");
+    assert!(!intel.receipt().contains("ARM64"));
+    assert!(intel.receipt().len() < 1024);
+}
