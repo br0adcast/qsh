@@ -67,7 +67,8 @@ class _Outcome:
     exit_code: int | None
     failure: str | None
     settled: bool
-    unreaped: tuple[int, ...] = ()
+    # None means census unknown; () means observed empty.
+    unreaped: tuple[int, ...] | None = ()
     launch_code: str | None = None
 
 
@@ -334,6 +335,17 @@ class _Owner:
                         pipe.close()
                     except BaseException as error:
                         custody_error(error)
+            else:
+                # A launcher can raise before returning its Popen custody.
+                # Only a fresh post-exception census can establish emptiness.
+                try:
+                    ids = _children()
+                except BaseException:
+                    ids = None
+                if ids != []:
+                    self._unsettled = True
+                    self._last = _Outcome(*captured(), None, 'COMMAND_UNSETTLED',
+                                          False, tuple(ids) if ids is not None else None)
             if not self._unsettled:
                 if lease_deadline is not None and time.monotonic() >= lease_deadline and failure is None:
                     failure = 'COMMAND_TIMEOUT'
