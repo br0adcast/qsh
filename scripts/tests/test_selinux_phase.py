@@ -263,6 +263,21 @@ class FailureProtocolTests(unittest.TestCase):
 class FailureSafetyTests(unittest.TestCase):
     def setUp(self):self.phase=load_phase();self.request=self.phase._request('provider-post-pristine')
 
+    def test_launch_code_validation_preserves_command_schema(self):
+        import qshd_selinux_process as process
+        for outcome in (None, object(),
+                process._Outcome(b'',b'',0,'TOOL_FAILURE',True,launch_code='OS_EMFILE'),
+                process._Outcome(b'',b'',None,'COMMAND_TIMEOUT',True,launch_code='OS_EMFILE'),
+                process._Outcome(b'',b'',None,'TOOL_FAILURE',True,launch_code='PRIVATE'),
+                process._Outcome(b'',b'',None,'TOOL_FAILURE',True,launch_code=True)):
+            self.assertIsNone(process._launch_code(outcome))
+        for code in ('PRIVATE',True,object(),None):
+            error=process._CommandError('TOOL_FAILURE',_outcome=code)
+            value=self.phase._parse_failure(self.phase._failure(error,self.request),self.request)
+            self.assertEqual(value['codes'],['TOOL_FAILURE'])
+        self.assertEqual(set(self.phase._parse_failure(self.phase._failure(error,self.request),self.request)),
+                         {'version','request','codes','command'})
+
     def test_unknown_private_text_and_cycles_are_bounded_without_rendering(self):
         class Private(Exception):
             def __str__(self):raise AssertionError('must not render exception')
@@ -373,6 +388,56 @@ raise SystemExit(status)
             value=self.phase._parse_failure(result.stderr,self.request)
             self.assertEqual(value['codes'],['COORDINATOR_INSTALL','COMMAND_TIMEOUT'])
             self.assertEqual(value['command']['exit_code'],-15)
+
+    def test_real_owner_launch_errno_crosses_child_parent_after_settlement(self):
+        program=r'''
+import importlib.util, pathlib, resource, sys, time
+root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);sys.path.insert(0,str(root))
+for key,value in ((resource.RLIMIT_CORE,0),(resource.RLIMIT_FSIZE,16*1024**2),(resource.RLIMIT_AS,1024**3),(resource.RLIMIT_CPU,15)):
+ resource.setrlimit(key,(value,value))
+spec=importlib.util.spec_from_file_location('actual_phase',root/'qshd_selinux_phase.py');phase=importlib.util.module_from_spec(spec);sys.modules[spec.name]=phase;spec.loader.exec_module(phase)
+phase._resources=lambda **kw:None
+if len(sys.argv)>3:
+ import qshd_selinux_first_activation as first
+ import qshd_selinux_process as process
+ def refuse(*args,**kw):
+  import errno, tempfile
+  from unittest.mock import patch
+  def fail(*a,**k):raise OSError(errno.EMFILE,'PRIVATE_MESSAGE','/private/canary')
+  with tempfile.TemporaryDirectory() as directory,patch.object(process.subprocess,'Popen',side_effect=fail):
+   try:process._Owner(process._Limits(15,1024**2))._run(('/trusted/tool',),directory)
+   except process._CommandError as inner:
+    from qshd_selinux_fs import Conflict
+    try:raise Conflict('PRIVATE') from inner
+    except Conflict as context:raise first.CoordinatorError('OBSERVATION') from context
+ phase._dispatch=refuse
+ raise SystemExit(phase._child_main(sys.argv[4:]))
+phase._SCRIPT=str(helper)
+status=phase._parent('provider-post-pristine',time.monotonic())
+import qshd_selinux_process as process
+assert process._children()==[]
+raise SystemExit(status)
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);root.chmod(0o700);helper=root/'child.py'
+            helper.write_text(program);helper.chmod(0o600)
+            env=os.environ|dict(HOME=directory,XDG_CACHE_HOME=directory,XDG_CONFIG_HOME=directory,TMPDIR=directory,HISTFILE='/dev/null')
+            # Child script receives the fixed production child selector then original request/times.
+            child_program=program.replace("root=pathlib.Path(sys.argv[1]);helper=pathlib.Path(sys.argv[2]);", "root=pathlib.Path("+repr(str(SOURCE))+ ");helper=pathlib.Path(__file__);").replace('if len(sys.argv)>3:', 'if True:').replace('sys.argv[4:]', 'sys.argv[2:]')
+            helper.write_text(child_program)
+            result=subprocess.run([sys.executable,'-I','-B','-c',program,str(SOURCE),str(helper)],cwd=directory,env=env,capture_output=True,timeout=15)
+            self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(result.stdout,b'')
+            value=self.phase._parse_failure(result.stderr,self.request)
+            self.assertEqual(value['codes'],['COORDINATOR_OBSERVATION','CONTEXT_REFUSED','OS_EMFILE'])
+            self.assertIsNone(value['command']['exit_code'])
+            self.assertEqual(value['command']['failure'],'TOOL_FAILURE')
+            self.assertEqual(value['command']['profile'],'module15')
+            self.assertTrue(value['command']['settled'])
+            self.assertEqual(value['command']['unreaped'],0)
+            self.assertLessEqual(len(result.stderr),1024)
+            self.assertNotIn(b'PRIVATE',result.stderr)
+            self.assertNotIn(b'/private',result.stderr)
 
 
 class DeliveryTests(unittest.TestCase):

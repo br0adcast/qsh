@@ -122,6 +122,7 @@ fn selinux57_physical_outcome_is_settled_but_failed_for_label_restore() {
             terminal_received: true,
             native_exit: 0,
             requested: true,
+            worker_failure: None,
         },
         pam_received: PamCompletion::NotOpened,
         cleanup_failure: None,

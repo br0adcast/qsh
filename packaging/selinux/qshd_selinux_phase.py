@@ -7,7 +7,6 @@ resources or custody. Only explicit execution configures its dedicated owner.
 import time
 _ENTRY_STARTED=time.monotonic() if __name__=='__main__' else None
 
-import errno
 import hashlib
 import importlib.abc
 import importlib.util
@@ -129,12 +128,13 @@ _COMMAND_CODES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TO
     'OUTPUT_INCOMPLETE','PROCESS_THREADS','PROCESS_SIGNALS','PROCESS_CHILDREN','PROCESS_LIMITS',
     'PROCESS_SUBREAPER','PROCESS_OWNER','COMMAND_LIMITS','COMMAND_INPUT','COMMAND_KIND',
     'COMMAND_BUDGET','COMMAND_STDERR','COMMAND_OUTPUT'))
-_ERRNO_CODES={getattr(errno,name):'OS_'+name for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM')}
-_CODES=frozenset(_ERRNO_CODES.values())|_COMMAND_CODES|frozenset('COORDINATOR_'+name for name in _STAGES)|frozenset((
+_CODES=_COMMAND_CODES|frozenset('COORDINATOR_'+name for name in _STAGES)|frozenset((
     'UNKNOWN','INSTALL_REFUSED','REGISTRY_REFUSED','CONTEXT_REFUSED','SLOT_REFUSED','SELINUX_REFUSED'))
 
 
 def _parse_failure(raw,request):
+    from qshd_selinux_process import _ERRNO_CODES
+    codes=_CODES|frozenset(_ERRNO_CODES.values())
     if type(raw) is not bytes or not 0<len(raw)<=1024:raise PhaseError('FAILURE')
     expected=_parse_request(request)
     try:
@@ -144,7 +144,7 @@ def _parse_failure(raw,request):
                 or value['request']!=expected or type(value['request']) is not dict
                 or _json(value['request'])!=request
                 or type(value['codes']) is not list or not 1<=len(value['codes'])<=8
-                or any(type(code) is not str or code not in _CODES for code in value['codes'])
+                or any(type(code) is not str or code not in codes for code in value['codes'])
                 or _json(value)+b'\n'!=raw):raise PhaseError('FAILURE')
         command=value['command']
         if command is not None:
@@ -158,7 +158,7 @@ def _parse_failure(raw,request):
 
 def _failure(error,request):
     from dataclasses import asdict
-    from qshd_selinux_process import _CommandError,_FailureSummary
+    from qshd_selinux_process import _CommandError,_FailureSummary,_ERRNO_CODES
     from qshd_selinux_first_activation import CoordinatorError as FirstError
     from qshd_selinux_consumer_activation import CoordinatorError as ConsumerError
     from qshd_selinux_module_install import InstallError
@@ -178,6 +178,8 @@ def _failure(error,request):
         elif kind is _CommandError:
             args=BaseException.args.__get__(error)
             if len(args)==1 and type(args[0]) is str and args[0] in _COMMAND_CODES:code=args[0]
+            launch_code=error.launch_code
+            if type(launch_code) is str and launch_code in _ERRNO_CODES.values():code=launch_code
             summary=error.summary
             if command is None and type(summary) is _FailureSummary:
                 try:summary.__post_init__();command=asdict(summary)

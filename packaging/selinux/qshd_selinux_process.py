@@ -5,6 +5,7 @@ children; its caller imposes the complete verifier's external hard deadline.
 No resources or subreaper state change merely by importing this module.
 """
 import ctypes
+import errno
 from dataclasses import dataclass
 import math
 import os
@@ -22,12 +23,16 @@ _CLEANUP_SECONDS = 10
 
 class _CommandError(RuntimeError):
     """Fixed bounded refusal; raw command output never enters its message."""
-    def __init__(self, code, *, summary=None):
+    def __init__(self, code, *, summary=None, _outcome=None):
         super().__init__(code)
         self._summary=summary
+        self._launch_code=_launch_code(_outcome)
 
     @property
     def summary(self):return self._summary
+
+    @property
+    def launch_code(self):return self._launch_code
 
 
 
@@ -63,6 +68,17 @@ class _Outcome:
     failure: str | None
     settled: bool
     unreaped: tuple[int, ...] = ()
+    launch_code: str | None = None
+
+
+_ERRNO_CODES={getattr(errno,name):'OS_'+name for name in ('EMFILE','ENFILE','ENOMEM','EFBIG','ENOSPC','EACCES','EPERM')}
+
+
+def _launch_code(outcome):
+    if (type(outcome) is _Outcome and type(outcome.failure) is str and outcome.failure=='TOOL_FAILURE'
+            and outcome.exit_code is None and type(outcome.launch_code) is str
+            and outcome.launch_code in _ERRNO_CODES.values()):return outcome.launch_code
+    return None
 
 
 _FAILURES=frozenset(('COMMAND_TIMEOUT','OUTPUT_LIMIT','COMMAND_CUSTODY','TOOL_FAILURE','COMMAND_UNSETTLED','OUTPUT_INCOMPLETE'))
@@ -181,6 +197,7 @@ class _Owner:
         nonblocking = False
         failure = None
         pending = None
+        launch_code = None
 
         def custody_error(error):
             nonlocal failure, pending
@@ -230,6 +247,9 @@ class _Owner:
                     break
                 select.select([pipes[index] for index in readable], [], [], min(.02, max(0, deadline-time.monotonic())))
         except BaseException as error:
+            if proc is None and type(error) in (OSError,PermissionError):
+                number=OSError.errno.__get__(error)
+                if type(number) is int:launch_code=_ERRNO_CODES.get(number)
             failure = 'TOOL_FAILURE'
             if not isinstance(error, OSError):
                 pending = error
@@ -318,11 +338,12 @@ class _Owner:
                 if lease_deadline is not None and time.monotonic() >= lease_deadline and failure is None:
                     failure = 'COMMAND_TIMEOUT'
                 self._last = _Outcome(*captured(), None if proc is None else proc.returncode,
-                                      'OUTPUT_LIMIT' if overflow else failure, True)
+                                      'OUTPUT_LIMIT' if overflow else failure, True, launch_code=launch_code)
         if self._unsettled:
             raise _CommandError('COMMAND_UNSETTLED',summary=_failure_summary(self._last,self._limits)) from None
         if pending is not None:
             raise pending
         if self._last.failure or self._last.exit_code != 0:
-            raise _CommandError(self._last.failure or 'TOOL_FAILURE',summary=_failure_summary(self._last,self._limits)) from None
+            raise _CommandError(self._last.failure or 'TOOL_FAILURE',summary=_failure_summary(self._last,self._limits),
+                                _outcome=self._last) from None
         return _Streams(self._last.stdout, self._last.stderr)

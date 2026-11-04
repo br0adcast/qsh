@@ -70,6 +70,94 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Observe the Intel Darwin runtime
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          python3 -I -B - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          QUERIES = (
+              ('checkout', ('/usr/bin/git', 'rev-parse', 'HEAD')),
+              ('kernel_version', ('/usr/sbin/sysctl', '-n', 'kern.version')),
+              ('osrelease', ('/usr/sbin/sysctl', '-n', 'kern.osrelease')),
+              ('os_build', ('/usr/sbin/sysctl', '-n', 'kern.osversion')),
+              ('hw_machine', ('/usr/sbin/sysctl', '-n', 'hw.machine')),
+              ('uname_machine', ('/usr/bin/uname', '-m')),
+              ('os_version', ('/usr/bin/sw_vers', '-productVersion')),
+          )
+          class Refused(Exception):
+              def __init__(self, query):
+                  self.query = query if query in {name for name, _ in QUERIES} else 'checkout'
+
+          def token(value, pattern, limit, query):
+              if type(value) is not str or len(value) > limit or re.fullmatch(pattern, value) is None:
+                  raise Refused(query)
+              return value
+
+          def kernel(value):
+              day = r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)'
+              month = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+              date = day + ' ' + month + r' {1,2}(?:[1-9]|[12][0-9]|3[01]) (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] (?:[A-Z]{1,8}|[+-][0-9]{4}) [0-9]{4}'
+              version = r'[0-9]{1,5}(?:\.[0-9]{1,5}){1,2}'
+              revision = r'[0-9]{1,12}(?:[.~][0-9]{1,12}){0,12}'
+              return token(value, 'Darwin Kernel Version ' + version + ': ' + date + '; root:xnu-' + revision + r'/RELEASE_[A-Z0-9_]{1,96}', 512, 'kernel_version')
+
+          def build_record(values, environ):
+              if type(values) is not dict or set(values) != {name for name, _ in QUERIES}:
+                  raise Refused('checkout')
+              sha = token(values['checkout'], r'[0-9a-f]{40}', 40, 'checkout')
+              event = token(environ.get('GITHUB_SHA'), r'[0-9a-f]{40}', 40, 'checkout')
+              run = token(environ.get('GITHUB_RUN_ID'), r'[1-9][0-9]{0,19}', 20, 'checkout')
+              attempt = token(environ.get('GITHUB_RUN_ATTEMPT'), r'[1-9][0-9]{0,9}', 10, 'checkout')
+              for name in ('hw_machine', 'uname_machine'):
+                  token(values[name], r'x86_64', 32, name)
+              return dict(schema=1, kind='darwin-intel-preflight', checkout_sha=sha, event_sha=event,
+                          run_id=int(run), attempt=int(attempt), runner_label='macos-15-intel',
+                          target='x86_64-apple-darwin', kernel_version=kernel(values['kernel_version']),
+                          osrelease=token(values['osrelease'], r'[0-9]+(?:\.[0-9]+)*', 32, 'osrelease'),
+                          os_build=token(values['os_build'], r'[A-Za-z0-9]+', 32, 'os_build'),
+                          os_version=token(values['os_version'], r'[0-9]+(?:\.[0-9]+)*', 20, 'os_version'),
+                          hw_machine=values['hw_machine'], uname_machine=values['uname_machine'])
+
+          def collect(metadata_command, environ):
+              values = {}
+              for name, argv in QUERIES:
+                  try:
+                      raw = metadata_command(list(argv), timeout=10, category='static-tool')
+                      if type(raw) is not bytes or not 0 < len(raw) <= 65536 or raw.count(b'\n') != 1 or not raw.endswith(b'\n'):
+                          raise Refused(name)
+                      values[name] = raw[:-1].decode('ascii')
+                  except Exception:
+                      raise Refused(name) from None
+              return build_record(values, environ)
+
+          def main():
+              try:
+                  path = Path('scripts/check-release-output.py')
+                  spec = importlib.util.spec_from_file_location('_qsh_release_output', path)
+                  module = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  record = collect(module.metadata_command, os.environ)
+                  line = ('DARWIN_INTEL_PREFLIGHT ' + json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+                  if len(line) > 2048:
+                      raise Refused('kernel_version')
+                  sys.stdout.buffer.write(line)
+                  return 0
+              except Exception as error:
+                  query = error.query if isinstance(error, Refused) else 'checkout'
+                  print('INTEL_PREFLIGHT_REFUSED query=' + query, file=sys.stderr)
+                  return 1
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PY
       - name: Install native prerequisites
         shell: bash
         run: |

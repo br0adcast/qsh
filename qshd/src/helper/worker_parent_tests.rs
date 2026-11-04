@@ -436,7 +436,26 @@ mod worker_parent {
         "no-receipt",
         "no-signal-failure",
         "deliberate",
+        "inner-budget",
+        "missing-receipt",
     ];
+    // The body's WorkerOwner budget, counted from its creation.
+    const PHYSICAL_WORKER_BUDGET: Duration = Duration::from_secs(2);
+    // Reaching the first pump is self-reexec, qualification and fixture setup,
+    // whatever the scheduler makes of them: this limit only ends a hang before
+    // the pump and is not a product deadline.
+    const PHYSICAL_SETUP_LIMIT: Duration = Duration::from_secs(10);
+    // Body teardown after settlement: its assertions, owner drops and exit.
+    const PHYSICAL_EXIT_ALLOWANCE: Duration = Duration::from_secs(1);
+    /// The supervisor's budget from the body's first pump: at most the whole
+    /// worker budget remains of the inner deadline, settlement needs at most
+    /// two reap passes once the exited leader is observable, then teardown.
+    fn physical_product_window() -> Duration {
+        PHYSICAL_WORKER_BUDGET + 2 * REAP_INTERVAL + PHYSICAL_EXIT_ALLOWANCE
+    }
+    // Delayed-setup control: longer than the whole worker budget, so a
+    // watchdog that also charged setup to that budget would expire.
+    const PHYSICAL_SETUP_DELAY: Duration = Duration::from_millis(2100);
 
     // Only closed codes and bounded numeric facts cross the body boundary.
     // Never copy panic payloads, stdout/stderr, process identities or environment.
@@ -572,7 +591,7 @@ mod worker_parent {
         assert!(PhysicalDiagnostic::decode(&diagnostic.encode()).is_some());
         assert!(diagnostic.report().len() + 100 <= PHYSICAL_REPORT_LIMIT);
         let largest = format!(
-            "timed_out=false, body_success=false, adopted_reaped={}, no_children=true, {}, {}",
+            "timed_out=false, timeout_window=product, body_success=false, adopted_reaped={}, no_children=true, {}, {}",
             usize::MAX,
             diagnostic.report(),
             timing_report(Ok(0), Ok(u64::MAX), &diagnostic)
@@ -693,6 +712,12 @@ mod worker_parent {
     }
 
     fn failed_physical_fixture(control: &str) -> String {
+        let (success, report) = physical_fixture(control);
+        assert!(!success, "controlled fixture must fail: {report}");
+        report
+    }
+
+    fn physical_fixture(control: &str) -> (bool, String) {
         use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report");
@@ -706,6 +731,8 @@ mod worker_parent {
             .env_remove("QSH_TEST_PARENT_PHYSICAL_STAGE")
             .env_remove("QSH_TEST_PARENT_PHYSICAL_HOLD")
             .env_remove("QSH_TEST_PARENT_PHYSICAL_ASSERT")
+            .env_remove("QSH_TEST_PARENT_PHYSICAL_SETUP_DELAY")
+            .env_remove("QSH_TEST_PARENT_PHYSICAL_PUMP_HOLD")
             .env("QSH_TEST_PARENT_PHYSICAL_CAPTURE", &path)
             .env(control, "1")
             .stdin(Stdio::null())
@@ -724,14 +751,20 @@ mod worker_parent {
             report.len() <= PHYSICAL_REPORT_LIMIT,
             "bounded owned fixture report"
         );
-        assert!(!status.success(), "controlled fixture must fail");
-        report
+        (status.success(), report)
+    }
+
+    /// A `name=Some(ms)` timing field of a fixture report.
+    fn report_ms(report: &str, name: &str) -> Option<u64> {
+        let rest = report.split_once(&format!("{name}=Some("))?.1;
+        rest.split_once(')')?.0.parse().ok()
     }
 
     #[test]
     fn worker40_parent_held_body_reports_phase_after_owned_cleanup() {
         let report = failed_physical_fixture("QSH_TEST_PARENT_PHYSICAL_HOLD");
         assert!(report.contains("timed_out=true"), "{report}");
+        assert!(report.contains("timeout_window=setup"), "{report}");
         assert!(report.contains("adopted_reaped=1"), "{report}");
         assert!(report.contains("no_children=true"), "{report}");
         assert!(report.contains("phase=held-body"), "{report}");
@@ -752,6 +785,34 @@ mod worker_parent {
         assert!(report.contains("outer_observed_ms=Some("), "{report}");
         assert!(report.contains("body_entry_ms=Some("), "{report}");
         assert!(report.contains("pump_entry_ms=Some("), "{report}");
+    }
+
+    #[test]
+    fn worker40_parent_setup_delay_does_not_consume_the_product_window() {
+        let (success, report) = physical_fixture("QSH_TEST_PARENT_PHYSICAL_SETUP_DELAY");
+        assert!(success, "{report}");
+        assert!(report.contains("timed_out=false"), "{report}");
+        assert!(report.contains("body_success=true"), "{report}");
+        assert!(report.contains("adopted_reaped=0"), "{report}");
+        assert!(report.contains("phase=complete"), "{report}");
+        assert!(report.contains("physical_wait=true"), "{report}");
+        let pump = report_ms(&report, "pump_entry_ms").expect("pump entry timing");
+        assert!(pump >= PHYSICAL_SETUP_DELAY.as_millis() as u64, "{report}");
+    }
+
+    #[test]
+    fn worker40_parent_held_pump_times_out_in_the_product_window() {
+        let report = failed_physical_fixture("QSH_TEST_PARENT_PHYSICAL_PUMP_HOLD");
+        assert!(report.contains("timed_out=true"), "{report}");
+        assert!(report.contains("timeout_window=product"), "{report}");
+        assert!(report.contains("adopted_reaped=1"), "{report}");
+        assert!(report.contains("no_children=true"), "{report}");
+        assert!(report.contains("phase=pump"), "{report}");
+        let pump = report_ms(&report, "pump_entry_ms").expect("pump entry timing");
+        let observed = report_ms(&report, "outer_observed_ms").expect("observation timing");
+        let window = physical_product_window().as_millis() as u64;
+        assert!(observed >= pump + window, "{report}");
+        assert!(observed < PHYSICAL_SETUP_LIMIT.as_millis() as u64, "{report}");
     }
 
     #[test]
@@ -786,18 +847,38 @@ mod worker_parent {
                     0
                 );
                 diagnostic.checkpoint("body-exec", "none", started);
-                // Supervisor-relative origin includes spawn time. The watchdog
-                // below starts AFTER spawn: this is not its remaining budget.
+                // Supervisor-relative origin includes spawn time. Neither window
+                // below is measured from it: setup from after spawn, product
+                // from the body's own pump stamp.
                 let origin = monotonic_ns();
                 let mut body = ChildOwner(reexec("body").spawn().unwrap());
-                let deadline = Instant::now() + Duration::from_secs(2);
+                // Setup is limited only against a hang. The product window
+                // starts at the first pump the body stamped on the shared
+                // clock, never at spawn: setup cannot consume it.
+                let setup_deadline = Instant::now() + PHYSICAL_SETUP_LIMIT;
+                let window = physical_product_window().as_nanos() as u64;
+                let mut product_end = None;
+                let mut timeout_window = "none";
                 let status = loop {
                     match body.0.try_wait() {
                         Ok(Some(status)) => break Some(status),
-                        Ok(None) if Instant::now() < deadline => {
+                        Ok(None) => {
+                            if product_end.is_none() {
+                                product_end = PhysicalDiagnostic::read()
+                                    .pump_ns
+                                    .and_then(|pump| pump.checked_add(window));
+                            }
+                            // Without a readable clock only the setup limit applies.
+                            let expired = match (product_end, monotonic_ns()) {
+                                (Some(end), Ok(now)) => (now >= end).then_some("product"),
+                                _ => (Instant::now() >= setup_deadline).then_some("setup"),
+                            };
+                            if let Some(expired) = expired {
+                                timeout_window = expired;
+                                break None;
+                            }
                             std::thread::sleep(Duration::from_millis(2))
                         }
-                        Ok(None) => break None,
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(error) => panic!("owned pump body observation: {error}"),
                     }
@@ -824,7 +905,7 @@ mod worker_parent {
                 // The body can create only /bin/true. Actual wait of that finite
                 // child is cleanup; elapsed time never supplies exit evidence.
                 let checkpoint = PhysicalDiagnostic::read();
-                let report = format!("timed_out={}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true, {}, {}",
+                let report = format!("timed_out={}, timeout_window={timeout_window}, body_success={}, adopted_reaped={adopted_reaped}, no_children=true, {}, {}",
                     status.is_none(), status.is_some_and(|s| s.success()), checkpoint.report(), timing_report(origin, observed, &checkpoint));
                 assert!(
                     report.len() <= PHYSICAL_REPORT_LIMIT,
@@ -873,16 +954,22 @@ mod worker_parent {
             other => panic!("unknown owned pump fixture stage: {other:?}"),
         }
         diagnostic.checkpoint("prepare", "none", started);
+        if std::env::var_os("QSH_TEST_PARENT_PHYSICAL_SETUP_DELAY").is_some() {
+            // Controlled slow setup: nothing is owned yet, and the worker
+            // budget below starts only after it.
+            std::thread::sleep(PHYSICAL_SETUP_DELAY);
+        }
         let view = crate::process_scope::prepare().unwrap();
         diagnostic.checkpoint("control-pair", "none", started);
         let (private, peer) = worker_control::pair().unwrap();
         diagnostic.checkpoint("spawn", "none", started);
         let process = Command::new("/bin/true").spawn().unwrap();
+        let worker_deadline = Instant::now() + PHYSICAL_WORKER_BUDGET;
         let owner = WorkerOwner::new(
             NonZeroU32::new(process.id()).unwrap(),
             view,
             private,
-            Instant::now() + Duration::from_secs(2),
+            worker_deadline,
         );
         let mut child = ChildOwner(process);
         diagnostic.checkpoint("worker-owner", "none", started);
@@ -900,6 +987,16 @@ mod worker_parent {
         drop(worker_channels);
         drop(worker_auth);
         diagnostic.checkpoint("pump", "none", started);
+        // A pump entered after the worker budget would test its timeout,
+        // not the missing receipt; that is checked after physical settlement.
+        let pump_in_budget = Instant::now() < worker_deadline;
+        if std::env::var_os("QSH_TEST_PARENT_PHYSICAL_PUMP_HOLD").is_some() {
+            // Controlled stalled pump: the worker owner and /bin/true remain
+            // owned until the supervisor performs actual cleanup.
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         let outcome = serve_owned(
             channels,
             auth,
@@ -921,8 +1018,15 @@ mod worker_parent {
         diagnostic.observations |= u8::from(reaped) << 1;
         diagnostic.checkpoint("assertions", "physical-wait", started);
         assert!(reaped, "return must follow the product's actual final wait");
+        diagnostic.checkpoint("assertions", "inner-budget", started);
+        assert!(pump_in_budget, "fixture setup reached the pump after the worker budget");
         diagnostic.checkpoint("assertions", "required-failure", started);
         assert!(outcome.first_failure.is_some());
+        diagnostic.checkpoint("assertions", "missing-receipt", started);
+        assert!(matches!(
+            outcome.worker_failure,
+            Some(crate::helper::worker_owner::WorkerFailure::MissingReceipt)
+        ));
         diagnostic.checkpoint("assertions", "no-receipt", started);
         assert!(!outcome.terminal_received);
         diagnostic.checkpoint("assertions", "no-signal-failure", started);

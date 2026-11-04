@@ -24,6 +24,10 @@ struct WorkerPhysicalOutcome {
     terminal_received: bool,
     native_exit: i32,
     requested: bool,
+    /// The worker owner's own first failure. `first_failure` belongs to the
+    /// whole parent and is often taken first by a seam end in the same pass.
+    #[cfg(test)]
+    worker_failure: Option<super::worker_owner::WorkerFailure>,
 }
 
 #[cfg(target_os = "linux")]
@@ -179,6 +183,8 @@ impl WorkerDomain {
             native_exit: self
                 .native_exit
                 .expect("settled worker retains exact native exit"),
+            #[cfg(test)]
+            worker_failure: self.owner.first_failure(),
         }
     }
 }

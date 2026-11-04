@@ -52,6 +52,7 @@ diagnostic_codes!(DiagnosticAssertion {
     Receive => "scope-response", Join => "helper-join", Receipt => "scope-receipt",
     MemberExit => "member-exit", EarlyPam => "no-early-pam-close", PamClosed => "pam-closed",
     Elapsed => "receipt-deadline", LeaderStatus => "leader-status", Deliberate => "deliberate-assertion",
+    FixtureIntervention => "fixture-intervention", ResidualChildren => "residual-children",
 });
 
 #[derive(Clone, Copy, Default)]
@@ -89,6 +90,8 @@ impl std::fmt::Debug for Diagnostic {
             .field("leader_cleanup_stop", &(self.cleanup_stops & 1 != 0))
             .field("member_cleanup_stop", &(self.cleanup_stops & 2 != 0))
             .field("monitor_cleanup_stop", &(self.cleanup_stops & 4 != 0))
+            .field("monitor_fixture_wait", &(self.cleanup_stops & 8 != 0))
+            .field("leader_fixture_wait", &(self.cleanup_stops & 16 != 0))
             .finish()
     }
 }
@@ -160,7 +163,8 @@ pub(crate) fn diagnostic_exit_code(code: Option<i32>) {
     });
 }
 // Cleanup updates cannot overwrite the phase/assertion that caused unwinding.
-// Bits identify fixture roles only: leader=1, member=2, monitor=4.
+// Bits identify fixture roles only: leader=1, member=2, monitor=4 are stops;
+// monitor=8 and leader=16 are consuming waits the fixture itself performed.
 pub(crate) fn diagnostic_cleanup_stops(bits: usize) {
     DIAGNOSTIC.with(|cell| {
         cell.set(Diagnostic {
@@ -263,6 +267,37 @@ fn wait_exact(fd: BorrowedFd<'_>) {
         );
     }
 }
+/// Non-consuming proof that this private body owns no child at all: every
+/// task's children list is empty and the kernel has no waitable child, exited
+/// or not. Nothing is waited or signaled, so a failed proof leaves every child
+/// to the final owned drain.
+pub(crate) fn owned_children_absent() -> bool {
+    assert_eq!(std::env::var(MODE).as_deref(), Ok("body"));
+    if !owned_child_census().is_empty() {
+        return false;
+    }
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            )
+        };
+        // Success, with or without an exited child, means a child exists.
+        if result == 0 {
+            return false;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ECHILD) => return true,
+            other => panic!("owned fixture child probe: {other:?}"),
+        }
+    }
+}
+
 /// Called only for a positively identified fixture member, after its parent
 /// has ended and this dedicated body has adopted it. No ECHILD shortcut.
 pub(crate) fn wait_expected(fd: BorrowedFd<'_>) {
@@ -316,23 +351,25 @@ struct Drain {
     adopted: usize,
     rescues: usize,
 }
+// As in the qualified adoption fixtures: include the libtest body's task,
+// not just /proc/self/task/<main>/children. Every child belongs to this case.
+fn owned_child_census() -> std::collections::BTreeSet<u32> {
+    let mut children = std::collections::BTreeSet::new();
+    for task in std::fs::read_dir("/proc/self/task").unwrap() {
+        let path = task.unwrap().path().join("children");
+        match std::fs::read_to_string(path) {
+            Ok(text) => children.extend(text.split_whitespace().map(|p| p.parse::<u32>().unwrap())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("owned fixture child census: {error}"),
+        }
+    }
+    children
+}
 fn drain_owned_children() -> Drain {
-    // As in the qualified adoption fixtures: include the libtest body's task,
-    // not just /proc/self/task/<main>/children. Every child belongs to this case.
     use std::os::fd::AsFd;
     let mut drain = Drain::default();
     loop {
-        let mut children = std::collections::BTreeSet::new();
-        for task in std::fs::read_dir("/proc/self/task").unwrap() {
-            let path = task.unwrap().path().join("children");
-            match std::fs::read_to_string(path) {
-                Ok(text) => {
-                    children.extend(text.split_whitespace().map(|p| p.parse::<u32>().unwrap()))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("owned fixture child census: {error}"),
-            }
-        }
+        let children = owned_child_census();
         if children.is_empty() {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let result = unsafe {
@@ -606,6 +643,35 @@ mod tests {
             std::panic::catch_unwind(|| write_report(&report_path, "x".repeat(REPORT_LIMIT + 1)));
         assert!(oversized.is_err());
         assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
+    }
+
+    #[test]
+    // The std handle is dropped unwaited: the exact pidfd wait below consumes it.
+    #[allow(clippy::zombie_processes)]
+    fn owned_child_probe_is_complete_and_non_consuming() {
+        use std::os::fd::AsFd;
+        const NAME: &str =
+            "test_borrowed_scope::tests::owned_child_probe_is_complete_and_non_consuming";
+        run_exact(NAME, 0, || {
+            assert!(owned_children_absent());
+            // Spawned from the libtest body thread, not the main task.
+            let running = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let running = pin(running.id());
+            assert!(!owned_children_absent(), "a running child is owned");
+            signal_kill(running.as_fd());
+            while !exited(running.as_fd()) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !owned_children_absent(),
+                "an exited, unwaited child is owned"
+            );
+            assert!(!owned_children_absent(), "the probe did not consume it");
+            // Still waitable: the probe neither waited nor released it.
+            wait_exact(running.as_fd());
+            assert!(owned_children_absent());
+        })
+        .assert_clean(0);
     }
 
     #[test]
