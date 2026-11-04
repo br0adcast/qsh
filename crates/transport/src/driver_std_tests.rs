@@ -2630,36 +2630,109 @@ struct KeystrokeRun {
 /// window to open.
 const BEFORE_THE_WINDOW_OPENS: Duration = Duration::from_millis(400);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadSchedule {
+    Unrestricted,
+    PauseAfterFive,
+}
+
+/// The fixture owns both threads until normal completion or unwind. The joined
+/// marker records an actual JoinHandle::join return, for the cleanup control.
+struct UploadProducer {
+    client: Arc<StdClient>,
+    producer: Option<thread::JoinHandle<usize>>,
+    pause_release: Option<mpsc::SyncSender<()>>,
+    paused: Option<mpsc::Receiver<usize>>,
+    progress: mpsc::Receiver<usize>,
+    joined: Arc<AtomicBool>,
+}
+
+impl UploadProducer {
+    fn start(client: Arc<StdClient>, schedule: UploadSchedule) -> Self {
+        let (progress_tx, progress) = mpsc::sync_channel(1);
+        let (paused_tx, paused) = mpsc::sync_channel(1);
+        let (pause_release, resume) = mpsc::sync_channel(1);
+        let producer_client = Arc::clone(&client);
+        let producer = thread::spawn(move || {
+            let image = vec![0x5au8; 2 * 1024 * 1024];
+            let mut handed = 0;
+            for chunk in image.chunks(64 * 1024) {
+                if producer_client
+                    .send_bytes_bounded(30, chunk.to_vec(), Duration::from_secs(30))
+                    .is_err()
+                {
+                    break;
+                }
+                handed += 1;
+                if handed == 8 {
+                    // One receipt for accepted handoffs, never ACKed bytes.
+                    let _ = progress_tx.send(handed);
+                }
+                if schedule == UploadSchedule::PauseAfterFive && handed == 5 {
+                    paused_tx
+                        .send(handed)
+                        .expect("the fixture receives the pause");
+                    resume
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("the fixture releases its producer");
+                }
+            }
+            handed
+        });
+        Self {
+            client,
+            producer: Some(producer),
+            pause_release: (schedule == UploadSchedule::PauseAfterFive).then_some(pause_release),
+            paused: (schedule == UploadSchedule::PauseAfterFive).then_some(paused),
+            progress,
+            joined: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn release_pause(&mut self) {
+        if let Some(release) = self.pause_release.take() {
+            let _ = release.try_send(());
+        }
+    }
+
+    fn finish(&mut self) -> usize {
+        self.client.detach();
+        self.release_pause();
+        let result = self.producer.take().expect("one owned producer").join();
+        self.joined.store(true, Ordering::SeqCst);
+        result.expect("the producer")
+    }
+}
+
+impl Drop for UploadProducer {
+    fn drop(&mut self) {
+        // Teardown must still release/join the producer if detach itself panics,
+        // and it must not turn an existing fixture panic into a double panic.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.client.detach()));
+        self.release_pause();
+        if let Some(producer) = self.producer.take() {
+            let _ = producer.join();
+            self.joined.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 /// A 2 MiB image pushed through `send_bytes_bounded` on stream 30 -- as
 /// the bulk class when `bulk` -- against a server that acknowledges
 /// nothing, and a keystroke on stream 16 as soon as the image's first
 /// segment arrives. The keystroke is waited for generously: the verdict
 /// is read off the server's clock, not off when this thread got to look.
 fn a_keystroke_during_an_upload(bulk: bool) -> KeystrokeRun {
-    const CHUNK: usize = 64 * 1024;
+    keystroke_upload(bulk, UploadSchedule::Unrestricted)
+}
+
+fn keystroke_upload(bulk: bool, schedule: UploadSchedule) -> KeystrokeRun {
     let (client, arrived) = crate::test_peer::client_whose_server_stops_acknowledging();
     if bulk {
         client.set_stream_class(30, StreamClass::Bulk);
     }
     let client = Arc::new(client);
-    let producer = {
-        let client = Arc::clone(&client);
-        thread::spawn(move || {
-            let image = vec![0x5au8; 2 * 1024 * 1024];
-            let mut handed = 0;
-            for chunk in image.chunks(CHUNK) {
-                if client
-                    .send_bytes_bounded(30, chunk.to_vec(), Duration::from_secs(30))
-                    .map_err(|rejected| rejected.reason)
-                    .is_err()
-                {
-                    break;
-                }
-                handed += 1;
-            }
-            handed
-        })
-    };
+    let mut producer = UploadProducer::start(Arc::clone(&client), schedule);
     let (stream, upload_at) = arrived
         .recv_timeout(Duration::from_secs(5))
         .expect("the upload's first segment arrives");
@@ -2675,14 +2748,92 @@ fn a_keystroke_during_an_upload(bulk: bool) -> KeystrokeRun {
             assert_eq!(stream, 16);
             at
         });
-    client.detach();
-    let handed = producer.join().expect("the producer");
+    // This fence follows the measurement; it cannot delay the keystroke.
+    let synchronization_end = Instant::now() + Duration::from_secs(5);
+    if let Some(paused) = &producer.paused {
+        assert_eq!(
+            paused
+                .recv_timeout(synchronization_end.saturating_duration_since(Instant::now()))
+                .expect("the actual producer pauses after five handoffs"),
+            5
+        );
+        assert!(!client.is_gone());
+        assert!(client.gates.gate(30, GateKind::Pipe).is_open());
+    }
+    producer.release_pause();
+    assert_eq!(
+        producer
+            .progress
+            .recv_timeout(synchronization_end.saturating_duration_since(Instant::now()))
+            .expect("eight successful upload handoffs before teardown"),
+        8
+    );
+    assert!(
+        !client.is_gone(),
+        "a dead client cannot establish a full live gate"
+    );
+    assert!(!client.gates.gate(30, GateKind::Pipe).is_open());
+    let handed = producer.finish();
     KeystrokeRun {
         upload_at,
         pressed_at,
         keystroke_at,
         handed,
     }
+}
+
+#[test]
+fn keystroke_upload_waits_for_delayed_producer_before_detach() {
+    let run = keystroke_upload(true, UploadSchedule::PauseAfterFive);
+    let at = run.keystroke_at.expect("the keystroke reached the server");
+    assert!(at < run.upload_at + BEFORE_THE_WINDOW_OPENS);
+    assert_eq!(run.handed, 8, "512 KiB handed over, then the gate shut");
+}
+
+#[test]
+fn keystroke_upload_failure_joins_owned_producer() {
+    let (client, _arrived) = crate::test_peer::client_whose_server_stops_acknowledging();
+    let client = Arc::new(client);
+    let mut producer = UploadProducer::start(Arc::clone(&client), UploadSchedule::PauseAfterFive);
+    let joined = Arc::clone(&producer.joined);
+    let (disconnected_tx, disconnected) = mpsc::sync_channel(1);
+    drop(disconnected_tx);
+    producer.progress = disconnected;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let owned = producer;
+        let synchronization_end = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            owned
+                .paused
+                .as_ref()
+                .expect("delayed producer")
+                .recv_timeout(synchronization_end.saturating_duration_since(Instant::now()))
+                .expect("the actual producer is paused"),
+            5
+        );
+        assert!(!owned.client.is_gone());
+        assert!(owned.client.gates.gate(30, GateKind::Pipe).is_open());
+        let receipt = owned
+            .progress
+            .recv_timeout(synchronization_end.saturating_duration_since(Instant::now()));
+        assert_eq!(receipt, Err(mpsc::RecvTimeoutError::Disconnected));
+        receipt.expect("intentionally disconnected fixture progress");
+    }));
+    let failure = failure.expect_err("the disconnected progress observation must fail");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("a fixture panic message");
+    assert!(message.contains("intentionally disconnected fixture progress"));
+    assert!(
+        client.is_gone(),
+        "the driver was joined before failure escaped"
+    );
+    assert!(
+        joined.load(Ordering::SeqCst),
+        "the producer was actually joined"
+    );
 }
 
 /// Spec §3.1 / §4.15: the image is the bulk class, so a keystroke typed
