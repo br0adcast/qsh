@@ -495,7 +495,7 @@ class PolicyContextTests(unittest.TestCase):
                     def capture(inner):b.assert_locked();b.point('module capture');return object()
                     def recheck(inner,value):b.point('module recheck')
                 yield View()
-            with self.patch.object(state,'production',return_value=slot),self.patch.object(registry,'production',return_value=__import__('types').SimpleNamespace(inspection=b.registry)),self.patch.object(transaction,'production',side_effect=lambda paths:engine),self.patch.object(modules,'production_observer',side_effect=module_scope),self.patch.object(queries,'required_observation',side_effect=lambda api:b.window()),self.patch.object(native,'SelinuxApi',return_value=object()),self.patch.object(files,'production',side_effect=AssertionError('deployed files forbidden')):
+            with self.patch.object(state,'production',return_value=slot),self.patch.object(registry,'production',return_value=__import__('types').SimpleNamespace(inspection=lambda: b.registry(deadline=None))),self.patch.object(transaction,'production',side_effect=lambda paths:engine),self.patch.object(modules,'production_observer',side_effect=module_scope),self.patch.object(queries,'required_observation',side_effect=lambda api:b.window()),self.patch.object(native,'SelinuxApi',return_value=object()),self.patch.object(files,'production',side_effect=AssertionError('deployed files forbidden')):
                 yield b,trust,binding,engine,slot
 
     def test_real_temp_complete_binding_and_all_three_lock_exclusions(self):

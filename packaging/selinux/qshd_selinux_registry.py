@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import posixpath
@@ -122,7 +123,7 @@ class Registry(SafeFiles):
         self._active = False
 
     @contextmanager
-    def inspection(self):
+    def inspection(self, *, deadline=None):
         """No context lock: caller orders package lock, routing, context, status.
 
         Sixty-second total includes setup, all commands, capture and final
@@ -131,14 +132,26 @@ class Registry(SafeFiles):
         if self._active:
             _fail('REGISTRY_ACTIVE')
         started = self._clock()
+        if deadline is not None:
+            try:
+                valid = type(deadline) in (int, float) and math.isfinite(deadline)
+            except OverflowError:
+                valid = False
+            if not valid:
+                _fail('REGISTRY_DEADLINE')
+        end = started + 60 if deadline is None else min(started + 60, deadline)
+        if self._clock() >= end:
+            _fail('REGISTRY_DEADLINE')
         self._active = True
         lease = None
         try:
             self._context_fd = self._directory(self.contexts)
             self._users_fd = self._directory(self.contexts / 'users')
-            lease = _Lease(self, started)
+            lease = _Lease(self, end)
             lease._check()
             yield lease
+            if self._clock() >= end:
+                _fail('REGISTRY_DEADLINE')
         except OSError:
             raise RegistryError('REGISTRY_FILESYSTEM') from None
         finally:
@@ -156,6 +169,8 @@ class Registry(SafeFiles):
             finally:
                 self.anchors, self.routes = [], []
                 self._active = False
+            if phase_error is None and self._clock() >= end:
+                _fail('REGISTRY_DEADLINE')
             if cleanup_failed:
                 if phase_error is not None:
                     phase_error.add_note('REGISTRY_CLEANUP')
@@ -191,15 +206,15 @@ class Registry(SafeFiles):
 
 
 class _Lease:
-    def __init__(self, files, started):
-        self._files, self._started = files, started
+    def __init__(self, files, end):
+        self._files, self._end = files, end
         self._active, self._failed = True, False
         self._routing, self._baseline = None, None
 
     def _check(self):
         if not self._active or self._failed:
             _fail('REGISTRY_CLOSED')
-        if self._files._clock() - self._started >= 60:
+        if self._files._clock() >= self._end:
             self._failed = True
             _fail('REGISTRY_DEADLINE')
 
@@ -209,7 +224,7 @@ class _Lease:
             # The shared trusted RPM owner enforces its five-second command
             # profile and combined output cap; no shell or dynamic command API.
             output = self._files._owner._run(tuple(argv), str(self._files.contexts),
-                                                  deadline=self._started + 60)
+                                                  deadline=self._end)
         except Exception:
             raise RegistryError('RPM_COMMAND') from None
         self._check()

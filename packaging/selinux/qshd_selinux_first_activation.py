@@ -48,9 +48,9 @@ class _Production:
     def activation(self):
         from qshd_selinux_activation_state import production
         return production().writer()
-    def registry(self):
+    def registry(self, *, deadline):
         from qshd_selinux_registry import production
-        return production().inspection()
+        return production().inspection(deadline=deadline)
     def contexts(self,paths):
         from qshd_selinux_transaction import production
         return production(paths).writer()
@@ -153,7 +153,7 @@ class _Coordinator:
         # independently gated their permitted initial slot state.
         b=self._bindings
         self._stage='ROUTING';self._check(60)
-        with b.registry() as registry:
+        with b.registry(deadline=self._end) as registry:
             routing=registry.routing()
         if type(routing) is not bytes or len(routing)>1024**2:raise CoordinatorError('ROUTING')
         identities=json.loads(routing)
@@ -173,7 +173,7 @@ class _Coordinator:
             self._check()
             self._stage='RECONCILE';writer.reconcile(identities);self._check(60)
             self._stage='OBSERVATION'
-            with b.registry() as registry:
+            with b.registry(deadline=self._end) as registry:
                 if registry.routing()!=routing:raise CoordinatorError('ROUTING_DRIFT')
                 with writer.inspection(identities) as contexts:
                     with b.modules(trust) as modules:

@@ -128,7 +128,8 @@ class Bindings:
                 yield writer
 
     @contextmanager
-    def registry(self):
+    def registry(self, *, deadline):
+        self.registry_deadlines=getattr(self,'registry_deadlines',[])+[deadline]
         binding=self
         class Registry:
             def routing(self):binding.point('routing');return binding.routing
@@ -208,6 +209,19 @@ class ConsumerTests(unittest.TestCase):
         self.addCleanup(lambda:self.assertEqual(set(os.listdir('/proc/self/fd')),self.fd_before))
 
     def coordinator(self):return consumer._Coordinator(self.b,clock=lambda:self.b.now)
+
+    def test_registry_forwards_original_effective_end(self):
+        self.b.installed_files();self.b.matching_pending()
+        self.coordinator().finalize_installed_owned_pending_consumer(deadline=290)
+        self.assertTrue(self.b.registry_deadlines)
+        self.assertEqual(set(self.b.registry_deadlines),{290})
+
+    def test_production_registry_requires_and_forwards_deadline(self):
+        from unittest.mock import Mock
+        value=Mock();sentinel=object();value.inspection.return_value=sentinel
+        with patch('qshd_selinux_registry.production',return_value=value):
+            self.assertIs(consumer._Production().registry(deadline=290),sentinel)
+        value.inspection.assert_called_once_with(deadline=290)
 
     def test_fresh_pre_real_state_one_lease_child_before_writer(self):
         initial=self.b.record();result=self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
