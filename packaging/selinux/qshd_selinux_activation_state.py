@@ -151,7 +151,7 @@ class _Writer:
             self._phase = 'completing'
             complete = _parse(document, 'COMPLETE')
             pending = self._pending.observation.record
-            fields = ('schema', 'profile', 'abi', 'query_profile', 'operation_id', 'artifact', 'module')
+            fields = ('schema', 'profile', 'abi', 'query_profile', 'operation_id', 'artifact', 'modules', 'intent')
             if any(getattr(complete, key) != getattr(pending, key) for key in fields):
                 raise SlotError('HEADER_MISMATCH')
             try:

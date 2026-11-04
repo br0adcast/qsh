@@ -230,44 +230,50 @@ def observe_managed_prestart(trusted_artifact,expected_pam,*,deadline=None,_star
     except OSError:_fail('CHILD_REFUSED')
 
 
+@contextmanager
+def _required(bindings):
+    # Exactly one owner; every query/file/retained operation borrows its token.
+    with bindings.window() as status:
+        api=status.require_open()
+        with bindings.queries(status):
+            if status.require_open() is not api:_fail('STATUS_BINDING')
+            yield status
+            if status.require_open() is not api:_fail('STATUS_BINDING')
+
+
 def _compose(trust,pam,*,deadline):
-    # Imports instantiate no policy engine until the explicit child mode runs.
-    import qshd_selinux_activation_state as state
-    import qshd_selinux_registry as registry_module
-    import qshd_selinux_transaction as transaction
-    import qshd_selinux_module_observer as modules
-    import qshd_selinux_files as files
-    import qshd_selinux_queries as queries
-    from qshd_selinux_api import SelinuxApi
-    api=SelinuxApi()
-    pending=False
-    with _within(state.production().inspection(),deadline) as slot:
-        with _within(registry_module.production().inspection(),deadline) as registry:
-            routing=registry.routing()
-            identities=json.loads(routing,object_pairs_hook=_pairs)
-            with _within(transaction.production(list(identities)).inspection(identities),deadline) as contexts:
-                with _within(modules.production_observer(trust,deadline=deadline),deadline) as module:
-                    with _within(files.production(pam,api).inspection(),deadline) as current_files:
-                        with _within(queries.required_observation(api),deadline):
-                            activation=slot.capture()
-                            discovered=registry.capture()
-                            context=contexts.capture()
-                            selected=module.capture()
-                            installed=current_files.capture()
-                            if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
-                                _fail('REGISTRY_BINDING')
-                            binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
-                            try:require_complete(activation.record,trust,binding)
-                            except ActivationError as error:
-                                if str(error)!='ACTIVATION_PENDING':raise
-                                pending=True
-                            slot.recheck(activation)
-                            module.recheck(selected)
-                            current_files.recheck(installed)
-                            registry.recheck(discovered)
-                            contexts.recheck(context)
-    # Deferred refusal lets native post-yield checks and every finalizer run
-    # normally. Any failure there supersedes the selected pending diagnostic.
+    from qshd_selinux_first_activation import RuntimeBindings
+    bindings=RuntimeBindings();pending=False
+    with _within(bindings.retained(deadline=deadline),deadline) as labels:
+        with _within(bindings.slot_object().inspection(),deadline) as slot:
+            with _within(bindings.registry(),deadline) as registry:
+                routing=registry.routing()
+                identities=json.loads(routing,object_pairs_hook=_pairs)
+                with _within(bindings.context_inspection(list(identities),identities),deadline) as contexts:
+                    with _within(bindings.modules(trust,deadline=deadline),deadline) as module:
+                        with _within(_required(bindings),deadline) as status:
+                            with _within(bindings.files(pam,status=status),deadline) as current_files:
+                                label_token=labels.capture(status=status)
+                                activation=slot.capture()
+                                discovered=registry.capture()
+                                context=contexts.capture()
+                                selected=module.capture()
+                                installed=current_files.capture()
+                                if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
+                                    _fail('REGISTRY_BINDING')
+                                binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
+                                try:require_complete(activation.record,trust,binding)
+                                except ActivationError as error:
+                                    if str(error)!='ACTIVATION_PENDING':raise
+                                    pending=True
+                                slot.recheck(activation)
+                                module.recheck(selected)
+                                current_files.recheck(installed)
+                                registry.recheck(discovered)
+                                contexts.recheck(context)
+                                labels.recheck(label_token,status=status)
+    # Pending is selected only after every borrowed proof and native owner
+    # normally close, including held retained descriptors and outer views.
     _check(deadline)
     if pending:raise _PendingRefusal()
     return binding
@@ -427,39 +433,33 @@ def _observe_policy_context(trusted_artifact,*,deadline=None,_started=None):
     except OSError:_fail('CHILD_REFUSED')
 
 def _compose_policy_context(trust,*,deadline):
-    # Imports instantiate no policy engine until the explicit child mode runs.
-    import qshd_selinux_activation_state as state
-    import qshd_selinux_registry as registry_module
-    import qshd_selinux_transaction as transaction
-    import qshd_selinux_module_observer as modules
-    import qshd_selinux_queries as queries
-    from qshd_selinux_api import SelinuxApi
-    api=SelinuxApi()
-    pending=False
-    with _within(state.production().inspection(),deadline) as slot:
-        with _within(registry_module.production().inspection(),deadline) as registry:
-            routing=registry.routing()
-            identities=json.loads(routing,object_pairs_hook=_pairs)
-            with _within(transaction.production(list(identities)).inspection(identities),deadline) as contexts:
-                with _within(modules.production_observer(trust,deadline=deadline),deadline) as module:
-                    with _within(queries.required_observation(api),deadline):
-                        activation=slot.capture()
-                        discovered=registry.capture()
-                        context=contexts.capture()
-                        selected=module.capture()
-                        if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
-                            _fail('REGISTRY_BINDING')
-                        binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
-                        try:require_complete(activation.record,trust,binding)
-                        except ActivationError as error:
-                            if str(error)!='ACTIVATION_PENDING':raise
-                            pending=True
-                        slot.recheck(activation)
-                        module.recheck(selected)
-                        registry.recheck(discovered)
-                        contexts.recheck(context)
-    # Deferred refusal lets native post-yield checks and every finalizer run
-    # normally. Any failure there supersedes the selected pending diagnostic.
+    from qshd_selinux_first_activation import RuntimeBindings
+    bindings=RuntimeBindings();pending=False
+    with _within(bindings.retained(deadline=deadline),deadline) as labels:
+        with _within(bindings.slot_object().inspection(),deadline) as slot:
+            with _within(bindings.registry(),deadline) as registry:
+                routing=registry.routing()
+                identities=json.loads(routing,object_pairs_hook=_pairs)
+                with _within(bindings.context_inspection(list(identities),identities),deadline) as contexts:
+                    with _within(bindings.modules(trust,deadline=deadline),deadline) as module:
+                        with _within(_required(bindings),deadline) as status:
+                            label_token=labels.capture(status=status)
+                            activation=slot.capture()
+                            discovered=registry.capture()
+                            context=contexts.capture()
+                            selected=module.capture()
+                            if discovered.registry_bytes!=routing or context.registry_bytes!=routing:
+                                _fail('REGISTRY_BINDING')
+                            binding=ContextBinding(context.registry_sha256,context.receipts_sha256)
+                            try:require_complete(activation.record,trust,binding)
+                            except ActivationError as error:
+                                if str(error)!='ACTIVATION_PENDING':raise
+                                pending=True
+                            slot.recheck(activation)
+                            module.recheck(selected)
+                            registry.recheck(discovered)
+                            contexts.recheck(context)
+                            labels.recheck(label_token,status=status)
     _check(deadline)
     if pending:raise _PendingRefusal()
     return binding

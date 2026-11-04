@@ -20,13 +20,13 @@ import sys
 
 _MODULES=tuple('qshd_selinux_'+name for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
-    'process','modules','module_observer','api','queries','files','observer',
+    'process','modules','module_observer','api','queries','files','retained_labels','observer',
     'reference_loader','package_state','module_install','first_activation',
     'consumer_activation','phase','rpm_query'))+('stop_guard',)
-_PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
+_PHASES={'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE','provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
          'consumer-pre-installed':'PENDING','consumer-post-owned':'COMPLETE',
          'consumer-preun-final':'PENDING'}
-_INTENTS={'provider-post-pristine':'provider-fresh','consumer-pre-fresh':'consumer-install',
+_INTENTS={'provider-pre-owned':'provider-refresh','provider-post-owned':'provider-refresh','provider-post-pristine':'provider-fresh','consumer-pre-fresh':'consumer-install',
           'consumer-pre-installed':'consumer-install','consumer-post-owned':'consumer-install',
           'consumer-preun-final':'consumer-erase'}
 _SCRIPT='/usr/libexec/qshd-selinux/qshd_selinux_phase.py'
@@ -75,20 +75,53 @@ def _install_loader():
     sys.meta_path.insert(0,_FixedFinder(root))
 
 
-def _request(phase):
+def _artifact(value):
+    from qshd_selinux_activation import TrustedArtifact
+    if (type(value) is not dict or set(value)!=
+            {'provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256'}):
+        raise PhaseError('REQUEST')
+    return TrustedArtifact(**value)
+
+
+def _request(phase,incoming_artifact=None):
     if type(phase) is not str or phase not in _PHASES:raise PhaseError('PHASE')
-    return _json(dict(schema=2,phase=phase))
+    value=dict(schema=2,phase=phase)
+    if phase=='provider-pre-owned':
+        from dataclasses import asdict
+        from qshd_selinux_activation import TrustedArtifact
+        if type(incoming_artifact) is not TrustedArtifact:raise PhaseError('REQUEST')
+        try:incoming_artifact.__post_init__()
+        except (ValueError,TypeError):raise PhaseError('REQUEST') from None
+        value['artifact']=asdict(incoming_artifact)
+    elif incoming_artifact is not None:raise PhaseError('REQUEST')
+    raw=_json(value)
+    if len(raw)>1024:raise PhaseError('REQUEST')
+    return raw
 
 
 def _parse_request(raw):
-    if type(raw) is not bytes or not 0<len(raw)<=256:raise PhaseError('REQUEST')
+    if type(raw) is not bytes or not 0<len(raw)<=1024:raise PhaseError('REQUEST')
     try:
         value=json.loads(raw,object_pairs_hook=_pairs)
-        if (type(value) is not dict or set(value)!={'schema','phase'}
-                or type(value['schema']) is not int or value['schema']!=2
-                or _request(value['phase'])!=raw):raise PhaseError('REQUEST')
+        if (type(value) is not dict or type(value.get('schema')) is not int
+                or value['schema']!=2 or type(value.get('phase')) is not str):raise PhaseError('REQUEST')
+        incoming=None
+        if value['phase']=='provider-pre-owned':
+            if set(value)!={'schema','phase','artifact'}:raise PhaseError('REQUEST')
+            incoming=_artifact(value['artifact'])
+        elif set(value)!={'schema','phase'}:raise PhaseError('REQUEST')
+        if _request(value['phase'],incoming)!=raw:raise PhaseError('REQUEST')
         return value
-    except (ValueError,TypeError,RecursionError):raise PhaseError('REQUEST') from None
+    except (ValueError,TypeError,RecursionError,UnicodeError):raise PhaseError('REQUEST') from None
+
+
+def _incoming_argument(raw):
+    if type(raw) is not str or not 0<len(raw)<=1024:raise PhaseError('ARGUMENTS')
+    try:
+        data=raw.encode('ascii');value=json.loads(data,object_pairs_hook=_pairs)
+        if _json(value)!=data:raise PhaseError('ARGUMENTS')
+        return _artifact(value)
+    except (ValueError,TypeError,RecursionError,UnicodeError):raise PhaseError('ARGUMENTS') from None
 
 
 def _parse_response(raw,request):
@@ -107,6 +140,8 @@ def _parse_response(raw,request):
                    {'provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256'}
                 or _json(value)+b'\n'!=raw):raise PhaseError('RESPONSE')
         TrustedArtifact(**value['artifact'])
+        if expected['phase']=='provider-pre-owned' and value['artifact']!=expected['artifact']:
+            raise PhaseError('RESPONSE')
         return value
     except (ValueError,TypeError,RecursionError,UnicodeError):raise PhaseError('RESPONSE') from None
 
@@ -215,12 +250,17 @@ def _resources(*,configure):
     _preconditions()
 
 
-def _dispatch(phase,*,deadline):
-    _request(phase)
+def _dispatch(phase,*,deadline,incoming_artifact=None):
+    _request(phase,incoming_artifact)
+    if phase=='provider-pre-owned':
+        from qshd_selinux_first_activation import invalidate_installed_provider_upgrade
+        return invalidate_installed_provider_upgrade(incoming_artifact,deadline=deadline)
+    if phase=='provider-post-owned':
+        from qshd_selinux_first_activation import activate_installed_owned_provider
+        return activate_installed_owned_provider(deadline=deadline)
     import qshd_selinux_consumer_activation as consumer
     if phase=='provider-post-pristine':
         from qshd_selinux_first_activation import activate_installed_pristine_pending_first
-        consumer._Production().guard(deadline)
         return activate_installed_pristine_pending_first(deadline=deadline)
     if phase in ('consumer-pre-fresh','consumer-pre-installed'):
         return consumer.invalidate_installed_consumer_pre(fresh=phase=='consumer-pre-fresh',deadline=deadline)
@@ -240,7 +280,7 @@ def _owner():
 def _child_main(args):
     if len(args)!=3:raise PhaseError('ARGUMENTS')
     try:
-        request=args[0].encode('ascii');_parse_request(request)
+        request=args[0].encode('ascii');parsed=_parse_request(request)
         started=float(args[1]);work_end=float(args[2]);now=time.monotonic()
         if (not math.isfinite(started) or not math.isfinite(work_end)
                 or started<0 or started>now or work_end!=started+430 or now>=work_end):
@@ -248,7 +288,9 @@ def _child_main(args):
     except (ValueError,UnicodeError):raise PhaseError('ARGUMENTS') from None
     _resources(configure=False)
     if time.monotonic()>=work_end:raise PhaseError('DEADLINE')
-    try:record=_dispatch(_parse_request(request)['phase'],deadline=work_end)
+    dispatch_args=dict(deadline=work_end)
+    if parsed['phase']=='provider-pre-owned':dispatch_args['incoming_artifact']=_artifact(parsed['artifact'])
+    try:record=_dispatch(parsed['phase'],**dispatch_args)
     except BaseException as error:
         if not isinstance(error,Exception):raise
         raw=_failure(error,request)
@@ -261,8 +303,8 @@ def _child_main(args):
     return 0
 
 
-def _parent(phase,started):
-    request=_request(phase);_resources(configure=True)
+def _parent(phase,started,*,incoming_artifact=None):
+    request=_request(phase,incoming_artifact);_resources(configure=True)
     handlers={}
     try:
         def interrupted(signum,frame):raise _Interrupted()
@@ -304,10 +346,15 @@ def main():
         args=sys.argv[1:]
         if args and args[0]==_CHILD:
             if len(args)!=4:raise PhaseError('ARGUMENTS')
-            _parse_request(args[1].encode('ascii'));_install_loader()
+            _install_loader();_parse_request(args[1].encode('ascii'))
             return _child_main(args[1:])
-        if len(args)!=1:raise PhaseError('ARGUMENTS')
-        _request(args[0]);_install_loader()
+        if not args or args[0] not in _PHASES:raise PhaseError('ARGUMENTS')
+        if len(args)!=(2 if args[0]=='provider-pre-owned' else 1):raise PhaseError('ARGUMENTS')
+        _install_loader()
+        if args[0]=='provider-pre-owned':
+            incoming=_incoming_argument(args[1]);_request(args[0],incoming)
+            return _parent(args[0],started,incoming_artifact=incoming)
+        _request(args[0])
         return _parent(args[0],started)
     except BaseException:
         sys.stderr.write('PHASE_REFUSED\n');return 1

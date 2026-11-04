@@ -233,6 +233,26 @@ class OwnedReloadTests(unittest.TestCase):
         with self.assertRaises(m.InstallError):item.reload(deadline=530)
 
 
+    def test_old_check_runs_once_inside_six_call_window_and_refuses_before_scratch(self):
+        for fault in ('none','return','raise','drift'):
+            with self.subTest(fault=fault):
+                item=self.reloader();seen=[]
+                def check(status):
+                    self.assertEqual(len(self.observations),6)
+                    self.assertTrue(self.status.mapped)
+                    seen.append(status);status.require_open()
+                    if fault=='return':return True
+                    if fault=='raise':raise ValueError('controlled old proof refusal')
+                    if fault=='drift':self.status.counter+=1
+                if fault=='none':
+                    item.reload(deadline=530,old_check=check)
+                    seen[0].require_closed();self.assertEqual(len(self.calls),1)
+                    self.calls=[]
+                else:
+                    with self.assertRaises(Exception):item.reload(deadline=530,old_check=check)
+                    self.assertEqual(self.calls,[]);self.assertIsNone(item._scratch)
+                self.assertEqual(len(seen),1)
+
     def test_native_policy_drift_refuses_old_pair_before_scratch_or_load(self):
         item = self.reloader()
         def drift(operation, cwd, owner):

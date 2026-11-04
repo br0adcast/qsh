@@ -114,6 +114,136 @@ class FixtureTests(unittest.TestCase):
             def check_context(self,text):outer.m._context(text)
         return Api()
 
+    def borrowed_api(self):
+        import qshd_selinux_api as native
+        from scripts.tests.test_selinux_api import SharedStatus
+        shared=SharedStatus();owner=native.SelinuxApi(shared.library());fake=self.api()
+        for name in ('file_defaults','file_context','check_context'):
+            setattr(owner,name,getattr(fake,name))
+        return owner,shared
+
+    def test_managed_readonly_borrows_one_owner_and_rechecks_across_windows(self):
+        owner,shared=self.borrowed_api()
+        with self.factory.managed_inspection(deadline=120) as scope:
+            with owner.status_observation() as status:
+                token=scope.capture(status=status);scope.recheck(token,status=status)
+                self.assertEqual(shared.events,['open','updated'])
+            with owner.status_observation() as status:
+                scope.recheck(token,status=status)
+        self.assertEqual(shared.events,['open','updated','updated','close']*2)
+        self.assertEqual(self.set_count,0)
+
+    def test_managed_requires_final_owner_closed_and_exact_observation(self):
+        from dataclasses import replace
+        for fault in ('open','copied','drift','wrong-status'):
+            with self.subTest(fault=fault):
+                self.factory=self.make_factory();owner,shared=self.borrowed_api()
+                with self.assertRaises(self.m.RetainedLabelError):
+                    with owner.status_observation() as status:
+                        with self.factory.managed_inspection(deadline=120) as scope:
+                            token=scope.capture(status=status)
+                            if fault=='copied':token=replace(token)
+                            if fault=='drift':self.labels[self.key(scope._objects['/etc/qshd'])]=b'bad'
+                            scope.recheck(token,status=object() if fault=='wrong-status' else status)
+                self.assertEqual(self.set_count,0)
+                for path,kind,role,label in self.m._ITEMS:
+                    physical=self.root/path[1:];self.labels[(physical.stat().st_dev,physical.stat().st_ino)]=label.encode()+b'\0'
+
+    def test_pristine_install_validates_all_targets_before_setting_and_preserves_files(self):
+        owner,shared=self.borrowed_api();self.after=True
+        for key in self.labels:self.labels[key]=b'system_u:object_r:etc_t:s0\0'
+        original_lookup=owner.file_defaults
+        from contextlib import contextmanager
+        @contextmanager
+        def defaults():
+            with original_lookup() as view:
+                class Defaults:
+                    def lookup(inner,path,kind):
+                        if not loaded[0]:return 'system_u:object_r:etc_t:s0'
+                        return next(row[3] for row in self.m._ITEMS if row[0]==path)
+                yield Defaults()
+        owner.file_defaults=defaults;loaded=[False]
+        # Translation uses the same raw-label mapping before and after load.
+        owner.file_context=lambda fd:self.labels[self.key(fd)].removesuffix(b'\0').decode()
+        with self.factory.pristine_install(deadline=120) as scope:
+            with owner.status_observation() as status:
+                token=scope.capture_defaults(status=status);scope.recheck_defaults(token,status=status)
+            loaded[0]=True
+            with owner.status_observation() as status:
+                result=scope.apply_managed(token,status=status)
+                scope.recheck_managed(result,status=status)
+        self.assertEqual(self.set_count,7)
+        self.assertEqual(shared.events,['open','updated','updated','close']*2)
+        self.assertTrue(all(self.m._Inspection._preserved(a.metadata,b.metadata) for a,b in zip(token.paths,result.paths)))
+        self.assertEqual((self.root/'etc/qshd/host_key').read_bytes(),b'k'*64)
+
+    def test_borrowed_managed_absent_and_mixed_inventory_never_creates_or_sets(self):
+        for mode in ('mixed','absent'):
+            with self.subTest(mode=mode):
+                for path in ('var/log/qshd/qshd.log','var/log/qshd/qshd.log.1'):
+                    physical=self.root/path
+                    if physical.exists():physical.unlink()
+                if mode=='absent':
+                    for path in ('etc/qshd/host_key','run/qshd/helper-status.sock.lock'):(self.root/path).unlink()
+                    for path in ('etc/qshd','var/log/qshd','run/qshd'):(self.root/path).rmdir()
+                owner,shared=self.borrowed_api();self.factory=self.make_factory()
+                with self.factory.managed_inspection(deadline=120) as scope:
+                    with owner.status_observation() as status:
+                        token=scope.capture(status=status);scope.recheck(token,status=status)
+                self.assertEqual(sum(item.present for item in token.paths),5 if mode=='mixed' else 0)
+                self.assertEqual(self.set_count,0)
+
+    def test_pristine_custom_unlabeled_and_missing_raw_labels_refuse_before_setter(self):
+        for raw in (b'system_u:object_r:unlabeled_t:s0',b'system_u:object_r:custom_t:s0',b''):
+            with self.subTest(raw_kind=len(raw)):
+                self.factory=self.make_factory();owner,shared=self.borrowed_api();self.after=True
+                for key in self.labels:self.labels[key]=raw
+                with self.assertRaises(self.m.RetainedLabelError):
+                    with self.factory.pristine_install(deadline=120) as scope:
+                        with owner.status_observation() as status:scope.capture_defaults(status=status)
+                self.assertEqual(self.set_count,0)
+
+    def test_managed_rejects_foreign_closed_or_unissued_status_without_opening_native(self):
+        import copy
+        import qshd_selinux_api as native
+        owner,shared=self.borrowed_api()
+        with owner.status_observation() as status:pass
+        for candidate in (status,object(),native._StatusToken(status._record)):
+            self.factory=self.make_factory();before=list(shared.events)
+            with self.assertRaises(self.m.RetainedLabelError):
+                with self.factory.managed_inspection(deadline=120) as scope:scope.capture(status=candidate)
+            self.assertEqual(shared.events,before)
+
+    def test_pristine_complete_target_vector_and_setter_failures_are_causal(self):
+        for fault in ('last-target','setter','evm','readback','close'):
+            with self.subTest(fault=fault):
+                self.factory=self.make_factory();self.after=True;self.set_count=0;self.extra={}
+                self.fail_set=1 if fault=='setter' else None;self.evm=fault=='evm'
+                for key in self.labels:self.labels[key]=b'system_u:object_r:etc_t:s0\0'
+                owner,shared=self.borrowed_api();loaded=[False]
+                @contextmanager
+                def defaults():
+                    class Defaults:
+                        def lookup(inner,path,kind):
+                            if not loaded[0]:return 'system_u:object_r:etc_t:s0'
+                            if fault=='last-target' and path==self.m._ITEMS[-1][0]:return 'system_u:object_r:custom_t:s0'
+                            return next(row[3] for row in self.m._ITEMS if row[0]==path)
+                    yield Defaults()
+                owner.file_defaults=defaults
+                owner.file_context=lambda fd:self.labels[self.key(fd)].removesuffix(b'\0').decode()
+                expected=self.m.RetainedLabelError if fault=='last-target' else self.m.RetainedLabelOutcomeUncertain
+                with self.assertRaises(expected):
+                    with self.factory.pristine_install(deadline=120) as scope:
+                        with owner.status_observation() as status:
+                            token=scope.capture_defaults(status=status);scope.recheck_defaults(token,status=status)
+                        loaded[0]=True
+                        with owner.status_observation() as status:
+                            result=scope.apply_managed(token,status=status)
+                            if fault=='readback':self.labels[self.key(scope._objects['/etc/qshd'])]=b'bad'
+                            scope.recheck_managed(result,status=status)
+                            if fault=='close':shared.counter+=1
+                self.assertEqual(self.set_count,0 if fault=='last-target' else 1 if fault in ('setter','evm') else 7)
+
     def ready(self,scope):
         observed=scope.capture();scope.recheck_before_removal(observed);self.after=True;return observed
 

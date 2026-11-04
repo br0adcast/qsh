@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from scripts.tests.test_selinux_module_install import natural_outcome
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'packaging/selinux'))
 import qshd_selinux_activation as model
@@ -27,6 +28,7 @@ from qshd_selinux_modules import HllIdentity
 import qshd_selinux_consumer_activation as consumer
 
 PP=b'explicit synthetic consumer policy; never loaded'
+CONTEXTS_PP=b'explicit synthetic consumer contexts policy; never loaded'
 ROOT=Path(__file__).resolve().parents[2]
 
 
@@ -48,11 +50,12 @@ class Bindings:
         spec=importlib.util.spec_from_file_location('consumer_fixture_builder',ROOT/'packaging/selinux/assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
         source=ROOT/'packaging/selinux';pp=root/'qshd.pp';pp.write_bytes(PP)
+        contexts_pp=root/'qshd_contexts.pp';contexts_pp.write_bytes(CONTEXTS_PP)
         artifact=source/'artifact.json';pam=ROOT/'packaging/pam.d/qshd.fedora-selinux'
         expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in builder.MODULES}
-        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,artifact,pam)})
-        self.provider=root/'provider';builder.assemble_payload(source,pp,artifact,pam,expected,self.provider,1000000000)
-        self.trust=model.TrustedArtifact('0.2.0',expected['artifact.json'],expected['qshd.pp'])
+        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,contexts_pp,artifact,pam)})
+        self.provider=root/'provider';builder.assemble_payload(source,pp,contexts_pp,artifact,pam,expected,self.provider,1000000000)
+        self.trust=model.TrustedArtifact(json.loads(artifact.read_bytes())['policy_version'],expected['artifact.json'],expected['qshd.pp'],expected['qshd_contexts.pp'])
         # Fixture-owned state setup, never a production phase or policy claim.
         with self.package_object().initialize():
             with self.transaction_object().writer() as writer:writer.reconcile(self.identities)
@@ -62,8 +65,9 @@ class Bindings:
                 with self.transaction_object().inspection(self.identities) as reader:
                     view=reader.capture();reader.recheck(view)
                 binding=model.ContextBinding(view.registry_sha256,view.receipts_sha256)
-                complete=replace(pending,state='COMPLETE',completion=model.Completion('normal-install-reload-v1',self.trust.pp_sha256,binding))
+                complete=replace(pending,state='COMPLETE',completion=model.Completion('normal-pair-install-reload-v2',model.PairDigests(self.trust.core_pp_sha256,self.trust.contexts_pp_sha256),binding))
                 writer.publish_complete(canonical(asdict(complete)),token,trusted_artifact=self.trust,trusted_context_binding=binding)
+        (root/'var/run').symlink_to('../run')
         self.events=[];self.phase_active=True
 
     def point(self,name):
@@ -75,7 +79,13 @@ class Bindings:
     def package_object(self):return package.PackageState(self.common,uid=os.getuid(),anchor=self.root)
     def slot_object(self):return slot.ActivationSlot(self.common/'selinux-activation',uid=os.getuid(),anchor=self.root,hook=self.slot_hook)
     def transaction_object(self):return transaction.Transaction(self.common/'selinux-contexts',{'/context':self.target},uid=os.getuid(),anchor=self.root)
-    def record_value(self,state,operation):return model.Activation(1,state,operation,'fedora44-targeted-v1',1,1,self.trust,model.ModuleIdentity('qshd',400,'targeted','pp'),None)
+    def record_value(self,state,operation):
+        from qshd_selinux_first_activation import _pending
+        if getattr(self,'phase_active',False):
+            prior=self.record()
+            completion=prior.completion if prior.state=='COMPLETE' else prior.basis.completion
+            return replace(_pending(self.trust,'consumer-install',model.HistoricalBasis(self.trust,completion)),operation_id=operation)
+        return replace(_pending(self.trust,'provider-fresh'),operation_id=operation)
     def record(self):return model.parse_activation((self.common/'selinux-activation/activation.json').read_bytes())
 
     def busy(self,path):
@@ -142,58 +152,123 @@ class Bindings:
                 binding.point('registry recheck')
         with self.track('registry',_value_scope(Registry())) as value:yield value
 
-    def reloader(self,trust,pp):
+    def reloader(self,owned,trust,pp,contexts_pp):
         binding=self
         class Reload:
-            def reload(self,*,deadline):
+            def reload(self,*,deadline,old_check):
                 binding.assert_locked();assert 'registry' not in binding.active
                 assert trust==binding.trust and pp==PP and binding.record().state=='PENDING'
+                with binding.window() as status:old_check(status)
                 binding.point('reload');binding.loads+=1
-                return SimpleNamespace(artifact=trust,pp_sha256=trust.pp_sha256)
+                return SimpleNamespace(artifact=trust,core_pp_sha256=trust.core_pp_sha256,contexts_pp_sha256=trust.contexts_pp_sha256)
         return Reload()
 
     @contextmanager
-    def modules(self,trust):
+    def modules(self,trust,*,deadline=None,mode='pair'):
         binding=self;assert trust==self.trust
         class Module:
-            def capture(self):binding.point('module capture');return SimpleNamespace(hll=HllIdentity(len(PP),getattr(binding,'hll_override',trust.pp_sha256)))
+            def capture(self):binding.point('module capture');return SimpleNamespace(core=SimpleNamespace(hll=HllIdentity(len(PP),getattr(binding,'hll_override',trust.core_pp_sha256))),contexts=SimpleNamespace(hll=HllIdentity(len(CONTEXTS_PP),trust.contexts_pp_sha256)))
             def recheck(self,value):binding.point('module recheck')
         with self.track('module',_value_scope(Module())) as value:yield value
 
     @contextmanager
     def window(self):
-        self.assert_locked()
-        with self.track('window',_value_scope(True)) as value:yield value
-
-    def files(self,expected_pam):
+        import qshd_selinux_api as native
+        from scripts.tests.test_selinux_api import SharedStatus
+        from scripts.tests.test_selinux_queries import FakeApi
+        shared=SharedStatus();api=native.SelinuxApi(shared.library());fake=FakeApi();fake.active=True
+        for name in ('check_context','require_av','compute_create','compute_relabel','validate_transition'):
+            setattr(api,name,getattr(fake,name))
         binding=self
-        class Api:
-            @contextmanager
-            def file_defaults(self):yield self
-            def lookup(self,path,kind):return getattr(binding,'default_override',None) or next(row[2] for row in files._PATHS if row[0]==path)
-            def file_context(self,fd):
-                physical=Path(os.readlink('/proc/self/fd/'+str(fd)));logical='/'+str(physical.relative_to(binding.root))
-                return self.lookup(logical,None)
+        @contextmanager
+        def defaults():
+            class Defaults:
+                def lookup(inner,path,kind):return getattr(binding,'default_override',None) or next(row[2] for row in files._PATHS if row[0]==path)
+            yield Defaults()
+        api.file_defaults=defaults
+        def file_context(fd):
+            physical=Path(os.readlink('/proc/self/fd/'+str(fd)))
+            logical='/'+str(physical.relative_to(binding.root))
+            return next(row[2] for row in files._PATHS if row[0]==logical)
+        api.file_context=file_context
+        with self.track('window',api.status_observation()) as value:yield value
+
+    @contextmanager
+    def queries(self,status):
+        from qshd_selinux_queries import required_observation
+        with required_observation(status.require_open(),status=status) as value:yield value
+
+    def retained(self,*,deadline,pristine=False):
+        import qshd_selinux_retained_labels as retained
+        def get(fd,name):
+            if name=='security.selinux':
+                path='/'+str(Path(os.readlink('/proc/self/fd/'+str(fd))).relative_to(self.root))
+                return next(row[3] for row in retained._ITEMS if row[0]==path).encode()+b'\0'
+            return os.getxattr(fd,name)
+        value=retained.RetainedLabels(_root=self.root,_uid=os.getuid(),_clock=lambda:self.now,
+            _getxattr=get,_listxattr=lambda fd:os.listxattr(fd)+['security.selinux'])
+        return self.track('retained',value.managed_inspection(deadline=deadline))
+
+    def package_operation(self):return self.package()
+    def consumer_selection(self,deadline):
+        import qshd_selinux_rpm_query as rpm
+        return self.track('authority',rpm.ConsumerAuthorityReader(_root=self.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.now).selection(deadline=deadline))
+
+    def consumer_authority(self,deadline):
+        import qshd_selinux_rpm_query as rpm
+        return self.track('authority',rpm.ConsumerAuthorityReader(_root=self.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.now).inspection(deadline=deadline))
+
+    def rpm_query(self,deadline):
+        binding=self
+        class Query:
+            def capture_absent(inner):binding.point('rpm capture');return None
+            def capture_owned(inner,authority):binding.point('rpm capture');return authority
+            def recheck(inner,value):binding.point('rpm recheck')
+        return self.track('rpm',_value_scope(Query()))
+
+    @contextmanager
+    def files(self,expected_pam,*,status,erase=False):
         assert expected_pam==self.expected_pam
-        return self.track('files',files._testing(expected_pam,self.root,Api(),os.getuid()).inspection())
+        engine=files._testing(expected_pam,self.root,status.require_open(),os.getuid())
+        with self.track('files',engine.erase_inspection() if erase else engine.inspection()) as scope:
+            class View:
+                original=None
+                seen=None
+                def capture(inner):
+                    inner.original=scope.capture()
+                    inner.seen=replace(inner.original,paths=tuple(replace(item,metadata=item.metadata[:2]+(0,0)+item.metadata[4:]) if item.metadata is not None else item for item in inner.original.paths))
+                    return inner.seen
+                def recheck(inner,value):
+                    assert value is inner.seen
+                    scope.recheck(inner.original)
+            yield View()
 
     def slot_hook(self,event):
         if not self.phase_active:return  # Trusted temporary setup is not a phase.
         if event=='slot_rename':
             self.point('publish '+self.record().state)
             if self.record().state=='COMPLETE':
-                self.assert_locked();assert not ({'window','module','registry','files'}&self.active)
+                self.assert_locked();assert not ({'window','module','registry','files','references'}&self.active)
 
     def installed_files(self):
         for path,data,mode in [('usr/bin/qshd',b'public inert executable',0o755),('etc/pam.d/qshd',self.expected_pam,0o644)]:
             p=self.root/path;p.write_bytes(data);p.chmod(mode)
         (self.root/'run/qshd').mkdir(mode=0o700)
+        import qshd_selinux_rpm_query as rpm
+        authority=rpm.ConsumerRpmAuthority(1,rpm.RpmPackage('qshd',0,'0.6.0','1','x86_64'),tuple(
+            rpm.RpmFileAuthority(path,len(data),hashlib.sha256(data).hexdigest(),mode,'root','root',flags)
+            for path,data,mode,flags in (('/etc/pam.d/qshd',self.expected_pam,0o100644,17),
+                ('/usr/bin/qshd',b'public inert executable',0o100755,0))))
+        parent=self.root/'usr/share/qshd';parent.mkdir(parents=True,exist_ok=True);parent.chmod(0o755);parent.parent.chmod(0o755)
+        (parent/'consumer-rpm.json').write_bytes(canonical(asdict(authority))+b'\n');(parent/'consumer-rpm.json').chmod(0o644)
 
     def matching_pending(self):
         with self.package_object().operation():
             with self.slot_object().writer() as writer:
-                value=self.record_value('PENDING','b'*32)
-                writer.begin_pending(canonical(asdict(value)),writer.capture_current())
+                prior=writer.capture_current().record
+                from qshd_selinux_first_activation import _pending
+                value=replace(_pending(self.trust,'consumer-install',model.HistoricalBasis(self.trust,prior.completion if prior.state=='COMPLETE' else prior.basis.completion)),operation_id='b'*32)
+                writer.begin_pending(canonical(asdict(value)),writer._initial)
         self.events=[];return value
 
 
@@ -209,11 +284,74 @@ class ConsumerTests(unittest.TestCase):
 
     def coordinator(self):return consumer._Coordinator(self.b,clock=lambda:self.b.now)
 
+    def test_consumer_post_requires_payload_after_real_fresh_pre(self):
+        pending=self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
+        self.assertEqual(pending.intent,'consumer-install')
+        fixed=('usr/bin/qshd','etc/pam.d/qshd','etc/pam.d/qshd.rpmnew','etc/pam.d/qshd.rpmsave','usr/share/qshd/consumer-rpm.json')
+        self.assertTrue(all(not (self.b.root/path).exists() for path in fixed))
+        self.b.events.clear()
+        with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
+        self.assertEqual(self.b.record(),pending);self.assertEqual(self.b.loads,0)
+        self.assertNotIn('publish COMPLETE',self.b.events)
+
+    def test_consumer_post_requires_owned_rpm_and_each_canonical_payload_file(self):
+        import qshd_selinux_rpm_query as rpm
+        from qshd_selinux_process import _Streams
+        for missing in ('authority','rpm','binary','pam'):
+            with self.subTest(missing=missing),tempfile.TemporaryDirectory() as root:
+                self.b=Bindings(Path(root));self.b.installed_files();self.b.matching_pending();calls=[]
+                if missing=='authority':(self.b.root/'usr/share/qshd/consumer-rpm.json').unlink()
+                elif missing in ('binary','pam'):
+                    (self.b.root/('usr/bin/qshd' if missing=='binary' else 'etc/pam.d/qshd')).unlink()
+                else:
+                    database=self.b.root/'usr/lib/sysimage/rpm';database.mkdir(parents=True)
+                    for parent in (self.b.root/'usr/lib',database.parent,database):parent.chmod(0o755)
+                    tool=self.b.root/'usr/bin/rpm';tool.write_bytes(b'inert fixture RPM; never executed');tool.chmod(0o755)
+                    (database/'rpmdb.sqlite').write_bytes(b'opaque fixture database');(database/'rpmdb.sqlite').chmod(0o644)
+                    class AbsentRpm:
+                        _last=None
+                        def _run(inner,argv,cwd,*,deadline):
+                            calls.append(argv);inner._last=natural_outcome(b'',b'',0,None,True)
+                            return _Streams(b'',b'')
+                    self.b.rpm_query=lambda deadline:self.b.track('rpm',rpm.RpmQuery(_root=self.b.root,
+                        _uid=os.getuid(),_owner=AbsentRpm(),_clock=lambda:self.b.now).inspection(deadline=deadline))
+                with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
+                self.assertEqual(self.b.loads,0);self.assertEqual(self.b.record().state,'PENDING')
+                self.assertNotIn('publish COMPLETE',self.b.events)
+                if missing=='rpm':self.assertEqual(len(calls),1)
+
+    def test_owned_consumer_reference_recheck_and_fd_close_precede_complete(self):
+        from scripts.tests.test_selinux_first_activation import require_reference_failure_before_complete
+        for fault in ('recheck','descriptor-close'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as root:
+                self.b=Bindings(Path(root));self.b.installed_files();self.b.matching_pending()
+                require_reference_failure_before_complete(self,self.b,
+                    lambda:self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000),fault)
+
+    def test_rpm_failure_blocks_pre_and_final_query_failure_blocks_complete(self):
+        before=self.b.record();self.b.failure='rpm capture'
+        with self.assertRaises(consumer.CoordinatorError):self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
+        self.assertEqual(self.b.record(),before);self.assertNotIn('publish PENDING',self.b.events)
+        self.b.failure=None;self.b.installed_files();self.b.matching_pending();self.b.failure='rpm recheck'
+        with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
+        self.assertEqual(self.b.loads,1);self.assertEqual(self.b.record().state,'PENDING')
+        self.assertNotIn('publish COMPLETE',self.b.events)
+
+    def test_fixed_pam_sidecars_never_join_canonical_consumer(self):
+        self.b.installed_files();before=self.b.record()
+        for name in ('qshd.rpmnew','qshd.rpmsave'):
+            path=self.b.root/'etc/pam.d'/name;path.symlink_to('/missing')
+            with self.subTest(name=name),self.assertRaises(consumer.CoordinatorError):
+                self.coordinator().invalidate_installed_consumer_pre(fresh=False,deadline=1000)
+            self.assertEqual(self.b.record(),before);self.assertEqual(self.b.loads,0)
+            path.unlink()
+
     def test_fresh_pre_real_state_one_lease_child_before_writer(self):
         initial=self.b.record();result=self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
         self.assertEqual(result.state,'PENDING');self.assertNotEqual(result.operation_id,initial.operation_id)
         self.assertEqual(self.b.events.count('package enter'),1)
-        self.assertLess(self.b.events.index('policy child'),self.b.events.index('activation enter'))
+        self.assertNotIn('policy child',self.b.events)
+        self.assertLess(self.b.events.index('module recheck'),self.b.events.index('publish PENDING'))
         self.assertEqual(self.b.loads,0);self.assertFalse(self.b.active)
         self.assertFalse(self.b.busy(self.b.common/'selinux-package.lock'))
         self.assertFalse(self.b.busy(self.b.common/'selinux-activation/lock'))
@@ -233,7 +371,11 @@ class ConsumerTests(unittest.TestCase):
 
     def test_owned_post_new_generation_and_complete_last_without_context_mutation(self):
         self.b.installed_files();initial=self.b.matching_pending();target=self.b.target.read_bytes()
-        result=self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
+        from scripts.tests.test_selinux_first_activation import reference_exit_fault
+        with reference_exit_fault(self.b,None) as closed:
+            result=self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
+        self.assertEqual(closed,[dict(state='PENDING',package=True,activation=True)])
+        self.assertLess(self.b.events.index('references exit'),self.b.events.index('publish COMPLETE'))
         self.assertEqual(result.state,'COMPLETE');self.assertNotEqual(result.operation_id,initial.operation_id)
         self.assertEqual(self.b.loads,1);self.assertEqual(self.b.target.read_bytes(),target)
         self.assertEqual(self.b.events.count('package enter'),1)
@@ -288,7 +430,7 @@ class ConsumerTests(unittest.TestCase):
             if mode=='absent':path.unlink()
             elif mode in ('mismatch','journal'):
                 record=self.b.matching_pending()
-                if mode=='mismatch':path.write_bytes(canonical(asdict(replace(record,artifact=model.TrustedArtifact('other','a'*64,'b'*64)))))
+                if mode=='mismatch':path.write_bytes(canonical(asdict(replace(record,artifact=model.TrustedArtifact('other','a'*64,'b'*64,'c'*64)))))
                 else:journal.write_bytes(b'unknown journal must stay untouched');journal.chmod(0o600)
             with self.subTest(mode=mode),self.assertRaises(consumer.CoordinatorError):
                 self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
@@ -307,7 +449,7 @@ class ConsumerTests(unittest.TestCase):
         self.b.guard=lambda deadline:None;point=self.b.point
         def drift(name):
             point(name)
-            if name=='policy child':
+            if name=='module recheck':
                 path=self.b.provider/'usr/share/qshd-selinux/reference.json';path.write_bytes(path.read_bytes()+b' ')
         self.b.point=drift
         with self.assertRaises(consumer.CoordinatorError):self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
@@ -318,7 +460,7 @@ class ConsumerTests(unittest.TestCase):
         def after_real_return(writer,*args,**kwargs):
             original(writer,*args,**kwargs)
             raise KeyboardInterrupt('controlled after actual COMPLETE return')
-        self.b.failure='references exit'
+        self.b.failure='package exit'
         with patch.object(slot._Writer,'publish_complete',after_real_return),self.assertRaises(slot.OutcomeUncertain):
             self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
         self.assertEqual(self.b.record().state,'COMPLETE')
@@ -383,7 +525,7 @@ class ConsumerTests(unittest.TestCase):
                 self.assertNotIn('publish PENDING',self.b.events);self.assertEqual(self.b.loads,0)
 
     def test_preflight_normal_exit_is_required_before_context_writer(self):
-        for failure in ('registry capture','registry recheck','preflight exit','window exit'):
+        for failure in ('registry capture','registry recheck','preflight exit'):
             with self.subTest(failure=failure),tempfile.TemporaryDirectory() as root:
                 self.b=Bindings(Path(root));self.b.installed_files();self.b.matching_pending()
                 before=self.inventory();self.b.failure=failure
@@ -415,10 +557,10 @@ class ConsumerTests(unittest.TestCase):
             point(name)
             if name=='window exit':
                 windows.append(name)
-                if len(windows)==2:raise RuntimeError('controlled borrowed window exit')
+                if len(windows)==1:raise RuntimeError('controlled borrowed window exit')
         self.b.point=fail
         with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
-        self.assertEqual(len(windows),2);self.assertEqual(self.b.record(),initial)
+        self.assertEqual(len(windows),1);self.assertNotEqual(self.b.record().operation_id,initial.operation_id)
         self.assertEqual(self.b.loads,0);self.assertFalse(self.b.active)
 
     def test_actual_complete_fsync_failure_plus_later_exit_is_uncertain(self):
@@ -429,7 +571,7 @@ class ConsumerTests(unittest.TestCase):
         def sync(fd):
             if armed:raise OSError('controlled actual directory sync')
             return native(fd)
-        self.b.point=arm;self.b.failure='references exit'
+        self.b.point=arm;self.b.failure='package exit'
         with patch.object(os,'fsync',sync),self.assertRaises(slot.OutcomeUncertain):
             self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
         self.assertTrue(armed);self.assertEqual(self.b.record().state,'COMPLETE')
@@ -442,7 +584,7 @@ class ConsumerTests(unittest.TestCase):
         self.b.matching_pending();point=self.b.point
         def late(name):
             point(name)
-            if name=='preflight exit':self.b.now=280
+            if name=='preflight exit':self.b.now=1000
         self.b.point=late
         with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
         self.assertNotIn('context writer acquisition',self.b.events)
@@ -527,7 +669,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(len(blocking),2)
         self.assertLess(self.b.events.index('preflight exit'),self.b.events.index('context writer acquisition'))
         self.assertEqual(self.b.events.count('package enter'),1);self.assertEqual(self.b.events.count('activation enter'),1)
-        self.assertEqual(self.b.events.count('window enter'),3)
+        self.assertEqual(self.b.events.count('window enter'),2)
 
     def test_postload_observer_and_all_window_finalizers_suppress_complete(self):
         modes=('module recheck','module exit','files exit','post-window','post-registry','default','PAM','HLL','reference')
@@ -536,16 +678,22 @@ class ConsumerTests(unittest.TestCase):
                 self.b=Bindings(Path(root));self.b.installed_files();self.b.matching_pending();point=self.b.point;counts={}
                 def fail(name):
                     point(name);counts[name]=counts.get(name,0)+1
-                    if mode=='reference' and name=='window exit' and counts[name]==3:
+                    if mode=='reference' and name=='window exit' and counts[name]==2:
                         path=self.b.provider/'usr/share/qshd-selinux/reference.json';path.write_bytes(path.read_bytes()+b' ')
-                    if ((mode in ('module recheck','module exit','files exit') and name==mode)
-                            or (mode=='post-window' and name=='window exit' and counts[name]==3)
-                            or (mode=='post-registry' and name=='registry exit' and counts[name]==3)):
+                    if ((mode in ('module recheck','module exit') and name==mode)
+                            or (mode=='files exit' and name==mode and counts[name]==2)
+                            or (mode=='post-window' and name=='window exit' and counts[name]==2)
+                            or (mode=='post-registry' and name=='registry exit' and counts[name]==4)):
                         raise RuntimeError('controlled final observer failure')
                 self.b.point=fail
-                if mode=='default':self.b.default_override='wrong_u:object_r:qshd_exec_t:s0'
-                elif mode=='PAM':(self.b.root/'etc/pam.d/qshd').write_bytes(b'unsupported installed PAM')
-                elif mode=='HLL':self.b.hll_override='b'*64
+                original_point=self.b.point
+                def after_load(name):
+                    original_point(name)
+                    if name=='reload':
+                        if mode=='default':self.b.default_override='wrong_u:object_r:qshd_exec_t:s0'
+                        elif mode=='PAM':(self.b.root/'etc/pam.d/qshd').write_bytes(b'unsupported installed PAM')
+                        elif mode=='HLL':self.b.hll_override='b'*64
+                self.b.point=after_load
                 with self.assertRaises(consumer.CoordinatorError):self.coordinator().finalize_installed_owned_pending_consumer(deadline=1000)
                 self.assertEqual(self.b.loads,1);self.assertEqual(self.b.record().state,'PENDING')
                 self.assertNotIn('publish COMPLETE',self.b.events);self.assertFalse(self.b.active)
@@ -557,12 +705,10 @@ class ConsumerTests(unittest.TestCase):
         with patch.object(package,'production',return_value=SimpleNamespace(operation=lambda:sentinel)) as factory:
             self.assertIs(production.package(),sentinel)
         factory.assert_called_once_with()
-        with patch.object(observer,'_observe_policy_context',return_value=sentinel) as private,patch.object(observer,'observe_installed_policy_context',side_effect=AssertionError('nested package gate')):
-            self.assertIs(production.policy_context(self.b.trust),sentinel)
-        private.assert_called_once_with(self.b.trust)
+        self.assertFalse(hasattr(production,'policy_context'))
         with patch.object(install,'production_owned_reloader',return_value=sentinel) as owned,patch.object(install,'production_installer',side_effect=AssertionError('first installer used by post')):
-            self.assertIs(production.reloader(self.b.trust,PP),sentinel)
-        owned.assert_called_once_with(self.b.trust,PP)
+            self.assertIs(production.reloader(self.b.trust,self.b.trust,PP,CONTEXTS_PP),sentinel)
+        owned.assert_called_once_with(self.b.trust,self.b.trust,PP,CONTEXTS_PP)
 
 
     def test_consumer_setup_after_fd_acquisition_closes_routes_without_publication(self):
@@ -582,16 +728,16 @@ class ConsumerTests(unittest.TestCase):
             path=os.readlink('/proc/self/fd/'+str(fd));native(fd)
             if path.endswith('/etc/pam.d') and not failed:
                 failed.append(True);raise OSError('controlled after real route close')
-        with patch.object(os,'close',close),self.assertRaises(slot.OutcomeUncertain):
+        with patch.object(os,'close',close),self.assertRaises(consumer.CoordinatorError):
             self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
-        self.assertTrue(failed);self.assertEqual(self.b.record().state,'PENDING');self.assertFalse(self.b.active)
+        self.assertTrue(failed);self.assertEqual(self.b.record().state,'COMPLETE');self.assertFalse(self.b.active)
 
     def test_public_phase_entries_use_only_fixed_production_binding(self):
         with patch.object(consumer,'_Production',return_value=self.b) as factory:
-            result=consumer.invalidate_installed_consumer_pre(fresh=True,deadline=time.monotonic()+220)
+            result=consumer.invalidate_installed_consumer_pre(fresh=True,deadline=time.monotonic()+430)
             self.assertEqual(result.state,'PENDING')
             self.b.installed_files()
-            result=consumer.finalize_installed_owned_pending_consumer(deadline=time.monotonic()+220)
+            result=consumer.finalize_installed_owned_pending_consumer(deadline=time.monotonic()+430)
             self.assertEqual(result.state,'COMPLETE')
         self.assertEqual(factory.call_count,2)
         self.assertTrue(all(call.args==() and call.kwargs=={} for call in factory.call_args_list))
@@ -599,12 +745,12 @@ class ConsumerTests(unittest.TestCase):
 
     def test_slot_change_after_policy_observation_refuses_pre_publication(self):
         before=self.b.record();point=self.b.point;path=self.b.common/'selinux-activation/activation.json'
-        changed=replace(before,state='PENDING',completion=None)
+        changed=replace(before,state='PENDING',basis=model.HistoricalBasis(before.artifact,before.completion),intent='consumer-install',completion=None)
         def drift(name):
             point(name)
-            if name=='policy child':path.write_bytes(canonical(asdict(changed)))
+            if name=='module recheck':path.write_bytes(canonical(asdict(changed)))
         self.b.point=drift
-        with self.assertRaises(consumer.CoordinatorError):self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
+        with self.assertRaises(slot.OutcomeUncertain):self.coordinator().invalidate_installed_consumer_pre(fresh=True,deadline=1000)
         self.assertEqual(self.b.record(),changed);self.assertNotIn('publish PENDING',self.b.events)
         self.assertEqual(self.b.loads,0)
 
@@ -622,11 +768,11 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
             (self.b.root/name).chmod(0o755)
         for name,data,mode in [('usr/bin/semodule',b'inert',0o755),('usr/lib/os-release',b'ID=fedora\nVERSION_ID=44\n',0o644),('etc/selinux/semanage.conf',b'# controlled',0o644),('var/lib/selinux/targeted/semanage.read.LOCK',b'',0o600)]:
             p=self.b.root/name;p.write_bytes(data);p.chmod(mode)
-        self.module_calls=[];self.module_listing=b'100 base cil\n400 qshd pp\n';self.module_pp=PP;self.module_action=None
+        self.module_calls=[];self.module_listing=b'100 base cil\n400 qshd pp\n400 qshd_contexts pp\n';self.module_pp=PP;self.module_action=None
         self.b.modules=self.modules
 
     @contextmanager
-    def modules(self,trust):
+    def modules(self,trust,*,deadline=None,mode='pair'):
         import qshd_selinux_module_observer as observer
         from qshd_selinux_process import _Outcome
         outer=self
@@ -635,11 +781,11 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
             def _run(owner,operation,cwd,*,deadline=None):
                 outer.assertIn('window',outer.b.active)
                 outer.module_calls.append((operation,deadline))
-                owner._last=_Outcome(b'',b'',0,None,True)
+                owner._last=natural_outcome(b'',b'',0,None,True)
                 if outer.module_action is not None:outer.module_action(operation,cwd,owner)
                 if operation=='list':return outer.module_listing
-                path=Path(cwd)/'qshd.pp';path.write_bytes(outer.module_pp);path.chmod(0o600);return b''
-        with self.b.track('module',observer.ModuleObserver(trust,_root=self.b.root,_uid=os.getuid(),_runner=lambda *args:None)) as lease:
+                path=Path(cwd)/('qshd.pp' if operation=='extract-core' else 'qshd_contexts.pp');path.write_bytes(outer.module_pp if operation=='extract-core' else CONTEXTS_PP);path.chmod(0o600);return b''
+        with self.b.track('module',observer.ModuleObserver(trust,mode=mode,deadline=deadline,_root=self.b.root,_uid=os.getuid(),_runner=lambda *args:None,_clock=lambda:self.b.now)) as lease:
             lease._owner=Owner();yield lease
 
     @contextmanager
@@ -651,9 +797,19 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
             with ExitStack() as forbidden:
                 for name in ('package','activation','policy_context','contexts','files','consumer_paths','preconditions','guard'):
                     forbidden.enter_context(patch.object(self.b,name,side_effect=AssertionError('nested or unrelated phase call')))
-                forbidden.enter_context(patch.object(item,'_start',side_effect=AssertionError('deadline restarted')))
+                forbidden.enter_context(patch.object(item,'_start',create=True,side_effect=AssertionError('deadline restarted')))
                 try:yield item,writer,trust
                 finally:refs.recheck(captured)
+
+    def test_naked_and_provider_erase_pending_never_supply_historical_basis(self):
+        from qshd_selinux_first_activation import _pending
+        prior=self.b.record();path=self.b.common/'selinux-activation/activation.json'
+        basis=model.HistoricalBasis(prior.artifact,prior.completion)
+        for pending in (_pending(prior.artifact,'provider-fresh'),_pending(prior.artifact,'provider-erase',basis)):
+            path.write_bytes(canonical(asdict(pending)))
+            with self.subTest(intent=pending.intent),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):
+                item._admit_owned_erase(writer,trust)
+            self.assertEqual(self.module_calls,[])
 
     def test_complete_and_pending_capture_full_owned_evidence_without_mutation(self):
         from dataclasses import FrozenInstanceError
@@ -673,7 +829,7 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
                 self.assertIsInstance(result.registry.candidates,tuple)
                 self.assertFalse(hasattr(result,'identities'))
                 identities=json.loads(result.routing);identities.clear();self.assertEqual(result.routing,self.b.routing)
-            self.assertEqual(self.module_calls,[('list',330),('extract',330),('list',330),('extract',330)])
+            self.assertEqual(self.module_calls,[('list',330),('extract-core',330),('extract-contexts',330)]*2)
             self.assertEqual(self.b.events.count('package enter'),1)
             self.assertEqual(self.b.events.count('activation enter'),1)
             self.assertNotIn('policy child',self.b.events);self.assertEqual(self.b.loads,0)
@@ -698,7 +854,7 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
         with self.held() as (item,writer,trust),patch.object(model,'require_complete',side_effect=AssertionError('no pending exception fallback')):
             result=item._admit_owned_erase(writer,trust)
             self.assertEqual(result.slot.record.state,'PENDING')
-        self.assertEqual(len(self.module_calls),4)
+        self.assertEqual(len(self.module_calls),6)
 
     def test_pending_requires_real_module_admission_not_policy_child_exception(self):
         self.b.matching_pending();before=self.inventory()
@@ -727,7 +883,7 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
         stale=replace(before,completion=replace(before.completion,contexts=model.ContextBinding('f'*64,'e'*64)))
         path.write_bytes(canonical(asdict(stale)))
         with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
-        self.assertEqual(len(self.module_calls),4)
+        self.assertEqual(len(self.module_calls),0)
         path.write_bytes(canonical(asdict(before)));self.module_calls=[]
         with self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,replace(trust,provider_version='another'))
         self.assertEqual(self.module_calls,[])
@@ -739,8 +895,8 @@ class OwnedEraseAdmissionTests(unittest.TestCase):
             elif case=='malformed':path.write_bytes(b'{malformed')
             else:
                 value=json.loads(raw)
-                if case=='profile':value['abi']=2
-                elif case=='module':value['module']['priority']=500
+                if case=='profile':value['abi']=3
+                elif case=='module':value['modules']['core']['priority']=500
                 else:value['state']='PENDING'
                 path.write_bytes(canonical(value))
             with self.subTest(case=case),self.held() as (item,writer,trust),self.assertRaises(consumer.CoordinatorError):item._admit_owned_erase(writer,trust)
@@ -839,7 +995,7 @@ class ConsumerEraseTests(unittest.TestCase):
                 if '-qf' in argv:
                     record=next(f for f in outer.authority.files if f.path==argv[-1])
                     header+=b'A\t8\n'+('F\t'+json.dumps(record.path)+f'\t{record.size}\t{record.mode}\t{record.flags}\t"root"\t"root"\t'+json.dumps(record.sha256)+'\t""\t0\nE\n').encode()
-                owner._last=_Outcome(b'',b'',0,None,True)
+                owner._last=natural_outcome(b'',b'',0,None,True)
                 if hasattr(outer,'query_change'):header=outer.query_change(header,argv)
                 return _Streams(header,b'')
         self.b.consumer_authority=lambda deadline:self.b.track('authority',rpm.ConsumerAuthorityReader(_root=self.b.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.b.now).inspection(deadline=deadline))
@@ -849,13 +1005,10 @@ class ConsumerEraseTests(unittest.TestCase):
 
     @contextmanager
     def window(self):
-        self.assertTrue(self.b.busy(self.b.common/'selinux-package.lock'))
-        self.assertTrue(self.b.busy(self.b.common/'selinux-activation/lock'))
-        self.assertNotIn('window',self.b.active)
-        with self.b.track('window',_value_scope(True)) as value:yield value
+        with Bindings.window(self.b) as value:yield value
 
     @contextmanager
-    def erase_files(self,expected_pam):
+    def erase_files(self,expected_pam,*,status):
         outer=self
         class Api:
             @contextmanager
@@ -899,18 +1052,18 @@ class ConsumerEraseTests(unittest.TestCase):
             self.assertEqual(result,self.b.record());self.assertEqual(len(self.query_calls),6)
             self.assertEqual(self.b.events.count('package enter'),1)
             self.assertEqual(self.b.events.count('activation enter'),1)
-            self.assertEqual(self.b.events.count('window enter'),2)
-            self.assertLess(self.b.events.index('module exit'),self.b.events.index('erase files enter'))
+            self.assertEqual(self.b.events.count('window enter'),1)
+            self.assertLess(self.b.events.index('erase files exit'),self.b.events.index('module exit'))
             self.assertLess(self.b.events.index('erase files exit'),self.b.events.index('publish PENDING'))
             self.assertFalse(self.b.active);self.assertFalse((self.b.root/'run/qshd').exists())
             self.assertNotIn('policy child',self.b.events);self.assertEqual(self.b.loads,0)
-            self.assertEqual(self.module_calls,[('list',330),('extract',330),('list',330),('extract',330)])
+            self.assertEqual(self.module_calls,[('list',990),('extract-core',990),('extract-contexts',990)]*2)
             self.assertEqual(self.b.events[-1],'package exit')
 
     def test_safe_present_runtime_and_public_entrypoint(self):
         (self.b.root/'run/qshd').mkdir(mode=0o700)
         with patch.object(consumer,'_Production',return_value=self.b) as factory:
-            self.assertEqual(consumer.invalidate_installed_consumer_erase(deadline=time.monotonic()+220).state,'PENDING')
+            self.assertEqual(consumer.invalidate_installed_consumer_erase(deadline=time.monotonic()+430).state,'PENDING')
         factory.assert_called_once_with()
 
     def test_manifest_product_predicates_refuse_before_query_or_write(self):
@@ -928,7 +1081,7 @@ class ConsumerEraseTests(unittest.TestCase):
                 initial=self.b.record();self.b.events=[]
                 with self.assertRaises(consumer.CoordinatorError):self.run_erase()
                 self.assertEqual(self.b.record(),initial);self.assertNotIn('rpm command',self.b.events)
-                self.assertNotIn('activation enter',self.b.events);self.assertFalse(self.b.active)
+                self.assertNotIn('publish PENDING',self.b.events);self.assertFalse(self.b.active)
 
     def test_selected_live_metadata_and_phase_join_is_required(self):
         for mode in ('phase','gid','mode','size','pam-hash'):
@@ -958,7 +1111,7 @@ class ConsumerEraseTests(unittest.TestCase):
                     point(name);counts[name]=counts.get(name,0)+1
                     if ((mode=='rpm-final' and name=='rpm command' and counts[name]==4)
                             or (mode=='guard-final' and name=='guard' and counts[name]==2)
-                            or (mode=='final-window' and name=='window exit' and counts[name]==2)
+                            or (mode=='final-window' and name=='window exit' and counts[name]==1)
                             or name==mode):raise RuntimeError('controlled before-publication failure')
                 self.b.point=failure
                 try:
@@ -1021,7 +1174,7 @@ class ConsumerEraseTests(unittest.TestCase):
                     self.assertFalse(self.b.active)
                 finally:
                     if journal.exists():self.assertEqual(journal.read_bytes(),b'unknown preserve');journal.unlink()
-                    self.module_listing=b'100 base cil\n400 qshd pp\n';self.b.failure=None;self.b.point=point
+                    self.module_listing=b'100 base cil\n400 qshd pp\n400 qshd_contexts pp\n';self.b.failure=None;self.b.point=point
 
     def test_post_attempt_failures_are_uncertain(self):
         for mode in ('begin','readback','authority exit','references exit','rpm exit','package exit','late','manifest-final-recheck'):
@@ -1029,7 +1182,7 @@ class ConsumerEraseTests(unittest.TestCase):
                 self.b.events=[];point=self.b.point;original=slot._Writer.begin_pending
                 def failure(name):
                     point(name)
-                    if mode=='late' and name=='package exit':self.b.now=340
+                    if mode=='late' and name=='package exit':self.b.now=1000
                     if mode=='manifest-final-recheck' and name=='rpm exit':self.manifest.write_bytes(self.manifest.read_bytes()+b' ')
                 self.b.point=failure
                 self.b.failure=mode if mode.endswith(' exit') else None
@@ -1041,14 +1194,14 @@ class ConsumerEraseTests(unittest.TestCase):
                         path.write_bytes(canonical(asdict(replace(record,operation_id='f'*32))))
                     return result
                 try:
-                    with patch.object(slot._Writer,'begin_pending',begin),self.assertRaises(slot.OutcomeUncertain):self.run_erase()
+                    with patch.object(slot._Writer,'begin_pending',begin),self.assertRaises(consumer.CoordinatorError if mode in ('authority exit','rpm exit','manifest-final-recheck') else slot.OutcomeUncertain):self.run_erase()
                     self.assertFalse(self.b.active)
                 finally:
                     self.b.point=point;self.b.failure=None;self.b.now=100
                     self.manifest.write_bytes(canonical(asdict(self.authority))+b'\n')
 
     def test_deadline_reserves_single_use_and_operation_reuse_refuse(self):
-        for stage,now in (('rpm enter',170),('activation enter',210),('module exit',280),('erase files exit',330)):
+        for stage,now in (('rpm enter',1000),('activation enter',1000),('module exit',1000),('erase files exit',1000)):
             with self.subTest(stage=stage):
                 point=self.b.point;before=self.b.record();self.b.events=[]
                 def late(name):

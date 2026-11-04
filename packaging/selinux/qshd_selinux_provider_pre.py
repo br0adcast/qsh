@@ -15,7 +15,7 @@ import time
 import qshd_selinux_activation as model
 import qshd_selinux_activation_state as state
 import qshd_selinux_package_state as package
-from qshd_selinux_process import _Owner, _Limits, _preconditions
+from qshd_selinux_process import _Owner, _Limits, _preconditions, _normal_outcome
 import stop_guard
 
 class PreError(RuntimeError):
@@ -37,8 +37,7 @@ class _Bindings:
         def run():
             streams=owner._run(stop_guard.COMMAND,'/',deadline=deadline)
             outcome=owner._last
-            if (outcome is None or outcome.failure is not None or outcome.exit_code!=0
-                    or not outcome.settled or outcome.unreaped or streams.stderr):
+            if not _normal_outcome(outcome) or outcome.exit_code!=0 or streams.stderr:
                 raise PreError('GUARD_REFUSED')
             return streams.stdout.decode('utf-8','strict')
         stop_guard.check(stop_guard.Host(),run,allow_absent=True)
@@ -56,7 +55,7 @@ class _Coordinator:
                     type(deadline) not in (int,float) or not math.isfinite(deadline)):
                 raise PreError('INVALID_INPUT')
             model.TrustedArtifact(trusted_artifact.provider_version,
-                trusted_artifact.manifest_sha256,trusted_artifact.pp_sha256)
+                trusted_artifact.manifest_sha256,trusted_artifact.core_pp_sha256,trusted_artifact.contexts_pp_sha256)
             end=min(deadline,start+30)
             def check():
                 if self._clock()>=end:raise PreError('DEADLINE')
@@ -69,9 +68,11 @@ class _Coordinator:
                     check();initial=writer.capture_current()
                     if initial.record is not None:raise PreError('EXISTING_RECORD')
                     self._bindings.guard(end);check()
-                    pending=model.Activation(1,'PENDING',secrets.token_hex(16),
-                        'fedora44-targeted-v1',1,1,trusted_artifact,
-                        model.ModuleIdentity('qshd',400,'targeted','pp'),None)
+                    pending=model.Activation(2,'PENDING',secrets.token_hex(16),
+                        'fedora44-targeted-pair-v2',2,1,trusted_artifact,
+                        model.ModulePair(model.ModuleIdentity('qshd',400,'targeted','pp'),
+                            model.ModuleIdentity('qshd_contexts',400,'targeted','pp')),
+                        'provider-fresh',None,None)
                     document=_json(asdict(pending))
                     attempted=True
                     writer.begin_pending(document,initial)
@@ -111,10 +112,10 @@ def _request_artifact(request):
     try:
         value=json.loads(request,object_pairs_hook=_pairs)
         if (type(value) is not dict or set(value)!={'schema','phase','artifact'} or
-                type(value['schema']) is not int or value['schema']!=1 or
+                type(value['schema']) is not int or value['schema']!=2 or
                 value['phase']!='provider-pre-fresh' or _json(value)!=request or
                 type(value['artifact']) is not dict or
-                set(value['artifact'])!={'provider_version','manifest_sha256','pp_sha256'}):
+                set(value['artifact'])!={'provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256'}):
             raise PreError('REQUEST')
         return model.TrustedArtifact(**value['artifact'])
     except (ValueError,TypeError,RecursionError):raise PreError('REQUEST') from None
@@ -122,7 +123,7 @@ def _request_artifact(request):
 
 def _frame(request,operation):
     import hashlib
-    return _json(dict(schema=1,phase='provider-pre-fresh',
+    return _json(dict(schema=2,phase='provider-pre-fresh',
         request_sha256=hashlib.sha256(request).hexdigest(),operation_id=operation,state='PENDING'))+b'\n'
 
 
@@ -196,8 +197,7 @@ def run_embedded_pre(child_source,fixed_request):
         streams=owner._run(('/usr/bin/python3','-I','-B','-c',child_source,str(start+30)),
                            '/',deadline=start+30)
         outcome=owner._last
-        if (outcome is None or outcome.failure is not None or outcome.exit_code!=0 or
-                not outcome.settled or outcome.unreaped or streams.stderr or
+        if (not _normal_outcome(outcome) or outcome.exit_code!=0 or streams.stderr or
                 time.monotonic()>=start+40):raise PreError('OWNER')
         _require_frame(streams.stdout,fixed_request)
         sys.stdout.buffer.write(streams.stdout);sys.stdout.buffer.flush()

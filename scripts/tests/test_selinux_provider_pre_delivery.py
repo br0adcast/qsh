@@ -16,8 +16,9 @@ class RenderTests(unittest.TestCase):
         self.root=Path(__file__).resolve().parents[2]/'packaging/selinux'
         self.sources={name:(self.root/(name+'.py')).read_bytes() for name in embed.MODULES}
         self.artifact=(self.root/'artifact.json').read_bytes();self.pp=b'explicit synthetic PP, never loaded'
-        self.trusted=model.TrustedArtifact('0.2.0',hashlib.sha256(self.artifact).hexdigest(),hashlib.sha256(self.pp).hexdigest())
-    def render(self,sources=None):return embed.render(self.sources if sources is None else sources,self.trusted,artifact_bytes=self.artifact,pp_bytes=self.pp)
+        self.contexts_pp=b'explicit synthetic CONTEXTS PP, never loaded'
+        self.trusted=model.TrustedArtifact('0.3.0',hashlib.sha256(self.artifact).hexdigest(),hashlib.sha256(self.pp).hexdigest(),hashlib.sha256(self.contexts_pp).hexdigest())
+    def render(self,sources=None):return embed.render(self.sources if sources is None else sources,self.trusted,artifact_bytes=self.artifact,core_pp_bytes=self.pp,contexts_pp_bytes=self.contexts_pp)
     def test_deterministic_bound_source_and_child_limit(self):
         a=self.render();self.assertEqual(a,self.render());compile(a,'capsule','exec')
         self.assertLessEqual(len(embed._child_source(self.sources,embed._request(self.trusted)).encode()),98304)
@@ -25,12 +26,20 @@ class RenderTests(unittest.TestCase):
         for changed in ({},dict(self.sources,extra=b'x'),dict(self.sources,qshd_selinux_contexts=b'\0'),dict(self.sources,qshd_selinux_contexts=b'\xff')):
             with self.assertRaises(ValueError):self.render(changed)
     def test_wrong_authority_refuses(self):
-        with self.assertRaises(ValueError):embed.render(self.sources,self.trusted,artifact_bytes=self.artifact+b' ',pp_bytes=self.pp)
-        with self.assertRaises(ValueError):embed.render(self.sources,self.trusted,artifact_bytes=self.artifact,pp_bytes=self.pp+b'x')
+        with self.assertRaises(ValueError):embed.render(self.sources,self.trusted,artifact_bytes=self.artifact+b' ',core_pp_bytes=self.pp,contexts_pp_bytes=self.contexts_pp)
+        with self.assertRaises(ValueError):embed.render(self.sources,self.trusted,artifact_bytes=self.artifact,core_pp_bytes=self.pp+b'x',contexts_pp_bytes=self.contexts_pp)
+
+    def test_distinct_paired_authority_inputs_are_independently_bound(self):
+        request=json.loads(embed._request(self.trusted))
+        self.assertEqual(request['schema'],2)
+        self.assertEqual(set(request['artifact']),{'provider_version','manifest_sha256','core_pp_sha256','contexts_pp_sha256'})
+        for core,contexts in ((self.pp+b'x',self.contexts_pp),(self.pp,self.contexts_pp+b'x'),(self.contexts_pp,self.pp)):
+            with self.subTest(core=core,contexts=contexts),self.assertRaises(ValueError):
+                embed.render(self.sources,self.trusted,artifact_bytes=self.artifact,core_pp_bytes=core,contexts_pp_bytes=contexts)
 
     def test_actual_owned_success_and_bad_frame(self):
         request=embed._request(self.trusted)
-        frame=dict(schema=1,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING')
+        frame=dict(schema=2,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING')
         line=json.dumps(frame,sort_keys=True,separators=(',',':'))+'\n'
         for child,expected in (("print("+repr(line[:-1])+")",0),("print('bad')",1)):
             harness="import sys;sys.path.insert(0,"+repr(str(self.root))+");import qshd_selinux_provider_pre as p;p.os.geteuid=lambda:0;raise SystemExit(p.run_embedded_pre("+repr(child)+","+repr(request)+"))"
@@ -43,7 +52,7 @@ class RenderTests(unittest.TestCase):
     def test_actual_isolated_capsule_without_installed_imports(self):
         sources=dict(self.sources)
         # Explicit test-only generated substitution: no manager/state action.
-        sources['qshd_selinux_provider_pre']+=b"\nos.geteuid=lambda:0\ndef invalidate_fresh_provider_pre(trusted_artifact,*,deadline):\n    import sys,resource\n    assert [resource.getrlimit(k) for k in (resource.RLIMIT_CORE,resource.RLIMIT_FSIZE,resource.RLIMIT_AS,resource.RLIMIT_NOFILE,resource.RLIMIT_CPU)]==[(0,0),(16777216,16777216),(1073741824,1073741824),(128,128),(40,40)]\n    for name in ('qshd_selinux_contexts','qshd_selinux_fs','qshd_selinux_activation','qshd_selinux_activation_state','qshd_selinux_package_state','qshd_selinux_process','stop_guard','qshd_selinux_provider_pre'):\n        assert sys.modules[name].__file__=='<qshd-provider-pre:'+name+':'+dict((n,d) for n,d,e in sys.modules['__main__']._entries)[name]+'>'\n    return model.Activation(1,'PENDING','a'*32,'fedora44-targeted-v1',1,1,trusted_artifact,model.ModuleIdentity('qshd',400,'targeted','pp'),None)\n"
+        sources['qshd_selinux_provider_pre']+=b"\nos.geteuid=lambda:0\ndef invalidate_fresh_provider_pre(trusted_artifact,*,deadline):\n    import sys,resource\n    assert [resource.getrlimit(k) for k in (resource.RLIMIT_CORE,resource.RLIMIT_FSIZE,resource.RLIMIT_AS,resource.RLIMIT_NOFILE,resource.RLIMIT_CPU)]==[(0,0),(16777216,16777216),(1073741824,1073741824),(128,128),(40,40)]\n    for name in ('qshd_selinux_contexts','qshd_selinux_fs','qshd_selinux_activation','qshd_selinux_activation_state','qshd_selinux_package_state','qshd_selinux_process','stop_guard','qshd_selinux_provider_pre'):\n        assert sys.modules[name].__file__=='<qshd-provider-pre:'+name+':'+dict((n,d) for n,d,e in sys.modules['__main__']._entries)[name]+'>'\n    return model.Activation(2,'PENDING','a'*32,'fedora44-targeted-pair-v2',2,1,trusted_artifact,model.ModulePair(model.ModuleIdentity('qshd',400,'targeted','pp'),model.ModuleIdentity('qshd_contexts',400,'targeted','pp')),'provider-fresh',None,None)\n"
         rendered=self.render(sources)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'qshd_selinux_activation.py').write_text("raise AssertionError('poisoned filesystem import')")
@@ -108,10 +117,10 @@ class RenderTests(unittest.TestCase):
 
     def test_protocol_duplicate_noncanonical_wrong_binding_and_extra_refuse(self):
         request=embed._request(self.trusted)
-        frame=dict(schema=1,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING')
+        frame=dict(schema=2,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING')
         canonical=json.dumps(frame,sort_keys=True,separators=(',',':'))
         wrong=dict(frame,request_sha256='b'*64)
-        for line in (canonical.replace('"schema":1','"schema":1,"schema":1'),
+        for line in (canonical.replace('"schema":2','"schema":2,"schema":2'),
                      json.dumps(frame),json.dumps(wrong,sort_keys=True,separators=(',',':')),
                      canonical+'\n'+canonical,canonical+' trailing'):
             with self.subTest(line=line):
@@ -142,11 +151,27 @@ class RenderTests(unittest.TestCase):
 
     def test_synthetic_unsettled_outcome_cannot_become_success(self):
         request=embed._request(self.trusted)
-        frame=json.dumps(dict(schema=1,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING'),sort_keys=True,separators=(',',':'))
+        frame=json.dumps(dict(schema=2,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING'),sort_keys=True,separators=(',',':'))
         harness="import sys;from dataclasses import replace;sys.path.insert(0,"+repr(str(self.root))+");import qshd_selinux_provider_pre as p;p.os.geteuid=lambda:0\n"
         harness+="class RefuseOutcome(p._Owner):\n def _run(self,*args,**kwargs):\n  streams=super()._run(*args,**kwargs);self._last=replace(self._last,settled=False);return streams\n"
         harness+="p._Owner=RefuseOutcome;raise SystemExit(p.run_embedded_pre("+repr('print('+repr(frame)+')')+","+repr(request)+"))"
         result=subprocess.run([sys.executable,'-I','-B','-c',harness],capture_output=True,timeout=15)
         self.assertEqual(result.returncode,1,result.stderr);self.assertEqual(result.stdout,b'')
+
+class NormalForwardingTests(unittest.TestCase):
+    setUp=RenderTests.setUp
+    def test_rescued_or_incomplete_outcomes_never_forward_valid_capsule_frame(self):
+        request=embed._request(self.trusted)
+        frame=json.dumps(dict(schema=2,phase='provider-pre-fresh',request_sha256=hashlib.sha256(request).hexdigest(),operation_id='a'*32,state='PENDING'),sort_keys=True,separators=(',',':'))
+        for change in ({'natural':False},{'stdout_eof':False},{'stderr_eof':False},
+                       {'group_term_attempts':1},{'adopted_term_attempts':1},{'kill_attempts':1}):
+            harness="import sys;from dataclasses import replace;sys.path.insert(0,"+repr(str(self.root))+");import qshd_selinux_provider_pre as p;p.os.geteuid=lambda:0\n"
+            harness+="class ChangedOutcome(p._Owner):\n def _run(self,*args,**kwargs):\n  streams=super()._run(*args,**kwargs);self._last=replace(self._last,**"+repr(change)+");return streams\n"
+            harness+="p._Owner=ChangedOutcome;raise SystemExit(p.run_embedded_pre("+repr('print('+repr(frame)+')')+","+repr(request)+"))"
+            with self.subTest(change=change):
+                result=subprocess.run([sys.executable,'-I','-B','-c',harness],capture_output=True,timeout=15)
+                self.assertEqual(result.returncode,1,result.stderr);self.assertEqual(result.stdout,b'')
+                self.assertEqual(result.stderr,b'PROVIDER_PRE_REFUSED\n')
+
 
 if __name__=='__main__':unittest.main()

@@ -19,16 +19,20 @@ import qshd_selinux_activation_state as state
 
 
 def document(kind='PENDING', operation='b'*32):
-    return dict(schema=1,state=kind,operation_id=operation,profile='fedora44-targeted-v1',
-                abi=1,query_profile=1,
-                artifact=dict(provider_version='0.2.0-1.fc44',manifest_sha256='c'*64,pp_sha256='d'*64),
-                module=dict(name='qshd',priority=400,store='targeted',format='pp'),
-                completion=None if kind=='PENDING' else dict(load='normal-install-reload-v1',
-                    extracted_hll_sha256='d'*64,contexts=dict(registry_sha256='e'*64,receipts_sha256='f'*64)))
+    return dict(schema=2,state=kind,operation_id=operation,profile='fedora44-targeted-pair-v2',
+                abi=2,query_profile=1,
+                artifact=dict(provider_version='0.2.0-1.fc44',manifest_sha256='c'*64,
+                              core_pp_sha256='d'*64,contexts_pp_sha256='9'*64),
+                modules=dict(core=dict(name='qshd',priority=400,store='targeted',format='pp'),
+                             contexts=dict(name='qshd_contexts',priority=400,store='targeted',format='pp')),
+                intent='provider-fresh',basis=None,
+                completion=None if kind=='PENDING' else dict(load='normal-pair-install-reload-v2',
+                    extracted_hll_sha256=dict(core='d'*64,contexts='9'*64),
+                    contexts=dict(registry_sha256='e'*64,receipts_sha256='f'*64)))
 
 
 def encoded(kind='PENDING', operation='b'*32):return json.dumps(document(kind,operation)).encode()
-TRUST=model.TrustedArtifact('0.2.0-1.fc44','c'*64,'d'*64)
+TRUST=model.TrustedArtifact('0.2.0-1.fc44','c'*64,'d'*64,'9'*64)
 BINDING=model.ContextBinding('e'*64,'f'*64)
 
 
@@ -188,6 +192,23 @@ class SlotTests(unittest.TestCase):
                     self.assertEqual(outcome.record.state,'COMPLETE' if event in ('stage_file_sync','before_slot_rename') else 'PENDING')
                 self.assertEqual(list(self.directory.glob('.qshd-*')),[])
 
+    def test_basis_a_transfers_to_null_complete_b_and_intent_is_immutable(self):
+        for switch in (False,True):
+            with self.subTest(switch=switch):
+                self.write(encoded('COMPLETE','a'*32))
+                pending=document();pending['intent']='provider-refresh'
+                old=document('COMPLETE')
+                old['artifact']['manifest_sha256']='8'*64
+                pending['basis']={key:old[key] for key in ('artifact','completion')}
+                with self.slot().writer() as writer:
+                    token=writer.begin_pending(json.dumps(pending).encode(),writer.capture_current())
+                    complete=document('COMPLETE');complete['intent']='consumer-install' if switch else 'provider-refresh'
+                    if switch:
+                        with self.assertRaises(state.SlotError):self.complete(writer,token,json.dumps(complete).encode())
+                    else:
+                        result=self.complete(writer,token,json.dumps(complete).encode())
+                        self.assertIsNone(result.record.basis)
+
     def test_completion_header_trust_and_current_pending_must_match(self):
         for change in ('operation','artifact','trusted','binding','pending-data','pending-inode'):
             with self.subTest(change=change):
@@ -197,7 +218,7 @@ class SlotTests(unittest.TestCase):
                     doc=document('COMPLETE');kwargs={}
                     if change=='operation':doc['operation_id']='c'*32
                     elif change=='artifact':doc['artifact']['provider_version']='different'
-                    elif change=='trusted':kwargs['artifact']=model.TrustedArtifact('different','c'*64,'d'*64)
+                    elif change=='trusted':kwargs['artifact']=model.TrustedArtifact('different','c'*64,'d'*64,'9'*64)
                     elif change=='binding':kwargs['binding']=model.ContextBinding('a'*64,'f'*64)
                     elif change=='pending-data':self.path.write_bytes(self.path.read_bytes()+b' ')
                     else:self.path.unlink();self.write(encoded())

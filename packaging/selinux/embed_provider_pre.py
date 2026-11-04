@@ -17,9 +17,9 @@ CHILD_LIMIT=98304
 
 
 def _request(trusted):
-    return json.dumps(dict(schema=1,phase='provider-pre-fresh',artifact=dict(
+    return json.dumps(dict(schema=2,phase='provider-pre-fresh',artifact=dict(
         provider_version=trusted.provider_version,manifest_sha256=trusted.manifest_sha256,
-        pp_sha256=trusted.pp_sha256)),sort_keys=True,separators=(',',':')).encode('ascii')
+        core_pp_sha256=trusted.core_pp_sha256,contexts_pp_sha256=trusted.contexts_pp_sha256)),sort_keys=True,separators=(',',':')).encode('ascii')
 
 
 def _loader(source_map):
@@ -46,7 +46,7 @@ raise SystemExit(_pre._child_main('''+repr(request)+''',sys.argv[1:]))
 '''
 
 
-def render(source_map,trusted_artifact,*,artifact_bytes,pp_bytes):
+def render(source_map,trusted_artifact,*,artifact_bytes,core_pp_bytes,contexts_pp_bytes):
     if type(source_map) is not dict or set(source_map)!=set(MODULES):raise ValueError('SOURCE_MAP')
     for name,data in source_map.items():
         if type(data) is not bytes or not data or len(data)>131072 or b'\0' in data:raise ValueError('SOURCE_BYTES')
@@ -54,9 +54,11 @@ def render(source_map,trusted_artifact,*,artifact_bytes,pp_bytes):
         except (SyntaxError,UnicodeError):raise ValueError('SOURCE_BYTES') from None
     if type(trusted_artifact) is not TrustedArtifact:raise ValueError('ARTIFACT')
     if (type(artifact_bytes) is not bytes or not 0<len(artifact_bytes)<=65536 or
-            type(pp_bytes) is not bytes or not 0<len(pp_bytes)<=16*1024**2 or
+            type(core_pp_bytes) is not bytes or not 0<len(core_pp_bytes)<=16*1024**2 or
+            type(contexts_pp_bytes) is not bytes or not 0<len(contexts_pp_bytes)<=16*1024**2 or
             hashlib.sha256(artifact_bytes).hexdigest()!=trusted_artifact.manifest_sha256 or
-            hashlib.sha256(pp_bytes).hexdigest()!=trusted_artifact.pp_sha256 or
+            hashlib.sha256(core_pp_bytes).hexdigest()!=trusted_artifact.core_pp_sha256 or
+            hashlib.sha256(contexts_pp_bytes).hexdigest()!=trusted_artifact.contexts_pp_sha256 or
             _artifact(artifact_bytes)!=trusted_artifact.provider_version):raise ValueError('ARTIFACT')
     request=_request(trusted_artifact);child=_child_source(source_map,request)
     if len(child.encode('utf-8'))>CHILD_LIMIT:raise ValueError('CHILD_SIZE')

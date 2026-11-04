@@ -23,7 +23,7 @@ PHASES={'provider-post-pristine':'COMPLETE','consumer-pre-fresh':'PENDING',
         'consumer-preun-final':'PENDING'}
 RUNTIME_MODULES=tuple('qshd_selinux_'+name+'.py' for name in (
     'activation','activation_state','contexts','transaction','fs','registry',
-    'process','modules','module_observer','api','queries','files','observer',
+    'process','modules','module_observer','api','queries','files','retained_labels','observer',
     'reference_loader','package_state','module_install','first_activation',
     'consumer_activation','phase','rpm_query'))+('stop_guard.py',)
 TRUST={'provider_version':'fixture','manifest_sha256':'a'*64,'core_pp_sha256':'b'*64,'contexts_pp_sha256':'f'*64}
@@ -51,7 +51,7 @@ class ProtocolTests(unittest.TestCase):
         return request,result
 
     def test_fixed_five_requests_and_exact_response_binding(self):
-        self.assertEqual(self.phase._PHASES,PHASES)
+        self.assertEqual(self.phase._PHASES,PHASES|{'provider-pre-owned':'PENDING','provider-post-owned':'COMPLETE'})
         for phase in PHASES:
             request,frame=self.response(phase)
             self.assertEqual(self.phase._request(phase),request)
@@ -136,8 +136,26 @@ class DispatchTests(unittest.TestCase):
              patch.object(consumer._Production,'guard',side_effect=lambda deadline:calls.append(('guard',deadline))),\
              patch.object(package,'production',side_effect=AssertionError('entry must not nest a package lease')):
             for name in PHASES:self.assertIs(phase._dispatch(name,deadline=530.0),records[name])
-        self.assertEqual(calls,[('guard',530.0),('bridge',530.0),('pre',True,530.0),('pre',False,530.0),('post',530.0),
+        self.assertEqual(calls,[('bridge',530.0),('pre',True,530.0),('pre',False,530.0),('post',530.0),
                                 ('erase',530.0)])
+
+    def test_pristine_dispatch_real_coordinator_owns_exact_two_original_deadline_guards(self):
+        from scripts.tests.test_selinux_first_activation import PristinePendingBridgeTests
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_consumer_activation as consumer
+        fixture=PristinePendingBridgeTests();fixture.setUp()
+        try:
+            fixture.b.now=__import__('time').monotonic();deadline=fixture.b.now+430
+            calls=[];guard=fixture.b.guard
+            def counted(end):calls.append(end);guard(end)
+            fixture.b.guard=counted
+            with patch.object(first,'_Production',return_value=fixture.b),patch.object(consumer._Production,'guard',side_effect=counted):
+                result=load_phase()._dispatch('provider-post-pristine',deadline=deadline)
+            self.assertEqual(result.state,'COMPLETE')
+            self.assertEqual(fixture.b.loads,1)
+            self.assertEqual(calls,[deadline,deadline])
+            self.assertEqual(fixture.b.events.count('guard'),2)
+        finally:fixture.doCleanups()
 
     def patched_consumer(self,erase):
         import qshd_selinux_first_activation as first
@@ -543,7 +561,7 @@ else:
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(result.stdout,b'')
 
-    def test_five_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
+    def test_seven_modes_dispatch_through_actual_assembled_payload_and_fixed_importer(self):
         spec=importlib.util.spec_from_file_location('integrated_payload_builder',SOURCE/'assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
         with tempfile.TemporaryDirectory() as directory:
@@ -554,11 +572,11 @@ else:
             expected={name:hashlib.sha256((SOURCE/name).read_bytes()).hexdigest() for name in RUNTIME_MODULES}
             expected.update({path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (pp,contexts_pp,artifact,pam)})
             out=base/'payload';inventory=builder.assemble_payload(SOURCE,pp,contexts_pp,artifact,pam,expected,out,1000000000)
-            self.assertEqual(len(expected),25)
-            self.assertEqual(len(inventory),26)
+            self.assertEqual(len(expected),26)
+            self.assertEqual(len(inventory),27)
             installed=out/'usr/libexec/qshd-selinux'
             poison=base/'poison';poison.mkdir()
-            for name in ('qshd_selinux_consumer_activation.py','qshd_selinux_rpm_query.py'):
+            for name in ('qshd_selinux_consumer_activation.py','qshd_selinux_rpm_query.py','qshd_selinux_retained_labels.py'):
                 (poison/name).write_text('raise AssertionError("source fallback")')
             code="""import importlib.util,sys,pathlib
 from unittest.mock import patch
@@ -592,6 +610,8 @@ import qshd_selinux_consumer_activation as consumer
 import qshd_selinux_first_activation as first
 import qshd_selinux_package_state as package
 import qshd_selinux_rpm_query as query
+import qshd_selinux_retained_labels as retained
+assert pathlib.Path(retained.__file__).parent==root
 assert pathlib.Path(query.__file__).parent==root
 from qshd_selinux_activation import Activation,TrustedArtifact,ModuleIdentity,ModulePair,PairDigests,HistoricalBasis,Completion,ContextBinding
 state=phase._PHASES[mode];trust=TrustedArtifact('fixture','a'*64,'b'*64,'f'*64)
@@ -604,13 +624,17 @@ def pre(*,fresh,deadline):calls.append(('pre',fresh,deadline));return record
 def post(*,deadline):calls.append(('post',deadline));return record
 def bridge(*,deadline):calls.append(('bridge',deadline));return record
 def erase(*,deadline):calls.append(('erase',deadline));return record
+def provider_pre(incoming_artifact,*,deadline):
+ assert incoming_artifact==trust
+ calls.append(('provider-pre',deadline));return record
+def provider_post(*,deadline):calls.append(('provider-post',deadline));return record
 assert pathlib.Path(consumer.__file__).parent==root
-with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
- result=phase._dispatch(mode,deadline=1234.0)
+with patch.object(consumer,'invalidate_installed_consumer_pre',side_effect=pre),patch.object(consumer,'finalize_installed_owned_pending_consumer',side_effect=post),patch.object(consumer,'invalidate_installed_consumer_erase',side_effect=erase),patch.object(first,'activate_installed_pristine_pending_first',side_effect=bridge),patch.object(first,'invalidate_installed_provider_upgrade',side_effect=provider_pre),patch.object(first,'activate_installed_owned_provider',side_effect=provider_post),patch.object(consumer._Production,'guard',side_effect=lambda end:calls.append(('guard',end))),patch.object(package,'production',side_effect=AssertionError('nested package operation')):
+ result=phase._dispatch(mode,deadline=1234.0,incoming_artifact=trust if mode=='provider-pre-owned' else None)
  assert result is record
- request=phase._request(mode);frame=phase._response(result,request)
+ request=phase._request(mode,trust if mode=='provider-pre-owned' else None);frame=phase._response(result,request)
  assert phase._parse_response(frame,request)['state']==state
-expected={'provider-post-pristine':[('guard',1234.0),('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)],'consumer-preun-final':[('erase',1234.0)]}
+expected={'provider-pre-owned':[('provider-pre',1234.0)],'provider-post-owned':[('provider-post',1234.0)],'provider-post-pristine':[('bridge',1234.0)],'consumer-pre-fresh':[('pre',True,1234.0)],'consumer-pre-installed':[('pre',False,1234.0)],'consumer-post-owned':[('post',1234.0)],'consumer-preun-final':[('erase',1234.0)]}
 assert calls==expected[mode]
 for name,module in list(sys.modules.items()):
  if name in phase._MODULES:
@@ -618,7 +642,7 @@ for name,module in list(sys.modules.items()):
 assert str(root) not in sys.path
 """
             env=os.environ|dict(PYTHONPATH=str(poison),HOME=directory,XDG_CONFIG_HOME=directory,XDG_CACHE_HOME=directory,HISTFILE='/dev/null')
-            for mode in (*PHASES,'preloaded-query','missing-query'):
+            for mode in (*PHASES,'provider-pre-owned','provider-post-owned','preloaded-query','missing-query'):
                 if mode=='missing-query':
                     (installed/'qshd_selinux_rpm_query.py').unlink()
                 with self.subTest(mode=mode):
@@ -626,10 +650,10 @@ assert str(root) not in sys.path
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(result.stdout,b'')
 
-    def test_exact_offline_payload_twenty_one_modules_twentysix_files_no_renderer(self):
+    def test_exact_offline_payload_twenty_two_modules_twentyseven_files_no_renderer(self):
         spec=importlib.util.spec_from_file_location('phase_payload_builder',SOURCE/'assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
-        self.assertEqual(set(builder.MODULES),set(RUNTIME_MODULES));self.assertEqual(len(builder.MODULES),21)
+        self.assertEqual(set(builder.MODULES),set(RUNTIME_MODULES));self.assertEqual(len(builder.MODULES),22)
         with tempfile.TemporaryDirectory() as directory:
             base=Path(directory);source=base/'source';source.mkdir()
             for name in RUNTIME_MODULES:shutil.copy2(SOURCE/name,source/name)
@@ -641,11 +665,120 @@ assert str(root) not in sys.path
             expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in RUNTIME_MODULES}
             expected.update({path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (pp,contexts_pp,artifact,pam)})
             out=base/'out';inventory=builder.assemble_payload(source,pp,contexts_pp,artifact,pam,expected,out,1000000000)
-            self.assertEqual(len(inventory),26)
+            self.assertEqual(len(inventory),27)
             actual={str(path.relative_to(out)) for path in out.rglob('*') if path.is_file()}
             self.assertEqual(actual,{'usr/libexec/qshd-selinux/'+name for name in RUNTIME_MODULES}|{
                 'usr/share/qshd-selinux/'+name for name in ('qshd.pp','qshd_contexts.pp','artifact.json','qshd.fedora-selinux','reference.json')})
             for name in RUNTIME_MODULES:self.assertEqual((out/'usr/libexec/qshd-selinux'/name).read_bytes(),(source/name).read_bytes())
+
+
+
+class OwnedProviderProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.phase=load_phase()
+        from qshd_selinux_activation import TrustedArtifact
+        self.incoming=TrustedArtifact(**TRUST)
+        self.request=canonical(dict(schema=2,phase='provider-pre-owned',artifact=TRUST))
+
+    def pending(self):
+        from qshd_selinux_activation import (Activation,TrustedArtifact,ModulePair,ModuleIdentity,
+            HistoricalBasis,Completion,PairDigests,ContextBinding)
+        old=TrustedArtifact('old-fixture','1'*64,'2'*64,'3'*64)
+        basis=HistoricalBasis(old,Completion('normal-pair-install-reload-v2',PairDigests('2'*64,'3'*64),ContextBinding('4'*64,'5'*64)))
+        return Activation(2,'PENDING','c'*32,'fedora44-targeted-pair-v2',2,1,self.incoming,
+            ModulePair(ModuleIdentity('qshd',400,'targeted','pp'),ModuleIdentity('qshd_contexts',400,'targeted','pp')),
+            'provider-refresh',basis,None)
+
+    def test_owned_pre_accepts_canonical_independently_supplied_target_only(self):
+        try:observed=self.phase._parse_request(self.request)
+        except self.phase.PhaseError:self.fail('canonical schema2 provider-pre-owned authority is not admitted')
+        self.assertEqual(observed,dict(schema=2,phase='provider-pre-owned',artifact=TRUST))
+        self.assertEqual(self.phase._request('provider-pre-owned',self.incoming),self.request)
+        for name in (*PHASES,'provider-post-owned'):
+            with self.subTest(name=name),self.assertRaises(self.phase.PhaseError):
+                self.phase._request(name,self.incoming)
+        with self.assertRaises(self.phase.PhaseError):self.phase._request('provider-pre-owned')
+        for raw in (canonical(dict(schema=2,phase='provider-pre-owned')),self.request+b' ',
+                    self.request.replace(b'"schema":2',b'"schema":2,"schema":2'),
+                    canonical(dict(schema=True,phase='provider-pre-owned',artifact=TRUST)),
+                    canonical(dict(schema=2,phase='provider-pre-owned',artifact=TRUST|{'pp_sha256':'b'*64})),
+                    canonical(dict(schema=2,phase='provider-post-owned',artifact=TRUST)),b'x'*1025):
+            with self.subTest(raw=raw[:64]),self.assertRaises(self.phase.PhaseError):self.phase._parse_request(raw)
+
+    def test_owned_pre_success_and_failure_frames_bind_target_b(self):
+        raw=self.phase._response(self.pending(),self.request)
+        frame=self.phase._parse_response(raw,self.request)
+        self.assertEqual(frame['artifact'],TRUST)
+        other=TRUST|{'core_pp_sha256':'9'*64}
+        with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(canonical(frame|{'artifact':other})+b'\n',self.request)
+        foreign=canonical(dict(schema=2,phase='provider-pre-owned',artifact=other))
+        with self.assertRaises(self.phase.PhaseError):self.phase._parse_response(raw,foreign)
+        from qshd_selinux_first_activation import CoordinatorError
+        failure=self.phase._failure(CoordinatorError('INPUT'),self.request)
+        self.assertEqual(self.phase._parse_failure(failure,self.request)['request'],json.loads(self.request))
+        with self.assertRaises(self.phase.PhaseError):self.phase._parse_failure(failure,foreign)
+
+    def test_owned_routes_dispatch_directly_once_with_original_deadline(self):
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_consumer_activation as consumer
+        import qshd_selinux_package_state as package
+        pre=object();post=object();calls=[];deadline=object()
+        def before(target,*,deadline):calls.append(('pre',target,deadline));return pre
+        def after(*,deadline):calls.append(('post',deadline));return post
+        with patch.object(first,'invalidate_installed_provider_upgrade',side_effect=before),\
+             patch.object(first,'activate_installed_owned_provider',side_effect=after),\
+             patch.object(consumer._Production,'guard',side_effect=AssertionError('phase must not duplicate provider guard')),\
+             patch.object(package,'production',side_effect=AssertionError('phase must not nest package lease')):
+            self.assertIs(self.phase._dispatch('provider-pre-owned',deadline=deadline,incoming_artifact=self.incoming),pre)
+            self.assertIs(self.phase._dispatch('provider-post-owned',deadline=deadline),post)
+        self.assertEqual(calls,[('pre',self.incoming,deadline),('post',deadline)])
+
+    def test_parent_forwards_full_owned_request_and_unchanged_phase_bounds(self):
+        import io
+        from types import SimpleNamespace
+        from qshd_selinux_process import _Outcome,_Streams
+        raw=self.phase._response(self.pending(),self.request);calls=[]
+        class Owner:
+            _last=_Outcome(raw,b'',0,None,True,natural=True,stdout_eof=True,stderr_eof=True)
+            def _run(inner,argv,cwd,*,deadline):calls.append((argv,cwd,deadline));return _Streams(raw,b'')
+        output=SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(self.phase,'_resources'),patch.object(self.phase,'_owner',return_value=Owner()),\
+             patch.object(self.phase.time,'monotonic',return_value=101.0),patch.object(self.phase.sys,'stdout',output):
+            self.assertEqual(self.phase._parent('provider-pre-owned',100.0,incoming_artifact=self.incoming),0)
+        self.assertEqual(calls,[(('/usr/bin/python3','-I','-B',self.phase._SCRIPT,self.phase._CHILD,self.request.decode(),'100.0','530.0'),'/',540.0)])
+        self.assertEqual(output.buffer.getvalue(),raw)
+
+    def test_child_reconstructs_exact_incoming_authority_with_original_end(self):
+        import io
+        from types import SimpleNamespace
+        calls=[];output=SimpleNamespace(buffer=io.BytesIO())
+        def dispatch(phase,*,deadline,incoming_artifact=None):
+            calls.append((phase,deadline,incoming_artifact));return self.pending()
+        with patch.object(self.phase,'_resources'),patch.object(self.phase,'_dispatch',side_effect=dispatch),\
+             patch.object(self.phase.time,'monotonic',return_value=101.0),patch.object(self.phase.sys,'stdout',output):
+            self.assertEqual(self.phase._child_main([self.request.decode(),'100.0','530.0']),0)
+        self.assertEqual(calls,[('provider-pre-owned',530.0,self.incoming)])
+        self.assertEqual(self.phase._parse_response(output.buffer.getvalue(),self.request)['artifact'],TRUST)
+
+    def test_public_owned_argument_uses_fixed_loader_and_rejects_other_extra_args(self):
+        program="""import importlib.util,sys,json
+spec=importlib.util.spec_from_file_location('owned_entry',sys.argv[1]);m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
+raw=sys.argv[2];expected=json.loads(raw);seen=[]
+def parent(phase,started,*,incoming_artifact=None):
+ assert phase=='provider-pre-owned' and incoming_artifact.__dict__==expected
+ seen.append(phase);return 0
+m._parent=parent
+sys.argv=[str(m.__file__),'provider-pre-owned',raw]
+assert m.main()==0 and seen==['provider-pre-owned']
+"""
+        result=subprocess.run([sys.executable,'-I','-B','-c',program,str(SCRIPT),canonical(TRUST).decode()],capture_output=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,b'')
+        for args in (['provider-pre-owned'],['provider-post-owned',canonical(TRUST).decode()],
+                     ['consumer-pre-fresh',canonical(TRUST).decode()],['provider-pre-owned',json.dumps(TRUST)],
+                     ['provider-pre-owned',canonical(TRUST|{'extra':True}).decode()]):
+            with self.subTest(args=args):
+                result=subprocess.run([sys.executable,'-I','-B',str(SCRIPT),*args],capture_output=True,timeout=10)
+                self.assertEqual((result.returncode,result.stdout,result.stderr),(1,b'',b'PHASE_REFUSED\n'))
 
 
 if __name__=='__main__':unittest.main()

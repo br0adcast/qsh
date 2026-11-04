@@ -94,6 +94,36 @@ class RetainedLabels:
         self._clock=_clock;self._get=_getxattr;self._list=_listxattr;self._set=_setxattr
         self._used=False
 
+    def managed_inspection(self,*,deadline):
+        return self._borrowed(deadline,False)
+
+    def pristine_install(self,*,deadline):
+        return self._borrowed(deadline,True)
+
+    @contextmanager
+    def _borrowed(self,deadline,pristine):
+        if self._used:_fail()
+        self._used=True
+        try:valid=type(deadline) in (int,float) and math.isfinite(deadline)
+        except OverflowError:valid=False
+        if not valid:_fail()
+        scope=_PristineInstall(self,deadline) if pristine else _ManagedInspection(self,deadline)
+        try:
+            scope._setup()
+            yield scope
+            scope._finish()
+        except BaseException as error:
+            scope._state='failed'
+            if scope._attempted:raise RetainedLabelOutcomeUncertain('RETAINED_LABEL_OUTCOME_UNCERTAIN') from None
+            if not isinstance(error,Exception):raise
+            raise RetainedLabelError('RETAINED_LABEL_REFUSED') from None
+        finally:
+            pending=sys.exc_info()[1]
+            if scope._close():
+                if pending is not None:pending.add_note('RETAINED_LABEL_CLEANUP_FAILED')
+                elif scope._attempted:raise RetainedLabelOutcomeUncertain('RETAINED_LABEL_OUTCOME_UNCERTAIN') from None
+                else:raise RetainedLabelError('RETAINED_LABEL_REFUSED') from None
+
     @contextmanager
     def inspection(self,*,deadline):
         if self._used:_fail()
@@ -222,7 +252,7 @@ class _Inspection(SafeFiles):
                 if path not in self._objects:_fail()
                 fd=self._objects[path]
             before=self._metadata(fd,parent,name,kind,role)
-            context=targets[path] if targets is not None else managed
+            context=(targets(path,kind,managed) if callable(targets) else targets[path]) if targets is not None else managed
             raw=self._raw(before,context,_RAW_ROLES[path])
             if api is not None:
                 if api.file_context(fd)!=context:_fail()
@@ -354,3 +384,118 @@ class _Inspection(SafeFiles):
         except BaseException:failure=True
         self._cleanup_failed=failure
         return failure
+
+
+class _ManagedInspection(_Inspection):
+    """Held finite descriptors; native status custody belongs only to the caller."""
+    def __init__(self,factory,deadline):
+        super().__init__(factory,deadline)
+        self._status=None;self._final_status=None;self._current_targets=None
+
+    def _borrow(self,status):
+        from qshd_selinux_api import _StatusToken
+        if type(status) is not _StatusToken:_fail()
+        api=status.require_open();self._check()
+        return api
+
+    def _read(self,status,*,initial=False,pristine=False):
+        api=self._borrow(status);targets={}
+        with api.file_defaults() as defaults:
+            def target(path,kind,managed):
+                value=defaults.lookup(path,kind);raw=_context(value)
+                name=raw.decode('ascii').split(':',3)[2]
+                if pristine:
+                    if name.startswith('qshd_') or name=='unlabeled_t':_fail()
+                elif value!=managed:_fail()
+                api.check_context(value);self._check();targets[path]=value
+                return value
+            paths,alias=self._sample(initial=initial,api=api,targets=target)
+        if self._borrow(status) is not api:_fail()
+        return RetainedLabelObservation(paths,alias),targets
+
+    def capture(self,*,status):
+        with self._errors():
+            self._operation('open')
+            value,targets=self._read(status,initial=True)
+            self._observed=value;self._expected=value;self._current_targets=targets
+            self._state='captured';return value
+
+    def recheck(self,token,*,status):
+        with self._errors():
+            if self._state not in ('captured','checked') or token is not self._observed:_fail()
+            self._state='failed'
+            value,targets=self._read(status)
+            if value!=token or targets!=self._current_targets:_fail()
+            self._final_status=status;self._state='checked'
+
+    def _finish(self):
+        with self._errors():
+            if self._state!='checked' or self._final_status is None:_fail()
+            self._final_status.require_closed()
+            if self._sample(targets=self._current_targets)!=(self._expected.paths,self._expected.alias):_fail()
+            self._check()
+
+
+class _PristineInstall(_ManagedInspection):
+    """Finite default-to-managed transition with complete target admission first."""
+    def capture_defaults(self,*,status):
+        with self._errors():
+            self._operation('open')
+            value,targets=self._read(status,initial=True,pristine=True)
+            self._observed=value;self._expected=value;self._current_targets=targets
+            self._state='pristine';return value
+
+    def recheck_defaults(self,token,*,status):
+        with self._errors():
+            if self._state not in ('pristine','pristine-checked') or token is not self._observed:_fail()
+            self._state='failed'
+            value,targets=self._read(status,pristine=True)
+            if value!=token or targets!=self._current_targets:_fail()
+            self._status=status;self._state='pristine-checked'
+
+    def apply_managed(self,token,*,status):
+        with self._errors():
+            self._operation('pristine-checked',token)
+            self._status.require_closed();api=self._borrow(status)
+            paths,alias=self._sample(api=api,targets=self._current_targets)
+            if (paths,alias)!=(token.paths,token.alias):_fail()
+            targets={}
+            # Admit the entire target vector before the first setter attempt.
+            with api.file_defaults() as defaults:
+                for item in paths:
+                    if not item.present:continue
+                    kind,managed=next((row[1],row[3]) for row in _ITEMS if row[0]==item.path)
+                    target=defaults.lookup(item.path,kind)
+                    if target!=managed:_fail()
+                    _context(target);api.check_context(target);self._check();targets[item.path]=target
+            self._borrow(status)
+            active=dict(self._current_targets);current=token
+            for index,item in enumerate(paths):
+                if not item.present:continue
+                if self._sample(api=api,targets=active)!=(current.paths,current.alias):_fail()
+                self._borrow(status);self._attempted=True
+                fd=self._objects[item.path]
+                self._factory._set(fd,_LABEL,targets[item.path].encode('ascii')+b'\0',os.XATTR_REPLACE)
+                self._check()
+                parent=self._parents[str(Path(item.path).parent)];name=Path(item.path).name
+                kind,role=next((row[1],row[2]) for row in _ITEMS if row[0]==item.path)
+                updated=self._metadata(fd,parent,name,kind,role)
+                raw=self._raw(updated,targets[item.path],_RAW_ROLES[item.path])
+                if not self._preserved(item.metadata,updated) or api.file_context(fd)!=targets[item.path]:_fail()
+                os.fsync(fd);self._check()
+                if self._metadata(fd,parent,name,kind,role)!=updated:_fail()
+                replacement=RetainedPath(item.path,True,updated,raw)
+                current=RetainedLabelObservation(current.paths[:index]+(replacement,)+current.paths[index+1:],alias)
+                active[item.path]=targets[item.path]
+            self._borrow(status)
+            result=RestoredLabelObservation(current.paths,alias,tuple(targets.items()))
+            self._restored=result;self._expected=result;self._current_targets=targets
+            self._state='managed';return result
+
+    def recheck_managed(self,result,*,status):
+        with self._errors():
+            if self._state not in ('managed','checked') or result is not self._restored:_fail()
+            self._state='failed'
+            value,targets=self._read(status)
+            if (value.paths,value.alias)!=(result.paths,result.alias) or targets!=self._current_targets:_fail()
+            self._final_status=status;self._state='checked'

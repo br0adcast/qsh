@@ -136,8 +136,9 @@ class Lease:
   if hasattr(self,'fd'):os.close(self.fd)
   if case('exit-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
  def inspection(self,*args):return self
+ def managed_inspection(self,**kwargs):return self
  def routing(self):event('routing');return ROUTING
- def capture(self):
+ def capture(self,*,status=None):
   event('capture-'+self.name)
   if case('capture-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
   if self.name=='slot':
@@ -147,13 +148,15 @@ class Lease:
   elif self.name in ('registry','context'):result=N(registry_bytes=b'{}' if case('drift') else ROUTING,registry_sha256='c'*64,receipts_sha256='d'*64)
   else:result=object()
   assert self.baseline is None;self.baseline=result;return result
- def recheck(self,baseline):
+ def recheck(self,baseline,*,status=None):
   event('recheck-'+self.name);assert baseline is self.baseline
   if case('recheck-'+self.name):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
 @contextmanager
 def window(api):
  event('enter-window')
- try:yield object()
+ class Status:
+  def require_open(self):return api
+ try:yield Status()
  finally:event('exit-window')
  if case('exit-window'):raise RuntimeError('DO_NOT_EXPOSE_PRIVATE_DETAIL')
 '''
@@ -179,7 +182,7 @@ class ChildTests(unittest.TestCase):
         import fcntl,os,shutil,subprocess,tempfile
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
-            for name in ('qshd_selinux_observer.py','qshd_selinux_activation.py','qshd_selinux_process.py'):
+            for name in ('qshd_selinux_observer.py','qshd_selinux_activation.py','qshd_selinux_process.py','qshd_selinux_first_activation.py','qshd_selinux_modules.py'):
                 shutil.copy2(ROOT/name,root/name)
             # Only this disposable copy substitutes UID admission; all filesystem/native factories below are private fixtures.
             path=root/'qshd_selinux_observer.py'
@@ -189,13 +192,14 @@ class ChildTests(unittest.TestCase):
             (root/'case').write_text(case);(root/'common.py').write_text(COMMON)
             (root/'pam').write_bytes((ROOT.parent/'pam.d/qshd.fedora-selinux').read_bytes())
             modules={
-                'qshd_selinux_activation_state':'from common import *\ndef production():return Lease("slot")\n',
+                'qshd_selinux_activation_state':'from common import *\nclass SlotError(ValueError):pass\nclass OutcomeUncertain(SlotError):pass\ndef production():return Lease("slot")\n',
                 'qshd_selinux_registry':'from common import *\ndef production():return Lease("registry")\n',
                 'qshd_selinux_transaction':'from common import *\ndef production(paths):\n assert paths==["/fixed"]\n return Lease("context")\n',
                 'qshd_selinux_module_observer':'from common import *\ndef production_observer(trust,**kwargs):\n assert trust==TRUST\n return Lease("module")\n',
                 'qshd_selinux_files':'from common import *\ndef production(pam,api):\n assert type(pam)is bytes\n return Lease("files")\n',
-                'qshd_selinux_queries':'from common import *\nrequired_observation=window\n',
-                'qshd_selinux_api':'class SelinuxApi:pass\n'}
+                'qshd_selinux_queries':'from common import *\n@contextmanager\ndef required_observation(api,*,status=None):\n assert status.require_open()is api\n yield\n assert status.require_open()is api\n',
+                'qshd_selinux_retained_labels':'from common import *\ndef production():return Lease("retained")\n',
+                'qshd_selinux_api':'from common import *\nclass SelinuxApi:\n def status_observation(self):return window(self)\n'}
             if policy:modules['qshd_selinux_files']="raise AssertionError('deployed file observer forbidden')\n"
             for name,value in modules.items():(root/(name+'.py')).write_text(value)
             fd=os.open(root/'lock',os.O_RDWR|os.O_CREAT,0o600)
@@ -220,7 +224,7 @@ class ChildTests(unittest.TestCase):
     def test_real_pending_refusal_waits_for_every_normal_exit(self):
         result,events=self.run_child('pending')
         self.assertEqual(result['error'],'ACTIVATION_PENDING')
-        self.assertEqual(events[-6:],['exit-window','exit-files','exit-module','exit-context','exit-registry','exit-slot'])
+        self.assertEqual(events[-7:],['exit-files','exit-window','exit-module','exit-context','exit-registry','exit-slot','exit-retained'])
         for failure in ('exit-window','recheck-files','exit-slot'):
             result,_=self.run_child('pending+'+failure)
             self.assertFalse(result['ok']);self.assertNotEqual(result['error'],'ACTIVATION_PENDING')
@@ -228,14 +232,14 @@ class ChildTests(unittest.TestCase):
     def test_real_child_all_scopes_before_success(self):
         result,events=self.run_child('normal')
         self.assertTrue(result['ok'])
-        self.assertEqual(events[:6],['enter-slot','enter-registry','routing','enter-context','enter-module','enter-files'])
+        self.assertEqual(events[:8],['enter-retained','enter-slot','enter-registry','routing','enter-context','enter-module','enter-window','enter-files'])
         start=events.index('enter-window');end=events.index('exit-window')
-        for name in ('slot','registry','context','module','files'):
+        for name in ('slot','registry','context','module','files','retained'):
             self.assertLess(start,events.index('capture-'+name));self.assertLess(events.index('recheck-'+name),end)
-        self.assertEqual(events[-6:],['exit-window','exit-files','exit-module','exit-context','exit-registry','exit-slot'])
+        self.assertEqual(events[-7:],['exit-files','exit-window','exit-module','exit-context','exit-registry','exit-slot','exit-retained'])
 
     def test_real_child_pending_drift_and_every_finalizer_refuse(self):
-        for case in ('pending','drift','enter-slot','enter-registry','enter-context','enter-module','enter-files','exit-window','exit-files','exit-module','exit-context','exit-registry','exit-slot','capture-module','recheck-files'):
+        for case in ('pending','drift','enter-slot','enter-registry','enter-context','enter-module','enter-files','exit-window','exit-files','exit-module','exit-context','exit-registry','exit-slot','exit-retained','capture-module','recheck-files'):
             with self.subTest(case=case):
                 result,_=self.run_child(case);self.assertFalse(result['ok'])
 
@@ -495,12 +499,17 @@ class PolicyContextTests(unittest.TestCase):
         import qshd_selinux_queries as queries
         import qshd_selinux_api as native
         import qshd_selinux_files as files
+        import qshd_selinux_retained_labels as retained
         from contextlib import contextmanager
-        b=fixture.Bindings(self.root)
+        proof_root=Path(__import__('tempfile').mkdtemp(prefix='proof-',dir=self.root))
+        b=fixture.Bindings(proof_root)
+        import qshd_selinux_package_state as package
+        proof_package=lambda:package.PackageState(b.common,uid=__import__('os').getuid(),anchor=proof_root)
+        with proof_package().initialize():pass
         with self.reader() as reader:
             references=reader.capture();reader.recheck(references)
         trust=references.artifact;engine=b.transaction_object();slot=b.slot_object()
-        with self.pkg().operation():
+        with proof_package().operation():
             with slot.writer() as writer:
                 initial=writer.capture_current()
                 record=model.Activation(2,'PENDING','a'*32,'fedora44-targeted-pair-v2',2,1,trust,model.ModulePair(model.ModuleIdentity('qshd',400,'targeted','pp'),model.ModuleIdentity('qshd_contexts',400,'targeted','pp')),'provider-fresh',None,None)
@@ -514,7 +523,7 @@ class PolicyContextTests(unittest.TestCase):
                     if not pending:
                         complete=dataclasses.replace(record,state='COMPLETE',completion=model.Completion('normal-pair-install-reload-v2',model.PairDigests(trust.core_pp_sha256,trust.contexts_pp_sha256),binding))
                         # Fixture seeding only: real publication migration belongs to Task3.
-                        slot._publish(encode(complete),token.observation,lambda:None)
+                        writer.publish_complete(encode(complete),token,trusted_artifact=trust,trusted_context_binding=binding)
             @contextmanager
             def module_scope(actual,**kwargs):
                 self.assertEqual(actual,trust)
@@ -522,8 +531,36 @@ class PolicyContextTests(unittest.TestCase):
                     def capture(inner):b.assert_locked();b.point('module capture');return object()
                     def recheck(inner,value):b.point('module recheck')
                 yield View()
-            with self.patch.object(state,'production',return_value=slot),self.patch.object(registry,'production',return_value=__import__('types').SimpleNamespace(inspection=b.registry)),self.patch.object(transaction,'production',side_effect=lambda paths:engine),self.patch.object(modules,'production_observer',side_effect=module_scope),self.patch.object(queries,'required_observation',side_effect=lambda api:b.window()),self.patch.object(native,'SelinuxApi',return_value=object()),self.patch.object(files,'production',side_effect=AssertionError('deployed files forbidden')):
+            from scripts.tests.test_selinux_api import SharedStatus
+            from scripts.tests.test_selinux_queries import FakeApi
+            shared=SharedStatus();api=native.SelinuxApi(shared.library());query_api=FakeApi();query_api.active=True
+            for name in ('check_context','require_av','compute_create','compute_relabel','validate_transition'):
+                setattr(api,name,getattr(query_api,name))
+            @contextmanager
+            def defaults():
+                class Defaults:
+                    def lookup(inner,path,kind):raise AssertionError('all retained objects absent')
+                yield Defaults()
+            api.file_defaults=defaults
+            original_window=api.status_observation
+            @contextmanager
+            def window():
+                b.point('window enter')
+                with original_window() as token:
+                    b.status_tokens.append(token);yield token
+                b.point('window exit')
+            api.status_observation=window;b.status_tokens=[];b.observer_api=api;b.status_shared=shared;b.query_api=query_api
+            with self.patch.object(state,'production',return_value=slot),self.patch.object(registry,'production',return_value=__import__('types').SimpleNamespace(inspection=b.registry)),self.patch.object(transaction,'production',side_effect=lambda paths:engine),self.patch.object(modules,'production_observer',side_effect=module_scope),self.patch.object(native,'SelinuxApi',return_value=api),self.patch.object(retained,'production',return_value=__import__('types').SimpleNamespace(managed_inspection=lambda **kwargs:b.retained(**kwargs))),self.patch.object(files,'production',side_effect=AssertionError('deployed files forbidden')):
                 yield b,trust,binding,engine,slot
+
+    def test_current_proof_uses_runtime_bindings_native_owner(self):
+        import qshd_selinux_first_activation as first
+        from qshd_selinux_retained_labels import RetainedLabelError
+        with self.actual_policy_state() as (b,trust,binding,engine,slot):
+            with self.patch.object(first.RuntimeBindings,'window',side_effect=RuntimeError('controlled owner refusal')) as owner:
+                with self.assertRaises(RetainedLabelError):
+                    self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
+            owner.assert_called_once();self.assertEqual(b.status_shared.events,[])
 
     def test_real_temp_complete_binding_and_all_three_lock_exclusions(self):
         with self.actual_policy_state() as (b,trust,binding,engine,slot):
@@ -541,7 +578,8 @@ class PolicyContextTests(unittest.TestCase):
             before=(b.target.read_bytes(),(engine.state/'receipts').read_bytes())
             b.events.clear()
             from qshd_selinux_fs import Conflict
-            with self.assertRaisesRegex(Conflict,'^JOURNAL_PRESENT$'):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
+            from qshd_selinux_retained_labels import RetainedLabelError
+            with self.assertRaises(RetainedLabelError):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
             self.assertEqual(journal.read_bytes(),b'not recoverable JSON')
             self.assertEqual((b.target.read_bytes(),(engine.state/'receipts').read_bytes()),before)
             self.assertNotIn('window enter',b.events)
@@ -550,7 +588,8 @@ class PolicyContextTests(unittest.TestCase):
         with self.actual_policy_state(pending=True) as (b,trust,binding,engine,slot):
             with self.assertRaises(self.m._PendingRefusal):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
             b.failure='window exit'
-            with self.assertRaisesRegex(RuntimeError,'controlled window exit'):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
+            from qshd_selinux_retained_labels import RetainedLabelError
+            with self.assertRaises(RetainedLabelError):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
             self.assertEqual(b.record()['state'],'PENDING')
 
 
@@ -559,15 +598,15 @@ class PolicyChildTests(unittest.TestCase):
 
     def test_real_policy_child_succeeds_without_any_files_observer(self):
         result,events=self.run_child('normal');self.assertTrue(result['ok'])
-        self.assertEqual(events[:5],['enter-slot','enter-registry','routing','enter-context','enter-module'])
-        self.assertEqual(events[-5:],['exit-window','exit-module','exit-context','exit-registry','exit-slot'])
+        self.assertEqual(events[:6],['enter-retained','enter-slot','enter-registry','routing','enter-context','enter-module'])
+        self.assertEqual(events[-6:],['exit-window','exit-module','exit-context','exit-registry','exit-slot','exit-retained'])
         for name in ('slot','registry','context','module'):
             self.assertLess(events.index('enter-window'),events.index('capture-'+name))
             self.assertLess(events.index('recheck-'+name),events.index('exit-window'))
 
     def test_real_policy_pending_and_every_exit_are_causal(self):
         result,events=self.run_child('pending');self.assertEqual(result['error'],'ACTIVATION_PENDING')
-        self.assertEqual(events[-5:],['exit-window','exit-module','exit-context','exit-registry','exit-slot'])
+        self.assertEqual(events[-6:],['exit-window','exit-module','exit-context','exit-registry','exit-slot','exit-retained'])
         for failure in ('exit-window','exit-module','exit-context','exit-registry','exit-slot','recheck-slot','recheck-module','drift'):
             with self.subTest(failure=failure):
                 result,_=self.run_child('pending+'+failure)
@@ -580,3 +619,67 @@ class PolicyChildTests(unittest.TestCase):
                 self.assertFalse(result['ok'])
                 if case in ('setup','lock'):self.assertEqual(result['error'],'DEADLINE');self.assertLess(result['elapsed'],5)
                 else:self.assertEqual(events,[])
+
+class BorrowedRetainedTests(unittest.TestCase):
+    setUp=InstalledTests.setUp
+    actual_policy_state=PolicyContextTests.actual_policy_state
+
+    def test_real_queries_and_retained_share_one_exact_normally_closed_owner(self):
+        from scripts.tests.test_selinux_queries import expected_calls
+        with self.actual_policy_state() as (b,trust,binding,engine,slot):
+            self.assertEqual(self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110),binding)
+            self.assertEqual(b.status_shared.events,['open','updated','updated','close'])
+            self.assertEqual(b.query_api.calls,expected_calls())
+            self.assertEqual(len(b.status_tokens),1)
+            self.assertIs(b.status_tokens[0].require_closed(),b.observer_api)
+            with self.assertRaises(Exception):b.status_tokens[0].require_open()
+
+    def test_copied_or_closed_real_token_refuses_before_queries_and_retained_read(self):
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_api as native
+        from qshd_selinux_retained_labels import RetainedLabelError
+        from contextlib import contextmanager
+        original=first.RuntimeBindings.window
+        for fault in ('copied','closed'):
+            with self.subTest(fault=fault),self.actual_policy_state() as (b,trust,binding,engine,slot):
+                @contextmanager
+                def wrong(runtime):
+                    with original(runtime) as token:
+                        if fault=='copied':yield native._StatusToken(token._record);return
+                    yield token
+                with self.patch.object(first.RuntimeBindings,'window',wrong),self.assertRaises(RetainedLabelError):
+                    self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
+                self.assertEqual(b.query_api.calls,[])
+                self.assertEqual(b.status_shared.events.count('open'),1)
+                self.assertEqual(b.status_shared.events.count('close'),1)
+
+    def test_real_present_retained_metadata_and_postcheck_label_drift_are_causal(self):
+        from contextlib import contextmanager
+        from scripts.tests.test_selinux_retained_labels import FixtureTests
+        import qshd_selinux_first_activation as first
+        import qshd_selinux_retained_labels as retained
+        for drift in (False,True):
+            with self.subTest(drift=drift),self.actual_policy_state() as (b,trust,binding,engine,slot):
+                fixture=FixtureTests();fixture.setUp()
+                try:
+                    api=fixture.api()
+                    b.observer_api.file_defaults=api.file_defaults
+                    b.observer_api.file_context=api.file_context
+                    paths=[fixture.root/row[0][1:]for row in retained._ITEMS]
+                    before={str(p):(p.stat(),p.read_bytes() if p.is_file() else None)for p in paths}
+                    original=first.RuntimeBindings.queries
+                    @contextmanager
+                    def queries(runtime,status):
+                        with original(runtime,status) as observation:yield observation
+                        if drift:
+                            path=fixture.root/'etc/qshd/host_key';info=path.stat()
+                            fixture.labels[(info.st_dev,info.st_ino)]=b'system_u:object_r:unlabeled_t:s0\0'
+                    factory=__import__('types').SimpleNamespace(managed_inspection=lambda **kw:fixture.make_factory().managed_inspection(**kw))
+                    with self.patch.object(retained,'production',return_value=factory),self.patch.object(first.RuntimeBindings,'queries',queries):
+                        if drift:
+                            with self.assertRaises(retained.RetainedLabelError):self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110)
+                        else:self.assertEqual(self.m._compose_policy_context(trust,deadline=__import__('time').monotonic()+110),binding)
+                    self.assertEqual(fixture.set_count,0)
+                    self.assertEqual({str(p):(p.stat(),p.read_bytes() if p.is_file() else None)for p in paths},before)
+                    self.assertEqual(b.status_shared.events,['open','updated','updated','close'])
+                finally:fixture.doCleanups()

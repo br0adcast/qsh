@@ -262,7 +262,7 @@ class OwnedReload(_InstallFiles):
         owned_artifact.__post_init__();self._owned=owned_artifact
         self._observer=production_observer if _observer is None else _observer
 
-    def reload(self,*,deadline):
+    def reload(self,*,deadline,old_check=None):
         from qshd_selinux_api import SelinuxApi, SelinuxError
         if self._used:_fail('RELOAD_USED')
         self._used=True
@@ -274,8 +274,11 @@ class OwnedReload(_InstallFiles):
             try:
                 self._admit()
                 with self._observer(self._owned,mode='pair',deadline=self._end) as observer:
-                    with SelinuxApi().status_observation():
+                    with SelinuxApi().status_observation() as status:
                         observed=observer.capture();self._time();observer.recheck(observed);self._time()
+                        if old_check is not None:
+                            if not callable(old_check) or old_check(status) is not None:_fail('OLD_CHECK')
+                            status.require_open();self._time()
                 self._time();self._guard();self._active();self._make_scratch()
                 paths=tuple(str(self.anchor/'run'/self._scratch['name']/name) for name in ('qshd.pp','qshd_contexts.pp'))
                 self._command(_PREFIX+('-X','400','-i')+paths,_INSTALL,reserve=215)
