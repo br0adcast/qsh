@@ -24,12 +24,40 @@ QUALIFIED = {'qshd.te': 'd891ce234fe9b6d008dfe34b5b885b498ba4ccab636b6f110413fe4
 BUNDLE_SOURCE_FILES = ('qshd.te', 'qshd.fc', 'qshd.if',
                        'qshd_contexts.te', 'qshd_contexts.fc', 'qshd_contexts.if', 'build.py',
                        'inputs.json', 'artifact.json', 'README.md', 'GPL-3.0.txt',
-                       'Dockerfile')
+                       'Dockerfile', 'assemble_payload.py', 'embed_provider_pre.py',
+                       'embed_stop_guard.py', 'qshd_selinux_provider_pre.py',
+                       'qshd-selinux.spec', 'build-fedora-packages.sh',
+                       'qshd-fedora-system.service') + tuple(
+    'qshd_selinux_' + name + '.py' for name in (
+        'activation', 'activation_state', 'contexts', 'transaction', 'fs', 'registry',
+        'process', 'modules', 'module_observer', 'api', 'queries', 'files',
+        'retained_labels', 'observer', 'reference_loader', 'package_state',
+        'module_install', 'first_activation', 'consumer_activation', 'provider_erase',
+        'phase', 'rpm_query')) + ('stop_guard.py',) + tuple(
+    'maintainer/' + name for name in (
+        'provider-pre', 'provider-post', 'provider-preun', 'provider-postun',
+        'consumer-pre', 'consumer-post', 'consumer-preun', 'consumer-postun'))
+
+BUNDLE_REPOSITORY_FILES = (
+    'LICENSE', 'Cargo.toml', 'cli/Cargo.toml', 'README.md', 'CHANGELOG.md',
+    'docs/licenses/openssl.txt', 'packaging/qshd.service',
+    'packaging/pam.d/qshd.fedora-selinux', 'scripts/check-pam-linkage.sh',
+    'scripts/check-selinux-linkage.sh', 'scripts/generate-selinux-consumer-authority.py',
+    'scripts/check-selinux-consumer-rpm.py', 'packaging/rpm-tool/README.md',
+    'packaging/rpm-tool/install.sh', 'packaging/rpm-tool/prepare.py',
+    'packaging/rpm-tool/test_dependencies.py',
+    'packaging/rpm-tool/rpm-0.23.2-archive-size.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-local-rpm.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-post.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-pre.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-preun.patch')
 
 
 def bundle_source_files(source):
-    return {'packaging/selinux/' + name: source / name
-            for name in BUNDLE_SOURCE_FILES}
+    files = {'packaging/selinux/' + name: source / name
+             for name in BUNDLE_SOURCE_FILES}
+    files.update({name: source.parents[1] / name for name in BUNDLE_REPOSITORY_FILES})
+    return files
 
 
 def compile_environment(work, epoch):

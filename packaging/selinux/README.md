@@ -149,43 +149,101 @@ source. `artifact.json` records the combined expression
 remain in the exact source RPM. Compiler binaries are not part of this combined
 artifact and are not included in the source archive.
 
-This recipe builds the pair and corresponding source; RPM lifecycle
-integration is separate. It does not supply an RPM spec or runtime dependency
-capability names.
-The native RPM's Fedora 44 targeted-policy bounds and phase-specific dependency
-headers must be finalized from actual package headers before packaging or
-activation is integrated.
+## Fedora RPM assembly
 
-## Installed maintenance phase entrypoint
+`build-fedora-packages.sh` assembles one independent `qshd-selinux` noarch provider
+and two `qshd` consumers for x86_64 and aarch64. The provider declares
+`qshd-selinux-abi = 2`; consumers require that exact ABI and the provider in real
+PRE, POST and PREUN phases. Generic qsh/qshd RPM and Debian variants keep their
+existing behavior.
 
-Task1 stages exactly 21 existing Python modules and five public data files
-(26 files total), including the core and contexts PPs. The independently
-reviewed assembly map has 25 hash inputs. `artifact.json` schema 2 fixes the two
-roles, names, priority 400, targeted store, PP format and policy version 0.3.0.
-Generated `reference.json` schema 2 binds both complete PP hashes and the
-canonical PAM file; protected readers copy and recheck both files separately.
-Neither a runtime-computed digest nor filesystem ownership creates trust.
+Prepare the qualified policy output and its matching source archive first, using
+the source workspace version and one source epoch. The archive now includes the
+23 installed helpers, fresh-pre helper, renderers, assembler, RPM spec/hooks/unit,
+consumer-authority tools, pinned RPM-tool patches and build-control inputs. The
+exact reference-policy source/devel RPMs and their notices remain included;
+compiler RPMs, caches, local evidence and private files are excluded. The old-floor
+Python 3.6 policy builder reads helper sources as bytes and does not import them.
+This offer covers policy/helpers and packaging inputs; the complete Rust consumer
+source continues to use the project's full source-distribution contract.
 
-Activation schema 2 uses `fedora44-targeted-pair-v2`, ABI 2 and query profile 1.
-It rejects old single-module records. COMPLETE binds both extracted HLL hashes
-and contexts; PENDING has no completion. A finite nonrecursive historical basis
-is separate from current readiness. Parsing this evidence never proves live
-module or policy state, and historical basis does not authorize repair.
+RPM assembly requires Python 3.11 or newer, Bash, rpmbuild, `/usr/bin/rpm`,
+`/usr/bin/rpm2cpio`, cpio, readelf, nm and `/usr/lib/rpm/find-requires` with its RPM
+dependency tools. Use the patched pinned generator from `packaging/rpm-tool` and
+supply its independently reviewed binary SHA-256. There is no tool download,
+compiler invocation, candidate execution or fallback to ldd-based discovery.
 
-The existing five-mode phase entry and single-module lifecycle callers have
-not yet been migrated to this pair authority. This Task1 staging cutpoint is
-not an operational installed payload: do not invoke it as a shipping lifecycle
-or wire RPM hooks until pair observation, install/reload, erase and final phase
-integration are complete. No placeholder modules are delivered to imply that
-future functionality exists. The existing phase deadlines/resources and its
-fixed sibling-import map remain unchanged in this stage.
+```sh
+QSH_RPM_TOOL=/absolute/reviewed/cargo-generate-rpm \
+QSH_RPM_TOOL_SHA256=REVIEWED_GENERATOR_SHA256 \
+bash packaging/selinux/build-fedora-packages.sh \
+  --policy-output /absolute/reviewed-policy-output \
+  --expected /absolute/reviewed-27-input-hashes.json \
+  --x86_64-binary /absolute/final/x86_64/qshd \
+  --aarch64-binary /absolute/final/aarch64/qshd \
+  --output /absolute/new-output-directory --release 1.fc44 --epoch 1800000000
+```
 
-Actual pinned pair construction and role/import/export inspection are a
-separate qualification gate. Synthetic header and staging tests are not compiler,
-link, load or HLL equality evidence. The small-base mechanism control cannot
-link the real core's many imports and is not full-pair qualification. Runtime
-acceptance still requires the supported Fedora 44 targeted environment, stopped
-and drained system service, stable policy/native windows and qualified normal
-cleanup. RPM recipes, service startup, migration and publication remain separate;
-the staging tree is not a complete redistributable package or a replacement for
-its license and source-offer assets.
+The input binaries must already have their final strip/transforms and qualified
+system-feature glibc/PAM/SELinux linkage. Assembly inspects architecture and version
+nodes without executing either binary and enforces the existing glibc 2.28 floor.
+Use plain absolute repository/output paths without whitespace or macro/shell
+metacharacters. Caller owns immutable reviewed inputs and an exclusive output
+parent. Existing
+outputs refuse; failure preserves partial evidence for inspection, never retries
+or cleans unknown files. Version comes from `[workspace.package]`; policy version
+stays `0.3.0` and protocol/ABI versions are unchanged.
+
+The builder stages exactly **23 code / 27 independently hashed inputs / 28 runtime
+outputs**. Source/license/documentation assets are separate. It binds the fresh
+incoming eight-module capsule, artifact identity, template and source offer;
+upgrade pre uses installed A's helper with literal trusted incoming B. RPM
+[macro-expands scriptlet files](https://github.com/rpm-software-management/rpm/blob/rpm-4.20.0-release/build/files.c#L2132),
+so the exact reviewed capsule uses short base64 transport lines and a SHA-256
+check before decoding; macro-looking capsule bytes never reach the spec parser.
+The original renderer entry clock runs before decoding; the hash-bound suffix
+executes in the same globals without renewing the fresh 30-second budget. Each
+consumer gets explicit final metadata and its own architecture-specific staging,
+manifest, output and receipt. Only `consumer-rpm.json` is installed; generation
+receipts and `work/` stay local build evidence. Nothing transforms binary or PAM
+bytes after authority generation.
+
+Before reporting construction, the builder queries actual headers, dependency
+flags and scriptlets, decodes payload leaves to stdout without extraction, and
+runs the maintained final consumer RPM checker on each exact RPM/manifest/receipt.
+The noarch payload includes the complete corresponding source offer and license
+texts, with no runtime activation, lock, journal or cache state. `inspection.json`
+records the exact three completed artifacts; it is a construction receipt, not
+installed-policy qualification or source-origin authentication.
+
+## Maintenance and managed start
+
+The supported contract is Fedora 44 live Enforcing targeted policy with ABI 2,
+activation schema 2, canonical PAM and the fixed pair/type/path profile. Before
+install, upgrade or erase, the administrator must stop and drain the system
+service and manual daemons, and exclude concurrent starts and privileged writers
+through maintenance. Hooks never force stop, kill, enable, start or restart the
+service. The consumer system unit checks current readiness through
+`managed-prestart` before ExecStart; its 460-second outer startup allowance does
+not renew helper deadlines or exclude maintenance begun afterward.
+
+Fresh provider pre uses a reviewed incoming capsule before installed helpers
+exist. Consumer pre admits canonical installed PAM or the separately allowed
+fresh absence before payload replacement. Custom/legacy PAM, `.rpmnew`/`.rpmsave`,
+legacy schema 1, mixed/missing pairs and unsupported ABI changes refuse. There is
+no implicit migration or administrative repair. ABI 2 artifact-changing A→B
+upgrades use distinct old/incoming authority; old-package positive-count preun
+hooks do not erase the new pair.
+
+Successful final provider erase restores the supported defaults and retires the
+exact PENDING slot to absence, allowing a separately admitted ordinary pristine
+reinstall. Partial failure or uncertain publication may leave PENDING or changed
+state and must refuse readiness. Historical basis and a parsed COMPLETE record
+alone do not prove current policy state or authorize repair.
+
+Actual finished three-RPM construction/header/payload review and Fedora Enforcing
+x86_64/aarch64 installed lifecycle qualification remain pending. Source, staging
+and synthetic-header checks do not establish policy load/HLL equality, package
+transaction ordering, managed connectivity, erase/default restoration or reinstall
+acceptance. Those require the separately gated real artifact and native lifecycle
+checks; this recipe does not close that acceptance work.

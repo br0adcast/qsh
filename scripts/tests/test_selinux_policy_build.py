@@ -131,8 +131,8 @@ class PolicyBuildTests(unittest.TestCase):
         import sys
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);repo=root/'repo';source=repo/'packaging/selinux';source.mkdir(parents=True)
-            for name in self.build.BUNDLE_SOURCE_FILES:
-                shutil.copyfile(ROOT/'packaging/selinux'/name,source/name)
+            for name, original in self.build.bundle_source_files(ROOT/'packaging/selinux').items():
+                target=repo/name;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(original,target)
             (repo/'LICENSE').write_text('Synthetic orchestration fixture only\n')
             (repo/'Cargo.toml').write_text('[workspace.package]\nversion = "0.5.0"\n')
             inputs=root/'inputs';inputs.mkdir();rpm=inputs/'fixture.rpm';rpm.write_bytes(b'harmless fixture input')
@@ -205,11 +205,11 @@ pathlib.Path(output).write_bytes(data)
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
             for name in self.build.BUNDLE_SOURCE_FILES:
-                (source / name).write_text('source')
+                path=source/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('source')
             (source / 'private-note.txt').write_text('must not ship')
             files = self.build.bundle_source_files(source)
             self.assertEqual(set(files), {'packaging/selinux/' + name
-                                         for name in self.build.BUNDLE_SOURCE_FILES})
+                                         for name in self.build.BUNDLE_SOURCE_FILES} | set(self.build.BUNDLE_REPOSITORY_FILES))
             self.assertNotIn('packaging/selinux/private-note.txt', files)
 
     def test_environment_recipe_is_obtainable_and_bundled(self):
@@ -226,6 +226,41 @@ pathlib.Path(output).write_bytes(data)
         self.assertIn('gpgcheck=1', recipe)
         # The pinned devel Makefile discovers interface layers with find.
         self.assertRegex(recipe, r'\bfindutils\b')
+
+    def test_source_offer_contains_exact_helper_and_recipe_closure_as_bytes(self):
+        import ast
+        import tarfile
+        source = ROOT / 'packaging/selinux'
+        files = self.build.bundle_source_files(source)
+        required = {'packaging/selinux/' + name for name in (
+            'qshd_selinux_' + suffix + '.py' for suffix in (
+                'activation', 'activation_state', 'contexts', 'transaction', 'fs', 'registry',
+                'process', 'modules', 'module_observer', 'api', 'queries', 'files',
+                'retained_labels', 'observer', 'reference_loader', 'package_state',
+                'module_install', 'first_activation', 'consumer_activation', 'provider_erase',
+                'phase', 'rpm_query', 'provider_pre'))}
+        required.update({'packaging/selinux/' + name for name in (
+            'stop_guard.py', 'assemble_payload.py', 'embed_provider_pre.py', 'embed_stop_guard.py',
+            'qshd-selinux.spec', 'build-fedora-packages.sh', 'qshd-fedora-system.service')})
+        required.update('packaging/selinux/maintainer/' + name for name in (
+            'provider-pre', 'provider-post', 'provider-preun', 'provider-postun',
+            'consumer-pre', 'consumer-post', 'consumer-preun', 'consumer-postun'))
+        required.update(('scripts/generate-selinux-consumer-authority.py',
+                         'scripts/check-selinux-consumer-rpm.py', 'cli/Cargo.toml',
+                         'packaging/pam.d/qshd.fedora-selinux', 'LICENSE', 'Cargo.toml'))
+        self.assertTrue(required <= set(files), sorted(required - set(files)))
+        self.assertFalse(any('__pycache__' in name or name.endswith('.pyc') for name in files))
+        # The floor builder must read modern helpers as bytes, never import them.
+        ast.parse((source / 'build.py').read_text(), feature_version=(3, 6))
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / 'offer.tar.gz'
+            self.build.source_bundle(archive, files, 123)
+            with tarfile.open(archive) as stream:
+                self.assertEqual(stream.getnames(), sorted(files))
+                for member in stream:
+                    self.assertTrue(member.isfile())
+                    self.assertEqual((member.mode, member.uid, member.gid, member.mtime), (0o644, 0, 0, 123))
+                    self.assertEqual(stream.extractfile(member).read(), files[member.name].read_bytes())
 
     def test_source_bundle_is_deterministic_and_preserves_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:

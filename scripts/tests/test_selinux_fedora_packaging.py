@@ -543,5 +543,258 @@ raise SystemExit(status)
         self.assertEqual(output.buffer.getvalue(), b'')
 
 
+
+class FedoraRecipeTests(unittest.TestCase):
+    def variant(self):
+        import tomllib
+        data = tomllib.loads((ROOT / 'cli/Cargo.toml').read_text())
+        variants = data['package']['metadata']['generate-rpm']['variants']
+        self.assertIn('qshd-fedora-selinux', variants, 'dedicated consumer variant missing')
+        return variants['qshd-fedora-selinux']
+
+    def test_dedicated_variant_is_explicit_and_phase_correct(self):
+        variant = self.variant()
+        self.assertEqual(variant['name'], 'qshd')
+        self.assertEqual(variant['requires'], {'qshd-selinux-abi': '= 2'})
+        self.assertEqual(variant['requires-pre'], {'qshd-selinux': '*'})
+        self.assertEqual(variant['requires-preun'], {'qshd-selinux': '*'})
+        self.assertEqual(variant['requires-post'], {'qshd-selinux': '*', '/usr/bin/getent': '*', '/usr/sbin/useradd': '*'})
+        self.assertEqual(variant['auto-req'], 'auto')
+        assets = {item['dest']: item for item in variant['assets']}
+        self.assertEqual(assets['/etc/pam.d/qshd']['config'], 'noreplace')
+        self.assertEqual(assets['/etc/pam.d/qshd']['source'], '../packaging/pam.d/qshd.fedora-selinux')
+        self.assertEqual(assets['/usr/lib/systemd/system/qshd.service']['source'], '../packaging/selinux/qshd-fedora-system.service')
+        self.assertEqual(assets['/usr/share/qshd/consumer-rpm.json']['mode'], '644')
+        for key, name in [('pre_install_script', 'consumer-pre'), ('post_install_script', 'consumer-post'),
+                          ('pre_uninstall_script', 'consumer-preun'), ('post_uninstall_script', 'consumer-postun')]:
+            self.assertEqual(variant[key], '../packaging/selinux/maintainer/' + name)
+
+    def builder(self):
+        script = SOURCE / 'build-fedora-packages.sh'
+        self.assertTrue(script.is_file(), 'Fedora assembly script missing')
+        code = script.read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+        module = SimpleNamespace(__name__='fedora_builder_test', __file__=str(script))
+        exec(compile(code, str(script), 'exec'), module.__dict__)
+        return module
+
+    def test_final_elf_checks_require_needed_entries_and_the_existing_floor(self):
+        builder = self.builder()
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'inert-ELF-header'
+            data = bytearray(64); data[:6] = b'\x7fELF\x02\x01'
+            import struct
+            struct.pack_into('<HH', data, 16, 3, 62)
+            binary.write_bytes(data)
+            dynamic = b'(NEEDED) Shared library: [libc.so.6]\n(NEEDED) Shared library: [libpam.so.0]\n(NEEDED) Shared library: [libselinux.so.1]\n'
+            versions = b'Name: GLIBC_2.28\n'
+            def run(argv, **kwargs):
+                return dynamic if argv[:2] == ['readelf', '-d'] else versions if argv[:2] == ['readelf', '-V'] else b''
+            with patch.object(builder, 'run', side_effect=run):
+                self.assertEqual(builder.binary_checks(ROOT, binary, 'x86_64'), bytes(data))
+                dynamic = dynamic.replace(b'(NEEDED) Shared library: [libpam.so.0]', b'(RUNPATH) Library runpath: [libpam.so.0]')
+                with self.assertRaises(ValueError): builder.binary_checks(ROOT, binary, 'x86_64')
+                dynamic = dynamic.replace(b'(RUNPATH) Library runpath:', b'(NEEDED) Shared library:')
+                versions = b'Name: GLIBC_2.34\n'
+                with self.assertRaises(ValueError): builder.binary_checks(ROOT, binary, 'x86_64')
+                with self.assertRaises(ValueError): builder.binary_checks(ROOT, binary, 'aarch64')
+
+    def test_capsule_decode_consumes_original_entry_budget_without_renewal(self):
+        builder = self.builder()
+        entry = b'import time\n_capsule_started=time.monotonic()\n'
+        capsule = entry + b"print('budget-consumed' if time.monotonic()-_capsule_started>=0.1 else 'budget-renewed')\n"
+        wrapped = builder.rpm_capsule(capsule).replace(b'import base64,hashlib\n', b'import time;time.sleep(0.15)\nimport base64,hashlib\n', 1)
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', wrapped.decode()], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'budget-consumed\n')
+
+    def test_rpm_capsule_transport_keeps_macro_like_bytes_inert_and_hash_bound(self):
+        builder = self.builder()
+        self.assertTrue(hasattr(builder, 'rpm_capsule'), 'macro-inert RPM capsule transport missing')
+        capsule = b"import time\n_capsule_started=time.monotonic()\nprint('%{not_a_macro} %(not_a_command)')\n" + b'#' + b'x' * 20000 + b'\n'
+        wrapped = builder.rpm_capsule(capsule)
+        self.assertNotIn(b'%', wrapped)
+        self.assertLess(max(map(len, wrapped.splitlines())), 256)
+        for source, accepted in ((wrapped, True), (wrapped.replace(hashlib.sha256(capsule).hexdigest().encode(), b'0' * 64), False)):
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', source.decode()], capture_output=True, timeout=10)
+            self.assertEqual(result.returncode == 0, accepted, result.stderr)
+            self.assertEqual(result.stdout, b'%{not_a_macro} %(not_a_command)\n' if accepted else b'')
+
+    def test_read_final_input_ignores_access_time_but_rejects_links(self):
+        builder = self.builder()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'final'
+            path.write_bytes(b'final reviewed bytes')
+            os.utime(path, (1, 2))
+            self.assertEqual(builder.read(path), b'final reviewed bytes')
+            link = root / 'symlink'; link.symlink_to(path)
+            with self.assertRaises(ValueError): builder.read(link)
+            hard = root / 'hard'; os.link(path, hard)
+            with self.assertRaises(ValueError): builder.read(path)
+            self.assertEqual(builder.read(path, single_link=False), b'final reviewed bytes')
+
+    def test_source_offer_refuses_missing_extra_stale_and_wrong_pinned_inputs(self):
+        builder = self.builder()
+        policy_build = builder.load('offer_fixture_builder', SOURCE / 'build.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'packaging/selinux'; source.mkdir(parents=True)
+            helper = root / 'helper.py'; helper.write_bytes(b"raise AssertionError('source bytes must never execute')\n")
+            devel = root / 'devel.rpm'; devel.write_bytes(b'explicit inert devel RPM fixture')
+            reference = root / 'source.rpm'; reference.write_bytes(b'explicit inert source RPM fixture')
+            pins = dict(policy_devel=devel.name, policy_source=reference.name,
+                        rpms={path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (devel, reference)})
+            (source / 'inputs.json').write_text(json.dumps(pins))
+            files = {'helper.py': helper, 'inputs/devel.rpm': devel, 'inputs/source.rpm': reference}
+            selected = SimpleNamespace(bundle_source_files=lambda unused: {'helper.py': helper})
+            archive = root / 'valid.tar.gz'; policy_build.source_bundle(archive, files, 123)
+            self.assertEqual(builder.source_offer(root, root, archive, 123, selected), archive.read_bytes())
+            for name, changed in [('missing', {key: value for key, value in files.items() if key != 'helper.py'}),
+                                  ('extra', dict(files, compiler=helper))]:
+                candidate = root / (name + '.tar.gz'); policy_build.source_bundle(candidate, changed, 123)
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    builder.source_offer(root, root, candidate, 123, selected)
+            for path in (helper, devel):
+                original = path.read_bytes(); path.write_bytes(original + b'tamper')
+                candidate = archive
+                if path == devel:
+                    candidate = root / 'wrong-embedded-devel.tar.gz'
+                    policy_build.source_bundle(candidate, files, 123)
+                with self.subTest(path=path.name), self.assertRaises(ValueError):
+                    builder.source_offer(root, root, candidate, 123, selected)
+                path.write_bytes(original)
+            with self.assertRaises(ValueError): builder.source_offer(root, root, archive, 124, selected)
+
+    def provider_fixture(self):
+        from scripts.tests.test_selinux_payload import PayloadTests
+        fixture = PayloadTests(); fixture.setUp(); self.addCleanup(fixture.doCleanups)
+        inventory = fixture.assemble()
+        extras = {'usr/share/qshd-selinux/source/offer.tar.gz': b'inert source offer',
+                  'usr/share/licenses/qshd-selinux/LICENSE': b'fixture license',
+                  'usr/share/licenses/qshd-selinux/GPL-3.0.txt': b'fixture GPL notice',
+                  'usr/share/doc/qshd-selinux/README.md': b'fixture description'}
+        for name, content in extras.items():
+            path = fixture.output / name; path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content); path.chmod(0o644)
+        builder = self.builder()
+        wanted = builder.provider_inventory(inventory, extras)
+        return builder, fixture, wanted
+
+    def test_provider_stage_is_bound_to_admitted_inventory_not_observed_bytes(self):
+        builder, fixture, wanted = self.provider_fixture()
+        builder.stage_check(fixture.output, wanted)
+        for name in ('usr/share/qshd-selinux/qshd.pp', 'usr/share/qshd-selinux/qshd_contexts.pp',
+                     'usr/share/qshd-selinux/reference.json', 'usr/share/licenses/qshd-selinux/LICENSE'):
+            path = fixture.output / name; original = path.read_bytes(); path.write_bytes(original + b'tamper')
+            with self.subTest(name=name), self.assertRaises(ValueError): builder.stage_check(fixture.output, wanted)
+            path.write_bytes(original)
+        extra = fixture.output / 'unexpected.pyc'; extra.write_bytes(b'not shipped')
+        with self.assertRaises(ValueError): builder.stage_check(fixture.output, wanted)
+        extra.unlink()
+        missing = fixture.output / 'usr/libexec/qshd-selinux/qshd_selinux_phase.py'
+        original = missing.read_bytes(); missing.unlink()
+        with self.assertRaises(ValueError): builder.stage_check(fixture.output, wanted)
+        missing.write_bytes(original); missing.chmod(0o644)
+        builder.stage_check(fixture.output, wanted)
+
+    def test_provider_header_controls_require_exact_payload_and_preun_tools(self):
+        builder, fixture, wanted = self.provider_fixture()
+        identity = 'qshd-selinux\t0\t0.5.0\t1.fc44\tnoarch\t8'
+        dependencies = [(tool, flag, '') for tool in ('/usr/bin/python3', '/usr/bin/semodule', '/usr/bin/rpm', '/usr/bin/systemctl') for flag in (512, 1024, 2048)]
+        def query(rpm, expression):
+            if '%{NAME}' in expression: return identity
+            if 'PROVIDENAME' in expression: return 'qshd-selinux-abi\t8\t2\n'
+            if 'REQUIRENAME' in expression: return ''.join(name + '\t' + str(flag) + '\t' + version + '\n' for name, flag, version in dependencies)
+            if 'FILENAMES' in expression:
+                return ''.join(name + '\t' + '\t'.join(map(str, row)) + '\t\n' for name, row in wanted.items())
+            tags = {'%{PREIN}': 'provider-pre', '%{POSTIN}': 'provider-post', '%{PREUN}': 'provider-preun', '%{POSTUN}': 'provider-postun'}
+            return (HOOKS / tags[expression]).read_text()
+        with patch.object(builder, 'query', side_effect=query):
+            builder.provider_headers(Path('inert.rpm'), wanted, '0.5.0', '1.fc44', HOOKS)
+            dependencies.remove(('/usr/bin/semodule', 2048, ''))
+            with self.assertRaises(ValueError): builder.provider_headers(Path('inert.rpm'), wanted, '0.5.0', '1.fc44', HOOKS)
+            dependencies.append(('/usr/bin/semodule', 2048, ''))
+            identity = identity.replace('noarch', 'aarch64')
+            with self.assertRaises(ValueError): builder.provider_headers(Path('inert.rpm'), wanted, '0.5.0', '1.fc44', HOOKS)
+
+    @unittest.skipUnless(os.environ.get('QSH_RPM_TOOL'), 'set QSH_RPM_TOOL for synthetic real RPM header control')
+    def test_synthetic_real_consumer_phase_headers_from_dedicated_variant(self):
+        spec = importlib.util.spec_from_file_location('fedora_header_fixture', ROOT / 'packaging/rpm-tool/test_dependencies.py')
+        dependency = importlib.util.module_from_spec(spec); spec.loader.exec_module(dependency)
+        case = dependency.GeneratedDependencyTests(); case.tool = os.environ['QSH_RPM_TOOL']
+        variant = self.variant()
+        metadata = {key: variant[key] for key in ('requires', 'requires-pre', 'requires-post', 'requires-preun')}
+        # Synthetic native interpreter payload, never qshd: only this recipe's
+        # phase/ABI headers are qualified here, not product linkage or lifecycle.
+        result, rows = case.generate(self.builder().toml_table(metadata))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for row in [(b'qshd-selinux-abi', 8, b'2'), (b'qshd-selinux', 512, b''),
+                    (b'qshd-selinux', 1024, b''), (b'qshd-selinux', 2048, b''),
+                    (b'/usr/bin/getent', 1024, b''), (b'/usr/sbin/useradd', 1024, b'')]:
+            self.assertIn(row, rows)
+        self.assertTrue(any(name.startswith(b'libc.so.6') for name, _, _ in rows))
+        self.assertFalse(any(b'(preun)' in name for name, _, _ in rows))
+
+    def test_phase_header_filter_requires_runtime_equality_and_real_phase_bits(self):
+        builder = self.builder()
+        good = [('qshd-selinux-abi', 8, '2'), ('qshd-selinux', 512, ''),
+                ('qshd-selinux', 1024, ''), ('qshd-selinux', 2048, ''),
+                ('/usr/bin/getent', 1024, ''), ('/usr/sbin/useradd', 1024, ''),
+                ('libc.so.6()(64bit)', 0, ''), ('libpam.so.0()(64bit)', 0, ''),
+                ('libselinux.so.1()(64bit)', 0, '')]
+        builder.consumer_dependencies(good)
+        for index in range(6):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                builder.consumer_dependencies(good[:index] + good[index + 1:])
+        for change in [('qshd-selinux(preun)', 0, ''), ('qshd-selinux', 0, ''), ('qshd-selinux', 1024, '')]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                builder.consumer_dependencies(good[:3] + [change] + good[4:])
+
+    def test_consumer_assets_use_exact_per_architecture_inputs_without_target_rewrite(self):
+        builder = self.builder()
+        variant = self.variant()
+        binary = Path('/explicit/aarch64/final-qshd')
+        manifest = Path('/explicit/aarch64/authority/consumer-rpm.json')
+        value = builder.consumer_metadata(ROOT, variant, binary, manifest, '1.fc44')
+        assets = {row['dest']: row for row in value['assets']}
+        self.assertEqual(assets['/usr/bin/qshd']['source'], str(binary))
+        self.assertEqual(assets['/usr/share/qshd/consumer-rpm.json']['source'], str(manifest))
+        self.assertEqual(value['release'], '1.fc44')
+        self.assertEqual(value['epoch'], 0)
+        self.assertTrue(all(Path(row['source']).is_absolute() for row in value['assets']))
+        import tomllib
+        self.assertEqual(tomllib.loads(builder.toml_table(value)), value)
+
+    def test_builder_refuses_invalid_release_epoch_stale_output_and_unpinned_tool(self):
+        script = SOURCE / 'build-fedora-packages.sh'
+        self.assertTrue(script.is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'out'
+            common = ['--policy-output', str(root / 'policy'), '--expected', str(root / 'expected.json'),
+                      '--x86_64-binary', str(root / 'x86_64'), '--aarch64-binary', str(root / 'aarch64'), '--output', str(output)]
+            environment = dict(os.environ, HOME=directory, XDG_CACHE_HOME=directory, XDG_CONFIG_HOME=directory,
+                               TMPDIR=directory, HISTFILE='/dev/null', PYTHONDONTWRITEBYTECODE='1',
+                               QSH_RPM_TOOL='', QSH_RPM_TOOL_SHA256='')
+            for release, epoch in [('0.fc44', '123'), ('1.fc43', '123'), ('1.fc44', '-1'), ('1.fc44', '123')]:
+                with self.subTest(release=release, epoch=epoch):
+                    result = subprocess.run(['bash', str(script), *common, '--release', release, '--epoch', epoch],
+                                            cwd=root, env=environment, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse(output.exists())
+                    self.assertNotIn(b'Traceback', result.stderr)
+            output.mkdir(); marker = output / 'keep'; marker.write_bytes(b'preexisting user output')
+            result = subprocess.run(['bash', str(script), *common, '--release', '1.fc44', '--epoch', '123'],
+                                    cwd=root, env=environment, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(marker.read_bytes(), b'preexisting user output')
+
+    def test_builder_missing_arguments_refuses_without_output(self):
+        script = SOURCE / 'build-fedora-packages.sh'
+        self.assertTrue(script.is_file(), 'Fedora assembly script missing')
+        result = subprocess.run(['bash', str(script)], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -189,3 +189,28 @@ post_install_script = "../packaging/maintainer/postinst"
 # (cargo-deb-3.8.0/src/deb/control.rs:109).
 pre_uninstall_script = "../packaging/maintainer/preun"
 post_uninstall_script = "../packaging/maintainer/postun"
+
+# Dedicated Fedora pair delivery; assembly supplies final per-architecture inputs.
+[package.metadata.generate-rpm.variants.qshd-fedora-selinux]
+name = "qshd"
+summary = "The daemon behind qsh, a terminal session that survives a network change"
+auto-req = "auto"
+requires = { "qshd-selinux-abi" = "= 2" }
+requires-pre = { "qshd-selinux" = "*" }
+requires-post = { "qshd-selinux" = "*", "/usr/bin/getent" = "*", "/usr/sbin/useradd" = "*" }
+requires-preun = { "qshd-selinux" = "*" }
+assets = [
+    { source = "fedora-selinux/consumer-rpm.json", dest = "/usr/share/qshd/consumer-rpm.json", mode = "644" },
+    { source = "fedora-selinux/qshd", dest = "/usr/bin/qshd", mode = "755" },
+    { source = "../packaging/selinux/qshd-fedora-system.service", dest = "/usr/lib/systemd/system/qshd.service", mode = "644" },
+    { source = "../packaging/qshd.service", dest = "/usr/lib/systemd/user/qshd.service", mode = "644" },
+    { source = "../packaging/pam.d/qshd.fedora-selinux", dest = "/etc/pam.d/qshd", mode = "644", config = "noreplace" },
+    { source = "../README.md", dest = "/usr/share/doc/qshd/README.md", mode = "644", doc = true },
+    { source = "../CHANGELOG.md", dest = "/usr/share/doc/qshd/CHANGELOG.md", mode = "644", doc = true },
+    { source = "../LICENSE", dest = "/usr/share/doc/qshd/LICENSE", mode = "644", doc = true },
+    { source = "../docs/licenses/openssl.txt", dest = "/usr/share/doc/qshd/LICENSE-OPENSSL.txt", mode = "644", doc = true },
+]
+post_install_script = "../packaging/selinux/maintainer/consumer-post"
+pre_uninstall_script = "../packaging/selinux/maintainer/consumer-preun"
+post_uninstall_script = "../packaging/selinux/maintainer/consumer-postun"
+pre_install_script = "../packaging/selinux/maintainer/consumer-pre"
