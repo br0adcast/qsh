@@ -1356,7 +1356,7 @@ enum ReplacementSite {
     FreshExit,
     FinalStop,
 }
-#[derive(Clone, Copy, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum FailureCode {
     FixtureTrueAdmission,
@@ -1365,6 +1365,13 @@ enum FailureCode {
     FreshExit,
     BodyError,
     BodyOk,
+    CloseObservation,
+    CloseRegistry,
+    OldClientRegistry,
+    ExitAfterClose,
+    OldInputFailed,
+    BodyPanic,
+    BodyCancelled,
 }
 #[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2083,6 +2090,138 @@ fn fixture_update_record_controls() {
     );
 }
 
+impl FailureCode {
+    fn token(self) -> &'static str {
+        match self {
+            Self::FixtureTrueAdmission => "FIXTURE_TRUE_ADMISSION",
+            Self::FreshLink => "FRESH_LINK",
+            Self::FreshEnqueue => "FRESH_ENQUEUE",
+            Self::FreshExit => "FRESH_EXIT",
+            Self::BodyError => "BODY_ERROR",
+            Self::BodyOk => "BODY_OK",
+            Self::CloseObservation => "CLOSE_OBSERVATION",
+            Self::CloseRegistry => "CLOSE_REGISTRY",
+            Self::OldClientRegistry => "OLD_CLIENT_REGISTRY",
+            Self::ExitAfterClose => "EXIT_AFTER_CLOSE",
+            Self::OldInputFailed => "OLD_INPUT_FAILED",
+            Self::BodyPanic => "BODY_PANIC",
+            Self::BodyCancelled => "BODY_CANCELLED",
+        }
+    }
+}
+fn connected_body_failure_code(result: Result<(), &'static str>) -> FailureCode {
+    match result {
+        Err("FIXTURE_TRUE_ADMISSION") => FailureCode::FixtureTrueAdmission,
+        Err("fresh link observation failed") => FailureCode::FreshLink,
+        Err("fresh enqueue failed") => FailureCode::FreshEnqueue,
+        Err("fresh exit observation failed") => FailureCode::FreshExit,
+        Err("CLOSE_OBSERVATION") => FailureCode::CloseObservation,
+        Err("CLOSE_REGISTRY") => FailureCode::CloseRegistry,
+        Err("OLD_CLIENT_REGISTRY") => FailureCode::OldClientRegistry,
+        Err("unexpected Exit after client CLOSE") => FailureCode::ExitAfterClose,
+        Err("client input failed") => FailureCode::OldInputFailed,
+        Err("BODY_PANIC") => FailureCode::BodyPanic,
+        Err("BODY_CANCELLED") => FailureCode::BodyCancelled,
+        Err(_) => FailureCode::BodyError,
+        Ok(()) => FailureCode::BodyOk,
+    }
+}
+fn connected_body_join_error(error: &tokio::task::JoinError) -> &'static str {
+    if error.is_panic() {
+        "BODY_PANIC"
+    } else if error.is_cancelled() {
+        "BODY_CANCELLED"
+    } else {
+        "connected body panicked or was cancelled"
+    }
+}
+fn fixture_body_mapping_controls() {
+    let directory = tempfile::tempdir().unwrap();
+    for (result, expected) in [
+        (
+            Err("FIXTURE_TRUE_ADMISSION"),
+            FailureCode::FixtureTrueAdmission,
+        ),
+        (Err("fresh link observation failed"), FailureCode::FreshLink),
+        (Err("fresh enqueue failed"), FailureCode::FreshEnqueue),
+        (Err("fresh exit observation failed"), FailureCode::FreshExit),
+        (Ok(()), FailureCode::BodyOk),
+        (Err("CLOSE_OBSERVATION"), FailureCode::CloseObservation),
+        (Err("CLOSE_REGISTRY"), FailureCode::CloseRegistry),
+        (Err("OLD_CLIENT_REGISTRY"), FailureCode::OldClientRegistry),
+        (
+            Err("unexpected Exit after client CLOSE"),
+            FailureCode::ExitAfterClose,
+        ),
+        (Err("client input failed"), FailureCode::OldInputFailed),
+        (Err("BODY_PANIC"), FailureCode::BodyPanic),
+        (Err("BODY_CANCELLED"), FailureCode::BodyCancelled),
+        (Err("PRIVATE_CANARY"), FailureCode::BodyError),
+        (
+            Err("CLOSE_OBSERVATION PRIVATE_CANARY"),
+            FailureCode::BodyError,
+        ),
+    ] {
+        let code = connected_body_failure_code(result);
+        assert_eq!(code, expected);
+        assert!(code.token().len() < 65);
+        std::fs::write(directory.path().join("failure-code"), code.token()).unwrap();
+        assert_eq!(failure_marker(directory.path()), Some(expected));
+        assert_eq!(serde_json::to_value(code).unwrap(), code.token());
+    }
+    std::fs::write(directory.path().join("failure-code"), b"PRIVATE_CANARY").unwrap();
+    assert!(failure_marker(directory.path()).is_none());
+}
+fn fixture_body_callback_controls() {
+    use transport::channel::{ServerRecord, FIRST_CHANNEL_STREAM};
+    use transport::driver_std::ClientEvents;
+    for (stream, expected) in [
+        (FIRST_CHANNEL_STREAM, FailureCode::ExitAfterClose),
+        (FIRST_CHANNEL_STREAM + 1, FailureCode::BodyOk),
+    ] {
+        let events = fixture_update_records(&[ServerRecord::Exit { stream, code: 0 }]);
+        let forbidden=events.records.lock().unwrap().iter().any(|record|matches!(record,ServerRecord::Exit{stream,..} if *stream==FIRST_CHANNEL_STREAM));
+        let result = if forbidden {
+            Err("unexpected Exit after client CLOSE")
+        } else {
+            Ok(())
+        };
+        assert_eq!(connected_body_failure_code(result), expected);
+    }
+    let events = ConnectedEvents::default();
+    events.on_input_failure(transport::driver_std::InputFailure::DriverUnavailable);
+    let result = if events.input_failed.load(Ordering::SeqCst) {
+        Err("client input failed")
+    } else {
+        Ok(())
+    };
+    assert_eq!(
+        connected_body_failure_code(result),
+        FailureCode::OldInputFailed
+    );
+}
+fn fixture_body_join_controls() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let panic = tokio::spawn(async { panic!("expected body task panic") })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            connected_body_failure_code(Err(connected_body_join_error(&panic))),
+            FailureCode::BodyPanic
+        );
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let cancelled = cancelled.await.unwrap_err();
+        assert_eq!(
+            connected_body_failure_code(Err(connected_body_join_error(&cancelled))),
+            FailureCode::BodyCancelled
+        );
+    });
+}
+
 fn marker_fact(directory: &Path, name: &str) -> Option<bool> {
     match std::fs::symlink_metadata(directory.join(name)) {
         Ok(info) if info.is_file() => Some(true),
@@ -2111,6 +2250,13 @@ fn failure_marker(directory: &Path) -> Option<FailureCode> {
         b"FRESH_EXIT" => Some(FailureCode::FreshExit),
         b"BODY_ERROR" => Some(FailureCode::BodyError),
         b"BODY_OK" => Some(FailureCode::BodyOk),
+        b"CLOSE_OBSERVATION" => Some(FailureCode::CloseObservation),
+        b"CLOSE_REGISTRY" => Some(FailureCode::CloseRegistry),
+        b"OLD_CLIENT_REGISTRY" => Some(FailureCode::OldClientRegistry),
+        b"EXIT_AFTER_CLOSE" => Some(FailureCode::ExitAfterClose),
+        b"OLD_INPUT_FAILED" => Some(FailureCode::OldInputFailed),
+        b"BODY_PANIC" => Some(FailureCode::BodyPanic),
+        b"BODY_CANCELLED" => Some(FailureCode::BodyCancelled),
         _ => None,
     }
 }
@@ -2616,8 +2762,8 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
                 // Require the independent parent's actual bound actor NOTE_EXIT
                 // after enqueue, then registry0, before any manager shutdown.
                 publish(&body_actor_directory.join("close-enqueued"));
-                connected_until(|| body_actor_directory.join("close-observed").exists()).await?;
-                connected_until(|| registry.outstanding() == 0 && registry.retiring_count() == 0).await?;
+                connected_until(|| body_actor_directory.join("close-observed").exists()).await.map_err(|_| "CLOSE_OBSERVATION")?;
+                connected_until(|| registry.outstanding() == 0 && registry.retiring_count() == 0).await.map_err(|_| "CLOSE_REGISTRY")?;
                 if events.records.lock().unwrap().iter().any(|record| {
                     matches!(record, ServerRecord::Exit { stream, .. } if *stream == FIRST_CHANNEL_STREAM)
                 }) { return Err("unexpected Exit after client CLOSE"); }
@@ -2625,7 +2771,7 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
             if mode == "fresh-session" {
                 admit_fixture_true(Path::new(FIXTURE_TRUE)).map_err(|_| "FIXTURE_TRUE_ADMISSION")?;
                 client.close();
-                connected_until(|| registry.outstanding() == 0).await?;
+                connected_until(|| registry.outstanding() == 0).await.map_err(|_| "OLD_CLIENT_REGISTRY")?;
                 let fresh_keys = generate_keypair();
                 allowlist.lock().unwrap().push(fresh_keys.public);
                 let fresh_events = Arc::new(ConnectedEvents::default());
@@ -2672,20 +2818,13 @@ async fn connected_case(mode: &str, signal_directory: Option<&Path>) {
             Ok(())
         }).await {
             Ok(result)=>result,
-            Err(_)=>Err("connected body panicked or was cancelled"),
+            Err(error)=>Err(connected_body_join_error(&error)),
         }
     };
-    let failure_code = match result {
-        Err("FIXTURE_TRUE_ADMISSION") => "FIXTURE_TRUE_ADMISSION",
-        Err("fresh link observation failed") => "FRESH_LINK",
-        Err("fresh enqueue failed") => "FRESH_ENQUEUE",
-        Err("fresh exit observation failed") => "FRESH_EXIT",
-        Err(_) => "BODY_ERROR",
-        Ok(()) => "BODY_OK",
-    };
+    let failure_code = connected_body_failure_code(result);
     publish_bytes(
         &actor_directory.join("failure-code"),
-        failure_code.as_bytes(),
+        failure_code.token().as_bytes(),
     );
     // This is the manager-stop seam, not a claim about the wire STOP
     // endpoint. Always retain and await the real lifecycle drain.
@@ -4709,6 +4848,9 @@ fn bounded_command_observe_diagnostic(
     result
 }
 fn fixture_command_controls() {
+    fixture_body_mapping_controls();
+    fixture_body_callback_controls();
+    fixture_body_join_controls();
     fixture_update_terminal_controls();
     fixture_update_decision_controls();
     fixture_update_record_controls();
