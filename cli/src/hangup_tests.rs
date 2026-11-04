@@ -1,51 +1,194 @@
 // SIGHUP keeps the session: the turn's decision and the batch that carries
 // it. A published but unadopted round's custody is tested in `background`.
 
+thread_local! {
+    /// Fails `enter_raw_mode` before it touches the terminal, so a test
+    /// reaches `interactive`'s actual setup exit.
+    pub(crate) static FAIL_RAW_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The terminal work a turn asked for, in order, with scripted answers.
+#[derive(Default)]
+struct ScriptedTerminal {
+    calls: Vec<&'static str>,
+    later: signals::Pending,
+    stop_fails: bool,
+}
+
+impl SignalTerminal for ScriptedTerminal {
+    fn stop(&mut self) -> Result<(), ()> {
+        self.calls.push("stop");
+        if self.stop_fails {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+    fn later(&mut self) -> signals::Pending {
+        self.calls.push("later");
+        self.later
+    }
+    fn size(&mut self) -> (u16, u16) {
+        self.calls.push("size");
+        (90, 30)
+    }
+    fn reenter(&mut self) -> Result<(), ()> {
+        self.calls.push("reenter");
+        Ok(())
+    }
+}
+
+/// The loop's own signal turn: a chosen exit skips every terminal
+/// transition and goes first; only without one does a stop run, and what it
+/// brings back is decided the same way.
 #[test]
-fn hangup_decision_keeps_only_when_no_close_was_observed() {
-    use signals::{Leave, Pending};
-    let hangup = Pending {
+fn hangup_signal_turn_decides_before_any_terminal_transition() {
+    use signals::Pending;
+    let none = Pending::default();
+    let everything = Pending {
+        resized: true,
+        resumed: true,
+        terminate: true,
         hangup: true,
-        ..Default::default()
+        suspend: true,
     };
-    for (pending, expected) in [
-        (hangup, Some(Leave::Keep)),
-        // A continue or resize observed with it changes nothing: the loop
-        // measures nothing and does not reenter raw mode for a kept exit.
+    for (name, pending, later, calls, first, keep) in [
         (
-            Pending {
-                resumed: true,
-                resized: true,
-                ..hangup
-            },
-            Some(Leave::Keep),
+            "close+hangup+suspend+continue+resize",
+            everything,
+            none,
+            vec![],
+            vec![UiEvent::Terminate],
+            false,
         ),
         (
+            "hangup+suspend+continue+resize",
             Pending {
-                terminate: true,
-                ..hangup
+                terminate: false,
+                ..everything
             },
-            Some(Leave::Close),
+            none,
+            vec![],
+            vec![UiEvent::Hangup],
+            true,
         ),
         (
-            Pending {
-                terminate: true,
-                ..Default::default()
-            },
-            Some(Leave::Close),
-        ),
-        (
+            "suspend, then hangup+continue",
             Pending {
                 suspend: true,
-                resumed: true,
-                ..Default::default()
+                ..none
             },
-            None,
+            Pending {
+                hangup: true,
+                resumed: true,
+                ..none
+            },
+            vec!["stop", "later"],
+            vec![UiEvent::Hangup],
+            true,
+        ),
+        (
+            "suspend, then close+hangup",
+            Pending {
+                suspend: true,
+                ..none
+            },
+            Pending {
+                terminate: true,
+                hangup: true,
+                ..none
+            },
+            vec!["stop", "later"],
+            vec![UiEvent::Terminate],
+            false,
+        ),
+        (
+            "suspend, then continue",
+            Pending {
+                suspend: true,
+                ..none
+            },
+            Pending {
+                resumed: true,
+                ..none
+            },
+            vec!["stop", "later", "reenter"],
+            vec![UiEvent::Resumed],
+            false,
+        ),
+        (
+            "resize",
+            Pending {
+                resized: true,
+                ..none
+            },
+            none,
+            vec!["size"],
+            vec![UiEvent::Resized { cols: 90, rows: 30 }],
+            false,
         ),
     ] {
         let (_home, mut links) = input_executor_links();
-        assert_eq!(decide_leave(&pending, &mut links), expected, "{pending:?}");
-        assert_eq!(links.keep, expected == Some(Leave::Keep), "{pending:?}");
+        let mut terminal = ScriptedTerminal {
+            later,
+            ..Default::default()
+        };
+        let turn = signal_turn(pending, &mut links, &mut terminal);
+        assert_eq!(turn, Ok(first), "{name}");
+        assert_eq!(terminal.calls, calls, "{name}");
+        assert_eq!(links.keep, keep, "{name}");
+    }
+
+    let (_home, mut links) = input_executor_links();
+    let mut terminal = ScriptedTerminal {
+        stop_fails: true,
+        ..Default::default()
+    };
+    let suspend = Pending {
+        suspend: true,
+        ..none
+    };
+    assert_eq!(signal_turn(suspend, &mut links, &mut terminal), Err(1));
+    assert_eq!(terminal.calls, ["stop"]);
+}
+
+/// `interactive`'s actual raw-mode setup exit, reached by an injected
+/// failure with an admitted live login and the signals already observed. A
+/// winning hangup keeps the session; a close with it, or no signal, leaves
+/// the way a setup failure always has.
+#[test]
+fn hangup_seen_before_a_ui_setup_failure_keeps_the_session() {
+    use nix::sys::signal::{raise, Signal};
+    signals::install().unwrap();
+    for (raised, keep) in [
+        (&[Signal::SIGHUP][..], true),
+        (&[Signal::SIGHUP, Signal::SIGTERM][..], false),
+        (&[][..], false),
+    ] {
+        let _ = signals::take_pending();
+        let sink: Sink = Box::new(|_, _| Ok(()));
+        let mut executor = input_executor(sink, true);
+        let (_home, idle) = input_executor_links();
+        let links = std::mem::replace(&mut executor.links, idle);
+        assert!(links.live.is_some(), "an admitted login");
+        let mut inbox = UiInbox::new().unwrap();
+        let tx = inbox.renew();
+        let mut display = DisplaySize {
+            physical: (20, 5),
+            logical: (20, 5),
+        };
+        for signal in raised {
+            raise(*signal).unwrap();
+        }
+        FAIL_RAW_MODE.with(|fail| fail.set(true));
+        let (code, mut links) =
+            interactive(links.setup.clone(), links, &mut display, tx, &mut inbox);
+        FAIL_RAW_MODE.with(|fail| fail.set(false));
+        let _ = signals::take_pending();
+        assert_eq!((code, links.keep), (1, keep), "{raised:?}");
+        if let Some(live) = links.live.take() {
+            live.attempt.detach();
+        }
     }
 }
 

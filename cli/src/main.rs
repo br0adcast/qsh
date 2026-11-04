@@ -123,6 +123,16 @@ fn run(a: args::Args) -> i32 {
         claim.token,
     ));
 
+    // Before the login: once a login is admitted it may own the shell, and
+    // a failure here would then have to decide that session's fate.
+    let mut inbox = match UiInbox::new() {
+        Ok(inbox) => inbox,
+        Err(error) => {
+            eprintln!("qsh: could not initialize UI waits: {error}");
+            return 1;
+        }
+    };
+
     // The connection's own channel: a failed attempt's events are dropped
     // from it, and once logged in they reach the main loop's through the
     // forwarder, stamped with the connection's number.
@@ -169,13 +179,6 @@ fn run(a: args::Args) -> i32 {
     let mut epoch = RecoveryEpoch {
         connection: 0,
         network: 0,
-    };
-    let mut inbox = match UiInbox::new() {
-        Ok(inbox) => inbox,
-        Err(error) => {
-            eprintln!("qsh: could not initialize UI waits: {error}");
-            return 1;
-        }
     };
     let mut resolver = BoundedResolver::with_notification(inbox.notifier());
     loop {
@@ -1287,6 +1290,144 @@ fn decide_leave(pending: &signals::Pending, links: &mut Links) -> Option<signals
     leave
 }
 
+/// The terminal for the session UI, or why it is unavailable.
+fn enter_raw_mode() -> Result<tty::RawMode, nix::Error> {
+    #[cfg(test)]
+    if tests::FAIL_RAW_MODE.with(std::cell::Cell::get) {
+        return Err(nix::Error::ENOTTY);
+    }
+    // Common handlers were installed before login. RawMode owns the deferred
+    // TSTP policy and installs it before changing terminal modes.
+    tty::RawMode::install_panic_hook();
+    tty::RawMode::enter(std::io::stdin().as_raw_fd())
+}
+
+/// A UI setup step failed after the login, before the loop could take any
+/// signal: a hangup already seen, and not beaten by a close, keeps the
+/// session on the way out. Otherwise the failure leaves the way it always
+/// has, and `Links::leave` closes the link.
+fn leave_failed_setup(mut links: Links) -> (i32, Links) {
+    if signals::requested_leave() == Some(signals::Leave::Keep) {
+        log::log("hangup during UI setup: keeping the session");
+        links.keep = true;
+    }
+    (1, links)
+}
+
+/// The terminal work a turn's signals can ask of the loop.
+trait SignalTerminal {
+    /// Hands the terminal back and stops until continued. `Err` ends the
+    /// run with 1.
+    fn stop(&mut self) -> Result<(), ()>;
+    /// What arrived while stopped, the SIGCONT that ended the stop included.
+    fn later(&mut self) -> signals::Pending;
+    /// The terminal's size now.
+    fn size(&mut self) -> (u16, u16);
+    /// Raw mode, the alternate screen and the mirrored modes again after a
+    /// stop. `Err` ends the run with 1.
+    fn reenter(&mut self) -> Result<(), ()>;
+}
+
+/// This turn's signals as the events that go first in its batch, or the
+/// code the run ends with. An exit is decided before any terminal
+/// transition: once one is chosen nothing is stopped, measured or reentered,
+/// and its event goes first, so nothing queued behind it changes it. Only
+/// without an exit does a stop run, with the signals it brings back decided
+/// the same way.
+fn signal_turn(
+    mut pending: signals::Pending,
+    links: &mut Links,
+    terminal: &mut impl SignalTerminal,
+) -> Result<Vec<UiEvent>, i32> {
+    let mut leave = decide_leave(&pending, links);
+    if pending.suspend && leave.is_none() {
+        terminal.stop().map_err(|()| 1)?;
+        let later = terminal.later();
+        pending.resized |= later.resized;
+        pending.terminate |= later.terminate;
+        pending.hangup |= later.hangup;
+        pending.resumed = true;
+        leave = decide_leave(&pending, links);
+    }
+    match leave {
+        Some(signals::Leave::Keep) => {
+            // The terminal may already be gone.
+            log::log("hangup: keeping the session");
+            return Ok(vec![UiEvent::Hangup]);
+        }
+        Some(signals::Leave::Close) => return Ok(vec![UiEvent::Terminate]),
+        None => {}
+    }
+    let mut first = Vec::new();
+    if pending.resized {
+        let (cols, rows) = terminal.size();
+        first.push(UiEvent::Resized { cols, rows });
+    }
+    if pending.resumed {
+        terminal.reenter().map_err(|()| 1)?;
+        first.push(UiEvent::Resumed);
+    }
+    Ok(first)
+}
+
+/// [`SignalTerminal`] for the live loop: the session's own screen and the
+/// real terminal.
+struct LoopTerminal<'a, W: Write> {
+    sess: &'a mut Session,
+    raw: &'a tty::RawMode,
+    stdout: &'a mut W,
+    out_fd: std::os::fd::RawFd,
+    now_ms: i64,
+}
+
+impl<W: Write> SignalTerminal for LoopTerminal<'_, W> {
+    fn stop(&mut self) -> Result<(), ()> {
+        // SIGTSTP: the terminal goes back to the shell the way it would
+        // on the way out -- the mirrored modes off, its own screen, its
+        // own settings -- and only then does the process stop. Once it
+        // is continued, `Resumed` brings raw mode, the alternate screen
+        // and a full repaint back. The SIGCONT that ends the stop is
+        // taken by `later` too, or it would repaint a second time; a
+        // group the kernel does not stop comes straight back all the same.
+        let _ = self.stdout.write_all(&self.sess.suspend(self.now_ms));
+        let _ = self.stdout.flush();
+        if let Err(error) = self.raw.suspend() {
+            log::error(&format!(
+                "could not restore terminal before stopping: {error}"
+            ));
+            return Err(());
+        }
+        log::log("stopping (SIGTSTP)");
+        if let Err(error) = self.raw.stop() {
+            log::error(&format!("could not complete terminal stop: {error}"));
+            return Err(());
+        }
+        log::log("continued");
+        Ok(())
+    }
+
+    fn later(&mut self) -> signals::Pending {
+        signals::take_pending()
+    }
+
+    fn size(&mut self) -> (u16, u16) {
+        tty::window_size(self.out_fd).unwrap_or(self.sess.physical_size())
+    }
+
+    fn reenter(&mut self) -> Result<(), ()> {
+        // Whatever had this terminal while we were stopped left it
+        // cooked, and `Resumed` only repaints -- painting a frame into a
+        // terminal that echoes and buffers by line is not the way back,
+        // so raw mode, the alternate screen (when the stop left it), the
+        // mirrored modes, and the screen all need restoring first.
+        // An unconfirmed terminal transition cannot continue painting
+        // or reenter raw mode under a foreground/default stop policy.
+        self.raw.reenter().map_err(|error| {
+            log::error(&format!("could not restore raw mode: {error}"));
+        })
+    }
+}
+
 /// One line on stderr that may fail: after a hangup the terminal is gone,
 /// and `eprintln!` would panic on the write error.
 fn best_effort_line(line: &str) {
@@ -1603,14 +1744,11 @@ fn interactive(
 ) -> (i32, Links) {
     let out_fd = std::io::stdout().as_raw_fd();
 
-    // Common handlers were installed before login. RawMode owns the deferred
-    // TSTP policy and installs it before changing terminal modes.
-    tty::RawMode::install_panic_hook();
-    let raw = match tty::RawMode::enter(std::io::stdin().as_raw_fd()) {
+    let raw = match enter_raw_mode() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("qsh: terminal unavailable: {e}");
-            return (1, links);
+            best_effort_line(&format!("qsh: terminal unavailable: {e}"));
+            return leave_failed_setup(links);
         }
     };
     // From here until `restore` nothing may write to the terminal but the
@@ -1685,7 +1823,7 @@ fn interactive(
             }
             display.physical = sess.physical_size();
             display.logical = sess.size();
-            return (1, links);
+            return leave_failed_setup(links);
         }
     };
 
@@ -1751,70 +1889,22 @@ fn interactive(
             };
         // Even empty notification turns reach Links::turn below. Never drain
         // Round/DNS publication and then park without observing its owner.
-        let mut pending = signals::take_pending();
-        // Decided before any terminal transition below can fail and leave
-        // by a path that would close a session the hangup keeps.
-        let mut leave = decide_leave(&pending, &mut links);
-        if pending.suspend && leave != Some(signals::Leave::Keep) {
-            // SIGTSTP: the terminal goes back to the shell the way it would
-            // on the way out -- the mirrored modes off, its own screen, its
-            // own settings -- and only then does the process stop. Once it
-            // is continued, `Resumed` below brings raw mode, the alternate
-            // screen and a full repaint back. The SIGCONT that ends the stop
-            // is taken here too, or it would repaint a second time; a group
-            // the kernel does not stop comes straight back all the same.
-            let _ = stdout.write_all(&sess.suspend(now_ms()));
-            let _ = stdout.flush();
-            if let Err(error) = raw.suspend() {
-                log::error(&format!(
-                    "could not restore terminal before stopping: {error}"
-                ));
-                break 1;
+        let first = signal_turn(
+            signals::take_pending(),
+            &mut links,
+            &mut LoopTerminal {
+                sess: &mut sess,
+                raw: &raw,
+                stdout: &mut stdout,
+                out_fd,
+                now_ms: now_ms(),
+            },
+        );
+        match first {
+            Ok(first) => {
+                events.splice(0..0, first);
             }
-            log::log("stopping (SIGTSTP)");
-            if let Err(error) = raw.stop() {
-                log::error(&format!("could not complete terminal stop: {error}"));
-                break 1;
-            }
-            log::log("continued");
-            let later = signals::take_pending();
-            pending.resized |= later.resized;
-            pending.terminate |= later.terminate;
-            pending.hangup |= later.hangup;
-            pending.resumed = true;
-            leave = decide_leave(&pending, &mut links);
-        }
-        if leave == Some(signals::Leave::Keep) {
-            // The terminal may already be gone: nothing is measured or put
-            // back into raw mode. The exit goes first and ends the batch
-            // before anything queued behind it.
-            log::log("hangup: keeping the session");
-            events.insert(0, UiEvent::Hangup);
-        } else {
-            let mut signal_prefix = 0;
-            if pending.resized {
-                let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
-                events.insert(signal_prefix, UiEvent::Resized { cols: c, rows: r });
-                signal_prefix += 1;
-            }
-            if pending.resumed {
-                // Whatever had this terminal while we were stopped left it
-                // cooked, and `Resumed` only repaints -- painting a frame into a
-                // terminal that echoes and buffers by line is not the way back,
-                // so raw mode, the alternate screen (when the stop left it), the
-                // mirrored modes, and the screen all need restoring first.
-                // An unconfirmed terminal transition cannot continue painting
-                // or reenter raw mode under a foreground/default stop policy.
-                if let Err(e) = raw.reenter() {
-                    log::error(&format!("could not restore raw mode: {e}"));
-                    break 1;
-                }
-                events.insert(signal_prefix, UiEvent::Resumed);
-                signal_prefix += 1;
-            }
-            if leave == Some(signals::Leave::Close) {
-                events.insert(signal_prefix, UiEvent::Terminate);
-            }
+            Err(code) => break code,
         }
         if queue != QueueState::BudgetReached {
             if sealed_fault {

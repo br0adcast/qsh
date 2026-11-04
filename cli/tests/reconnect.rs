@@ -1011,7 +1011,9 @@ fn the_marked_shell_answers(
 
 /// How many pseudo-terminal masters process `pid` holds. A client holding
 /// a copy of its own terminal's master would keep that terminal from ever
-/// hanging up when the test closes its side.
+/// hanging up when the test closes its side. Read from `/proc`, so this
+/// diagnostic is Linux-only; the close and the assertions after it are not.
+#[cfg(target_os = "linux")]
 fn masters_held_by(pid: u32) -> usize {
     std::fs::read_dir(format!("/proc/{pid}/fd"))
         .expect("the client's descriptors")
@@ -1037,6 +1039,7 @@ fn a_closed_terminal_keeps_the_session_and_the_next_run_comes_back() {
     answer_yes(&mut first, &screen, &daemon);
     let pid = mark_with_pid(&mut first, &screen);
 
+    #[cfg(target_os = "linux")]
     assert_eq!(
         masters_held_by(first.pid()),
         0,
