@@ -1,0 +1,22 @@
+[package]
+name = "release-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+sigstore-verify = { version = "=0.15.1", default-features = false, features = ["aws-lc-rs"] }
+sigstore-trust-root = { version = "=0.15.1", default-features = false }
+sigstore-crypto = { version = "=0.15.1", default-features = false }
+sigstore-types = { version = "=0.15.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+semver = "1"
+x509-cert = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+base64 = "0.23"

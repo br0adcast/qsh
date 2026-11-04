@@ -9,6 +9,7 @@ on:
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
       - 'crates/sshauth/**'
+      - 'crates/release-auth/**'
       - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
@@ -29,6 +30,7 @@ on:
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
       - 'crates/sshauth/**'
+      - 'crates/release-auth/**'
       - 'crates/ssh/src/crypto_worker.rs'
       - 'scripts/*openssl*'
       - 'scripts/openssl/**'
@@ -199,6 +201,40 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: native-products-${{ matrix.target }}
+      - name: Qualify offline release authentication
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          cargo test --locked -p release-auth --all-targets --target "$NATIVE_TARGET"
+          cargo build --locked -p release-auth --example verify-release --target "$NATIVE_TARGET"
+          verifier="target/$NATIVE_TARGET/debug/examples/verify-release"
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "$verifier")
+            if grep -q NEEDED <<< "$dynamic"; then
+              echo 'musl release verifier imports dynamic libraries' >&2
+              exit 1
+            fi
+          else
+            dynamic=$(otool -L "$verifier")
+            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
+              echo 'release verifier imports a dynamic crypto backend' >&2
+              exit 1
+            fi
+          fi
+          python3 -I -B - "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP" <<'PY'
+          from pathlib import Path
+          import os
+          import sys
+          data = Path(sys.argv[1]).read_bytes()
+          if any(os.fsencode(path) in data for path in sys.argv[2:]):
+              raise SystemExit('release verifier contains an unremapped build path')
+          PY
       - name: Qualify the linked products and generated RSA operations
         shell: bash
         env:
