@@ -16,6 +16,7 @@ use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 static RESIZED: AtomicBool = AtomicBool::new(false);
 static RESUMED: AtomicBool = AtomicBool::new(false);
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+static HANGUP: AtomicBool = AtomicBool::new(false);
 // The low bits are fixed policy flags; high bits are a non-wrapping owner
 // generation. An old Saved guard cannot restore a replacement's disposition.
 const DEFERRED: u64 = 1;
@@ -25,14 +26,16 @@ const FLAGS: u64 = 7;
 static SUSPEND: AtomicU64 = AtomicU64::new(0);
 
 /// What arrived since the last look. `terminate` is a GROUP: SIGTERM,
-/// SIGHUP, SIGINT and SIGQUIT all mean the same thing to this program --
-/// close the session and put the terminal back -- and the loop has nothing
-/// to do differently for any of them.
+/// SIGINT and SIGQUIT all mean the same thing to this program -- close the
+/// session and put the terminal back -- and the loop has nothing to do
+/// differently for any of them. `hangup` (SIGHUP, what a closing terminal
+/// sends) is apart: it leaves the way `Ctrl-] .` does, keeping the session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Pending {
     pub resized: bool,
     pub resumed: bool,
     pub terminate: bool,
+    pub hangup: bool,
     /// SIGTSTP: the terminal is to be handed back before the process stops
     /// ([`stop`]).
     pub suspend: bool,
@@ -51,6 +54,35 @@ extern "C" fn on_cont(_: libc::c_int) {
 extern "C" fn on_terminate(_: libc::c_int) {
     TERMINATE.store(true, Ordering::SeqCst);
     crate::signal_wake::notify();
+}
+
+extern "C" fn on_hangup(_: libc::c_int) {
+    HANGUP.store(true, Ordering::SeqCst);
+    crate::signal_wake::notify();
+}
+
+/// How an attached session ends when signals ask it to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Leave {
+    /// SIGTERM, SIGINT or SIGQUIT: close the session.
+    Close,
+    /// SIGHUP alone: leave and keep the session on the server.
+    Keep,
+}
+
+impl Pending {
+    /// The exit these signals decide, if any. An explicit request to close
+    /// wins over a hangup observed with it; a signal that arrives after the
+    /// decision does not change it.
+    pub fn leave(&self) -> Option<Leave> {
+        if self.terminate {
+            Some(Leave::Close)
+        } else if self.hangup {
+            Some(Leave::Keep)
+        } else {
+            None
+        }
+    }
 }
 
 extern "C" fn on_tstp(_: libc::c_int) {
@@ -125,7 +157,7 @@ pub fn install() -> Result<(), nix::Error> {
     install_common(Signal::SIGWINCH, SigHandler::Handler(on_winch))?;
     install_common(Signal::SIGCONT, SigHandler::Handler(on_cont))?;
     install_common(Signal::SIGTERM, SigHandler::Handler(on_terminate))?;
-    install_common(Signal::SIGHUP, SigHandler::Handler(on_terminate))?;
+    install_common(Signal::SIGHUP, SigHandler::Handler(on_hangup))?;
     // SIGINT and SIGQUIT belong here for one reason: their DEFAULT
     // disposition ends the process on the spot, running neither `Drop`,
     // nor the panic hook, nor `restore()` -- leaving exactly the broken
@@ -161,6 +193,7 @@ pub fn has_pending() -> bool {
     RESIZED.load(Ordering::SeqCst)
         || RESUMED.load(Ordering::SeqCst)
         || TERMINATE.load(Ordering::SeqCst)
+        || HANGUP.load(Ordering::SeqCst)
         || SUSPEND.load(Ordering::SeqCst) & PENDING != 0
 }
 
@@ -323,9 +356,10 @@ impl Drop for DeferredSuspend {
     }
 }
 
-/// Whether termination was requested, without consuming the interactive loop's flag.
+/// Whether termination or a hangup was requested, without consuming the
+/// interactive loop's flags: a foreground phase cancels for either.
 pub fn termination_requested() -> bool {
-    TERMINATE.load(Ordering::SeqCst)
+    TERMINATE.load(Ordering::SeqCst) || HANGUP.load(Ordering::SeqCst)
 }
 
 /// Keeps a cancellation token synchronized with termination for one foreground operation.
@@ -359,6 +393,7 @@ pub fn take_pending() -> Pending {
         resized: RESIZED.swap(false, Ordering::SeqCst),
         resumed: RESUMED.swap(false, Ordering::SeqCst),
         terminate: TERMINATE.swap(false, Ordering::SeqCst),
+        hangup: HANGUP.swap(false, Ordering::SeqCst),
         suspend: SUSPEND.fetch_and(!PENDING, Ordering::SeqCst) & PENDING != 0,
     }
 }
@@ -458,6 +493,32 @@ mod tests {
         let _ = take_pending();
         raise(Signal::SIGTERM).expect("raise");
         assert!(take_pending().terminate, "SIGTERM must be seen, not fatal");
+    }
+
+    /// SIGHUP is recorded on its own: it keeps the session, and only an
+    /// explicit close observed with it ends the session.
+    #[test]
+    fn a_hangup_is_recorded_apart_from_termination() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        install().expect("install");
+        let _ = take_pending();
+        raise(Signal::SIGHUP).expect("raise");
+        assert!(has_pending());
+        assert!(
+            termination_requested() && termination_requested(),
+            "a foreground phase sees the hangup without consuming it"
+        );
+        let pending = take_pending();
+        assert!(pending.hangup && !pending.terminate, "{pending:?}");
+        assert_eq!(pending.leave(), Some(Leave::Keep));
+        assert!(!termination_requested() && !take_pending().hangup);
+
+        raise(Signal::SIGHUP).expect("raise");
+        raise(Signal::SIGTERM).expect("raise");
+        let both = take_pending();
+        assert!(both.hangup && both.terminate);
+        assert_eq!(both.leave(), Some(Leave::Close), "close wins");
+        assert_eq!(take_pending().leave(), None);
     }
 
     /// SIGINT must not be fatal either. Its default disposition kills the

@@ -44,6 +44,9 @@ pub struct Claim {
     /// retains an inherited descriptor before exec. None for a throwaway token.
     _lock: Option<SlotLock>,
     warning: Option<String>,
+    /// Whether `token` itself is the one saved in the locked slot: what a
+    /// later run would read. Kept apart from `warning`, which is taken once.
+    persisted: bool,
 }
 
 struct SlotLock {
@@ -100,13 +103,28 @@ impl Claim {
         self.warning.take()
     }
 
+    /// Whether a later run with the same tuple would read this run's
+    /// current token. Says nothing about how long the server keeps the
+    /// session, or whether the disk stays available.
+    pub fn persisted(&self) -> bool {
+        self.persisted
+    }
+
     /// Replace only this run's token, retaining its exclusive slot lock.
+    /// Without a lock the new token is in memory only: `Ok`, not persisted.
     pub fn replace_token(&mut self) -> std::io::Result<[u8; 16]> {
         let token = fresh_token();
         if let Some(slot) = &mut self._lock {
             slot.binding
                 .validate_private_current(&slot.parent, &slot.file)?;
-            write_token(&mut slot.file, &token)?;
+            if let Err(error) = write_token(&mut slot.file, &token) {
+                // The write may already have truncated the old record.
+                self.persisted = false;
+                return Err(error);
+            }
+            self.persisted = true;
+        } else {
+            self.persisted = false;
         }
         self.token = token;
         Ok(token)
@@ -199,6 +217,7 @@ fn ephemeral(path: &Path, error: std::io::Error) -> Claim {
         token: fresh_token(),
         _lock: None,
         warning: Some(persistence_warning(path, error)),
+        persisted: false,
     }
 }
 
@@ -232,6 +251,7 @@ fn claim_locked(
                     token,
                     _lock: Some(slot),
                     warning: None,
+                    persisted: true,
                 });
             }
         }
@@ -247,6 +267,7 @@ fn claim_locked(
     Ok(Claim {
         token,
         _lock: Some(slot),
+        persisted: warning.is_none(),
         warning,
     })
 }
@@ -517,7 +538,9 @@ mod tests {
         let original = first.token;
         let second = claim(dir.path(), "alice", "example.org", 60000);
         let second_token = second.token;
+        assert!(first.persisted(), "a fresh token was written");
         let replacement = first.replace_token().unwrap();
+        assert!(first.persisted(), "the replacement was written");
         assert_ne!(replacement, original);
         assert_ne!(replacement, second.token);
         drop(first);
@@ -539,11 +562,15 @@ mod tests {
     #[test]
     fn the_same_host_gets_the_same_token_next_time() {
         let dir = slot139_fixture();
-        let first = claim(dir.path(), "alice", "example.org", 60000).token;
+        let run = claim(dir.path(), "alice", "example.org", 60000);
+        assert!(run.persisted(), "a fresh token was written");
+        let first = run.token;
         // The first run ends: its lock goes with it.
-        let second = claim(dir.path(), "alice", "example.org", 60000).token;
+        drop(run);
+        let run = claim(dir.path(), "alice", "example.org", 60000);
+        assert!(run.persisted(), "the saved token was read back");
         assert_eq!(
-            first, second,
+            first, run.token,
             "a slot nobody holds is the session to return to"
         );
     }

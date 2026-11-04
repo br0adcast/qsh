@@ -96,6 +96,30 @@ impl RoundTask {
     pub fn retry_now(&self) {
         self.recovery.retry_now();
     }
+
+    /// The run is ending: a login this round already published, and nobody
+    /// adopted, is let go without a `Close`, so the server keeps the session.
+    /// Whether there was one.
+    pub fn release_published(&self) -> bool {
+        match self.try_recv() {
+            Ok(Round::Connected { connected, .. }) => {
+                connected.attempt.detach();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Test-only: a task whose round already published `round` for the
+    /// current revision and was not consumed -- the state the owner finds
+    /// when its run ends between publication and adoption. No worker runs.
+    #[cfg(test)]
+    pub(crate) fn published(round: Round, recovery: Arc<Recovery>) -> RoundTask {
+        let (tx, done) = std::sync::mpsc::channel();
+        tx.send((recovery.revision(), round))
+            .expect("the receiver is held here");
+        RoundTask { done, recovery }
+    }
 }
 
 impl Drop for RoundTask {
@@ -315,6 +339,78 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// A real attempt to a fixture-owned silent socket, wrapped as a round's
+    /// published login, and its teardown record.
+    fn published_login(peer: &std::net::UdpSocket) -> (RoundTask, Arc<crate::connect::Events>) {
+        use crate::connect::{Attempt, AttemptScope, Login};
+        let (tx, _rx) = mpsc::channel();
+        let attempt = Attempt::open(
+            peer.local_addr().unwrap(),
+            transport::generate_keypair().public,
+            transport::generate_keypair().private,
+            Login::Allowlist,
+            tx,
+            AttemptScope {
+                token: [2; 16],
+                input_budget: Default::default(),
+            },
+        );
+        let events = Arc::clone(&attempt.events);
+        let sink: crate::climb::Sink = Box::new(|_, _| Ok(()));
+        let connected = Connected {
+            attempt,
+            trial: crate::climb::Trial {
+                channel_session: client::channel::ChannelSession::new(
+                    client::qsh::QshSubstrate::new(sink),
+                ),
+                opened_ch: None,
+                cols: 20,
+                rows: 5,
+            },
+            addr: 0,
+            port: peer.local_addr().unwrap().port(),
+            remote: peer.local_addr().unwrap(),
+        };
+        let (_events_tx, events_rx) = mpsc::channel();
+        let recovery = Arc::new(Recovery::new(
+            RecoveryEpoch {
+                connection: 1,
+                network: 1,
+            },
+            1,
+        ));
+        let task = RoundTask::published(
+            Round::Connected {
+                connected,
+                events: events_rx,
+            },
+            recovery,
+        );
+        (task, events)
+    }
+
+    /// A run that ends between a round's publication and its adoption lets
+    /// that login go without a `Close`, through both of the owner's ways
+    /// out: releasing the published result, and dropping the task. The
+    /// record is written after the real release and driver join returned:
+    /// custody coverage, not a record of what reached the wire.
+    #[test]
+    fn a_published_unadopted_login_is_detached_never_closed() {
+        use crate::connect::Teardown;
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let (task, events) = published_login(&peer);
+        assert!(task.release_published(), "the published login is released");
+        assert_eq!(*events.teardowns.lock().unwrap(), [Teardown::Detach]);
+        assert!(!task.release_published(), "and only once");
+        drop(task);
+        assert_eq!(*events.teardowns.lock().unwrap(), [Teardown::Detach]);
+
+        let (task, events) = published_login(&peer);
+        drop(task);
+        assert_eq!(*events.teardowns.lock().unwrap(), [Teardown::Detach]);
+    }
 
     #[test]
     fn a_connection_s_events_arrive_stamped_with_its_number_and_in_order() {

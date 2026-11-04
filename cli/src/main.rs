@@ -174,7 +174,7 @@ fn run(a: args::Args) -> i32 {
             &mut display,
             addresses,
             epoch,
-            (resolver, &mut inbox),
+            (resolver, &mut inbox, claim.persisted()),
         );
         let lost = links.replacement_at.is_some();
         addresses = links.addresses.clone();
@@ -209,7 +209,9 @@ fn run(a: args::Args) -> i32 {
         let token = match claim.replace_token() {
             Ok(token) => token,
             Err(error) => {
-                eprintln!("qsh: could not save the replacement session: {error}");
+                best_effort_line(&format!(
+                    "qsh: could not save the replacement session: {error}"
+                ));
                 return 1;
             }
         };
@@ -240,7 +242,7 @@ fn run(a: args::Args) -> i32 {
             )
         };
         let mut task = start_round(epoch, &catalog);
-        eprintln!("qsh: starting a new session");
+        best_effort_line("qsh: starting a new session");
         let started = Instant::now();
         loop {
             resolve_roads(
@@ -284,7 +286,7 @@ fn run(a: args::Args) -> i32 {
                     let waited = inbox.wait_until(due, signals::notification_fd().ok(), None);
                     let drained = inbox.drain().and_then(|()| signals::drain_notifications());
                     if let Err(error) = waited.and(drained.map(|()| false)) {
-                        eprintln!("qsh: replacement wait failed: {error}");
+                        best_effort_line(&format!("qsh: replacement wait failed: {error}"));
                         return 1;
                     }
                     // A drained wake commits the next complete round/catalog
@@ -312,7 +314,7 @@ fn connected_session(
     display: &mut DisplaySize,
     mut addresses: Vec<Address>,
     road_epoch: RecoveryEpoch,
-    (resolver, inbox): (BoundedResolver, &mut UiInbox),
+    (resolver, inbox, persisted): (BoundedResolver, &mut UiInbox, bool),
 ) -> (i32, Links) {
     let tx = inbox.renew();
     background::forward(0, events, tx.clone());
@@ -379,6 +381,7 @@ fn connected_session(
         round_line: None,
         farewell: None,
         stopped: false,
+        persisted,
         replacement_at: None,
         tx: tx.clone(),
     };
@@ -612,6 +615,9 @@ struct Links {
     /// The session or tracked shell is unavailable, or its key changed:
     /// there is no kept shell to report on the way out.
     stopped: bool,
+    /// Whether this run's current token was saved: whether the way-out
+    /// notice may say a later run can come back (`Claim::persisted`).
+    persisted: bool,
     /// Explicit lifecycle evidence that the tracked shell is unavailable,
     /// and the authenticated road to prefer if replacement is accepted.
     replacement_at: Option<usize>,
@@ -1203,15 +1209,17 @@ impl Links {
     fn leave(mut self) -> BoundedResolver {
         self.resolver.cancel();
         let host = self.addresses[self.at].host.as_str();
-        if let Some(Ok(Round::Connected { connected, .. })) =
-            self.round.as_ref().map(background::RoundTask::try_recv)
+        if self
+            .round
+            .as_ref()
+            .is_some_and(background::RoundTask::release_published)
         {
             log::log("leaving: a round had just got back in; letting it go");
-            connected.attempt.detach();
         }
-        if let Some(line) = &self.farewell {
-            eprintln!("{line}");
-        }
+        // Lines only after the link's fate is settled: the terminal may be
+        // gone (a hangup), and nothing printed may stand between a kept
+        // session and its detach.
+        let mut lines: Vec<String> = self.farewell.take().into_iter().collect();
         match &self.live {
             Some(live) => {
                 // Read before `close`, which ends the connection with this
@@ -1227,25 +1235,50 @@ impl Links {
                 // there is nothing kept to tell the person about.
                 if self.keep && !graceful {
                     log::log("leaving; letting the link go, the session stays");
-                    eprintln!("{}", status::left_kept_notice(host));
                     live.attempt.detach();
-                    return self.resolver;
+                    lines.push(status::left_kept_notice(host, self.persisted));
+                } else {
+                    let notice =
+                        status::kept_session_notice(host, closed, graceful, self.persisted);
+                    live.attempt.close();
+                    lines.extend(notice);
                 }
-                if let Some(notice) = status::kept_session_notice(host, closed, graceful) {
-                    eprintln!("{notice}");
-                }
-                live.attempt.close();
             }
             // Leaving in the middle of a reconnect: the link was let go
             // quietly, so the server still has the session -- and a person
             // who left with `Ctrl-] .` is told they left.
             None if !self.stopped => {
-                eprintln!("{}", status::mid_reconnect_notice(host, self.keep));
+                lines.push(status::mid_reconnect_notice(
+                    host,
+                    self.keep,
+                    self.persisted,
+                ));
             }
             None => {}
         }
+        for line in lines {
+            best_effort_line(&line);
+        }
         self.resolver
     }
+}
+
+/// The exit this turn's signals decide (see [`signals::Pending::leave`]).
+/// A kept session is recorded on `links` at once: the caller may still
+/// attempt terminal transitions that fail and leave, and that way out must
+/// not close what the hangup keeps.
+fn decide_leave(pending: &signals::Pending, links: &mut Links) -> Option<signals::Leave> {
+    let leave = pending.leave();
+    if leave == Some(signals::Leave::Keep) {
+        links.keep = true;
+    }
+    leave
+}
+
+/// One line on stderr that may fail: after a hangup the terminal is gone,
+/// and `eprintln!` would panic on the write error.
+fn best_effort_line(line: &str) {
+    let _ = writeln!(std::io::stderr(), "{line}");
 }
 
 /// All connection events, including terminal aborts, use the same exact link
@@ -1634,9 +1667,9 @@ fn interactive(
             // Restore before displaying an initialization failure, as on the
             // normal exit path. No reader thread survived a failed start.
             let restored = raw.restore();
-            eprintln!("qsh: could not start keyboard input: {error}");
+            best_effort_line(&format!("qsh: could not start keyboard input: {error}"));
             if let Err(error) = restored {
-                eprintln!("qsh: could not restore terminal: {error}");
+                best_effort_line(&format!("qsh: could not restore terminal: {error}"));
             }
             display.physical = sess.physical_size();
             display.logical = sess.size();
@@ -1707,7 +1740,10 @@ fn interactive(
         // Even empty notification turns reach Links::turn below. Never drain
         // Round/DNS publication and then park without observing its owner.
         let mut pending = signals::take_pending();
-        if pending.suspend {
+        // Decided before any terminal transition below can fail and leave
+        // by a path that would close a session the hangup keeps.
+        let mut leave = decide_leave(&pending, &mut links);
+        if pending.suspend && leave != Some(signals::Leave::Keep) {
             // SIGTSTP: the terminal goes back to the shell the way it would
             // on the way out -- the mirrored modes off, its own screen, its
             // own settings -- and only then does the process stop. Once it
@@ -1732,31 +1768,41 @@ fn interactive(
             let later = signals::take_pending();
             pending.resized |= later.resized;
             pending.terminate |= later.terminate;
+            pending.hangup |= later.hangup;
             pending.resumed = true;
+            leave = decide_leave(&pending, &mut links);
         }
-        let mut signal_prefix = 0;
-        if pending.resized {
-            let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
-            events.insert(signal_prefix, UiEvent::Resized { cols: c, rows: r });
-            signal_prefix += 1;
-        }
-        if pending.resumed {
-            // Whatever had this terminal while we were stopped left it
-            // cooked, and `Resumed` only repaints -- painting a frame into a
-            // terminal that echoes and buffers by line is not the way back,
-            // so raw mode, the alternate screen (when the stop left it), the
-            // mirrored modes, and the screen all need restoring first.
-            // An unconfirmed terminal transition cannot continue painting
-            // or reenter raw mode under a foreground/default stop policy.
-            if let Err(e) = raw.reenter() {
-                log::error(&format!("could not restore raw mode: {e}"));
-                break 1;
+        if leave == Some(signals::Leave::Keep) {
+            // The terminal may already be gone: nothing is measured or put
+            // back into raw mode. The exit goes first and ends the batch
+            // before anything queued behind it.
+            log::log("hangup: keeping the session");
+            events.insert(0, UiEvent::Hangup);
+        } else {
+            let mut signal_prefix = 0;
+            if pending.resized {
+                let (c, r) = tty::window_size(out_fd).unwrap_or(sess.physical_size());
+                events.insert(signal_prefix, UiEvent::Resized { cols: c, rows: r });
+                signal_prefix += 1;
             }
-            events.insert(signal_prefix, UiEvent::Resumed);
-            signal_prefix += 1;
-        }
-        if pending.terminate {
-            events.insert(signal_prefix, UiEvent::Terminate);
+            if pending.resumed {
+                // Whatever had this terminal while we were stopped left it
+                // cooked, and `Resumed` only repaints -- painting a frame into a
+                // terminal that echoes and buffers by line is not the way back,
+                // so raw mode, the alternate screen (when the stop left it), the
+                // mirrored modes, and the screen all need restoring first.
+                // An unconfirmed terminal transition cannot continue painting
+                // or reenter raw mode under a foreground/default stop policy.
+                if let Err(e) = raw.reenter() {
+                    log::error(&format!("could not restore raw mode: {e}"));
+                    break 1;
+                }
+                events.insert(signal_prefix, UiEvent::Resumed);
+                signal_prefix += 1;
+            }
+            if leave == Some(signals::Leave::Close) {
+                events.insert(signal_prefix, UiEvent::Terminate);
+            }
         }
         if queue != QueueState::BudgetReached {
             if sealed_fault {
@@ -1894,12 +1940,12 @@ fn interactive(
     let code = match raw.restore() {
         Ok(()) => code,
         Err(error) => {
-            eprintln!("qsh: could not restore terminal: {error}");
+            best_effort_line(&format!("qsh: could not restore terminal: {error}"));
             1
         }
     };
     for notice in &notices {
-        eprintln!("{notice}");
+        best_effort_line(notice);
     }
     display.physical = sess.physical_size();
     display.logical = sess.size();
@@ -1991,6 +2037,7 @@ mod tests {
     include!("input_action_tests.rs");
     include!("input_turn_tests.rs");
     include!("applied_gap_tests.rs");
+    include!("hangup_tests.rs");
 
     fn geometry_session() -> Session {
         geometry_session_with_cols(20)
@@ -2395,6 +2442,7 @@ mod tests {
             round_line: None,
             farewell: None,
             stopped: false,
+            persisted: true,
             replacement_at: None,
             tx: tx.into(),
         };

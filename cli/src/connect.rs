@@ -137,6 +137,19 @@ pub struct Events {
     /// Nothing takes from the queue any more: a waiting delivery returns.
     released: AtomicBool,
     recovery_progress: Option<Arc<dyn Fn(RecoveryProgress) + Send + Sync>>,
+    /// Test-only: which teardown each owner dispatched, recorded once the
+    /// real release and driver join have returned. Custody coverage, not a
+    /// record of what reached the wire.
+    #[cfg(test)]
+    pub(crate) teardowns: Mutex<Vec<Teardown>>,
+}
+
+/// Test-only: how an [`Attempt`] was let go.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Teardown {
+    Close,
+    Detach,
 }
 
 impl Events {
@@ -155,7 +168,17 @@ impl Events {
             room: Condvar::new(),
             released: AtomicBool::new(false),
             recovery_progress: None,
+            #[cfg(test)]
+            teardowns: Mutex::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn record_teardown(&self, teardown: Teardown) {
+        self.teardowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(teardown);
     }
 
     /// Coalesce one terminal local input failure per exact stamped attempt.
@@ -574,6 +597,8 @@ impl Attempt {
     pub fn close(&self) {
         self.events.release();
         self.client.close();
+        #[cfg(test)]
+        self.events.record_teardown(Teardown::Close);
     }
 
     /// Lets the connection go without a `Close`: like [`Attempt::close`],
@@ -581,6 +606,8 @@ impl Attempt {
     pub fn detach(&self) {
         self.events.release();
         self.client.detach();
+        #[cfg(test)]
+        self.events.record_teardown(Teardown::Detach);
     }
 
     /// The committed admission outcome, distinct from msg2's tentative resume hint.
