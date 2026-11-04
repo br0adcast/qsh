@@ -1450,65 +1450,60 @@ mod roles {
                     }
                     if complete {
                         let current = unsafe { libc::getpgrp() };
-                        if groups.contains(&current) {
-                            if ensure_pin(&mut keepers, current, &mut upstream, instance, sid)? {
-                                if !keepers
+                        if groups.contains(&current)
+                            && ensure_pin(&mut keepers, current, &mut upstream, instance, sid)?
+                        {
+                            if !keepers
+                                .iter()
+                                .any(|k| !k.waited && k.requested == 0 && !k.destination_used)
+                                && keepers.len() < 8
+                            {
+                                let keeper = create_keeper(0, instance, sid)?;
+                                send(
+                                    &mut upstream,
+                                    Frame {
+                                        operation: Operation::KeeperSpawned,
+                                        fields: [keeper.pid as i64, 0, 0, 0],
+                                    },
+                                )?;
+                                keepers.push(keeper);
+                            }
+                            if !keepers.iter().any(|k| !k.waited && !k.notified) {
+                                if let Some(destination) = keepers
                                     .iter()
-                                    .any(|k| !k.waited && k.requested == 0 && !k.destination_used)
-                                    && keepers.len() < 8
+                                    .filter(|k| k.requested == 0 && !k.destination_used)
+                                    .filter_map(|k| k.claim.map(|(_, g)| g))
+                                    .find(|g| {
+                                        *g != current
+                                            && keepers.iter().any(|k| valid_pin(k, *g, sid))
+                                    })
                                 {
-                                    let keeper = create_keeper(0, instance, sid)?;
+                                    if !keepers.iter().any(|k| valid_pin(k, current, sid)) {
+                                        return Err(protocol());
+                                    }
+                                    if unsafe { libc::setpgid(0, destination) } < 0 {
+                                        std::thread::sleep(INTERVAL);
+                                        continue;
+                                    }
+                                    if unsafe { libc::getpgrp() } != destination
+                                        || unsafe { libc::getsid(0) } != sid
+                                    {
+                                        return Err(protocol());
+                                    }
+                                    if let Some(k) = keepers.iter_mut().find(|k| {
+                                        k.requested == 0
+                                            && !k.destination_used
+                                            && k.claim.is_some_and(|(_, g)| g == destination)
+                                    }) {
+                                        k.destination_used = true;
+                                    }
                                     send(
                                         &mut upstream,
                                         Frame {
-                                            operation: Operation::KeeperSpawned,
-                                            fields: [keeper.pid as i64, 0, 0, 0],
+                                            operation: Operation::BrokerMoved,
+                                            fields: [me as i64, destination as i64, sid as i64, 0],
                                         },
                                     )?;
-                                    keepers.push(keeper);
-                                }
-                                if !keepers.iter().any(|k| !k.waited && !k.notified) {
-                                    if let Some(destination) = keepers
-                                        .iter()
-                                        .filter(|k| k.requested == 0 && !k.destination_used)
-                                        .filter_map(|k| k.claim.map(|(_, g)| g))
-                                        .find(|g| {
-                                            *g != current
-                                                && keepers.iter().any(|k| valid_pin(k, *g, sid))
-                                        })
-                                    {
-                                        if !keepers.iter().any(|k| valid_pin(k, current, sid)) {
-                                            return Err(protocol());
-                                        }
-                                        if unsafe { libc::setpgid(0, destination) } < 0 {
-                                            std::thread::sleep(INTERVAL);
-                                            continue;
-                                        }
-                                        if unsafe { libc::getpgrp() } != destination
-                                            || unsafe { libc::getsid(0) } != sid
-                                        {
-                                            return Err(protocol());
-                                        }
-                                        if let Some(k) = keepers.iter_mut().find(|k| {
-                                            k.requested == 0
-                                                && !k.destination_used
-                                                && k.claim.is_some_and(|(_, g)| g == destination)
-                                        }) {
-                                            k.destination_used = true;
-                                        }
-                                        send(
-                                            &mut upstream,
-                                            Frame {
-                                                operation: Operation::BrokerMoved,
-                                                fields: [
-                                                    me as i64,
-                                                    destination as i64,
-                                                    sid as i64,
-                                                    0,
-                                                ],
-                                            },
-                                        )?;
-                                    }
                                 }
                             }
                         }
