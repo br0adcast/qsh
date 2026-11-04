@@ -95,14 +95,14 @@ impl DecodedKey {
 pub const MAX_KEY_FILE_BYTES: usize = 1024 * 1024;
 
 /// Read a regular private-key file into storage cleared when parsing finishes.
-/// Explicit symlinks remain supported; this does not add owner or mode policy.
+/// Symlinks remain supported when the final opened file passes the Unix policy.
 pub fn read(path: &Path) -> Result<DecodedKey, KeyFileError> {
     decode(&read_text(path)?)
 }
 
 /// Shared file boundary for QSH and SSH decoders, capped at 1 MiB of input.
-/// File type is checked on the opened descriptor; no pathname check can stand
-/// in for that observation. Owner, mode and symlink acceptance are unchanged.
+/// The same descriptor must pass regular-file and Unix owner/mode checks both
+/// before and after reading. Ordinary pathname resolution, including links, applies.
 pub fn read_text(path: &Path) -> Result<Zeroizing<String>, KeyFileError> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -112,13 +112,60 @@ pub fn read_text(path: &Path) -> Result<Zeroizing<String>, KeyFileError> {
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC);
     }
     let mut file = options.open(path).map_err(KeyFileError::Io)?;
-    if !file.metadata().map_err(KeyFileError::Io)?.is_file() {
+    read_opened_with(&mut file, read_bounded)
+}
+
+fn read_opened_with(
+    file: &mut std::fs::File,
+    read: impl FnOnce(&mut std::fs::File) -> Result<Zeroizing<String>, KeyFileError>,
+) -> Result<Zeroizing<String>, KeyFileError> {
+    validate_private_file(file)?;
+    let text = read(file)?;
+    validate_private_file(file)?;
+    Ok(text)
+}
+
+fn validate_private_file(file: &std::fs::File) -> Result<(), KeyFileError> {
+    let metadata = file.metadata().map_err(KeyFileError::Io)?;
+    if !metadata.is_file() {
         return Err(KeyFileError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "private key must be a regular file",
         )));
     }
-    read_bounded(&mut file)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        validate_unix_owner_mode(
+            metadata.uid(),
+            metadata.mode(),
+            rustix::process::geteuid().as_raw(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        Err(KeyFileError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private-key file permission checks are unavailable on this platform",
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_owner_mode(owner: u32, mode: u32, effective_uid: u32) -> Result<(), KeyFileError> {
+    if owner != effective_uid && owner != 0 {
+        return Err(KeyFileError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private key must be owned by the current user or root",
+        )));
+    }
+    if mode & 0o077 != 0 {
+        return Err(KeyFileError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private key must not grant permissions to group or others",
+        )));
+    }
+    Ok(())
 }
 
 fn read_bounded(reader: &mut impl io::Read) -> Result<Zeroizing<String>, KeyFileError> {

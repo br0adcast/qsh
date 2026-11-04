@@ -148,6 +148,31 @@ mod tests {
         assert!(!error.contains("xxxx"));
     }
 
+    #[test]
+    fn private_key_read_enforces_shared_owner_mode_policy() {
+        use std::io::Write;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let encoded = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        file.write_all(encoded.as_bytes()).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(file.path(), &alias).unwrap();
+        assert_eq!(read(&alias).unwrap().public_key(), key.public_key());
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let error = read(&alias).unwrap_err();
+        assert!(error.contains("private key must not grant permissions to group or others"));
+        assert!(!error.contains("PRIVATE KEY"));
+        assert_eq!(decode(&encoded).unwrap().public_key(), key.public_key());
+    }
+
     /// RSA signs only with a SHA-2 hash; other key types take none.
     #[test]
     fn an_rsa_signature_needs_a_sha2_hash_and_other_keys_none() {

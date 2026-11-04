@@ -325,6 +325,25 @@ mod tests {
     use std::cell::Cell;
     use transport::{AuthError, AuthRecord};
 
+    fn private_file(path: &std::path::Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    fn write_private(
+        path: impl AsRef<std::path::Path>,
+        bytes: impl AsRef<[u8]>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        private_file(path.as_ref()).write_all(bytes.as_ref())
+    }
+
     struct NoPassphrase;
     impl Passphrase for NoPassphrase {
         fn ask(&self, _prompt: &str) -> Option<String> {
@@ -398,7 +417,7 @@ mod tests {
             )
             .expect("encrypt");
         let path = dir.join(name);
-        std::fs::write(
+        write_private(
             &path,
             encrypted
                 .to_openssh(ssh_key::LineEnding::LF)
@@ -416,7 +435,7 @@ mod tests {
         )
         .expect("generate");
         let path = dir.join(name);
-        std::fs::write(
+        write_private(
             &path,
             key.to_openssh(ssh_key::LineEnding::LF)
                 .expect("encode")
@@ -424,6 +443,43 @@ mod tests {
         )
         .expect("write");
         path
+    }
+
+    #[test]
+    fn unsafe_explicit_identity_never_prompts_or_falls_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_key = write_encrypted_key(dir.path(), "explicit");
+        write_key(dir.path(), "id_ed25519");
+        std::fs::set_permissions(&unsafe_key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ask = RecordingRefusal::new();
+        let result = candidates_in(Some(&unsafe_key), &ask, false, Some(dir.path()), "alice");
+        assert!(!ask.asked.get(), "unsafe encrypted file must never prompt");
+        let error = result.expect_err("unsafe explicit identity must be terminal");
+        assert!(matches!(error, KeyError::IdentityUnreadable { .. }));
+        let reason = error.to_string();
+        assert!(reason.contains("private key must not grant permissions to group or others"));
+        assert!(!reason.contains("PRIVATE KEY"));
+        assert!(!reason.contains("hunter2"));
+    }
+
+    #[test]
+    fn unsafe_discovered_identity_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_key = write_encrypted_key(dir.path(), "id_ed25519");
+        write_key(dir.path(), "id_rsa");
+        std::fs::set_permissions(&unsafe_key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ask = RecordingRefusal::new();
+        let mut looked = Vec::new();
+        let found = file_candidates(&ask, true, dir.path(), &mut looked, "alice");
+        assert!(!ask.asked.get(), "unsafe discovered file must never prompt");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].label.contains("id_rsa"));
+        assert!(looked
+            .iter()
+            .any(|reason| reason
+                .contains("private key must not grant permissions to group or others")));
     }
 
     /// An explicit `-i` is an instruction, so it comes first and it is the
@@ -499,7 +555,7 @@ mod tests {
     fn a_file_that_is_not_a_key_is_reported_without_asking_for_a_passphrase() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("garbage");
-        std::fs::write(&path, b"this is not a key\n").expect("write");
+        write_private(&path, b"this is not a key\n").expect("write");
         let ask = RecordingRefusal::new();
         let err = candidates(Some(&path), &ask, "alice").expect_err("must fail");
         assert!(
@@ -703,7 +759,7 @@ mod tests {
             &key,
             b"generated-fixture",
             1000,
-            std::fs::File::create(&path).unwrap(),
+            private_file(&path),
         )
         .unwrap();
         let ask = RecordingRefusal::new();
@@ -717,7 +773,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid");
         for bytes in [b"PRIVATE_INPUT_SENTINEL\x1b[2J".as_slice(), &[0xff, 0xfe]] {
-            std::fs::write(&path, bytes).unwrap();
+            write_private(&path, bytes).unwrap();
             let ask = RecordingRefusal::new();
             let error = candidates(Some(&path), &ask, "fixture").expect_err("invalid file");
             assert!(matches!(error, KeyError::IdentityUnreadable { .. }));
@@ -783,7 +839,7 @@ mod tests {
                 "retained-key-fixture",
             )
             .unwrap();
-        std::fs::write(
+        write_private(
             &path,
             encrypted
                 .to_openssh(ssh_key::LineEnding::LF)

@@ -299,7 +299,7 @@ pub fn start_daemon_with_shell_env(
     )
     .expect("generate");
     let key_path = home.path().join("id_ed25519");
-    std::fs::write(
+    write_private(
         &key_path,
         key.to_openssh(ssh_key::LineEnding::LF)
             .expect("encode")
@@ -771,4 +771,19 @@ pub fn top_row(bytes: &[u8], cols: u16, rows: u16) -> String {
     model.feed(bytes);
     let frame = model.frame();
     (0..cols).map(|col| frame.cell(0, col).ch).collect()
+}
+
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(bytes.as_ref())
 }

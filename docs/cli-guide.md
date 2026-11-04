@@ -42,9 +42,21 @@ Direct login proves identity with an SSH key signature. qsh tries agent keys and
 usual key files, or only the file named by `-i` for direct authentication.
 Both QSH signing and SSH authentication read private keys only from regular
 files, with a 1 MiB input limit (including comments and padding). This is a
-resource limit, not a maximum defined by key formats. Explicit symbolic links
-remain supported; these read checks do not add owner or permission restrictions.
-For a QSH key file, a passphrase unlocks the key selected before the prompt.
+resource limit, not a maximum defined by key formats. On Unix, the opened file
+must belong to the effective user or root and grant no group or other permissions
+(including execute): `0400` and `0600` work. The same descriptor is checked before
+and after the bounded read, before decoding or asking for a passphrase. Unsafe
+files are refused without changing their permissions or ownership.
+
+Symbolic links to safe final files and hardlinks remain supported. Parent paths
+use ordinary OS resolution, without additional ancestor ownership or mode rules.
+These Unix owner/mode checks do not audit extended ACLs, including macOS ACLs,
+and do not provide an atomic content snapshot or continuous permission monitor.
+Agent keys, platform signers and keys supplied in memory do not use this file
+policy. An explicit QSH identity failure stops selection; unsafe discovered QSH
+files are skipped with a reason, while SSH keeps its method fallback behavior.
+
+For a file identity, a passphrase unlocks the key selected before the prompt.
 Replacing or editing its path during that attempt does not select another key;
 a later selection attempt can read the changed file normally.
 Direct QSH login supports Ed25519, ECDSA P-256/P-384, and RSA with SHA-2
