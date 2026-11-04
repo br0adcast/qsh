@@ -42,16 +42,35 @@ Direct login proves identity with an SSH key signature. qsh tries agent keys and
 usual key files, or only the file named by `-i` for direct authentication.
 Both QSH signing and SSH authentication read private keys only from regular
 files, with a 1 MiB input limit (including comments and padding). This is a
-resource limit, not a maximum defined by key formats. Explicit symbolic links
-remain supported; these read checks do not add owner or permission restrictions.
-For a QSH key file, a passphrase unlocks the key selected before the prompt.
+resource limit, not a maximum defined by key formats. On Unix, the opened file
+must belong to the effective user or root and grant no group or other permissions
+(including execute): `0400` and `0600` work. The same descriptor is checked before
+and after the bounded read, before decoding or asking for a passphrase. Unsafe
+files are refused without changing their permissions or ownership.
+
+Symbolic links to safe final files and hardlinks remain supported. Parent paths
+use ordinary OS resolution, without additional ancestor ownership or mode rules.
+These Unix owner/mode checks do not audit extended ACLs, including macOS ACLs,
+and do not provide an atomic content snapshot or continuous permission monitor.
+Agent keys, platform signers and keys supplied in memory do not use this file
+policy. An explicit QSH identity failure stops selection; unsafe discovered QSH
+files are skipped with a reason, while SSH keeps its method fallback behavior.
+
+For a file identity, a passphrase unlocks the key selected before the prompt.
 Replacing or editing its path during that attempt does not select another key;
 a later selection attempt can read the changed file normally.
 Direct QSH login supports Ed25519, ECDSA P-256/P-384, and RSA with SHA-2
 signatures. It refuses RSA/SHA-1 signatures (`ssh-rsa` as a signature
 algorithm), but accepts RSA public keys whose type is `ssh-rsa` when the
-signature uses SHA-2. SSH login has separate signature negotiation and
-retains legacy RSA/SHA-1 fallback. A personal daemon checks
+signature uses SHA-2. SSH negotiates its own signatures and refuses RSA/SHA-1
+the same way, in both directions: an RSA host key is used only through
+`rsa-sha2-512` or `rsa-sha2-256`, and an RSA key file, agent key or platform key
+signs only with one of those. When a server advertises only legacy `ssh-rsa`
+for RSA keys, qsh skips the RSA key, says why, and goes on with the next one. A
+server that advertises no RSA algorithm, or no signature algorithms at all, gets
+one `rsa-sha2-512` attempt. A server whose host-key offer is only `ssh-rsa`
+fails the handshake with that offer named. Ed25519 and ECDSA keys are
+unaffected. There is no option to allow SHA-1. A personal daemon checks
 `~/.ssh/authorized_keys`; system mode checks the claimed account through a
 privileged helper and PAM.
 
@@ -342,6 +361,9 @@ qsh 'user@home.example.org,ssh=2222,knock=tcp:7000+200ms+udp:8000:open'
 `tcp:PORT` attempts a TCP connection. `udp:PORT[:DATA]` sends a UDP datagram;
 DATA may be text, including `:` but not `+` or `,`, or hex prefixed with `0x`.
 Pauses such as `200ms` and `1s` need a unit and follow the previous step.
+Name resolution has its own 10-second limit. After it, the knock with its
+pauses and the TCP connection share one 10-second limit: a sequence that does
+not fit stops there, and no connection is attempted.
 The client logs the number of knock steps, never their ports or payloads.
 Replace real knock sequences before sharing a command or report.
 
@@ -400,20 +422,34 @@ go to the remote application; local commands become available after the end
 marker. This depends on your terminal sending those markers. qsh cannot confirm
 that an input source has finished, and this is not a universal recovery method.
 
-To end the client instead, use another terminal to send an operating-system
-termination signal to the identified qsh process. `SIGTERM`, `SIGHUP`, `SIGINT`
-and `SIGQUIT` use qsh's normal exit path, which may end the remote session;
-they are not a session-preserving detach. Typing `Ctrl-C` or `Ctrl-Z` in raw
-mode does not send these operating-system signals to qsh. Closing the terminal
-also does not guarantee a retained session.
+To leave anyway, close the terminal or use another terminal to send a signal
+to the identified qsh process. During a session, `SIGHUP`, which closing a
+terminal usually sends, leaves the way `Ctrl-] .` does: qsh exits with code 1
+and the server keeps the session, also inside an unfinished paste. qsh sends
+nothing more to the remote application, so after you return it may still be
+waiting for the paste's end marker. `SIGTERM`, `SIGINT` and `SIGQUIT` end the
+client and close the remote session. When a closing signal and `SIGHUP` are
+both seen before qsh has decided how to leave, the close wins; a signal that
+arrives after that decision changes nothing. Which signals a closing terminal
+or a logout sends, and in what order, depends on the terminal and the system.
+Before a session is attached (while connecting, or at a trust or password
+question), any of these signals cancels with code 130. If the login was already
+admitted when the signal arrived, a hangup still leaves its session on the
+server, and a closing signal ends it. Typing `Ctrl-C` or
+`Ctrl-Z` in raw mode does not send these operating-system signals to qsh.
+
+After a lost terminal, restoring its settings and printing the closing notice
+are best effort, as there may be nowhere left to write them; the client log
+records the hangup. Coming back needs the session token to have been saved
+(see below) and the server to still keep the session.
 
 `--escape ^X` changes the prefix; `--escape ^b` selects Ctrl-B.
 Avoid `^[` and `^M` unless you intend to intercept Escape or Enter.
 With `^[`, the history command `Esc [` is also the beginning of a paste marker;
 it waits for another byte to distinguish the command from a paste.
-`--escape none` disables the prefix. The shell's `exit`, an external termination
-signal, or closing the terminal can end the run; these do not promise to retain
-the remote session.
+`--escape none` disables the prefix. Closing the terminal or sending `SIGHUP`
+leaves and keeps the remote session; the shell's `exit`, `SIGTERM`, `SIGINT` and
+`SIGQUIT` end it.
 
 The connection panel lists routes in command-line order with state and latency.
 Arrows or `1`–`8` select a row; Enter switches to an answering spare route. Escape
@@ -535,8 +571,8 @@ backend remains retained for another hour for warm recovery. The daemon allows
 at most sixteen live and retained sessions together. tmux provides persistence
 beyond these bounds; qsh alone does not promise it.
 
-Leaving with `Ctrl-] .` keeps the server session. Running the same command returns
-to it. Local session records are scoped by the effective login, the first
+Leaving with `Ctrl-] .`, or by a terminal hangup, keeps the server session.
+Running the same command can return to it while the server keeps it. Local session records are scoped by the effective login, the first
 configured host's exact spelling, and its QSH port. Different logins have separate
 tokens and numbered locks. Reordering addresses, changing the login or port, or
 using another spelling or alias for the host can select a different session;
@@ -544,7 +580,9 @@ qsh does not resolve or normalize host names when choosing a local record.
 
 If the local session store cannot be opened or written, qsh prints one warning
 before drawing the terminal. The current connection remains usable, but future
-recovery may be unavailable because its token was not saved. The warning names
+recovery may be unavailable because its token was not saved. The notice printed
+on leaving then says the session is kept but that another run cannot return to
+it. The warning names
 the failing path and condition without printing the token. Inspect the reported
 component's ownership, permissions, and available space; qsh does not repair an
 unsafe ancestor or replace another account's file.
@@ -601,13 +639,13 @@ exit is returned as its own exit code. Client-generated failures use:
 
 | Code | Meaning |
 | --- | --- |
-| 1 | Trust or installation declined, session startup failure, or leaving with Ctrl-] . while retaining the session. |
+| 1 | Trust or installation declined, session startup failure, or leaving with Ctrl-] . or a terminal hangup (SIGHUP) while retaining the session. |
 | 2 | Invalid command line. |
 | 10 | Authentication keys could not be loaded. |
 | 11 | A server key changed during foreground login, or supplied addresses have conflicting server keys. |
 | 12 | All addresses failed during login. |
 | 13 | Recovery confirmed session loss and a replacement was declined or could not be confirmed. |
-| 130 | An interrupted operation, such as cancelling an installation with Ctrl-C. |
+| 130 | An interrupted operation, such as cancelling an installation with Ctrl-C, or a termination or hangup signal before a session is attached. |
 
 ### Prediction
 

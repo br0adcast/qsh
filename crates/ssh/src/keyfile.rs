@@ -113,14 +113,19 @@ pub(crate) fn append_signature(mut to_sign: Vec<u8>, blob: &[u8]) -> Vec<u8> {
 }
 
 /// The encoded SSH signature of `data`, as russh makes it for a key it
-/// holds (its own helper is private): RSA with the negotiated hash, other
-/// types as they are.
+/// holds (its own helper is private): RSA with the negotiated SHA-2 hash,
+/// other types as they are. An RSA request without a hash would be legacy
+/// SHA-1 `ssh-rsa`, refused on SSH (#150).
 pub(crate) fn sign_with_hash_alg(
     key: &PreparedKey,
     hash_alg: Option<HashAlg>,
     data: &[u8],
 ) -> Result<Vec<u8>, String> {
     let digest = match hash_alg {
+        None if key.public_key().algorithm().is_rsa() => {
+            return Err("refusing a legacy ssh-rsa (SHA-1) RSA signature".into())
+        }
+        // Ignored by every non-RSA key.
         None => RsaDigest::Sha1,
         Some(HashAlg::Sha256) => RsaDigest::Sha256,
         Some(HashAlg::Sha512) => RsaDigest::Sha512,
@@ -141,6 +146,67 @@ mod tests {
         let error = read(file.path()).unwrap_err();
         assert!(error.contains("1 MiB"), "{error}");
         assert!(!error.contains("xxxx"));
+    }
+
+    #[test]
+    fn private_key_read_enforces_shared_owner_mode_policy() {
+        use std::io::Write;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let key = PrivateKey::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let encoded = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        file.write_all(encoded.as_bytes()).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(file.path(), &alias).unwrap();
+        assert_eq!(read(&alias).unwrap().public_key(), key.public_key());
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let error = read(&alias).unwrap_err();
+        assert!(error.contains("private key must not grant permissions to group or others"));
+        assert!(!error.contains("PRIVATE KEY"));
+        assert_eq!(decode(&encoded).unwrap().public_key(), key.public_key());
+    }
+
+    /// RSA signs only with a SHA-2 hash; other key types take none.
+    #[test]
+    fn an_rsa_signature_needs_a_sha2_hash_and_other_keys_none() {
+        let random = |algorithm| {
+            PreparedKey::from_key(
+                ssh_key::PrivateKey::random(
+                    &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+                    algorithm,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let pair = ssh_key::private::RsaKeypair::random(
+            &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+            2048,
+        )
+        .unwrap();
+        let rsa = PreparedKey::from_key(
+            ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Rsa(pair), "").unwrap(),
+        )
+        .unwrap();
+        let refused = sign_with_hash_alg(&rsa, None, b"data").unwrap_err();
+        assert!(refused.contains("SHA-1"), "{refused}");
+        for hash in [HashAlg::Sha256, HashAlg::Sha512] {
+            let blob = sign_with_hash_alg(&rsa, Some(hash), b"data").unwrap();
+            let signature = sshauth::record::decode_signature(&blob).unwrap();
+            assert_eq!(
+                signature.algorithm(),
+                ssh_key::Algorithm::Rsa { hash: Some(hash) }
+            );
+        }
+        let ed25519 = random(ssh_key::Algorithm::Ed25519);
+        assert!(sign_with_hash_alg(&ed25519, None, b"data").is_ok());
     }
 
     #[test]

@@ -85,9 +85,13 @@ pub enum UiEvent {
     Resized { cols: u16, rows: u16 },
     /// Returned from the background (SIGCONT).
     Resumed,
-    /// A signal asking us to stop -- SIGTERM, SIGHUP, SIGINT or SIGQUIT:
-    /// close down in an orderly way rather than dying where we stand.
+    /// A signal asking us to stop -- SIGTERM, SIGINT or SIGQUIT: close down
+    /// in an orderly way rather than dying where we stand.
     Terminate,
+    /// SIGHUP, what a closing terminal sends: leave the way `Ctrl-] .` does,
+    /// keeping the session on the server. It is not keyboard input, so an
+    /// unfinished paste or an open window cannot hold it back.
+    Hangup,
     /// A periodic nudge, so prediction can expire on time.
     Tick,
     /// Raw bytes newly arrived on a wire stream -- the session-control
@@ -578,6 +582,12 @@ impl Session {
                 self.repaint(now_ms)
             }
             UiEvent::Terminate => self.leave(0, now_ms),
+            // The same way out as `Ctrl-] .`: code 1, the session stays.
+            UiEvent::Hangup => {
+                let mut actions = vec![Action::Keep];
+                actions.extend(self.leave(1, now_ms));
+                actions
+            }
             UiEvent::Tick => self.on_tick(now_ms),
             // `main` intercepts these before they ever reach `handle`: it is
             // the one that knows what a stream number means, and decodes
@@ -3679,6 +3689,38 @@ mod tests {
             .rposition(|a| matches!(a, Action::SendChannel { .. }))
             .unwrap();
         assert!(end < keep && keep < exit, "{actions:?}");
+    }
+
+    /// A hangup inside an unfinished paste leaves the way `Ctrl-] .` does:
+    /// the held start of an end marker is never sent, no end marker is made
+    /// up, and the local commands pasted before it stay literal.
+    #[test]
+    fn a_hangup_mid_paste_keeps_the_session_without_sending_the_held_marker() {
+        let mut s = ready_session();
+        let actions = s.handle(
+            UiEvent::Stdin(ingress_input(b"\x1b[200~ab\x1d.\x1dr\x1ds".to_vec())),
+            0,
+        );
+        assert_eq!(sent(&actions), b"\x1b[200~ab\x1d.\x1dr\x1ds");
+        // The cut end marker is held, unsent, for the bytes that would follow.
+        let actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[20".to_vec())), 10);
+        assert!(sent(&actions).is_empty(), "{actions:?}");
+
+        let actions = s.handle(UiEvent::Hangup, 20);
+        assert!(
+            sent(&actions).is_empty(),
+            "nothing more reaches the shell: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|action| matches!(action, Action::Write(_) | Action::Keep | Action::Exit(1))),
+            "{actions:?}"
+        );
+        let keep = actions.iter().position(|a| *a == Action::Keep);
+        let exit = actions.iter().position(|a| *a == Action::Exit(1));
+        assert!(keep.is_some() && keep < exit, "{actions:?}");
+        assert_eq!(exit, Some(actions.len() - 1));
     }
 
     /// The two halves may arrive in separate reads -- they usually do, since

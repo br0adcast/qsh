@@ -40,7 +40,8 @@ fn local_rsa_files_and_pem_connect_with_each_advertised_ssh_digest() {
     let dir = tempfile::tempdir().unwrap();
     let (plain, _) = support::keygen_file("rsa", dir.path());
     let (locked, _) = support::keygen_with_passphrase("rsa", dir.path(), "generated passphrase");
-    for hash in [None, Some(HashAlg::Sha256), Some(HashAlg::Sha512)] {
+    // Legacy `ssh-rsa` is not offered at all: see `rsa_policy`.
+    for hash in [Some(HashAlg::Sha256), Some(HashAlg::Sha512)] {
         let server = FakeServer::start(FakeAuth {
             accept_any_key: true,
             rsa_hash: Some(hash),
@@ -78,7 +79,7 @@ fn a_refused_native_rsa_identity_does_not_prompt_for_its_passphrase() {
     let dir = tempfile::tempdir().unwrap();
     let (locked, _) = support::keygen_with_passphrase("rsa", dir.path(), "generated passphrase");
     let server = FakeServer::start(FakeAuth {
-        rsa_hash: Some(None),
+        rsa_hash: Some(Some(russh::keys::HashAlg::Sha512)),
         ..Default::default()
     });
     let prompts = Arc::new(CountingPrompter::answering_passphrases(&[
@@ -125,11 +126,18 @@ fn malformed_rsa_file(dir: &std::path::Path, locked: bool) -> (std::path::PathBu
         key
     };
     let path = dir.join("malformed-rsa");
-    std::fs::write(
-        &path,
-        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
-    )
-    .unwrap();
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes())
+            .unwrap();
+    }
     (path, public)
 }
 

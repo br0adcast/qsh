@@ -75,7 +75,8 @@ class Bindings:
                 else:raise AssertionError('coordinator lost exclusion')
             finally:os.close(fd)
     @contextmanager
-    def registry(self):
+    def registry(self, *, deadline):
+        self.registry_deadlines=getattr(self,'registry_deadlines',[])+[deadline]
         self.registry_count+=1;number=self.registry_count
         self.point('registry enter');self.active.add('registry')
         binding=self
@@ -142,6 +143,16 @@ class CoordinatorTests(unittest.TestCase):
             with self.b.track('references',refs._testing_references(out)) as reader:yield reader
         self.b.references=references
         return out/'usr/share/qshd-selinux/reference.json'
+
+    def test_registry_forwards_original_effective_end(self):
+        self.run_coordinator(deadline=290)
+        self.assertEqual(self.b.registry_deadlines,[290,290])
+
+    def test_production_registry_requires_and_forwards_deadline(self):
+        value=Mock();sentinel=object();value.inspection.return_value=sentinel
+        with patch('qshd_selinux_registry.production',return_value=value):
+            self.assertIs(c._Production().registry(deadline=290),sentinel)
+        value.inspection.assert_called_once_with(deadline=290)
 
     def test_installed_real_references_under_single_package_lease(self):
         self.installed()
@@ -317,7 +328,6 @@ class CoordinatorTests(unittest.TestCase):
         production=c._Production();sentinel=object()
         for module,method,facade,args in [('qshd_selinux_package_state','package','initialize',()),
                                          ('qshd_selinux_activation_state','activation','writer',()),
-                                         ('qshd_selinux_registry','registry','inspection',()),
                                          ('qshd_selinux_transaction','contexts','writer',(['/contexts'],))]:
             target=importlib.import_module(module);value=Mock();getattr(value,facade).return_value=sentinel
             with patch.object(target,'production',return_value=value) as factory:

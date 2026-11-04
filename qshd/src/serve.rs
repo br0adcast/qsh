@@ -1407,6 +1407,21 @@ mod tests {
     /// a helper that has stopped answering.
     #[cfg(feature = "system")]
     mod silent_helper {
+        fn write_private(
+            path: impl AsRef<std::path::Path>,
+            bytes: impl AsRef<[u8]>,
+        ) -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?
+                .write_all(bytes.as_ref())
+        }
+
         use super::*;
 
         use std::future::Future;
@@ -1693,7 +1708,7 @@ mod tests {
                 ssh_key::Algorithm::Ed25519,
             )
             .expect("keygen");
-            std::fs::write(
+            write_private(
                 &key_path,
                 key.to_openssh(ssh_key::LineEnding::LF)
                     .expect("encode")
@@ -1928,7 +1943,7 @@ mod tests {
                 ssh_key::Algorithm::Ed25519,
             )
             .expect("keygen");
-            std::fs::write(
+            write_private(
                 &key_path,
                 key.to_openssh(ssh_key::LineEnding::LF)
                     .expect("encode")
@@ -2265,7 +2280,7 @@ mod tests {
                     ssh_key::Algorithm::Ed25519,
                 )
                 .expect("keygen");
-                std::fs::write(
+                write_private(
                     &key_path,
                     key.to_openssh(ssh_key::LineEnding::LF)
                         .expect("encode")

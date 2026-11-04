@@ -15,6 +15,7 @@ pub mod shell_env;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -298,7 +299,7 @@ pub fn start_daemon_with_shell_env(
     )
     .expect("generate");
     let key_path = home.path().join("id_ed25519");
-    std::fs::write(
+    write_private(
         &key_path,
         key.to_openssh(ssh_key::LineEnding::LF)
             .expect("encode")
@@ -457,6 +458,22 @@ pub fn spawn_qsh_os_at(
         None,
     )
     .expect("openpty");
+    // openpty does not mark the master close-on-exec. Without this the
+    // client inherits a copy of its own terminal's master, and the terminal
+    // can never hang up when the test closes its side.
+    // SAFETY: fcntl on a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(pty.master.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        flags >= 0
+            && unsafe {
+                libc::fcntl(
+                    pty.master.as_raw_fd(),
+                    libc::F_SETFD,
+                    flags | libc::FD_CLOEXEC,
+                )
+            } == 0,
+        "mark the pseudo-terminal master close-on-exec"
+    );
 
     let slave = pty.slave;
     let mut command = Command::new(env!("CARGO_BIN_EXE_qsh"));
@@ -754,4 +771,22 @@ pub fn top_row(bytes: &[u8], cols: u16, rows: u16) -> String {
     model.feed(bytes);
     let frame = model.frame();
     (0..cols).map(|col| frame.cell(0, col).ch).collect()
+}
+
+pub fn private_file(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+pub fn write_private(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    private_file(path)?.write_all(bytes.as_ref())
 }

@@ -272,7 +272,12 @@ fn path_diagnostics_unavailable_store_warns_once_and_keeps_usable_token() {
     assert!(!warning.contains(&hex(&token)));
     assert!(owner.take_warning().is_none());
     assert!(owner._lock.is_none());
+    assert!(!owner.persisted(), "taking the warning does not change the fact");
     assert_ne!(token, [0; 16]);
+    // Without a slot a replacement succeeds in memory only.
+    let replacement = owner.replace_token().unwrap();
+    assert_eq!(owner.token, replacement);
+    assert!(!owner.persisted());
     assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777, 0o777);
 }
 
@@ -294,6 +299,7 @@ fn path_diagnostics_failed_initial_write_retains_token_and_lock_with_warning() {
     assert!(!warning.contains(&hex(&token)));
     assert_eq!(owner.token, token);
     assert!(owner._lock.is_some());
+    assert!(!owner.persisted(), "the fresh token was not saved");
     assert_lock_from_subprocess(&path, false);
     assert_eq!(std::fs::read(&path).unwrap(), b"not a token");
 }

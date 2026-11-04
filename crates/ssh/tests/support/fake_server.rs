@@ -24,6 +24,9 @@ pub struct FakeAuth {
     pub accept_any_key: bool,
     /// Restrict advertised RSA hashes; Some(None) advertises legacy ssh-rsa.
     pub rsa_hash: Option<Option<russh::keys::HashAlg>>,
+    /// Advertise no RSA signature algorithm at all: a `server-sig-algs`
+    /// list without RSA. Takes precedence over `rsa_hash`.
+    pub advertise_no_rsa: bool,
     pub activity: Arc<ServerActivity>,
     /// Successive exec outputs, without running a shell or touching user state.
     pub exec_outputs: Vec<Vec<u8>>,
@@ -114,6 +117,10 @@ impl FakeServer {
             auth_rejection_time_initial: Some(Duration::ZERO),
             keys: vec![key],
             preferred: match auth.rsa_hash {
+                _ if auth.advertise_no_rsa => russh::Preferred {
+                    key: Cow::Owned(vec![russh::keys::Algorithm::Ed25519]),
+                    ..Default::default()
+                },
                 Some(hash) => russh::Preferred {
                     key: Cow::Owned(vec![
                         russh::keys::Algorithm::Ed25519,

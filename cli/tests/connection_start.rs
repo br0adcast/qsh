@@ -14,7 +14,7 @@ fn a_closed_port_with_a_pinned_key_reaches_ssh_promptly() {
     )
     .unwrap();
     let key = home.path().join("identity");
-    std::fs::write(
+    support::write_private(
         &key,
         identity
             .to_openssh(ssh_key::LineEnding::LF)

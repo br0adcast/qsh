@@ -244,6 +244,7 @@ mod inheritance {
         let mut owner = Claim {
             token: original,
             warning: None,
+            persisted: true,
             _lock: Some({
                 let store = Store::open(dir.path(), DirectoryIntent::Generic).unwrap();
                 let (parent, binding) = store
@@ -257,6 +258,8 @@ mod inheritance {
         let error = owner.replace_token().unwrap_err();
         let failed = error.raw_os_error().is_some();
         let token_retained = owner.token == original;
+        // Conservative: the failed write may have truncated the record.
+        let reported_unsaved = !owner.persisted();
         assert_lock_from_subprocess(&path, false);
         drop(owner);
         let reclaimed = claim(dir.path(), "alice", "example.invalid", 60000);
@@ -265,7 +268,7 @@ mod inheritance {
         let status = child.finish();
         assert!(status.success());
         assert!(failed, "read-only token storage must reject replacement");
-        assert!(token_retained && persisted_token_retained);
+        assert!(token_retained && persisted_token_retained && reported_unsaved);
         // A transient wait failure must retain an actual owned child until a
         // real terminal wait result, rather than release its fixture early.
         let mut probe = Command::new("/bin/sh")
