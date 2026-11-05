@@ -514,6 +514,78 @@ elif name == 'python3':
         for target in self.DARWIN:
             self.refusal(body, target, prepopulate=self.DARWIN)
 
+    def test_intel_owner_has_independent_budget_and_required_setup(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        self.assertIn('  darwin-owner-intel:\n', native, 'Intel ownership needs its independent budget')
+        job = native.split('  darwin-owner-intel:\n', 1)[1].split('\n  system-floors:', 1)[0]
+        for required in ('name: Native Intel Darwin process owner', 'runs-on: macos-15-intel',
+                         'timeout-minutes: 35', 'NATIVE_TARGET: x86_64-apple-darwin',
+                         'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
+                         'test "$checkout_sha" = "$GITHUB_SHA"',
+                         '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
+                         'key: native-owner-x86_64-apple-darwin'):
+            self.assertIn(required, job)
+        for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'download-artifact',
+                          'Qualify offline release authentication', self.NATIVE,
+                          'cargo test --locked -p sshauth'):
+            self.assertNotIn(forbidden, job)
+        ordered = ['Bind the Intel owner checkout', 'Observe the Intel Darwin runtime',
+                   'Install native owner prerequisites', 'Build and execute the pinned owner backend',
+                   'Install qualified Rust for owner checks', 'Swatinem/rust-cache@',
+                   'Qualify the production Intel Darwin process owner']
+        self.assertEqual(sorted(ordered, key=job.index), ordered)
+        backend = self.body('native-crypto.yml', 'darwin-owner-intel', 'Build and execute the pinned owner backend')
+        for required in ('scripts/qualify-openssl.sh --target "$NATIVE_TARGET"',
+                         'scripts/build-openssl.sh --target "$NATIVE_TARGET"',
+                         '--cache "$RUNNER_TEMP/native-crypto"', '--toolchain-id "$ImageOS/$ImageVersion"',
+                         'echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"',
+                         "echo 'OPENSSL_STATIC=1' >> \"$GITHUB_ENV\""):
+            self.assertIn(required, backend)
+        rust = self.body('native-crypto.yml', 'darwin-owner-intel', 'Install qualified Rust for owner checks')
+        self.assertIn('rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal', rust)
+        self.assertIn('rustup target add "$NATIVE_TARGET"', rust)
+        self.assertIn('scripts/check-qualified-rust.sh', rust)
+        portable = native.split('  portable:\n', 1)[1].split('\n  darwin-owner-intel:', 1)[0]
+        self.assertIn('timeout-minutes: 35', portable)
+        self.assertNotIn('Qualify the production Intel Darwin process owner', portable)
+        self.assertNotIn('Observe the Intel Darwin runtime', portable)
+
+    def test_intel_owner_preserves_artifact_and_acceptance_contract(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        self.assertIn('  darwin-owner-intel:\n', native, 'independent Intel owner job is missing')
+        owner = self.body('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')
+        arm = self.body('ci.yml', 'macos', 'Qualify the production Darwin process owner')
+        import re
+        names = lambda body: re.findall(r'^  (darwin_process_scope::\S+)\s*\\?$', body, re.MULTILINE)
+        self.assertEqual(len(names(owner)), 20)
+        self.assertEqual(names(owner), names(arm))
+        for count in (10, 4, 6):
+            self.assertIn(f'test result: ok. {count} passed; 0 failed; 0 ignored;', owner)
+        self.assertEqual(owner.count('cargo test -p qshd --lib'), 2)
+        self.assertEqual(owner.count('--no-run --message-format=json-render-diagnostics'), 2)
+        self.assertEqual(owner.count('--bin qshd --profile test'), 2)
+        self.assertEqual(owner.count('verify_harness "$ordinary_harness"'), 2)
+        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 1)
+        for required in ('--features test-build-labels', '--features test-darwin-keeper',
+                         'timed feature-check cargo check', 'timed feature-clippy cargo clippy',
+                         '-- -D warnings', '--target "$NATIVE_TARGET"',
+                         "assert len(records) == 1", "assert set(record['features']) == features",
+                         "record['manifest_path']", "record['target']['src_path']",
+                         'hashlib.sha256(executable.read_bytes()).hexdigest()',
+                         'test -z "${CARGO_ENCODED_RUSTFLAGS:-}"', '-Dwarnings',
+                         '--remap-path-prefix=$GITHUB_WORKSPACE=/qsh', '-Wl,-oso_prefix,$GITHUB_WORKSPACE/',
+                         'export AWS_LC_SYS_USE_SYSTEM=0', 'export AWS_LC_SYS_CFLAGS=',
+                         'export HOME="$runtime/home"', 'XDG_CONFIG_HOME="$runtime/config"',
+                         'XDG_CACHE_HOME="$runtime/cache"', 'HISTFILE=/dev/null',
+                         "trap 'rm -rf \"$runtime\"' EXIT", 'set -euo pipefail',
+                         'SKIPPED', 'rescue=true', 'seen == 1 && passed == 1',
+                         'real_eof_delivered_alive=true', 'keeper223 open_executor mode=',
+                         'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false',
+                         'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait', 'keeper223 replacement_routes old_image='):
+            self.assertIn(required, owner)
+        self.assertLess(owner.index('timed modern-runtime'), owner.index('timed keeper-runtime'))
+        self.assertLess(owner.index('timed keeper-runtime'), owner.index('timed integrated-runtime'))
+
     def test_four_native_targets_and_required_workflow_consumers_remain_wired(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         import re
