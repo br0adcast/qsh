@@ -368,7 +368,7 @@ elif name == 'python3':
         records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
         return result, calls, records
 
-    def environment(self, calls, env, targets, *, linux):
+    def environment(self, calls, env, targets, *, linux, deny_warnings=False):
         builds = [c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build']
         self.assertEqual(len(builds), len(targets))
         cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
@@ -377,6 +377,8 @@ elif name == 'python3':
                 f'--remap-path-prefix={env["RUNNER_TEMP"]}=/build')
         if not linux:
             rust += f' -C link-arg=-Wl,-oso_prefix,{env["GITHUB_WORKSPACE"]}/'
+        if deny_warnings:
+            rust += ' -Dwarnings'
         cflags = (f'-ffile-prefix-map={env["GITHUB_WORKSPACE"]}=/qsh '
                   f'-ffile-prefix-map={cargo_home}=/cargo '
                   f'-ffile-prefix-map={env["RUNNER_TEMP"]}=/build')
@@ -429,7 +431,8 @@ elif name == 'python3':
             with self.subTest(target=target), self.fixture(target, explicit_cargo=index % 2 == 0) as (work, env):
                 result, calls, _ = self.execute(body, work, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.environment(calls, env, [target], linux='linux' in target)
+                self.environment(calls, env, [target], linux='linux' in target,
+                                 deny_warnings=(target == 'x86_64-apple-darwin'))
                 tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
                 self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
                                          '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])

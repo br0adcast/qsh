@@ -5952,9 +5952,14 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
     assert_eq!(after.checksum, hex::encode(new_hash));
     assert_eq!(hash_path(&old), new_hash);
     let resumed = ops.classify(after.pid as i32).unwrap();
-    let original_identity = daemon.identity.unwrap();
-    assert!(resumed.identity.same_process(original_identity.identity));
-    assert_ne!(resumed.identity.version, original_identity.identity.version);
+    let original_process_identity = daemon.identity.unwrap();
+    assert!(resumed
+        .identity
+        .same_process(original_process_identity.identity));
+    assert_ne!(
+        resumed.identity.version,
+        original_process_identity.identity.version
+    );
     let mut application_exited = false;
     let mut session_exited = session_guard.is_none();
     until_tagged(
