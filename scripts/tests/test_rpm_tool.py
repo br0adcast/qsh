@@ -97,7 +97,7 @@ class PreparationTests(unittest.TestCase):
         # and real header tests. A stale PATH binary must never be selected.
         bundle = self.root / "bundle"
         bundle.mkdir()
-        for name in ["install.sh", "test_dependencies.py"]:
+        for name in ["install.sh", "test_child_reaping.py", "test_dependencies.py"]:
             source = ROOT / "packaging/rpm-tool" / name
             (bundle / name).write_bytes(source.read_bytes())
         (bundle / "prepare.py").write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).mkdir()\n")
@@ -126,6 +126,72 @@ chmod +x "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"fresh-tool", result.stderr)
         self.assertNotIn(b"stale-tool", result.stderr)
+
+    def test_installer_child_gate_uses_fresh_absolute_tool_and_stops_on_failure(self):
+        for exit_code in (0, 23):
+            with self.subTest(exit_code=exit_code):
+                root = self.root / str(exit_code); root.mkdir()
+                bundle = root / 'bundle'; bundle.mkdir()
+                (bundle / 'install.sh').write_bytes((ROOT / 'packaging/rpm-tool/install.sh').read_bytes())
+                (bundle / 'prepare.py').write_text('import pathlib,sys;pathlib.Path(sys.argv[1]).mkdir()\n')
+                record = root / 'gate-tool'; later = root / 'dependencies-called'
+                (bundle / 'test_child_reaping.py').write_text(
+                    'import pathlib,sys\npathlib.Path(' + repr(str(record))
+                    + ').write_text(sys.argv[1]);sys.exit(' + str(exit_code) + ')\n')
+                (bundle / 'test_dependencies.py').write_text(
+                    'import pathlib,sys\nassert pathlib.Path(' + repr(str(record))
+                    + ').read_text()==sys.argv[1]\npathlib.Path(' + repr(str(later)) + ').touch()\n')
+                commands = root / 'commands'; commands.mkdir()
+                cargo = commands / 'cargo'
+                cargo.write_text('#!/bin/sh\nmkdir -p "$CARGO_INSTALL_ROOT/bin"\n'
+                                 'printf "#!/bin/sh\\nexit 0\\n" > "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm"\n'
+                                 'chmod +x "$CARGO_INSTALL_ROOT/bin/cargo-generate-rpm"\n')
+                cargo.chmod(0o755)
+                environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                                   CARGO_INSTALL_ROOT=str(root / 'installed'), QSH_RPM_TOOL='/stale/tool')
+                result = subprocess.run(['bash', str(bundle / 'install.sh')], env=environment,
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(record.read_text(), str(root / 'installed/bin/cargo-generate-rpm'))
+                self.assertEqual(later.exists(), exit_code == 0)
+
+    def test_child_observer_rejects_adoption_after_natural_owned_reaping(self):
+        # Only this subprocess becomes a subreaper; no state leaks to unittest.
+        import json
+        import sys
+        code = r"""
+import importlib.util,json,os,subprocess,sys,time
+spec=importlib.util.spec_from_file_location('child_gate',sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+m.enable_subreaper()
+producer='import os;pid=os.fork();os._exit(23) if pid==0 else print(pid)'
+result=subprocess.run([sys.executable,'-B','-c',producer],capture_output=True,check=True)
+pid=int(result.stdout)
+observation=m.collect_owned_children(time.monotonic()+5)
+assert pid in observation['adopted']
+assert any(row['pid']==pid and os.waitstatus_to_exitcode(row['status'])==23 for row in observation['waits'])
+try:m.require_no_adoption(observation)
+except AssertionError:pass
+else:raise AssertionError('adoption was accepted')
+assert not m.collect_owned_children(time.monotonic()+5)['adopted']
+print(json.dumps(observation))
+"""
+        result = subprocess.run([sys.executable, '-B', '-c', code,
+                                 str(ROOT / 'packaging/rpm-tool/test_child_reaping.py')],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(len(observed['adopted']), 1)
+        self.assertEqual(len(observed['waits']), 1)
+        self.assertFalse(observed['emergency_cleanup'])
+
+    def test_reaping_patch_is_registered_without_changing_archive_pins(self):
+        self.assertEqual(prepare.SOURCES, (
+            ('cargo-generate-rpm-0.21.0', '3187e19f0e00274b3b24f017559038722388889bd1a2ecd2281cd748e7d52ec6'),
+            ('rpm-0.23.2', 'cf5c92939a06adb261d757e43f49bcdb121d62c6fe8e859b1006ce37f81e6d7f')))
+        name = 'cargo-generate-rpm-0.21.0-reap-ldd.patch'
+        self.assertEqual(prepare.PATCHES[-1], name)
+        self.assertTrue((ROOT / 'packaging/rpm-tool' / name).is_file())
 
     def test_package_floor_copy_sources_exist_in_both_actual_contexts(self):
         native = (ROOT / ".github/workflows/native-crypto.yml").read_text()

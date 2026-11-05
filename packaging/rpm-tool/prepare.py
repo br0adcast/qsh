@@ -15,6 +15,7 @@ PATCHES = (
     "cargo-generate-rpm-0.21.0-local-rpm.patch",
     "cargo-generate-rpm-0.21.0-requires-post.patch",
     "cargo-generate-rpm-0.21.0-requires-pre.patch",
+    "cargo-generate-rpm-0.21.0-reap-ldd.patch",
 )
 
 

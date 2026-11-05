@@ -103,3 +103,32 @@ merely look like a post-script dependency in a manifest. Controlled minimal
 installation additionally proves package-manager resolution with the
 user-management provider initially absent; stock-image tool presence alone
 cannot establish that property.
+
+## Automatic-requirements child custody
+
+The pinned builtin `ldd` reader now closes its stdout handle and waits for its
+own child on both successful reads and read errors. Read errors keep precedence;
+wait I/O errors use the existing process-error category. Dependency parsing and
+the existing policy of ignoring successfully obtained nonzero exit status stay
+unchanged. The patch adds focused Rust controls for output, nonzero status,
+invalid UTF-8, and an early read error with a finite producer exceeding pipe
+capacity; closing the read handle before waiting prevents that error path from
+blocking the producer.
+
+Every Linux installation first runs `test_child_reaping.py` against the exact
+fresh absolute binary, then the existing dependency checks. The custody check
+uses isolated workers: real system `ldd` is distinguished from controlled-output
+invalid-UTF-8/nonzero fixtures. Any adopted child fails qualification even when
+the observer naturally reaps it. No package is installed or payload executed.
+Unsupported platforms fail explicitly. Run it against an existing prepared tool:
+
+```sh
+python3 packaging/rpm-tool/test_child_reaping.py /absolute/path/to/cargo-generate-rpm
+```
+
+Run the focused crate controls in a fresh prepared tree:
+
+```sh
+cargo test --manifest-path /tmp/new-rpm-tool-sources/cargo-generate-rpm-0.21.0/Cargo.toml \
+  --locked --bin cargo-generate-rpm ldd_child_reaping_tests
+```
