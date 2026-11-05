@@ -364,11 +364,14 @@ fn open24_late_receipt_retry_releases_the_exact_retained_registration() {
     ));
     let receipt = custody.cleanup_notifier();
     drop(job);
-    assert!(matches!(receipt.retry_cleanup(), CleanupStatus::Unknown));
+    assert!(matches!(custody.retry_cleanup(), CleanupStatus::Unknown));
+    assert_eq!(session.occupied(), 1);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 0);
     assert_eq!(registry.outstanding(), 1);
     observation.confirmed.store(true, Ordering::SeqCst);
     assert!(matches!(
-        receipt.retry_cleanup(),
+        custody.retry_cleanup(),
         CleanupStatus::Confirmed(_)
     ));
     assert_eq!(registry.outstanding(), 0);
@@ -382,6 +385,9 @@ fn open24_late_receipt_retry_releases_the_exact_retained_registration() {
         0,
         "duplicate receipt cannot refund twice"
     );
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -662,6 +668,10 @@ async fn open24_executor_constructor_panic_keeps_unknown_until_late_receipt() {
         matches!(job.take_outcome(), Some(OpenOutcome::Failed(reason)) if reason == "channel creation failed")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        job.custody().retry_cleanup(),
+        CleanupStatus::Unknown
+    ));
     assert_eq!(registry.outstanding(), 1);
     assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
     assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 0);
@@ -673,6 +683,7 @@ async fn open24_executor_constructor_panic_keeps_unknown_until_late_receipt() {
     ));
     assert_eq!(registry.outstanding(), 0);
     assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -979,4 +990,56 @@ fn initial_admission_requires_healthy_construction() {
         Err(InitialAdmissionError::Unavailable)
     );
     assert!(!called.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_removed_registration_retains_exact_cleanup_confirmation() {
+    let registry = ChannelOpenRegistry::new(OpenLimits {
+        global: 1,
+        per_uid: 1,
+    });
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 9, 1))
+        .unwrap();
+    let observation = Arc::new(Observation::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = ChannelOpenExecutor::new(
+        Arc::new(ExecutorSpawn {
+            registry: registry.clone(),
+            observation: observation.clone(),
+            calls: calls.clone(),
+            panic_after_protect: true,
+        }),
+        registry.clone(),
+    );
+    observation.confirmed.store(true, Ordering::SeqCst);
+    executor.submit(&job).unwrap();
+    job.take_worker().unwrap().await.unwrap();
+    assert!(
+        matches!(job.take_outcome(), Some(OpenOutcome::Failed(reason)) if reason == "channel creation failed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(session.occupied(), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
+    // Registry lookup is not the retained exact-owner terminal certificate.
+    assert!(matches!(job.cleanup(), CleanupStatus::Unknown));
+    assert!(matches!(
+        job.custody().retry_cleanup(),
+        CleanupStatus::Confirmed(_)
+    ));
+    let waits = observation.waits.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(matches!(
+            job.custody().retry_cleanup(),
+            CleanupStatus::Confirmed(_)
+        ));
+        assert_eq!(registry.outstanding(), 0);
+        assert_eq!(session.occupied(), 0);
+        assert_eq!(observation.waits.load(Ordering::SeqCst), waits);
+        assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
+    }
 }

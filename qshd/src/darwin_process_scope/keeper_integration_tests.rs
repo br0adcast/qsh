@@ -1261,7 +1261,7 @@ pub(super) mod native {
                     }else{None};
                     let mut outcome=None;until(||{outcome=body_job.take_outcome();outcome.is_some()},end).await;
                     assert!(matches!(outcome,Some(OpenOutcome::Failed(_))));
-                    until(||matches!(body_job.cleanup(),CleanupStatus::Confirmed(_)),end).await;
+                    until(||matches!(body_job.custody().retry_cleanup(),CleanupStatus::Confirmed(_)),end).await;
                     body_fixture.assert_settled(1);let proof=observation.authority.snapshot().unwrap();
                     if mode==0 {assert!(proof.not_started&&proof.app.is_none()&&proof.app_status.is_none());assert!(!marker.exists());}
                     else {assert!(!proof.not_started&&proof.app.is_some()&&proof.app_status.is_some());}
