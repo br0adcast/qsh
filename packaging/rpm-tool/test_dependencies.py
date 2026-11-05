@@ -8,10 +8,69 @@ import tempfile
 import unittest
 
 
+_HEADER_TAGS = frozenset((1023, 1024, 1025, 1026, 1048, 1049, 1050,
+                          1085, 1086, 1087, 1088, 5020, 5021, 5022, 5023))
+
+
+def read_main_header(data):
+    """Read selected test header fields, retaining absent tags and actual types."""
+    if type(data) is not bytes or not 112 <= len(data) <= 64 * 1024**2:
+        raise ValueError("RPM input bound")
+
+    def header(offset, decode):
+        if offset < 96 or offset > len(data) - 16:
+            raise ValueError("RPM header extent")
+        if data[offset:offset + 8] != b"\x8e\xad\xe8\x01\0\0\0\0":
+            raise ValueError("RPM header magic")
+        count, size = struct.unpack_from(">II", data, offset + 8)
+        if count > (len(data) - offset - 16) // 16:
+            raise ValueError("RPM entry table extent")
+        store = offset + 16 + count * 16
+        if size > len(data) - store:
+            raise ValueError("RPM store extent")
+        end = store + size
+        entries = {}
+        for index in range(count):
+            tag, kind, start, length = struct.unpack_from(
+                ">IIII", data, offset + 16 + index * 16)
+            if start > size:
+                raise ValueError("RPM entry offset")
+            if not decode or tag not in _HEADER_TAGS:
+                continue
+            if tag in entries:
+                raise ValueError("RPM duplicate selected tag")
+            position = store + start
+            if kind == 4:
+                if length > (end - position) // 4:
+                    raise ValueError("RPM integer extent")
+                values = struct.unpack_from(">" + "I" * length, data, position)
+            elif kind in (6, 8):
+                if kind == 6 and length != 1:
+                    raise ValueError("RPM STRING count")
+                if length > end - position:
+                    raise ValueError("RPM string count")
+                values = []
+                for _ in range(length):
+                    terminator = data.find(b"\0", position, end)
+                    if terminator < 0:
+                        raise ValueError("RPM unterminated string")
+                    values.append(data[position:terminator])
+                    position = terminator + 1
+                values = tuple(values)
+            else:
+                raise ValueError("RPM selected tag type")
+            entries[tag] = dict(kind=kind, count=length, values=values)
+        return entries, end
+
+    _, signature_end = header(96, False)
+    entries, _ = header((signature_end + 7) & ~7, True)
+    return entries
+
+
 class GeneratedDependencyTests(unittest.TestCase):
     tool = None
 
-    def generate(self, metadata):
+    def generate(self, metadata, *, inspect_header=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             # Rocky minimal images expose /bin/true as a coreutils shebang
@@ -33,22 +92,14 @@ class GeneratedDependencyTests(unittest.TestCase):
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if result.returncode:
                 return result, None
-            data = output.read_bytes()
-            def header(offset):
-                self.assertEqual(data[offset:offset + 3], b"\x8e\xad\xe8")
-                count, size = struct.unpack_from(">II", data, offset + 8)
-                store = offset + 16 + count * 16
-                entries = {}
-                for index in range(count):
-                    tag, kind, start, length = struct.unpack_from(">IIII", data, offset + 16 + index * 16)
-                    if kind == 8:
-                        entries[tag] = data[store + start:].split(b"\0", length)[:length]
-                    elif kind == 4:
-                        entries[tag] = struct.unpack_from(">" + "I" * length, data, store + start)
-                return entries, store + size
-            _, end = header(96)
-            entries, _ = header((end + 7) & ~7)
-            return result, list(zip(entries[1049], entries[1048], entries[1050]))
+            entries = read_main_header(output.read_bytes())
+            if inspect_header is not None:
+                inspect_header(entries)
+            names, flags, versions = (entries[tag] for tag in (1049, 1048, 1050))
+            if (names['kind'] != 8 or flags['kind'] != 4 or versions['kind'] != 8
+                    or len({entry['count'] for entry in (names, flags, versions)}) != 1):
+                raise ValueError("RPM dependency vectors")
+            return result, list(zip(names['values'], flags['values'], versions['values']))
 
     def test_pre_post_preun_and_automatic_elf_requirements(self):
         result, dependencies = self.generate(

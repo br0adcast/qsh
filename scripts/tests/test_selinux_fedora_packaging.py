@@ -568,6 +568,42 @@ class FedoraRecipeTests(unittest.TestCase):
         for key, name in [('pre_install_script', 'consumer-pre'), ('post_install_script', 'consumer-post'),
                           ('pre_uninstall_script', 'consumer-preun'), ('post_uninstall_script', 'consumer-postun')]:
             self.assertEqual(variant[key], '../packaging/selinux/maintainer/' + name)
+            self.assertEqual(variant[key + '_prog'], ['/bin/sh'])
+            self.assertIs(type(variant[key + '_flags']), int)
+            self.assertEqual(variant[key + '_flags'], 0)
+
+        spec = importlib.util.spec_from_file_location('rpm_reader_controls', ROOT / 'packaging/rpm-tool/test_dependencies.py')
+        reader = importlib.util.module_from_spec(spec); spec.loader.exec_module(reader)
+        import struct
+
+        def package(records, store):
+            signature = b'\x8e\xad\xe8\x01' + b'\0' * 12
+            main = (b'\x8e\xad\xe8\x01' + b'\0' * 4
+                    + struct.pack('>II', len(records), len(store))
+                    + b''.join(struct.pack('>IIII', *row) for row in records) + store)
+            return b'\0' * 96 + signature + main
+
+        for kind, count, store, values in [(6, 1, b'/bin/sh\0', (b'/bin/sh',)),
+                                            (8, 1, b'/bin/sh\0', (b'/bin/sh',)),
+                                            (8, 0, b'', ()),
+                                            (8, 2, b'/bin/sh\0-e\0', (b'/bin/sh', b'-e'))]:
+            with self.subTest(reader_kind=kind, reader_count=count):
+                parsed = reader.read_main_header(package([(1085, kind, 0, count)], store))
+                self.assertEqual(parsed, {1085: dict(kind=kind, count=count, values=values)})
+        valid = package([(1085, 6, 0, 1)], b'/bin/sh\0')
+        invalid = [valid[:-1], valid[:112], b'',
+                   package([(1085, 6, 0, 0)], b''),
+                   package([(1085, 6, 0, 2)], b'sh\0sh\0'),
+                   package([(1085, 6, 0, 1)], b'unterminated') + b'payload\0',
+                   package([(1085, 8, 10, 1)], b'sh\0'),
+                   package([(5020, 4, 0, 1)], b'\0' * 3),
+                   package([(5020, 4, 0, 0xffffffff)], b'\0' * 4),
+                   package([(1085, 8, 0, 0xffffffff)], b'sh\0'),
+                   package([(1085, 7, 0, 1)], b'sh\0'),
+                   package([(1085, 6, 0, 1), (1085, 6, 0, 1)], b'sh\0')]
+        for index, raw in enumerate(invalid):
+            with self.subTest(malformed_header=index), self.assertRaises(ValueError):
+                reader.read_main_header(raw)
 
     def builder(self):
         script = SOURCE / 'build-fedora-packages.sh'
@@ -755,9 +791,32 @@ class FedoraRecipeTests(unittest.TestCase):
         case = dependency.GeneratedDependencyTests(); case.tool = os.environ['QSH_RPM_TOOL']
         variant = self.variant()
         metadata = {key: variant[key] for key in ('requires', 'requires-pre', 'requires-post', 'requires-preun')}
-        # Synthetic native interpreter payload, never qshd: only this recipe's
-        # phase/ABI headers are qualified here, not product linkage or lifecycle.
-        result, rows = case.generate(self.builder().toml_table(metadata))
+        phases = [('pre_install_script', 1023, 1085, 5020),
+                  ('post_install_script', 1024, 1086, 5021),
+                  ('pre_uninstall_script', 1025, 1087, 5022),
+                  ('post_uninstall_script', 1026, 1088, 5023)]
+        bodies = {}
+        for name, body_tag, _, _ in phases:
+            path = (ROOT / 'cli' / variant[name]).resolve()
+            metadata[name] = str(path)
+            bodies[body_tag] = path.read_bytes()
+            for suffix in ('_prog', '_flags'):
+                if name + suffix in variant:
+                    metadata[name + suffix] = variant[name + suffix]
+
+        def inspect(entries):
+            for _, body_tag, prog_tag, flags_tag in phases:
+                self.assertEqual(entries[body_tag], dict(kind=6, count=1, values=(bodies[body_tag],)))
+                self.assertTrue(prog_tag in entries, 'explicit consumer interpreter tag missing')
+                self.assertIn(entries[prog_tag]['kind'], (6, 8))
+                self.assertEqual(entries[prog_tag]['count'], 1)
+                self.assertEqual(entries[prog_tag]['values'], (b'/bin/sh',))
+                self.assertTrue(flags_tag in entries, 'explicit consumer flags tag missing')
+                self.assertEqual(entries[flags_tag], dict(kind=4, count=1, values=(0,)))
+
+        # The Python ELF qualifies automatic libc requirements only. Hooks are
+        # inert stored bytes; this control never executes a package script.
+        result, rows = case.generate(self.builder().toml_table(metadata), inspect_header=inspect)
         self.assertEqual(result.returncode, 0, result.stderr)
         for row in [(b'qshd-selinux-abi', 8, b'2'), (b'qshd-selinux', 512, b''),
                     (b'qshd-selinux', 1024, b''), (b'qshd-selinux', 2048, b''),
@@ -765,6 +824,25 @@ class FedoraRecipeTests(unittest.TestCase):
             self.assertIn(row, rows)
         self.assertTrue(any(name.startswith(b'libc.so.6') for name, _, _ in rows))
         self.assertFalse(any(b'(preun)' in name for name, _, _ in rows))
+
+        mutations = [
+            ('omitted', {key: value for key, value in metadata.items()
+                         if not key.endswith(('_prog', '_flags'))}),
+            ('empty-program', dict(metadata, pre_install_script_prog=[])),
+            ('multiple-programs', dict(metadata, pre_install_script_prog=['/bin/sh', '-e'])),
+            ('wrong-program', dict(metadata, pre_install_script_prog=['/bin/bash'])),
+            ('missing-flags', {key: value for key, value in metadata.items()
+                               if key != 'pre_install_script_flags'}),
+            ('nonzero-flags', dict(metadata, pre_install_script_flags=1)),
+        ]
+        for name, changed in mutations:
+            with self.subTest(header_case=name):
+                observed = []
+                result, _ = case.generate(self.builder().toml_table(changed), inspect_header=observed.append)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(observed), 1)
+                with self.assertRaises(AssertionError):
+                    inspect(observed[0])
 
     def test_phase_header_filter_requires_runtime_equality_and_real_phase_bits(self):
         builder = self.builder()
