@@ -80,23 +80,72 @@ jobs:
           set -euo pipefail
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
+          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings"
+          rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
+          scripts/check-qualified-rust.sh
+          rustc -vV
           runtime=$(mktemp -d "$RUNNER_TEMP/qsh-darwin-owner.XXXXXX")
           trap 'rm -rf "$runtime"' EXIT
           mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
           export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
           export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
-          cargo build -p qshd --bin qshd --features test-build-labels --locked --message-format=json-render-diagnostics > "$runtime/build.jsonl"
-          python3 - "$runtime/build.jsonl" "$runtime/daemon-path" <<'PY_DAEMON'
-          import json, pathlib, sys
+          select_artifact() {
+            python3 -I -B - "$1" "$2" "$3" "$4" <<'PY_ARTIFACT'
+          import hashlib, json, os, pathlib, sys
+          root = pathlib.Path.cwd().resolve(strict=True)
+          kind, features = sys.argv[3], set(sys.argv[4].split(','))
+          assert kind in {'bin', 'lib'}
+          manifest = root / 'qshd/Cargo.toml'
+          source = root / ('qshd/src/main.rs' if kind == 'bin' else 'qshd/src/lib.rs')
           records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-          paths = [record["executable"] for record in records if record.get("reason") == "compiler-artifact" and record.get("target", {}).get("name") == "qshd" and record.get("target", {}).get("kind") == ["bin"] and record.get("executable")]
-          assert len(paths) == 1 and pathlib.Path(paths[0]).is_file()
-          pathlib.Path(sys.argv[2]).write_text(paths[0])
-          PY_DAEMON
-          export QSH_DARWIN223_DAEMON="$(cat "$runtime/daemon-path")"
-          export QSH_DARWIN223_DAEMON_SHA256="$(shasum -a 256 "$QSH_DARWIN223_DAEMON" | awk '{print $1}')"
-          cargo test -p qshd --lib --features test-build-labels --locked darwin_process_scope::native_tests::darwin223_native_ \
-            -- --nocapture --test-threads=1 2>&1 | tee "$runtime/results.log"
+          records = [r for r in records if r.get('reason') == 'compiler-artifact'
+                     and r.get('target', {}).get('name') == 'qshd'
+                     and r.get('target', {}).get('kind') == [kind]
+                     and r.get('executable')]
+          assert len(records) == 1, 'expected one current Cargo qshd artifact'
+          record = records[0]
+          assert record.get('profile', {}).get('test') is (kind == 'lib')
+          assert set(record['features']) == features, 'wrong fixture feature configuration'
+          assert pathlib.Path(record['manifest_path']).resolve(strict=True) == manifest
+          assert pathlib.Path(record['target']['src_path']).resolve(strict=True) == source
+          executable = pathlib.Path(record['executable'])
+          assert executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK)
+          executable = executable.resolve(strict=True)
+          assert (root / 'target').resolve(strict=True) in executable.parents
+          sha = hashlib.sha256(executable.read_bytes()).hexdigest()
+          prefix = pathlib.Path(sys.argv[2])
+          prefix.with_suffix('.path').write_text(str(executable))
+          prefix.with_suffix('.sha256').write_text(sha)
+          receipt = dict(kind='darwin-custody-Cargo-artifact', target_kind=kind, features=sorted(features),
+                         profile_test=record['profile']['test'], sha256=sha,
+                         manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+          prefix.with_suffix('.json').write_text(json.dumps(receipt, sort_keys=True) + '\n')
+          print(json.dumps(receipt, sort_keys=True))
+          PY_ARTIFACT
+          }
+          verify_harness() {
+            test "$(shasum -a 256 "$1" | awk '{print $1}')" = "$(cat "$2")"
+          }
+          timed() {
+            local stage=$1 result
+            shift
+            printf 'darwin223 timing stage=%s event=start unix_seconds=%s\n' "$stage" "$(date +%s)" >&2
+            if "$@"; then result=0; else result=$?; fi
+            printf 'darwin223 timing stage=%s event=end unix_seconds=%s status=%s\n' "$stage" "$(date +%s)" "$result" >&2
+            return "$result"
+          }
+          timed ordinary-daemon cargo build -p qshd --bin qshd --profile test --features test-build-labels --locked --message-format=json-render-diagnostics > "$runtime/build.jsonl"
+          select_artifact "$runtime/build.jsonl" "$runtime/ordinary-daemon" bin test-build-labels
+          export QSH_DARWIN223_DAEMON="$(cat "$runtime/ordinary-daemon.path")"
+          export QSH_DARWIN223_DAEMON_SHA256="$(cat "$runtime/ordinary-daemon.sha256")"
+          timed ordinary-harness cargo test -p qshd --lib --features test-build-labels --locked --no-run --message-format=json-render-diagnostics > "$runtime/ordinary-harness.jsonl"
+          select_artifact "$runtime/ordinary-harness.jsonl" "$runtime/ordinary-harness" lib test-build-labels
+          ordinary_harness="$(cat "$runtime/ordinary-harness.path")"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          timed modern-runtime "$ordinary_harness" darwin_process_scope::native_tests::darwin223_native_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/results.log"
           for name in \
             darwin_process_scope::native_tests::darwin223_native_noncooperative_token_exec_and_bound_exit \
             darwin_process_scope::native_tests::darwin223_native_signaled_leader_scope_uses_portable_code_one \
@@ -121,8 +170,9 @@ jobs:
           done
           ! grep -F 'SKIPPED' "$runtime/results.log"
           grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
-          cargo test -p qshd --lib --features test-build-labels --locked darwin_process_scope::keeper_tests::keeper_native_ \
-            -- --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
           for name in \
             darwin_process_scope::keeper_tests::keeper_native_exit37_and_pty_eof \
             darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork \
@@ -145,27 +195,19 @@ jobs:
           test "$(grep -Fc 'case=cancel after_admit=false expired=false noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
           test "$(grep -Fc 'case=cancel after_admit=true expired=false noapp=false app=Some(' "$runtime/keeper-results.log")" -eq 1
           test "$(grep -Fc 'case=cancel after_admit=false expired=true noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
-          test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
-          export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Dwarnings"
-          rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
-          scripts/check-qualified-rust.sh
-          rustc -vV
-          cargo check -p qshd --lib --bin qshd --features test-darwin-keeper --locked
-          cargo clippy -p qshd --lib --bin qshd --features test-darwin-keeper --locked -- -D warnings
-          cargo build -p qshd --bin qshd --features test-darwin-keeper --locked --message-format=json-render-diagnostics > "$runtime/keeper-integrated-build.jsonl"
-          python3 - "$runtime/keeper-integrated-build.jsonl" "$runtime/keeper-integrated-daemon-path" <<'PY_KEEPER'
-          import json, pathlib, sys
-          records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-          records = [r for r in records if r.get("reason") == "compiler-artifact" and r.get("target", {}).get("name") == "qshd" and r.get("target", {}).get("kind") == ["bin"] and r.get("executable")]
-          assert len(records) == 1 and {"test-darwin-keeper", "test-build-labels"}.issubset(records[0]["features"])
-          assert pathlib.Path(records[0]["executable"]).is_file()
-          pathlib.Path(sys.argv[2]).write_text(records[0]["executable"])
-          PY_KEEPER
-          export QSH_DARWIN223_DAEMON="$(cat "$runtime/keeper-integrated-daemon-path")"
-          export QSH_DARWIN223_DAEMON_SHA256="$(shasum -a 256 "$QSH_DARWIN223_DAEMON" | awk '{print $1}')"
+          timed feature-check cargo check -p qshd --lib --bin qshd --features test-darwin-keeper --locked
+          timed feature-clippy cargo clippy -p qshd --lib --bin qshd --features test-darwin-keeper --locked -- -D warnings
+          timed feature-daemon cargo build -p qshd --bin qshd --profile test --features test-darwin-keeper --locked --message-format=json-render-diagnostics > "$runtime/keeper-integrated-build.jsonl"
+          select_artifact "$runtime/keeper-integrated-build.jsonl" "$runtime/feature-daemon" bin test-build-labels,test-darwin-keeper
+          export QSH_DARWIN223_DAEMON="$(cat "$runtime/feature-daemon.path")"
+          export QSH_DARWIN223_DAEMON_SHA256="$(cat "$runtime/feature-daemon.sha256")"
           printf 'keeper223 compatibility_Cargo_binary_sha256=%s source=compiled-missing\n' "$QSH_DARWIN223_DAEMON_SHA256"
-          cargo test -p qshd --lib --features test-darwin-keeper --locked darwin_process_scope::keeper_integration_tests::keeper_integrated_ \
-            -- --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-integrated-results.log"
+          timed feature-harness cargo test -p qshd --lib --features test-darwin-keeper --locked --no-run --message-format=json-render-diagnostics > "$runtime/feature-harness.jsonl"
+          select_artifact "$runtime/feature-harness.jsonl" "$runtime/feature-harness" lib test-build-labels,test-darwin-keeper
+          feature_harness="$(cat "$runtime/feature-harness.path")"
+          verify_harness "$feature_harness" "$runtime/feature-harness.sha256"
+          timed integrated-runtime "$feature_harness" darwin_process_scope::keeper_integration_tests::keeper_integrated_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-integrated-results.log"
           for name in \
             darwin_process_scope::keeper_integration_tests::keeper_integrated_terminal_status_and_io \
             darwin_process_scope::keeper_integration_tests::keeper_integrated_open_cancel_and_setup_failure \
