@@ -734,6 +734,7 @@ pub(super) struct FixtureIoObservation {
     pub reader_drop: std::sync::atomic::AtomicBool,
     pub reader_drop_finished: std::sync::atomic::AtomicBool,
     pub retiring_running: std::sync::atomic::AtomicBool,
+    pub producers: eof_diagnostics::Producers,
     release: std::sync::atomic::AtomicBool,
     deadline: Option<std::time::Instant>,
 }
@@ -745,6 +746,7 @@ impl FixtureIoObservation {
             reader_drop: false.into(),
             reader_drop_finished: false.into(),
             retiring_running: false.into(),
+            producers: eof_diagnostics::Producers::default(),
             release: false.into(),
             deadline,
         }
@@ -762,7 +764,7 @@ struct ObservedFixtureReader {
 #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
 impl Read for ObservedFixtureReader {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let actual = self.inner.read(bytes);
+        let actual = self.observation.producers.read(&mut self.inner, bytes);
         if matches!(actual, Ok(0)) {
             self.observation
                 .eof
@@ -801,7 +803,10 @@ struct ObservedFixtureWait {
 #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
 impl ChannelWait for ObservedFixtureWait {
     fn poll_exit(&mut self) -> transport::channel_server::ChildStatus {
-        let actual = self.inner.poll_exit();
+        let actual = self
+            .observation
+            .producers
+            .exit_poll(|| self.inner.poll_exit());
         if self
             .observation
             .eof
@@ -815,7 +820,9 @@ impl ChannelWait for ObservedFixtureWait {
         actual
     }
     fn poll_leader_status(&mut self) -> Option<transport::channel_server::LeaderStatus> {
-        self.inner.poll_leader_status()
+        self.observation
+            .producers
+            .leader_poll(|| self.inner.poll_leader_status())
     }
     fn active_observation(&self) -> transport::channel_server::ActiveObservation {
         self.inner.active_observation()
@@ -834,5 +841,284 @@ impl ChannelWait for ObservedFixtureWait {
         a: &transport::channel_open::CleanupAuthority<'_>,
     ) -> transport::channel_open::CleanupStatus {
         self.inner.cleanup_uninstalled(a)
+    }
+}
+
+// Portable controls exercise only these observation helpers, never a fake keeper.
+#[cfg(test)]
+pub(super) mod eof_diagnostics {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+    use transport::channel_server::{ChildStatus, LeaderStatus};
+
+    #[repr(u8)]
+    enum ReadPhase {
+        NotCalled,
+        Entered,
+        ReturnedData,
+        ReturnedEof,
+        ReturnedError,
+    }
+    #[repr(u8)]
+    enum ExitPhase {
+        NotCalled,
+        Entered,
+        ReturnedRunning,
+        ReturnedWaitingForWorkers,
+        ReturnedReaped,
+        ReturnedUnknown,
+    }
+    #[repr(u8)]
+    enum LeaderPhase {
+        NotCalled,
+        Entered,
+        ReturnedNone,
+        ReturnedRunning,
+        ReturnedExited,
+        ReturnedUnknown,
+    }
+
+    // Decode every scalar explicitly, including invalid/unknown diagnostic data.
+    fn read_label(code: u8) -> &'static str {
+        match code {
+            0 => "NotCalled",
+            1 => "Entered(NotReturned)",
+            2 => "ReturnedData",
+            3 => "ReturnedEof",
+            4 => "ReturnedError",
+            _ => "InvalidOrUnknown",
+        }
+    }
+    fn exit_label(code: u8) -> &'static str {
+        match code {
+            0 => "NotCalled",
+            1 => "Entered(NotReturned)",
+            2 => "ReturnedRunning",
+            3 => "ReturnedWaitingForWorkers",
+            4 => "ReturnedReaped",
+            5 => "ReturnedUnknown",
+            _ => "InvalidOrUnknown",
+        }
+    }
+    fn leader_label(code: u8) -> &'static str {
+        match code {
+            0 => "NotCalled",
+            1 => "Entered(NotReturned)",
+            2 => "ReturnedNone",
+            3 => "ReturnedRunning",
+            4 => "ReturnedExited",
+            5 => "ReturnedUnknown",
+            _ => "InvalidOrUnknown",
+        }
+    }
+
+    pub(crate) struct Producers {
+        read: AtomicU8,
+        raw_error: AtomicI32,
+        has_raw_error: AtomicBool,
+        exit: AtomicU8,
+        leader: AtomicU8,
+    }
+    impl Default for Producers {
+        fn default() -> Self {
+            Self {
+                read: AtomicU8::new(ReadPhase::NotCalled as u8),
+                raw_error: AtomicI32::new(0),
+                has_raw_error: AtomicBool::new(false),
+                exit: AtomicU8::new(ExitPhase::NotCalled as u8),
+                leader: AtomicU8::new(LeaderPhase::NotCalled as u8),
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(crate) struct Sample {
+        read: u8,
+        raw_error: i32,
+        has_raw_error: bool,
+        exit: u8,
+        leader: u8,
+    }
+    impl std::fmt::Display for Sample {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "producer_fields=individually_sampled read_phase={}({}) read_raw_os_error={:?} exit_poll_phase={}({}) leader_poll_phase={}({})", read_label(self.read), self.read, self.has_raw_error.then_some(self.raw_error), exit_label(self.exit), self.exit, leader_label(self.leader), self.leader)
+        }
+    }
+    impl Producers {
+        pub(crate) fn sample(&self) -> Sample {
+            Sample {
+                read: self.read.load(Ordering::SeqCst),
+                raw_error: self.raw_error.load(Ordering::SeqCst),
+                has_raw_error: self.has_raw_error.load(Ordering::SeqCst),
+                exit: self.exit.load(Ordering::SeqCst),
+                leader: self.leader.load(Ordering::SeqCst),
+            }
+        }
+        pub(crate) fn read(
+            &self,
+            reader: &mut (impl std::io::Read + ?Sized),
+            bytes: &mut [u8],
+        ) -> std::io::Result<usize> {
+            self.has_raw_error.store(false, Ordering::SeqCst);
+            self.read.store(ReadPhase::Entered as u8, Ordering::SeqCst);
+            let actual = reader.read(bytes);
+            let phase = match &actual {
+                Ok(0) => ReadPhase::ReturnedEof,
+                Ok(_) => ReadPhase::ReturnedData,
+                Err(error) => {
+                    if let Some(code) = error.raw_os_error() {
+                        self.raw_error.store(code, Ordering::SeqCst);
+                        self.has_raw_error.store(true, Ordering::SeqCst);
+                    }
+                    ReadPhase::ReturnedError
+                }
+            };
+            self.read.store(phase as u8, Ordering::SeqCst);
+            actual
+        }
+        pub(crate) fn exit_poll(&self, call: impl FnOnce() -> ChildStatus) -> ChildStatus {
+            self.exit.store(ExitPhase::Entered as u8, Ordering::SeqCst);
+            let actual = call();
+            let phase = match &actual {
+                ChildStatus::Running => ExitPhase::ReturnedRunning,
+                ChildStatus::WaitingForWorkers => ExitPhase::ReturnedWaitingForWorkers,
+                ChildStatus::Reaped { .. } => ExitPhase::ReturnedReaped,
+                ChildStatus::Unknown(_) => ExitPhase::ReturnedUnknown,
+            };
+            self.exit.store(phase as u8, Ordering::SeqCst);
+            actual
+        }
+        pub(crate) fn leader_poll(
+            &self,
+            call: impl FnOnce() -> Option<LeaderStatus>,
+        ) -> Option<LeaderStatus> {
+            self.leader
+                .store(LeaderPhase::Entered as u8, Ordering::SeqCst);
+            let actual = call();
+            let phase = match &actual {
+                None => LeaderPhase::ReturnedNone,
+                Some(LeaderStatus::Running) => LeaderPhase::ReturnedRunning,
+                Some(LeaderStatus::Exited { .. }) => LeaderPhase::ReturnedExited,
+                Some(LeaderStatus::Unknown(_)) => LeaderPhase::ReturnedUnknown,
+            };
+            self.leader.store(phase as u8, Ordering::SeqCst);
+            actual
+        }
+    }
+
+    #[test]
+    fn keeper_eof_diagnostics_read_records_one_actual_result_without_changing_it() {
+        struct Counting<'a> {
+            diagnostics: &'a Producers,
+            calls: usize,
+            result: Option<std::io::Result<usize>>,
+        }
+        impl std::io::Read for Counting<'_> {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                assert_eq!(self.diagnostics.sample().read, ReadPhase::Entered as u8);
+                self.result.take().unwrap()
+            }
+        }
+        let diagnostics = Producers::default();
+        assert!(diagnostics.sample().to_string().contains("NotCalled"));
+        for (result, expected_phase, code) in [
+            (Ok(7), ReadPhase::ReturnedData as u8, None),
+            (Ok(0), ReadPhase::ReturnedEof as u8, None),
+            (
+                Err(std::io::Error::from_raw_os_error(9)),
+                ReadPhase::ReturnedError as u8,
+                Some(9),
+            ),
+            (
+                Err(std::io::Error::other("diagnostic read control")),
+                ReadPhase::ReturnedError as u8,
+                None,
+            ),
+        ] {
+            let expected = result.as_ref().ok().copied();
+            let mut reader = Counting {
+                diagnostics: &diagnostics,
+                calls: 0,
+                result: Some(result),
+            };
+            let actual = diagnostics.read(&mut reader, &mut [0; 8]);
+            assert_eq!(reader.calls, 1);
+            assert_eq!(actual.as_ref().ok().copied(), expected);
+            assert_eq!(actual.as_ref().err().and_then(|e| e.raw_os_error()), code);
+            if expected.is_none() && code.is_none() {
+                assert_eq!(actual.unwrap_err().to_string(), "diagnostic read control");
+            }
+            let saved = diagnostics.sample();
+            assert_eq!(saved.read, expected_phase);
+            assert_eq!(saved.has_raw_error.then_some(saved.raw_error), code);
+        }
+    }
+
+    #[test]
+    fn keeper_eof_diagnostics_poll_records_single_actual_status_and_preserves_payload() {
+        let diagnostics = Producers::default();
+        for (status, phase) in [
+            (ChildStatus::Running, 2),
+            (ChildStatus::WaitingForWorkers, 3),
+            (ChildStatus::Reaped { code: Some(37) }, 4),
+            (ChildStatus::Unknown("exit-control".into()), 5),
+        ] {
+            let mut calls = 0;
+            let actual = diagnostics.exit_poll(|| {
+                calls += 1;
+                assert_eq!(diagnostics.sample().exit, ExitPhase::Entered as u8);
+                status
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(diagnostics.sample().exit, phase);
+            match actual {
+                ChildStatus::Reaped { code } => assert_eq!(code, Some(37)),
+                ChildStatus::Unknown(reason) => assert_eq!(reason, "exit-control"),
+                ChildStatus::Running => assert_eq!(phase, 2),
+                ChildStatus::WaitingForWorkers => assert_eq!(phase, 3),
+            }
+        }
+        for (status, phase) in [
+            (None, 2),
+            (Some(LeaderStatus::Running), 3),
+            (Some(LeaderStatus::Exited { code: Some(0) }), 4),
+            (Some(LeaderStatus::Unknown("leader-control".into())), 5),
+        ] {
+            let mut calls = 0;
+            let actual = diagnostics.leader_poll(|| {
+                calls += 1;
+                assert_eq!(diagnostics.sample().leader, LeaderPhase::Entered as u8);
+                status
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(diagnostics.sample().leader, phase);
+            match actual {
+                Some(LeaderStatus::Exited { code }) => assert_eq!(code, Some(0)),
+                Some(LeaderStatus::Unknown(reason)) => assert_eq!(reason, "leader-control"),
+                Some(LeaderStatus::Running) => assert_eq!(phase, 3),
+                None => assert_eq!(phase, 2),
+            }
+        }
+    }
+
+    #[test]
+    fn keeper_eof_diagnostics_format_uses_saved_individual_fields_and_invalid_codes() {
+        let diagnostics = Producers::default();
+        let absent = diagnostics.sample();
+        diagnostics
+            .read
+            .store(ReadPhase::Entered as u8, Ordering::SeqCst);
+        let entered = diagnostics.sample();
+        diagnostics.read.store(255, Ordering::SeqCst);
+        diagnostics.exit.store(255, Ordering::SeqCst);
+        diagnostics.leader.store(255, Ordering::SeqCst);
+        assert!(absent.to_string().contains("read_phase=NotCalled(0)"));
+        assert!(entered
+            .to_string()
+            .contains("read_phase=Entered(NotReturned)(1)"));
+        assert!(diagnostics
+            .sample()
+            .to_string()
+            .contains("read_phase=InvalidOrUnknown(255)"));
+        assert!(absent.to_string().contains("read_raw_os_error=None"));
     }
 }

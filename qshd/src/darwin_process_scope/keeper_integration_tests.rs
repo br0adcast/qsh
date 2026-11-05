@@ -104,6 +104,140 @@ fn keeper_settlement_diagnostics_continue_after_broken_pipe() {
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EofComponent {
+    Eof,
+    ReaderDrop,
+    RetiringRunning,
+}
+#[derive(Clone, Copy)]
+struct TerminalEofSample {
+    eof: bool,
+    reader_drop: bool,
+    retiring_running: bool,
+    reader_drop_finished: bool,
+    producers: super::keeper_pty::eof_diagnostics::Sample,
+}
+impl std::fmt::Display for TerminalEofSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "phase=terminal_eof_proof eof={} reader_drop={} retiring_running={} reader_drop_finished={} {}", self.eof, self.reader_drop, self.retiring_running, self.reader_drop_finished, self.producers)
+    }
+}
+fn sample_terminal_eof(
+    mut load: impl FnMut(EofComponent) -> bool,
+    drop_finished: impl FnOnce() -> bool,
+    producers: impl FnOnce() -> super::keeper_pty::eof_diagnostics::Sample,
+) -> TerminalEofSample {
+    // Preserve all three eager original evaluations, including false EOF.
+    let eof = load(EofComponent::Eof);
+    let reader_drop = load(EofComponent::ReaderDrop);
+    let retiring_running = load(EofComponent::RetiringRunning);
+    TerminalEofSample {
+        eof,
+        reader_drop,
+        retiring_running,
+        reader_drop_finished: drop_finished(),
+        producers: producers(),
+    }
+}
+#[track_caller]
+fn terminal_eof_until(
+    mut sample: impl FnMut() -> TerminalEofSample,
+    end: std::time::Instant,
+) -> impl std::future::Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        loop {
+            let cached = sample();
+            if delivered_eof(cached.eof, cached.reader_drop, cached.retiring_running) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "original integrated fixture deadline caller_line={} caller_column={} {}",
+                caller.line(),
+                caller.column(),
+                cached
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[test]
+fn keeper_eof_diagnostics_samples_eager_components_once_in_original_order() {
+    use std::cell::RefCell;
+    for mask in 0..8 {
+        let calls = RefCell::new(Vec::new());
+        let producers = super::keeper_pty::eof_diagnostics::Producers::default();
+        let saved = sample_terminal_eof(
+            |component| {
+                calls.borrow_mut().push(match component {
+                    EofComponent::Eof => "eof",
+                    EofComponent::ReaderDrop => "drop",
+                    EofComponent::RetiringRunning => "retiring",
+                });
+                mask & (1 << component as u8) != 0
+            },
+            || {
+                calls.borrow_mut().push("drop_finished");
+                false
+            },
+            || {
+                calls.borrow_mut().push("producers");
+                producers.sample()
+            },
+        );
+        assert_eq!(
+            *calls.borrow(),
+            ["eof", "drop", "retiring", "drop_finished", "producers"]
+        );
+        assert_eq!(
+            delivered_eof(saved.eof, saved.reader_drop, saved.retiring_running),
+            mask == 7
+        );
+        let rendered = saved.to_string();
+        assert!(rendered.contains("phase=terminal_eof_proof"));
+        assert!(rendered.contains("producer_fields=individually_sampled"));
+        assert_eq!(calls.borrow().len(), 5, "formatting must not resample");
+    }
+}
+
+#[tokio::test]
+async fn keeper_eof_diagnostics_deadline_formats_original_cached_sample_before_unwind() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let producers = super::keeper_pty::eof_diagnostics::Producers::default();
+    let saved = sample_terminal_eof(
+        |component| component == EofComponent::ReaderDrop,
+        || false,
+        || producers.sample(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sampled = calls.clone();
+    let expected_line = line!() + 1;
+    let wait = terminal_eof_until(
+        move || {
+            sampled.fetch_add(1, Ordering::SeqCst);
+            saved
+        },
+        std::time::Instant::now(),
+    );
+    let panic = tokio::spawn(wait).await.unwrap_err().into_panic();
+    let text = panic
+        .downcast_ref::<String>()
+        .expect("formatted cached assertion");
+    assert!(text.contains(&format!("caller_line={expected_line}")));
+    assert!(text.contains("phase=terminal_eof_proof eof=false reader_drop=true retiring_running=false reader_drop_finished=false"));
+    assert!(text.contains("read_phase=NotCalled(0)"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Success is still checked before the original end assertion.
+    let success = sample_terminal_eof(|_| true, || false, || producers.sample());
+    terminal_eof_until(|| success, std::time::Instant::now()).await;
+}
+
 #[track_caller]
 fn until(
     mut check: impl FnMut() -> bool,
@@ -1331,7 +1465,7 @@ pub(super) mod native {
                     client.send_bytes(FIRST_CHANNEL_STREAM,b"keeper-input-proof\n".to_vec()).unwrap();
                     until(||read_gate(&path.join("stdio-closed")).as_deref()==Some(nonce.as_bytes()),end).await;
                     let observation=f.observation(0).expect("actual factory child ran");
-                    until(||super::delivered_eof(observation.io.eof.load(Ordering::SeqCst),observation.io.reader_drop.load(Ordering::SeqCst),observation.io.retiring_running.load(Ordering::SeqCst)),end).await;
+                    super::terminal_eof_until(||super::sample_terminal_eof(|component|match component {super::EofComponent::Eof=>observation.io.eof.load(Ordering::SeqCst),super::EofComponent::ReaderDrop=>observation.io.reader_drop.load(Ordering::SeqCst),super::EofComponent::RetiringRunning=>observation.io.retiring_running.load(Ordering::SeqCst)},||observation.io.reader_drop_finished.load(Ordering::SeqCst),||observation.io.producers.sample()),end).await;
                     assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
                     let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
                     assert!(snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
