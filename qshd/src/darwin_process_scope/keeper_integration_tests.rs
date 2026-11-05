@@ -2,6 +2,25 @@
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
 
+#[track_caller]
+fn until(
+    mut check: impl FnMut() -> bool,
+    end: std::time::Instant,
+) -> impl std::future::Future<Output = ()> {
+    let caller = std::panic::Location::caller();
+    async move {
+        while !check() {
+            assert!(
+                std::time::Instant::now() < end,
+                "original integrated fixture deadline caller_line={} caller_column={}",
+                caller.line(),
+                caller.column()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
 // Availability is not validation: return the first snapshot, even if its
 // contents will fail the caller's existing custody assertions.
 async fn snapshot_available_until<T>(
@@ -826,6 +845,7 @@ fn keeper_fixture_eof_proof_requires_delivery_and_retiring_poll() {
 pub(super) mod native {
     use super::super::native_tests::{ConnectedBinder, ConnectedEvents};
     use super::super::{keeper_pty::KeeperFixture, native::NativeOps, Class, Ops};
+    use super::until;
     use std::{
         path::{Path, PathBuf},
         sync::{atomic::Ordering, Arc, Mutex},
@@ -925,12 +945,6 @@ pub(super) mod native {
             .enable_all()
             .build()
             .unwrap()
-    }
-    async fn until(mut check: impl FnMut() -> bool, end: Instant) {
-        while !check() {
-            assert!(Instant::now() < end, "original integrated fixture deadline");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
     }
     fn exclusive(path: &Path, bytes: &[u8]) {
         use std::io::Write;
@@ -1720,5 +1734,80 @@ async fn keeper_snapshot_availability_returns_ledger_uncertainty_without_retry()
     assert_eq!(
         probes, 1,
         "availability must not retry until a desired state"
+    );
+}
+
+#[tokio::test]
+async fn keeper_until_reports_outer_caller_without_extra_checks() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let end = std::time::Instant::now();
+    let first_count = Arc::new(AtomicUsize::new(0));
+    let second_count = Arc::new(AtomicUsize::new(0));
+    let first_calls = first_count.clone();
+    let second_calls = second_count.clone();
+    let first_line = line!() + 1;
+    let first = until(
+        move || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        },
+        end,
+    );
+    let second_line = line!() + 1;
+    let second = until(
+        move || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        },
+        end,
+    );
+    assert_eq!(first_count.load(Ordering::SeqCst), 0);
+    assert_eq!(second_count.load(Ordering::SeqCst), 0);
+    let first_task = tokio::spawn(first);
+    let second_task = tokio::spawn(second);
+    let first_result = first_task.await;
+    let second_result = second_task.await;
+    assert_ne!(first_line, second_line);
+    for (result, line, calls) in [
+        (first_result, first_line, first_count),
+        (second_result, second_line, second_count),
+    ] {
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let error = result.expect_err("expired false condition must panic");
+        assert!(error.is_panic());
+        let payload = error.into_panic();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .expect("deadline panic text");
+        assert!(message.starts_with("original integrated fixture deadline"));
+        assert!(
+            message.contains(&format!("caller_line={line} caller_column=")),
+            "{message}"
+        );
+        let column: u32 = message
+            .split_once("caller_column=")
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        assert!(column > 0);
+    }
+    let mut true_calls = 0;
+    until(
+        || {
+            true_calls += 1;
+            true
+        },
+        end,
+    )
+    .await;
+    assert_eq!(
+        true_calls, 1,
+        "expired already-true condition retains check-first behavior"
     );
 }
