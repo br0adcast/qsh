@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 use transport::channel_server::ChildStatus;
 
 use super::keeper_integration_tests::{
-    parse_replacement_actor_report, parse_replacement_descendant_report, parse_replacement_stage,
-    replacement_terminal, valid_replacement_nonce, validate_replacement_binding,
-    validate_replacement_topology, ReplacementActorProjection, ReplacementActorReport,
-    ReplacementActorRole, ReplacementActorStage, ReplacementTopology,
+    bootstrap_image_identity, bootstrap_staged_path, copy_bootstrap_image,
+    copy_bootstrap_update_image, parse_replacement_actor_report,
+    parse_replacement_descendant_report, parse_replacement_stage, replacement_terminal,
+    valid_replacement_nonce, validate_replacement_binding, validate_replacement_topology,
+    ReplacementActorProjection, ReplacementActorReport, ReplacementActorRole,
+    ReplacementActorStage, ReplacementTopology,
 };
 
 fn replacement_exclusive(directory: &Path, name: &str, bytes: &[u8]) {
@@ -4490,7 +4492,7 @@ fn bootstrap_actor() {
     bootstrap_stage(BootstrapStage::Gate);
     bootstrap_result(bootstrap_gate(&mut gate));
     drop(gate);
-    let staged = destination.with_file_name(format!(".qshd-update-{}-a223", std::process::id()));
+    let staged = bootstrap_result(bootstrap_staged_path(&destination, std::process::id()));
     let handover = crate::handover::Handover {
         handover_version: crate::state::HANDOVER_VERSION,
         binary_path: destination,
@@ -5516,6 +5518,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
 }
 fn run_actual_daemon_replacement(role: ReplacementActorRole) {
     use std::ffi::OsStr;
+    use std::io::Write;
     use transport::channel::{
         encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, UpdateAnswer,
         UpdateOffer, CONTROL_STREAM, FIRST_CHANNEL_STREAM, UPDATE_STREAM,
@@ -5526,13 +5529,17 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
         std::env::var_os("QSH_DARWIN223_DAEMON").expect("required source-bound Cargo daemon path"),
     );
     assert!(original.is_absolute() && original.is_file());
+    let original_identity = bootstrap_image_identity(&original).unwrap();
     let original_hash = hash_path(&original);
     assert_eq!(
         hex::encode(original_hash),
         std::env::var("QSH_DARWIN223_DAEMON_SHA256").expect("required Cargo artifact digest")
     );
     let original_check = actual_self_check(&original, None);
-    let copies = tempfile::tempdir().unwrap();
+    let copies = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let old = copies.path().join("qshd");
     let new = copies.path().join("new-qshd");
     for (path, identifier) in [
@@ -5651,6 +5658,7 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
             Some(nix::libc::ECHILD)
         );
     }
+    let staging_end = Instant::now() + Duration::from_secs(10);
     let (mut gate, child_gate) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut command = bootstrap_command(
         &udp,
@@ -5672,31 +5680,18 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
         rescues: 0,
     };
     drop((udp, listener, child_gate));
-    let staged = old.with_file_name(format!(".qshd-update-{}-a223", daemon.owner.child.id()));
-    // Fresh distinct inode, preserving the already reviewed signed image.
-    use std::io::{Read, Write};
-    use std::os::unix::fs::PermissionsExt;
-    let mut source = std::fs::File::open(&old).unwrap();
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .unwrap();
-    let copied = std::io::copy(
-        &mut Read::by_ref(&mut source).take(crate::update::MAX_UPDATE_SIZE + 1),
-        &mut target,
-    )
-    .unwrap();
-    assert!(copied <= crate::update::MAX_UPDATE_SIZE);
-    target
-        .set_permissions(std::fs::Permissions::from_mode(0o700))
-        .unwrap();
-    target.sync_all().unwrap();
-    drop(target);
-    drop(source);
+    let staged = bootstrap_staged_path(&old, daemon.owner.child.id()).unwrap();
+    // Replacement retains its update-transfer ceiling, independently of the
+    // larger unstripped fixture-source ceiling in the shared copy helper.
+    assert!(std::fs::metadata(&old).unwrap().len() <= crate::update::MAX_UPDATE_SIZE);
+    copy_bootstrap_update_image(&old, &staged, &hex::encode(old_hash), staging_end).unwrap();
     assert_eq!(hash_path(&staged), old_hash);
-    gate.set_write_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    gate.set_write_timeout(Some(
+        gate_remaining(staging_end)
+            .unwrap()
+            .min(Duration::from_secs(3)),
+    ))
+    .unwrap();
     gate.write_all(b"GO\n").unwrap();
     gate.shutdown(std::net::Shutdown::Write).unwrap();
     drop(gate);
@@ -6045,6 +6040,10 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
         );
     }
     assert_eq!(hash_path(&original), original_hash);
+    assert_eq!(
+        bootstrap_image_identity(&original).unwrap(),
+        original_identity
+    );
     eprintln!("darwin223 actual_update=exec same_pid=true execution_version=fresh parked_leader=reaped descendant=exited application_reaped=true session_reaped=true fresh_channel=completed wire_STOP=normal rescue=false");
 }
 
@@ -6074,6 +6073,16 @@ fn keeper_stop_control_case() {
         FIRST_CHANNEL_STREAM,
     };
     let fixture = super::keeper_integration_tests::native::fixture();
+    let original_identity = bootstrap_image_identity(&fixture.path).unwrap();
+    // Declare before the daemon guard so unwind settles the child before its
+    // private executable directory can be removed.
+    let images = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let destination = images.path().join("qshd");
+    let staging_end = Instant::now() + Duration::from_secs(10);
+    copy_bootstrap_image(&fixture.path, &destination, &fixture.sha256, staging_end).unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -6094,7 +6103,7 @@ fn keeper_stop_control_case() {
         &listener,
         &child_gate,
         home.path(),
-        &fixture.path,
+        &destination,
         client_key.public,
         "",
     );
@@ -6109,8 +6118,19 @@ fn keeper_stop_control_case() {
         rescues: 0,
     };
     drop((udp, listener, child_gate));
-    gate.set_write_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    let staged = bootstrap_staged_path(&destination, daemon.owner.child.id()).unwrap();
+    copy_bootstrap_image(&destination, &staged, &fixture.sha256, staging_end).unwrap();
+    assert_eq!(
+        bootstrap_image_identity(&fixture.path).unwrap(),
+        original_identity
+    );
+    assert_eq!(hex::encode(hash_path(&fixture.path)), fixture.sha256);
+    gate.set_write_timeout(Some(
+        gate_remaining(staging_end)
+            .unwrap()
+            .min(Duration::from_secs(3)),
+    ))
+    .unwrap();
     gate.write_all(b"GO\n").unwrap();
     gate.shutdown(std::net::Shutdown::Write).unwrap();
     drop(gate);
@@ -6145,5 +6165,10 @@ fn keeper_stop_control_case() {
     actors.finish(true);
     super::keeper_integration_tests::native::assert_routes(&daemon.owner.stderr_bytes, 1);
     assert_eq!(daemon.rescues, 0);
+    assert_eq!(
+        bootstrap_image_identity(&fixture.path).unwrap(),
+        original_identity
+    );
+    assert_eq!(hex::encode(hash_path(&fixture.path)), fixture.sha256);
     eprintln!("keeper223 wire_STOP=ack_then_actual_exit_watch_and_consumed_wait actors=joined rescue=false");
 }

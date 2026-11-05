@@ -2,6 +2,269 @@
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
 
+#[cfg(unix)]
+mod bootstrap_images {
+    use sha2::{Digest, Sha256};
+    use std::{
+        fs::{File, Metadata, OpenOptions, Permissions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        path::{Component, Path, PathBuf},
+        time::Instant,
+    };
+    const SOURCE_LIMIT: u64 = 512 * 1024 * 1024;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::darwin_process_scope) struct ImageIdentity {
+        dev: u64,
+        ino: u64,
+        mode: u32,
+        links: u64,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+    fn identity(m: &Metadata) -> ImageIdentity {
+        ImageIdentity {
+            dev: m.dev(),
+            ino: m.ino(),
+            mode: m.mode(),
+            links: m.nlink(),
+            uid: m.uid(),
+            gid: m.gid(),
+            size: m.len(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+    fn remaining(end: Instant) -> anyhow::Result<()> {
+        anyhow::ensure!(Instant::now() < end, "BOOTSTRAP_DEADLINE");
+        Ok(())
+    }
+    fn normal(path: &Path) -> bool {
+        path.is_absolute()
+            && path.file_name().is_some()
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+    }
+    pub(in crate::darwin_process_scope) fn path(
+        destination: &Path,
+        pid: u32,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::ensure!(
+            normal(destination) && pid > 0 && pid <= i32::MAX as u32,
+            "BOOTSTRAP_PATH"
+        );
+        Ok(destination.with_file_name(format!(".qshd-update-{pid}-a223")))
+    }
+    fn open(path: &Path) -> anyhow::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+            .open(path)?;
+        let m = file.metadata()?;
+        anyhow::ensure!(
+            m.is_file() && (1..=SOURCE_LIMIT).contains(&m.len()),
+            "BOOTSTRAP_SOURCE"
+        );
+        bound(&file, path, identity(&m))?;
+        Ok(file)
+    }
+    fn bound(file: &File, path: &Path, expected: ImageIdentity) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            identity(&file.metadata()?) == expected
+                && identity(&std::fs::symlink_metadata(path)?) == expected,
+            "BOOTSTRAP_IDENTITY_DRIFT"
+        );
+        Ok(())
+    }
+    pub(in crate::darwin_process_scope) fn source_identity(
+        path: &Path,
+    ) -> anyhow::Result<ImageIdentity> {
+        Ok(identity(&open(path)?.metadata()?))
+    }
+    fn digest(file: &mut File, size: u64, end: Instant) -> anyhow::Result<String> {
+        let mut hash = Sha256::new();
+        let mut count = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            remaining(end)?;
+            let limit = ((size - count + 1).min(buffer.len() as u64)) as usize;
+            let n = file.read(&mut buffer[..limit])?;
+            remaining(end)?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            anyhow::ensure!(count <= size, "BOOTSTRAP_SIZE");
+            hash.update(&buffer[..n]);
+        }
+        anyhow::ensure!(count == size, "BOOTSTRAP_SIZE");
+        Ok(hex::encode(hash.finalize()))
+    }
+    pub(in crate::darwin_process_scope) fn copy(
+        source: &Path,
+        destination: &Path,
+        sha: &str,
+        end: Instant,
+    ) -> anyhow::Result<()> {
+        copy_limited(source, destination, sha, end, SOURCE_LIMIT)
+    }
+    pub(in crate::darwin_process_scope) fn copy_update(
+        source: &Path,
+        destination: &Path,
+        sha: &str,
+        end: Instant,
+    ) -> anyhow::Result<()> {
+        copy_limited(
+            source,
+            destination,
+            sha,
+            end,
+            crate::update::MAX_UPDATE_SIZE,
+        )
+    }
+    fn copy_limited(
+        source: &Path,
+        destination: &Path,
+        sha: &str,
+        end: Instant,
+        limit: u64,
+    ) -> anyhow::Result<()> {
+        remaining(end)?;
+        anyhow::ensure!(
+            sha.len() == 64
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "BOOTSTRAP_DIGEST"
+        );
+        anyhow::ensure!(normal(source) && normal(destination), "BOOTSTRAP_PATH");
+        let parent = std::fs::symlink_metadata(
+            destination
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("BOOTSTRAP_PARENT"))?,
+        )?;
+        anyhow::ensure!(
+            parent.is_dir()
+                && parent.uid() == unsafe { nix::libc::geteuid() }
+                && parent.mode() & 0o7777 == 0o700,
+            "BOOTSTRAP_PRIVATE_PARENT"
+        );
+        let mut input = open(source)?;
+        let original = identity(&input.metadata()?);
+        anyhow::ensure!(original.size <= limit, "BOOTSTRAP_COPY_LIMIT");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(destination)?;
+        let created = output.metadata()?;
+        anyhow::ensure!(
+            created.is_file()
+                && created.nlink() == 1
+                && (created.dev(), created.ino()) != (original.dev, original.ino),
+            "BOOTSTRAP_ALIAS"
+        );
+        let mut hash = Sha256::new();
+        let mut count = 0;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            remaining(end)?;
+            let limit = ((original.size - count + 1).min(buffer.len() as u64)) as usize;
+            let n = input.read(&mut buffer[..limit])?;
+            remaining(end)?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            anyhow::ensure!(count <= original.size, "BOOTSTRAP_SIZE");
+            output.write_all(&buffer[..n])?;
+            hash.update(&buffer[..n]);
+        }
+        bound(&input, source, original)?;
+        anyhow::ensure!(
+            count == original.size && hex::encode(hash.finalize()) == sha,
+            "BOOTSTRAP_DIGEST"
+        );
+        remaining(end)?;
+        output.set_permissions(Permissions::from_mode(0o700))?;
+        output.sync_all()?;
+        let admitted = identity(&output.metadata()?);
+        anyhow::ensure!(
+            admitted.links == 1 && admitted.mode & 0o7777 == 0o700,
+            "BOOTSTRAP_TARGET"
+        );
+        bound(&output, destination, admitted)?;
+        drop(output);
+        let mut reopened = open(destination)?;
+        anyhow::ensure!(
+            identity(&reopened.metadata()?) == admitted
+                && admitted.size == original.size
+                && digest(&mut reopened, admitted.size, end)? == sha,
+            "BOOTSTRAP_REOPEN"
+        );
+        bound(&reopened, destination, admitted)?;
+        bound(&input, source, original)?;
+        remaining(end)?;
+        Ok(())
+    }
+    #[test]
+    fn keeper_bootstrap_stage_refuses_source_identity_drift() {
+        let root = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
+        let source = root.path().join("source");
+        std::fs::write(&source, b"original").unwrap();
+        let held = open(&source).unwrap();
+        let expected = identity(&held.metadata().unwrap());
+        std::fs::rename(&source, root.path().join("old-source")).unwrap();
+        std::fs::write(&source, b"original").unwrap();
+        assert!(bound(&held, &source, expected).is_err());
+    }
+}
+#[cfg(unix)]
+pub(super) use bootstrap_images::{
+    copy as copy_bootstrap_image, copy_update as copy_bootstrap_update_image,
+    path as bootstrap_staged_path, source_identity as bootstrap_image_identity,
+};
+
+#[cfg(unix)]
+#[test]
+fn keeper_bootstrap_stage_refuses_wrong_digest_without_admission() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("qshd");
+    std::fs::write(&source, b"actual source bytes").unwrap();
+    let stage = bootstrap_staged_path(&destination, 42).unwrap();
+    assert!(!stage.exists());
+    let admitted = copy_bootstrap_image(
+        &source,
+        &stage,
+        &"0".repeat(64),
+        Instant::now() + Duration::from_secs(2),
+    );
+    assert!(
+        admitted.is_err(),
+        "wrong source bytes must never authorize GO"
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), b"actual source bytes");
+    use std::os::unix::fs::MetadataExt;
+    // A refused owned partial image stays non-executable and cannot admit GO.
+    assert_eq!(std::fs::metadata(&stage).unwrap().mode() & 0o7777, 0o600);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub(super) enum ReplacementActorRole {
     ModernSessionLeader,
@@ -1194,4 +1457,154 @@ fn keeper_integrated_actual_daemon_replacement() {
 #[test]
 fn keeper_integrated_foreign_sid_retains_debt() {
     native::foreign_sid();
+}
+
+#[cfg(unix)]
+#[test]
+fn keeper_bootstrap_stage_copies_private_distinct_bound_images() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        os::unix::fs::MetadataExt,
+        time::{Duration, Instant},
+    };
+    let root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("qshd");
+    let bytes = b"real source-bound executable fixture bytes";
+    std::fs::write(&source, bytes).unwrap();
+    let before = bootstrap_image_identity(&source).unwrap();
+    let hash = hex::encode(Sha256::digest(bytes));
+    let stage = bootstrap_staged_path(&destination, 42).unwrap();
+    assert_eq!(stage.file_name().unwrap(), ".qshd-update-42-a223");
+    assert!(!stage.exists());
+    let end = Instant::now() + Duration::from_secs(2);
+    copy_bootstrap_image(&source, &destination, &hash, end).unwrap();
+    assert!(!stage.exists());
+    copy_bootstrap_image(&destination, &stage, &hash, end).unwrap();
+    for path in [&destination, &stage] {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(path).unwrap().nlink(), 1);
+    }
+    let inodes: std::collections::HashSet<_> = [&source, &destination, &stage]
+        .into_iter()
+        .map(|p| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.dev(), m.ino())
+        })
+        .collect();
+    assert_eq!(inodes.len(), 3);
+    assert_eq!(bootstrap_image_identity(&source).unwrap(), before);
+}
+#[cfg(unix)]
+#[test]
+fn keeper_bootstrap_stage_refuses_aliases_and_preserves_existing_targets() {
+    use sha2::{Digest, Sha256};
+    use std::{
+        os::unix::fs::{symlink, MetadataExt},
+        time::{Duration, Instant},
+    };
+    let root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("qshd");
+    std::fs::write(&source, b"source").unwrap();
+    std::fs::write(&destination, b"sentinel").unwrap();
+    let before = bootstrap_image_identity(&destination).unwrap();
+    let hash = hex::encode(Sha256::digest(b"source"));
+    let end = Instant::now() + Duration::from_secs(2);
+    assert!(copy_bootstrap_image(&source, &destination, &hash, end).is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"sentinel");
+    assert_eq!(bootstrap_image_identity(&destination).unwrap(), before);
+    assert!(copy_bootstrap_image(&source, &source, &hash, end).is_err());
+    let alias = root.path().join("alias");
+    symlink(&source, &alias).unwrap();
+    let absent = root.path().join("absent");
+    assert!(copy_bootstrap_image(&alias, &absent, &hash, end).is_err());
+    assert!(!absent.exists());
+    assert!(copy_bootstrap_image(&source, &alias, &hash, end).is_err());
+    assert!(std::fs::symlink_metadata(&alias)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&source).unwrap(), b"source");
+    let hardlink = root.path().join("hardlink");
+    std::fs::hard_link(&source, &hardlink).unwrap();
+    assert!(copy_bootstrap_image(&source, &hardlink, &hash, end).is_err());
+    assert_eq!(
+        std::fs::metadata(&hardlink).unwrap().ino(),
+        std::fs::metadata(&source).unwrap().ino()
+    );
+}
+#[cfg(unix)]
+#[test]
+fn keeper_bootstrap_stage_refuses_invalid_paths_inputs_and_original_deadline() {
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, Instant};
+    let root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("qshd");
+    let hash = hex::encode(Sha256::digest(b"source"));
+    let end = Instant::now() + Duration::from_secs(2);
+    for pid in [0, u32::MAX] {
+        assert!(bootstrap_staged_path(&destination, pid).is_err());
+    }
+    for path in [
+        std::path::Path::new("relative"),
+        std::path::Path::new("/"),
+        std::path::Path::new("/tmp/../qshd"),
+    ] {
+        assert!(bootstrap_staged_path(path, 42).is_err());
+    }
+    std::fs::write(&source, []).unwrap();
+    assert!(copy_bootstrap_image(&source, &destination, &hash, end).is_err());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_len(512 * 1024 * 1024 + 1)
+        .unwrap();
+    assert!(copy_bootstrap_image(&source, &destination, &hash, end).is_err());
+    assert!(!destination.exists());
+    std::fs::write(&source, b"source").unwrap();
+    assert!(copy_bootstrap_image(&source, &destination, &hash, Instant::now()).is_err());
+    assert!(!destination.exists());
+    for bad in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+        assert!(copy_bootstrap_image(&source, &destination, &bad, end).is_err());
+        assert!(!destination.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn keeper_bootstrap_stage_preserves_replacement_copy_ceiling() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("qshd");
+    let file = std::fs::File::create(&source).unwrap();
+    file.set_len(crate::update::MAX_UPDATE_SIZE + 1).unwrap();
+    let failure = copy_bootstrap_update_image(
+        &source,
+        &destination,
+        &"0".repeat(64),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap_err();
+    assert_eq!(failure.to_string(), "BOOTSTRAP_COPY_LIMIT");
+    assert!(
+        !destination.exists(),
+        "oversized replacement must be refused before copying"
+    );
 }
