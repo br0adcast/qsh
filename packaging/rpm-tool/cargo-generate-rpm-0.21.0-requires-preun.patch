@@ -21,7 +21,7 @@
 @@ -336,6 +347,12 @@
              }
          }
-
+ 
 +        if let Some(requires_preun) = metadata.get_table("requires-preun")? {
 +            for dependency in Self::table_to_preun_dependencies(requires_preun)? {
 +                builder.requires(dependency);

@@ -46,11 +46,13 @@ BUNDLE_REPOSITORY_FILES = (
     'scripts/check-selinux-consumer-rpm.py', 'packaging/rpm-tool/README.md',
     'packaging/rpm-tool/install.sh', 'packaging/rpm-tool/prepare.py',
     'packaging/rpm-tool/test_dependencies.py',
+    'packaging/rpm-tool/test_child_reaping.py',
     'packaging/rpm-tool/rpm-0.23.2-archive-size.patch',
     'packaging/rpm-tool/cargo-generate-rpm-0.21.0-local-rpm.patch',
     'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-post.patch',
     'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-pre.patch',
-    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-preun.patch')
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-preun.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-reap-ldd.patch')
 
 
 def bundle_source_files(source):
