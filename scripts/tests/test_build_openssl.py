@@ -1072,7 +1072,7 @@ class ProductEntrypointTests(unittest.TestCase):
         import shutil
         callers = {
             '.github/workflows/ci.yml': 3,
-            '.github/workflows/native-crypto.yml': 1,
+            '.github/workflows/native-crypto.yml': 2,
             '.github/workflows/release.yml': 2,
             'packaging/build-server-packages.sh': 1,
             'packaging/acceptance.sh': 1,
