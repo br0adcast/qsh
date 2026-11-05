@@ -517,12 +517,199 @@ fn keeper_master_read_preserves_pty_eof_and_other_errors() {
     );
 }
 
+mod late_diagnostics {
+    // A diagnostic output failure must never interrupt the fixture's cleanup.
+    pub(super) fn emit(writer: &mut impl std::io::Write, message: std::fmt::Arguments<'_>) {
+        let _ = writer
+            .write_fmt(message)
+            .and_then(|()| writer.write_all(b"\n"));
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum Phase {
+        Ready,
+        Intrusion,
+        KillS,
+        SKilled,
+        SessionObserved,
+        ForkLate,
+        LateCreated,
+        ExitA,
+        Reap,
+        FinalProof,
+        IoJoin,
+        FinalAssertions,
+        Done,
+    }
+    impl Phase {
+        pub(super) const ALL: [Self; 13] = [
+            Self::Ready,
+            Self::Intrusion,
+            Self::KillS,
+            Self::SKilled,
+            Self::SessionObserved,
+            Self::ForkLate,
+            Self::LateCreated,
+            Self::ExitA,
+            Self::Reap,
+            Self::FinalProof,
+            Self::IoJoin,
+            Self::FinalAssertions,
+            Self::Done,
+        ];
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Ready => "ready",
+                Self::Intrusion => "intrusion",
+                Self::KillS => "kill_s",
+                Self::SKilled => "s_killed",
+                Self::SessionObserved => "session_observed",
+                Self::ForkLate => "fork_late",
+                Self::LateCreated => "late_created",
+                Self::ExitA => "exit_a",
+                Self::Reap => "reap",
+                Self::FinalProof => "final_proof",
+                Self::IoJoin => "io_join",
+                Self::FinalAssertions => "final_assertions",
+                Self::Done => "done",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum Boundary {
+        Begin,
+        End,
+        Checkpoint,
+        Failure,
+    }
+    impl Boundary {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Begin => "begin",
+                Self::End => "end",
+                Self::Checkpoint => "checkpoint",
+                Self::Failure => "failure",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum Gate {
+        Unobserved,
+        Missing,
+        Refused,
+        Mismatch,
+        Readable,
+        Valid,
+        Written,
+    }
+    impl Gate {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::Unobserved => "unobserved",
+                Self::Missing => "missing",
+                Self::Refused => "refused",
+                Self::Mismatch => "mismatch",
+                Self::Readable => "readable",
+                Self::Valid => "valid",
+                Self::Written => "written",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum Poll {
+        NotPolled,
+        Running,
+        WaitingWorkers,
+        Reaped(Option<i32>),
+        Unknown,
+    }
+    impl Poll {
+        pub(super) fn label(self) -> &'static str {
+            match self {
+                Self::NotPolled => "not_polled",
+                Self::Running => "running",
+                Self::WaitingWorkers => "waiting_workers",
+                Self::Reaped(_) => "reaped",
+                Self::Unknown => "unknown",
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub(super) enum Worker {
+        Absent,
+        Running,
+        Finished,
+    }
+    impl Worker {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Absent => "absent",
+                Self::Running => "running",
+                Self::Finished => "finished",
+            }
+        }
+    }
+    #[derive(Default)]
+    pub(super) struct Snapshot {
+        pub app_status: Option<i32>,
+        pub session_status: Option<i32>,
+        pub session_wait: Option<i32>,
+        pub broker_parent: Option<i32>,
+        pub broker_terminal: bool,
+        pub custody_lost: bool,
+        pub drained: bool,
+        pub census: bool,
+        pub consumed: bool,
+        pub keepers: usize,
+    }
+    pub(super) struct Io {
+        pub eof: bool,
+        pub reader: Worker,
+        pub writer: Worker,
+    }
+    pub(super) struct State {
+        pub phase: Phase,
+        pub boundary: Boundary,
+        pub poll: Poll,
+        pub s_killed: Gate,
+        pub late_created: Gate,
+        pub fork_late: Gate,
+        pub exit_a: Gate,
+    }
+    impl State {
+        pub(super) fn new() -> Self {
+            Self {
+                phase: Phase::Ready,
+                boundary: Boundary::Begin,
+                poll: Poll::NotPolled,
+                s_killed: Gate::Unobserved,
+                late_created: Gate::Unobserved,
+                fork_late: Gate::Unobserved,
+                exit_a: Gate::Unobserved,
+            }
+        }
+        pub(super) fn line(
+            &self,
+            controller_instant_before_end: bool,
+            snapshot: Option<Snapshot>,
+            io: Option<Io>,
+        ) -> String {
+            let code = match self.poll {
+                Poll::Reaped(code) => code,
+                _ => None,
+            };
+            format!("keeper223 late_diag phase={} boundary={} controller_instant_before_end={} last_poll={} last_code={:?} last_s_killed={} last_late_created={} last_fork_late={} last_exit_a={} snapshot_available={} app_status={:?} session_status={:?} session_wait={:?} broker_parent={:?} broker_terminal={:?} custody_lost={:?} drained={:?} census={:?} consumed={:?} keepers={:?} io_available={} eof={:?} reader={} writer={}",self.phase.label(),self.boundary.label(),controller_instant_before_end,self.poll.label(),code,self.s_killed.label(),self.late_created.label(),self.fork_late.label(),self.exit_a.label(),snapshot.is_some(),snapshot.as_ref().and_then(|s|s.app_status),snapshot.as_ref().and_then(|s|s.session_status),snapshot.as_ref().and_then(|s|s.session_wait),snapshot.as_ref().and_then(|s|s.broker_parent),snapshot.as_ref().map(|s|s.broker_terminal),snapshot.as_ref().map(|s|s.custody_lost),snapshot.as_ref().map(|s|s.drained),snapshot.as_ref().map(|s|s.census),snapshot.as_ref().map(|s|s.consumed),snapshot.as_ref().map(|s|s.keepers),io.is_some(),io.as_ref().map(|i|i.eof),io.as_ref().map_or("absent",|i|i.reader.label()),io.as_ref().map_or("absent",|i|i.writer.label()))
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod native_fixture {
     use super::super::{
         keeper::{FixtureAuthority, FixtureSnapshot, KeeperOwner},
         keeper_pty::ImageSource,
     };
+    use super::late_diagnostics::{self as diag, Boundary, Gate, Phase, Poll};
     use nix::libc;
     use std::io::{self, Read, Write};
     use std::os::unix::{
@@ -1059,6 +1246,7 @@ mod native_fixture {
         channel: Option<SpawnedChannel>,
         io: Option<IoWorkers>,
         complete: bool,
+        late_diagnostic: Option<diag::State>,
         deadline: Deadline,
         nonce: String,
         directory: tempfile::TempDir,
@@ -1099,6 +1287,7 @@ mod native_fixture {
                 channel: None,
                 io: None,
                 complete: false,
+                late_diagnostic: (case == "late").then(diag::State::new),
                 deadline,
                 nonce,
                 directory,
@@ -1138,6 +1327,65 @@ mod native_fixture {
             ));
             fixture
         }
+        fn late_boundary(&mut self, phase: Phase, boundary: Boundary) {
+            if let Some(state) = &mut self.late_diagnostic {
+                state.phase = phase;
+                state.boundary = boundary;
+                diag::emit(
+                    &mut io::stderr(),
+                    format_args!(
+                        "keeper223 late_phase phase={} boundary={}",
+                        phase.label(),
+                        match boundary {
+                            Boundary::Begin => "begin",
+                            Boundary::End => "end",
+                            Boundary::Checkpoint => "checkpoint",
+                            Boundary::Failure => "failure",
+                        }
+                    ),
+                );
+            }
+        }
+        fn late_report(&mut self, boundary: Boundary) {
+            let Some(state) = &mut self.late_diagnostic else {
+                return;
+            };
+            state.boundary = boundary;
+            let snapshot = self
+                .authority
+                .try_lock()
+                .ok()
+                .and_then(|authority| authority.as_ref().and_then(FixtureAuthority::snapshot))
+                .map(|snapshot| diag::Snapshot {
+                    app_status: snapshot.app_status,
+                    session_status: snapshot.session_status,
+                    session_wait: snapshot.session_wait,
+                    broker_parent: snapshot.broker_parent,
+                    broker_terminal: snapshot.broker_terminal,
+                    custody_lost: snapshot.custody_lost,
+                    drained: snapshot.drained,
+                    census: snapshot.census,
+                    consumed: snapshot.consumed,
+                    keepers: snapshot.keepers.len(),
+                });
+            let worker = |thread: &Option<std::thread::JoinHandle<io::Result<()>>>| match thread {
+                None => diag::Worker::Absent,
+                Some(thread) if thread.is_finished() => diag::Worker::Finished,
+                Some(_) => diag::Worker::Running,
+            };
+            let io = self.io.as_ref().map(|io| diag::Io {
+                eof: io.eof.load(Ordering::SeqCst),
+                reader: worker(&io.reader),
+                writer: worker(&io.writer),
+            });
+            diag::emit(
+                &mut io::stderr(),
+                format_args!(
+                    "{}",
+                    state.line(Instant::now() < self.deadline.end, snapshot, io)
+                ),
+            );
+        }
         fn authority(&self) -> FixtureAuthority {
             self.authority
                 .lock()
@@ -1156,6 +1404,14 @@ mod native_fixture {
                 "original keeper case deadline expired"
             );
             let status = self.channel.as_mut().unwrap().wait.poll_exit();
+            if let Some(state) = &mut self.late_diagnostic {
+                state.poll = match &status {
+                    ChildStatus::Running => Poll::Running,
+                    ChildStatus::WaitingForWorkers => Poll::WaitingWorkers,
+                    ChildStatus::Reaped { code } => Poll::Reaped(*code),
+                    ChildStatus::Unknown(_) => Poll::Unknown,
+                };
+            }
             assert!(
                 !matches!(status, ChildStatus::Unknown(_)),
                 "keeper ownership became unknown"
@@ -1186,6 +1442,7 @@ mod native_fixture {
             }
         }
         fn finish(&mut self, expected: i32) -> FixtureSnapshot {
+            self.late_boundary(Phase::Reap, Boundary::Begin);
             loop {
                 match self.tick() {
                     ChildStatus::Reaped { code } => {
@@ -1195,6 +1452,8 @@ mod native_fixture {
                     _ => std::thread::sleep(Duration::from_millis(5)),
                 }
             }
+            self.late_boundary(Phase::Reap, Boundary::End);
+            self.late_boundary(Phase::FinalProof, Boundary::Begin);
             let snapshot = self.snapshot();
             assert_eq!(snapshot.app_status, Some(expected));
             assert!(snapshot.broker_terminal && snapshot.drained && snapshot.census);
@@ -1203,14 +1462,21 @@ mod native_fixture {
                 .keepers
                 .iter()
                 .all(|k| k.2.is_some() && k.3.is_some()));
+            self.late_boundary(Phase::FinalProof, Boundary::End);
+            self.late_boundary(Phase::IoJoin, Boundary::Begin);
+            self.late_report(Boundary::Checkpoint);
             assert!(self.io.as_mut().unwrap().finish(self.deadline.end));
             assert!(self.io.as_ref().unwrap().eof.load(Ordering::SeqCst));
+            self.late_boundary(Phase::IoJoin, Boundary::End);
             self.complete = true;
             snapshot
         }
     }
     impl Drop for Case {
         fn drop(&mut self) {
+            if self.late_diagnostic.is_some() && (std::thread::panicking() || !self.complete) {
+                self.late_report(Boundary::Failure);
+            }
             if !self.complete {
                 if let Some(io) = &mut self.io {
                     io.stop.store(true, Ordering::SeqCst);
@@ -1273,6 +1539,7 @@ mod native_fixture {
                 channel: None,
                 io: None,
                 complete: false,
+                late_diagnostic: None,
                 deadline,
                 nonce,
                 directory,
@@ -1475,38 +1742,89 @@ mod native_fixture {
             "late",
             "darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork",
         );
+        case.late_boundary(Phase::Ready, Boundary::Begin);
         let ready = case.event("READY");
         assert_eq!(ready.len(), 4);
+        case.late_boundary(Phase::Ready, Boundary::End);
+        case.late_boundary(Phase::Intrusion, Boundary::Begin);
         let intrusion = case.event("S_INTRUSION");
         assert_eq!(intrusion.len(), 1);
+        case.late_boundary(Phase::Intrusion, Boundary::End);
+        case.late_boundary(Phase::KillS, Boundary::Begin);
         case.io.as_ref().unwrap().send("KILL_S");
+        case.late_boundary(Phase::KillS, Boundary::End);
+        case.late_boundary(Phase::SKilled, Boundary::Begin);
         case.until(|fixture| {
-            read_gate(&fixture.directory.path().join("s-killed"))
-                .is_ok_and(|bytes| bytes == fixture.nonce.as_bytes())
+            let result = read_gate(&fixture.directory.path().join("s-killed"));
+            let valid = match &result {
+                Ok(bytes) => bytes == fixture.nonce.as_bytes(),
+                Err(_) => false,
+            };
+            if let Some(state) = &mut fixture.late_diagnostic {
+                state.s_killed = match &result {
+                    Ok(_) if valid => Gate::Valid,
+                    Ok(_) => Gate::Mismatch,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Gate::Missing,
+                    Err(_) => Gate::Refused,
+                };
+            }
+            valid
         });
+        case.late_boundary(Phase::SKilled, Boundary::End);
+        case.late_boundary(Phase::SessionObserved, Boundary::Begin);
         case.until(|fixture| {
             let snapshot = fixture.snapshot();
             snapshot.session_status.is_some()
                 && snapshot.session_wait.is_none()
                 && snapshot.broker_parent == Some(1)
         });
+        case.late_boundary(Phase::SessionObserved, Boundary::End);
+        case.late_boundary(Phase::ForkLate, Boundary::Begin);
         exclusive(
             &case.directory.path().join("fork-late"),
             case.nonce.as_bytes(),
         )
         .unwrap();
-        case.until(|fixture| read_gate(&fixture.directory.path().join("late-created")).is_ok());
+        if let Some(state) = &mut case.late_diagnostic {
+            state.fork_late = Gate::Written;
+        }
+        case.late_boundary(Phase::ForkLate, Boundary::End);
+        case.late_boundary(Phase::LateCreated, Boundary::Begin);
+        case.until(|fixture| {
+            let result = read_gate(&fixture.directory.path().join("late-created"));
+            if let Some(state) = &mut fixture.late_diagnostic {
+                state.late_created = match &result {
+                    Ok(_) => Gate::Readable,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Gate::Missing,
+                    Err(_) => Gate::Refused,
+                };
+            }
+            result.is_ok()
+        });
         let late = read_gate(&case.directory.path().join("late-created")).unwrap();
         let late = std::str::from_utf8(&late).unwrap();
         let mut fields = late.split_whitespace();
         assert_eq!(fields.next(), Some(case.nonce.as_str()));
         let late = fields.next().unwrap().parse::<i32>().unwrap();
         assert!(fields.next().is_none());
+        if let Some(state) = &mut case.late_diagnostic {
+            state.late_created = Gate::Valid;
+        }
+        case.late_boundary(Phase::LateCreated, Boundary::End);
+        case.late_boundary(Phase::ExitA, Boundary::Begin);
         exclusive(&case.directory.path().join("exit-a"), case.nonce.as_bytes()).unwrap();
+        if let Some(state) = &mut case.late_diagnostic {
+            state.exit_a = Gate::Written;
+        }
+        case.late_boundary(Phase::ExitA, Boundary::End);
         let result = case.finish(37);
+        case.late_boundary(Phase::FinalAssertions, Boundary::Begin);
         assert_eq!(result.broker_parent, Some(1));
         assert_eq!(result.session_wait, Some(1));
         assert!(result.keepers.iter().any(|k| k.1 == Some(late)));
+        case.late_boundary(Phase::FinalAssertions, Boundary::End);
+        case.late_boundary(Phase::Done, Boundary::Begin);
+        case.late_boundary(Phase::Done, Boundary::End);
         eprintln!("keeper223 case=late-fork app=37 session=1 broker_parent=1 broker_exit=true io_joined=2 rescue=false");
     }
     pub fn intrusion() {
@@ -1829,4 +2147,134 @@ fn keeper_fixture_gate_holds_ready_completion_until_release() {
         worker.join().unwrap();
         assert!(complete.load(Ordering::SeqCst));
     }
+}
+
+#[test]
+fn keeper_late_diag_phase_boundaries_are_closed_and_distinct() {
+    use late_diagnostics::*;
+    let mut labels = std::collections::HashSet::new();
+    for phase in Phase::ALL {
+        assert!(labels.insert(phase.label()));
+        let mut state = State::new();
+        state.phase = phase;
+        state.boundary = Boundary::Begin;
+        assert!(state.line(true, None, None).contains("boundary=begin"));
+        state.boundary = Boundary::End;
+        assert!(state.line(true, None, None).contains("boundary=end"));
+    }
+    assert_eq!(labels.len(), 13);
+    assert!(labels.contains("session_observed"));
+}
+#[test]
+fn keeper_late_diag_absence_failure_and_poll_are_not_success() {
+    use late_diagnostics::*;
+    let mut state = State::new();
+    let absent = state.line(false, None, None);
+    assert!(absent.contains("controller_instant_before_end=false"));
+    assert!(absent.contains("snapshot_available=false"));
+    assert!(absent.contains("app_status=None"));
+    assert!(absent.contains("last_poll=not_polled"));
+    assert!(absent.contains("last_s_killed=unobserved"));
+    assert!(absent.contains("reader=absent"));
+    state.s_killed = Gate::Refused;
+    state.poll = Poll::Unknown;
+    let failed = state.line(false, None, None);
+    assert!(failed.contains("last_s_killed=refused"));
+    assert!(failed.contains("last_poll=unknown"));
+    state.s_killed = Gate::Valid;
+    state.poll = Poll::Reaped(Some(37));
+    let available = state.line(
+        true,
+        Some(Snapshot::default()),
+        Some(Io {
+            eof: false,
+            reader: Worker::Running,
+            writer: Worker::Finished,
+        }),
+    );
+    assert!(available.contains("snapshot_available=true"));
+    assert!(available.contains("last_s_killed=valid"));
+    assert!(available.contains("last_poll=reaped last_code=Some(37)"));
+    assert!(available.contains("reader=running writer=finished"));
+    assert!(state
+        .line(
+            true,
+            None,
+            Some(Io {
+                eof: false,
+                reader: Worker::Absent,
+                writer: Worker::Absent
+            })
+        )
+        .contains("reader=absent writer=absent"));
+    for gate in [
+        Gate::Unobserved,
+        Gate::Missing,
+        Gate::Refused,
+        Gate::Mismatch,
+        Gate::Readable,
+        Gate::Valid,
+        Gate::Written,
+    ] {
+        assert!(!gate.label().is_empty());
+    }
+    for poll in [
+        Poll::NotPolled,
+        Poll::Running,
+        Poll::WaitingWorkers,
+        Poll::Reaped(None),
+        Poll::Unknown,
+    ] {
+        state.poll = poll;
+        assert!(state.line(true, None, None).contains(poll.label()));
+    }
+    state.boundary = Boundary::Checkpoint;
+    assert!(state.line(true, None, None).contains("boundary=checkpoint"));
+    state.boundary = Boundary::Failure;
+    assert!(state.line(true, None, None).contains("boundary=failure"));
+}
+#[test]
+fn keeper_late_diag_extreme_scalars_remain_bounded_private_ascii() {
+    use late_diagnostics::*;
+    let state = State::new();
+    let snapshot = Snapshot {
+        app_status: Some(i32::MIN),
+        session_status: Some(i32::MAX),
+        session_wait: Some(i32::MIN),
+        broker_parent: Some(i32::MAX),
+        keepers: usize::MAX,
+        ..Snapshot::default()
+    };
+    let line = state.line(false, Some(snapshot), None);
+    assert!(line.starts_with("keeper223 late_diag "));
+    assert!(line.is_ascii() && !line.contains(['\n', '\r']) && line.len() <= 2048);
+    assert!(line.contains("app_status=Some(-2147483648)"));
+    assert!(line.contains("session_status=Some(2147483647)"));
+    assert!(line.contains(&format!("keepers=Some({})", usize::MAX)));
+}
+
+#[test]
+fn keeper_late_diag_failed_writer_does_not_block_continuation() {
+    struct Refused;
+    impl std::io::Write for Refused {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut continued = false;
+    let mut cleanup = || {
+        late_diagnostics::emit(&mut Refused, format_args!("keeper223 late_diag refused"));
+        continued = true;
+    };
+    cleanup();
+    assert!(continued);
+    let mut bytes = Vec::new();
+    late_diagnostics::emit(
+        &mut bytes,
+        format_args!("keeper223 late_diag {}", "checkpoint"),
+    );
+    assert_eq!(bytes, b"keeper223 late_diag checkpoint\n");
 }
