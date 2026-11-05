@@ -2,6 +2,108 @@
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
 
+// Fresh OPEN identities arrive through authenticated first-stream Geometry.
+fn established_instance(
+    geometries: &[transport::channel_geometry::GeometryRecord],
+) -> Option<transport::channel_geometry::ChannelInstance> {
+    geometries.iter().find_map(|g| {
+        (g.request_id == 0
+            && g.outcome == transport::channel_geometry::GeometryOutcome::Established)
+            .then_some(g.instance)
+    })
+}
+
+#[test]
+fn keeper_terminal_instance_selector_uses_decoded_established_geometry() {
+    use transport::channel_geometry::{
+        ChannelInstance, GeometryOutcome, GeometryRecord, ResizeRefusal,
+    };
+    use transport::shell_frame::{encode_shell, ShellDeframer, ShellRecord};
+    let instance = ChannelInstance::new(0x1234_5678_9abc).unwrap();
+    let mut decoded = Vec::new();
+    let mut deframer = ShellDeframer::new();
+    assert_eq!(established_instance(&decoded), None);
+    for (request_id, outcome) in [
+        (7, GeometryOutcome::Applied),
+        (8, GeometryOutcome::Refused(ResizeRefusal::ResourceLimit)),
+        (0, GeometryOutcome::Established),
+    ] {
+        let bytes = encode_shell(&ShellRecord::Geometry(GeometryRecord {
+            instance,
+            request_id,
+            outcome,
+            cols: 80,
+            rows: 24,
+        }))
+        .unwrap();
+        for chunk in bytes.chunks(3) {
+            for record in deframer.push(chunk) {
+                if let ShellRecord::Geometry(g) = record {
+                    decoded.push(g);
+                }
+            }
+        }
+        assert_eq!(
+            established_instance(&decoded),
+            (request_id == 0).then_some(instance)
+        );
+    }
+    // Even an in-memory malformed nonzero Established cannot select an identity.
+    assert_eq!(
+        established_instance(&[GeometryRecord {
+            instance,
+            request_id: 9,
+            outcome: GeometryOutcome::Established,
+            cols: 80,
+            rows: 24,
+        }]),
+        None
+    );
+}
+
+// Follow the keeper diagnostic writer: a sink failure cannot stop cleanup.
+fn emit_settlement(writer: &mut impl std::io::Write, message: std::fmt::Arguments<'_>) {
+    let _ = writer
+        .write_fmt(message)
+        .and_then(|()| writer.write_all(b"\n"));
+}
+
+#[test]
+fn keeper_settlement_diagnostics_continue_after_broken_pipe() {
+    struct Broken(usize);
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut broken = Broken(0);
+    emit_settlement(
+        &mut broken,
+        format_args!("keeper223 settlement boundary=finish_entry body_ok=false"),
+    );
+    emit_settlement(
+        &mut broken,
+        format_args!("keeper223 settlement boundary=final_assertions body_ok=false"),
+    );
+    assert_eq!(
+        broken.0, 2,
+        "both fixed boundaries continue despite refused output"
+    );
+    let mut bytes = Vec::new();
+    emit_settlement(
+        &mut bytes,
+        format_args!("keeper223 settlement boundary=finish_entry body_ok=true"),
+    );
+    assert_eq!(
+        bytes,
+        b"keeper223 settlement boundary=finish_entry body_ok=true\n"
+    );
+}
+
 #[track_caller]
 fn until(
     mut check: impl FnMut() -> bool,
@@ -974,6 +1076,12 @@ pub(super) mod native {
         manager: tokio::task::JoinHandle<Result<(), String>>,
         end: Instant,
     }
+    fn settlement(boundary: &'static str, body_ok: bool) {
+        super::emit_settlement(
+            &mut std::io::stderr(),
+            format_args!("keeper223 settlement boundary={boundary} body_ok={body_ok}"),
+        );
+    }
     impl Connected {
         async fn new(fixture: KeeperFixture, end: Instant) -> Self {
             use transport::session_manager::{LoginEndedReports, ServerAuth};
@@ -1076,6 +1184,7 @@ pub(super) mod native {
                 .map_err(|_| "OPEN enqueue")
         }
         async fn finish(mut self, body_ok: bool) {
+            settlement("finish_entry", body_ok);
             for i in 0..self.fixture.count() {
                 let observation = self.fixture.observation(i).unwrap();
                 observation.io.release_reader();
@@ -1083,8 +1192,13 @@ pub(super) mod native {
                     gate.release();
                 }
             }
+            settlement("reader_admission_release_complete", body_ok);
+            settlement("client_close_entry", body_ok);
             self.client.close();
+            settlement("client_close_return", body_ok);
             self.shutdown.request();
+            settlement("shutdown_request_return", body_ok);
+            settlement("original_budget_manager_wait_entry", body_ok);
             let joined = tokio::time::timeout(
                 self.end
                     .saturating_duration_since(Instant::now())
@@ -1092,21 +1206,31 @@ pub(super) mod native {
                 &mut self.manager,
             )
             .await;
+            super::emit_settlement(
+                &mut std::io::stderr(),
+                format_args!("keeper223 settlement boundary=original_budget_manager_wait_return body_ok={body_ok} result={}", if joined.is_ok() { "ready" } else { "timeout" }),
+            );
             let normal = joined.is_ok();
             let result = match joined {
                 Ok(v) => v,
                 Err(_) => {
                     // Failure-only fixture cleanup; never a product-completion pass.
                     for i in 0..self.fixture.count() {
+                        super::emit_settlement(&mut std::io::stderr(), format_args!("keeper223 settlement boundary=failure_rescue_entry body_ok={body_ok} index={i}"));
                         self.fixture
                             .observation(i)
                             .unwrap()
                             .authority
                             .rescue(Instant::now() + Duration::from_secs(10));
+                        super::emit_settlement(&mut std::io::stderr(), format_args!("keeper223 settlement boundary=failure_rescue_return body_ok={body_ok} index={i}"));
                     }
-                    self.manager.await
+                    settlement("failure_final_manager_wait_entry", body_ok);
+                    let result = self.manager.await;
+                    settlement("failure_final_manager_wait_return", body_ok);
+                    result
                 }
             };
+            settlement("final_assertions_entry", body_ok);
             result.unwrap().unwrap();
             assert!(
                 normal && body_ok,
@@ -1201,7 +1325,7 @@ pub(super) mod native {
                     if kind==ChannelKind::Shell {let mut bytes=b"exec ".to_vec();bytes.extend_from_slice(&command);bytes.push(b'\n');client.send_bytes(FIRST_CHANNEL_STREAM,bytes).unwrap();}
                     until(||events.output.lock().unwrap().windows(b"KEEPER_READY".len()).any(|w|w==b"KEEPER_READY"),end).await;
                     if screen {assert_ne!(budget.used(),crate::screen_budget::Usage::default());}else{assert_eq!(budget.used(),crate::screen_budget::Usage::default());}
-                    let instance=loop {let found=events.records.lock().unwrap().iter().find_map(|r|match r {ServerRecord::ChannelSnapshot(s)=>s.active().first().map(|a|a.instance),_=>None});if let Some(id)=found{break id;}assert!(Instant::now()<end);tokio::task::yield_now().await;};
+                    let instance=loop {let found=super::established_instance(&events.geometries.lock().unwrap());if let Some(id)=found{break id;}assert!(Instant::now()<end);tokio::task::yield_now().await;};
                     client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::ResizeRequest{stream:FIRST_CHANNEL_STREAM,instance,request_id:transport::channel_geometry::ResizeRequestId::new(1).unwrap(),cols:91,rows:31})).unwrap();
                     until(||events.geometries.lock().unwrap().iter().any(|g|g.instance==instance&&g.request_id==1&&g.outcome==transport::channel_geometry::GeometryOutcome::Applied&&g.cols==91&&g.rows==31),end).await;
                     client.send_bytes(FIRST_CHANNEL_STREAM,b"keeper-input-proof\n".to_vec()).unwrap();
@@ -1232,7 +1356,7 @@ pub(super) mod native {
                     until(||registry.outstanding()==0&&registry.retiring_count()==0,end).await;
                     assert!(fence.wait_until(Instant::now()).is_some());fence.reopen();f.assert_settled(2);
                 }).await;
-                release.release();c.finish(result.is_ok()).await;result.unwrap();
+                let body_ok=result.is_ok();settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();
                 eprintln!("keeper223 terminal kind={kind:?} screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false");
             }}
         });
