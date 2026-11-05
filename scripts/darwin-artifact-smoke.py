@@ -18,7 +18,17 @@ EXPANDED_LIMIT=768*1024**2
 EXECUTABLE_LIMIT=256*1024**2
 DOCUMENT_LIMIT=4*1024**2
 PROGRAMS=('qsh','qshd')
-DOCUMENTS=('README.md','LICENSE','CHANGELOG.md','LICENSE-OPENSSL.txt')
+# Archives carry both products, including the client's additional native code.
+# This does not add notices or dependencies to server-only packages.
+NOTICES={'LICENSE-OPENSSL.txt':'openssl.txt',
+         'LICENSE-AWS-LC-RS.txt':'aws-lc-rs.txt','LICENSE-AWS-LC.txt':'aws-lc.txt'}
+# Pinned to the maintained notice bytes; isolated tools need no source-tree data.
+NOTICE_SHA256 = {
+    'LICENSE-OPENSSL.txt': '7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a',
+    'LICENSE-AWS-LC-RS.txt': 'b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7',
+    'LICENSE-AWS-LC.txt': '728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e',
+}
+DOCUMENTS=('README.md','LICENSE','CHANGELOG.md',*NOTICES)
 
 class SmokeError(ValueError):
     """Closed refusal category, without paths or input content."""
@@ -300,6 +310,8 @@ def _scan(stream,root,stage_fd,known,*,compressed_limit):
                     data=reader.exact(min(65536,remaining));remaining-=len(data);value.update(data)
                     if output is not None:_write_all(output,data)
                 reader.exact((-size)%512)
+                if leaf in NOTICES:
+                    if value.hexdigest()!=NOTICE_SHA256[leaf]:fail('NOTICE_BYTES')
                 if output is not None:
                     os.fsync(output);result[leaf]=dict(sha256=value.hexdigest(),bytes=size)
             finally:

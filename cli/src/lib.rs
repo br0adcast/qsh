@@ -45,3 +45,13 @@ pub mod tty;
 pub mod ui_wait;
 pub mod viewport;
 pub mod window;
+
+#[cfg(test)]
+extern crate self as qsh;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "main.rs"]
+mod cli_entry;
+
+#[cfg(all(test, target_os = "linux"))]
+mod install_fixture_tests;

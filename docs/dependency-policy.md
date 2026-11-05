@@ -66,7 +66,7 @@ required separately; Cargo policy checks do not cover that native source.
 
 `deny.toml` records the current declarations. The common set is MIT, Apache-2.0,
 BSD-3-Clause, ISC, Unicode-3.0 and Zlib. Additional rules apply only to the
-fourteen named workspace packages at 0.5.0 (AGPL-3.0-only), option-ext 0.2.0
+fifteen named workspace packages at 0.5.0 (AGPL-3.0-only), option-ext 0.2.0
 (MPL-2.0), and webpki-roots 1.0.10 (CDLA-Permissive-2.0). Workspace/private/path
 packages are not skipped, and no content-free license clarification is used.
 
@@ -116,3 +116,19 @@ owned metadata and never contacts that registry. No real identities, keys,
 credentials or vulnerable external packages are downloaded for the controls.
 They run the verified real tools, demonstrate accepted and rejected policies,
 and do not compile fixture or product crates or create Cargo target directories.
+
+## Offline release authentication
+
+`release-auth` pins Sigstore 0.15.1 with default features disabled and only
+its AWS-LC crypto provider enabled. Runtime TUF, signing and online clients
+are absent from this verifier's feature graph. The embedded production roots
+and public interoperability fixtures have provenance in
+[`crates/release-auth/README.md`](../crates/release-auth/README.md).
+
+AWS-LC adds a native C build through `aws-lc-sys`; its complete upstream
+license and notices are retained in [`licenses/aws-lc.txt`](licenses/aws-lc.txt),
+with the Rust wrapper's license in [`licenses/aws-lc-rs.txt`](licenses/aws-lc-rs.txt).
+Sigstore's Apache-2.0 license accompanies the roots and fixtures. These notices
+must accompany distributions containing this code. Native qualification runs
+real offline crypto fixtures on the four shipping client targets, keeps static
+musl linkage checks, and remaps native C source paths as well as Rust paths.

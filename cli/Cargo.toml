@@ -26,6 +26,7 @@ prediction = { path = "../crates/prediction" }
 rand = "0.8"
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
 render = { path = "../crates/render" }
+release-auth = { path = "../crates/release-auth" }
 sha1 = "0.10"
 sha2 = "0.10"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-webpki-roots"] }
@@ -96,6 +97,8 @@ assets = [
     ["../README.md", "usr/share/doc/qsh/README.md", "644"],
     ["../CHANGELOG.md", "usr/share/doc/qsh/CHANGELOG.md", "644"],
     ["../docs/licenses/openssl.txt", "usr/share/doc/qsh/LICENSE-OPENSSL.txt", "644"],
+    ["../docs/licenses/aws-lc-rs.txt", "usr/share/doc/qsh/LICENSE-AWS-LC-RS.txt", "644"],
+    ["../docs/licenses/aws-lc.txt", "usr/share/doc/qsh/LICENSE-AWS-LC.txt", "644"],
 ]
 
 # The server package. `cargo deb -p qsh --variant qshd --no-build` builds it;
@@ -145,6 +148,8 @@ assets = [
     { source = "../CHANGELOG.md", dest = "/usr/share/doc/qsh/CHANGELOG.md", mode = "644", doc = true },
     { source = "../LICENSE", dest = "/usr/share/doc/qsh/LICENSE", mode = "644", doc = true },
     { source = "../docs/licenses/openssl.txt", dest = "/usr/share/doc/qsh/LICENSE-OPENSSL.txt", mode = "644", doc = true },
+    { source = "../docs/licenses/aws-lc-rs.txt", dest = "/usr/share/doc/qsh/LICENSE-AWS-LC-RS.txt", mode = "644", doc = true },
+    { source = "../docs/licenses/aws-lc.txt", dest = "/usr/share/doc/qsh/LICENSE-AWS-LC.txt", mode = "644", doc = true },
 ]
 
 # The server package: `cargo generate-rpm -p cli --variant qshd`. The flag is

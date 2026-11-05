@@ -114,4 +114,4 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', workflow)
         self.assertIn('python3 scripts/released-peer-acceptance.py --evidence', workflow)
         release = (SCRIPT.parents[1] / '.github/workflows/release.yml').read_text()
-        self.assertRegex(release, r'needs: \[release, ordinary-ci, released-peer-acceptance\]')
+        self.assertRegex(release, r'needs: \[release, ordinary-ci, released-peer-acceptance, release-verifier\]')

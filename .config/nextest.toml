@@ -14,3 +14,8 @@ daemon-ports = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = '(package(qsh) | package(qshd) | package(bringup)) & kind(test)'
 test-group = 'daemon-ports'
+
+# The moved private CLI fixtures still select real daemon ports.
+[[profile.default.overrides]]
+filter = 'package(qsh) & kind(lib) & test(/install_fixture_tests::/)'
+test-group = 'daemon-ports'

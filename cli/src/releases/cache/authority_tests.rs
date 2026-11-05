@@ -251,9 +251,9 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
         let cancel = knock::Cancel::new();
         let budget = Budget::new(Duration::from_secs(5), &cancel);
         let (bytes, sha, image) = fixture_archive(b"original", &budget);
-        let cache = Cache::open(&root, &request(), &budget).ok().unwrap();
+        let cache = Cache::open_test(&root, &request(), &budget).ok().unwrap();
         cache
-            .publish(&request(), &bytes, &sha, &image, &budget)
+            .publish_test(&request(), &bytes, &sha, &image, &budget)
             .ok()
             .unwrap();
         let generation = root
@@ -281,12 +281,12 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
         }));
         if boundary < 2 {
             assert!(cache
-                .load(&request(), None, &budget, Duration::from_secs(5))
+                .load_test(&request(), &budget, Duration::from_secs(5))
                 .unwrap()
                 .is_none());
         } else {
             assert!(cache
-                .publish(&request(), &bytes, &sha, &image, &budget)
+                .publish_test(&request(), &bytes, &sha, &image, &budget)
                 .is_err());
         }
         assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
@@ -303,17 +303,17 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
         let cancel = knock::Cancel::new();
         let budget = Budget::new(Duration::from_secs(5), &cancel);
         let (bytes, sha, image) = fixture_archive(b"required authority", &budget);
-        let cache = Cache::open(&root, &request(), &budget).ok().unwrap();
+        let cache = Cache::open_test(&root, &request(), &budget).ok().unwrap();
         cache
-            .publish(&request(), &bytes, &sha, &image, &budget)
+            .publish_test(&request(), &bytes, &sha, &image, &budget)
             .ok()
             .unwrap();
         let target = root.join("releases/0.4.0/x86_64-unknown-linux-musl");
         let protected = if replace_root {
             let other = owner.path().join("other");
-            let replacement = Cache::open(&other, &request(), &budget).ok().unwrap();
+            let replacement = Cache::open_test(&other, &request(), &budget).ok().unwrap();
             replacement
-                .publish(&request(), &bytes, &sha, &image, &budget)
+                .publish_test(&request(), &bytes, &sha, &image, &budget)
                 .ok()
                 .unwrap();
             drop(replacement);
@@ -329,11 +329,11 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
         };
         let original = std::fs::read(&protected).unwrap();
         assert!(cache
-            .load(&request(), None, &budget, Duration::from_secs(5))
+            .load_test(&request(), &budget, Duration::from_secs(5))
             .unwrap()
             .is_none());
         assert!(cache
-            .publish(&request(), &bytes, &sha, &image, &budget)
+            .publish_test(&request(), &bytes, &sha, &image, &budget)
             .is_err());
         assert_eq!(std::fs::read(protected).unwrap(), original);
     }
@@ -342,9 +342,11 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
     let budget = Budget::new(Duration::from_secs(5), &cancel);
     let (bytes, sha, image) =
         fixture_archive(b"verified archive survives optional image refusal", &budget);
-    let cache = Cache::open(root.path(), &request(), &budget).ok().unwrap();
+    let cache = Cache::open_test(root.path(), &request(), &budget)
+        .ok()
+        .unwrap();
     cache
-        .publish(&request(), &bytes, &sha, &image, &budget)
+        .publish_test(&request(), &bytes, &sha, &image, &budget)
         .ok()
         .unwrap();
     let generation = root
@@ -356,7 +358,7 @@ fn cache_authority_substitution_refuses_read_and_mutation() {
     std::fs::remove_file(generation.join("image")).unwrap();
     symlink(&sentinel, generation.join("image")).unwrap();
     let recovered = cache
-        .load(&request(), None, &budget, Duration::from_secs(5))
+        .load_test(&request(), &budget, Duration::from_secs(5))
         .unwrap()
         .unwrap();
     assert_eq!(recovered.bytes, image.bytes);
@@ -376,10 +378,12 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
     let root = private_root();
     let cancel = knock::Cancel::new();
     let budget = Budget::new(Duration::from_secs(5), &cancel);
-    let cache = Cache::open(root.path(), &request(), &budget).ok().unwrap();
+    let cache = Cache::open_test(root.path(), &request(), &budget)
+        .ok()
+        .unwrap();
     let (old, old_sha, old_image) = fixture_archive(b"old", &budget);
     cache
-        .publish(&request(), &old, &old_sha, &old_image, &budget)
+        .publish_test(&request(), &old, &old_sha, &old_image, &budget)
         .ok()
         .unwrap();
     let target = root.path().join("releases/0.4.0/x86_64-unknown-linux-musl");
@@ -403,7 +407,13 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
     *cache.hook.borrow_mut() = Some(Box::new(move |phase| {
         if matches!(phase, Phase::BeforePointerRename) {
             assert_eq!(std::fs::read(&current).unwrap(), expected);
-            for file in ["archive", "image", "receipt.json"] {
+            for file in [
+                "archive",
+                "image",
+                "receipt.json",
+                "SHA256SUMS",
+                "SHA256SUMS.sigstore.json",
+            ] {
                 assert!(complete.join(file).is_file());
             }
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -412,7 +422,7 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
         }
     }));
     assert!(cache
-        .publish(&request(), &new, &sha, &image, &budget)
+        .publish_test(&request(), &new, &sha, &image, &budget)
         .is_err());
     assert!(recorded.load(std::sync::atomic::Ordering::SeqCst));
     assert!(pointer.is_dir());
@@ -428,9 +438,9 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
         for before_pointer in [false, true] {
             let owner = private_root();
             let root = owner.path().join("cache");
-            let cache = Cache::open(&root, &request(), &budget).ok().unwrap();
+            let cache = Cache::open_test(&root, &request(), &budget).ok().unwrap();
             cache
-                .publish(&request(), &old, &old_sha, &old_image, &budget)
+                .publish_test(&request(), &old, &old_sha, &old_image, &budget)
                 .ok()
                 .unwrap();
             let target = root.join("releases/0.4.0/x86_64-unknown-linux-musl");
@@ -465,7 +475,7 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
                         .unwrap();
                 }
             }));
-            let result = cache.publish(&request(), bytes, digest, expected_image, &budget);
+            let result = cache.publish_test(&request(), bytes, digest, expected_image, &budget);
             assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
             assert!(result.is_err(), "replacement after generation commit must refuse pointer publication: existing={existing}, before_pointer={before_pointer}");
             assert_eq!(std::fs::read(&pointer).unwrap(), pointer_before);
@@ -477,7 +487,13 @@ fn cache_authority_publication_keeps_one_lock_and_pointer_last() {
                 std::fs::read(generation.join("sentinel")).unwrap(),
                 b"replacement generation"
             );
-            for name in ["archive", "image", "receipt.json"] {
+            for name in [
+                "archive",
+                "image",
+                "receipt.json",
+                "SHA256SUMS",
+                "SHA256SUMS.sigstore.json",
+            ] {
                 assert!(retained.join(name).is_file());
             }
         }
@@ -490,7 +506,9 @@ fn cache_authority_cleanup_never_removes_replacements() {
     let root = private_root();
     let cancel = knock::Cancel::new();
     let budget = Budget::new(Duration::from_secs(5), &cancel);
-    let cache = Cache::open(root.path(), &request(), &budget).ok().unwrap();
+    let cache = Cache::open_test(root.path(), &request(), &budget)
+        .ok()
+        .unwrap();
     let (bytes, sha, image) = fixture_archive(b"owned stage", &budget);
     let objects = root
         .path()
@@ -509,7 +527,7 @@ fn cache_authority_cleanup_never_removes_replacements() {
         }
     }));
     assert!(cache
-        .publish(&request(), &bytes, &sha, &image, &budget)
+        .publish_test(&request(), &bytes, &sha, &image, &budget)
         .is_err());
     let replacement = replacement
         .lock()
@@ -558,5 +576,105 @@ fn cache_group_write_and_sticky_boundaries_preserve_authority() {
         if !allowed {
             assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
         }
+    }
+}
+
+#[test]
+fn both_evidence_read_tokens_survive_until_return_and_repair() {
+    use super::super::{Cache, Phase};
+    for name in ["SHA256SUMS", "SHA256SUMS.sigstore.json"] {
+        for before_repair in [false, true] {
+            let root = private_root();
+            let cancel = knock::Cancel::new();
+            let budget = Budget::new(Duration::from_secs(5), &cancel);
+            let (bytes, sha, image) = fixture_archive(b"original", &budget);
+            let cache = Cache::open_test(root.path(), &request(), &budget)
+                .ok()
+                .unwrap();
+            cache
+                .publish_test(&request(), &bytes, &sha, &image, &budget)
+                .ok()
+                .unwrap();
+            let generation = root
+                .path()
+                .join("releases/0.4.0/x86_64-unknown-linux-musl/objects")
+                .join(super::super::archive::hex(&sha));
+            std::fs::remove_file(generation.join("image")).unwrap();
+            let path = generation.join(name);
+            let original = std::fs::read(&path).unwrap();
+            let replacement = path.clone();
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = fired.clone();
+            *cache.hook.borrow_mut() = Some(Box::new(move |phase| {
+                if (if before_repair {
+                    matches!(phase, Phase::BeforeRepair)
+                } else {
+                    matches!(phase, Phase::AfterImageRead)
+                }) && !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::fs::rename(&replacement, replacement.with_extension("retained")).unwrap();
+                    std::fs::write(&replacement, &original).unwrap();
+                }
+            }));
+            assert!(cache
+                .load_test(&request(), &budget, Duration::from_secs(5))
+                .unwrap()
+                .is_none());
+            assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                !generation.join("image").exists(),
+                "substitution forbids repair"
+            );
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                std::fs::read(generation.join(name).with_extension("retained")).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn image_repair_replaces_the_named_receipt_without_losing_evidence_tokens() {
+    use super::super::Cache;
+    let root = private_root();
+    let cancel = knock::Cancel::new();
+    let budget = Budget::new(Duration::from_secs(5), &cancel);
+    let (bytes, sha, image) = fixture_archive(b"repaired", &budget);
+    let cache = Cache::open_test(root.path(), &request(), &budget)
+        .ok()
+        .unwrap();
+    cache
+        .publish_test(&request(), &bytes, &sha, &image, &budget)
+        .ok()
+        .unwrap();
+    let generation = root
+        .path()
+        .join("releases/0.4.0/x86_64-unknown-linux-musl/objects")
+        .join(super::super::archive::hex(&sha));
+    let evidence: Vec<_> = ["SHA256SUMS", "SHA256SUMS.sigstore.json"]
+        .into_iter()
+        .map(|name| {
+            (
+                generation.join(name),
+                std::fs::metadata(generation.join(name)).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(generation.join("image"), b"broken").unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            cache
+                .load_test(&request(), &budget, Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .bytes,
+            image.bytes
+        );
+    }
+    for (path, old) in evidence {
+        assert!(
+            same(&old, &std::fs::metadata(path).unwrap()),
+            "repair retains evidence identities"
+        );
     }
 }

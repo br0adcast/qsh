@@ -31,26 +31,6 @@ pub(super) fn parse_hash(text: &str) -> Option<[u8; 32]> {
     Some(hash)
 }
 
-pub(super) fn expected_hash(sums: &[u8], name: &str) -> Result<[u8; 32], ImageError> {
-    let text = std::str::from_utf8(sums).map_err(|_| ImageError::Checksum)?;
-    let mut result = None;
-    for line in text.lines() {
-        let Some((hash, file)) = line.split_once(' ') else {
-            continue;
-        };
-        let Some(file) = file.strip_prefix(' ').or_else(|| file.strip_prefix('*')) else {
-            continue;
-        };
-        if file == name {
-            if result.is_some() {
-                return Err(ImageError::Checksum);
-            }
-            result = Some(parse_hash(hash).ok_or(ImageError::Checksum)?);
-        }
-    }
-    result.ok_or(ImageError::Checksum)
-}
-
 pub(super) fn verified_image(
     request: &ImageRequest,
     bytes: &[u8],

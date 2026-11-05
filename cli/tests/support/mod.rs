@@ -54,76 +54,24 @@ pub fn wait_until(mut probe: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Where `qshd` should be, and builds it if it is not there yet.
-///
-/// Deviates from a plain `env!("CARGO_BIN_EXE_qshd")`: that macro only
-/// exists for binaries of the package under test, and `qshd` is a binary of
-/// the `qshd` package (the crate that happens to live in the `qshd/`
-/// directory), not of `qsh` -- using it here would not compile. `qsh` and
-/// `qshd` still land in the same target directory (this workspace does not
-/// give each member its own), so the fix is to look for `qshd` beside the
-/// `qsh` binary this test was built with, and build it on demand if it is
-/// missing.
-///
-/// That happens under `cargo test -p qsh`: cargo only builds targets that
-/// belong to the selected package, and `qshd` is not one of them. Under
-/// `cargo test --workspace`, the `qshd` package is built as part of the
-/// workspace and `qshd` is already there, so the on-demand build is a no-op
-/// check.
+/// The exact daemon artifact supplied by the owning runner's Cargo JSON.
+/// Tests never discover a stale sibling binary or launch nested Cargo builds.
 pub fn qshd_path() -> PathBuf {
-    let qsh_bin = PathBuf::from(env!("CARGO_BIN_EXE_qsh"));
-    let bin_dir = qsh_bin
-        .parent()
-        .expect("the qsh binary path has a parent directory")
-        .to_path_buf();
-    let candidate = bin_dir.join("qshd");
-    if candidate.is_file() {
-        return candidate;
-    }
+    let path = PathBuf::from(std::env::var_os("QSH_TEST_QSHD").expect(
+        "QSH_TEST_QSHD must name the exact daemon artifact from the owned Cargo JSON build",
+    ));
+    validate_test_daemon(&path);
+    path
+}
 
-    // Build it now, into the very directory `qsh` itself came from: the
-    // parent of `bin_dir` is the shared target directory, and `bin_dir`'s own
-    // name (`debug` or `release`) says which profile to match so the two
-    // binaries end up side by side.
-    let target_dir = bin_dir
-        .parent()
-        .expect("the target profile directory has a parent (the target directory itself)");
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("`cli` is a direct child of the workspace root");
-
-    // The package living in the `qshd/` directory is named `qshd` in its own
-    // `Cargo.toml` (`[package] name = "qshd"`), so `-p qshd` is the specifier
-    // that selects it for this on-demand build.
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut build = Command::new(&cargo);
-    build
-        .args(["build", "-p", "qshd", "--bin", "qshd", "--target-dir"])
-        .arg(target_dir)
-        .current_dir(workspace_root);
-    if bin_dir.file_name().and_then(|n| n.to_str()) == Some("release") {
-        build.arg("--release");
-    }
-
-    let output = build.output().expect("run cargo to build qshd");
-    if !output.status.success() {
-        panic!(
-            "building qshd on demand failed (status {:?}).\nstdout:\n{}\nstderr:\n{}\n\
-             Run `cargo build -p qshd --bin qshd` yourself and re-run this test.",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-
-    if !candidate.is_file() {
-        panic!(
-            "qshd is still missing at {} after building it. \
-             Run `cargo build -p qshd --bin qshd` yourself and re-run this test.",
-            candidate.display()
-        );
-    }
-    candidate
+fn validate_test_daemon(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    assert!(
+        path.is_absolute()
+            && path.is_file()
+            && std::fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0,
+        "the test daemon must be an absolute executable file from the owned Cargo JSON build"
+    );
 }
 
 pub struct Daemon {
@@ -448,6 +396,42 @@ pub fn spawn_qsh_os_at(
     cols: u16,
     rows: u16,
 ) -> (Client, std::os::fd::OwnedFd) {
+    // This helper is also compiled into library fixtures, where Cargo does not
+    // provide the integration-only variable. Explicit-command callers bypass it.
+    let binary = match option_env!("CARGO_BIN_EXE_qsh") {
+        Some(binary) => binary,
+        None => {
+            panic!("the default PTY wrapper requires Cargo's production qsh integration artifact")
+        }
+    };
+    let mut command = Command::new(binary);
+    if let Some(argv0) = argv0 {
+        command.arg0(argv0);
+    }
+    command.args(args).env_remove("QSH_INSTALL_FIXTURE_RECORD");
+    spawn_on(command, config_home, cols, rows)
+}
+
+/// Reuse the controlling PTY lifecycle with an explicit private test command
+/// and the exact daemon artifact selected by its owning runner.
+pub fn spawn_command_on(
+    mut command: Command,
+    config_home: &Path,
+    daemon: &Path,
+    cols: u16,
+    rows: u16,
+) -> (Client, std::os::fd::OwnedFd) {
+    validate_test_daemon(daemon);
+    command.env("QSH_TEST_QSHD", daemon);
+    spawn_on(command, config_home, cols, rows)
+}
+
+fn spawn_on(
+    mut command: Command,
+    config_home: &Path,
+    cols: u16,
+    rows: u16,
+) -> (Client, std::os::fd::OwnedFd) {
     let pty = nix::pty::openpty(
         Some(&nix::pty::Winsize {
             ws_row: rows,
@@ -476,19 +460,14 @@ pub fn spawn_qsh_os_at(
     );
 
     let slave = pty.slave;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_qsh"));
-    if let Some(argv0) = argv0 {
-        command.arg0(argv0);
-    }
     command
-        .args(args)
         .env_remove("SSH_AUTH_SOCK")
         .env("HOME", config_home)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_CACHE_HOME", config_home)
         .env("TERM", "xterm-256color")
         .env("HISTFILE", "/dev/null")
-        // Release checks must fail locally so seeded offline caches are used.
+        // Force local metadata outage; unsigned seeds remain deliberate refusal bait.
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
         .env("https_proxy", "http://127.0.0.1:1")
         .env("NO_PROXY", "")

@@ -156,12 +156,12 @@
       "owner": "CI container job: run_suite lib qshd"
     },
     {
-      "binary": "qsh::release_cache_authority_privilege",
+      "binary": "qsh",
       "tests": [
-        "release_cache_root_readonly_and_foreign_owner_boundaries"
+        "releases::cache::privilege_tests::release_cache_root_readonly_and_foreign_owner_boundaries"
       ],
       "reason": "Requires disposable root self-exec children for real root-readonly and foreign-owner cache authority",
-      "owner": "CI container job: run_suite test release_cache_authority_privilege"
+      "owner": "CI container job: exact qsh library cache privilege fixture"
     },
     {
       "binary": "sshauth::qsh_pin_authority_privilege",
