@@ -1,5 +1,474 @@
 //! Source-bound compatibility fixtures. The six connected tests exist only in
 //! the explicit Darwin fixture build; host controls never count as native runs.
+use super::{Class, Classified, Failure, Identity};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) enum ReplacementActorRole {
+    ModernSessionLeader,
+    KeeperForegroundApplication,
+}
+impl ReplacementActorRole {
+    pub(super) fn token(self) -> &'static str {
+        match self {
+            Self::ModernSessionLeader => "modern",
+            Self::KeeperForegroundApplication => "keeper",
+        }
+    }
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "modern" => Some(Self::ModernSessionLeader),
+            "keeper" => Some(Self::KeeperForegroundApplication),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplacementTopology {
+    pub application: Identity,
+    pub session: Identity,
+    pub sid: i32,
+    pub group: i32,
+    pub foreground: i32,
+    pub tty: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplacementActorReport {
+    pub role: ReplacementActorRole,
+    pub topology: ReplacementTopology,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReplacementActorError {
+    Grammar,
+    Identity,
+    Topology,
+    Binding,
+}
+fn canonical_number(value: &str) -> Result<u64, ReplacementActorError> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(ReplacementActorError::Grammar);
+    }
+    value.parse().map_err(|_| ReplacementActorError::Grammar)
+}
+fn parse_identity(value: &str) -> Result<Identity, ReplacementActorError> {
+    let fields: Vec<_> = value.split(':').collect();
+    if fields.len() != 3 {
+        return Err(ReplacementActorError::Grammar);
+    }
+    let id = Identity {
+        pid: i32::try_from(canonical_number(fields[0])?)
+            .map_err(|_| ReplacementActorError::Identity)?,
+        unique: canonical_number(fields[1])?,
+        version: u32::try_from(canonical_number(fields[2])?)
+            .map_err(|_| ReplacementActorError::Identity)?,
+    };
+    if !id.valid() {
+        return Err(ReplacementActorError::Identity);
+    }
+    Ok(id)
+}
+pub(super) fn valid_replacement_nonce(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn report_fields<'a>(
+    bytes: &'a [u8],
+    nonce: &str,
+    prefix: &str,
+    count: usize,
+) -> Result<Vec<&'a str>, ReplacementActorError> {
+    if bytes.len() > 1024 || !valid_replacement_nonce(nonce) {
+        return Err(ReplacementActorError::Grammar);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| ReplacementActorError::Grammar)?;
+    let line = text
+        .strip_suffix('\n')
+        .ok_or(ReplacementActorError::Grammar)?;
+    let fields: Vec<_> = line.split(' ').collect();
+    if fields.len() != count
+        || fields[0] != prefix
+        || fields[1].strip_prefix("nonce=") != Some(nonce)
+    {
+        return Err(ReplacementActorError::Grammar);
+    }
+    Ok(fields)
+}
+fn field<'a>(value: &'a str, key: &str) -> Result<&'a str, ReplacementActorError> {
+    value
+        .strip_prefix(key)
+        .ok_or(ReplacementActorError::Grammar)
+}
+fn pid(value: &str) -> Result<i32, ReplacementActorError> {
+    let n = i32::try_from(canonical_number(value)?).map_err(|_| ReplacementActorError::Identity)?;
+    if n <= 0 {
+        return Err(ReplacementActorError::Identity);
+    }
+    Ok(n)
+}
+pub(super) fn parse_replacement_actor_report(
+    bytes: &[u8],
+    nonce: &str,
+) -> Result<ReplacementActorReport, ReplacementActorError> {
+    let f = report_fields(bytes, nonce, "qsh223-actor-v1", 9)?;
+    Ok(ReplacementActorReport {
+        role: ReplacementActorRole::parse(field(f[2], "role=")?)
+            .ok_or(ReplacementActorError::Grammar)?,
+        topology: ReplacementTopology {
+            application: parse_identity(field(f[3], "a=")?)?,
+            session: parse_identity(field(f[4], "s=")?)?,
+            sid: pid(field(f[5], "sid=")?)?,
+            group: pid(field(f[6], "pgrp=")?)?,
+            foreground: pid(field(f[7], "fg=")?)?,
+            tty: match field(f[8], "tty=")? {
+                "0" => false,
+                "1" => true,
+                _ => return Err(ReplacementActorError::Grammar),
+            },
+        },
+    })
+}
+pub(super) fn validate_replacement_topology(
+    expected: ReplacementActorRole,
+    report: &ReplacementActorReport,
+) -> Result<(), ReplacementActorError> {
+    let t = report.topology;
+    if report.role != expected || !t.application.valid() || !t.session.valid() {
+        return Err(ReplacementActorError::Identity);
+    }
+    if !t.tty
+        || t.sid != t.session.pid
+        || t.group != t.application.pid
+        || t.foreground != t.application.pid
+    {
+        return Err(ReplacementActorError::Topology);
+    }
+    match expected {
+        ReplacementActorRole::ModernSessionLeader if t.application != t.session => {
+            return Err(ReplacementActorError::Topology)
+        }
+        ReplacementActorRole::KeeperForegroundApplication
+            if t.application.pid == t.session.pid || t.application.unique == t.session.unique =>
+        {
+            return Err(ReplacementActorError::Topology)
+        }
+        _ => {}
+    }
+    Ok(())
+}
+pub(super) fn validate_replacement_binding(
+    expected: Identity,
+    actual: Classified,
+    sid: i32,
+    group: i32,
+    expected_group: i32,
+) -> Result<(), ReplacementActorError> {
+    if expected != actual.identity || actual.class != Class::Session(sid) || group != expected_group
+    {
+        return Err(ReplacementActorError::Binding);
+    }
+    Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplacementDescendantReport {
+    pub identity: Identity,
+    pub sid: i32,
+    pub group: i32,
+}
+pub(super) fn parse_replacement_descendant_report(
+    bytes: &[u8],
+    nonce: &str,
+) -> Result<ReplacementDescendantReport, ReplacementActorError> {
+    let f = report_fields(bytes, nonce, "qsh223-desc-v1", 5)?;
+    Ok(ReplacementDescendantReport {
+        identity: parse_identity(field(f[2], "d=")?)?,
+        sid: pid(field(f[3], "sid=")?)?,
+        group: pid(field(f[4], "pgrp=")?)?,
+    })
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) enum ReplacementActorStage {
+    Entry,
+    Sampled,
+    Accepted,
+    Refused,
+    DescendantPublished,
+}
+impl ReplacementActorStage {
+    pub(super) fn token(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::Sampled => "sampled",
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::DescendantPublished => "descendant",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct ReplacementActorProjection {
+    pub role: ReplacementActorRole,
+    pub stage: ReplacementActorStage,
+}
+pub(super) fn parse_replacement_stage(
+    bytes: &[u8],
+    nonce: &str,
+) -> Result<ReplacementActorProjection, ReplacementActorError> {
+    let f = report_fields(bytes, nonce, "qsh223-stage-v1", 4)?;
+    let role =
+        ReplacementActorRole::parse(field(f[2], "role=")?).ok_or(ReplacementActorError::Grammar)?;
+    let stage = match field(f[3], "stage=")? {
+        "entry" => ReplacementActorStage::Entry,
+        "sampled" => ReplacementActorStage::Sampled,
+        "accepted" => ReplacementActorStage::Accepted,
+        "refused" => ReplacementActorStage::Refused,
+        "descendant" => ReplacementActorStage::DescendantPublished,
+        _ => return Err(ReplacementActorError::Grammar),
+    };
+    Ok(ReplacementActorProjection { role, stage })
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(super) struct ReplacementTerminal {
+    pub stream: u8,
+    pub code: i32,
+}
+pub(super) fn replacement_terminal(
+    records: &[transport::channel::ServerRecord],
+) -> Option<ReplacementTerminal> {
+    use transport::channel::{ServerRecord, FIRST_CHANNEL_STREAM};
+    if records.len() > 256 {
+        return None;
+    }
+    let mut terminal = None;
+    for record in records {
+        if let ServerRecord::Exit { stream, code } = record {
+            if *stream == FIRST_CHANNEL_STREAM {
+                if terminal.is_some() {
+                    return None;
+                }
+                terminal = Some(ReplacementTerminal {
+                    stream: *stream,
+                    code: *code,
+                });
+            }
+        }
+    }
+    terminal
+}
+
+pub(super) fn replacement_identity_absent(
+    expected: Identity,
+    observed: Result<Identity, Failure>,
+) -> bool {
+    match observed {
+        Ok(current) => current.pid == expected.pid && current.unique != expected.unique,
+        Err(Failure::Errno(number)) if number == nix::libc::ESRCH => true,
+        _ => false,
+    }
+}
+#[test]
+fn keeper_replacement_absence_requires_positive_kernel_evidence() {
+    let id = Identity {
+        pid: 41,
+        unique: 410,
+        version: 0,
+    };
+    assert!(!replacement_identity_absent(id, Ok(id)));
+    assert!(!replacement_identity_absent(
+        id,
+        Ok(Identity { version: 1, ..id })
+    ));
+    assert!(!replacement_identity_absent(
+        id,
+        Ok(Identity {
+            pid: 42,
+            unique: 411,
+            ..id
+        })
+    ));
+    assert!(replacement_identity_absent(
+        id,
+        Ok(Identity { unique: 411, ..id })
+    ));
+    assert!(replacement_identity_absent(
+        id,
+        Err(Failure::Errno(nix::libc::ESRCH))
+    ));
+    for error in [
+        Failure::Errno(nix::libc::EIO),
+        Failure::Errno(nix::libc::EACCES),
+        Failure::Invalid,
+        Failure::LostBinding,
+    ] {
+        assert!(!replacement_identity_absent(id, Err(error)));
+    }
+}
+#[test]
+fn keeper_replacement_topology_preserves_modern_and_accepts_keeper() {
+    use ReplacementActorRole::*;
+    let a = Identity {
+        pid: 41,
+        unique: 410,
+        version: 0,
+    };
+    let s = Identity {
+        pid: 31,
+        unique: 310,
+        version: 2,
+    };
+    let mut report = ReplacementActorReport {
+        role: KeeperForegroundApplication,
+        topology: ReplacementTopology {
+            application: a,
+            session: s,
+            sid: 31,
+            group: 41,
+            foreground: 41,
+            tty: true,
+        },
+    };
+    assert_ne!(
+        report.topology.sid, report.topology.application.pid,
+        "old actor predicate must reject real keeper topology"
+    );
+    assert_eq!(
+        validate_replacement_topology(KeeperForegroundApplication, &report),
+        Ok(())
+    );
+    assert!(validate_replacement_topology(ModernSessionLeader, &report).is_err());
+    for field in [0, 1, 2, 3, 4] {
+        let mut bad = report;
+        match field {
+            0 => bad.topology.group = 31,
+            1 => bad.topology.foreground = 31,
+            2 => bad.topology.tty = false,
+            3 => {
+                bad.topology.application = s;
+                bad.topology.group = s.pid;
+                bad.topology.foreground = s.pid;
+            }
+            _ => bad.role = ModernSessionLeader,
+        };
+        assert!(validate_replacement_topology(KeeperForegroundApplication, &bad).is_err());
+    }
+    report.role = ModernSessionLeader;
+    report.topology.session = a;
+    report.topology.sid = 41;
+    assert_eq!(
+        validate_replacement_topology(ModernSessionLeader, &report),
+        Ok(())
+    );
+    assert!(validate_replacement_topology(KeeperForegroundApplication, &report).is_err());
+    assert_eq!(
+        ReplacementActorRole::parse(ModernSessionLeader.token()),
+        Some(ModernSessionLeader)
+    );
+}
+#[test]
+fn keeper_replacement_controller_rejects_sid_as_application_and_kernel_drift() {
+    let a = Identity {
+        pid: 41,
+        unique: 410,
+        version: 0,
+    };
+    let actual = Classified {
+        identity: a,
+        class: Class::Session(31),
+    };
+    assert_eq!(validate_replacement_binding(a, actual, 31, 41, 41), Ok(()));
+    for bad in [
+        Identity { pid: 31, ..a },
+        Identity { unique: 411, ..a },
+        Identity { version: 1, ..a },
+    ] {
+        assert!(validate_replacement_binding(bad, actual, 31, 41, 41).is_err());
+    }
+    assert!(validate_replacement_binding(a, actual, 41, 41, 41).is_err());
+    assert!(validate_replacement_binding(a, actual, 31, 31, 41).is_err());
+}
+#[test]
+fn keeper_replacement_reports_are_strict_nonce_bound_and_bounded() {
+    let nonce = "a".repeat(32);
+    let line=format!("qsh223-actor-v1 nonce={nonce} role=keeper a=41:410:0 s=31:310:2 sid=31 pgrp=41 fg=41 tty=1\n");
+    assert!(parse_replacement_actor_report(line.as_bytes(), &nonce).is_ok());
+    for bad in [
+        line.trim_end().to_owned(),
+        format!("{line}\n"),
+        line.replace("a=41", "a=041"),
+        line.replace("410:0", "0:0"),
+        line.replace("31:310:2", "31:310:4294967296"),
+        line.replace("tty=1", "tty=true"),
+        line.replace("role=keeper", "role=PRIVATE_CANARY"),
+        line.replace(" fg=41", " fg=41 fg=41"),
+        "x".repeat(1025),
+    ] {
+        assert!(parse_replacement_actor_report(bad.as_bytes(), &nonce).is_err());
+    }
+    assert!(parse_replacement_actor_report(line.as_bytes(), &"b".repeat(32)).is_err());
+    let d = format!("qsh223-desc-v1 nonce={nonce} d=51:510:0 sid=31 pgrp=51\n");
+    assert_eq!(
+        parse_replacement_descendant_report(d.as_bytes(), &nonce)
+            .unwrap()
+            .group,
+        51
+    );
+    assert!(
+        parse_replacement_descendant_report(d.replace("d=51", "d=0").as_bytes(), &nonce).is_err()
+    );
+}
+#[test]
+fn keeper_replacement_stage_and_numeric_terminal_projection_are_closed() {
+    let nonce = "a".repeat(32);
+    for stage in [
+        ReplacementActorStage::Entry,
+        ReplacementActorStage::Sampled,
+        ReplacementActorStage::Accepted,
+        ReplacementActorStage::Refused,
+        ReplacementActorStage::DescendantPublished,
+    ] {
+        let line = format!(
+            "qsh223-stage-v1 nonce={nonce} role=keeper stage={}\n",
+            stage.token()
+        );
+        assert_eq!(
+            parse_replacement_stage(line.as_bytes(), &nonce)
+                .unwrap()
+                .stage,
+            stage
+        );
+        assert!(parse_replacement_stage(line.as_bytes(), &"b".repeat(32)).is_err());
+        assert!(
+            parse_replacement_stage(format!("{line}PRIVATE_CANARY").as_bytes(), &nonce).is_err()
+        );
+    }
+    use transport::channel::{ServerRecord, FIRST_CHANNEL_STREAM};
+    let records = [ServerRecord::Exit {
+        stream: FIRST_CHANNEL_STREAM,
+        code: 101,
+    }];
+    assert_eq!(
+        replacement_terminal(&records),
+        Some(ReplacementTerminal {
+            stream: FIRST_CHANNEL_STREAM,
+            code: 101
+        })
+    );
+    assert!(replacement_terminal(&[]).is_none());
+    assert!(replacement_terminal(&[records[0].clone(), records[0].clone()]).is_none());
+    let bytes = serde_json::to_vec(
+        &parse_replacement_stage(
+            format!("qsh223-stage-v1 nonce={nonce} role=keeper stage=refused\n").as_bytes(),
+            &nonce,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!String::from_utf8(bytes).unwrap().contains(&nonce));
+}
+
 pub(super) fn route_images(bytes: &[u8]) -> Option<Vec<String>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut images = Vec::new();

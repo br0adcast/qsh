@@ -8,6 +8,195 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use transport::channel_server::ChildStatus;
 
+use super::keeper_integration_tests::{
+    parse_replacement_actor_report, parse_replacement_descendant_report, parse_replacement_stage,
+    replacement_terminal, valid_replacement_nonce, validate_replacement_binding,
+    validate_replacement_topology, ReplacementActorProjection, ReplacementActorReport,
+    ReplacementActorRole, ReplacementActorStage, ReplacementTopology,
+};
+
+fn replacement_exclusive(directory: &Path, name: &str, bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    assert!(bytes.len() <= 1024);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(directory.join(name))
+        .expect("exclusive replacement fixture record");
+    file.write_all(bytes)
+        .expect("bounded replacement fixture record");
+    drop(file);
+    let ready = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(directory.join(format!("{name}-ready")))
+        .expect("exclusive replacement ready marker");
+    drop(ready);
+}
+fn replacement_private_file(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() > 1024
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(1025).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= 1024).then_some(bytes)
+}
+fn replacement_private_read(directory: &Path, name: &str) -> Option<Vec<u8>> {
+    if !replacement_private_file(&directory.join(format!("{name}-ready")))?.is_empty() {
+        return None;
+    }
+    replacement_private_file(&directory.join(name))
+}
+fn replacement_stage_publish(
+    directory: &Path,
+    nonce: &str,
+    role: ReplacementActorRole,
+    stage: ReplacementActorStage,
+) {
+    assert!(valid_replacement_nonce(nonce));
+    replacement_exclusive(
+        directory,
+        &format!("replacement-stage-{}", stage.token()),
+        format!(
+            "qsh223-stage-v1 nonce={nonce} role={} stage={}\n",
+            role.token(),
+            stage.token()
+        )
+        .as_bytes(),
+    );
+}
+fn replacement_stage_observe(
+    directory: &Path,
+    nonce: Option<&str>,
+) -> Option<ReplacementActorProjection> {
+    let nonce = nonce?;
+    for stage in [
+        ReplacementActorStage::DescendantPublished,
+        ReplacementActorStage::Refused,
+        ReplacementActorStage::Accepted,
+        ReplacementActorStage::Sampled,
+        ReplacementActorStage::Entry,
+    ] {
+        if let Some(raw) =
+            replacement_private_read(directory, &format!("replacement-stage-{}", stage.token()))
+        {
+            let record = parse_replacement_stage(&raw, nonce).ok()?;
+            if record.stage != stage {
+                return None;
+            }
+            return Some(record);
+        }
+    }
+    None
+}
+fn replacement_actor_sample(role: ReplacementActorRole) -> Result<ReplacementActorReport, Failure> {
+    let mut ops = NativeOps;
+    let pid = std::process::id() as i32;
+    let before = ops.identity(pid)?;
+    let sid = unsafe { nix::libc::getsid(0) };
+    if sid <= 0 {
+        return Err(Failure::Invalid);
+    }
+    let session = ops.identity(sid)?;
+    let group = unsafe { nix::libc::getpgrp() };
+    let foreground = unsafe { nix::libc::tcgetpgrp(0) };
+    let tty = unsafe { nix::libc::isatty(0) } == 1;
+    if ops.identity(pid)? != before
+        || ops.identity(sid)? != session
+        || unsafe { nix::libc::getsid(0) } != sid
+        || unsafe { nix::libc::getpgrp() } != group
+        || unsafe { nix::libc::tcgetpgrp(0) } != foreground
+        || (unsafe { nix::libc::isatty(0) } == 1) != tty
+    {
+        return Err(Failure::LostBinding);
+    }
+    Ok(ReplacementActorReport {
+        role,
+        topology: ReplacementTopology {
+            application: before,
+            session,
+            sid,
+            group,
+            foreground,
+            tty,
+        },
+    })
+}
+fn replacement_report_publish(directory: &Path, nonce: &str, report: ReplacementActorReport) {
+    let t = report.topology;
+    let a = t.application;
+    let s = t.session;
+    replacement_exclusive(directory,"replacement-actor",format!("qsh223-actor-v1 nonce={nonce} role={} a={}:{}:{} s={}:{}:{} sid={} pgrp={} fg={} tty={}\n",report.role.token(),a.pid,a.unique,a.version,s.pid,s.unique,s.version,t.sid,t.group,t.foreground,u8::from(t.tty)).as_bytes());
+}
+fn replacement_descendant_publish(directory: &Path, nonce: &str) {
+    assert!(valid_replacement_nonce(nonce));
+    let mut ops = NativeOps;
+    let pid = std::process::id() as i32;
+    let before = ops.identity(pid).unwrap();
+    let sid = unsafe { nix::libc::getsid(0) };
+    let group = unsafe { nix::libc::getpgrp() };
+    assert_eq!(before, ops.identity(pid).unwrap());
+    assert_eq!(unsafe { nix::libc::getsid(0) }, sid);
+    assert_eq!(unsafe { nix::libc::getpgrp() }, group);
+    assert_eq!(group, pid);
+    assert_eq!(ops.keeper_group(before, sid).unwrap(), group);
+    replacement_exclusive(
+        directory,
+        "replacement-descendant",
+        format!(
+            "qsh223-desc-v1 nonce={nonce} d={}:{}:{} sid={sid} pgrp={group}\n",
+            before.pid, before.unique, before.version
+        )
+        .as_bytes(),
+    );
+}
+fn replacement_kernel_binding(
+    identity: Identity,
+    sid: i32,
+    group: i32,
+) -> Result<Classified, Failure> {
+    let mut ops = NativeOps;
+    let actual = ops.classify(identity.pid)?;
+    let observed_group = ops.keeper_group(identity, sid)?;
+    validate_replacement_binding(identity, actual, sid, observed_group, group)
+        .map_err(|_| Failure::LostBinding)?;
+    Ok(actual)
+}
+fn replacement_guard(identity: Classified, sid: i32, cookie: u64) -> DescendantGuard {
+    let mut ops = NativeOps;
+    let token = ops.acquire_signal_token(identity.identity, sid).unwrap();
+    let watch = ops.bind_exit(identity, cookie).unwrap();
+    DescendantGuard {
+        token: token.handle,
+        watch: watch.handle,
+        normal_exit: false,
+    }
+}
+fn replacement_absent(identity: Identity) -> bool {
+    super::keeper_integration_tests::replacement_identity_absent(
+        identity,
+        NativeOps.identity(identity.pid),
+    )
+}
+
 // Retain the actual fixture Child independently of the production wrapper so
 // assertion failure cannot discard it. Rescue is failure-only, never evidence.
 #[derive(Debug)]
@@ -396,9 +585,35 @@ fn darwin223_owned_actor() {
         finish();
         return;
     }
+    let replacement_role = std::env::var("QSH_DARWIN223_REPLACEMENT_ROLE")
+        .ok()
+        .map(|value| ReplacementActorRole::parse(&value).expect("closed replacement actor role"));
+    let replacement_nonce = std::env::var("QSH_DARWIN223_REPLACEMENT_NONCE").ok();
+    if let Some(role) = replacement_role {
+        let nonce = replacement_nonce
+            .as_deref()
+            .filter(|nonce| valid_replacement_nonce(nonce))
+            .expect("private replacement nonce");
+        replacement_stage_publish(&directory, nonce, role, ReplacementActorStage::Entry);
+        let sampled = replacement_actor_sample(role);
+        replacement_stage_publish(&directory, nonce, role, ReplacementActorStage::Sampled);
+        let accepted = match sampled {
+            Ok(report) => {
+                replacement_report_publish(&directory, nonce, report);
+                validate_replacement_topology(role, &report).is_ok()
+            }
+            Err(_) => false,
+        };
+        if !accepted {
+            replacement_stage_publish(&directory, nonce, role, ReplacementActorStage::Refused);
+            panic!("replacement actor topology refused");
+        }
+        replacement_stage_publish(&directory, nonce, role, ReplacementActorStage::Accepted);
+    }
     let stage = std::env::var_os("QSH_DARWIN223_STAGE2").is_some();
     let descendant = std::env::var_os("QSH_DARWIN223_DESCENDANT").is_some();
-    let pty_leader = std::env::var_os("QSH_DARWIN223_PTY_LEADER").is_some();
+    let legacy_pty_leader = std::env::var_os("QSH_DARWIN223_PTY_LEADER").is_some();
+    let pty_leader = legacy_pty_leader || replacement_role.is_some();
     let fork_root = std::env::var_os("QSH_DARWIN223_FORK_ROOT").is_some();
     let foreign_parent = std::env::var_os("QSH_DARWIN223_FOREIGN_PARENT").is_some();
     if descendant {
@@ -406,7 +621,7 @@ fn darwin223_owned_actor() {
     } else if !stage && !pty_leader && !foreign_parent {
         assert!(unsafe { nix::libc::setsid() } > 0);
     }
-    if pty_leader {
+    if legacy_pty_leader {
         assert_eq!(unsafe { nix::libc::getsid(0) }, std::process::id() as i32);
     }
     unsafe {
@@ -499,9 +714,21 @@ fn darwin223_owned_actor() {
                 "--nocapture",
             ])
             .env_remove("QSH_DARWIN223_PTY_LEADER")
+            .env_remove("QSH_DARWIN223_REPLACEMENT_ROLE")
             .env("QSH_DARWIN223_DESCENDANT", "1");
+        if replacement_role.is_some() {
+            command.env("QSH_DARWIN223_REPLACEMENT_DESCENDANT", "1");
+        }
         let mut child = OwnedCommand::spawn(&mut command).unwrap();
         until(|| directory.join("descendant-ready").exists());
+        if let Some(role) = replacement_role {
+            replacement_stage_publish(
+                &directory,
+                replacement_nonce.as_deref().unwrap(),
+                role,
+                ReplacementActorStage::DescendantPublished,
+            );
+        }
         // Do not orphan the fixture until the independent controller owns its
         // exact token/watch. Setup refusal retains a direct-child cleanup path.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -538,6 +765,14 @@ fn darwin223_owned_actor() {
         publish(&directory.join("grandchild-ready"));
     }
     if descendant && !grandchild {
+        if std::env::var_os("QSH_DARWIN223_REPLACEMENT_DESCENDANT").is_some() {
+            replacement_descendant_publish(
+                &directory,
+                replacement_nonce
+                    .as_deref()
+                    .expect("bound descendant nonce"),
+            );
+        }
         publish_bytes(
             &directory.join("descendant-pid"),
             std::process::id().to_string().as_bytes(),
@@ -1435,6 +1670,7 @@ struct ReplacementDiagnostic<'a> {
     progress: &'a std::cell::Cell<ReplacementProgress>,
     events: Option<&'a ConnectedEvents>,
     actor: &'a Path,
+    replacement: Option<(&'a str, ReplacementActorRole)>,
     status_wait: Option<&'a std::cell::Cell<StatusWaitObservation>>,
     update_wait: Option<UpdateWaitSnapshot>,
 }
@@ -1457,6 +1693,7 @@ struct EventFacts {
     restarting: bool,
     exit0: bool,
     exitother: bool,
+    parked_terminal: Option<super::keeper_integration_tests::ReplacementTerminal>,
 }
 #[derive(serde::Serialize)]
 #[serde(tag = "case", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1480,6 +1717,7 @@ enum FailurePayload {
         markers: MarkerFacts,
         status_wait: Option<StatusWaitObservation>,
         update_wait: Option<UpdateWaitSnapshot>,
+        actor_stage: Option<ReplacementActorProjection>,
     },
 }
 #[derive(Clone, Copy, Default, serde::Serialize)]
@@ -1630,10 +1868,15 @@ fn fixture_status_projection_controls() {
             restarting: true,
             exit0: true,
             exitother: true,
+            parked_terminal: Some(super::keeper_integration_tests::ReplacementTerminal {
+                stream: transport::channel::FIRST_CHANNEL_STREAM,
+                code: 101,
+            }),
         }),
         markers: marker_facts(directory.path(), directory.path()),
         status_wait: Some(state.get()),
         update_wait: None,
+        actor_stage: None,
     };
     let bytes = failure_bytes(&record).unwrap();
     assert!(bytes.len() <= 2048);
@@ -2057,6 +2300,7 @@ fn fixture_update_record_controls() {
                 input_failed: true,
                 failure,
             }),
+            actor_stage: None,
         };
         let bytes = failure_bytes(&record).unwrap();
         assert!(bytes.len() <= 2048);
@@ -2088,6 +2332,7 @@ fn fixture_update_record_controls() {
         markers: marker_facts(directory.path(), directory.path()),
         status_wait: None,
         update_wait: None,
+        actor_stage: None,
     };
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&failure_bytes(&record).unwrap()).unwrap()
@@ -2283,7 +2528,10 @@ fn event_facts(events: Option<&ConnectedEvents>) -> Option<EventFacts> {
     if records.len() > 256 {
         return None;
     }
-    let mut facts = EventFacts::default();
+    let mut facts = EventFacts {
+        parked_terminal: replacement_terminal(&records),
+        ..EventFacts::default()
+    };
     for record in records.iter() {
         match record {
             ServerRecord::Opened { .. } => facts.opened = true,
@@ -2340,6 +2588,9 @@ fn replacement_failure(context: ReplacementDiagnostic<'_>) {
         markers: marker_facts(context.actor, context.actor),
         status_wait: context.status_wait.map(|value| value.get()),
         update_wait: context.update_wait,
+        actor_stage: context.replacement.and_then(|(nonce, role)| {
+            replacement_stage_observe(context.actor, Some(nonce)).filter(|stage| stage.role == role)
+        }),
     });
 }
 fn connected_failure(
@@ -2445,6 +2696,7 @@ fn fixture_timeout_formatter_controls() {
             markers: marker_facts(&private, directory.path()),
             status_wait: None,
             update_wait: None,
+            actor_stage: None,
         };
         assert!(failure_bytes(&record).unwrap().len() <= 2048);
     }
@@ -2475,6 +2727,7 @@ fn fixture_timeout_tag_control() {
             progress: &progress,
             events: None,
             actor: directory.path(),
+            replacement: None,
             status_wait: None,
             update_wait: None,
         });
@@ -4936,7 +5189,79 @@ fn bounded_command_observe_diagnostic(
     }
     result
 }
+fn fixture_replacement_role_controls() {
+    use std::os::unix::fs::PermissionsExt;
+    use transport::channel::{ServerRecord, FIRST_CHANNEL_STREAM};
+    let directory = tempfile::tempdir().unwrap();
+    let nonce = "a".repeat(32);
+    for stage in [
+        ReplacementActorStage::Entry,
+        ReplacementActorStage::Sampled,
+        ReplacementActorStage::Accepted,
+        ReplacementActorStage::Refused,
+        ReplacementActorStage::DescendantPublished,
+    ] {
+        replacement_stage_publish(
+            directory.path(),
+            &nonce,
+            ReplacementActorRole::KeeperForegroundApplication,
+            stage,
+        );
+        let bytes = replacement_private_read(
+            directory.path(),
+            &format!("replacement-stage-{}", stage.token()),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_replacement_stage(&bytes, &nonce).unwrap().stage,
+            stage
+        );
+        let record = FailurePayload::Replacement {
+            stage: ReplacementSite::DescendantReady,
+            progress: ReplacementProgress::default(),
+            events: Some(EventFacts {
+                parked_terminal: Some(super::keeper_integration_tests::ReplacementTerminal {
+                    stream: FIRST_CHANNEL_STREAM,
+                    code: 101,
+                }),
+                ..EventFacts::default()
+            }),
+            markers: marker_facts(directory.path(), directory.path()),
+            status_wait: None,
+            update_wait: None,
+            actor_stage: Some(parse_replacement_stage(&bytes, &nonce).unwrap()),
+        };
+        let bytes = failure_bytes(&record).unwrap();
+        assert!(bytes.len() <= 2048);
+        assert!(!String::from_utf8(bytes).unwrap().contains(&nonce));
+    }
+    assert!(replacement_stage_observe(directory.path(), Some(&"b".repeat(32))).is_none());
+    assert!(replacement_stage_observe(directory.path(), None).is_none());
+    let private = tempfile::tempdir().unwrap();
+    replacement_exclusive(private.path(), "replacement-stage-entry", b"PRIVATE_CANARY");
+    assert!(replacement_stage_observe(private.path(), Some(&nonce)).is_none());
+    assert!(replacement_private_read(private.path(), "unpublished").is_none());
+    let file = private.path().join("replacement-stage-entry");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(replacement_private_read(private.path(), "replacement-stage-entry").is_none());
+    let events = fixture_update_records(&[ServerRecord::Exit {
+        stream: FIRST_CHANNEL_STREAM,
+        code: 101,
+    }]);
+    assert_eq!(
+        event_facts(Some(&events))
+            .unwrap()
+            .parked_terminal
+            .unwrap()
+            .code,
+        101
+    );
+    let held = events.records.lock().unwrap();
+    assert!(event_facts(Some(&events)).is_none());
+    drop(held);
+}
 fn fixture_command_controls() {
+    fixture_replacement_role_controls();
     fixture_body_mapping_controls();
     fixture_body_callback_controls();
     fixture_body_join_controls();
@@ -5187,6 +5512,9 @@ fn actual_connect_tagged(
 }
 #[test]
 fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session() {
+    run_actual_daemon_replacement(ReplacementActorRole::ModernSessionLeader);
+}
+fn run_actual_daemon_replacement(role: ReplacementActorRole) {
     use std::ffi::OsStr;
     use transport::channel::{
         encode_client, ChannelKind, ClientRecord, OpenRequest, ServerRecord, UpdateAnswer,
@@ -5401,12 +5729,17 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     // Installed before Open enqueue; leader retains its real child until the
     // controller binds both watches, and observes abort even before Opened.
     let _actor_abort = AbortActor(actor_directory.path());
+    use rand_core::RngCore;
+    let mut nonce_bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+    let actor_nonce = hex::encode(nonce_bytes);
     let progress = std::cell::Cell::new(ReplacementProgress::default());
     let diagnostic = |site, events| ReplacementDiagnostic {
         site,
         progress: &progress,
         events,
         actor: actor_directory.path(),
+        replacement: Some((&actor_nonce, role)),
         status_wait: None,
         update_wait: None,
     };
@@ -5420,7 +5753,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     let executable = std::env::current_exe().unwrap();
     assert!(!executable.to_str().unwrap().contains('\''));
     assert!(!actor_directory.path().to_str().unwrap().contains('\''));
-    let command=format!("/usr/bin/env QSH_DARWIN223_ACTOR='{}' QSH_DARWIN223_PTY_LEADER=1 QSH_DARWIN223_HOLD_LEADER=1 '{}' --exact darwin_process_scope::native_tests::darwin223_owned_actor --nocapture",actor_directory.path().display(),executable.display());
+    let command=format!("/usr/bin/env QSH_DARWIN223_ACTOR='{}' QSH_DARWIN223_REPLACEMENT_ROLE={} QSH_DARWIN223_REPLACEMENT_NONCE={} QSH_DARWIN223_HOLD_LEADER=1 '{}' --exact darwin_process_scope::native_tests::darwin223_owned_actor --nocapture",actor_directory.path().display(),role.token(),actor_nonce,executable.display());
     parked
         .send_bytes(
             CONTROL_STREAM,
@@ -5452,38 +5785,66 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
             Some(&parked_events),
         )),
     );
+    let reports = std::cell::Cell::new(None);
     until_tagged(
-        || actor_directory.path().join("descendant-ready").exists(),
+        || {
+            if !actor_directory.path().join("descendant-ready").exists() {
+                return false;
+            }
+            let Some(raw) = replacement_private_read(actor_directory.path(), "replacement-actor")
+            else {
+                return false;
+            };
+            let Ok(application) = parse_replacement_actor_report(&raw, &actor_nonce) else {
+                return false;
+            };
+            if validate_replacement_topology(role, &application).is_err() {
+                return false;
+            }
+            let Some(raw) =
+                replacement_private_read(actor_directory.path(), "replacement-descendant")
+            else {
+                return false;
+            };
+            let Ok(descendant) = parse_replacement_descendant_report(&raw, &actor_nonce) else {
+                return false;
+            };
+            let t = application.topology;
+            if descendant.sid != t.sid
+                || descendant.group != descendant.identity.pid
+                || descendant.identity.pid == t.application.pid
+                || descendant.identity.pid == t.session.pid
+            {
+                return false;
+            }
+            if replacement_kernel_binding(t.application, t.sid, t.application.pid).is_err()
+                || replacement_kernel_binding(t.session, t.sid, t.session.pid).is_err()
+                || replacement_kernel_binding(descendant.identity, t.sid, descendant.group).is_err()
+            {
+                return false;
+            }
+            reports.set(Some((application, descendant)));
+            true
+        },
         Some(diagnostic(
             ReplacementSite::DescendantReady,
             Some(&parked_events),
         )),
     );
-    let descendant_pid = std::fs::read_to_string(actor_directory.path().join("descendant-pid"))
-        .unwrap()
-        .parse::<i32>()
-        .unwrap();
+    let (application, descendant) = reports.get().expect("actual bound replacement reports");
+    let t = application.topology;
+    let sid = t.sid;
+    let leader = replacement_kernel_binding(t.application, sid, t.application.pid).unwrap();
+    let desc = replacement_kernel_binding(descendant.identity, sid, descendant.group).unwrap();
+    let session = replacement_kernel_binding(t.session, sid, t.session.pid).unwrap();
+    let mut leader_guard = replacement_guard(leader, sid, 2);
+    let mut desc_guard = replacement_guard(desc, sid, 1);
+    let mut session_guard = if t.session != t.application {
+        Some(replacement_guard(session, sid, 3))
+    } else {
+        None
+    };
     let mut ops = NativeOps;
-    let desc = ops.classify(descendant_pid).unwrap();
-    let Class::Session(sid) = desc.class else {
-        panic!("live owned descendant required");
-    };
-    let leader = ops.classify(sid).unwrap();
-    assert_eq!(leader.class, Class::Session(sid));
-    let desc_token = ops.acquire_signal_token(desc.identity, sid).unwrap();
-    let desc_watch = ops.bind_exit(desc, 1).unwrap();
-    let mut desc_guard = DescendantGuard {
-        token: desc_token.handle,
-        watch: desc_watch.handle,
-        normal_exit: false,
-    };
-    let leader_token = ops.acquire_signal_token(leader.identity, sid).unwrap();
-    let leader_watch = ops.bind_exit(leader, 2).unwrap();
-    let mut leader_guard = DescendantGuard {
-        token: leader_token.handle,
-        watch: leader_watch.handle,
-        normal_exit: false,
-    };
     publish(&actor_directory.path().join("controller-bound"));
     parked.detach();
     until_tagged(
@@ -5500,14 +5861,9 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         [1; 16],
         Some(diagnostic(ReplacementSite::UpdateLink, None)),
     );
-    assert_eq!(
-        ops.classify(sid).unwrap().identity.unique,
-        leader.identity.unique
-    );
-    assert_eq!(
-        ops.classify(descendant_pid).unwrap().identity.unique,
-        desc.identity.unique
-    );
+    replacement_kernel_binding(t.application, sid, t.application.pid).unwrap();
+    replacement_kernel_binding(t.session, sid, t.session.pid).unwrap();
+    replacement_kernel_binding(descendant.identity, sid, descendant.group).unwrap();
     client
         .send_bytes(
             CONTROL_STREAM,
@@ -5604,19 +5960,34 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
     let original_identity = daemon.identity.unwrap();
     assert!(resumed.identity.same_process(original_identity.identity));
     assert_ne!(resumed.identity.version, original_identity.identity.version);
-    leader_guard.finish_tagged(Some(diagnostic(
-        ReplacementSite::OldLeaderExit,
-        Some(&events),
-    )));
+    let mut application_exited = false;
+    let mut session_exited = session_guard.is_none();
+    until_tagged(
+        || {
+            if !application_exited {
+                application_exited = ops.observe_exit(&mut leader_guard.watch).unwrap().is_some();
+            }
+            if !session_exited {
+                session_exited = ops
+                    .observe_exit(&mut session_guard.as_mut().unwrap().watch)
+                    .unwrap()
+                    .is_some();
+            }
+            application_exited
+                && session_exited
+                && replacement_absent(t.application)
+                && replacement_absent(t.session)
+        },
+        Some(diagnostic(ReplacementSite::OldLeaderExit, Some(&events))),
+    );
+    leader_guard.normal_exit = true;
+    if let Some(guard) = session_guard.as_mut() {
+        guard.normal_exit = true;
+    }
     desc_guard.finish_tagged(Some(diagnostic(
         ReplacementSite::OldDescendantExit,
         Some(&events),
     )));
-    assert!(
-        !ops.identity(sid)
-            .is_ok_and(|value| value.same_process(leader.identity)),
-        "old direct leader must be physically reaped before exec"
-    );
     admit_fixture_true(Path::new(FIXTURE_TRUE)).expect("FIXTURE_TRUE_ADMISSION");
     let (fresh, fresh_events) = actual_connect_tagged(
         port,
@@ -5674,7 +6045,7 @@ fn darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_sessi
         );
     }
     assert_eq!(hash_path(&original), original_hash);
-    eprintln!("darwin223 actual_update=exec same_pid=true execution_version=fresh parked_leader=reaped descendant=exited fresh_channel=completed wire_STOP=normal rescue=false");
+    eprintln!("darwin223 actual_update=exec same_pid=true execution_version=fresh parked_leader=reaped descendant=exited application_reaped=true session_reaped=true fresh_channel=completed wire_STOP=normal rescue=false");
 }
 
 #[cfg(feature = "test-darwin-keeper")]
@@ -5692,7 +6063,7 @@ pub(super) fn keeper_signal_suite() {
 #[cfg(feature = "test-darwin-keeper")]
 pub(super) fn keeper_replacement_suite() {
     super::keeper_integration_tests::native::fixture();
-    darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session();
+    run_actual_daemon_replacement(ReplacementActorRole::KeeperForegroundApplication);
 }
 #[cfg(feature = "test-darwin-keeper")]
 fn keeper_stop_control_case() {
