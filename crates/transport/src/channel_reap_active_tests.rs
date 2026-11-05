@@ -387,6 +387,8 @@ fn cleanup143_cleanup_failure_and_backend_panic_keep_typed_first_observation() {
             runtime.spawn_blocking(|| ()).await.unwrap();
         });
         let snapshot = registry.cleanup_snapshot().unwrap();
+        assert_eq!(snapshot.retiring_channels, 1);
+        assert!(!snapshot.leader_unconfirmed);
         assert_eq!(snapshot.unique_cleanup_debt, 1);
         assert_eq!(snapshot.observed_unconfirmed_owners, 1);
         assert_eq!(
@@ -407,7 +409,13 @@ fn cleanup143_cleanup_failure_and_backend_panic_keep_typed_first_observation() {
                 .await
                 .unwrap();
         });
-        assert_eq!(registry.cleanup_snapshot().unwrap().unique_cleanup_debt, 0);
+        let settled = registry.cleanup_snapshot().unwrap();
+        assert_eq!(settled.retiring_channels, 0);
+        assert_eq!(settled.unique_cleanup_debt, 0);
+        assert_eq!(settled.observed_unconfirmed_owners, 0);
+        assert!(!settled.leader_unconfirmed);
+        assert!(!settled.cleanup_unconfirmed);
+        assert!(!settled.observation_panicked);
         drop(reaps);
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
@@ -520,6 +528,7 @@ fn bootstrap223_running_pending_delivers_stop_before_exact_completion() {
     let exact_owner = reaps.owners.get(&1).unwrap().clone();
     reaps.stop_all();
     let stop_delivered = stopped.recv_timeout(Duration::from_secs(2)).is_ok();
+    let pending = registry.cleanup_snapshot();
     let held = !reaps.is_empty() && registry.outstanding() == 1;
     let early = runtime.block_on(async {
         tokio::time::timeout(Duration::from_millis(40), reaps.next())
@@ -534,11 +543,29 @@ fn bootstrap223_running_pending_delivers_stop_before_exact_completion() {
             .await
             .unwrap();
     });
+    let settled = registry.cleanup_snapshot();
+    let outstanding = registry.outstanding();
+    let empty = reaps.is_empty();
+    drop(reaps);
+    runtime.shutdown_timeout(Duration::from_secs(2));
     assert!(stop_delivered);
     assert!(held);
     assert!(!early);
-    assert_eq!(registry.outstanding(), 0);
-    assert!(reaps.is_empty());
-    drop(reaps);
-    runtime.shutdown_timeout(Duration::from_secs(2));
+    assert_eq!(outstanding, 0);
+    assert!(empty);
+    // Healthy pending custody is debt, not a backend observation failure.
+    let pending = pending.unwrap();
+    assert_eq!(pending.retiring_channels, 1);
+    assert_eq!(pending.unique_cleanup_debt, 1);
+    assert_eq!(pending.observed_unconfirmed_owners, 0);
+    assert!(!pending.leader_unconfirmed);
+    assert!(!pending.cleanup_unconfirmed);
+    assert!(!pending.observation_panicked);
+    let settled = settled.unwrap();
+    assert_eq!(settled.retiring_channels, 0);
+    assert_eq!(settled.unique_cleanup_debt, 0);
+    assert_eq!(settled.observed_unconfirmed_owners, 0);
+    assert!(!settled.leader_unconfirmed);
+    assert!(!settled.cleanup_unconfirmed);
+    assert!(!settled.observation_panicked);
 }

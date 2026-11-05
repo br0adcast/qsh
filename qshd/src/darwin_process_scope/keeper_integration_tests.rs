@@ -1301,7 +1301,10 @@ pub(super) mod native {
                 exclusive(&path.join("app-exit"),nonce.as_bytes());until(||observation.authority.snapshot().is_some_and(|s|s.app_status==Some(37)),end).await;
                 client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::Close{stream:FIRST_CHANNEL_STREAM})).unwrap();until(||registry.retiring_count()>0,end).await;
                 let fence=registry.begin_restart_fence().unwrap();assert!(fence.wait_until(Instant::now()).is_none());
-                let snapshot=registry.try_cleanup_snapshot().unwrap();assert!(snapshot.unique_cleanup_debt>0 && snapshot.cleanup_unconfirmed);
+                let snapshot=super::snapshot_available_until(||registry.try_cleanup_snapshot(),end).await.expect("cleanup snapshot unavailable before original deadline");
+                // cleanup_unconfirmed reports backend observation failure, not normal pending cleanup.
+                eprintln!("keeper223 foreign_sid_pending retiring={} debt={} observed={} leader_unconfirmed={} cleanup_unconfirmed={} observation_panicked={}",snapshot.retiring_channels,snapshot.unique_cleanup_debt,snapshot.observed_unconfirmed_owners,snapshot.leader_unconfirmed,snapshot.cleanup_unconfirmed,snapshot.observation_panicked);
+                assert!(snapshot.unique_cleanup_debt>0,"foreign-SID cleanup debt missing: {snapshot:?}");
                 until(||budget.used()==crate::screen_budget::Usage::default(),end).await;
                 assert!(!events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{..}|ServerRecord::ExitStatusUnavailable{..})));
                 let debt=super::snapshot_available_until(|| observation.authority.snapshot(),end).await.expect("snapshot unavailable before original deadline");assert!(!debt.drained&&!debt.consumed&&debt.session_wait.is_none());
