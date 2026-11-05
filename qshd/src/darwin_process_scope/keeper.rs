@@ -1168,6 +1168,14 @@ mod owner {
             core.admission_gate = Some(Arc::clone(&gate));
             gate
         }
+        #[cfg(all(test, feature = "test-darwin-keeper"))]
+        pub(in crate::darwin_process_scope) fn with_core_locked_for_fixture<R>(
+            &self,
+            inspect: impl FnOnce() -> R,
+        ) -> R {
+            let _core = self.shared.core.lock().unwrap();
+            inspect()
+        }
         pub fn snapshot(&self) -> Option<FixtureSnapshot> {
             let core = self.shared.core.try_lock().ok()?;
             Some(FixtureSnapshot {

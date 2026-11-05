@@ -2,6 +2,31 @@
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
 
+// Availability is not validation: return the first snapshot, even if its
+// contents will fail the caller's existing custody assertions.
+async fn snapshot_available_until<T>(
+    mut probe: impl FnMut() -> Option<T>,
+    end: std::time::Instant,
+) -> Option<T> {
+    loop {
+        if std::time::Instant::now() >= end {
+            return None;
+        }
+        let value = probe();
+        if std::time::Instant::now() >= end {
+            return None;
+        }
+        if value.is_some() {
+            return value;
+        }
+        tokio::time::sleep(
+            std::time::Duration::from_millis(5)
+                .min(end.saturating_duration_since(std::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
 #[cfg(unix)]
 mod bootstrap_images {
     use sha2::{Digest, Sha256};
@@ -1265,14 +1290,21 @@ pub(super) mod native {
                 eprintln!("keeper223 debt stored_version={} current_version={} binding=pid_unique",recorded.version,actual.version);
                 let text=std::str::from_utf8(&target).unwrap();let fields:Vec<_>=text.split_whitespace().collect();assert_eq!(fields[0],nonce);let pid:i32=fields[1].parse().unwrap();
                 let observed=NativeOps.classify(pid).unwrap();assert_eq!(observed.identity,actual);let Class::Session(foreign)=observed.class else {panic!("escaped child must remain alive")};assert_eq!(foreign,pid);
-                let observation=fixture.observation(0).unwrap();let original=observation.authority.snapshot().unwrap();assert_ne!(original.sid,foreign);
+                let observation=fixture.observation(0).unwrap();
+                let mut snapshot = Box::pin(super::snapshot_available_until(|| observation.authority.snapshot(), end));
+                observation.authority.with_core_locked_for_fixture(|| {
+                    assert!(observation.authority.snapshot().is_none());
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(std::future::Future::poll(snapshot.as_mut(), &mut context).is_pending());
+                });
+                let original=snapshot.await.expect("snapshot unavailable before original deadline");assert_ne!(original.sid,foreign);
                 exclusive(&path.join("app-exit"),nonce.as_bytes());until(||observation.authority.snapshot().is_some_and(|s|s.app_status==Some(37)),end).await;
                 client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::Close{stream:FIRST_CHANNEL_STREAM})).unwrap();until(||registry.retiring_count()>0,end).await;
                 let fence=registry.begin_restart_fence().unwrap();assert!(fence.wait_until(Instant::now()).is_none());
                 let snapshot=registry.try_cleanup_snapshot().unwrap();assert!(snapshot.unique_cleanup_debt>0 && snapshot.cleanup_unconfirmed);
                 until(||budget.used()==crate::screen_budget::Usage::default(),end).await;
                 assert!(!events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{..}|ServerRecord::ExitStatusUnavailable{..})));
-                let debt=observation.authority.snapshot().unwrap();assert!(!debt.drained&&!debt.consumed&&debt.session_wait.is_none());
+                let debt=super::snapshot_available_until(|| observation.authority.snapshot(),end).await.expect("snapshot unavailable before original deadline");assert!(!debt.drained&&!debt.consumed&&debt.session_wait.is_none());
                 assert_eq!(NativeOps.classify(pid).unwrap().identity,observed.identity);assert!(!path.join("foreign-signaled").exists());
                 exclusive(&path.join("release"),nonce.as_bytes());until(||registry.retiring_count()==0&&registry.outstanding()==0,end).await;
                 fixture.assert_settled(1);assert!(fence.wait_until(Instant::now()).is_some());fence.reopen();assert!(!path.join("foreign-signaled").exists());
@@ -1606,5 +1638,84 @@ fn keeper_bootstrap_stage_preserves_replacement_copy_ceiling() {
     assert!(
         !destination.exists(),
         "oversized replacement must be refused before copying"
+    );
+}
+
+#[tokio::test]
+async fn keeper_snapshot_availability_returns_first_some_after_unavailable() {
+    let mut probes = 0;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = snapshot_available_until(
+        || {
+            probes += 1;
+            match probes {
+                1 => None,
+                2 => Some(37),
+                _ => panic!("probed after first Some"),
+            }
+        },
+        end,
+    )
+    .await;
+    assert_eq!(result, Some(37));
+    assert_eq!(probes, 2);
+}
+#[tokio::test]
+async fn keeper_snapshot_availability_permanent_none_expires_original_end() {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    assert_eq!(snapshot_available_until(|| None::<u8>, end).await, None);
+    assert!(std::time::Instant::now() >= end);
+}
+#[tokio::test]
+async fn keeper_snapshot_availability_expired_end_never_probes() {
+    let end = std::time::Instant::now();
+    assert_eq!(
+        snapshot_available_until(|| panic!("expired probe must not run"), end).await,
+        None::<u8>
+    );
+}
+#[tokio::test]
+async fn keeper_snapshot_availability_rechecks_same_end_after_probe() {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    let mut probes = 0;
+    let result = snapshot_available_until(
+        || {
+            probes += 1;
+            while std::time::Instant::now() < end {
+                std::thread::yield_now();
+            }
+            Some(37)
+        },
+        end,
+    )
+    .await;
+    assert_eq!(result, None);
+    assert_eq!(probes, 1);
+}
+#[tokio::test]
+async fn keeper_snapshot_availability_returns_ledger_uncertainty_without_retry() {
+    #[derive(Debug, PartialEq)]
+    enum State {
+        LedgerUncertainty,
+        Valid,
+    }
+    let mut probes = 0;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let result = snapshot_available_until(
+        || {
+            probes += 1;
+            Some(if probes == 1 {
+                State::LedgerUncertainty
+            } else {
+                State::Valid
+            })
+        },
+        end,
+    )
+    .await;
+    assert_eq!(result, Some(State::LedgerUncertainty));
+    assert_eq!(
+        probes, 1,
+        "availability must not retry until a desired state"
     );
 }
