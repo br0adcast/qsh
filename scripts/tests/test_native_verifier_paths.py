@@ -436,6 +436,17 @@ elif name == 'python3':
                 tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
                 self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
                                          '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])
+                test_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test')
+                build_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build')
+                cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
+                baseline = (f'--remap-path-prefix={env["GITHUB_WORKSPACE"]}=/qsh '
+                            f'--remap-path-prefix={cargo_home}=/cargo '
+                            f'--remap-path-prefix={env["RUNNER_TEMP"]}=/build')
+                if 'linux' not in target:
+                    baseline += f' -C link-arg=-Wl,-oso_prefix,{env["GITHUB_WORKSPACE"]}/'
+                self.assertEqual(test_call['env']['RUSTFLAGS'], baseline)
+                self.assertEqual({key: value for key, value in test_call['env'].items() if key != 'RUSTFLAGS'},
+                                 {key: value for key, value in build_call['env'].items() if key != 'RUSTFLAGS'})
 
     def test_native_product_checks_cover_both_roles_before_and_after_strip(self):
         body = self.body('native-crypto.yml', 'portable', self.NATIVE)

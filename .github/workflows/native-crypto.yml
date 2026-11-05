@@ -270,6 +270,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then
             export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
           fi
+          rsa_baseline_rustflags="$RUSTFLAGS"
           if [ "$NATIVE_TARGET" = x86_64-apple-darwin ]; then
             test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
             export RUSTFLAGS="$RUSTFLAGS -Dwarnings"
@@ -278,7 +279,7 @@ jobs:
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
           cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
-          cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
+          RUSTFLAGS="$rsa_baseline_rustflags" cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
             --test rsa_file_signing --test native_rsa_backend -- --include-ignored
           if [ "$RUNNER_OS" = Linux ]; then
             dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")

@@ -8,13 +8,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use transport::channel_server::ChildStatus;
 
+#[cfg(feature = "test-darwin-keeper")]
+use super::keeper_integration_tests::copy_bootstrap_image;
+
 use super::keeper_integration_tests::{
-    bootstrap_image_identity, bootstrap_staged_path, copy_bootstrap_image,
-    copy_bootstrap_update_image, parse_replacement_actor_report,
-    parse_replacement_descendant_report, parse_replacement_stage, replacement_terminal,
-    valid_replacement_nonce, validate_replacement_binding, validate_replacement_topology,
-    ReplacementActorProjection, ReplacementActorReport, ReplacementActorRole,
-    ReplacementActorStage, ReplacementTopology,
+    bootstrap_image_identity, bootstrap_staged_path, copy_bootstrap_update_image,
+    parse_replacement_actor_report, parse_replacement_descendant_report, parse_replacement_stage,
+    replacement_terminal, valid_replacement_nonce, validate_replacement_binding,
+    validate_replacement_topology, ReplacementActorProjection, ReplacementActorReport,
+    ReplacementActorRole, ReplacementActorStage, ReplacementTopology,
 };
 
 fn replacement_exclusive(directory: &Path, name: &str, bytes: &[u8]) {
