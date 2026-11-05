@@ -1,0 +1,136 @@
+--- a/cargo-generate-rpm-0.21.0/src/auto_req/builtin.rs
++++ b/cargo-generate-rpm-0.21.0/src/auto_req/builtin.rs
+@@ -6,9 +6,9 @@
+ use std::collections::BTreeSet;
+ use std::ffi::OsString;
+ use std::fs::File;
+-use std::io::{BufRead, BufReader, Read};
++use std::io::{self, BufRead, BufReader, Read};
+ use std::path::Path;
+-use std::process::{Command, Stdio};
++use std::process::{Child, ChildStdout, Command, Stdio};
+ 
+ #[derive(Debug)]
+ struct ElfInfo {
+@@ -47,6 +47,23 @@
+ #[test]
+ fn test_elf_info_new() {
+     ElfInfo::new("/bin/sh").unwrap();
++}
++
++fn read_and_wait_ldd(
++    mut process: Child,
++    path: &Path,
++    read_stdout: impl FnOnce(&mut ChildStdout, &mut String) -> io::Result<usize>,
++) -> Result<String, AutoReqError> {
++    let mut stdout = process.stdout.take().expect("piped ldd stdout");
++    let mut output = String::new();
++    let read_result = read_stdout(&mut stdout, &mut output);
++    // Close before waiting: a failed read must not leave a blocked producer.
++    drop(stdout);
++    let wait_result = process.wait();
++    read_result.map_err(|error| AutoReqError::LddOutputReadError(path.to_path_buf(), error))?;
++    // ldd exit status remains deliberately ignored, as in the pinned version.
++    wait_result.map_err(|error| AutoReqError::ProcessError(OsString::from("ldd"), error))?;
++    Ok(output)
+ }
+ 
+ fn find_requires_by_ldd(
+@@ -69,12 +86,9 @@
+         .spawn()
+         .map_err(|e| AutoReqError::ProcessError(OsString::from("ldd"), e))?;
+ 
+-    let mut s = String::new();
+-    process
+-        .stdout
+-        .unwrap()
+-        .read_to_string(&mut s)
+-        .map_err(|e| AutoReqError::LddOutputReadError(path.to_path_buf(), e))?;
++    let s = read_and_wait_ldd(process, path, |stdout, output| {
++        stdout.read_to_string(output)
++    })?;
+ 
+     let unversioned_libraries = s
+         .split('\n')
+@@ -222,3 +236,81 @@
+     }
+     Ok(requires)
+ }
++
++#[cfg(all(test, target_os = "linux"))]
++mod ldd_child_reaping_tests {
++    use super::*;
++
++    fn child(script: &str) -> Child {
++        Command::new("/bin/sh")
++            .args(["-c", script])
++            .stdout(Stdio::piped())
++            .spawn()
++            .unwrap()
++    }
++
++    fn assert_reaped(pid: u32) {
++        assert!(
++            !Path::new(&format!("/proc/{pid}")).exists(),
++            "owned child was not reaped"
++        );
++    }
++
++    #[test]
++    fn valid_output_reaps_exit_zero() {
++        let process = child("printf 'libfixture.so.1 => /fixture/libfixture.so.1 (0x0)\\n'");
++        let pid = process.id();
++        let output = read_and_wait_ldd(process, Path::new("fixture"), |stdout, output| {
++            stdout.read_to_string(output)
++        })
++        .unwrap();
++        assert!(output.starts_with("libfixture.so.1"));
++        assert_reaped(pid);
++    }
++
++    #[test]
++    fn valid_output_preserves_ignored_nonzero_status() {
++        let process = child("printf 'libfixture.so.1\\n'; exit 7");
++        let pid = process.id();
++        let output = read_and_wait_ldd(process, Path::new("fixture"), |stdout, output| {
++            stdout.read_to_string(output)
++        })
++        .unwrap();
++        assert_eq!(output, "libfixture.so.1\n");
++        assert_reaped(pid);
++    }
++
++    #[test]
++    fn invalid_utf8_retains_read_error_after_reaping() {
++        let process = child("printf '\\377'");
++        let pid = process.id();
++        let result = read_and_wait_ldd(process, Path::new("fixture"), |stdout, output| {
++            stdout.read_to_string(output)
++        });
++        assert!(matches!(
++            result,
++            Err(AutoReqError::LddOutputReadError(_, _))
++        ));
++        assert_reaped(pid);
++    }
++
++    #[test]
++    fn early_read_error_closes_pipe_before_waiting_for_finite_producer() {
++        let process = child("printf x; exec /usr/bin/head -c 16777216 /dev/zero");
++        let pid = process.id();
++        let result = read_and_wait_ldd(process, Path::new("fixture"), |stdout, _| {
++            let mut byte = [0];
++            stdout.read_exact(&mut byte)?;
++            assert_eq!(byte, [b'x']);
++            Err(io::Error::new(
++                io::ErrorKind::Other,
++                "injected early read error",
++            ))
++        });
++        assert!(matches!(
++            result,
++            Err(AutoReqError::LddOutputReadError(_, _))
++        ));
++        assert_reaped(pid);
++    }
++}
