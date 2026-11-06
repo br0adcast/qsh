@@ -25,8 +25,9 @@ esac
 # Only after admission succeeded, and while the unit file still exists, remove
 # the fixed unit's enablement. Never --now, stop, start, enable or restart; the
 # reload belongs to postun. The admitted phase already required the supported
-# manager, so no optional guard may skip this. A failed disable fails the erase
-# after PENDING publication; retry the erase.
+# manager, so no optional guard may skip this. A failed disable returns a
+# refusal after PENDING publication; a later erase still requires all current
+# admission and ownership proofs. Target transaction aftermath needs acceptance.
 if ! /usr/bin/systemctl --no-reload disable qshd.service; then
     echo QSHD_UNIT_DISABLE_REFUSED >&2
     exit 1

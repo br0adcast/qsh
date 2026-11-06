@@ -225,9 +225,18 @@ service and manual daemons, and exclude concurrent starts and privileged writers
 through maintenance. Hooks never force stop, kill, enable, start or restart the
 service. Only after final consumer erase admission succeeds, while the unit file
 still exists, consumer preun runs `systemctl --no-reload disable qshd.service`
-without `--now`; upgrades and non-final erase leave enablement unchanged. A
-failed disable fails the erase after PENDING publication, keeping the package
-for a retried erase. The consumer system unit checks current readiness through
+without `--now`; upgrades and non-final erase leave enablement unchanged. If
+disable fails, the preun hook reports `QSHD_UNIT_DISABLE_REFUSED` and exits nonzero
+after PENDING publication. The hook does not clear that PENDING state. A later
+erase must satisfy the current admission and ownership proofs; retry is not an
+unconditional recovery guarantee. Fedora transaction aftermath and erase/reinstall
+behavior remain subject to target acceptance.
+
+The disable command runs after the Python phase returns and is outside that
+phase's deadline. The acceptance driver's enclosing execution timeout and cleanup
+ownership remain responsible for bounding an actual attempt.
+
+The consumer system unit checks current readiness through
 `managed-prestart` before ExecStart; its 460-second outer startup allowance does
 not renew helper deadlines or exclude maintenance begun afterward.
 
