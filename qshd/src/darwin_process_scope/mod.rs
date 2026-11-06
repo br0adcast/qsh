@@ -270,3 +270,6 @@ mod keeper_integration_tests;
 mod keeper_pty_eof_tests;
 #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
 pub(crate) use keeper_pty::KeeperFixture;
+
+#[cfg(test)]
+mod darwin_artifact_tests;

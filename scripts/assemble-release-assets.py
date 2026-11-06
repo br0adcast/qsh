@@ -37,8 +37,8 @@ def expected_products(version):
             ('aarch64-unknown-linux-musl','arm64','aarch64')):
         products['linux-'+target]=(f'qsh-{version}-{target}.tar.gz',
             f'qsh_{deb}_{deb_arch}.deb',f'qsh-{version}-1.{rpm_arch}.rpm')
-    products['macos']=tuple(f'qsh-{version}-{target}.tar.gz'
-        for target in ('aarch64-apple-darwin','x86_64-apple-darwin'))
+    for target in ('aarch64-apple-darwin','x86_64-apple-darwin'):
+        products['macos-'+target]=(f'qsh-{version}-{target}.tar.gz',)
     products['server-packages']=tuple(f'qshd_{deb}_{arch}.deb' for arch in ('amd64','arm64'))+tuple(
         f'qshd-{version}-1.{arch}.rpm' for arch in ('x86_64','aarch64'))
     names=[name for values in products.values() for name in values]

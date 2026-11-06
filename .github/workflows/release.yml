@@ -216,9 +216,18 @@ jobs:
           path: dist/
 
   macos:
-    runs-on: macos-15
-    # Both architectures build on one runner and must execute there; see the
-    # `linux` job's timeout for why this is bounded at all.
+    needs: [native-crypto]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -234,7 +243,7 @@ jobs:
       - name: Install the toolchain and targets
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup target add "$NATIVE_TARGET"
           scripts/check-qualified-rust.sh
 
       - name: Validate the shipped pair version
@@ -249,10 +258,10 @@ jobs:
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      - name: Prepare both pinned native architectures
+      - name: Prepare the pinned native architecture
         run: |
           brew install gnupg
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          for target in "$NATIVE_TARGET"; do
             prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
             scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
             echo "${scoped}_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
@@ -269,7 +278,7 @@ jobs:
             XDG_CONFIG_HOME="$test_home/config" HISTFILE=/dev/null \
             cargo test --locked -p qshd --lib handover::tests -- --test-threads=1
 
-      - name: Build both architectures
+      - name: Build the native pair
         run: |
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
@@ -278,32 +287,28 @@ jobs:
           fi
           export AWS_LC_SYS_USE_SYSTEM=0
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
-          cargo build --release --locked -p qsh -p qshd --target aarch64-apple-darwin
-          cargo build --release --locked -p qsh -p qshd --target x86_64-apple-darwin
+          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
 
       # macOS strip has no GNU-style -o flag, so it strips the binary in place.
       - name: Strip
         run: |
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          for target in "$NATIVE_TARGET"; do
             for program in qsh qshd; do
               binary="target/$target/release/$program"
               python3 -I -B scripts/check-native-verifier-paths.py \
                 "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
             done
           done
-          strip target/aarch64-apple-darwin/release/qsh
-          strip target/aarch64-apple-darwin/release/qshd
-          strip target/x86_64-apple-darwin/release/qsh
-          strip target/x86_64-apple-darwin/release/qshd
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
+          for target in "$NATIVE_TARGET"; do
             for program in qsh qshd; do
               binary="target/$target/release/$program"
               python3 -I -B scripts/check-native-verifier-paths.py \
                 "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
             done
           done
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          for target in "$NATIVE_TARGET"; do
             for program in qsh qshd; do
               binary="target/$target/release/$program"
               python3 -I -B - "$binary" "$target" <<'PY'
@@ -327,7 +332,7 @@ jobs:
           mkdir -p dist
           evidence="$RUNNER_TEMP/darwin-producer-evidence"
           mkdir -p "$evidence"
-          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+          for target in "$NATIVE_TARGET"; do
             stage="qsh-$VERSION-$target"
             mkdir -p "$stage"
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
@@ -345,15 +350,39 @@ jobs:
               "dist/$stage.tar.gz"
           done
 
+      - name: Authenticate the exact extracted native archive
+        shell: bash
+        run: |
+          # Private state is retained on any failure; never upload raw fixtures.
+          private=$(mktemp -d /tmp/qsh185.XXXXXXXX)
+          private=$( { cd -P -- "$private" && pwd -P; } 2>/dev/null) || exit 1
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          mkdir -p "$private/home" "$private/cache" "$private/config"
+          CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" HOME="$private/home" \
+            XDG_CACHE_HOME="$private/cache" XDG_CONFIG_HOME="$private/config" HISTFILE=/dev/null \
+            cargo test --locked -p qshd --lib --target "$NATIVE_TARGET" --no-run \
+              --message-format=json > "$private/cargo.json" 2> "$private/build.log"
+          python3 -I -B scripts/darwin-artifact-smoke.py run-archive \
+            --archive "dist/qsh-$RELEASE_VERSION-$NATIVE_TARGET.tar.gz" \
+            --metadata "$RUNNER_TEMP/darwin-producer-evidence/$NATIVE_TARGET.json" \
+            --version "$RELEASE_VERSION" --target "$NATIVE_TARGET" --source-commit "$GITHUB_SHA" \
+            --destination "$private/run" --cargo-messages "$private/cargo.json" \
+            --harness-root "$GITHUB_WORKSPACE/target/$NATIVE_TARGET/debug/deps" \
+            --evidence "$RUNNER_TEMP/darwin-producer-evidence"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos
+          name: macos-${{ matrix.target }}
           path: dist/
 
       # CI evidence is intentionally separate from distributable release assets.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: darwin-producer-evidence
+          name: darwin-producer-evidence-${{ matrix.target }}
           path: ${{ runner.temp }}/darwin-producer-evidence/*.json
           if-no-files-found: error
           retention-days: 7

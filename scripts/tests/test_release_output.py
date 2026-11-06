@@ -570,7 +570,8 @@ class DarwinMetadataTests(unittest.TestCase):
         products={
             'linux-x86_64-unknown-linux-musl':('qsh-0.5.0-x86_64-unknown-linux-musl.tar.gz','qsh_0.5.0-1_amd64.deb','qsh-0.5.0-1.x86_64.rpm'),
             'linux-aarch64-unknown-linux-musl':('qsh-0.5.0-aarch64-unknown-linux-musl.tar.gz','qsh_0.5.0-1_arm64.deb','qsh-0.5.0-1.aarch64.rpm'),
-            'macos':('qsh-0.5.0-aarch64-apple-darwin.tar.gz','qsh-0.5.0-x86_64-apple-darwin.tar.gz'),
+            'macos-aarch64-apple-darwin':('qsh-0.5.0-aarch64-apple-darwin.tar.gz',),
+            'macos-x86_64-apple-darwin':('qsh-0.5.0-x86_64-apple-darwin.tar.gz',),
             'server-packages':('qshd_0.5.0-1_amd64.deb','qshd_0.5.0-1_arm64.deb','qshd-0.5.0-1.x86_64.rpm','qshd-0.5.0-1.aarch64.rpm')}
         artifacts=self.root/'artifacts';artifacts.mkdir();expected={}
         for producer,names in products.items():
@@ -579,8 +580,9 @@ class DarwinMetadataTests(unittest.TestCase):
                 data=('PUBLIC SYNTHETIC '+producer+'/'+name+'\n').encode()
                 (directory/name).write_bytes(data);expected[name]=data
         self.assertEqual(len(expected),12);self.assertFalse((self.root/'dist').exists())
-        private=artifacts/'darwin-producer-evidence';private.mkdir()
-        (private/'arm.json').write_text('{}');(private/'intel.json').write_text('{}')
+        for target in ('aarch64-apple-darwin','x86_64-apple-darwin'):
+            private=artifacts/('darwin-producer-evidence-'+target);private.mkdir()
+            (private/(target+'.json')).write_text('{}')
         scripts=self.root/'scripts';scripts.mkdir()
         for name in ('assemble-release-assets.py','check-release-version.py','check-release-output.py'):
             shutil.copyfile(ROOT/'scripts'/name,scripts/name)
@@ -592,8 +594,8 @@ class DarwinMetadataTests(unittest.TestCase):
         for name,data in expected.items():self.assertEqual((dist/name).read_bytes(),data)
         manifest=''.join(hashlib.sha256(expected[name]).hexdigest()+'  '+name+'\n' for name in sorted(expected))
         self.assertEqual((dist/'SHA256SUMS').read_text(),manifest)
-        self.assertEqual(workflow.count('name: darwin-producer-evidence'),1)
-        upload=workflow.split('          name: darwin-producer-evidence\n',1)[1]
+        self.assertEqual(workflow.count('name: darwin-producer-evidence-${{ matrix.target }}'),1)
+        upload=workflow.split('          name: darwin-producer-evidence-${{ matrix.target }}\n',1)[1]
         upload_lines=[]
         for line in upload.splitlines():
             if line and not line.startswith('          '):break
