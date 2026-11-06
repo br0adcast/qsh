@@ -50,8 +50,24 @@ class RouteTests(unittest.TestCase):
             self.assertEqual(owner.select_artifacts([test, libc, host_libc], root, target, arch), (image, lib))
             for rows in ([test, test, libc], [test, libc, libc], [test, host_libc], [dict(test, features=[]), libc], [dict(test, manifest_path=str(root / 'other/Cargo.toml')), libc]):
                 with self.assertRaises(ValueError): owner.select_artifacts(rows, root, target, arch)
+            outsider = root / 'outside-image'; outsider.write_bytes(b'inert')
+            for rows, reason in (([], 'artifact_ambiguity'),
+                                 ([dict(test, features=[]), libc], 'artifact_features'),
+                                 ([dict(test, manifest_path=str(root / 'other')), libc], 'artifact_source'),
+                                 ([dict(test, executable=str(outsider)), libc], 'artifact_placement'),
+                                 ([test, dict(libc, filenames=[str(lib), str(deps / 'second.rlib')])], 'libc_artifact'),
+                                 ([test, dict(libc, package_id='registry+local#libc@0.2.188')], 'libc_version')):
+                with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts(rows, root, target, arch)
+                self.assertEqual(caught.exception.reason, reason)
+            with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, 'unknown')
+            self.assertEqual(caught.exception.reason, 'artifact_target')
+            image.chmod(0o600)
+            with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, arch)
+            self.assertEqual(caught.exception.reason, 'artifact_executable')
+            image.chmod(0o700)
             (libroot / '.cargo-checksum.json').write_text(json.dumps({'package': '0' * 64}))
-            with self.assertRaises(ValueError): owner.select_artifacts([test, libc], root, target, arch)
+            with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, arch)
+            self.assertEqual(caught.exception.reason, 'libc_checksum')
 
     def test_fixture_copies_are_literal(self):
         owner.verify_copies(ROOT)
@@ -200,9 +216,10 @@ class AdmissionTests(unittest.TestCase):
     def test_mocked_control_preserves_all_settled_disagreement_summaries(self):
         self.mocked_route('pty-eof-control', disagreement=True)
 
-    def mocked_route(self, mode, disagreement):
+    def mocked_route(self, mode, disagreement, fail_substage=None):
         # Inert file/argv doubles only. No compiler or native image is executed.
         calls = []
+        ActualOwner = owner.Owner
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             image, libc, compiler = (base / n for n in ('inert-test', 'inert-libc', 'inert-rustc'))
@@ -213,12 +230,28 @@ class AdmissionTests(unittest.TestCase):
                 def __init__(self, root, runtime, env): self.env = env
                 def command(self, argv, **kwargs):
                     calls.append(argv)
+                    actual_substage = ('clippy' if argv[1] == 'clippy' else 'test_compile') if argv[0] == 'cargo' else ('helper_compile' if argv[0] == 'rustc' and '-o' in argv else None)
+                    if fail_substage is not None and actual_substage == fail_substage:
+                        process = mock.Mock(); process.wait.return_value = 1
+                        def start(command, **options):
+                            diagnostic = dict(level='error', code=dict(code='E0308'), message='PRIVATE_SECRET_CANARY', spans=[])
+                            record = dict(reason='compiler-message', message=diagnostic) if actual_substage != 'helper_compile' else dict(diagnostic, **{'$message_type': 'diagnostic'})
+                            options['stdout'].write((json.dumps(record) + '\n').encode()); options['stdout'].flush()
+                            return process
+                        with mock.patch.object(owner.subprocess, 'Popen', side_effect=start):
+                            return ActualOwner(ROOT, base, self.env).command(argv, **kwargs)
                     if argv[:2] == ['git', 'rev-parse']: return 0, b'a' * 40 + b'\n'
                     if argv == ['rustc', '-vV']: return 0, b'host: aarch64-apple-darwin\n'
                     if argv == ['rustup', 'which', 'rustc']: return 0, str(compiler).encode() + b'\n'
                     if argv[0] in ('/usr/sbin/sysctl', '/usr/bin/xcrun'): return 0, b'synthetic\n'
-                    if argv[0] == 'cargo': return 0, b''
+                    if argv[0] == 'cargo':
+                        if argv[1] == 'clippy':
+                            assert '--message-format=json' in argv
+                        if fail_substage == 'cargo_records' and argv[1] == 'test':
+                            return 0, b'{broken PRIVATE_RECORD_CANARY'
+                        return 0, b''
                     if argv[0] == 'rustc':
+                        assert '--error-format=json' in argv
                         Path(argv[argv.index('-o') + 1]).write_bytes(b'inert-helper')
                         return 0, b''
                     if argv[0] == str(image):
@@ -232,10 +265,37 @@ class AdmissionTests(unittest.TestCase):
                     raise AssertionError('unexpected executable')
             environ = dict(GITHUB_EVENT_NAME='workflow_dispatch', PTY_EOF_MODE=mode, GITHUB_SHA='a' * 40, RUNNER_TEMP=str(base), OPENSSL_DIR=str(crypto))
             output = io.StringIO()
-            with mock.patch.dict(owner.os.environ, environ, clear=True), mock.patch.object(owner.sys, 'argv', ['owner', mode, 'aarch64-apple-darwin']), mock.patch.object(owner.sys, 'platform', 'darwin'), mock.patch.object(owner.platform, 'machine', return_value='arm64'), mock.patch.object(owner, 'Owner', FakeOwner), mock.patch.object(owner, 'select_artifacts', return_value=(image, libc)), contextlib.redirect_stdout(output):
+            actual_digest, actual_chmod = owner.digest, Path.chmod
+            def select(*args):
+                if fail_substage == 'artifact_select': raise owner.Refusal('artifact_ambiguity')
+                return image, libc
+            def artifact_digest(path):
+                if fail_substage == 'artifact_hashes' and Path(path).name == 'helper':
+                    raise OSError('PRIVATE_HASH_CANARY')
+                return actual_digest(path)
+            def chmod(path, mode, **kwargs):
+                if fail_substage == 'helper_permissions' and path.name == 'helper':
+                    raise OSError('PRIVATE_PERMISSION_CANARY')
+                return actual_chmod(path, mode, **kwargs)
+            with mock.patch.object(owner, 'digest', side_effect=artifact_digest), mock.patch.object(Path, 'chmod', chmod), mock.patch.dict(owner.os.environ, environ, clear=True), mock.patch.object(owner.sys, 'argv', ['owner', mode, 'aarch64-apple-darwin']), mock.patch.object(owner.sys, 'platform', 'darwin'), mock.patch.object(owner.platform, 'machine', return_value='arm64'), mock.patch.object(owner, 'Owner', FakeOwner), mock.patch.object(owner, 'select_artifacts', side_effect=select), contextlib.redirect_stdout(output):
                 status = owner.main()
             summary = json.loads(output.getvalue())
+            if fail_substage is not None:
+                self.assertEqual(status, 1)
+                self.assertEqual(summary['substage'], fail_substage)
+                self.assertEqual(summary['build_completed'], list(owner.BUILD_SUBSTAGES[:owner.BUILD_SUBSTAGES.index(fail_substage)]))
+                if fail_substage in owner.COMPILER_SUBSTAGES:
+                    self.assertEqual(summary['reason'], 'command_nonzero')
+                    self.assertEqual(summary['command_status'], {'kind': 'exit', 'value': 1})
+                    self.assertEqual(summary['diagnostics']['records'][0]['code'], 'E0308')
+                else:
+                    self.assertEqual(summary['reason'], {'cargo_records': 'compiler_json', 'artifact_select': 'artifact_ambiguity'}.get(fail_substage, 'internal_refusal'))
+                    self.assertNotIn('command_status', summary)
+                self.assertNotIn('PRIVATE_SECRET_CANARY', output.getvalue())
+                self.assertNotIn(str(base), output.getvalue())
+                return summary
             self.assertEqual(status, int(disagreement))
+            self.assertEqual(summary['build_completed'], list(owner.BUILD_SUBSTAGES))
             self.assertEqual(summary['portable_passed'], 7)
             self.assertEqual(summary['native_executed'], int(disagreement))
             executions = [a for a in calls if a[0] == str(image) and '--ignored' in a and '--list' not in a]
@@ -255,6 +315,145 @@ class AdmissionTests(unittest.TestCase):
                 with self.assertRaises(ValueError): owner.Owner(ROOT, Path(directory), {}).command(['inert'])
             self.assertEqual(process.wait.call_count, 2)
             process.kill.assert_not_called(); process.terminate.assert_not_called()
+
+
+class BuildDiagnosticTests(unittest.TestCase):
+    def test_main_actual_owner_failures_identify_three_compiler_substages(self):
+        controller = AdmissionTests()
+        for stage in ('clippy', 'test_compile', 'helper_compile'):
+            controller.mocked_route('pty-eof-build', False, fail_substage=stage)
+
+    def test_main_noncommand_failures_identify_exact_fixed_substage(self):
+        controller = AdmissionTests()
+        for stage in ('cargo_records', 'artifact_select', 'helper_permissions', 'artifact_hashes'):
+            controller.mocked_route('pty-eof-build', False, fail_substage=stage)
+
+    def test_actual_owner_failure_retains_closed_status_and_private_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock(); process.wait.return_value = 1
+            def start(argv, **kwargs):
+                kwargs['stdout'].write(b'{"reason":"compiler-message","message":{"level":"error","code":{"code":"E0308"},"message":"PRIVATE_SECRET_CANARY","spans":[]}}\n')
+                kwargs['stdout'].flush()
+                return process
+            with mock.patch.object(owner.subprocess, 'Popen', side_effect=start):
+                with self.assertRaises(ValueError) as caught:
+                    owner.Owner(ROOT, Path(directory), {}).command(['inert-compiler'])
+            self.assertEqual(getattr(caught.exception, 'reason', None), 'command_nonzero')
+            self.assertEqual(caught.exception.status, 1)
+            self.assertTrue(caught.exception.capture.is_file())
+            process.wait.assert_called_once()
+            projected = owner.project_diagnostics(caught.exception.capture, ROOT, {'qshd/src/lib.rs'}, 'cargo')
+            self.assertEqual(projected['records'][0]['code'], 'E0308')
+            self.assertNotIn('PRIVATE_SECRET_CANARY', json.dumps(projected))
+
+
+    def test_actual_owner_start_capture_and_interrupt_failures_stay_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(owner.subprocess, 'Popen', side_effect=OSError('PRIVATE_START_CANARY')):
+                with self.assertRaises(owner.CommandFailure) as caught:
+                    owner.Owner(ROOT, Path(directory), {}).command(['inert'])
+            self.assertEqual(caught.exception.reason, 'command_start')
+            self.assertEqual(owner.closed_status(caught.exception.status), {'kind': 'unavailable'})
+        for failure, reason in ((ValueError('PRIVATE_LIMIT_CANARY'), 'capture_limit'), (OSError('PRIVATE_READ_CANARY'), 'capture_read')):
+            with tempfile.TemporaryDirectory() as directory:
+                process = mock.Mock(); process.wait.return_value = 0
+                with mock.patch.object(owner.subprocess, 'Popen', return_value=process), mock.patch.object(owner, 'bounded', side_effect=failure):
+                    with self.assertRaises(owner.CommandFailure) as caught:
+                        owner.Owner(ROOT, Path(directory), {}).command(['inert'])
+                self.assertEqual(caught.exception.reason, reason)
+                process.wait.assert_called_once()
+                self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def project(self, records, dialect='cargo'):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / 'private-capture'
+            capture.write_bytes(records)
+            return owner.project_diagnostics(capture, ROOT, {'qshd/src/lib.rs'}, dialect)
+
+    @staticmethod
+    def diagnostic(path='qshd/src/lib.rs', code='E0308', **extra):
+        span = dict(file_name=path, is_primary=True, line_start=2, line_end=2, column_start=1, column_end=5,
+                    text=[dict(text='PRIVATE_SNIPPET_CANARY')], label='PRIVATE_LABEL_CANARY', suggested_replacement='PRIVATE_REPLACEMENT_CANARY', expansion={'span': {'file_name': '/private/EXPANSION_CANARY'}})
+        return dict(level='error', code=dict(code=code), message='PRIVATE_MESSAGE_CANARY', rendered='PRIVATE_RENDERED_CANARY', spans=[span], children=[dict(message='PRIVATE_CHILD_CANARY')], environment={'PRIVATE_ENV_CANARY': 'PRIVATE_VALUE_CANARY'}, fd=99123, pid=99124, nonce='PRIVATE_NONCE_CANARY', url='https://PRIVATE_URL_CANARY.invalid', **extra)
+
+    def test_closed_projection_remaps_only_exact_allowlisted_sources(self):
+        paths = ('qshd/src/lib.rs', str(ROOT) + '/qshd/src/lib.rs', '/qsh/qshd/src/lib.rs',
+                 '/private/SECRET_PATH_CANARY', '/qsh-lookalike/qshd/src/lib.rs', 'qshd/../qshd/src/lib.rs',
+                 str(ROOT) + '-lookalike/qshd/src/lib.rs', 'qshd/src/lib.rs\x00', 'qshd/src/not-allowlisted.rs')
+        for index, path in enumerate(paths):
+            result = self.project((json.dumps(dict(reason='compiler-message', message=self.diagnostic(path))) + '\n').encode())
+            location = result['records'][0]['primary_spans'][0]
+            self.assertEqual(location['source'], 'qshd/src/lib.rs' if index < 3 else 'external_or_unknown')
+            public = json.dumps(result)
+            for forbidden in ('CANARY', str(ROOT), 'rendered', 'message', 'children', 'suggested', 'expansion', '"environment"', '"fd"', '"pid"', '"nonce"', '"url"'):
+                self.assertNotIn(forbidden, public)
+
+    def test_codes_levels_spans_and_rustc_schema_are_closed(self):
+        for code, expected in [('E0308', 'E0308'), ('unused_imports', 'unused_imports'),
+                               ('clippy::SECRET_LINT_CANARY', 'unknown_code'), ('E12345', 'unknown_code')]:
+            d = self.diagnostic(code=code)
+            d.update({'$message_type': 'diagnostic'})
+            result = self.project((json.dumps(d) + '\n').encode(), 'rustc')
+            self.assertEqual(result['records'][0]['code'], expected)
+            self.assertNotIn('CANARY', json.dumps(result))
+        d = self.diagnostic(); d['level'] = 'PRIVATE_LEVEL_CANARY'; d['code'] = None
+        d['spans'] = d['spans'] * 9
+        result = self.project((json.dumps(dict(reason='compiler-message', message=d)) + '\n').encode())
+        self.assertEqual(result['records'][0]['level'], 'other')
+        self.assertEqual(result['records'][0]['code'], 'none')
+        self.assertEqual(len(result['records'][0]['primary_spans']), 4)
+        self.assertEqual(result['truncated_spans'], 5)
+
+    def test_projection_input_record_and_public_caps(self):
+        line = (json.dumps(dict(reason='compiler-message', message=self.diagnostic())) + '\n').encode()
+        data = line * 40 + b'plain PRIVATE_STDERR_CANARY\n{broken PRIVATE_CANARY\n' + b'{' + b'x' * (1024 * 1024) + b'\n' + b'{"reason":"PRIVATE_UNKNOWN_CANARY"}\n' + b'{'
+        result = self.project(data)
+        self.assertEqual(len(result['records']), 32)
+        self.assertEqual(result['oversized'], 1)
+        self.assertGreaterEqual(result['malformed'], 2)
+        self.assertEqual(result['unknown_records'], 1)
+        self.assertGreaterEqual(result['truncated'], 9)
+        self.assertLessEqual(len(json.dumps(result).encode()), 64 * 1024)
+        self.assertNotIn('CANARY', json.dumps(result))
+        with mock.patch.object(owner, 'bounded', side_effect=ValueError('PRIVATE_CANARY')):
+            self.assertEqual(owner.project_diagnostics(Path('inert'), ROOT, {}, 'cargo')['capture'], 'limit')
+        for value in (-1000, 1000, None, True):
+            self.assertEqual(owner.closed_status(value), {'kind': 'unavailable'})
+        self.assertEqual(owner.closed_status(-9), {'kind': 'signal', 'value': 9})
+
+    def test_actual_private_capture_limit_and_bounded_counters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock(); process.wait.return_value = 1
+            def start(argv, **kwargs):
+                kwargs['stdout'].truncate(32 * 1024 * 1024 + 1)
+                return process
+            with mock.patch.object(owner.subprocess, 'Popen', side_effect=start):
+                with self.assertRaises(owner.CommandFailure) as caught:
+                    owner.Owner(ROOT, Path(directory), {}).command(['inert'])
+            self.assertEqual(caught.exception.reason, 'capture_limit')
+            self.assertEqual(process.wait.call_count, 1)
+            self.assertEqual(owner.project_diagnostics(caught.exception.capture, ROOT, {}, 'cargo')['capture'], 'limit')
+        self.assertEqual(self.project(b'PRIVATE_CANARY\n' * 70000)['unstructured'], 65535)
+        raw = ('{"reason":"compiler-message","message":' + '{"nested":' * 2000 + '0' + '}' * 2000 + '}').encode()
+        self.assertNotIn('nested', json.dumps(self.project(raw)))
+        for value in (0, True, '2', 1_000_001):
+            span = self.diagnostic()['spans'][0]; span['line_start'] = value
+            self.assertEqual(owner.public_span(span, ROOT, {'qshd/src/lib.rs'}), {'source': 'external_or_unknown'})
+
+    def test_malformed_cargo_records_refuse_without_private_text(self):
+        for raw in (b'{"PRIVATE_SECRET_CANARY":', b'{' + b'x' * (1024 * 1024)):
+            with self.assertRaises(owner.Refusal) as caught: owner.cargo_records(raw)
+            self.assertEqual(caught.exception.reason, 'compiler_json')
+            self.assertNotIn('PRIVATE', str(caught.exception))
+
+    def test_fixed_public_manifest_rejects_symlink_without_diagnostic_reads(self):
+        self.assertIn('qshd/tests/fixtures/pty_eof/helper.rs', owner.PUBLIC_RUST_SOURCES)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'outside'; target.write_bytes(b'inert')
+            path = root / 'qshd/src/lib.rs'; path.parent.mkdir(parents=True); path.symlink_to(target)
+            with mock.patch.object(owner, 'PUBLIC_RUST_SOURCES', ('qshd/src/lib.rs',)):
+                self.assertEqual(owner.public_source_manifest(root), {})
 
 
 if __name__ == "__main__": unittest.main()
