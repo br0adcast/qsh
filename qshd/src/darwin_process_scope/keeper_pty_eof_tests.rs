@@ -955,10 +955,16 @@ mod native {
             return Err(io::Error::last_os_error());
         }
         let master = unsafe { File::from_raw_fd(fd) };
-        os_result(unsafe { libc::ioctl(fd, libc::TIOCPTYGRANT, 0) })?;
-        os_result(unsafe { libc::ioctl(fd, libc::TIOCPTYUNLK, 0) })?;
+        os_result(unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::TIOCPTYGRANT), 0) })?;
+        os_result(unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::TIOCPTYUNLK), 0) })?;
         let mut name = [0u8; 128];
-        os_result(unsafe { libc::ioctl(fd, libc::TIOCPTYGNAME, name.as_mut_ptr()) })?;
+        os_result(unsafe {
+            libc::ioctl(
+                fd,
+                libc::c_ulong::from(libc::TIOCPTYGNAME),
+                name.as_mut_ptr(),
+            )
+        })?;
         let end = name
             .iter()
             .position(|x| *x == 0)

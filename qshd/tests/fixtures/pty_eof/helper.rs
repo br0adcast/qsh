@@ -146,7 +146,8 @@ impl Helper {
         let session = syscall(unsafe { libc::setsid() });
         self.emit(Op::Session, slave, session, Some(id))?;
         if self.arm >= 2 {
-            let control = syscall(unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) });
+            let control =
+                syscall(unsafe { libc::ioctl(slave, libc::c_ulong::from(libc::TIOCSCTTY), 0) });
             self.emit(Op::Controlling, slave, control, Some(id))?;
             let foreground = syscall(unsafe { libc::tcsetpgrp(slave, libc::getpgrp()) });
             self.emit(Op::Foreground, slave, foreground, Some(id))?;
