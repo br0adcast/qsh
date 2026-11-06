@@ -355,6 +355,7 @@ jobs:
         run: |
           # Private state is retained on any failure; never upload raw fixtures.
           private=$(mktemp -d /tmp/qsh185.XXXXXXXX)
+          private=$( { cd -P -- "$private" && pwd -P; } 2>/dev/null) || exit 1
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"

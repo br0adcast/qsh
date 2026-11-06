@@ -54,6 +54,55 @@ class PrepareTests(unittest.TestCase):
         value=importlib.util.module_from_spec(spec);spec.loader.exec_module(value)
         return value
 
+    def staging_control(self, destination, expected, *, mask=0o077):
+        adapter=self.adapter();context=adapter.DiagnosticContext()
+        sentinel=RuntimeError('input sentinel')
+        old=os.umask(mask)
+        try:
+            with patch.object(adapter,'_native_host',return_value=dict(arch='arm64',execution='native',os_version='15.0')), \
+                 patch.object(adapter,'_open_input',side_effect=sentinel) as opened, \
+                 patch.object(adapter,'prepare',side_effect=AssertionError('prepare forbidden')), \
+                 patch.object(adapter,'_invoke_fixed',side_effect=AssertionError('executor forbidden')):
+                with self.assertRaises(expected) as caught:
+                    adapter.run_archive(self.archive,self.meta,VERSION,TARGET,destination,self.root/'inert-harness',
+                                        source_commit='a'*40,diagnostic=context)
+        finally:
+            os.umask(old)
+        self.assertEqual(context.diagnostic_state,'NOT_ATTEMPTED')
+        self.assertIsNone(context.harness_status);self.assertIsNone(context.rust_outcome)
+        if expected is RuntimeError:
+            self.assertIs(caught.exception,sentinel);opened.assert_called_once()
+            self.assertEqual(context.phase,'INPUT_BINDING')
+            self.assertEqual(destination.stat().st_mode&0o777,0o700)
+        else:
+            opened.assert_not_called();self.assertEqual(context.phase,'STAGING')
+            if expected is ValueError:self.assertEqual(str(caught.exception),'DESTINATION')
+
+    def test_verbatim_alias_refuses_before_input_binding(self):
+        physical=self.root.resolve();private=physical/'private';private.mkdir(mode=0o700)
+        alias=physical/'alias';alias.symlink_to(private,target_is_directory=True)
+        self.staging_control(alias/'run',ValueError)
+        self.assertFalse((private/'run').exists())
+
+    def test_canonical_destination_reaches_input_binding(self):
+        self.staging_control(self.root.resolve()/'run',RuntimeError)
+
+    def test_destination_guards_remain_strict(self):
+        physical=self.root.resolve()
+        for path in (Path('relative-run'),physical/'absent'/'..'/'run'):
+            with self.subTest(path=path):self.staging_control(path,ValueError)
+        existing=physical/'existing';existing.mkdir();(existing/'sentinel').write_bytes(b'preserve')
+        self.staging_control(existing,FileExistsError)
+        self.assertEqual((existing/'sentinel').read_bytes(),b'preserve')
+        for mask in (0o022,0o077,0o777):
+            destination=physical/('mask-'+str(mask))
+            try:
+                with self.subTest(mask=mask):
+                    self.staging_control(destination,ValueError if mask==0o777 else RuntimeError,mask=mask)
+                    if mask==0o777:self.assertEqual(destination.stat().st_mode&0o777,0)
+            finally:
+                if destination.exists():destination.chmod(0o700)
+
     def archive_bytes(self,extra=None,omit=None):
         buffer=io.BytesIO()
         with tarfile.open(fileobj=buffer,mode='w:gz',format=tarfile.USTAR_FORMAT) as archive:
