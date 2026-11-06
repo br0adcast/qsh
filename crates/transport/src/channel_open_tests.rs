@@ -364,11 +364,14 @@ fn open24_late_receipt_retry_releases_the_exact_retained_registration() {
     ));
     let receipt = custody.cleanup_notifier();
     drop(job);
-    assert!(matches!(receipt.retry_cleanup(), CleanupStatus::Unknown));
+    assert!(matches!(custody.retry_cleanup(), CleanupStatus::Unknown));
+    assert_eq!(session.occupied(), 1);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 0);
     assert_eq!(registry.outstanding(), 1);
     observation.confirmed.store(true, Ordering::SeqCst);
     assert!(matches!(
-        receipt.retry_cleanup(),
+        custody.retry_cleanup(),
         CleanupStatus::Confirmed(_)
     ));
     assert_eq!(registry.outstanding(), 0);
@@ -382,6 +385,9 @@ fn open24_late_receipt_retry_releases_the_exact_retained_registration() {
         0,
         "duplicate receipt cannot refund twice"
     );
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -662,6 +668,10 @@ async fn open24_executor_constructor_panic_keeps_unknown_until_late_receipt() {
         matches!(job.take_outcome(), Some(OpenOutcome::Failed(reason)) if reason == "channel creation failed")
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        job.custody().retry_cleanup(),
+        CleanupStatus::Unknown
+    ));
     assert_eq!(registry.outstanding(), 1);
     assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
     assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 0);
@@ -673,6 +683,7 @@ async fn open24_executor_constructor_panic_keeps_unknown_until_late_receipt() {
     ));
     assert_eq!(registry.outstanding(), 0);
     assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -873,4 +884,162 @@ fn cleanup143_try_snapshot_discards_partial_counts_on_capsule_contention() {
         unreachable!()
     };
     assert!(registry.finish_cleanup(job.id(), &proof));
+}
+
+#[test]
+fn initial_admission_cancel_before_commit_skips_callback() {
+    let (custody, _guard, _) = protected();
+    let stale = custody.is_cancelled();
+    assert!(!stale);
+    custody.cancel(); // Completes between the initial read and queue commitment.
+    let called = AtomicBool::new(false);
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Cancelled)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+#[test]
+fn initial_admission_commit_before_cancel_is_preserved() {
+    let (custody, _guard, _) = protected();
+    let committed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&committed);
+    let cancel_custody = custody.clone();
+    let cancel = std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        cancel_custody.cancel();
+    });
+    let result = custody.try_commit_initial_admission(|| {
+        assert!(matches!(
+            custody.inner.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        committed.store(true, Ordering::SeqCst);
+        37
+    });
+    assert_eq!(result, Ok(37));
+    cancel.join().unwrap();
+    assert!(custody.is_cancelled());
+    assert_eq!(
+        custody.try_commit_initial_admission(|| panic!("second admission")),
+        Err(InitialAdmissionError::Cancelled)
+    );
+}
+
+#[test]
+fn initial_admission_queue_refusal_preserves_custody() {
+    let (custody, _guard, observation) = protected();
+    assert_eq!(
+        custody.try_commit_initial_admission(|| Err::<(), _>(std::io::ErrorKind::WouldBlock)),
+        Ok(Err(std::io::ErrorKind::WouldBlock))
+    );
+    assert!(!custody.is_cancelled());
+    assert_eq!(observation.waits.load(Ordering::SeqCst), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(custody.try_commit_initial_admission(|| true), Ok(true));
+}
+
+#[test]
+fn initial_admission_requires_healthy_construction() {
+    let called = AtomicBool::new(false);
+    let missing = OpenCustody::new();
+    assert_eq!(
+        missing.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    let (custody, guard, _) = protected();
+    let channel = guard.finish(
+        Box::new(std::io::empty()),
+        Box::new(std::io::sink()),
+        Box::new(Resize),
+    );
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    drop(channel);
+    for field in 0..4 {
+        let (custody, _guard, _) = protected();
+        {
+            let mut state = custody.inner.state.lock().unwrap();
+            match field {
+                0 => state.constructing = false,
+                1 => state.leased = true,
+                2 => state.adopted = true,
+                _ => state.terminal = Some(ProofKind::NoChild),
+            }
+        }
+        assert_eq!(
+            custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+            Err(InitialAdmissionError::Unavailable)
+        );
+    }
+    let (custody, _guard, _) = protected();
+    let poisoned = custody.clone();
+    assert!(std::thread::spawn(move || {
+        let _lock = poisoned.inner.state.lock().unwrap();
+        panic!("controlled capsule poison");
+    })
+    .join()
+    .is_err());
+    assert_eq!(
+        custody.try_commit_initial_admission(|| called.store(true, Ordering::SeqCst)),
+        Err(InitialAdmissionError::Unavailable)
+    );
+    assert!(!called.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn open24_executor_removed_registration_retains_exact_cleanup_confirmation() {
+    let registry = ChannelOpenRegistry::new(OpenLimits {
+        global: 1,
+        per_uid: 1,
+    });
+    let session = registry.session().unwrap();
+    let job = registry
+        .try_reserve(&session, request(&session, 9, 1))
+        .unwrap();
+    let observation = Arc::new(Observation::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = ChannelOpenExecutor::new(
+        Arc::new(ExecutorSpawn {
+            registry: registry.clone(),
+            observation: observation.clone(),
+            calls: calls.clone(),
+            panic_after_protect: true,
+        }),
+        registry.clone(),
+    );
+    observation.confirmed.store(true, Ordering::SeqCst);
+    executor.submit(&job).unwrap();
+    job.take_worker().unwrap().await.unwrap();
+    assert!(
+        matches!(job.take_outcome(), Some(OpenOutcome::Failed(reason)) if reason == "channel creation failed")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.outstanding(), 0);
+    assert_eq!(session.occupied(), 0);
+    assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
+    // Registry lookup is not the retained exact-owner terminal certificate.
+    assert!(matches!(job.cleanup(), CleanupStatus::Unknown));
+    assert!(matches!(
+        job.custody().retry_cleanup(),
+        CleanupStatus::Confirmed(_)
+    ));
+    let waits = observation.waits.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(matches!(
+            job.custody().retry_cleanup(),
+            CleanupStatus::Confirmed(_)
+        ));
+        assert_eq!(registry.outstanding(), 0);
+        assert_eq!(session.occupied(), 0);
+        assert_eq!(observation.waits.load(Ordering::SeqCst), waits);
+        assert_eq!(observation.wait_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
+    }
 }

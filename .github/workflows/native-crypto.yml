@@ -1,10 +1,19 @@
 name: Native crypto prerequisite
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-build' && format('PTY EOF build · {0} · {1}', github.ref_name, github.sha) || github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-control' && format('PTY EOF control · {0} · {1}', github.ref_name, github.sha) || '' }}
 
 on:
   pull_request:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'qshd/**'
+      - 'crates/logging/**'
+      - 'crates/transport/**'
+      - 'crates/terminal-size/**'
+      - 'crates/terminal/**'
+      - 'vendor/vte/**'
+      - 'vendor/alacritty_terminal/**'
+      - '.github/workflows/ci.yml'
       - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
@@ -29,6 +38,14 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'qshd/**'
+      - 'crates/logging/**'
+      - 'crates/transport/**'
+      - 'crates/terminal-size/**'
+      - 'crates/terminal/**'
+      - 'vendor/vte/**'
+      - 'vendor/alacritty_terminal/**'
+      - '.github/workflows/ci.yml'
       - 'cli/Cargo.toml'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
@@ -49,6 +66,13 @@ on:
       - 'scripts/tests/test_rpm_tool.py'
       - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixed qualification or standalone PTY EOF diagnostic stage
+        type: choice
+        required: true
+        default: qualification
+        options: [qualification, pty-eof-build, pty-eof-control]
   workflow_call:
 
 permissions:
@@ -61,6 +85,7 @@ env:
 
 jobs:
   portable:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -78,8 +103,177 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install native prerequisites
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
+          else
+            brew install gnupg
+          fi
+      - name: Build and execute the pinned backend
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          args=()
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Only kernel UAPI headers supplement musl's own include path;
+            # adding /usr/include wholesale would mix glibc and musl headers.
+            uapi="$RUNNER_TEMP/kernel-uapi"
+            mkdir -p "$uapi"
+            ln -s /usr/include/linux "$uapi/linux"
+            ln -s /usr/include/asm-generic "$uapi/asm-generic"
+            ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
+            args+=(--cflag=-idirafter --cflag="$uapi")
+          fi
+          bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}"
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}")
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Install qualified Rust for linked product checks
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add '${{ matrix.target }}'
+          scripts/check-qualified-rust.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: native-products-${{ matrix.target }}
+      - name: Qualify offline release authentication
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          python3 -I -B -m unittest discover -s scripts/tests -p test_native_verifier_paths.py
+          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          # Darwin's linker records object paths separately from compiler source paths.
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          if [ "$NATIVE_TARGET" = x86_64-apple-darwin ]; then
+            test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
+            export RUSTFLAGS="$RUSTFLAGS -Dwarnings"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          cargo test --locked -p release-auth --all-targets --target "$NATIVE_TARGET"
+          cargo build --locked -p release-auth --example verify-release --target "$NATIVE_TARGET"
+          verifier="target/$NATIVE_TARGET/debug/examples/verify-release"
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "$verifier")
+            if grep -q NEEDED <<< "$dynamic"; then
+              echo 'musl release verifier imports dynamic libraries' >&2
+              exit 1
+            fi
+          else
+            dynamic=$(otool -L "$verifier")
+            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
+              echo 'release verifier imports a dynamic crypto backend' >&2
+              exit 1
+            fi
+          fi
+          python3 -I -B scripts/check-native-verifier-paths.py \
+            "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+      - name: Qualify the linked products and generated RSA operations
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
+          fi
+          rsa_baseline_rustflags="$RUSTFLAGS"
+          if [ "$NATIVE_TARGET" = x86_64-apple-darwin ]; then
+            test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
+            export RUSTFLAGS="$RUSTFLAGS -Dwarnings"
+          fi
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
+          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
+          RUSTFLAGS="$rsa_baseline_rustflags" cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
+            --test rsa_file_signing --test native_rsa_backend -- --include-ignored
+          if [ "$RUNNER_OS" = Linux ]; then
+            dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
+            if grep -q NEEDED <<< "$dynamic"; then
+              echo 'musl products import dynamic libraries' >&2
+              exit 1
+            fi
+          else
+            dynamic=$(otool -L "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
+            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
+              echo 'products import an unqualified dynamic native backend' >&2
+              exit 1
+            fi
+          fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          if [ "$RUNNER_OS" = Linux ]; then
+            strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
+          else
+            strip "target/$NATIVE_TARGET/release/qsh"
+            strip "target/$NATIVE_TARGET/release/qshd"
+          fi
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B scripts/check-native-verifier-paths.py \
+                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
+            done
+          done
+          for target in "$NATIVE_TARGET"; do
+            for program in qsh qshd; do
+              binary="target/$target/release/$program"
+              python3 -I -B - "$binary" "$target" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          binary = Path(sys.argv[1])
+          data = binary.read_bytes()
+          print(json.dumps(dict(schema=1, kind='native-product-path-qualification',
+                                target=sys.argv[2], program=binary.name, profile='release',
+                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
+                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
+          PY
+            done
+          done
+
+  # Ownership gets its own budget; measured crypto/product prerequisites used
+  # almost 31 minutes of the shared 35-minute Intel job before owner compilation.
+  darwin-owner-intel:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    name: Native Intel Darwin process owner
+    runs-on: macos-15-intel
+    timeout-minutes: 35
+    env:
+      NATIVE_TARGET: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Bind the Intel owner checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_sha=$(git rev-parse HEAD)
+          test "$checkout_sha" = "$GITHUB_SHA"
+          printf 'darwin223 checkout=%s event=%s run=%s attempt=%s\n' "$checkout_sha" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
       - name: Observe the Intel Darwin runtime
-        if: matrix.target == 'x86_64-apple-darwin'
         shell: bash
         timeout-minutes: 2
         run: |
@@ -166,148 +360,218 @@ jobs:
           if __name__ == '__main__':
               raise SystemExit(main())
           PY
-      - name: Install native prerequisites
+      - name: Install native owner prerequisites
+        run: brew install gnupg
+      - name: Build and execute the pinned owner backend
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y musl-tools linux-libc-dev perl make gnupg
-          else
-            brew install gnupg
-          fi
-      - name: Build and execute the pinned backend
-        shell: bash
-        env:
-          NATIVE_TARGET: ${{ matrix.target }}
-        run: |
-          args=()
-          if [ "$RUNNER_OS" = Linux ]; then
-            # Only kernel UAPI headers supplement musl's own include path;
-            # adding /usr/include wholesale would mix glibc and musl headers.
-            uapi="$RUNNER_TEMP/kernel-uapi"
-            mkdir -p "$uapi"
-            ln -s /usr/include/linux "$uapi/linux"
-            ln -s /usr/include/asm-generic "$uapi/asm-generic"
-            ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
-            args+=(--cflag=-idirafter --cflag="$uapi")
-          fi
           bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" \
-            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}"
+            --toolchain-id "$ImageOS/$ImageVersion"
           prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
             --cache "$RUNNER_TEMP/native-crypto" \
-            --toolchain-id "$ImageOS/$ImageVersion" "${args[@]}")
+            --toolchain-id "$ImageOS/$ImageVersion")
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
-      - name: Install qualified Rust for linked product checks
+      - name: Install qualified Rust for owner checks
         run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-          rustup target add '${{ matrix.target }}'
+          rustup target add "$NATIVE_TARGET"
           scripts/check-qualified-rust.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          key: native-products-${{ matrix.target }}
-      - name: Qualify offline release authentication
+          key: native-owner-x86_64-apple-darwin
+      - name: Qualify the production Intel Darwin process owner
         shell: bash
-        env:
-          NATIVE_TARGET: ${{ matrix.target }}
         run: |
-          python3 -I -B -m unittest discover -s scripts/tests -p test_native_verifier_paths.py
-          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
-          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
-          # Darwin's linker records object paths separately from compiler source paths.
-          if [ "$RUNNER_OS" = macOS ]; then
-            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
-          fi
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          test -z "${CARGO_ENCODED_RUSTFLAGS:-}"
+          cargo_home="$CARGO_HOME"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
           export AWS_LC_SYS_USE_SYSTEM=0
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
-          cargo test --locked -p release-auth --all-targets --target "$NATIVE_TARGET"
-          cargo build --locked -p release-auth --example verify-release --target "$NATIVE_TARGET"
-          verifier="target/$NATIVE_TARGET/debug/examples/verify-release"
-          if [ "$RUNNER_OS" = Linux ]; then
-            dynamic=$(readelf -d "$verifier")
-            if grep -q NEEDED <<< "$dynamic"; then
-              echo 'musl release verifier imports dynamic libraries' >&2
-              exit 1
-            fi
-          else
-            dynamic=$(otool -L "$verifier")
-            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
-              echo 'release verifier imports a dynamic crypto backend' >&2
-              exit 1
-            fi
-          fi
-          python3 -I -B scripts/check-native-verifier-paths.py \
-            "$verifier" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
-      - name: Qualify the linked products and generated RSA operations
-        shell: bash
-        env:
-          NATIVE_TARGET: ${{ matrix.target }}
-        run: |
-          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
-          if [ "$RUNNER_OS" = macOS ]; then
-            export RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/"
-          fi
-          export AWS_LC_SYS_USE_SYSTEM=0
-          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
-          if [ "$RUNNER_OS" = Linux ]; then export CC=musl-gcc; fi
-          cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
-          cargo test --locked -p sshauth --target "$NATIVE_TARGET" \
-            --test rsa_file_signing --test native_rsa_backend -- --include-ignored
-          if [ "$RUNNER_OS" = Linux ]; then
-            dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
-            if grep -q NEEDED <<< "$dynamic"; then
-              echo 'musl products import dynamic libraries' >&2
-              exit 1
-            fi
-          else
-            dynamic=$(otool -L "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
-            if grep -Ei 'lib(ssl|crypto).*dylib' <<< "$dynamic"; then
-              echo 'products import an unqualified dynamic native backend' >&2
-              exit 1
-            fi
-          fi
-          for target in "$NATIVE_TARGET"; do
-            for program in qsh qshd; do
-              binary="target/$target/release/$program"
-              python3 -I -B scripts/check-native-verifier-paths.py \
-                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
-            done
+          rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
+          scripts/check-qualified-rust.sh
+          rustc -vV
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-darwin-owner.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          select_artifact() {
+            python3 -I -B - "$1" "$2" "$3" "$4" <<'PY_ARTIFACT'
+          import hashlib, json, os, pathlib, sys
+          root = pathlib.Path.cwd().resolve(strict=True)
+          kind, features = sys.argv[3], set(sys.argv[4].split(','))
+          assert kind in {'bin', 'lib'}
+          manifest = root / 'qshd/Cargo.toml'
+          source = root / ('qshd/src/main.rs' if kind == 'bin' else 'qshd/src/lib.rs')
+          records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+          records = [r for r in records if r.get('reason') == 'compiler-artifact'
+                     and r.get('target', {}).get('name') == 'qshd'
+                     and r.get('target', {}).get('kind') == [kind]
+                     and r.get('executable')]
+          assert len(records) == 1, 'expected one current Cargo qshd artifact'
+          record = records[0]
+          assert record.get('profile', {}).get('test') is (kind == 'lib')
+          assert set(record['features']) == features, 'wrong fixture feature configuration'
+          assert pathlib.Path(record['manifest_path']).resolve(strict=True) == manifest
+          assert pathlib.Path(record['target']['src_path']).resolve(strict=True) == source
+          executable = pathlib.Path(record['executable'])
+          assert executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK)
+          executable = executable.resolve(strict=True)
+          assert (root / 'target').resolve(strict=True) in executable.parents
+          sha = hashlib.sha256(executable.read_bytes()).hexdigest()
+          prefix = pathlib.Path(sys.argv[2])
+          prefix.with_suffix('.path').write_text(str(executable))
+          prefix.with_suffix('.sha256').write_text(sha)
+          receipt = dict(kind='darwin-custody-Cargo-artifact', target_kind=kind, features=sorted(features),
+                         profile_test=record['profile']['test'], sha256=sha,
+                         manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+          prefix.with_suffix('.json').write_text(json.dumps(receipt, sort_keys=True) + '\n')
+          print(json.dumps(receipt, sort_keys=True))
+          PY_ARTIFACT
+          }
+          verify_harness() {
+            test "$(shasum -a 256 "$1" | awk '{print $1}')" = "$(cat "$2")"
+          }
+          timed() {
+            local stage=$1 result
+            shift
+            printf 'darwin223 timing stage=%s event=start unix_seconds=%s\n' "$stage" "$(date +%s)" >&2
+            if "$@"; then result=0; else result=$?; fi
+            printf 'darwin223 timing stage=%s event=end unix_seconds=%s status=%s\n' "$stage" "$(date +%s)" "$result" >&2
+            return "$result"
+          }
+          timed ordinary-daemon cargo build -p qshd --bin qshd --profile test --features test-build-labels --locked --target "$NATIVE_TARGET" --message-format=json-render-diagnostics > "$runtime/build.jsonl"
+          select_artifact "$runtime/build.jsonl" "$runtime/ordinary-daemon" bin test-build-labels
+          export QSH_DARWIN223_DAEMON="$(cat "$runtime/ordinary-daemon.path")"
+          export QSH_DARWIN223_DAEMON_SHA256="$(cat "$runtime/ordinary-daemon.sha256")"
+          timed ordinary-harness cargo test -p qshd --lib --features test-build-labels --locked --target "$NATIVE_TARGET" --no-run --message-format=json-render-diagnostics > "$runtime/ordinary-harness.jsonl"
+          select_artifact "$runtime/ordinary-harness.jsonl" "$runtime/ordinary-harness" lib test-build-labels
+          ordinary_harness="$(cat "$runtime/ordinary-harness.path")"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          timed modern-runtime "$ordinary_harness" darwin_process_scope::native_tests::darwin223_native_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/results.log"
+          for name in \
+            darwin_process_scope::native_tests::darwin223_native_noncooperative_token_exec_and_bound_exit \
+            darwin_process_scope::native_tests::darwin223_native_signaled_leader_scope_uses_portable_code_one \
+            darwin_process_scope::native_tests::darwin223_native_already_zombie_handshake_child_keeps_reserved_leader \
+            darwin_process_scope::native_tests::darwin223_native_classification_bracket_refuses_exec_and_one_sided_zombie \
+            darwin_process_scope::native_tests::darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins \
+            darwin_process_scope::native_tests::darwin223_native_connected_close_stop_rebind_and_fresh_session \
+            darwin_process_scope::native_tests::darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork \
+            darwin_process_scope::native_tests::darwin223_native_term_and_interrupt_join_real_manager_and_workers \
+            darwin_process_scope::native_tests::darwin223_native_partial_descriptor_failure_retains_real_process_owner \
+            darwin_process_scope::native_tests::darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
           done
-          if [ "$RUNNER_OS" = Linux ]; then
-            strip "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd"
-          else
-            strip "target/$NATIVE_TARGET/release/qsh"
-            strip "target/$NATIVE_TARGET/release/qshd"
-          fi
-          for target in "$NATIVE_TARGET"; do
-            for program in qsh qshd; do
-              binary="target/$target/release/$program"
-              python3 -I -B scripts/check-native-verifier-paths.py \
-                "$binary" "$GITHUB_WORKSPACE" "$cargo_home" "$RUNNER_TEMP"
-            done
+          ! grep -F 'SKIPPED' "$runtime/results.log"
+          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
+          for name in \
+            darwin_process_scope::keeper_tests::keeper_native_exit37_and_pty_eof \
+            darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork \
+            darwin_process_scope::keeper_tests::keeper_native_broker_group_intrusion \
+            darwin_process_scope::keeper_tests::keeper_native_cancel_before_admit_no_application
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/keeper-results.log"
           done
-          for target in "$NATIVE_TARGET"; do
-            for program in qsh qshd; do
-              binary="target/$target/release/$program"
-              python3 -I -B - "$binary" "$target" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import sys
-          binary = Path(sys.argv[1])
-          data = binary.read_bytes()
-          print(json.dumps(dict(schema=1, kind='native-product-path-qualification',
-                                target=sys.argv[2], program=binary.name, profile='release',
-                                stage='stripped', sha256=hashlib.sha256(data).hexdigest(),
-                                bytes=len(data)), sort_keys=True, separators=(',', ':')))
-          PY
-            done
+          if grep -F 'SKIPPED' "$runtime/keeper-results.log"; then exit 1; fi
+          grep -F 'test result: ok. 4 passed; 0 failed; 0 ignored;' "$runtime/keeper-results.log"
+          if grep -F 'rescue=true' "$runtime/keeper-results.log"; then exit 1; fi
+          test "$(grep -Fc 'case=cancel after_admit=false expired=false noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
+          test "$(grep -Fc 'case=cancel after_admit=true expired=false noapp=false app=Some(' "$runtime/keeper-results.log")" -eq 1
+          test "$(grep -Fc 'case=cancel after_admit=false expired=true noapp=true app=None' "$runtime/keeper-results.log")" -eq 1
+          timed feature-check cargo check -p qshd --lib --bin qshd --features test-darwin-keeper --locked --target "$NATIVE_TARGET"
+          timed feature-clippy cargo clippy -p qshd --lib --bin qshd --features test-darwin-keeper --locked --target "$NATIVE_TARGET" -- -D warnings
+          timed feature-daemon cargo build -p qshd --bin qshd --profile test --features test-darwin-keeper --locked --target "$NATIVE_TARGET" --message-format=json-render-diagnostics > "$runtime/keeper-integrated-build.jsonl"
+          select_artifact "$runtime/keeper-integrated-build.jsonl" "$runtime/feature-daemon" bin test-build-labels,test-darwin-keeper
+          export QSH_DARWIN223_DAEMON="$(cat "$runtime/feature-daemon.path")"
+          export QSH_DARWIN223_DAEMON_SHA256="$(cat "$runtime/feature-daemon.sha256")"
+          printf 'keeper223 compatibility_Cargo_binary_sha256=%s source=compiled-missing\n' "$QSH_DARWIN223_DAEMON_SHA256"
+          timed feature-harness cargo test -p qshd --lib --features test-darwin-keeper --locked --target "$NATIVE_TARGET" --no-run --message-format=json-render-diagnostics > "$runtime/feature-harness.jsonl"
+          select_artifact "$runtime/feature-harness.jsonl" "$runtime/feature-harness" lib test-build-labels,test-darwin-keeper
+          feature_harness="$(cat "$runtime/feature-harness.path")"
+          verify_harness "$feature_harness" "$runtime/feature-harness.sha256"
+          timed command-terminal-contrast "$feature_harness" --ignored --exact darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/keeper-command-contrast-results.log"
+          awk -v expected="test darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast ... " '
+            /^test .* \.\.\. / { starts++ }
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(starts == 1 && seen == 1 && passed == 1) }
+          ' "$runtime/keeper-command-contrast-results.log"
+          test "$(grep -Fxc 'running 1 test' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fxc 'keeper223 terminal kind=Command screen=false real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fxc 'keeper223 connected_join=normal registry=0 screen_credits=0 two_io_joins=terminal_certificate rescue=false' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          if grep -E 'SKIPPED|rescue=true|boundary=failure_rescue' "$runtime/keeper-command-contrast-results.log"; then exit 1; fi
+          verify_harness "$feature_harness" "$runtime/feature-harness.sha256"
+          timed integrated-runtime "$feature_harness" darwin_process_scope::keeper_integration_tests::keeper_integrated_ \
+            --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-integrated-results.log"
+          for name in \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_terminal_status_and_io \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_open_cancel_and_setup_failure \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_close_stop_rebind_and_fresh_session \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_term_interrupt_join \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_actual_daemon_replacement \
+            darwin_process_scope::keeper_integration_tests::keeper_integrated_foreign_sid_retains_debt
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/keeper-integrated-results.log"
           done
+          if grep -F 'SKIPPED' "$runtime/keeper-integrated-results.log"; then exit 1; fi
+          if grep -F 'rescue=true' "$runtime/keeper-integrated-results.log"; then exit 1; fi
+          grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$runtime/keeper-integrated-results.log"
+          grep -F 'keeper223 route=keeper source=compiled-missing' "$runtime/keeper-integrated-results.log"
+          for screen in false true
+          do
+            test "$(grep -Fxc "keeper223 terminal kind=Command screen=$screen real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false" "$runtime/keeper-integrated-results.log")" -eq 1
+            test "$(grep -Fxc "keeper223 terminal kind=Shell screen=$screen eof_contract=normal_completion real_eof_delivered=true reader_join_held=true cleanup_receipts=true screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false" "$runtime/keeper-integrated-results.log")" -eq 1
+          done
+          test "$(grep -c '^keeper223 terminal ' "$runtime/keeper-integrated-results.log")" -eq 4
+          if grep -E 'SKIPPED|rescue=true|boundary=failure_rescue' "$runtime/keeper-integrated-results.log"; then exit 1; fi
+          test "$(grep -Fc 'keeper223 open_executor mode=' "$runtime/keeper-integrated-results.log")" -eq 4
+          grep -F 'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false' "$runtime/keeper-integrated-results.log"
+          grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
+          grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
 
   system-floors:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native system floor (${{ matrix.format }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -371,3 +635,68 @@ jobs:
                 fi
               done
             '
+
+  dispatch-mode:
+    name: Validate manual mode
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Refuse unknown manual modes
+        env:
+          PTY_EOF_MODE: ${{ inputs.mode }}
+        run: |
+          python3 -I -B - <<'PY_MODE'
+          import os
+          if os.environ['PTY_EOF_MODE'] not in ('qualification', 'pty-eof-build', 'pty-eof-control'):
+              raise SystemExit('manual mode refused')
+          PY_MODE
+
+  pty-eof-diagnostic:
+    name: PTY EOF ${{ inputs.mode == 'pty-eof-build' && 'build' || 'control' }} (${{ matrix.target }})
+    needs: dispatch-mode
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install native diagnostic prerequisites
+        run: brew install gnupg
+      - name: Qualify the pinned diagnostic backend
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion"
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion")
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Install qualified Rust for standalone controls
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add "$NATIVE_TARGET"
+          rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
+          scripts/check-qualified-rust.sh
+      - name: Build and qualify only the fixed standalone stage
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+          PTY_EOF_MODE: ${{ inputs.mode }}
+        run: |
+          python3 -I -B scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"

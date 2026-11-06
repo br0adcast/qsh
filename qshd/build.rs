@@ -19,6 +19,14 @@ fn main() {
             .warnings(true)
             .extra_warnings(true)
             .compile("qsh_handover_darwin");
+        println!("cargo:rerun-if-changed=src/darwin_process_scope/native.c");
+        println!("cargo:rerun-if-changed=src/darwin_process_scope/native.h");
+        cc::Build::new()
+            .file("src/darwin_process_scope/native.c")
+            .flag_if_supported("-std=c11")
+            .warnings(true)
+            .extra_warnings(true)
+            .compile("qsh_darwin_process_scope");
         println!("cargo:rustc-link-lib=proc");
     }
     // Rebuild when HEAD (or a ref it points at) moves, so the stamp tracks

@@ -40,6 +40,9 @@ system = ["nix/process", "nix/socket", "nix/signal", "nix/fs", "nix/poll", "nix/
 # default and never enabled by `scripts/build-qshd-assets.sh`: a binary a
 # client installs has no such branch.
 test-build-labels = []
+# Native compatibility fixtures only. Ordinary/release/assets builds omit this.
+# Simulates Missing for selection; admission and all native ownership APIs stay real.
+test-darwin-keeper = ["test-build-labels"]
 
 [dev-dependencies]
 transport = { path = "../crates/transport", features = ["tokio-driver", "testnet"] }

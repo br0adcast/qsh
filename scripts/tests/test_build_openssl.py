@@ -1072,7 +1072,7 @@ class ProductEntrypointTests(unittest.TestCase):
         import shutil
         callers = {
             '.github/workflows/ci.yml': 3,
-            '.github/workflows/native-crypto.yml': 1,
+            '.github/workflows/native-crypto.yml': 3,  # Includes the closed diagnostic job.
             '.github/workflows/release.yml': 2,
             'packaging/build-server-packages.sh': 1,
             'packaging/acceptance.sh': 1,
@@ -1119,6 +1119,11 @@ class ProductEntrypointTests(unittest.TestCase):
                         argv = json.loads(record.read_text())
                         self.assertEqual(argv[:2], ['--target', target])
                         self.assertIn('--cache', argv)
+                        if caller == '.github/workflows/native-crypto.yml' and index == 2:
+                            self.assertEqual(argv, ['--target', target, '--cache',
+                                                    str(Path(temp) / 'native-crypto'),
+                                                    '--toolchain-id', 'fixture/1'])
+                            self.assertFalse(os.access(wrapper, os.X_OK))
 
 
 if __name__ == '__main__':

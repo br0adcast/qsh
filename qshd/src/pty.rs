@@ -364,7 +364,7 @@ pub fn spawn_command(
 /// `portable-pty` does not expose a termios API directly -- only the
 /// master side's raw file descriptor via [`MasterPty::as_raw_fd`]; termios
 /// is read and written on top of it via the `nix` crate.
-fn disable_echo(master: &(dyn MasterPty + Send)) -> Result<()> {
+pub(crate) fn disable_echo(master: &(dyn MasterPty + Send)) -> Result<()> {
     let fd = master
         .as_raw_fd()
         .context("the PTY master side does not hand over a file descriptor")?;
