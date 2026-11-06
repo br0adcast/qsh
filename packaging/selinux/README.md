@@ -247,18 +247,17 @@ This subsection states the current source contract and its fail-closed limits.
 It is not Fedora transaction acceptance (see the end of this section), and it
 does not authorize adopting unknown state, automatic repair or relaxed checks.
 
-**Configuration prerequisites.** These checks apply to more than upgrade.
-While the consumer is installed, every phase checks the PAM and sidecar
-conditions below: consumer upgrade, consumer post, final consumer erase,
-provider upgrade and managed prestart. The retained-entry limits apply to every
-phase, including fresh provider activation and final provider erase.
+**Supported configuration.** The paired contract supports only the
+configuration below, for every phase and not just upgrade. The phases do not
+all enforce it identically; the next paragraph says which phase checks what. A
+condition that a given phase does not check stays outside the supported
+configuration.
 
 - `/etc/pam.d/qshd` holds exactly the packaged bytes, owned by root:root with
   mode 0644. The provider ships the same canonical bytes as
   `/usr/share/qshd-selinux/qshd.fedora-selinux`, and `rpm -V qshd` must not
-  report the file. A customized profile, even a deliberate one, refuses
-  maintenance and managed start alike. The paired contract has no supported
-  customized PAM profile.
+  report the file. The paired contract has no supported customized PAM
+  profile.
 - `/etc/pam.d/qshd.rpmnew` and `/etc/pam.d/qshd.rpmsave` are absent.
 - Retained entries are finite. `/etc/qshd` may contain only `host_key`.
   `/var/log/qshd` may contain only `qshd.log` and `qshd.log.1`. `/run/qshd`
@@ -271,13 +270,40 @@ phase, including fresh provider activation and final provider erase.
   - it carries the label the phase expects: defaults before fresh provider
     activation, qshd types afterward.
 
-  `/var/run` must be the usual symlink to `/run`. Any other entry refuses, for
-  example an extra or compressed rotated log or a key backup.
+  `/var/run` must be the usual symlink to `/run`. Any other entry, for example
+  an extra or compressed rotated log or a key backup, is unsupported.
 - While the consumer is not installed, `/usr/bin/qshd`, `/etc/pam.d/qshd` and
-  both sidecars must be absent. This covers fresh provider activation, a fresh
-  consumer install, a provider upgrade without the consumer, and final
-  provider erase. A leftover profile from another `qshd` package therefore
-  refuses these phases too.
+  both sidecars are absent.
+
+**What each phase checks.** This is the current source, not a stronger promise:
+
+- *Pair phases while the consumer is installed*: consumer upgrade pre,
+  consumer post, final consumer erase, and provider upgrade pre and post. They
+  check the following:
+  - the canonical PAM bytes and the absence of both sidecars;
+  - the installed consumer files against the consumer's RPM header entries,
+    including owner and group root, the exact 0644 PAM mode and the size;
+  - the retained-entry limits with qshd labels.
+
+  A customized profile, even a deliberate one, therefore refuses these
+  phases, not only upgrade.
+- *Managed prestart* requires the canonical PAM bytes. It also requires the
+  profile to be root-owned, with an owner read bit and no group or other write
+  bit. It checks the retained-entry limits with qshd labels. It does not check
+  the sidecars, the group or the exact 0644 mode. So a customized profile
+  refuses managed start, but a leftover sidecar or a different group does not;
+  those remain unsupported.
+- *Pair phases while the consumer is absent*: fresh consumer pre, provider
+  upgrade pre and post without the consumer, fresh provider post and final
+  provider erase. They require the binary, the PAM profile and both sidecars
+  to be absent; a leftover profile from another `qshd` package therefore
+  refuses them. They also check the retained-entry limits: fresh provider post
+  with default labels, and the others with qshd labels.
+- *Fresh provider pre* checks only root, the process preconditions, the stop
+  guard (which here admits an absent unit) and an absent activation slot. Then
+  it publishes `PENDING provider-fresh`. It checks neither the retained
+  entries nor consumer absence; fresh provider post checks those first, after
+  that publication.
 
 **Preserving administrator data.** Hooks never adopt, rewrite, move or delete
 administrator data, and refusal does not imply that the data must be discarded.
@@ -319,28 +345,52 @@ managed labels and `PENDING consumer-erase` in
 - upgrading or reinstalling the provider;
 - every other consumer phase.
 
-Final provider erase is the only admitted next step. Continuing with only the
+Final provider erase is the only candidate next step, and it still has to pass
+its own checks, described under partial states below. Continuing with only the
 consumer is unsupported under the present contract.
 
-**Partial states.** A refusal before PENDING publication leaves the previous
-state, so the transaction can be retried after the prerequisite is fixed. A
-fresh provider install publishes `PENDING provider-fresh` already in its pre.
-Any later refusal in its post therefore comes after publication, even a
-refusal that changed nothing else. After publication, the routes are as
-follows.
+**Partial states.** Two kinds of failure differ:
 
-- **`PENDING consumer-install`** (failed consumer post). The consumer stays
-  installed and managed start refuses. A final consumer erase is admitted;
-  continue with the provider erase.
-- **`PENDING consumer-erase`** after a failed final consumer erase. The package
-  stays installed, and a retried consumer erase is admitted.
+- A refusal proved before the phase mutates anything leaves the previous
+  state. The transaction can be retried after the prerequisite is fixed.
+- Once a phase has attempted its PENDING publication, a failed return is
+  outcome-uncertain. It proves neither that the slot kept its previous state
+  nor that anything was rolled back.
+
+Fresh provider pre attempts that publication after only the checks listed
+above. So every refusal in fresh provider post comes after publication, even a
+refusal that changed nothing else.
+
+A PENDING record alone admits nothing and authorizes no repair. Where a record
+below names a candidate route, that phase only goes on to inspect. It still
+requires all of the following, and any one of them can refuse:
+- current consumer RPM authority, or for provider erase established consumer
+  absence;
+- the RPM inventory and file owners;
+- the PAM profile and sidecars;
+- the policy, context, module and retained-entry proofs;
+- the stop guard.
+
+Whether a package is still installed after a failed scriptlet is the
+aftermath of the actual Fedora transaction. That aftermath is not qualified
+(see the end of this section). The candidate routes are:
+
+- **`PENDING consumer-install`** (a consumer pre or post that failed after
+  publication). Managed start refuses. If the consumer is still installed, a
+  final consumer erase is the only candidate, followed by provider erase. If
+  it is not installed, no ordinary route exists: provider erase refuses
+  (`ERASE_SLOT`).
+- **`PENDING consumer-erase`**. A final consumer erase that failed after
+  publication can leave this state with the consumer still installed. Then a
+  retried final consumer erase is the candidate. With the consumer absent,
+  final provider erase is the candidate.
 - **`PENDING provider-fresh`, `PENDING provider-refresh` or
-  `PENDING provider-erase`** (a failed or uncertain provider pre, post or
-  final erase). No ordinary package-manager route exists. Provider erase
+  `PENDING provider-erase`** (a provider pre, post or final erase that failed
+  after publication). No ordinary package-manager route exists. Provider erase
   refuses (`ERASE_SLOT`). Provider upgrade, consumer install and a later fresh
   provider install refuse as well. Managed start refuses.
 
-In a state without a route, do not invent a recovery:
+When no route exists, or a candidate route refuses, do not invent a recovery:
 
 - do not use `--noscripts`, `--nopreun` or `tsflags=noscripts`. They remove the
   payload without the phase and leave the loaded pair, labels and slot for a
