@@ -59,6 +59,8 @@
 
 pub mod channel_backend;
 pub mod control;
+#[cfg(any(test, target_os = "macos"))]
+mod darwin_process_scope;
 pub mod handover;
 #[cfg(feature = "system")]
 pub mod helper;
@@ -148,4 +150,11 @@ mod test_allocator;
 fn qualify_borrowed_fixture() {
     let _view =
         process_scope::prepare().expect("private fixture proc namespace/wait qualification");
+}
+
+/// Private binary-to-library entry; it performs no normal daemon dispatch.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn darwin_keeper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
+    darwin_process_scope::keeper_helper_entry(args)
 }

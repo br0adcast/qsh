@@ -128,6 +128,13 @@ impl std::fmt::Debug for Capsule {
     }
 }
 
+/// Refusal of a new application admission, without a cleanup certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialAdmissionError {
+    Cancelled,
+    Unavailable,
+}
+
 /// Shared capsule handle. The registration owner outlives worker/runner stacks.
 #[derive(Clone, Default)]
 pub struct OpenCustody {
@@ -165,6 +172,39 @@ impl OpenCustody {
             custody: self.clone(),
             armed: true,
         }
+    }
+
+    /// Linearize an initial application queue+commit with `cancel`.
+    ///
+    /// The callback runs under the capsule mutex and may only perform bounded
+    /// in-memory frame queueing and the caller's immutable decision assignment.
+    /// It must not call custody/registry methods, acquire the backend core,
+    /// flush/read sockets, call native APIs, log, destroy descriptors, or wait.
+    /// The callback's queue/backpressure result is independent of this Result.
+    pub fn try_commit_initial_admission<T>(
+        &self,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, InitialAdmissionError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| InitialAdmissionError::Unavailable)?;
+        if state.cancelled {
+            return Err(InitialAdmissionError::Cancelled);
+        }
+        if !state.constructing
+            || state.resources.is_none()
+            || state.leased
+            || state.adopted
+            || state.terminal.is_some()
+            || state.ready
+        {
+            return Err(InitialAdmissionError::Unavailable);
+        }
+        let result = commit();
+        drop(state);
+        Ok(result)
     }
 
     pub fn is_cancelled(&self) -> bool {

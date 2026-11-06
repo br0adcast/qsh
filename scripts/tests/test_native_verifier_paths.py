@@ -368,7 +368,7 @@ elif name == 'python3':
         records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
         return result, calls, records
 
-    def environment(self, calls, env, targets, *, linux):
+    def environment(self, calls, env, targets, *, linux, deny_warnings=False):
         builds = [c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build']
         self.assertEqual(len(builds), len(targets))
         cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
@@ -377,6 +377,8 @@ elif name == 'python3':
                 f'--remap-path-prefix={env["RUNNER_TEMP"]}=/build')
         if not linux:
             rust += f' -C link-arg=-Wl,-oso_prefix,{env["GITHUB_WORKSPACE"]}/'
+        if deny_warnings:
+            rust += ' -Dwarnings'
         cflags = (f'-ffile-prefix-map={env["GITHUB_WORKSPACE"]}=/qsh '
                   f'-ffile-prefix-map={cargo_home}=/cargo '
                   f'-ffile-prefix-map={env["RUNNER_TEMP"]}=/build')
@@ -429,10 +431,22 @@ elif name == 'python3':
             with self.subTest(target=target), self.fixture(target, explicit_cargo=index % 2 == 0) as (work, env):
                 result, calls, _ = self.execute(body, work, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.environment(calls, env, [target], linux='linux' in target)
+                self.environment(calls, env, [target], linux='linux' in target,
+                                 deny_warnings=(target == 'x86_64-apple-darwin'))
                 tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
                 self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
                                          '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])
+                test_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test')
+                build_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build')
+                cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
+                baseline = (f'--remap-path-prefix={env["GITHUB_WORKSPACE"]}=/qsh '
+                            f'--remap-path-prefix={cargo_home}=/cargo '
+                            f'--remap-path-prefix={env["RUNNER_TEMP"]}=/build')
+                if 'linux' not in target:
+                    baseline += f' -C link-arg=-Wl,-oso_prefix,{env["GITHUB_WORKSPACE"]}/'
+                self.assertEqual(test_call['env']['RUSTFLAGS'], baseline)
+                self.assertEqual({key: value for key, value in test_call['env'].items() if key != 'RUSTFLAGS'},
+                                 {key: value for key, value in build_call['env'].items() if key != 'RUSTFLAGS'})
 
     def test_native_product_checks_cover_both_roles_before_and_after_strip(self):
         body = self.body('native-crypto.yml', 'portable', self.NATIVE)
@@ -500,10 +514,294 @@ elif name == 'python3':
         for target in self.DARWIN:
             self.refusal(body, target, prepopulate=self.DARWIN)
 
+    def test_intel_owner_has_independent_budget_and_required_setup(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        self.assertIn('  darwin-owner-intel:\n', native, 'Intel ownership needs its independent budget')
+        job = native.split('  darwin-owner-intel:\n', 1)[1].split('\n  system-floors:', 1)[0]
+        for required in ('name: Native Intel Darwin process owner', 'runs-on: macos-15-intel',
+                         'timeout-minutes: 45', 'NATIVE_TARGET: x86_64-apple-darwin',
+                         'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
+                         'test "$checkout_sha" = "$GITHUB_SHA"',
+                         '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
+                         'key: native-owner-x86_64-apple-darwin'):
+            self.assertIn(required, job)
+        for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'download-artifact',
+                          'Qualify offline release authentication', self.NATIVE,
+                          'cargo test --locked -p sshauth'):
+            self.assertNotIn(forbidden, job)
+        ordered = ['Bind the Intel owner checkout', 'Observe the Intel Darwin runtime',
+                   'Install native owner prerequisites', 'Build and execute the pinned owner backend',
+                   'Install qualified Rust for owner checks', 'Swatinem/rust-cache@',
+                   'Qualify the production Intel Darwin process owner']
+        self.assertEqual(sorted(ordered, key=job.index), ordered)
+        backend = self.body('native-crypto.yml', 'darwin-owner-intel', 'Build and execute the pinned owner backend')
+        for required in ('scripts/qualify-openssl.sh --target "$NATIVE_TARGET"',
+                         'scripts/build-openssl.sh --target "$NATIVE_TARGET"',
+                         '--cache "$RUNNER_TEMP/native-crypto"', '--toolchain-id "$ImageOS/$ImageVersion"',
+                         'echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"',
+                         "echo 'OPENSSL_STATIC=1' >> \"$GITHUB_ENV\""):
+            self.assertIn(required, backend)
+        rust = self.body('native-crypto.yml', 'darwin-owner-intel', 'Install qualified Rust for owner checks')
+        self.assertIn('rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal', rust)
+        self.assertIn('rustup target add "$NATIVE_TARGET"', rust)
+        self.assertIn('scripts/check-qualified-rust.sh', rust)
+        portable = native.split('  portable:\n', 1)[1].split('\n  darwin-owner-intel:', 1)[0]
+        self.assertIn('timeout-minutes: 35', portable)
+        self.assertNotIn('Qualify the production Intel Darwin process owner', portable)
+        self.assertNotIn('Observe the Intel Darwin runtime', portable)
+
+    def test_corrected_terminal_contract_literal_admission(self):
+        command = 'keeper223 terminal kind=Command screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false'
+        shell = 'keeper223 terminal kind=Shell screen={screen} eof_contract=normal_completion real_eof_delivered=true reader_join_held=true cleanup_receipts=true screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false'
+        records = [template.format(screen=screen) for template in (command, shell) for screen in ('false', 'true')]
+        blocks = []
+        for workflow, job, step in (
+                ('ci.yml', 'macos', 'Qualify the production Darwin process owner'),
+                ('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')):
+            owner = self.body(workflow, job, step)
+            start = owner.index('for screen in false true')
+            stop = owner.index('test "$(grep -Fc \'keeper223 open_executor', start)
+            block = owner[start:stop]
+            blocks.append(block)
+            good = '\n'.join(records) + '\n'
+            variants = [(good, True)]
+            for row in records:
+                variants.extend([(good.replace(row + '\n', ''), False), (good + row + '\n', False)])
+            variants.append(('\n'.join(command.format(screen=screen).replace('kind=Command', 'kind=' + kind)
+                                       for kind in ('Shell', 'Command') for screen in ('false', 'true')) + '\n', False))
+            for before, after in (('kind=Shell', 'kind=Other'), ('screen=false', 'screen=other'),
+                                  ('real_eof_delivered=true', 'real_eof_delivered=false'),
+                                  ('reader_join_held=true', 'reader_join_held=false'),
+                                  ('cleanup_receipts=true', 'cleanup_receipts=false'),
+                                  ('terminal=37', 'terminal=0'), ('session=0', 'session=1'),
+                                  ('rescue=false', 'rescue=true')):
+                variants.append((good.replace(before, after), False))
+            variants.extend([(good + 'keeper223 terminal extra=true\n', False),
+                             (good + 'keeper223 settlement boundary=failure_rescue_entry\n', False),
+                             (good + 'SKIPPED\n', False)])
+            with tempfile.TemporaryDirectory(prefix='terminal-contract-inert-') as directory:
+                env = os.environ.copy(); env['runtime'] = directory
+                for output, accepted in variants:
+                    (Path(directory) / 'keeper-integrated-results.log').write_text(output)
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, accepted, output + result.stdout + result.stderr)
+        self.assertEqual(blocks[0], blocks[1])
+        source = (ROOT / 'qshd/src/darwin_process_scope/keeper_integration_tests.rs').read_text()
+        terminal = source.split('fn terminal_run(command_only: bool)', 1)[1].split('pub(super) fn cancel_setup()', 1)[0]
+        branches = terminal.split('match kind {', 1)[1]
+        command, shell = branches.split('ChannelKind::Shell => {', 1)
+        shell = shell.split('assert!(registry.retiring_count()', 1)[0]
+        self.assertIn('TerminalEofContract::LiveApplication', command)
+        self.assertLess(command.index('terminal_eof_until_contract'), command.index('snapshot.app_status.is_none()'))
+        self.assertIn('for kind in [ChannelKind::Shell,ChannelKind::Command]', terminal)
+        release = 'exclusive(&path.join("release"),nonce.as_bytes());'
+        self.assertLess(shell.index('KEEPER_RESIZED'), shell.index(release))
+        self.assertLess(shell.index('snapshot.app_status.is_none()'), shell.index(release))
+        self.assertLess(shell.index(release), shell.index('TerminalEofContract::NormalCompletion'))
+        self.assertLess(shell.index('TerminalEofContract::NormalCompletion'), shell.index('s.app_status==Some(37)'))
+        self.assertIn('!s.custody_lost&&s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed', shell)
+        self.assertIn('let fence=registry.begin_restart_fence().unwrap();assert!(fence.wait_until(Instant::now()).is_none(),"reader has not joined");', terminal)
+        self.assertLess(terminal.index('reader has not joined'), terminal.index('observation.io.release_reader()'))
+
+    def test_command_contrast_literal_gate_executes_only_inert_harness(self):
+        selector = 'darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast'
+        blocks = []
+        for workflow, job, step in (
+                ('ci.yml', 'macos', 'Qualify the production Darwin process owner'),
+                ('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')):
+            owner = self.body(workflow, job, step)
+            self.assertEqual(owner.count('timed command-terminal-contrast '), 1)
+            start = owner.index('timed command-terminal-contrast ')
+            stop = owner.index('verify_harness "$feature_harness"', start)
+            block = owner[start:stop]
+            blocks.append(block)
+            self.assertIn('--ignored --exact ' + selector, block)
+            self.assertLess(start, owner.index('timed integrated-runtime '))
+            self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
+            with tempfile.TemporaryDirectory(prefix='contrast-inert-') as directory:
+                runtime = Path(directory)
+                harness = runtime / 'inert-harness'
+                harness.write_text('#!/bin/bash\ntest "$*" = "--ignored --exact ' + selector + ' --nocapture --test-threads=1" || exit 9\ncat "$runtime/inert-output"\nexit "$inert_status"\n')
+                harness.chmod(0o700)
+                good = ('running 1 test\n' + 'test ' + selector + ' ... observing\nok\n'
+                        'keeper223 terminal kind=Command screen=false real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false\n'
+                        'keeper223 connected_join=normal registry=0 screen_credits=0 two_io_joins=terminal_certificate rescue=false\n'
+                        'test result: ok. 1 passed; 0 failed; 0 ignored;\n')
+                variants = [(good, '0', True), (good, '7', False),
+                            (good.replace('running 1 test', 'running 0 tests'), '0', False),
+                            (good.replace('1 passed', '0 passed'), '0', False),
+                            (good.replace(selector, selector + '_wrong'), '0', False),
+                            (good + 'test ' + selector + ' ... ok\n', '0', False),
+                            (good.replace('connected_join=normal', 'connected_join=absent'), '0', False),
+                            (good + 'test unexpected ... ok\n', '0', False),
+                            (good + 'keeper223 settlement boundary=failure_rescue_entry\n', '0', False)]
+                for output, status, accepted in variants:
+                    (runtime / 'inert-output').write_text(output)
+                    env = os.environ.copy()
+                    env.update(runtime=directory, feature_harness=str(harness), inert_status=status)
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\ntimed() { shift; "$@"; }\n' + block],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                (runtime / 'inert-output').write_text(good)
+                env['inert_status'] = '0'
+                for mutation in (block.replace('--exact ', ''), block.replace('--ignored ', ''),
+                                 block.replace('--exact ' + selector, '--exact wrong_selector')):
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' +
+                                             'timed() { shift; "$@"; }\n' + mutation],
+                                            env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+
+        self.assertEqual(blocks[0], blocks[1])
+        source = (ROOT / 'qshd/src/darwin_process_scope/keeper_integration_tests.rs').read_text()
+        self.assertIn('#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]\n'
+                      '#[test]\n#[ignore = "requires exact owned native qualification"]\n'
+                      'fn keeper_command_terminal_contrast() {\n    native::terminal_command_contrast();\n}', source)
+        self.assertIn('pub(super) fn terminal() {\n        terminal_run(false);\n    }', source)
+        self.assertIn('pub(super) fn terminal_command_contrast() {\n        terminal_run(true);\n    }', source)
+        self.assertEqual(source.count('fn terminal_run(command_only: bool)'), 1)
+        self.assertIn('s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed', source)
+        self.assertIn('settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();', source)
+        self.assertNotIn('keeper_integrated_', selector)
+        self.assertNotIn('keeper_native_', selector)
+        for path in (ROOT / '.github/workflows').glob('*.yml'):
+            for line in path.read_text().splitlines():
+                if 'nextest run' in line or 'run-nextest-ci.py' in line:
+                    self.assertNotIn('--include-ignored', line)
+        self.assertNotIn('--include-ignored', (ROOT / 'scripts/run-nextest-ci.py').read_text())
+
+    def test_intel_owner_preserves_artifact_and_acceptance_contract(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        self.assertIn('  darwin-owner-intel:\n', native, 'independent Intel owner job is missing')
+        owner = self.body('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')
+        arm = self.body('ci.yml', 'macos', 'Qualify the production Darwin process owner')
+        import re
+        names = lambda body: re.findall(r'^  (darwin_process_scope::\S+)\s*\\?$', body, re.MULTILINE)
+        self.assertEqual(len(names(owner)), 20)
+        self.assertEqual(names(owner), [
+            'darwin_process_scope::native_tests::darwin223_native_noncooperative_token_exec_and_bound_exit',
+            'darwin_process_scope::native_tests::darwin223_native_signaled_leader_scope_uses_portable_code_one',
+            'darwin_process_scope::native_tests::darwin223_native_already_zombie_handshake_child_keeps_reserved_leader',
+            'darwin_process_scope::native_tests::darwin223_native_classification_bracket_refuses_exec_and_one_sided_zombie',
+            'darwin_process_scope::native_tests::darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins',
+            'darwin_process_scope::native_tests::darwin223_native_connected_close_stop_rebind_and_fresh_session',
+            'darwin_process_scope::native_tests::darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork',
+            'darwin_process_scope::native_tests::darwin223_native_term_and_interrupt_join_real_manager_and_workers',
+            'darwin_process_scope::native_tests::darwin223_native_partial_descriptor_failure_retains_real_process_owner',
+            'darwin_process_scope::native_tests::darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session',
+            'darwin_process_scope::keeper_tests::keeper_native_exit37_and_pty_eof',
+            'darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork',
+            'darwin_process_scope::keeper_tests::keeper_native_broker_group_intrusion',
+            'darwin_process_scope::keeper_tests::keeper_native_cancel_before_admit_no_application',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_terminal_status_and_io',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_open_cancel_and_setup_failure',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_close_stop_rebind_and_fresh_session',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_term_interrupt_join',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_actual_daemon_replacement',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_foreign_sid_retains_debt',
+        ])
+        self.assertEqual(names(owner), names(arm))
+        for count in (10, 4, 6):
+            self.assertIn(f'test result: ok. {count} passed; 0 failed; 0 ignored;', owner)
+        self.assertEqual(owner.count('cargo test -p qshd --lib'), 2)
+        self.assertEqual(owner.count('--no-run --message-format=json-render-diagnostics'), 2)
+        self.assertEqual(owner.count('--bin qshd --profile test'), 2)
+        self.assertEqual(owner.count('verify_harness "$ordinary_harness"'), 2)
+        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
+        for required in ('--features test-build-labels', '--features test-darwin-keeper',
+                         'timed feature-check cargo check', 'timed feature-clippy cargo clippy',
+                         '-- -D warnings', '--target "$NATIVE_TARGET"',
+                         "assert len(records) == 1", "assert set(record['features']) == features",
+                         "record['manifest_path']", "record['target']['src_path']",
+                         'hashlib.sha256(executable.read_bytes()).hexdigest()',
+                         'test -z "${CARGO_ENCODED_RUSTFLAGS:-}"', '-Dwarnings',
+                         '--remap-path-prefix=$GITHUB_WORKSPACE=/qsh', '-Wl,-oso_prefix,$GITHUB_WORKSPACE/',
+                         'export AWS_LC_SYS_USE_SYSTEM=0', 'export AWS_LC_SYS_CFLAGS=',
+                         'export HOME="$runtime/home"', 'XDG_CONFIG_HOME="$runtime/config"',
+                         'XDG_CACHE_HOME="$runtime/cache"', 'HISTFILE=/dev/null',
+                         "trap 'rm -rf \"$runtime\"' EXIT", 'set -euo pipefail',
+                         'SKIPPED', 'rescue=true', 'seen == 1 && passed == 1',
+                         'real_eof_delivered_alive=true', 'keeper223 open_executor mode=',
+                         'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false',
+                         'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait', 'keeper223 replacement_routes old_image='):
+            self.assertIn(required, owner)
+        self.assertLess(owner.index('timed modern-runtime'), owner.index('timed keeper-runtime'))
+        self.assertLess(owner.index('timed keeper-runtime'), owner.index('timed integrated-runtime'))
+
+    def test_reusable_native_qualification_defaults_for_release_dispatch(self):
+        # Source/interface simulation of Release's no-input manual caller, not
+        # a GitHub execution. Read the callee default rather than inventing one.
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        called = native.split('  workflow_call:\n', 1)[1].split('\npermissions:', 1)[0]
+        fields = dict(line.strip().split(': ', 1) for line in called.splitlines()
+                      if line.startswith('        ') and ': ' in line)
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('  workflow_dispatch:\n\nenv:', release)
+        caller = release.split('  native-crypto:\n', 1)[1].split('\n  linux:', 1)[0]
+        self.assertEqual(caller.strip(), 'uses: ./.github/workflows/native-crypto.yml')
+        validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
+        with self.fixture('x86_64-unknown-linux-musl') as (work, env):
+            env['PTY_EOF_MODE'] = fields.get('default', '')
+            result, calls, records = self.execute(validator, work, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((work / 'completed').is_file())
+            self.assertEqual((calls, records), ([], []))
+        self.assertIn('    inputs:\n      mode:\n', called)
+        self.assertEqual(fields, {'type': 'string', 'required': 'false', 'default': 'qualification'})
+
+    def test_native_manual_mode_contract(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        direct = native.split('  workflow_dispatch:\n', 1)[1].split('  workflow_call:', 1)[0]
+        for declaration in ('type: choice', 'required: true', 'default: qualification',
+                            'options: [qualification, pty-eof-build, pty-eof-control]'):
+            self.assertIn(declaration, direct)
+        validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
+        for mode, accepted in (('qualification', True), ('pty-eof-build', True),
+                               ('pty-eof-control', True), ('', False), ('unknown', False)):
+            with self.subTest(mode=mode), self.fixture('x86_64-unknown-linux-musl') as (work, env):
+                env['PTY_EOF_MODE'] = mode
+                result, calls, records = self.execute(validator, work, env)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                self.assertEqual((work / 'completed').exists(), accepted)
+                self.assertEqual((calls, records), ([], []))
+        selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        for job in ('portable', 'darwin-owner-intel', 'system-floors', 'pty-eof-diagnostic'):
+            condition = native.split('  ' + job + ':\n', 1)[1].splitlines()
+            condition = next(line for line in condition if line.startswith('    if:'))
+            expected = selection if job == 'pty-eof-diagnostic' else '!(' + selection + ')'
+            self.assertEqual(condition, '    if: ${{ ' + expected + ' }}')
+        dispatch = native.split('  dispatch-mode:\n', 1)[1].split('  pty-eof-diagnostic:', 1)[0]
+        self.assertIn("    if: github.event_name == 'workflow_dispatch'\n", dispatch)
+        # Truth table for the exact literal predicate checked above, not an
+        # expression interpreter. Invalid manual modes still fail validation.
+        for event, mode, diagnostic in (('workflow_dispatch', 'qualification', False),
+                                       ('workflow_dispatch', 'pty-eof-build', True),
+                                       ('workflow_dispatch', 'pty-eof-control', True),
+                                       ('pull_request', '', False), ('push', '', False),
+                                       ('pull_request', 'pty-eof-build', False)):
+            with self.subTest(event=event, mode=mode):
+                selected = event == 'workflow_dispatch' and mode in ('pty-eof-build', 'pty-eof-control')
+                self.assertEqual(selected, diagnostic)
+                self.assertEqual(not selected, not diagnostic)
+
     def test_four_native_targets_and_required_workflow_consumers_remain_wired(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         import re
-        self.assertEqual(re.findall(r'          - runner: (\S+)\n            target: (\S+)', native), list(self.TARGETS))
+        portable = native.split('  portable:\n', 1)[1].split('\n  darwin-owner-intel:', 1)[0]
+        diagnostic = native.split('  pty-eof-diagnostic:\n', 1)[1]
+        pairs = r'          - runner: (\S+)\n            target: (\S+)'
+        self.assertEqual(re.findall(pairs, portable), list(self.TARGETS))
+        self.assertEqual(re.findall(pairs, diagnostic), list(self.TARGETS[2:]))
+        selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        for job in ('portable', 'darwin-owner-intel', 'system-floors'):
+            beginning = native.split('  ' + job + ':\n', 1)[1].split('\n', 1)[0]
+            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") }}")
+        self.assertIn("    if: ${{ " + selection + " }}", diagnostic)
+        self.assertIn('options: [qualification, pty-eof-build, pty-eof-control]', native)
+        self.assertIn('ref: ${{ github.sha }}', diagnostic)
+        self.assertIn('scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"', diagnostic)
+        for forbidden in ('--include-ignored', 'native_tests::', 'keeper_tests::', 'keeper_integration_tests::', 'upload-artifact'):
+            self.assertNotIn(forbidden, diagnostic)
         self.assertEqual(native.count("      - 'cli/Cargo.toml'"), 2)
         helper = self.body('native-crypto.yml', 'portable', 'Qualify offline release authentication')
         self.assertIn('-p test_native_verifier_paths.py', helper)

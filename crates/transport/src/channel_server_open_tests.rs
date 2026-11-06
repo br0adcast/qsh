@@ -3,6 +3,100 @@ mod open24_tests {
     use super::*;
     use std::sync::Condvar;
 
+    #[tokio::test]
+    async fn fresh_open_geometry_establishes_instance_after_empty_attachment_snapshot() {
+        let spawner = FakeSpawner::new();
+        let (io, input, mut output) = channel_pair();
+        let snapshots = io.snapshot_reader_for_test();
+        let runner = tokio::spawn(run_channel_session(io, spawner.clone()));
+        input
+            .send(SessionInbound::ResumeReset(AttachmentContext {
+                generation: 1,
+                ..channel_context()
+            }))
+            .await
+            .unwrap();
+        let initial = next_snapshot(&mut output, &snapshots).await;
+        let ServerRecord::ChannelSnapshot(initial) = initial else {
+            panic!("attachment snapshot")
+        };
+        assert!(initial.active().is_empty() && initial.draining().is_empty());
+        // The old oracle retains this empty attachment snapshot. Fresh OPEN
+        // publishes its identity on the channel timeline, not a snapshot refresh.
+        assert!(initial.active().first().map(|a| a.instance).is_none());
+        let mut instances = Vec::new();
+        for stream in [FIRST_CHANNEL_STREAM, FIRST_CHANNEL_STREAM + 1] {
+            input
+                .send(open(stream, ChannelKind::Shell, false))
+                .await
+                .unwrap();
+            assert_eq!(
+                next_control(&mut output).await,
+                ServerRecord::Opened { stream }
+            );
+            let established = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutbound::ChannelOutput {
+                        stream: actual,
+                        output: ChannelOutput::Geometry(g, _),
+                        ..
+                    } = output.recv().await.unwrap()
+                    {
+                        assert_eq!(actual, stream);
+                        break g;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(established.outcome, GeometryOutcome::Established);
+            assert_eq!(established.request_id, 0);
+            instances.push(established.instance);
+            input
+                .send(control(ClientRecord::ResizeRequest {
+                    stream,
+                    instance: established.instance,
+                    request_id: ResizeRequestId::new(1).unwrap(),
+                    cols: 91,
+                    rows: 31,
+                }))
+                .await
+                .unwrap();
+            let applied = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SessionOutbound::ChannelOutput {
+                        stream: actual,
+                        output: ChannelOutput::Geometry(g, _),
+                        ..
+                    } = output.recv().await.unwrap()
+                    {
+                        assert_eq!(actual, stream);
+                        break g;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                applied,
+                GeometryRecord {
+                    instance: established.instance,
+                    request_id: 1,
+                    outcome: GeometryOutcome::Applied,
+                    cols: 91,
+                    rows: 31,
+                }
+            );
+        }
+        assert_ne!(instances[0], instances[1]);
+        assert_ne!(instances[1].get(), 1);
+        drop(input);
+        spawner.end_channel(FIRST_CHANNEL_STREAM);
+        spawner.end_channel(FIRST_CHANNEL_STREAM + 1);
+        runner.await.unwrap();
+        assert_eq!(spawner.open_registry().outstanding(), 0);
+    }
+
     fn process_fixture_live(io: &mut SessionIo) {
         let mut event = std::pin::pin!(io.recv());
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());

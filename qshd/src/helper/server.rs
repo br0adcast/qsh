@@ -1329,7 +1329,7 @@ fn serve_inner(
             .filter(|worker| !worker.owner.control_closed() && !worker.native_complete)
         {
             let mut flags = PollFlags::POLLIN;
-            if worker.pending.is_some() {
+            if worker.stop_writable() {
                 flags |= PollFlags::POLLOUT;
             }
             let raw = worker.owner.control_fd().as_raw_fd();

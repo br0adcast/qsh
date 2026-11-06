@@ -249,6 +249,12 @@ needs:
   remove this account — it may still own files written while the daemon
   ran.
 
+The dedicated Fedora SELinux pairing — this `qshd` built against the
+separate `qshd-selinux` policy package — has its own, stricter maintenance
+contract. Its upgrade, removal, reinstall and recovery limits are in
+[`packaging/selinux/README.md`](../packaging/selinux/README.md#supported-teardown-reinstall-and-recovery-limits),
+not in this guide.
+
 The statically linked `qshd` in the Linux `.tar.gz` archives is a different
 build of the same source, without the
 `system` feature: it can only ever run in personal mode, and refuses
@@ -966,7 +972,10 @@ for those versions needs that one edit.
 - Package upgrades preserve administrator-edited `/etc/pam.d/qshd`. Merge new
   defaults into a customized profile deliberately; an upgrade does not silently
   rewrite it. The admission and limits behavior above describes the packaged
-  defaults and the distribution stacks they include.
+  defaults and the distribution stacks they include. The Fedora SELinux
+  pairing is stricter: while that profile differs from the packaged bytes, it
+  refuses upgrade, removal and managed start (see
+  [`packaging/selinux/README.md`](../packaging/selinux/README.md#supported-teardown-reinstall-and-recovery-limits)).
 - `/etc/pam.d/qshd` is a real, editable configuration file, and an
   administrator is expected to open it — but a module that decides by
   client address (`pam_access`, `pam_rhosts`) would be trusting a value
