@@ -469,7 +469,7 @@ mod worker_parent {
     #[test]
     fn worker508_terminal_before_pending_send_suppresses_stop() {
         use crate::helper::worker_protocol::StopReason;
-        for terminal in [b'F', b'D'] {
+        for terminal in *b"FD" {
             let (mut worker, mut fixture) = stage_fixture();
             worker.request_stop(StopReason::Requested);
             fixture.command(b'P');
