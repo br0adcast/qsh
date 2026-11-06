@@ -1,6 +1,91 @@
 //! Fixed extracted-pair fixture. Portable controls are not native execution proof.
 use std::collections::BTreeSet;
 
+#[test]
+fn darwin185_outcome_encoding_is_closed_and_bounded() {
+    for error in [
+        "INPUT",
+        "HOST",
+        "DEADLINE",
+        "START",
+        "CUSTODY",
+        "IO",
+        "CONNECT",
+        "OUTPUT",
+        "IDENTITY",
+        "CANCELLED",
+        "CLIENT_EXIT",
+        "UNSETTLED",
+        "FAILURE_CUSTODY",
+        "unowned wait",
+        "synthetic-private-canary",
+    ] {
+        let raw = execute_outcome(true, Err(error));
+        assert!(raw.len() <= 512 && raw.is_ascii());
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["mode"], "failure");
+        assert_eq!(value["outcome"], "error");
+        assert_eq!(
+            value["code"],
+            if error == "synthetic-private-canary" {
+                "OTHER_EXECUTE_ERROR"
+            } else {
+                error
+            }
+        );
+        assert!(!String::from_utf8(raw)
+            .unwrap()
+            .contains("synthetic-private-canary"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&execute_outcome(false, Ok(()))).unwrap();
+    assert_eq!(value["mode"], "positive");
+    assert_eq!(value["outcome"], "ok");
+    assert!(value["code"].is_null());
+}
+
+#[test]
+fn darwin185_optional_outcome_preserves_original_result() {
+    for result in [
+        Ok(()),
+        Err("OUTPUT"),
+        Err("UNSETTLED"),
+        Err("synthetic-private-canary"),
+    ] {
+        let mut called = false;
+        let actual = preserve_execute_outcome(result, || {
+            called = true;
+            Err("OUTPUT")
+        });
+        assert!(called);
+        assert_eq!(actual, result);
+    }
+}
+
+fn execute_outcome(fault: bool, result: Result<(), &'static str>) -> Vec<u8> {
+    let code = result.err().map(|error| match error {
+        "INPUT" | "HOST" | "DEADLINE" | "START" | "CUSTODY" | "IO" | "CONNECT" | "OUTPUT"
+        | "IDENTITY" | "CANCELLED" | "CLIENT_EXIT" | "UNSETTLED" | "FAILURE_CUSTODY"
+        | "unowned wait" => error,
+        _ => "OTHER_EXECUTE_ERROR",
+    });
+    // All interpolated values are closed ASCII constants, never an error message.
+    let code = code.map_or_else(|| "null".to_owned(), |code| format!("\"{code}\""));
+    format!(
+        "{{\"schema\":1,\"kind\":\"darwin-archive-execute-outcome\",\"mode\":\"{}\",\"outcome\":\"{}\",\"code\":{code}}}\n",
+        if fault { "failure" } else { "positive" },
+        if result.is_ok() { "ok" } else { "error" },
+    )
+    .into_bytes()
+}
+
+fn preserve_execute_outcome(
+    result: Result<(), &'static str>,
+    sink: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let _ = sink();
+    result
+}
+
 #[derive(Default)]
 struct Custody {
     started: BTreeSet<u32>,
@@ -704,6 +789,31 @@ mod native {
     }
     fn execute(fault: bool) -> Result<()> {
         let (request, directory) = request()?;
+        let result = execute_validated(fault, &request, &directory);
+        super::preserve_execute_outcome(result, || {
+            let raw = super::execute_outcome(fault, result);
+            if raw.len() > 512 || !raw.is_ascii() {
+                return Err("OUTPUT");
+            }
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .mode(0o600)
+                .open(directory.join("execute-outcome.json"))
+                .map_err(|_| "OUTPUT")?;
+            let info = file.metadata().map_err(|_| "OUTPUT")?;
+            if !info.is_file()
+                || info.nlink() != 1
+                || info.uid() != unsafe { nix::libc::geteuid() }
+                || info.mode() & 0o777 != 0o600
+            {
+                return Err("OUTPUT");
+            }
+            file.write_all(&raw).map_err(|_| "OUTPUT")
+        })
+    }
+    fn execute_validated(fault: bool, request: &Value, directory: &Path) -> Result<()> {
         let prepared = &request["prepared"];
         let host = host(text(prepared, "target")?)?;
         let end = Instant::now() + Duration::from_secs(55);
@@ -745,7 +855,7 @@ mod native {
             isolated(&mut keygen, &client_home);
             children.push(Direct::spawn(&mut keygen, &mut custody)?);
             while children[0].poll(&mut custody)?.is_none() {
-                deadline(end, &directory)?;
+                deadline(end, directory)?;
                 tick()?;
             }
             if children[0].status != Some(0) {
@@ -771,7 +881,7 @@ mod native {
             let udp = UdpSocket::bind("127.0.0.1:0").map_err(|_| "START")?;
             let port = udp.local_addr().map_err(|_| "START")?.port().to_string();
             drop(udp);
-            let mut server = Command::new(text(&request, "daemon")?);
+            let mut server = Command::new(text(request, "daemon")?);
             server
                 .args(["serve", "--port", &port, "--authorized-keys"])
                 .arg(&authorized)
@@ -802,7 +912,7 @@ mod native {
                 false,
             )?);
             let fingerprint = loop {
-                deadline(end, &directory)?;
+                deadline(end, directory)?;
                 if children[daemon_index.ok_or("CUSTODY")?]
                     .poll(&mut custody)?
                     .is_some()
@@ -863,7 +973,7 @@ mod native {
             }
             let master = unsafe { File::from_raw_fd(master) };
             let slave = unsafe { File::from_raw_fd(slave) };
-            let mut client = Command::new(text(&request, "client")?);
+            let mut client = Command::new(text(request, "client")?);
             client
                 .arg("-i")
                 .arg(&key)
@@ -896,7 +1006,7 @@ mod native {
             let mut pending = Vec::new();
             let mut registered = false;
             loop {
-                deadline(end, &directory)?;
+                deadline(end, directory)?;
                 let app = children[client_index.ok_or("CUSTODY")?].poll(&mut custody)?;
                 for pump in &mut pumps {
                     pump.drain(app.is_some())?;

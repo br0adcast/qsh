@@ -34,6 +34,106 @@ class SmokeError(ValueError):
     """Closed refusal category, without paths or input content."""
 
 
+_CATEGORIES=frozenset('ARCHIVE_LIMIT ARCHIVE_NAME BINDING BOUNDS CLI DEADLINE DESTINATION EXECUTABLE '
+    'EXPANDED_LIMIT FAILURE_CUSTODY HARNESS HARNESS_FAILED HARNESS_OUTPUT HOST INPUT INPUT_DRIFT '
+    'INPUT_LIMIT JSON METADATA NATIVE_REFUSED NOTICE_BYTES PAYLOAD_DIGEST PREPARE RECEIPT SCHEMA '
+    'SOURCE STAGING_CLEANUP STAGING_CLOSE STAGING_DRIFT TARGET TAR_CHECKSUM TAR_END TAR_FORMAT '
+    'TAR_HEADER TAR_HEADERS TAR_LINK TAR_MEMBERS TAR_SIZE TAR_TRAILING TAR_UNSUPPORTED TRUNCATED '
+    'UNSETTLED_HARNESS VERSION WRITE'.split())
+_PHASES=frozenset('CLI HARNESS_SELECTION HOST STAGING PREPARE INPUT_BINDING CONTROLLED_EXECUTE '
+    'CONTROLLED_VERIFY CONTROLLED_RECHECK POSITIVE_EXECUTE POSITIVE_VERIFY POSITIVE_RECHECK '
+    'PUBLIC_PROJECTION EVIDENCE_WRITE PREPARE_COMMAND VERIFY_COMMAND'.split())
+_STATES=frozenset(('NOT_ATTEMPTED','ABSENT','VALID','INVALID','UNSETTLED'))
+_EXECUTE_CODES=frozenset(('INPUT','HOST','DEADLINE','START','CUSTODY','IO','CONNECT','OUTPUT',
+    'IDENTITY','CANCELLED','CLIENT_EXIT','UNSETTLED','FAILURE_CUSTODY','unowned wait','OTHER_EXECUTE_ERROR'))
+
+
+class DiagnosticContext:
+    """Informational only; never admits an archive or proves native custody."""
+    def __init__(self):
+        self.phase='CLI'
+        self.reset_harness()
+
+    def reset_harness(self):
+        self.harness_status=None
+        self.rust_outcome=None
+        self.diagnostic_state='NOT_ATTEMPTED'
+
+
+def _status(value):
+    return value if type(value) is int and -2147483648<=value<=2147483647 else None
+
+
+def _outcome(value,mode):
+    _keys(value,('schema','kind','mode','outcome','code'))
+    if (type(value['schema']) is not int or value['schema']!=1
+            or value['kind']!='darwin-archive-execute-outcome'
+            or type(value['mode']) is not str or value['mode'] not in ('failure','positive')
+            or value['mode']!=mode):fail('SCHEMA')
+    if value['outcome']=='ok':
+        if value['code'] is not None:fail('SCHEMA')
+    elif value['outcome']=='error':
+        if type(value['code']) is not str or value['code'] not in _EXECUTE_CODES:fail('SCHEMA')
+    else:fail('SCHEMA')
+    return value
+
+
+def _read_outcome(directory,mode,*,held_directory=None):
+    """Read fixed private scratch only after the exact writer has been reaped."""
+    held=None;fd=None
+    try:
+        held=(os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+              if held_directory is None else os.dup(held_directory))
+        before=os.fstat(held)
+        if (before.st_uid!=os.geteuid() or stat.S_IMODE(before.st_mode)!=0o700
+                or _snapshot(os.stat(directory,follow_symlinks=False))!=_snapshot(before)):
+            return 'INVALID',None
+        try:fd=os.open('execute-outcome.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=held)
+        except FileNotFoundError:return 'ABSENT',None
+        info=os.fstat(fd);snapshot=_snapshot(info)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_uid!=os.geteuid()
+                or stat.S_IMODE(info.st_mode)!=0o600 or not 0<info.st_size<=512):return 'INVALID',None
+        if _snapshot(os.stat('execute-outcome.json',dir_fd=held,follow_symlinks=False))!=snapshot:return 'INVALID',None
+        raw=bytearray()
+        while True:
+            chunk=os.read(fd,513-len(raw))
+            if not chunk:break
+            raw.extend(chunk)
+            if len(raw)>512:return 'INVALID',None
+        if (not raw.isascii() or _snapshot(os.fstat(fd))!=snapshot
+                or _snapshot(os.stat('execute-outcome.json',dir_fd=held,follow_symlinks=False))!=snapshot
+                or _snapshot(os.fstat(held))!=_snapshot(before)
+                or _snapshot(os.stat(directory,follow_symlinks=False))!=_snapshot(before)):
+            return 'INVALID',None
+        return 'VALID',_outcome(_json(bytes(raw),512),mode)
+    except (ValueError,OSError,EOFError):return 'INVALID',None
+    finally:
+        # Diagnostic close errors cannot replace the original refusal.
+        for selected in (fd,held):
+            if selected is not None:
+                try:os.close(selected)
+                except OSError:pass
+
+
+def _refusal_record(error,context):
+    category='INVALID'
+    if isinstance(error,SmokeError):
+        if len(error.args)==1 and type(error.args[0]) is str and error.args[0] in _CATEGORIES:category=error.args[0]
+    elif isinstance(error,OSError):category='OS'
+    elif isinstance(error,EOFError):category='EOF'
+    elif isinstance(error,zlib.error):category='ZLIB'
+    phase=context.phase if type(context.phase) is str and context.phase in _PHASES else 'CLI'
+    state=context.diagnostic_state if type(context.diagnostic_state) is str and context.diagnostic_state in _STATES else 'NOT_ATTEMPTED'
+    outcome=None
+    if state=='VALID':
+        try:
+            value=context.rust_outcome
+            outcome=_outcome(value,value.get('mode') if type(value) is dict else None)
+        except (ValueError,TypeError):state='INVALID'
+    return dict(schema=1,kind='darwin-archive-refusal',phase=phase,category=category,
+                harness_status=_status(context.harness_status),rust_outcome=outcome,diagnostic_state=state)
+
+
 def fail(code):raise SmokeError(code)
 def canonical(value):return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')+b'\n'
 def digest(raw):return hashlib.sha256(raw).hexdigest()
@@ -523,9 +623,12 @@ def _failure_result(raw,prepared_sha):
     return raw
 
 
-def _invoke_fixed(harness,request,mode):
+def _invoke_fixed(harness,request,mode,*,diagnostic=None):
+    import contextlib
     import subprocess
     import time
+    diagnostic=diagnostic if diagnostic is not None else DiagnosticContext()
+    diagnostic.reset_harness()
     # No generic timeout kill: the fixed harness owns the cancellation/settlement
     # protocol. An unresponsive runner retains fixtures and fails the job.
     directory=Path(request['directory'])/mode;directory.mkdir(mode=0o700)
@@ -537,7 +640,13 @@ def _invoke_fixed(harness,request,mode):
     for key in ('SSH_AUTH_SOCK','SSH_AGENT_PID'):env.pop(key,None)
     # Capture to private bounded files in the harness; libtest's bounded summary
     # goes to a private regular file and never enters workflow stdout.
-    with (directory/'harness.log').open('xb') as log:
+    with contextlib.ExitStack() as stack:
+        held_directory=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        def close_directory():
+            try:os.close(held_directory)
+            except OSError:pass
+        stack.callback(close_directory)
+        log=stack.enter_context((directory/'harness.log').open('xb'))
         child=subprocess.Popen([str(harness),'--exact',FIXED_TESTS[mode],'--ignored','--test-threads=1'],
                                env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
         failure=None
@@ -548,6 +657,7 @@ def _invoke_fixed(harness,request,mode):
                 if os.fstat(log.fileno()).st_size>65536:fail('HARNESS_OUTPUT')
                 time.sleep(.02)
             status=child.wait()
+            diagnostic.harness_status=_status(status)
             if os.fstat(log.fileno()).st_size>65536:fail('HARNESS_OUTPUT')
             if status!=0:fail('HARNESS_FAILED')
         except BaseException as error:
@@ -558,26 +668,38 @@ def _invoke_fixed(harness,request,mode):
             except OSError:pass
             end=time.monotonic()+20
             while child.poll() is None and time.monotonic()<end:time.sleep(.02)
-            if child.poll() is None:fail('UNSETTLED_HARNESS')
-            child.wait()
+            if child.poll() is None:
+                diagnostic.diagnostic_state='UNSETTLED'
+                fail('UNSETTLED_HARNESS')
+            status=child.wait()
+            diagnostic.harness_status=_status(status)
+        if status!=0:
+            diagnostic.diagnostic_state,diagnostic.rust_outcome=_read_outcome(
+                directory,mode,held_directory=held_directory)
         if failure is not None:raise failure
     return _json(_receipt_file(directory/'result.json'),RECEIPT_LIMIT)
 
 
-def run_archive(archive,metadata,version,target,destination,harness,*,source_commit):
+def run_archive(archive,metadata,version,target,destination,harness,*,source_commit,diagnostic=None):
     """Fixed failure then positive observation, surrounded by file bindings."""
+    diagnostic=diagnostic if diagnostic is not None else DiagnosticContext()
+    diagnostic.phase='HOST'
     _selection(version,target);host=_native_host()
     if host.get('arch')!=DARWIN_TARGETS[target] or host.get('execution')!='native' or host.get('os_version','').split('.')[0]!='15':fail('HOST')
+    diagnostic.phase='STAGING'
     destination=Path(destination)
     if not destination.is_absolute() or destination.resolve()!=destination:fail('DESTINATION')
     destination.mkdir(mode=0o700)
     if stat.S_IMODE(destination.stat().st_mode)!=0o700:fail('DESTINATION')
     held=[]
     try:
+        diagnostic.phase='INPUT_BINDING'
         for path,limit in ((Path(archive),ARCHIVE_LIMIT),(Path(metadata),METADATA_LIMIT)):
             fd,snapshot=_open_input(path,limit);held.append((path,fd,snapshot,_hash_fd(fd,limit)))
+        diagnostic.phase='PREPARE'
         prepared=prepare(archive,metadata,version,target,destination/'pair',source_commit=source_commit)
         prepared_raw=canonical(prepared)
+        diagnostic.phase='INPUT_BINDING'
         for name in PROGRAMS:
             path=destination/'pair'/name;fd,snapshot,sha=_executable(path);held.append((path,fd,snapshot,sha))
             if sha!=prepared['binaries'][name]['sha256']:fail('STAGING_DRIFT')
@@ -588,8 +710,20 @@ def run_archive(archive,metadata,version,target,destination,harness,*,source_com
             for path,fd,snapshot,sha in held:
                 _recheck(path,fd,snapshot)
                 if _hash_fd(fd)!=sha:fail('INPUT_DRIFT')
-        recheck();negative=_failure_result(_invoke_fixed(harness,request,'failure'),request['prepared_sha256']);recheck()
-        native=_invoke_fixed(harness,request,'positive');verify_result(prepared_raw,canonical(native));recheck()
+        recheck()
+        diagnostic.phase='CONTROLLED_EXECUTE'
+        negative=_invoke_fixed(harness,request,'failure',diagnostic=diagnostic)
+        diagnostic.phase='CONTROLLED_VERIFY'
+        negative=_failure_result(negative,request['prepared_sha256'])
+        diagnostic.phase='CONTROLLED_RECHECK'
+        recheck()
+        diagnostic.phase='POSITIVE_EXECUTE'
+        native=_invoke_fixed(harness,request,'positive',diagnostic=diagnostic)
+        diagnostic.phase='POSITIVE_VERIFY'
+        verify_result(prepared_raw,canonical(native))
+        diagnostic.phase='POSITIVE_RECHECK'
+        recheck()
+        diagnostic.phase='PUBLIC_PROJECTION'
         # Public closed evidence excludes the private prepared nonce and paths.
         public_native={key:value for key,value in native.items() if key!='request_id'}
         public_native['kind']='darwin-archive-observation'
@@ -606,6 +740,7 @@ def main(argv=None):
     import sys
     class Parser(argparse.ArgumentParser):
         def error(self,message):fail('CLI')
+    diagnostic=DiagnosticContext()
     try:
         parser=Parser(description=__doc__);commands=parser.add_subparsers(dest='command',required=True)
         stage=commands.add_parser('prepare')
@@ -617,19 +752,28 @@ def main(argv=None):
             run.add_argument('--'+name,required=True)
         args=parser.parse_args(argv)
         if args.command=='prepare':
+            diagnostic.phase='PREPARE_COMMAND'
             result=prepare(args.archive,args.metadata,args.version,args.target,args.destination,source_commit=args.source_commit)
         elif args.command=='run-archive':
+            diagnostic.phase='HARNESS_SELECTION'
             harness=select_harness(args.cargo_messages,Path(args.harness_root),args.target)
-            result=run_archive(args.archive,args.metadata,args.version,args.target,args.destination,harness,source_commit=args.source_commit)
+            result=run_archive(args.archive,args.metadata,args.version,args.target,args.destination,harness,
+                               source_commit=args.source_commit,diagnostic=diagnostic)
+            diagnostic.phase='EVIDENCE_WRITE'
             evidence=Path(args.evidence)
             for key,value in result.items():
                 with (evidence/(args.target+'-'+key+'.json')).open('xb') as output:output.write(canonical(value))
             return 0
-        else:result=verify_result(_receipt_file(args.prepared),_receipt_file(args.native))
+        else:
+            diagnostic.phase='VERIFY_COMMAND'
+            result=verify_result(_receipt_file(args.prepared),_receipt_file(args.native))
         sys.stdout.buffer.write(canonical(result));sys.stdout.buffer.flush()
         return 0
-    except (ValueError,OSError,EOFError,zlib.error):
-        print('DARWIN_SMOKE_REFUSED',file=sys.stderr)
+    except (ValueError,OSError,EOFError,zlib.error) as error:
+        try:
+            line=b'DARWIN_SMOKE_REFUSED '+canonical(_refusal_record(error,diagnostic))
+            if len(line)<=1024:sys.stderr.write(line.decode('ascii'))
+        except (ValueError,OSError,EOFError,zlib.error):pass
         return 1
 
 
