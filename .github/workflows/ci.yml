@@ -949,6 +949,55 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_first_activation.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_consumer_activation.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_phase.py'
+          timeout --signal=TERM --kill-after=10 180 python3 -B - <<'PY'
+          import json, os, unittest
+          if os.environ.get('QSH_RPM_TOOL'):
+              raise SystemExit('source packaging gate requires QSH_RPM_TOOL unset')
+          suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_selinux_fedora_packaging.py')
+          def inventory(node):
+              if isinstance(node, unittest.TestCase): return [node.id()]
+              return [name for child in node for name in inventory(child)]
+          ids = inventory(suite)
+          if len(ids) != 35 or len(set(ids)) != 35:
+              raise SystemExit('packaging source test inventory drift')
+          class Counted(unittest.TextTestResult):
+              def __init__(self, *args):
+                  super().__init__(*args); self.success_ids = []
+              def addSuccess(self, test):
+                  super().addSuccess(test); self.success_ids.append(test.id())
+          result = unittest.TextTestRunner(verbosity=2, resultclass=Counted).run(suite)
+          skipped = [(test.id(), reason) for test, reason in result.skipped]
+          native = 'test_selinux_fedora_packaging.FedoraRecipeTests.test_synthetic_real_consumer_phase_headers_from_dedicated_variant'
+          expected = [(native, 'set QSH_RPM_TOOL for synthetic real RPM header control')]
+          print('SOURCE_PACKAGING_ACCOUNTING ' + json.dumps(dict(discovered=ids, tests_run=result.testsRun,
+              successful=result.success_ids, skipped=skipped), sort_keys=True))
+          accepted = (result.testsRun == 35 and result.wasSuccessful() and not result.unexpectedSuccesses
+              and skipped == expected and len(result.success_ids) == 34
+              and set(result.success_ids) == set(ids) - {native})
+          raise SystemExit(0 if accepted else 1)
+          PY
+          timeout --signal=TERM --kill-after=10 180 python3 -B - <<'PY'
+          import json, unittest
+          suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_selinux_pair_acceptance.py')
+          def inventory(node):
+              if isinstance(node, unittest.TestCase): return [node.id()]
+              return [name for child in node for name in inventory(child)]
+          ids = inventory(suite)
+          if not ids or len(set(ids)) != len(ids):
+              raise SystemExit('offline pair test inventory drift')
+          class Counted(unittest.TextTestResult):
+              def __init__(self, *args):
+                  super().__init__(*args); self.success_ids = []
+              def addSuccess(self, test):
+                  super().addSuccess(test); self.success_ids.append(test.id())
+          result = unittest.TextTestRunner(verbosity=2, resultclass=Counted).run(suite)
+          print('OFFLINE_PAIR_ACCOUNTING ' + json.dumps(dict(discovered=ids, tests_run=result.testsRun,
+              successful=result.success_ids, skipped=[(test.id(), reason) for test, reason in result.skipped]), sort_keys=True))
+          accepted = (result.testsRun == len(ids) and result.wasSuccessful() and not result.skipped
+              and not result.unexpectedSuccesses and len(result.success_ids) == len(ids)
+              and set(result.success_ids) == set(ids))
+          raise SystemExit(0 if accepted else 1)
+          PY
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_rpm_query.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_consumer_authority_generator.py'
           python3 -B -m unittest discover -s scripts/tests -p 'test_selinux_consumer_rpm_check.py'
@@ -956,6 +1005,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_api.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_files.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_selinux_retained_labels.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_observer.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_payload.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_references.py'

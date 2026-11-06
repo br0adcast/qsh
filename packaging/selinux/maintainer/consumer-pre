@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fedora SELinux pair lifecycle: RPM count is the sole routing authority.
+set -e
+
+if [ "$#" -ne 1 ]; then
+    echo QSHD_RPM_COUNT_REFUSED >&2
+    exit 1
+fi
+case "$1" in
+    ''|*[!0-9]*|0[0-9]*)
+        echo QSHD_RPM_COUNT_REFUSED >&2
+        exit 1
+        ;;
+esac
+
+case "$1" in
+    0)
+        echo QSHD_RPM_COUNT_REFUSED >&2
+        exit 1
+        ;;
+    1) exec /usr/bin/python3 -I -B /usr/libexec/qshd-selinux/qshd_selinux_phase.py consumer-pre-fresh ;;
+    *) exec /usr/bin/python3 -I -B /usr/libexec/qshd-selinux/qshd_selinux_phase.py consumer-pre-installed ;;
+esac

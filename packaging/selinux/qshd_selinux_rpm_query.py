@@ -519,6 +519,22 @@ class ConsumerAuthorityReader:
         self._used = False
 
     @contextmanager
+    def selection(self, *, deadline):
+        """Observe only the fixed authority's protected presence/absence branch."""
+        if self._used:_fail('MANIFEST_USED')
+        self._used=True;lease=_AuthoritySelection(self,_deadline(deadline))
+        try:
+            lease._open_routes()
+            yield lease
+            if lease._state!='checked':_fail('MANIFEST_RECHECK_REQUIRED')
+            lease.recheck(lease._observed)
+        except Exception as error:
+            if isinstance(error,RpmQueryError):raise
+            raise RpmQueryError('MANIFEST_REFUSED') from None
+        finally:lease._close()
+        lease._check()
+
+    @contextmanager
     def inspection(self, *, deadline):
         if self._used:
             _fail('MANIFEST_USED')
@@ -631,3 +647,47 @@ class _AuthorityLease(SafeFiles):
             if not isinstance(first_error, Exception):
                 raise first_error
             _fail('MANIFEST_CLOSE')
+
+
+@dataclass(frozen=True)
+class ConsumerAuthoritySelection:
+    authority: ConsumerRpmAuthority | None
+
+
+class _AuthoritySelection(_AuthorityLease):
+    def _open_routes(self):
+        self._check();self._missing=None
+        parent=self._directory(self.anchor)
+        relative=Path()
+        for name in ('usr','share','qshd'):
+            try:os.stat(name,dir_fd=parent,follow_symlinks=False)
+            except FileNotFoundError:
+                self._missing=(parent,name);break
+            relative=relative/name
+            parent=self._directory(self.anchor/relative)
+        self._parent=parent
+        self._validate_directory_routes();self._state='open';self._check()
+
+    def _selected(self):
+        self._check();self._validate_directory_routes()
+        parent,name=self._missing if self._missing is not None else (self._parent,'consumer-rpm.json')
+        try:os.stat(name,dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError:return None,None
+        if self._missing is not None:_fail('MANIFEST_BRANCH_DRIFT')
+        return super()._sample()
+
+    def capture(self):
+        if self._state!='open':_fail('MANIFEST_ORDER')
+        self._state='failed'
+        value,before=self._selected();again,after=self._selected()
+        if value!=again or before!=after:_fail('MANIFEST_DRIFT')
+        self._snapshot=before;self._observed=ConsumerAuthoritySelection(value)
+        self._state='captured';return self._observed
+
+    def recheck(self,selection):
+        valid=self._state in ('captured','checked') and selection is self._observed
+        self._state='failed'
+        if not valid:_fail('MANIFEST_OBSERVATION')
+        value,snapshot=self._selected()
+        if value!=selection.authority or snapshot!=self._snapshot:_fail('MANIFEST_DRIFT')
+        self._check();self._state='checked'

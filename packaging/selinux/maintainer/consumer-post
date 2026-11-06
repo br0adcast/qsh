@@ -1,0 +1,36 @@
+#!/bin/sh
+# Fedora SELinux pair lifecycle: RPM count is the sole routing authority.
+set -e
+
+if [ "$#" -ne 1 ]; then
+    echo QSHD_RPM_COUNT_REFUSED >&2
+    exit 1
+fi
+case "$1" in
+    ''|*[!0-9]*|0[0-9]*)
+        echo QSHD_RPM_COUNT_REFUSED >&2
+        exit 1
+        ;;
+esac
+
+case "$1" in
+    0)
+        echo QSHD_RPM_COUNT_REFUSED >&2
+        exit 1
+        ;;
+esac
+
+# Preserve the existing idempotent unprivileged worker-account contract.
+if ! /usr/bin/getent passwd qshd >/dev/null; then
+    /usr/sbin/useradd --system --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin --comment "qshd worker" qshd
+fi
+
+/usr/bin/python3 -I -B /usr/libexec/qshd-selinux/qshd_selinux_phase.py consumer-post-owned
+
+# Optional metadata refresh; service activation remains an administrator action.
+if [ -d /run/systemd/system ] && [ -x /usr/bin/systemctl ]; then
+    /usr/bin/systemctl --system daemon-reload >/dev/null 2>&1 || :
+fi
+
+exit 0

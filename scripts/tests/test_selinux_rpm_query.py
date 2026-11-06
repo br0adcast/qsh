@@ -458,6 +458,35 @@ class AuthorityReaderTests(unittest.TestCase):
         options.update(changes)
         return m.ConsumerAuthorityReader(**options)
 
+    def test_selection_binds_present_missing_leaf_and_missing_parent(self):
+        for branch in ('present','leaf','parent'):
+            with self.subTest(branch=branch):
+                if branch=='leaf':self.path.unlink()
+                if branch=='parent':self.parent.rmdir()
+                with self.reader().selection(deadline=300) as lease:
+                    value=lease.capture()
+                    self.assertEqual(value.authority,self.authority if branch=='present' else None)
+                    lease.recheck(value)
+                    lease.recheck(value)
+
+    def test_selection_refuses_unsafe_authority_and_branch_changes(self):
+        m=adapter()
+        for branch in ('appeared','disappeared','dangling','denied'):
+            with self.subTest(branch=branch):
+                if self.path.is_symlink():self.path.unlink()
+                self.path.write_bytes(self.raw);self.path.chmod(0o644)
+                if branch in ('appeared','dangling'):self.path.unlink()
+                if branch=='dangling':self.path.symlink_to('/missing')
+                with self.assertRaises(m.RpmQueryError):
+                    with self.reader().selection(deadline=300) as lease:
+                        if branch=='denied':
+                            with patch.object(lease,'_read',side_effect=PermissionError()):lease.capture()
+                        else:
+                            value=lease.capture()
+                            if branch=='appeared':self.path.write_bytes(self.raw);self.path.chmod(0o644)
+                            elif branch=='disappeared':self.path.unlink()
+                            lease.recheck(value)
+
     def test_protected_canonical_capture_repeat_recheck_and_closed_identity(self):
         m=adapter()
         reader=self.reader()

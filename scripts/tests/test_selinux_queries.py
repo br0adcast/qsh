@@ -94,6 +94,27 @@ class FakeApi:
     def validate_transition(self, *args): return self.call('validate_transition', *args)
 
 class QueryTests(unittest.TestCase):
+    def test_borrowed_exact_native_token_has_no_extra_status_calls(self):
+        import copy
+        import qshd_selinux_api as native
+        from scripts.tests.test_selinux_api import SharedStatus
+        shared=SharedStatus();api=native.SelinuxApi(shared.library());fake=FakeApi()
+        for name in ('check_context','require_av','compute_create','compute_relabel','validate_transition'):
+            setattr(api,name,getattr(fake,name))
+        fake.active=True
+        with api.status_observation() as status:
+            before=list(shared.events)
+            with queries.required_observation(api,status=status):pass
+            self.assertEqual(shared.events,before)
+            self.assertEqual(fake.calls,expected_calls())
+            with self.assertRaises(Exception):
+                with queries.required_observation(api,status=copy.copy(status)):pass
+            with self.assertRaises(Exception):
+                with queries.required_observation(native.SelinuxApi(shared.library()),status=status):pass
+        self.assertEqual(shared.events,['open','updated','updated','close'])
+        with self.assertRaises(Exception):
+            with queries.required_observation(api,status=status):pass
+
     def test_complete_order_and_caller_inside_single_window(self):
         api = FakeApi()
         with queries.required_observation(api) as record:

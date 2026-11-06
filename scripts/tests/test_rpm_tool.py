@@ -193,6 +193,74 @@ print(json.dumps(observation))
         self.assertEqual(prepare.PATCHES[-1], name)
         self.assertTrue((ROOT / 'packaging/rpm-tool' / name).is_file())
 
+    def test_preun_and_reaping_patch_composition_order(self):
+        self.assertEqual(prepare.PATCHES, (
+            'rpm-0.23.2-archive-size.patch',
+            'cargo-generate-rpm-0.21.0-local-rpm.patch',
+            'cargo-generate-rpm-0.21.0-requires-post.patch',
+            'cargo-generate-rpm-0.21.0-requires-pre.patch',
+            'cargo-generate-rpm-0.21.0-requires-preun.patch',
+            'cargo-generate-rpm-0.21.0-reap-ldd.patch'))
+        for name, expected in (
+                ('cargo-generate-rpm-0.21.0-requires-preun.patch',
+                 '08e4c95a429dc9871aa41fd7e49e197b652537048a0b127df2091477bc27b3a6'),
+                ('cargo-generate-rpm-0.21.0-reap-ldd.patch',
+                 '7f38ee3fded721f159dcda1477e3fa0d0717392a200b7a3026061fd605b7f907')):
+            self.assertEqual(hashlib.sha256((ROOT / 'packaging/rpm-tool' / name).read_bytes()).hexdigest(), expected)
+
+    def offer_builder(self):
+        spec = importlib.util.spec_from_file_location('rpm_offer_builder', ROOT / 'packaging/selinux/build.py')
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        return builder
+
+    def assert_recipe_offer_closed(self, files):
+        required = {'packaging/rpm-tool/' + name for name in (
+            'README.md', 'install.sh', 'prepare.py', 'test_dependencies.py', 'test_child_reaping.py')}
+        required.update('packaging/rpm-tool/' + name for name in prepare.PATCHES)
+        self.assertFalse(required - set(files), 'source offer omits pinned recipe inputs')
+        for name in required:
+            self.assertEqual(files[name].read_bytes(), (ROOT / name).read_bytes(), name)
+
+    def test_source_offer_contains_complete_recipe_and_refuses_missing_leaves(self):
+        files = self.offer_builder().bundle_source_files(ROOT / 'packaging/selinux')
+        for leaf in ('cargo-generate-rpm-0.21.0-reap-ldd.patch', 'test_child_reaping.py'):
+            with self.subTest(required_leaf=leaf):
+                self.assertIn('packaging/rpm-tool/' + leaf, files)
+        self.assert_recipe_offer_closed(files)
+        for leaf in ('cargo-generate-rpm-0.21.0-reap-ldd.patch', 'test_child_reaping.py'):
+            incomplete = {name: path for name, path in files.items()
+                          if name != 'packaging/rpm-tool/' + leaf}
+            with self.subTest(missing_leaf=leaf), self.assertRaises(AssertionError):
+                self.assert_recipe_offer_closed(incomplete)
+
+    def test_source_offer_fixture_has_exact_members_bytes_modes_and_epoch(self):
+        import json
+        builder = self.offer_builder()
+        files = builder.bundle_source_files(ROOT / 'packaging/selinux')
+        self.assertEqual(len(files), 73)
+        pins = json.loads((ROOT / 'packaging/selinux/inputs.json').read_text())
+        # Inert input stand-ins test the corresponding-source archive closure;
+        # this creates no policy output or A/B product/source-offer artifact.
+        for role in ('policy_devel', 'policy_source'):
+            path = self.root / pins[role]
+            path.write_bytes(('inert ' + role + ' fixture').encode())
+            files['inputs/' + pins[role]] = path
+        self.assertEqual(len(files), 75)
+        self.assert_recipe_offer_closed(files)
+        epoch = 1793798821
+        output = self.root / 'source-closure-fixture.tar.gz'
+        builder.source_bundle(output, files, epoch)
+        with tarfile.open(str(output)) as archive:
+            members = archive.getmembers()
+            self.assertEqual([item.name for item in members], sorted(files))
+            for item in members:
+                self.assertTrue(item.isfile())
+                self.assertFalse(item.name.startswith('/'))
+                self.assertTrue(all(part not in ('', '.', '..') for part in item.name.split('/')))
+                self.assertEqual((item.mode, item.uid, item.gid, item.mtime), (0o644, 0, 0, epoch))
+                self.assertEqual(archive.extractfile(item).read(), files[item.name].read_bytes())
+
     def test_package_floor_copy_sources_exist_in_both_actual_contexts(self):
         native = (ROOT / ".github/workflows/native-crypto.yml").read_text()
         native_line = next(line for line in native.splitlines()

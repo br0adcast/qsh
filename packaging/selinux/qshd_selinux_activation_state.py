@@ -24,7 +24,7 @@ class SlotError(Conflict):
 
 
 class OutcomeUncertain(SlotError):
-    """Completion replacement began; failure does not prove disk is PENDING."""
+    """Terminal slot mutation began; failure does not prove disk is PENDING."""
 
 
 def _error(error, fallback='FILESYSTEM_REFUSED'):
@@ -102,6 +102,7 @@ class _Writer:
         self._phase = 'new'
         self._initial = None
         self._pending = None
+        self._retirement_attempted = False
 
     def _live(self):
         if not self._active:
@@ -151,7 +152,7 @@ class _Writer:
             self._phase = 'completing'
             complete = _parse(document, 'COMPLETE')
             pending = self._pending.observation.record
-            fields = ('schema', 'profile', 'abi', 'query_profile', 'operation_id', 'artifact', 'module')
+            fields = ('schema', 'profile', 'abi', 'query_profile', 'operation_id', 'artifact', 'modules', 'intent')
             if any(getattr(complete, key) != getattr(pending, key) for key in fields):
                 raise SlotError('HEADER_MISMATCH')
             try:
@@ -168,6 +169,31 @@ class _Writer:
             if not isinstance(error, Exception):
                 raise
             _error(error, 'COMPLETION_FAILED')
+
+    def retire_erased(self, pending_token):
+        """Retire only this writer's exact, same-artifact provider-erase PENDING."""
+        self._live()
+        def boundary():
+            self._retirement_attempted = True
+        try:
+            if self._phase != 'pending' or pending_token is not self._pending:
+                raise SlotError('NO_FRESH_PENDING')
+            self._phase = 'retiring'
+            pending = _parse(self._pending.observation.document, 'PENDING')
+            if (pending != self._pending.observation.record or pending.intent != 'provider-erase'
+                    or pending.completion is not None or pending.basis is None
+                    or pending.basis.artifact != pending.artifact):
+                raise SlotError('INVALID_ERASE_PENDING')
+            result = self._slot._retire(self._pending.observation, boundary)
+            self._phase = 'retired'
+            return result
+        except BaseException as error:
+            self._phase = 'failed'
+            if self._retirement_attempted:
+                raise OutcomeUncertain('OUTCOME_UNCERTAIN') from None
+            if not isinstance(error, Exception):
+                raise
+            _error(error, 'RETIREMENT_FAILED')
 
     def observe_outcome(self):
         self._live()
@@ -253,6 +279,29 @@ class ActivationSlot(SafeFiles):
         self.hook('slot_readback')
         return result
 
+    def _retire(self, baseline, boundary):
+        def entries(expected):
+            self._validate()
+            if self._stages or set(os.listdir(self.state_fd)) != expected:
+                raise SlotError('RETIREMENT_LAYOUT')
+        self._recheck(baseline)
+        entries({'lock', 'activation.json'})
+        self.hook('before_slot_unlink')
+        self._recheck(baseline)
+        entries({'lock', 'activation.json'})
+        boundary()  # Even a failed unlink acknowledgment cannot prove preservation.
+        os.unlink('activation.json', dir_fd=self.state_fd)
+        self.hook('slot_unlink')
+        os.fsync(self.state_fd)
+        self.hook('slot_retire_directory_sync')
+        result = self._observe()
+        if result != SlotObservation(None, None, None):
+            raise SlotError('RETIREMENT_READBACK')
+        self.hook('slot_retire_readback')
+        self._recheck(result)
+        entries({'lock'})
+        return result
+
     def _cleanup_stages(self):
         for name, stage in list(self._stages.items()):
             self._validate()
@@ -278,48 +327,53 @@ class ActivationSlot(SafeFiles):
         facade = None
         try:
             try:
-                self.state_fd = self._directory(self.state)
-                if stat.S_IMODE(os.fstat(self.state_fd).st_mode) != 0o700:
-                    raise SlotError('STATE_MODE')
-                self.lock_fd = self._open(self.state_fd, 'lock', state=True)
-                fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-                self._validate()
-            except Exception as error:
-                _error(error)
-            facade = _Writer(self) if writer else _Reader(self)
-            yield facade
-            try:
-                self._validate()
-            except Exception as error:
-                _error(error)
-        finally:
-            if facade is not None:
-                facade._active = False
-            original = sys.exc_info()[1]
-            try:
-                if self._stages:
-                    try:
-                        self._cleanup_stages()
-                    except Exception:
-                        if isinstance(original, OutcomeUncertain):
-                            raise OutcomeUncertain('OUTCOME_UNCERTAIN_CLEANUP') from None
-                        raise SlotError('STAGE_CLEANUP') from None
+                try:
+                    self.state_fd = self._directory(self.state)
+                    if stat.S_IMODE(os.fstat(self.state_fd).st_mode) != 0o700:
+                        raise SlotError('STATE_MODE')
+                    self.lock_fd = self._open(self.state_fd, 'lock', state=True)
+                    fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+                    self._validate()
+                except Exception as error:
+                    _error(error)
+                facade = _Writer(self) if writer else _Reader(self)
+                yield facade
+                try:
+                    self._validate()
+                except Exception as error:
+                    _error(error)
             finally:
-                fds = set(self.anchors + [fd for route in self.routes for fd in (route[0], route[2])])
-                if self.lock_fd is not None:
-                    fds.add(self.lock_fd)
-                close_failed = False
-                for fd in fds:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        close_failed = True
-                self.anchors, self.routes = [], []
-                self._busy = False
-                if close_failed:
-                    if isinstance(original, OutcomeUncertain):
-                        raise OutcomeUncertain('OUTCOME_UNCERTAIN_CLOSE') from None
-                    raise SlotError('CLOSE_FAILED') from None
+                if facade is not None:
+                    facade._active = False
+                original = sys.exc_info()[1]
+                try:
+                    if self._stages:
+                        try:
+                            self._cleanup_stages()
+                        except Exception:
+                            if isinstance(original, OutcomeUncertain):
+                                raise OutcomeUncertain('OUTCOME_UNCERTAIN_CLEANUP') from None
+                            raise SlotError('STAGE_CLEANUP') from None
+                finally:
+                    fds = set(self.anchors + [fd for route in self.routes for fd in (route[0], route[2])])
+                    if self.lock_fd is not None:
+                        fds.add(self.lock_fd)
+                    close_failed = False
+                    for fd in fds:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            close_failed = True
+                    self.anchors, self.routes = [], []
+                    self._busy = False
+                    if close_failed:
+                        if isinstance(original, OutcomeUncertain):
+                            raise OutcomeUncertain('OUTCOME_UNCERTAIN_CLOSE') from None
+                        raise SlotError('CLOSE_FAILED') from None
+        except BaseException:
+            if facade is not None and writer and facade._retirement_attempted:
+                raise OutcomeUncertain('OUTCOME_UNCERTAIN_RETIREMENT') from None
+            raise
 
     def inspection(self):
         return self._lease(False)

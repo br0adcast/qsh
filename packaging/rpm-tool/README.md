@@ -49,10 +49,11 @@ cargo test --manifest-path /tmp/new-rpm-tool-sources/rpm-0.23.2/Cargo.toml \
 ```
 
 Every installation runs the shared `test_dependencies.py` checks against the
-freshly installed binary. They generate RPMs and inspect numeric PRE/POST flags,
-ordinary version constraints, automatic ELF requirements, and invalid PRE
-metadata rejection. Failure stops both hosted release packaging and the RPM
-floor image build, without a second tool build or separate CI job. Payloads
+freshly installed binary. They generate RPMs and inspect numeric PRE/POST/PREUN
+flags, ordinary version constraints (including ABI equality), automatic ELF
+requirements, and invalid PRE/PREUN metadata rejection. Failure stops both hosted
+release packaging and the RPM floor image build, without a second tool build or
+separate CI job. Payloads
 are never executed. Run the same checks against an existing prepared tool:
 
 ```sh
@@ -103,6 +104,31 @@ merely look like a post-script dependency in a manifest. Controlled minimal
 installation additionally proves package-manager resolution with the
 user-management provider initially absent; stock-image tool presence alone
 cannot establish that property.
+
+## Pre-uninstall command dependencies
+
+The pinned generator also accepts unversioned capabilities in `requires-preun`:
+
+```toml
+requires = { "qsh-selinux-policy-abi" = "= 2" }
+requires-preun = { "qsh-selinux-policy-abi" = "*" }
+```
+
+The `requires-preun` table emits genuine `SCRIPT_PREUN` dependencies through
+`rpm::Dependency::script_preun`. As with `requires-pre` and `requires-post`,
+values are trimmed; empty strings and `"*"` are accepted, while version
+expressions and non-string values fail. Ordinary `requires` retains versioned
+runtime constraints, so an ABI equality requirement stays separate from the
+unversioned script dependency. A capability named with a `(preun)` suffix does
+not express script ordering.
+
+The PREUN patch is applied after the existing POST and PRE extensions, before
+the child-reaping patch below. Shared
+installation checks inspect actual generated RPM headers for numeric flags
+512 (`SCRIPT_PRE`), 1024 (`SCRIPT_POST`), and 2048 (`SCRIPT_PREUN`), preserving
+ordinary dependencies and automatic ELF requirements. Header checks validate
+the recipe primitive; installed transaction ordering requires separate package
+lifecycle acceptance.
 
 ## Automatic-requirements child custody
 

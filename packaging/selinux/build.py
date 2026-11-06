@@ -18,21 +18,48 @@ import subprocess
 import tarfile
 
 HERE = Path(__file__).resolve().parent
-QUALIFIED = {
-    'qshd.te': '7221989093de7c5e7e015e613446d78f869c14001cedf79dac44303758a02f09',
-    'qshd.fc': '563b0c6804699187eeea5dd98f737025685c25d5e178c61221f5e2f9c2e06317',
-    'qshd.if': hashlib.sha256(b'\n').hexdigest(),
-}
+QUALIFIED = {'qshd.te': 'd891ce234fe9b6d008dfe34b5b885b498ba4ccab636b6f110413fe4e0cc258a3', 'qshd.fc': '01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b', 'qshd.if': '01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b', 'qshd_contexts.te': '2726380551198a6a2e2df4953f59fa7bc98bc979ee24b53d3f6a2783ce06bf72', 'qshd_contexts.fc': '563b0c6804699187eeea5dd98f737025685c25d5e178c61221f5e2f9c2e06317', 'qshd_contexts.if': '01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b'}
 
 
-BUNDLE_SOURCE_FILES = ('qshd.te', 'qshd.fc', 'qshd.if', 'build.py',
+BUNDLE_SOURCE_FILES = ('qshd.te', 'qshd.fc', 'qshd.if',
+                       'qshd_contexts.te', 'qshd_contexts.fc', 'qshd_contexts.if', 'build.py',
                        'inputs.json', 'artifact.json', 'README.md', 'GPL-3.0.txt',
-                       'Dockerfile')
+                       'Dockerfile', 'assemble_payload.py', 'embed_provider_pre.py',
+                       'embed_stop_guard.py', 'qshd_selinux_provider_pre.py',
+                       'qshd-selinux.spec', 'build-fedora-packages.sh',
+                       'qshd-fedora-system.service') + tuple(
+    'qshd_selinux_' + name + '.py' for name in (
+        'activation', 'activation_state', 'contexts', 'transaction', 'fs', 'registry',
+        'process', 'modules', 'module_observer', 'api', 'queries', 'files',
+        'retained_labels', 'observer', 'reference_loader', 'package_state',
+        'module_install', 'first_activation', 'consumer_activation', 'provider_erase',
+        'phase', 'rpm_query')) + ('stop_guard.py',) + tuple(
+    'maintainer/' + name for name in (
+        'provider-pre', 'provider-post', 'provider-preun', 'provider-postun',
+        'consumer-pre', 'consumer-post', 'consumer-preun', 'consumer-postun'))
+
+BUNDLE_REPOSITORY_FILES = (
+    'LICENSE', 'Cargo.toml', 'cli/Cargo.toml', 'README.md', 'CHANGELOG.md',
+    'docs/licenses/openssl.txt', 'packaging/qshd.service',
+    'packaging/pam.d/qshd.fedora-selinux', 'scripts/check-pam-linkage.sh',
+    'scripts/check-selinux-linkage.sh', 'scripts/generate-selinux-consumer-authority.py',
+    'scripts/check-selinux-consumer-rpm.py', 'packaging/rpm-tool/README.md',
+    'packaging/rpm-tool/install.sh', 'packaging/rpm-tool/prepare.py',
+    'packaging/rpm-tool/test_dependencies.py',
+    'packaging/rpm-tool/test_child_reaping.py',
+    'packaging/rpm-tool/rpm-0.23.2-archive-size.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-local-rpm.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-post.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-pre.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-requires-preun.patch',
+    'packaging/rpm-tool/cargo-generate-rpm-0.21.0-reap-ldd.patch')
 
 
 def bundle_source_files(source):
-    return {'packaging/selinux/' + name: source / name
-            for name in BUNDLE_SOURCE_FILES}
+    files = {'packaging/selinux/' + name: source / name
+             for name in BUNDLE_SOURCE_FILES}
+    files.update({name: source.parents[1] / name for name in BUNDLE_REPOSITORY_FILES})
+    return files
 
 
 def compile_environment(work, epoch):
@@ -46,7 +73,10 @@ def compile_environment(work, epoch):
 def compile_command(share):
     return ['/usr/bin/make', '-f', str(share / 'devel/Makefile'),
             'SHAREDIR=' + str(share), 'NAME=targeted', 'TYPE=mcs',
-            'M4=/usr/bin/m4', 'AWK=/usr/bin/gawk', 'DIRECT_INITRC=n', 'qshd.pp']
+            'M4=/usr/bin/m4', 'AWK=/usr/bin/gawk', 'DIRECT_INITRC=n',
+            # Explicit goals survive GNU make's implicit-intermediate cleanup.
+            'tmp/qshd.mod.fc', 'tmp/qshd_contexts.mod.fc',
+            'qshd.pp', 'qshd_contexts.pp']
 
 
 def canonical(data):
@@ -70,35 +100,58 @@ def validate_paths(source, work, output):
         raise ValueError('work/output paths must not exist (stale output)')
 
 
-def validate_package(data, expected_contexts):
-    """Read libsepol PP v1/module headers, requiring the qualified format floor."""
+def validate_package(data, *, role, expected_contexts):
+    """Validate a closed MCS pair role, preserving exact reviewed FC bytes.
+
+    The pinned devel Makefile always packages its expanded FC file. For the
+    core this has no canonical mappings. Expected bytes are an explicit trusted
+    expanded-file input; observed comments/whitespace never bypass exact equality.
+    Actual output bytes and import/export inspection remain build evidence.
+    """
+    roles={'core':b'qshd','contexts':b'qshd_contexts'}
+    if type(role) is not str or role not in roles:
+        raise ValueError('unknown policy role')
+    if type(data) is not bytes or not 0<len(data)<=16*1024**2:
+        raise ValueError('invalid package size')
+    if type(expected_contexts) is not bytes or len(expected_contexts)>1024**2:
+        raise ValueError('invalid expected contexts')
+    if role=='core' and canonical(expected_contexts)!=b'\n':
+        raise ValueError('core contains mappings')
+    if role=='contexts' and canonical(expected_contexts)!=expanded_contexts():
+        raise ValueError('unexpected companion mappings')
     try:
-        magic, version, count, module_start, context_start = struct.unpack_from('<5I', data)
-        if (magic, version, count, module_start) != (0xf97cff8f, 1, 2, 20):
+        magic,version,count,module_start,context_start=struct.unpack_from('<5I',data)
+        if (magic,version,count,module_start)!=(0xf97cff8f,1,2,20):
             raise ValueError('unexpected policy package format')
-        if not 20 < context_start < len(data):
+        if not 20<context_start<=len(data)-4:
             raise ValueError('invalid package section offsets')
-        module = data[module_start:context_start]
-        magic, length = struct.unpack_from('<2I', module)
-        if magic != 0xf97cff8d or module[8:8 + length] != b'SE Linux Module':
+        module=data[module_start:context_start]
+        magic,length=struct.unpack_from('<2I',module)
+        if magic!=0xf97cff8d or length!=15 or module[8:23]!=b'SE Linux Module':
             raise ValueError('unexpected module format')
-        offset = 8 + length
-        kind, policy_version, flags, symbols, contexts = struct.unpack_from('<5I', module, offset)
-        if (kind, policy_version, flags, symbols, contexts) != (2, 19, 1, 8, 0):
-            raise ValueError('module is outside the qualified format floor')
-        offset += 20
-        for expected in (b'qshd', b'0.2.0'):
-            length = struct.unpack_from('<I', module, offset)[0]
-            offset += 4
-            if module[offset:offset + length] != expected:
-                raise ValueError('unexpected module name/version')
-            offset += length
-        if struct.unpack_from('<I', data, context_start)[0] != 0xf97cff90:
+        offset=23
+        if struct.unpack_from('<5I',module,offset)!=(2,19,1,8,0):
+            raise ValueError('module is outside the qualified MCS format floor')
+        offset+=20
+        for expected in (roles[role],b'0.3.0'):
+            length=struct.unpack_from('<I',module,offset)[0];offset+=4
+            if length!=len(expected) or module[offset:offset+length]!=expected:
+                raise ValueError('unexpected module role/name/version')
+            offset+=length
+        if struct.unpack_from('<I',data,context_start)[0]!=0xf97cff90:
             raise ValueError('missing file-context section')
-        if canonical(data[context_start + 4:]) != canonical(expected_contexts):
-            raise ValueError('unexpected embedded file contexts')
-    except (struct.error, UnicodeError) as error:
+        if data[context_start+4:]!=expected_contexts:
+            raise ValueError('unexpected exact embedded file contexts')
+    except (struct.error,UnicodeError) as error:
         raise ValueError('truncated or invalid policy package') from error
+
+
+def expanded_contexts():
+    return (b'/usr/bin/qshd -- system_u:object_r:qshd_exec_t:s0\n'
+            b'/etc/qshd(/.*)? system_u:object_r:qshd_config_t:s0\n'
+            b'/var/log/qshd(/.*)? system_u:object_r:qshd_log_t:s0\n'
+            b'/run/qshd(/.*)? system_u:object_r:qshd_runtime_t:s0\n'
+            b'/var/run/qshd(/.*)? system_u:object_r:qshd_runtime_t:s0\n')
 
 
 def source_bundle(output, files, epoch):
@@ -177,13 +230,15 @@ def build(args):
         shutil.copyfile(source / name, compile_dir / name)
     run(compile_command(share), cwd=compile_dir,
         env=compile_environment(work, args.epoch))
-    contexts = b'\n'.join(line.replace(b'gen_context(', b'').replace(b',s0)', b':s0')
-                           for line in canonical((source / 'qshd.fc').read_bytes()).splitlines()) + b'\n'
-    pp = (compile_dir / 'qshd.pp').read_bytes()
-    validate_package(pp, contexts)
+    packages={}
+    contexts={}
+    for role,name in (('core','qshd'),('contexts','qshd_contexts')):
+        packages[name]=(compile_dir/(name+'.pp')).read_bytes()
+        contexts[name]=(compile_dir/'tmp'/(name+'.mod.fc')).read_bytes()
+        validate_package(packages[name],role=role,expected_contexts=contexts[name])
     output.mkdir()
-    (output / 'qshd.pp').write_bytes(pp)
-    (output / 'qshd.fc').write_bytes(contexts)
+    for name,pp in packages.items():(output/(name+'.pp')).write_bytes(pp)
+    (output/'qshd_contexts.fc').write_bytes(contexts['qshd_contexts'])
     files.update(bundle_source_files(source))
     files['LICENSE'] = HERE.parents[1] / 'LICENSE'
     files['Cargo.toml'] = HERE.parents[1] / 'Cargo.toml'

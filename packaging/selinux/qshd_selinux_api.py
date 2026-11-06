@@ -7,6 +7,7 @@ Status observations detect cooperative policy/mode changes, not hostile races.
 import ctypes as C
 from contextlib import contextmanager
 import re
+import os
 import stat
 
 
@@ -50,6 +51,52 @@ def _name(value):
     if not isinstance(value, str) or not _NAME.fullmatch(value):
         raise SelinuxError('input', 'name')
     return value.encode('ascii')
+
+
+# libselinux's status mapping is process-global and has no open refcount.
+# These helpers are serialized and single-threaded; parallel native bypasses
+# are outside this adapter's contract.
+_STATUS_OWNER = None
+_STATUS_POISONED = False
+
+
+class _StatusRecord:
+    def __init__(self, api):
+        self.api = api
+        self.pid = os.getpid()
+        self.state = 'provisional'
+        self.token = _StatusToken(self)
+
+
+class _StatusToken:
+    """Exact issued observation custody, not a serializable policy proof."""
+    __slots__ = ('_record',)
+
+    def __init__(self, record):
+        self._record = record
+
+    def __reduce__(self):
+        raise TypeError('status tokens cannot be serialized')
+
+    def _issued(self):
+        record = self._record
+        if (type(record) is not _StatusRecord or record.token is not self
+                or record.pid != os.getpid()):
+            raise SelinuxError('status', 'invalid observation token')
+        return record
+
+    def require_open(self):
+        record = self._issued()
+        if (_STATUS_POISONED or _STATUS_OWNER is not record
+                or record.state != 'open' or not record.api._observing):
+            raise SelinuxError('status', 'observation not open')
+        return record.api
+
+    def require_closed(self):
+        record = self._issued()
+        if record.state != 'closed':
+            raise SelinuxError('status', 'observation not normally closed')
+        return record.api
 
 
 class SelinuxApi:
@@ -204,32 +251,46 @@ class SelinuxApi:
 
     @contextmanager
     def status_observation(self):
-        """Require enforcing and no observed policy/mode change within a window."""
-        if self._observing:
-            raise SelinuxError('status', 'nested observation')
+        """Own the sole native window; issue exact live/normal-close custody."""
+        global _STATUS_OWNER, _STATUS_POISONED
+        if self._observing or _STATUS_OWNER is not None or _STATUS_POISONED:
+            raise SelinuxError('status', 'observation already owned or poisoned')
+        record = _StatusRecord(self)
+        _STATUS_OWNER = record  # Reserve before any native call.
         self._observing = True
         opened = False
+        checked = False
         try:
             result = self._call('selinux_status_open', 0)
             opened = True
-            if result != 0:  # Refuse netlink fallback and abnormal results.
+            if result != 0:
                 raise SelinuxError('status', 'open fallback')
-            self._call('selinux_status_updated')  # Consume initial indication.
+            self._call('selinux_status_updated')
             if self._call('selinux_status_getenforce') != 1:
                 raise SelinuxError('status', 'not enforcing')
             counter = self._call('selinux_status_policyload')
-            yield
+            record.state = 'open'
+            yield record.token
             updated = self._call('selinux_status_updated')
             enforcing = self._call('selinux_status_getenforce')
             current = self._call('selinux_status_policyload')
             if updated != 0 or enforcing != 1 or current != counter:
                 raise SelinuxError('status', 'observation changed')
+            checked = True
         finally:
+            record.state = 'failed'
             try:
                 if opened:
-                    self._lib.selinux_status_close()
+                    try:
+                        self._lib.selinux_status_close()
+                    except BaseException:
+                        _STATUS_POISONED = True
+                        raise
+                if checked:
+                    record.state = 'closed'
             finally:
                 self._observing = False
+                _STATUS_OWNER = None
 
 
 class _FileDefaults:

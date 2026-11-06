@@ -11,24 +11,30 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import math
+import time
 from dataclasses import dataclass
 
 from qshd_selinux_activation import TrustedArtifact
 from qshd_selinux_fs import SafeFiles, Conflict
 from qshd_selinux_modules import ModuleEntry, HllIdentity, ModuleError, parse_full_listing, select_owned, verify_hll, MAX_HLL
-from qshd_selinux_process import _CommandError, _Limits, _Owner
+from qshd_selinux_process import _CommandError, _Limits, _Owner, _Streams, _normal_outcome
 
 
 _LIMITS = _Limits(15, 1024 * 1024)
 _PREFIX = ('/usr/bin/semodule', '--store-path', '/var/lib/selinux', '-s', 'targeted')
 _COMMANDS = {'list': _PREFIX + ('-lfull',),
-             'extract': _PREFIX + ('-X', '400', '--hll', '-E', 'qshd')}
+             'extract-core': _PREFIX + ('-X', '400', '--hll', '-E', 'qshd'),
+             'extract-contexts': _PREFIX + ('-X','400','--hll','-E','qshd_contexts')}
 
 
 class _SemoduleOwner:
     """Only the future trusted observer selects these two fixed operations."""
 
-    def __init__(self):
+    def __init__(self,mode='pair'):
+        if type(mode) is not str or mode not in ('pair','core-only','absent'):raise _CommandError('COMMAND_KIND')
+        self._mode=mode
+        self._budget={'pair':6,'core-only':4,'absent':2}[mode]
         self._owner = _Owner(_LIMITS)
         self._calls = 0
 
@@ -39,14 +45,18 @@ class _SemoduleOwner:
     def _run(self, operation, cwd, *, deadline=None):
         if type(operation) is not str or operation not in _COMMANDS:
             raise _CommandError('COMMAND_KIND')
-        if self._calls >= 4:
+        if operation!='list' and (self._mode=='absent' or self._mode=='core-only' and operation=='extract-contexts'):
+            raise _CommandError('COMMAND_KIND')
+        if self._calls >= self._budget:
             raise _CommandError('COMMAND_BUDGET')
         self._calls += 1
         streams = self._owner._run(_COMMANDS[operation], cwd, deadline=deadline)
+        if (type(streams) is not _Streams or type(streams.stdout) is not bytes or type(streams.stderr) is not bytes
+                or not _normal_outcome(self._last) or self._last.exit_code!=0):raise _CommandError('COMMAND_CUSTODY')
         if streams.stderr:
             raise _CommandError('COMMAND_STDERR')
         output = streams.stdout
-        if operation == 'extract' and output:
+        if operation != 'list' and output:
             raise _CommandError('COMMAND_OUTPUT')
         return output
 
@@ -81,28 +91,29 @@ def _store_readlock(files, store):
 
 
 @dataclass(frozen=True)
-class ModuleObservation:
+class ModuleComponent:
     entry: ModuleEntry
     hll: HllIdentity
-    pp_sha256: str
+
+
+@dataclass(frozen=True)
+class ModuleObservation:
+    mode: str
+    core: ModuleComponent | None
+    contexts: ModuleComponent | None
+    artifact: TrustedArtifact
     bindings: tuple
 
 
-def production_observer(trusted_artifact):
-    """Fixed production authority; no caller-selected roots or commands.
-
-    Caller supplies independent trusted artifact identity and serializes lifecycle
-    writers. Enforcing/targeted kernel and one status window are separate caller
-    prerequisites. Library setup checks Fedora44 and protected existing paths.
-    """
-    if os.geteuid() != 0:
-        _fail('ROOT_REQUIRED')
-    return ModuleObserver(trusted_artifact)
+def production_observer(trusted_artifact,*,mode='pair',deadline):
+    """Caller supplies independent pair authority and original absolute end."""
+    if os.geteuid()!=0:_fail('ROOT_REQUIRED')
+    return ModuleObserver(trusted_artifact,mode=mode,deadline=deadline)
 
 
-def _testing_observer(trusted_artifact, root, runner):
-    return ModuleObserver(trusted_artifact, _root=root, _runner=runner,
-                          _uid=os.getuid())
+def _testing_observer(trusted_artifact,root,runner,*,mode='pair',deadline=None,_clock=time.monotonic):
+    if deadline is None:deadline=_clock()+110
+    return ModuleObserver(trusted_artifact,mode=mode,deadline=deadline,_root=root,_runner=runner,_uid=os.getuid(),_clock=_clock)
 
 
 class ModuleObserver(SafeFiles):
@@ -112,13 +123,19 @@ class ModuleObserver(SafeFiles):
     Construct production callers through production_observer.
     """
 
-    def __init__(self, trusted_artifact, *, _root=None, _runner=None, _uid=0):
+    def __init__(self,trusted_artifact,*,mode='pair',deadline,_root=None,_runner=None,_uid=0,_clock=time.monotonic):
         if type(trusted_artifact) is not TrustedArtifact:
             _fail('TRUSTED_ARTIFACT')
         trusted_artifact.__post_init__()
         self._trusted = TrustedArtifact(trusted_artifact.provider_version,
                                        trusted_artifact.manifest_sha256,
-                                       trusted_artifact.pp_sha256)
+                                       trusted_artifact.core_pp_sha256,trusted_artifact.contexts_pp_sha256)
+        if type(mode) is not str or mode not in ('pair','core-only','absent'):_fail('MODE')
+        try:finite=type(deadline) in (int,float) and math.isfinite(deadline)
+        except OverflowError:finite=False
+        if not finite:_fail('DEADLINE')
+        self._mode=mode;self._end=deadline;self._clock=_clock;self._calls=0
+        self._budget={'pair':6,'core-only':4,'absent':2}[mode]
         self.anchor = Path('/') if _root is None else Path(_root)
         if not self.anchor.is_absolute():
             _fail('ANCHOR')
@@ -136,6 +153,9 @@ class ModuleObserver(SafeFiles):
         self._output = []
         self._acquired = []
 
+    def _time(self):
+        if self._clock()>=self._end:_fail('DEADLINE')
+
     def _protected(self, parent, name, limit, *, mode=None, executable=False):
         return _protected_file(self, parent, name, limit, mode=mode, executable=executable)
 
@@ -144,6 +164,7 @@ class ModuleObserver(SafeFiles):
             _fail('LEASE_STATE')
         self._state = 'failed'
         try:
+            self._time()
             for key, relative in (('bin','usr/bin'), ('config','etc/selinux'),
                                   ('store','var/lib/selinux/targeted'),
                                   ('active','var/lib/selinux/targeted/active'),
@@ -161,7 +182,7 @@ class ModuleObserver(SafeFiles):
                 if ([line for line in fields if line.startswith(b'ID=')] != [b'ID=fedora']
                         or [line for line in fields if line.startswith(b'VERSION_ID=')] != [b'VERSION_ID=44']):
                     _fail('PLATFORM')
-                self._owner = _SemoduleOwner()
+                self._owner = _SemoduleOwner(self._mode)
             self._guard()
             self._new_scratch(self._dirs['run'], 'qshd-module-' + secrets.token_hex(16))
             self._work = self._scratch[0][2]
@@ -177,6 +198,7 @@ class ModuleObserver(SafeFiles):
         return _store_readlock(self, self._dirs['store'])
 
     def _guard(self):
+        self._time()
         self._validate_directory_routes()
         specs = [('executable','bin','semodule',MAX_HLL),
                  ('config','config','semanage.conf',65536)]
@@ -219,39 +241,46 @@ class ModuleObserver(SafeFiles):
 
     def _command(self, operation, directory):
         self._guard()
+        if self._calls>=self._budget:_fail('COMMAND_BUDGET')
+        if self._clock()+15*(self._budget-self._calls)+10>=self._end:_fail('DEADLINE')
+        self._calls+=1
         try:
             if self._owner is None:
-                result = self._injected(operation, directory)
+                result=self._injected(operation,directory,deadline=self._end-10)
             else:
-                result = self._owner._run(operation, directory)
+                result=self._owner._run(operation,directory,deadline=self._end-10)
         finally:
             self._guard()
         if type(result) is not bytes:
             _fail('COMMAND_RESULT')
         return result
 
+    def _extract(self,role):
+        name={'core':'qshd','contexts':'qshd_contexts'}[role]+'.pp'
+        parent,leaf,fd,path=self._new_scratch(self._work,'extract-'+role+'-'+secrets.token_hex(16))
+        if os.listdir(fd):_fail('SCRATCH_NOT_EMPTY')
+        output=self._command('extract-'+role,path)
+        if name not in os.listdir(fd):_fail('HLL_MISSING')
+        value=self._protected(fd,name,MAX_HLL,mode=0o600)
+        held=self._open(fd,name);self._acquired.append(held)
+        if (os.fstat(held).st_dev,os.fstat(held).st_ino)!=tuple(value['inode']):_fail('HLL_BINDING')
+        self._output.append((fd,name,held))
+        if output or sorted(os.listdir(fd))!=[name]:_fail('EXTRACTION_CONTENTS')
+        digest=self._trusted.core_pp_sha256 if role=='core' else self._trusted.contexts_pp_sha256
+        return verify_hll(value['data'],digest)
+
     def _sample(self):
-        entry = select_owned(parse_full_listing(self._command('list', self._scratch[0][3])))
-        parent,name,fd,path = self._new_scratch(self._work, 'extract-' + secrets.token_hex(16))
-        if os.listdir(fd):
-            _fail('SCRATCH_NOT_EMPTY')
-        output = self._command('extract', path)
-        # Record only a safe, still-bound regular output; unknown entries survive.
-        if 'qshd.pp' in os.listdir(fd):
-            value = self._protected(fd,'qshd.pp',MAX_HLL,mode=0o600)
-            held = self._open(fd,'qshd.pp')
-            self._acquired.append(held)
-            current = os.fstat(held)
-            if (current.st_dev,current.st_ino) != tuple(value['inode']):
-                _fail('HLL_BINDING')
-            self._output.append((fd,'qshd.pp',held))
-        else:
-            _fail('HLL_MISSING')
-        if output or sorted(os.listdir(fd)) != ['qshd.pp']:
-            _fail('EXTRACTION_CONTENTS')
-        hll = verify_hll(value['data'], self._trusted.pp_sha256)
+        entries=parse_full_listing(self._command('list',self._scratch[0][3]))
+        if self._mode=='absent':
+            if any(x.name in ('qshd','qshd_contexts') for x in entries):_fail('MODULE_REMAINS')
+            return None,None
+        if self._mode=='core-only' and any(x.name=='qshd_contexts' for x in entries):_fail('CONTEXTS_REMAINS')
+        core=select_owned(entries,role='core')
+        contexts=select_owned(entries,role='contexts') if self._mode=='pair' else None
+        core=ModuleComponent(core,self._extract('core'))
+        contexts=ModuleComponent(contexts,self._extract('contexts')) if contexts is not None else None
         self._guard()
-        return entry,hll
+        return core,contexts
 
     def capture(self):
         return self._observe(None)
@@ -276,7 +305,7 @@ class ModuleObserver(SafeFiles):
                 self._files['executable'] = self._protected(self._dirs['bin'],'semodule',MAX_HLL,executable=True)
                 self._files['config'] = self._protected(self._dirs['config'],'semanage.conf',65536)
                 self._lock = self._lock_snapshot()
-            entry,hll = self._sample()
+            core,contexts = self._sample()
             if observation is None:
                 files = {key: dict(value, data=hashlib.sha256(value['data']).hexdigest())
                          for key,value in self._files.items()}
@@ -284,10 +313,10 @@ class ModuleObserver(SafeFiles):
                                for key,fd in self._dirs.items()}
                 bindings = _frozen({'files': files, 'lock': self._lock,
                                     'directories': directories})
-                self._observation = ModuleObservation(entry,hll,self._trusted.pp_sha256,bindings)
+                self._observation = ModuleObservation(self._mode,core,contexts,self._trusted,bindings)
                 self._state = 'captured'
                 return self._observation
-            if (entry,hll) != (observation.entry,observation.hll):
+            if (core,contexts)!=(observation.core,observation.contexts):
                 _fail('MODULE_DRIFT')
             self._state = 'checked'
         except (OSError, Conflict, ModuleError, _CommandError):
@@ -341,9 +370,11 @@ class ModuleObserver(SafeFiles):
     def __exit__(self, kind, value, traceback):
         checked = self._state == 'checked'
         try:
-            self._close()
-        except ObserverError:
-            raise ObserverError('CLEANUP') from None
-        if kind is None and not checked:
-            _fail('FINAL_RECHECK_REQUIRED')
+            if kind is None:self._time()
+        finally:
+            try:self._close()
+            except ObserverError:raise ObserverError('CLEANUP') from None
+        if kind is None:
+            self._time()
+            if not checked:_fail('FINAL_RECHECK_REQUIRED')
         return False

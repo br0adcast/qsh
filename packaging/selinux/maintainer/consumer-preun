@@ -1,0 +1,36 @@
+#!/bin/sh
+# Fedora SELinux pair lifecycle: RPM count is the sole routing authority.
+set -e
+
+if [ "$#" -ne 1 ]; then
+    echo QSHD_RPM_COUNT_REFUSED >&2
+    exit 1
+fi
+case "$1" in
+    ''|*[!0-9]*|0[0-9]*)
+        echo QSHD_RPM_COUNT_REFUSED >&2
+        exit 1
+        ;;
+esac
+
+# Final erase requires the already stopped/drained daemon; never stop it here.
+# Upgrade and non-final erase keep the current enablement and activity.
+case "$1" in
+    0) ;;
+    *) exit 0 ;;
+esac
+
+/usr/bin/python3 -I -B /usr/libexec/qshd-selinux/qshd_selinux_phase.py consumer-preun-final
+
+# Only after admission succeeded, and while the unit file still exists, remove
+# the fixed unit's enablement. Never --now, stop, start, enable or restart; the
+# reload belongs to postun. The admitted phase already required the supported
+# manager, so no optional guard may skip this. A failed disable returns a
+# refusal after PENDING publication; a later erase still requires all current
+# admission and ownership proofs. Target transaction aftermath needs acceptance.
+if ! /usr/bin/systemctl --no-reload disable qshd.service; then
+    echo QSHD_UNIT_DISABLE_REFUSED >&2
+    exit 1
+fi
+
+exit 0

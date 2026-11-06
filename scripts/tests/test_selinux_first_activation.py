@@ -23,7 +23,45 @@ import qshd_selinux_transaction as tx
 from qshd_selinux_activation import TrustedArtifact
 from qshd_selinux_modules import HllIdentity
 
-PP=b'inert canonical test PP';TRUST=TrustedArtifact('fixture','a'*64,hashlib.sha256(PP).hexdigest())
+CONTEXTS_PP=b'inert contexts test PP'
+PP=b'inert canonical test PP';TRUST=TrustedArtifact('fixture','a'*64,hashlib.sha256(PP).hexdigest(),hashlib.sha256(b'inert contexts test PP').hexdigest())
+
+
+@contextmanager
+def reference_exit_fault(bindings,fault):
+    """Fail real final recheck or a real held descriptor close, never publication."""
+    import qshd_selinux_reference_loader as references
+    original=references.References.__exit__;native_close=os.close;observed=[]
+    def exit(reader,kind,value,traceback):
+        if kind is not None:return original(reader,kind,value,traceback)
+        record=bindings.record()
+        observed.append(dict(state=record['state'] if type(record) is dict else record.state,
+            package='package' in bindings.active,activation='activation' in bindings.active))
+        if fault=='recheck':
+            path=reader.anchor/references._SHARE/'reference.json'
+            path.write_bytes(path.read_bytes()+b' ')
+        if fault=='descriptor-close':
+            held=set(reader.anchors+[part for route in reader.routes for part in (route[0],route[2])]);failed=[]
+            def close(fd):
+                native_close(fd)
+                if fd in held and not failed:
+                    failed.append(fd);raise OSError('controlled after real reference descriptor close')
+            with patch.object(references.os,'close',close):return original(reader,kind,value,traceback)
+        return original(reader,kind,value,traceback)
+    with patch.object(references.References,'__exit__',exit):yield observed
+
+
+def require_reference_failure_before_complete(test,bindings,invoke,fault):
+    calls=[];original=slot._Writer.publish_complete
+    def publish(writer,*args,**kwargs):
+        calls.append(True);return original(writer,*args,**kwargs)
+    with reference_exit_fault(bindings,fault) as observed,patch.object(slot._Writer,'publish_complete',publish):
+        with test.assertRaises(c.CoordinatorError):invoke()
+    test.assertEqual(calls,[])
+    record=bindings.record()
+    test.assertEqual(record['state'] if type(record) is dict else record.state,'PENDING')
+    test.assertEqual(observed,[dict(state='PENDING',package=True,activation=True)])
+
 
 class Bindings:
     def __init__(self,root):
@@ -33,6 +71,10 @@ class Bindings:
         self.ids={'/contexts':dict(path='/contexts',source_type='sshd_t',original_package='fixture')}
         self.routing=json.dumps(self.ids,sort_keys=True,separators=(',',':')).encode()
         self.expected_trust=TRUST
+        for name in ('usr/bin','etc/pam.d','var/log','run'):(root/name).mkdir(parents=True,exist_ok=True)
+        for path in root.rglob('*'):
+            if path.is_dir():path.chmod(0o755)
+        (root/'var/run').symlink_to('../run')
         self.events=[];self.active=set();self.failure=None;self.registry_count=0;self.loads=0;self.now=100
     def fails(self,name):
         return name in self.failure if isinstance(self.failure,set) else self.failure==name
@@ -62,6 +104,7 @@ class Bindings:
         if event=='slot_rename' and self.record()['state']=='COMPLETE':
             self.assert_locked()
             assert 'registry' not in self.active
+            assert 'references' not in self.active
             self.point('complete replace')
         if self.fails('completion fsync') and event=='slot_directory_sync' and self.record()['state']=='COMPLETE':
             raise OSError('controlled completion directory sync acknowledgement')
@@ -75,8 +118,8 @@ class Bindings:
                 else:raise AssertionError('coordinator lost exclusion')
             finally:os.close(fd)
     @contextmanager
-    def registry(self, *, deadline):
-        self.registry_deadlines=getattr(self,'registry_deadlines',[])+[deadline]
+    def registry(self,*,deadline):
+        assert deadline==self.expected_registry_deadline
         self.registry_count+=1;number=self.registry_count
         self.point('registry enter');self.active.add('registry')
         binding=self
@@ -91,7 +134,20 @@ class Bindings:
         try:yield View()
         finally:self.active.remove('registry')
         self.point('registry exit')
-    def installer(self,trust,pp):
+    def guard(self,deadline):self.expected_registry_deadline=deadline;self.point('guard')
+    def consumer_paths(self,pam,*,fresh):
+        from qshd_selinux_consumer_activation import _ConsumerPaths
+        return _ConsumerPaths(pam,_root=self.root,_uid=os.getuid()).inspection(fresh=fresh)
+    def retained(self,*,deadline,pristine=False):
+        self.expected_registry_deadline=deadline
+        import qshd_selinux_retained_labels as retained
+        value=retained.RetainedLabels(_root=self.root,_uid=os.getuid(),_clock=lambda:self.now)
+        return value.pristine_install(deadline=deadline) if pristine else value.managed_inspection(deadline=deadline)
+    @contextmanager
+    def queries(self,status):
+        from qshd_selinux_queries import required_observation
+        with required_observation(status.require_open(),status=status) as value:yield value
+    def installer(self,trust,pp,contexts_pp):
         binding=self
         class Installer:
             def install(self,*,deadline):
@@ -99,44 +155,67 @@ class Bindings:
                 assert {'package','activation','contexts'}<=binding.active
                 binding.assert_locked();assert binding.record()['state']=='PENDING'
                 assert binding.target.read_bytes()==binding.original
-                assert trust==binding.expected_trust and pp==PP and deadline<=binding.now+240
+                assert trust==binding.expected_trust and pp==PP and deadline>binding.now
                 binding.point('load');binding.loads+=1
-                if binding.failure=='late load':binding.now=400
-                return SimpleNamespace(artifact=trust,pp_sha256=trust.pp_sha256)
+                if binding.failure=='late load':binding.now=1001
+                return SimpleNamespace(artifact=trust,pp_sha256=trust.core_pp_sha256)
         return Installer()
     @contextmanager
-    def modules(self,trust):
+    def modules(self,trust,*,mode='pair',deadline=None):
         binding=self;self.point('module enter')
         class View:
             def capture(self):
                 binding.assert_locked();binding.point('module capture')
-                return SimpleNamespace(hll=HllIdentity(len(PP),'b'*64 if binding.failure=='HLL mismatch' else TRUST.pp_sha256))
+                return SimpleNamespace(core=SimpleNamespace(hll=HllIdentity(len(PP),'b'*64 if binding.failure=='HLL mismatch' else trust.core_pp_sha256)),contexts=SimpleNamespace(hll=HllIdentity(len(CONTEXTS_PP),trust.contexts_pp_sha256)))
             def recheck(self,value):binding.point('module recheck')
         yield View()
         self.point('module exit')
     @contextmanager
     def window(self):
-        self.point('window enter');self.assert_locked()
-        yield True
+        import qshd_selinux_api as native
+        from scripts.tests.test_selinux_api import SharedStatus
+        from scripts.tests.test_selinux_queries import FakeApi
+        self.point('window enter')
+        shared=SharedStatus();api=native.SelinuxApi(shared.library());fake=FakeApi();fake.active=True
+        for name in ('check_context','require_av','compute_create','compute_relabel','validate_transition'):
+            setattr(api,name,getattr(fake,name))
+        @contextmanager
+        def defaults():
+            class Defaults:
+                def lookup(inner,path,kind):raise AssertionError('all missing inventory')
+            yield Defaults()
+        api.file_defaults=defaults
+        with api.status_observation() as status:yield status
         self.point('window exit')
 
 class CoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.b=Bindings(Path(self.temp.name))
+    def test_runtime_registry_requires_and_forwards_original_absolute_end(self):
+        import qshd_selinux_registry as registry
+        end=731.25;scope=object();factory=Mock();factory.inspection.return_value=scope
+        with patch.object(registry,'production',return_value=factory) as production:
+            with self.assertRaises(TypeError):c.RuntimeBindings().registry()
+            production.assert_not_called()
+            self.assertIs(c.RuntimeBindings().registry(deadline=end),scope)
+        factory.inspection.assert_called_once_with(deadline=end)
+        self.assertIs(factory.inspection.call_args.kwargs['deadline'],end)
+
     def run_coordinator(self,trust=TRUST,pp=PP,deadline=1000):
-        return c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(trust,pp,deadline=deadline)
+        return c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(trust,pp,CONTEXTS_PP,deadline=deadline)
     def installed(self):
         import qshd_selinux_reference_loader as refs
         root=Path(__file__).resolve().parents[2]
         spec=importlib.util.spec_from_file_location('builder',root/'packaging/selinux/assemble_payload.py')
         builder=importlib.util.module_from_spec(spec);spec.loader.exec_module(builder)
         pp=self.b.root/'qshd.pp';pp.write_bytes(PP)
+        contexts_pp=self.b.root/'qshd_contexts.pp';contexts_pp.write_bytes(CONTEXTS_PP)
         source=root/'packaging/selinux';artifact=source/'artifact.json';pam=root/'packaging/pam.d/qshd.fedora-selinux'
         expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in builder.MODULES}
-        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,artifact,pam)})
-        out=self.b.root/'installed';builder.assemble_payload(source,pp,artifact,pam,expected,out,1000000000)
-        self.b.expected_trust=TrustedArtifact('0.2.0',expected['artifact.json'],expected['qshd.pp'])
+        expected.update({p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (pp,contexts_pp,artifact,pam)})
+        out=self.b.root/'installed';builder.assemble_payload(source,pp,contexts_pp,artifact,pam,expected,out,1000000000)
+        self.b.expected_trust=TrustedArtifact(json.loads(artifact.read_bytes())['policy_version'],expected['artifact.json'],expected['qshd.pp'],expected['qshd_contexts.pp'])
         @contextmanager
         def references():
             assert 'package' in self.b.active
@@ -144,19 +223,19 @@ class CoordinatorTests(unittest.TestCase):
         self.b.references=references
         return out/'usr/share/qshd-selinux/reference.json'
 
-    def test_registry_forwards_original_effective_end(self):
-        self.run_coordinator(deadline=290)
-        self.assertEqual(self.b.registry_deadlines,[290,290])
-
-    def test_production_registry_requires_and_forwards_deadline(self):
-        value=Mock();sentinel=object();value.inspection.return_value=sentinel
-        with patch('qshd_selinux_registry.production',return_value=value):
-            self.assertIs(c._Production().registry(deadline=290),sentinel)
-        value.inspection.assert_called_once_with(deadline=290)
+    def test_installed_reference_recheck_and_fd_close_precede_complete(self):
+        for fault in ('recheck','descriptor-close'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory() as root:
+                self.b=Bindings(Path(root));self.installed()
+                require_reference_failure_before_complete(self,self.b,
+                    lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000),fault)
 
     def test_installed_real_references_under_single_package_lease(self):
         self.installed()
-        value=c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        with reference_exit_fault(self.b,None) as closed:
+            value=c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
+        self.assertEqual(closed,[dict(state='PENDING',package=True,activation=True)])
+        self.assertLess(self.b.events.index('references exit'),self.b.events.index('complete replace'))
         self.assertEqual(value.artifact,self.b.expected_trust)
         self.assertEqual(self.b.events.count('package enter'),1)
         self.assertLess(self.b.events.index('references exit'),self.b.events.index('package exit'))
@@ -172,15 +251,10 @@ class CoordinatorTests(unittest.TestCase):
             c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
         self.assertEqual(self.b.record()['state'],'PENDING')
 
-    def test_installed_reference_finalizer_failure_is_uncertain(self):
-        path=self.installed();point=self.b.point
-        def drift(name):
-            point(name)
-            if name=='complete replace':path.write_bytes(path.read_bytes()+b' ')
-        self.b.point=drift
-        with self.assertRaises(slot.OutcomeUncertain):
-            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
-        self.assertEqual(self.b.record()['state'],'COMPLETE')
+    def test_installed_reference_finalizer_failure_keeps_pending(self):
+        self.installed()
+        require_reference_failure_before_complete(self,self.b,
+            lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000),'recheck')
 
     def test_installed_invalid_reference_never_begins_pending_or_load(self):
         path=self.installed();path.write_bytes(b'{}')
@@ -190,8 +264,8 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.b.loads,0)
         self.assertEqual(self.b.target.read_bytes(),self.b.original)
 
-    def test_installed_uncertainty_survives_reference_exit_masking(self):
-        self.installed();self.b.failure={'completion fsync','references exit'}
+    def test_installed_uncertainty_survives_package_exit_masking(self):
+        self.installed();self.b.failure={'completion fsync','package exit'}
         with self.assertRaises(slot.OutcomeUncertain):
             c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)
         self.assertEqual(self.b.record()['state'],'COMPLETE')
@@ -199,7 +273,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_installed_public_entry_and_reference_factory_are_fixed(self):
         self.installed();self.b.now=time.monotonic()
         with patch.object(c,'_Production',return_value=self.b) as factory:
-            self.assertEqual(c.activate_installed_first(deadline=time.monotonic()+200).state,'COMPLETE')
+            self.assertEqual(c.activate_installed_first(deadline=time.monotonic()+430).state,'COMPLETE')
         factory.assert_called_once_with()
         import qshd_selinux_reference_loader as references
         sentinel=object()
@@ -211,7 +285,7 @@ class CoordinatorTests(unittest.TestCase):
         result=self.run_coordinator()
         self.assertEqual(result.state,'COMPLETE');self.assertEqual(self.b.record()['state'],'COMPLETE')
         self.assertEqual(self.b.loads,1);self.assertEqual(self.b.registry_count,2)
-        self.assertEqual(self.b.events.count('window enter'),1)
+        self.assertEqual(self.b.events.count('window enter'),2)
         self.assertLess(self.b.events.index('registry exit'),self.b.events.index('load'))
         self.assertLess(self.b.events.index('window exit'),self.b.events.index('module exit'))
         self.assertLess(self.b.events.index('module exit'),self.b.events.index('complete replace'))
@@ -258,7 +332,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.b.loads,0);self.assertEqual(orphan.read_bytes(),b'preserve')
         self.assertEqual(self.b.record()['state'],'PENDING')
     def test_input_process_and_expired_deadline_gate_before_state(self):
-        for pp,deadline in ((b'wrong',1000),(PP,True),(PP,float('inf')),(PP,99)):
+        for pp,deadline in ((b'wrong',1000),(PP,True),(PP,float('inf')),(PP,10**10000),(PP,99)):
             with self.assertRaises(c.CoordinatorError):self.run_coordinator(pp=pp,deadline=deadline)
             self.assertFalse(self.b.common.exists())
         self.b.failure='preconditions'
@@ -320,7 +394,7 @@ class CoordinatorTests(unittest.TestCase):
     def test_actual_public_entrypoint_uses_fixed_factory_binding(self):
         self.b.now=time.monotonic()
         with patch.object(c,'_Production',return_value=self.b) as production:
-            observed=c.activate_first(TRUST,PP,deadline=time.monotonic()+200)
+            observed=c.activate_first(TRUST,PP,CONTEXTS_PP,deadline=time.monotonic()+430)
         production.assert_called_once_with();self.assertEqual(observed.state,'COMPLETE')
 
     def test_fixed_production_factory_delegation_without_native_calls(self):
@@ -328,23 +402,26 @@ class CoordinatorTests(unittest.TestCase):
         production=c._Production();sentinel=object()
         for module,method,facade,args in [('qshd_selinux_package_state','package','initialize',()),
                                          ('qshd_selinux_activation_state','activation','writer',()),
+                                         ('qshd_selinux_registry','registry','inspection',()),
                                          ('qshd_selinux_transaction','contexts','writer',(['/contexts'],))]:
             target=importlib.import_module(module);value=Mock();getattr(value,facade).return_value=sentinel
+            kwargs={'deadline':self.b.now+430} if method=='registry' else {}
             with patch.object(target,'production',return_value=value) as factory:
-                self.assertIs(getattr(production,method)(*args),sentinel)
-            factory.assert_called_once_with(*args);getattr(value,facade).assert_called_once_with()
+                self.assertIs(getattr(production,method)(*args,**kwargs),sentinel)
+            factory.assert_called_once_with(*args);getattr(value,facade).assert_called_once_with(**kwargs)
         target=importlib.import_module('qshd_selinux_module_install')
         with patch.object(target,'production_installer',return_value=sentinel) as factory:
-            self.assertIs(production.installer(TRUST,PP),sentinel)
-        factory.assert_called_once_with(TRUST,PP)
+            self.assertIs(production.installer(TRUST,PP,CONTEXTS_PP),sentinel)
+        factory.assert_called_once_with(TRUST,PP,CONTEXTS_PP)
         target=importlib.import_module('qshd_selinux_module_observer')
         with patch.object(target,'production_observer',return_value=sentinel) as factory:
-            self.assertIs(production.modules(TRUST),sentinel)
-        factory.assert_called_once_with(TRUST)
+            self.assertIs(production.modules(TRUST,deadline=1000),sentinel)
+        factory.assert_called_once_with(TRUST,deadline=1000,mode='pair')
         native=importlib.import_module('qshd_selinux_api');queries=importlib.import_module('qshd_selinux_queries')
-        with patch.object(native,'SelinuxApi',return_value='injected') as api,patch.object(queries,'required_observation',return_value=sentinel) as window:
+        value=Mock();value.status_observation.return_value=sentinel
+        with patch.object(native,'SelinuxApi',return_value=value) as api:
             self.assertIs(production.window(),sentinel)
-        api.assert_called_once_with();window.assert_called_once_with('injected')
+        api.assert_called_once_with();value.status_observation.assert_called_once_with()
         process=importlib.import_module('qshd_selinux_process')
         with patch.object(c.os,'geteuid',return_value=1000),patch.object(process,'_preconditions') as preconditions:
             with self.assertRaisesRegex(c.CoordinatorError,'ROOT_REQUIRED'):production.preconditions()
@@ -360,7 +437,7 @@ class CoordinatorTests(unittest.TestCase):
                     original(name)
                     if ((phase=='initial routing' and name=='routing') or
                             (phase=='final registry' and name=='registry exit' and self.b.registry_count==2)):
-                        self.b.now=400
+                        self.b.now=1001
                 self.b.point=point
                 with self.assertRaisesRegex(c.CoordinatorError,'DEADLINE'):self.run_coordinator()
                 if phase=='initial routing':
@@ -372,7 +449,7 @@ class CoordinatorTests(unittest.TestCase):
         original=self.b.point
         def point(name):
             original(name)
-            if name=='package exit':self.b.now=400
+            if name=='package exit':self.b.now=1001
         self.b.point=point
         with self.assertRaises(slot.OutcomeUncertain):self.run_coordinator()
         self.assertEqual(self.b.record()['state'],'COMPLETE')
@@ -414,7 +491,7 @@ class CoordinatorTests(unittest.TestCase):
                 def trace(frame,event,arg):
                     if event=='return' and frame.f_code is slot._Writer.publish_complete.__code__:
                         returned[0]=True
-                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_pristine_locked.__code__:
+                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._publish.__code__:
                         returned[0]=False;interrupted.append(frame.f_lineno)
                         raise ReturnInterruption('first coordinator line after actual publication return')
                     return trace
@@ -434,8 +511,7 @@ class PristinePendingBridgeTests(unittest.TestCase):
         self.configure()
     def configure(self):
         self.reference_path=self.installed()
-        self.prior=c.Activation(1,'PENDING','1'*32,'fedora44-targeted-v1',1,1,self.b.expected_trust,
-            c.ModuleIdentity('qshd',400,'targeted','pp'),None)
+        self.prior=replace(c._pending(self.b.expected_trust,'provider-fresh'),operation_id='1'*32)
         with package.PackageState(self.b.common,uid=os.getuid(),anchor=self.b.root).initialize():
             with self.b.slot_object().writer() as writer:
                 initial=writer.capture_current();writer.begin_pending(c._json(asdict(self.prior)),initial)
@@ -448,8 +524,15 @@ class PristinePendingBridgeTests(unittest.TestCase):
             self.b=Bindings(Path(root));self.configure();yield
     def run_bridge(self,deadline=1000):
         return c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_pristine_pending_first(deadline=deadline)
+    def test_pristine_reference_recheck_and_fd_close_precede_complete(self):
+        for fault in ('recheck','descriptor-close'):
+            with self.subTest(fault=fault),self.fresh():
+                require_reference_failure_before_complete(self,self.b,self.run_bridge,fault)
+
     def test_matching_pending_becomes_new_complete_under_one_existing_package_lease(self):
-        result=self.run_bridge()
+        with reference_exit_fault(self.b,None) as closed:result=self.run_bridge()
+        self.assertEqual(closed,[dict(state='PENDING',package=True,activation=True)])
+        self.assertLess(self.b.events.index('references exit'),self.b.events.index('complete replace'))
         self.assertEqual(result.state,'COMPLETE');self.assertNotEqual(result.operation_id,self.prior.operation_id)
         self.assertEqual(result.artifact,self.b.expected_trust);self.assertEqual(self.b.loads,1)
         self.assertEqual(self.b.events.count('package enter'),1);self.b.package.assert_not_called()
@@ -457,11 +540,11 @@ class PristinePendingBridgeTests(unittest.TestCase):
     def test_matching_pending_still_refuses_in_both_original_first_apis(self):
         before=self.b.record()
         self.b.package=lambda:self.b.track('package',package.PackageState(self.b.common,uid=os.getuid(),anchor=self.b.root).initialize())
-        for invoke in (lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(self.b.expected_trust,PP,deadline=1000),lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)):
+        for invoke in (lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_first(self.b.expected_trust,PP,CONTEXTS_PP,deadline=1000),lambda:c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_first(deadline=1000)):
             with self.assertRaisesRegex(c.CoordinatorError,'^ACTIVATION_EXISTS$'):invoke()
         self.assertEqual(self.b.record(),before);self.assertEqual(self.b.loads,0)
     def test_all_three_incoming_artifact_fields_must_match_before_replacement(self):
-        for changes in ({'provider_version':'different'},{'manifest_sha256':'b'*64},{'pp_sha256':'c'*64}):
+        for changes in ({'provider_version':'different'},{'manifest_sha256':'b'*64},{'core_pp_sha256':'c'*64},{'contexts_pp_sha256':'c'*64}):
             with self.subTest(changes=changes),self.fresh():
                 prior=replace(self.prior,artifact=replace(self.prior.artifact,**changes))
                 path=self.b.common/'selinux-activation/activation.json';path.write_bytes(c._json(asdict(prior)))
@@ -493,7 +576,7 @@ class PristinePendingBridgeTests(unittest.TestCase):
                     value=self.b.record()
                     if defect=='bad-profile':value['profile']='unsupported'
                     elif defect=='bad-abi':value['abi']=True
-                    else:value['module']['priority']=100
+                    else:value['modules']['core']['priority']=100
                     path.write_text(json.dumps(value))
                 before=path.read_bytes();mode=path.stat().st_mode
                 with self.assertRaises(c.CoordinatorError):self.run_bridge()
@@ -521,14 +604,14 @@ class PristinePendingBridgeTests(unittest.TestCase):
                 self.assertEqual(self.b.loads,0);self.assertEqual(self.b.record()['state'],'PENDING')
                 self.assertNotEqual(self.b.record()['operation_id'],self.prior.operation_id)
     def test_existing_module_real_firstinstaller_is_list_only_after_generation_refresh(self):
-        import test_selinux_module_install as fixture
+        from scripts.tests import test_selinux_module_install as fixture
         import qshd_selinux_module_install as install
         for listing in (b'400 qshd pp\n',b'100 qshd cil disabled\n',b'999 qshd pp\n'):
             with self.subTest(listing=listing),self.fresh():
                 store=fixture.InstallTests();store.setUp()
                 try:
                     store.listing=listing
-                    self.b.installer=lambda trust,pp:install.FirstInstall(trust,pp,_root=store.root,_uid=os.getuid(),_owner=store,_clock=lambda:100)
+                    self.b.installer=lambda trust,pp,contexts:install.FirstInstall(trust,pp,contexts,_root=store.root,_uid=os.getuid(),_owner=store,_clock=lambda:100)
                     with self.assertRaises(c.CoordinatorError):self.run_bridge()
                     self.assertEqual(len(store.calls),1);self.assertEqual(store.calls[0][0][-1],'-lfull')
                     self.assertEqual(list((store.root/'run').iterdir()),[])
@@ -548,7 +631,7 @@ class PristinePendingBridgeTests(unittest.TestCase):
                 with self.assertRaises(c.CoordinatorError):self.run_bridge()
                 self.assertEqual(self.b.record()['state'],'PENDING')
     def test_real_completion_sync_uncertainty_survives_every_outer_exit(self):
-        for later in ('contexts exit','activation exit','references exit','package exit'):
+        for later in ('contexts exit','activation exit','package exit'):
             with self.subTest(later=later),self.fresh():
                 self.b.failure=later;native_sync=os.fsync;failed=[]
                 def fsync(fd):
@@ -558,14 +641,14 @@ class PristinePendingBridgeTests(unittest.TestCase):
                     return native_sync(fd)
                 with patch.object(slot.os,'fsync',side_effect=fsync),self.assertRaises(slot.OutcomeUncertain):self.run_bridge()
                 self.assertEqual(failed,[True]);self.assertEqual(self.b.record()['state'],'COMPLETE')
-    def test_trace_return_boundary_and_reference_unwind_stay_uncertain(self):
+    def test_trace_return_boundary_and_package_unwind_stay_uncertain(self):
         class Interruption(BaseException):pass
-        for later in (None,'references exit'):
+        for later in (None,'package exit'):
             with self.subTest(later=later),self.fresh():
                 self.b.failure=later;returned=[False];interruptions=[];previous=sys.gettrace()
                 def trace(frame,event,arg):
                     if event=='return' and frame.f_code is slot._Writer.publish_complete.__code__:returned[0]=True
-                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._activate_pristine_locked.__code__:
+                    elif returned[0] and event=='line' and frame.f_code is c._Coordinator._publish.__code__:
                         returned[0]=False;interruptions.append(True);raise Interruption()
                     return trace
                 try:
@@ -575,7 +658,7 @@ class PristinePendingBridgeTests(unittest.TestCase):
                 self.assertEqual(interruptions,[True]);self.assertIs(sys.gettrace(),previous)
                 self.assertEqual(self.b.record()['state'],'COMPLETE')
     def test_known_precompletion_slot_error_stays_ordinary_even_with_later_exit(self):
-        for later in (None,'references exit'):
+        for later in (None,'package exit'):
             with self.subTest(later=later),self.fresh():
                 self.b.failure=later;hook=self.b.slot_hook
                 def refuse(event):
@@ -592,7 +675,7 @@ class PristinePendingBridgeTests(unittest.TestCase):
             with self.assertRaises(c.CoordinatorError):self.run_bridge(deadline)
         self.assertNotIn('package enter',self.b.events)
         self.b.now=time.monotonic()
-        with patch.object(c,'_Production',return_value=self.b):result=c.activate_installed_pristine_pending_first(deadline=self.b.now+200)
+        with patch.object(c,'_Production',return_value=self.b):result=c.activate_installed_pristine_pending_first(deadline=self.b.now+430)
         self.assertEqual(result.state,'COMPLETE')
         with self.fresh():
             coordinator=c._Coordinator(self.b,clock=lambda:self.b.now)
@@ -600,3 +683,170 @@ class PristinePendingBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(c.CoordinatorError,'^COORDINATOR_USED$'):coordinator.activate_installed_pristine_pending_first(deadline=1000)
 
 if __name__=='__main__':unittest.main()
+
+
+class ProviderUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        from scripts.tests.test_selinux_consumer_activation import Bindings as OwnedBindings
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.b=OwnedBindings(Path(self.temp.name));self.old=self.b.trust
+        self.old_complete=self.b.record();self.calls=[]
+
+    def coordinator(self):return c._Coordinator(self.b,clock=lambda:self.b.now)
+
+    def incoming(self,*,core=True,contexts=True):
+        manifest=json.loads((Path(__file__).resolve().parents[2]/'packaging/selinux/artifact.json').read_bytes())
+        manifest['policy_version']='0.3.0'
+        self.incoming_manifest=c._json(manifest)+b'\n'
+        return TrustedArtifact('0.3.0',hashlib.sha256(self.incoming_manifest).hexdigest(),
+            hashlib.sha256(b'incoming core' if core else __import__('scripts.tests.test_selinux_consumer_activation',fromlist=['PP']).PP).hexdigest(),
+            hashlib.sha256(b'incoming contexts' if contexts else __import__('scripts.tests.test_selinux_consumer_activation',fromlist=['CONTEXTS_PP']).CONTEXTS_PP).hexdigest())
+
+    def replace_references(self,incoming):
+        from scripts.tests.test_selinux_consumer_activation import PP as old_core, CONTEXTS_PP as old_contexts
+        import assemble_payload as builder
+        root=self.b.root;source=Path(__file__).resolve().parents[2]/'packaging/selinux'
+        incoming_dir=root/'incoming';incoming_dir.mkdir()
+        core=incoming_dir/'qshd.pp';contexts=incoming_dir/'qshd_contexts.pp'
+        core.write_bytes(b'incoming core' if incoming.core_pp_sha256!=self.old.core_pp_sha256 else old_core)
+        contexts.write_bytes(b'incoming contexts' if incoming.contexts_pp_sha256!=self.old.contexts_pp_sha256 else old_contexts)
+        manifest=incoming_dir/'artifact.json'
+        manifest.write_bytes(self.incoming_manifest if incoming!=self.old else (source/'artifact.json').read_bytes())
+        pam=source.parent/'pam.d/qshd.fedora-selinux'
+        expected={name:hashlib.sha256((source/name).read_bytes()).hexdigest() for name in builder.MODULES}
+        expected.update({path.name:hashlib.sha256(path.read_bytes()).hexdigest() for path in (core,contexts,manifest,pam)})
+        provider=root/'incoming-provider';builder.assemble_payload(source,core,contexts,manifest,pam,expected,provider,1000000000)
+        self.b.provider=provider;self.b.trust=incoming
+        binding=self.b
+        outer=self
+        def reloader(owned,target,core,contexts):
+            outer.assertEqual(owned,outer.old);outer.assertEqual(target,incoming)
+            outer.assertEqual(hashlib.sha256(core).hexdigest(),incoming.core_pp_sha256)
+            outer.assertEqual(hashlib.sha256(contexts).hexdigest(),incoming.contexts_pp_sha256)
+            class Reload:
+                def reload(inner,*,deadline,old_check):
+                    outer.assertEqual(deadline,1000)
+                    with binding.window() as status:old_check(status)
+                    outer.assertNotIn('window',binding.active)
+                    outer.calls.append((owned,target));binding.loads+=1
+                    return __import__('types').SimpleNamespace(artifact=target,core_pp_sha256=target.core_pp_sha256,contexts_pp_sha256=target.contexts_pp_sha256)
+            return Reload()
+        self.b.reloader=reloader
+
+    def test_owned_provider_reference_recheck_and_fd_close_precede_complete(self):
+        for fault in ('recheck','descriptor-close'):
+            with self.subTest(fault=fault):
+                if self.calls:self.setUp()
+                incoming=self.incoming();self.coordinator().invalidate_installed_provider_upgrade(incoming,deadline=1000)
+                self.replace_references(incoming)
+                require_reference_failure_before_complete(self,self.b,
+                    lambda:self.coordinator().activate_installed_owned_provider(deadline=1000),fault)
+
+    def test_independent_a_to_b_both_or_single_component_and_same_pair_reload(self):
+        for components in ((True,True),(True,False),(False,True),(False,False)):
+            with self.subTest(components=components):
+                if self.calls:self.setUp()
+                incoming=self.incoming(core=components[0],contexts=components[1]) if any(components) else self.old
+                pending=self.coordinator().invalidate_installed_provider_upgrade(incoming,deadline=1000)
+                self.assertEqual(pending.intent,'provider-refresh');self.assertEqual(pending.basis.artifact,self.old)
+                self.assertEqual(pending.basis.completion,self.old_complete.completion)
+                self.replace_references(incoming)
+                with reference_exit_fault(self.b,None) as closed:
+                    complete=self.coordinator().activate_installed_owned_provider(deadline=1000)
+                self.assertEqual(closed,[dict(state='PENDING',package=True,activation=True)])
+                self.assertLess(max(i for i,event in enumerate(self.b.events) if event=='references exit'),self.b.events.index('publish COMPLETE'))
+                self.assertEqual(complete.artifact,incoming);self.assertIsNone(complete.basis)
+                self.assertEqual(complete.state,'COMPLETE');self.assertEqual(self.calls,[(self.old,incoming)])
+                self.assertEqual(self.b.record(),complete)
+
+    def test_wrong_intent_or_old_binding_refuses_before_reload(self):
+        incoming=self.incoming();pending=self.coordinator().invalidate_installed_provider_upgrade(incoming,deadline=1000)
+        self.replace_references(incoming)
+        path=self.b.common/'selinux-activation/activation.json'
+        for changed in (replace(pending,intent='consumer-install'),replace(pending,basis=c.HistoricalBasis(self.old,
+                replace(pending.basis.completion,contexts=c.ContextBinding('1'*64,'2'*64))))):
+            path.write_bytes(c._json(asdict(changed)))
+            with self.assertRaises(c.CoordinatorError):self.coordinator().activate_installed_owned_provider(deadline=1000)
+            self.assertEqual(self.calls,[])
+
+    def test_owned_pre_readback_requires_exact_protected_pending_bytes(self):
+        incoming=self.incoming();original=slot._Writer.begin_pending
+        def changed(writer,*args):
+            token=original(writer,*args)
+            path=self.b.common/'selinux-activation/activation.json'
+            path.write_bytes(path.read_bytes()+b' ')
+            return token
+        with patch.object(slot._Writer,'begin_pending',changed),self.assertRaises(slot.OutcomeUncertain):
+            self.coordinator().invalidate_installed_provider_upgrade(incoming,deadline=1000)
+        self.assertEqual(self.b.record().state,'PENDING');self.assertEqual(self.b.loads,0)
+
+    def test_final_b_failure_keeps_pending_without_adopting_loaded_pair(self):
+        incoming=self.incoming();self.coordinator().invalidate_installed_provider_upgrade(incoming,deadline=1000)
+        self.replace_references(incoming);self.b.hll_override='1'*64
+        with self.assertRaises(c.CoordinatorError):self.coordinator().activate_installed_owned_provider(deadline=1000)
+        self.assertEqual(len(self.calls),1);self.assertEqual(self.b.record().state,'PENDING')
+
+
+class OwnedPostRegistryLifecycleTests(unittest.TestCase):
+    """Actual Registry/Transaction admission, stopped before any policy reload."""
+    def setUp(self):
+        from scripts.tests.test_selinux_provider_erase import RegistryBridgeTests,EraseBindings
+        RegistryBridgeTests.setUp(self);self.b=EraseBindings(self)
+        self.reloads=[]
+        from qshd_selinux_first_activation import _pending
+        with self.b.package_engine().operation():
+            with self.b.slot_engine().writer() as writer:
+                current=writer.capture_current()
+                pending=_pending(self.b.trust,'provider-refresh',c.HistoricalBasis(self.b.trust,current.record.completion))
+                writer.begin_pending(c._json(asdict(pending)),current)
+        # Optional installed-consumer manifest is actually absent on this layout.
+        (self.root/'usr/share').mkdir(mode=0o755,exist_ok=True)
+        import qshd_selinux_rpm_query as rpm
+        self.b.consumer_selection=lambda deadline:rpm.ConsumerAuthorityReader(_root=self.root,_uid=os.getuid(),_gid=os.getgid(),_clock=lambda:self.b.now).selection(deadline=deadline)
+        test=self
+        class ReloadBoundary(BaseException):pass
+        self.ReloadBoundary=ReloadBoundary
+        class Reload:
+            def reload(inner,*,deadline,old_check):
+                test.assertEqual(deadline,test.b.end)
+                test.assertTrue(callable(old_check))
+                test.assertEqual(test.b.active,{'package','references','activation','contexts','consumer','rpm','install retained'})
+                test.reloads.append(deadline)
+                raise ReloadBoundary()
+        self.b.reloader=lambda *args:Reload()
+        self.b.events=[]
+
+    def test_real_fresh_registry_lease_is_routed_and_rechecked_before_reload_boundary(self):
+        import qshd_selinux_registry as registry
+        import qshd_selinux_transaction as transaction
+        self.assertTrue(Path(registry.__file__).is_relative_to(Path(__file__).resolve().parents[2]))
+        self.assertTrue(Path(transaction.__file__).is_relative_to(Path(__file__).resolve().parents[2]))
+        with self.assertRaises(self.ReloadBoundary):
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_owned_provider(deadline=self.b.end)
+        self.assertEqual(self.reloads,[self.b.end])
+        self.assertEqual(self.b.registry_count,2)
+        self.assertEqual(sum(kind=='registry1' for kind,end,start in self.b.commands),9)
+        self.assertEqual(sum(kind=='registry2' for kind,end,start in self.b.commands),9)
+        self.assertEqual(self.b.record().state,'PENDING')
+        self.assertEqual(self.b.record().intent,'provider-refresh')
+        self.assertIn('registry2 exit',self.b.events)
+        self.assertEqual(self.b.shared,[]) # No native owner was entered or claimed.
+        self.assertEqual(self.b.active,set())
+        self.assertTrue(all(end<=self.b.end for kind,end,start in self.b.commands))
+
+    def test_real_second_lease_routing_change_refuses_before_pending_refresh_or_reload(self):
+        before=self.b.record()
+        def change(event):
+            if event=='registry2 enter':self.runner.mapping[self.paths[1]]='container-selinux'
+        self.b.action=change
+        with self.assertRaises(c.CoordinatorError) as caught:
+            c._Coordinator(self.b,clock=lambda:self.b.now).activate_installed_owned_provider(deadline=self.b.end)
+        error=caught.exception;chain=[]
+        while error is not None:
+            chain.append((type(error).__name__,error.args))
+            error=error.__cause__ if error.__cause__ is not None else error.__context__
+        self.assertIn(('CoordinatorError',('ROUTING_DRIFT',)),chain)
+        self.assertEqual(self.reloads,[])
+        self.assertEqual(self.b.record(),before)
+        self.assertEqual(self.b.shared,[])
+        self.assertEqual(self.b.active,set())

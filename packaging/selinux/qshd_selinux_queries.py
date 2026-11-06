@@ -7,7 +7,7 @@ required_observation window and accept evidence only after normal scope exit.
 Integrations must run the complete verifier in a fresh process with an external
 hard deadline; this library cannot interrupt a blocking native call.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import re
 
@@ -176,14 +176,18 @@ def _validate_profile():
 
 
 @contextmanager
-def required_observation(api):
+def required_observation(api, *, status=None):
     """Query once, then keep caller observers in the same required status window.
 
     The yielded record never means readiness. Caller and status-exit failures
     propagate; callers must not commit acceptance until this scope exits.
     """
     contexts = _validate_profile()
-    with api.status_observation():
+    if status is not None:
+        from qshd_selinux_api import _StatusToken
+        if type(status) is not _StatusToken or status.require_open() is not api:
+            raise QueryError('status', 'invalid-borrow')
+    with api.status_observation() if status is None else nullcontext(status):
         for symbol, raw in _CONTEXTS:
             try:
                 api.check_context(raw)
@@ -208,3 +212,5 @@ def required_observation(api):
             tuple('context-' + symbol for symbol, _ in _CONTEXTS),
             tuple(query[0] for query in _QUERIES),
         )
+        if status is not None and status.require_open() is not api:
+            raise QueryError('status', 'invalid-borrow')

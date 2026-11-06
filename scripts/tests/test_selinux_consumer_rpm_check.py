@@ -162,8 +162,20 @@ def owned_source(config_path):
         streams=None
     outcome=owner._last
     assert outcome is not None and outcome.settled and not outcome.unreaped
+    from qshd_selinux_process import _children
+    children=_children()
+    assert children==[]
+    try:os.waitpid(-1,os.WNOHANG)
+    except ChildProcessError:pass
+    else:raise AssertionError('owned child not reaped')
     print(json.dumps({'exit':outcome.exit_code,'failure':outcome.failure,'settled':outcome.settled,
-        'unreaped':list(outcome.unreaped),'stdout':base64.b64encode(outcome.stdout).decode(),
+        'unreaped':list(outcome.unreaped),'children':children,
+        'natural':getattr(outcome,'natural',None),
+        'stdout_eof':getattr(outcome,'stdout_eof',None),'stderr_eof':getattr(outcome,'stderr_eof',None),
+        'group_term_attempts':getattr(outcome,'group_term_attempts',None),
+        'adopted_term_attempts':getattr(outcome,'adopted_term_attempts',None),
+        'kill_attempts':getattr(outcome,'kill_attempts',None),
+        'stdout':base64.b64encode(outcome.stdout).decode(),
         'stderr':base64.b64encode(outcome.stderr).decode()}))
     return 0
 
@@ -191,6 +203,7 @@ class SourceTests(unittest.TestCase):
         outcome=json.loads(result.stdout)
         self.assertTrue(outcome['settled'])
         self.assertEqual(outcome['unreaped'],[])
+        self.assertEqual(outcome['children'],[])
         return outcome
 
     def assert_refused(self, **options):
@@ -214,6 +227,9 @@ class SourceTests(unittest.TestCase):
         outcome=self.run_worker()
         self.assertEqual(outcome['exit'],0)
         self.assertIsNone(outcome['failure'])
+        self.assertIs(outcome['natural'],True)
+        self.assertIs(outcome['stdout_eof'],True);self.assertIs(outcome['stderr_eof'],True)
+        self.assertEqual([outcome[key] for key in ('group_term_attempts','adopted_term_attempts','kill_attempts')],[0,0,0])
         result=base64.b64decode(outcome['stdout'])
         value=json.loads(result)
         self.assertEqual(result,canonical(value))
@@ -358,6 +374,9 @@ class SourceTests(unittest.TestCase):
                 result=self.assert_refused(**option)
                 self.assertEqual(result['exit'],1)
                 self.assertIsNone(result['failure'])
+                self.assertIs(result['natural'],True)
+                self.assertIs(result['stdout_eof'],True);self.assertIs(result['stderr_eof'],True)
+                self.assertEqual([result[key] for key in ('group_term_attempts','adopted_term_attempts','kill_attempts')],[0,0,0])
 
     def test_stderr_pressure_and_header_output_caps_refuse(self):
         self.assert_refused(query_prefix='os.write(2,b"x"*65537)')
@@ -370,12 +389,19 @@ if child==0:
  for fd in (0,1,2):
   try:os.close(fd)
   except OSError:pass
- time.sleep(3)
- os._exit(0)
+ # Stay live until owned rescue; the alarm is fixture-only leak protection.
+ signal.alarm(15)
+ signal.pause()
+ os._exit(1)
 """
         result=self.assert_refused(decode_prefix=orphan)
         self.assertEqual(result['exit'],1)
-        self.assertIsNone(result['failure'],'must refuse adopted helper rather than rely on outer timeout')
+        self.assertEqual(base64.b64decode(result['stderr']),b'CHECK_REFUSED TOOL_CHILDREN\n')
+        self.assertEqual(result['failure'],'COMMAND_CUSTODY')
+        self.assertIs(result['natural'],False)
+        self.assertIs(result['stdout_eof'],True);self.assertIs(result['stderr_eof'],True)
+        self.assertGreater(result['group_term_attempts']+result['adopted_term_attempts'],0)
+        self.assertEqual(result['kill_attempts'],0)
 
     def test_source_drift_and_original_worker_deadline_refuse(self):
         self.assert_refused(query_tail='with open('+repr(str(self.rpm))+',"ab") as target:target.write(b"changed")')
@@ -557,7 +583,9 @@ class NativeTests(unittest.TestCase):
             'cp "%{_sourcedir}/manifest" "%{buildroot}/usr/share/qshd/consumer-rpm.json"\n'
             '%files\n%defattr(-,root,root,-)\n%attr(0755,root,root) /usr/bin/qshd\n'
             '%config(noreplace) %attr(0644,root,root) /etc/pam.d/qshd\n'
-            '%attr(0644,root,root) /usr/share/qshd/consumer-rpm.json\n')
+            '%attr(0644,root,root) /usr/share/qshd/consumer-rpm.json\n'
+            '%changelog\n* Thu Jan 01 2026 Synthetic fixture <fixture@example.invalid> - '+version+'-1\n'
+            '- Opaque selected-content regression fixture.\n')
         outcome=self.invoke({'worker':'--_builder-worker','spec':str(spec),'top':str(top)},'builder-'+label)
         self.assertEqual(outcome['exit'],0)
         self.assertEqual(base64.b64decode(outcome['stdout']),b'BUILT\n')

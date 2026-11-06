@@ -16,7 +16,7 @@ class StateTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.common=self.root/'qshd';self.guards=0
-        self.trusted=model.TrustedArtifact('test1','a'*64,'b'*64)
+        self.trusted=model.TrustedArtifact('test1','a'*64,'b'*64,'f'*64)
         outer=self
         class Bindings:
             def preconditions(self): pass
@@ -35,7 +35,8 @@ class StateTests(unittest.TestCase):
     def run_pre(self):return pre._Coordinator(self.bindings).invalidate(self.trusted,deadline=time.monotonic()+30)
     def test_absent_exact_pending_and_real_locks(self):
         r=self.run_pre();self.assertEqual(r.state,'PENDING');self.assertEqual(r.artifact,self.trusted)
-        self.assertEqual(r.module,model.ModuleIdentity('qshd',400,'targeted','pp'));self.assertIsNone(r.completion)
+        self.assertEqual(r.modules,model.ModulePair(model.ModuleIdentity('qshd',400,'targeted','pp'),model.ModuleIdentity('qshd_contexts',400,'targeted','pp')));self.assertIsNone(r.completion)
+        self.assertEqual((r.schema,r.profile,r.abi,r.intent,r.basis),(2,'fedora44-targeted-pair-v2',2,'provider-fresh',None))
         self.assertEqual(self.guards,2);self.assertEqual(model.parse_activation((self.common/'selinux-activation/activation.json').read_bytes()),r)
     def test_existing_pending_preserved(self):
         self.run_pre();p=self.common/'selinux-activation/activation.json';before=(p.read_bytes(),p.stat())
@@ -60,9 +61,9 @@ class StateTests(unittest.TestCase):
         self.bindings.guard=lambda deadline:None
         with self.bindings.package().initialize():pass
         p=self.common/'selinux-activation/activation.json'
-        complete=model.Activation(1,'COMPLETE','c'*32,'fedora44-targeted-v1',1,1,
-            self.trusted,model.ModuleIdentity('qshd',400,'targeted','pp'),
-            model.Completion('normal-install-reload-v1','b'*64,model.ContextBinding('d'*64,'e'*64)))
+        complete=model.Activation(2,'COMPLETE','c'*32,'fedora44-targeted-pair-v2',2,1,
+            self.trusted,model.ModulePair(model.ModuleIdentity('qshd',400,'targeted','pp'),model.ModuleIdentity('qshd_contexts',400,'targeted','pp')),
+            'provider-fresh',None,model.Completion('normal-pair-install-reload-v2',model.PairDigests('b'*64,'f'*64),model.ContextBinding('d'*64,'e'*64)))
         for data in (pre._json(asdict(complete)),b'{malformed'):
             p.write_bytes(data);p.chmod(0o600);before=(p.read_bytes(),p.stat())
             with self.assertRaises(pre.PreError):self.run_pre()
@@ -157,9 +158,28 @@ class StateTests(unittest.TestCase):
 
 
     def test_forged_artifact_shape_refused_before_setup(self):
-        forged=model.TrustedArtifact('test1','a'*64,'b'*64)
-        object.__setattr__(forged,'pp_sha256','invalid')
+        forged=model.TrustedArtifact('test1','a'*64,'b'*64,'f'*64)
+        object.__setattr__(forged,'contexts_pp_sha256','invalid')
         with self.assertRaises(pre.PreError):pre._Coordinator(self.bindings).invalidate(forged,deadline=time.monotonic()+30)
         self.assertEqual(self.guards,0);self.assertFalse(self.common.exists())
+
+class GuardOutcomeTests(unittest.TestCase):
+    def test_guard_requires_normal_terminal_eof_and_no_rescue(self):
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from qshd_selinux_process import _Outcome,_Streams
+        normal=_Outcome(b'public guard fixture',b'',0,None,True,natural=True,stdout_eof=True,stderr_eof=True)
+        for change in ({'natural':False},{'stdout_eof':False},{'stderr_eof':False},
+                       {'group_term_attempts':1},{'adopted_term_attempts':1},{'kill_attempts':1}):
+            owner=SimpleNamespace(_last=replace(normal,**change),_run=lambda *a,**k:_Streams(normal.stdout,b''))
+            with self.subTest(change=change),patch.object(pre,'_Owner',return_value=owner),\
+                 patch.object(pre.stop_guard,'check',side_effect=lambda host,run,**kw:run()),\
+                 self.assertRaisesRegex(pre.PreError,'^GUARD_REFUSED$'):
+                pre._Bindings().guard(time.monotonic()+5)
+        owner=SimpleNamespace(_last=normal,_run=lambda *a,**k:_Streams(normal.stdout,b''))
+        with patch.object(pre,'_Owner',return_value=owner),patch.object(pre.stop_guard,'check',side_effect=lambda host,run,**kw:run()):
+            pre._Bindings().guard(time.monotonic()+5)
+
 
 if __name__=='__main__':unittest.main()
