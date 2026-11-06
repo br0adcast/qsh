@@ -1,6 +1,8 @@
 //! Source-bound compatibility fixtures. The six connected tests exist only in
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
+#[path = "keeper_owner_observation.rs"]
+mod keeper_owner_observation;
 #[path = "keeper_terminal_observation.rs"]
 mod keeper_terminal_observation;
 
@@ -1211,6 +1213,7 @@ pub(super) mod native {
         shutdown: transport::Shutdown,
         manager: tokio::task::JoinHandle<Result<(), String>>,
         end: Instant,
+        diagnostic_kind: std::sync::Mutex<Option<(ChannelKind, bool)>>,
     }
     fn settlement(boundary: &'static str, body_ok: bool) {
         super::emit_settlement(
@@ -1283,6 +1286,7 @@ pub(super) mod native {
                 shutdown,
                 manager,
                 end,
+                diagnostic_kind: std::sync::Mutex::new(None),
             };
             while !connected.events.live.load(Ordering::SeqCst) {
                 if Instant::now() >= end {
@@ -1299,6 +1303,7 @@ pub(super) mod native {
             command: Vec<u8>,
             screen: bool,
         ) -> Result<(), &'static str> {
+            *self.diagnostic_kind.lock().unwrap() = Some((kind, screen));
             self.client
                 .send_bytes(
                     CONTROL_STREAM,
@@ -1353,11 +1358,35 @@ pub(super) mod native {
                     // Failure-only fixture cleanup; never a product-completion pass.
                     for i in 0..self.fixture.count() {
                         super::emit_settlement(&mut std::io::stderr(), format_args!("keeper223 settlement boundary=failure_rescue_entry body_ok={body_ok} index={i}"));
-                        self.fixture
-                            .observation(i)
-                            .unwrap()
+                        let observation = self.fixture.observation(i).unwrap();
+                        let before =
+                            super::keeper_owner_observation::real::context(&observation.authority);
+                        let kind = self.diagnostic_kind.lock().unwrap().map(|(k, s)| {
+                            (
+                                match k {
+                                    ChannelKind::Shell => "shell",
+                                    ChannelKind::Command => "command",
+                                },
+                                s,
+                            )
+                        });
+                        let source = super::keeper_terminal_observation::source_digest();
+                        if let Ok(json) = serde_json::to_string(&before) {
+                            super::emit_settlement(&mut std::io::stderr(),format_args!("keeper223 failure_context phase=before kind={kind:?} source={source} {json} eof={} reader_drop={} reader_drop_finished={} retiring_running={} {}",observation.io.eof.load(Ordering::SeqCst),observation.io.reader_drop.load(Ordering::SeqCst),observation.io.reader_drop_finished.load(Ordering::SeqCst),observation.io.retiring_running.load(Ordering::SeqCst),observation.io.producers.sample()));
+                        }
+                        let rescue_returned = observation
                             .authority
                             .rescue(Instant::now() + Duration::from_secs(10));
+                        let after =
+                            super::keeper_owner_observation::real::context(&observation.authority);
+                        let context = super::keeper_owner_observation::RescueProjection {
+                            before,
+                            after,
+                            rescue_returned,
+                        };
+                        if let Ok(json) = serde_json::to_string(&context) {
+                            super::emit_settlement(&mut std::io::stderr(),format_args!("keeper223 failure_context phase=after kind={kind:?} source={source} {json} eof={} reader_drop={} reader_drop_finished={} retiring_running={} {}",observation.io.eof.load(Ordering::SeqCst),observation.io.reader_drop.load(Ordering::SeqCst),observation.io.reader_drop_finished.load(Ordering::SeqCst),observation.io.retiring_running.load(Ordering::SeqCst),observation.io.producers.sample()));
+                        }
                         super::emit_settlement(&mut std::io::stderr(), format_args!("keeper223 settlement boundary=failure_rescue_return body_ok={body_ok} index={i}"));
                     }
                     settlement("failure_final_manager_wait_entry", body_ok);
@@ -1451,8 +1480,10 @@ pub(super) mod native {
         kind: ChannelKind,
         screen: bool,
         observed: Option<super::super::keeper_pty::FixtureObservation>,
+        instance: Option<u64>,
     ) {
         use super::keeper_terminal_observation as observation;
+        let owner_observed = observed.clone();
         let admitted = observed.and_then(|o| o.authority.snapshot()).and_then(|s| {
             if s.app_status.is_some() || s.session_wait.is_some() {
                 return None;
@@ -1500,6 +1531,23 @@ pub(super) mod native {
                 format_args!("keeper223 terminal_observation kind={kind:?} screen={screen} {json}"),
             );
         }
+        let gate = read_gate(&path.join("stdio-closed"))
+            .and_then(|b| observation::parse_gate(&b, nonce))
+            == Some(true);
+        let bytes = super::keeper_owner_observation::real::observe(
+            path,
+            nonce,
+            end,
+            instance,
+            gate,
+            owner_observed.as_ref(),
+        );
+        if let Ok(json) = std::str::from_utf8(&bytes) {
+            super::emit_settlement(
+                &mut std::io::stderr(),
+                format_args!("keeper223 owner_observation kind={kind:?} screen={screen} {json}"),
+            );
+        }
     }
     pub(super) fn terminal() {
         let _serial = SERIAL.lock().unwrap();
@@ -1513,7 +1561,7 @@ pub(super) mod native {
                 let projected=Arc::new(std::sync::atomic::AtomicBool::new(false));let projected_body=projected.clone();
                 let client=c.client.clone();let events=c.events.clone();let registry=c.registry.clone();let budget=c.budget.clone();let f=c.fixture.clone();let path=d.path().to_path_buf();
                 let command=actor_command("terminal",&path,&nonce,raw,kind==ChannelKind::Shell);
-                if c.open(kind,if kind==ChannelKind::Shell {vec![]}else{command.clone()},screen).is_err(){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0));let _retained=d.keep();c.finish(false).await;panic!("OPEN enqueue failed");}
+                if c.open(kind,if kind==ChannelKind::Shell {vec![]}else{command.clone()},screen).is_err(){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0),None);let _retained=d.keep();c.finish(false).await;panic!("OPEN enqueue failed");}
                 let result=tokio::spawn(async move {
                     until(||events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Opened{stream} if *stream==FIRST_CHANNEL_STREAM)),end).await;
                     if kind==ChannelKind::Shell {let mut bytes=b"exec ".to_vec();bytes.extend_from_slice(&command);bytes.push(b'\n');client.send_bytes(FIRST_CHANNEL_STREAM,bytes).unwrap();}
@@ -1525,7 +1573,7 @@ pub(super) mod native {
                     client.send_bytes(FIRST_CHANNEL_STREAM,b"keeper-input-proof\n".to_vec()).unwrap();
                     until(||read_gate(&path.join("stdio-closed")).and_then(|bytes|super::keeper_terminal_observation::parse_gate(&bytes,&nonce)).is_some(),end).await;
                     let observation=f.observation(0).expect("actual factory child ran");
-                    terminal_observation(&path,&nonce,raw,kind,screen,Some(observation.clone()));projected_body.store(true,Ordering::SeqCst);
+                    terminal_observation(&path,&nonce,raw,kind,screen,Some(observation.clone()),Some(instance.get()));projected_body.store(true,Ordering::SeqCst);
                     super::terminal_eof_until(||super::sample_terminal_eof(|component|match component {super::EofComponent::Eof=>observation.io.eof.load(Ordering::SeqCst),super::EofComponent::ReaderDrop=>observation.io.reader_drop.load(Ordering::SeqCst),super::EofComponent::RetiringRunning=>observation.io.retiring_running.load(Ordering::SeqCst)},||observation.io.reader_drop_finished.load(Ordering::SeqCst),||observation.io.producers.sample()),end).await;
                     assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
                     let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
@@ -1552,7 +1600,7 @@ pub(super) mod native {
                     assert!(fence.wait_until(Instant::now()).is_some());fence.reopen();f.assert_settled(2);
                 }).await;
                 let body_ok=result.is_ok();
-                if !projected.load(Ordering::SeqCst){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0));}
+                if !projected.load(Ordering::SeqCst){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0),None);}
                 if !body_ok {let _retained=d.keep();}
                 settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();
                 eprintln!("keeper223 terminal kind={kind:?} screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false");

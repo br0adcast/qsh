@@ -22,4 +22,12 @@ int qsh_scope_leader(int32_t, uint32_t *, int32_t *, struct qsh_scope_error *);
 int qsh_scope_keeper_prepare(struct qsh_scope_runtime *, struct qsh_scope_error *);
 int qsh_scope_group(struct qsh_scope_identity, int32_t, int32_t *, struct qsh_scope_error *);
 int qsh_scope_keeper_pre_exec(int32_t, int32_t, int32_t);
+/* Read-only fixture queries; SDK structures never cross this boundary. */
+struct qsh_scope_fixture_fd {
+    int32_t fd; uint32_t type;
+    uint64_t dev, rdev, ino;
+    uint32_t mode, reserved;
+};
+int qsh_scope_fixture_fds(int32_t, struct qsh_scope_fixture_fd *, uint32_t, uint32_t *, struct qsh_scope_error *);
+int qsh_scope_fixture_vnode(int32_t, int32_t, struct qsh_scope_fixture_fd *, struct qsh_scope_error *);
 #endif

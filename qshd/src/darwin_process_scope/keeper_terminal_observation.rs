@@ -83,10 +83,15 @@ pub(super) trait Ops {
 }
 pub(super) fn source_digest() -> String {
     let mut h = Sha256::new();
-    h.update(b"qsh223-actor-observation-v1\0");
+    h.update(b"qsh223-original-owner-observation-v1\0");
     for bytes in [
         include_bytes!("keeper_integration_tests.rs").as_slice(),
         include_bytes!("keeper_terminal_observation.rs").as_slice(),
+        include_bytes!("keeper_owner_observation.rs").as_slice(),
+        include_bytes!("keeper.rs").as_slice(),
+        include_bytes!("native.c").as_slice(),
+        include_bytes!("native.h").as_slice(),
+        include_bytes!("native.rs").as_slice(),
     ] {
         h.update((bytes.len() as u64).to_be_bytes());
         h.update(bytes);
@@ -452,14 +457,28 @@ fn publish_with_close(
     report: &Report,
     mut close: impl FnMut(std::fs::File) -> Result<(), ObserverError>,
 ) -> Result<(), ObserverError> {
+    let bytes = encoded(report)?;
+    publish_named(path, &bytes, c"terminal-observation.json", &mut close)
+}
+pub(super) fn publish_owner(path: &std::path::Path, bytes: &[u8]) -> Result<(), ObserverError> {
+    if bytes.len() > CAP {
+        return Err(ObserverError::ReportLimit);
+    }
+    publish_named(path, bytes, c"owner-observation.json", &mut close_file)
+}
+fn publish_named(
+    path: &std::path::Path,
+    bytes: &[u8],
+    leaf: &std::ffi::CStr,
+    close: &mut impl FnMut(std::fs::File) -> Result<(), ObserverError>,
+) -> Result<(), ObserverError> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
-    let bytes = encoded(report)?;
     let dir = directory(path)?;
     let fd = unsafe {
         nix::libc::openat(
             dir.as_raw_fd(),
-            c"terminal-observation.json".as_ptr(),
+            leaf.as_ptr(),
             nix::libc::O_WRONLY
                 | nix::libc::O_CREAT
                 | nix::libc::O_EXCL
@@ -475,7 +494,7 @@ fn publish_with_close(
     let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| {
         checked_file(&f)?;
-        f.write_all(&bytes).map_err(|_| ObserverError::ReportIo)?;
+        f.write_all(bytes).map_err(|_| ObserverError::ReportIo)?;
         checked_file(&f)
     })();
     let file_closed = close(f);
@@ -548,6 +567,45 @@ pub(super) fn project_report(
         }
     }
     p
+}
+#[derive(Clone, Copy)]
+pub(super) struct SlaveKey {
+    pub dev: u64,
+    pub rdev: u64,
+    pub ino: u64,
+    pub kind: u32,
+}
+pub(super) fn validated_slave_key(
+    bytes: &[u8],
+    binding: &Binding,
+    admitted: Option<([u64; 3], i32)>,
+    complete_gate: bool,
+) -> Result<SlaveKey, ObserverError> {
+    if !complete_gate {
+        return Err(ObserverError::Binding);
+    }
+    validate_report(bytes, binding, admitted)?;
+    let mut time: nix::libc::timespec = unsafe { std::mem::zeroed() };
+    if unsafe { nix::libc::clock_gettime(nix::libc::CLOCK_MONOTONIC, &mut time) } != 0
+        || time.tv_sec < 0
+        || time.tv_nsec < 0
+        || time.tv_sec as u128 * 1_000_000_000 + time.tv_nsec as u128 >= binding.end
+    {
+        return Err(ObserverError::Deadline);
+    }
+    let report: Report = serde_json::from_slice(bytes).map_err(|_| ObserverError::Binding)?;
+    let before = report.before.map_err(|_| ObserverError::Binding)?;
+    let d = before
+        .descriptors
+        .iter()
+        .find(|d| d.fd == 0)
+        .ok_or(ObserverError::Binding)?;
+    Ok(SlaveKey {
+        dev: d.dev,
+        rdev: d.rdev,
+        ino: d.ino,
+        kind: d.mode & 0o170000,
+    })
 }
 #[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
 pub(super) mod real {
@@ -1089,5 +1147,89 @@ mod tests {
         assert!(
             actor.find("observation::publish").unwrap() < actor.find("observation::gate").unwrap()
         );
+    }
+    #[test]
+    fn owner_slave_key_requires_complete_bound_report_and_live_deadline() {
+        let mut report = successful();
+        let mut binding = binding();
+        binding.end = u128::MAX;
+        report.binding = binding.clone();
+        report
+            .before
+            .as_mut()
+            .unwrap_or_else(|_| panic!("fixture"))
+            .binding = binding.clone();
+        report
+            .after
+            .as_mut()
+            .unwrap_or_else(|_| panic!("fixture"))
+            .binding = binding.clone();
+        let bytes = serde_json::to_vec(&report).unwrap();
+        let admitted = Some((binding.actor, 10));
+        let key = validated_slave_key(&bytes, &binding, admitted, true)
+            .unwrap_or_else(|_| panic!("fixture"));
+        let descriptor = &report
+            .before
+            .as_ref()
+            .unwrap_or_else(|_| panic!("fixture"))
+            .descriptors[0];
+        assert_eq!(
+            (key.dev, key.rdev, key.ino, key.kind),
+            (
+                descriptor.dev,
+                descriptor.rdev,
+                descriptor.ino,
+                descriptor.mode & 0o170000
+            )
+        );
+        assert!(validated_slave_key(&bytes, &binding, admitted, false).is_err());
+        for variant in 0..4 {
+            let mut changed = binding.clone();
+            match variant {
+                0 => changed.nonce = "b".repeat(32),
+                1 => changed.source = "f".repeat(64),
+                2 => changed.actor[2] += 1,
+                _ => changed.end = 0,
+            };
+            assert!(validated_slave_key(&bytes, &changed, admitted, true).is_err());
+        }
+        assert!(validated_slave_key(&bytes, &binding, Some((binding.actor, 11)), true).is_err());
+        report.binding.end = 0;
+        report
+            .before
+            .as_mut()
+            .unwrap_or_else(|_| panic!("fixture"))
+            .binding
+            .end = 0;
+        report
+            .after
+            .as_mut()
+            .unwrap_or_else(|_| panic!("fixture"))
+            .binding
+            .end = 0;
+        binding.end = 0;
+        assert!(matches!(
+            validated_slave_key(
+                &serde_json::to_vec(&report).unwrap(),
+                &binding,
+                admitted,
+                true
+            ),
+            Err(ObserverError::Deadline)
+        ));
+    }
+    #[test]
+    fn owner_private_leaf_is_exclusive_bounded_and_separate() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(publish_owner(d.path(), b"PRIVATE_SENTINEL").is_ok());
+        assert!(publish_owner(d.path(), b"replacement").is_err());
+        assert_eq!(
+            std::fs::read(d.path().join("owner-observation.json")).unwrap(),
+            b"PRIVATE_SENTINEL"
+        );
+        assert!(!d.path().join("terminal-observation.json").exists());
+        assert!(publish_owner(d.path(), &vec![0; CAP + 1]).is_err());
     }
 }

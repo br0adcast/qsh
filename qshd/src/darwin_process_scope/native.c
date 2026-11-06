@@ -311,3 +311,75 @@ int qsh_scope_keeper_pre_exec(int32_t slave, int32_t session, int32_t broker) {
     }
     return 0;
 }
+
+/* Fixture-only callers. Queries neither open descriptor paths nor control processes. */
+_Static_assert(sizeof(struct qsh_scope_fixture_fd) == 40, "fixture scalar size");
+_Static_assert(_Alignof(struct qsh_scope_fixture_fd) == 8, "fixture scalar alignment");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, fd) == 0, "fixture fd offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, type) == 4, "fixture type offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, dev) == 8, "fixture dev offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, rdev) == 16, "fixture rdev offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, ino) == 24, "fixture inode offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, mode) == 32, "fixture mode offset");
+_Static_assert(offsetof(struct qsh_scope_fixture_fd, reserved) == 36, "fixture reserved offset");
+_Static_assert(sizeof(((struct vinfo_stat *)0)->vst_dev) == 4, "SDK dev width");
+_Static_assert(sizeof(((struct vinfo_stat *)0)->vst_rdev) == 4, "SDK rdev width");
+_Static_assert(sizeof(((struct vinfo_stat *)0)->vst_ino) == 8, "SDK inode width");
+_Static_assert(sizeof(((struct vinfo_stat *)0)->vst_mode) == 2, "SDK mode width");
+_Static_assert(sizeof(dev_t) == 4 && (dev_t)-1 < 0, "actor signed dev_t contract");
+typedef int (*fixture_fd_fn)(int, int, int, void *, int);
+_Static_assert(__builtin_types_compatible_p(__typeof__(&proc_pidfdinfo), fixture_fd_fn), "SDK fd query ABI");
+static int fixture_type(uint32_t type) {
+    switch (type) {
+    case PROX_FDTYPE_ATALK: case PROX_FDTYPE_VNODE: case PROX_FDTYPE_SOCKET:
+    case PROX_FDTYPE_PSHM: case PROX_FDTYPE_PSEM: case PROX_FDTYPE_KQUEUE:
+    case PROX_FDTYPE_PIPE: case PROX_FDTYPE_FSEVENTS: case PROX_FDTYPE_NETPOLICY:
+    case PROX_FDTYPE_CHANNEL: case PROX_FDTYPE_NEXUS: return 1;
+    default: return 0;
+    }
+}
+int qsh_scope_fixture_fds(int32_t pid, struct qsh_scope_fixture_fd *rows,
+    uint32_t capacity, uint32_t *count, struct qsh_scope_error *error) {
+    if (!error) return -1;
+    if (pid <= 0 || !rows || !count || capacity != 129) return invalid(error);
+    *count = 0;
+    memset(rows, 0, capacity * sizeof(*rows));
+    struct proc_fdinfo info[129] = {{0}};
+    errno = 0;
+    int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, info, sizeof(info));
+    /* libproc maps syscall failure to zero; never certify an empty result. */
+    if (bytes <= 0) return unix_error(error);
+    if (bytes >= (int)sizeof(info) || bytes % (int)sizeof(info[0])) return invalid(error);
+    uint32_t n = (uint32_t)bytes / sizeof(info[0]);
+    if (n > 128) return invalid(error);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (info[i].proc_fd < 0 || !fixture_type(info[i].proc_fdtype)) return invalid(error);
+        for (uint32_t j = 0; j < i; ++j) if (info[j].proc_fd == info[i].proc_fd) return invalid(error);
+        rows[i].fd = info[i].proc_fd;
+        rows[i].type = info[i].proc_fdtype;
+    }
+    *count = n;
+    return 0;
+}
+int qsh_scope_fixture_vnode(int32_t pid, int32_t fd,
+    struct qsh_scope_fixture_fd *row, struct qsh_scope_error *error) {
+    if (!error) return -1;
+    if (pid <= 0 || fd < 0 || !row) return invalid(error);
+    memset(row, 0, sizeof(*row));
+    struct vnode_fdinfo info = {0};
+    errno = 0;
+    int bytes = proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEINFO, &info, sizeof(info));
+    if (bytes <= 0) return unix_error(error);
+    if (bytes != (int)sizeof(info)) return invalid(error);
+    row->fd = fd; row->type = PROX_FDTYPE_VNODE;
+    row->dev = (uint64_t)(int64_t)(int32_t)info.pvi.vi_stat.vst_dev;
+    row->rdev = (uint64_t)(int64_t)(int32_t)info.pvi.vi_stat.vst_rdev;
+    row->ino = info.pvi.vi_stat.vst_ino;
+    row->mode = info.pvi.vi_stat.vst_mode;
+    return 0;
+}
+
+_Static_assert(PROX_FDTYPE_ATALK == 0 && PROX_FDTYPE_VNODE == 1 && PROX_FDTYPE_SOCKET == 2 &&
+    PROX_FDTYPE_PSHM == 3 && PROX_FDTYPE_PSEM == 4 && PROX_FDTYPE_KQUEUE == 5 &&
+    PROX_FDTYPE_PIPE == 6 && PROX_FDTYPE_FSEVENTS == 7 && PROX_FDTYPE_NETPOLICY == 9 &&
+    PROX_FDTYPE_CHANNEL == 10 && PROX_FDTYPE_NEXUS == 11, "fixture type scalar mapping");

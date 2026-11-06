@@ -1135,6 +1135,10 @@ mod owner {
     #[cfg(test)]
     pub(in crate::darwin_process_scope) struct FixtureSnapshot {
         pub sid: i32,
+        #[cfg(feature = "test-darwin-keeper")]
+        pub session: Option<Identity>,
+        #[cfg(feature = "test-darwin-keeper")]
+        pub reservation_identities: Vec<Option<Identity>>,
         pub app: Option<i32>,
         pub app_status: Option<i32>,
         pub not_started: bool,
@@ -1180,6 +1184,10 @@ mod owner {
             let core = self.shared.core.try_lock().ok()?;
             Some(FixtureSnapshot {
                 sid: core.sid,
+                #[cfg(feature = "test-darwin-keeper")]
+                session: core.session_identity,
+                #[cfg(feature = "test-darwin-keeper")]
+                reservation_identities: core.keepers.iter().map(|k| k.identity).collect(),
                 app: core.app,
                 app_status: core.completion.application.status(),
                 not_started: core.completion.application == AppDisposition::NotStarted,
