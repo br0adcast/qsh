@@ -408,6 +408,286 @@ fn encoded(report: &Report) -> Result<Vec<u8>, ObserverError> {
         Ok(bytes)
     }
 }
+// Files are private fixture evidence, never PTY bytes or public diagnostics.
+fn directory(path: &std::path::Path) -> Result<std::fs::File, ObserverError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| ObserverError::ReportIo)?;
+    let m = f.metadata().map_err(|_| ObserverError::ReportIo)?;
+    if !m.is_dir() || m.uid() != unsafe { nix::libc::geteuid() } || m.mode() & 0o077 != 0 {
+        return Err(ObserverError::ReportIo);
+    }
+    Ok(f)
+}
+fn close_file(f: std::fs::File) -> Result<(), ObserverError> {
+    use std::os::fd::IntoRawFd;
+    let fd = f.into_raw_fd();
+    if unsafe { nix::libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(ObserverError::ReportIo)
+    }
+}
+fn checked_file(f: &std::fs::File) -> Result<(), ObserverError> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata().map_err(|_| ObserverError::ReportIo)?;
+    if !m.is_file()
+        || m.uid() != unsafe { nix::libc::geteuid() }
+        || m.mode() & 0o777 != 0o600
+        || m.nlink() != 1
+        || m.len() > CAP as u64
+    {
+        return Err(ObserverError::ReportIo);
+    }
+    Ok(())
+}
+pub(super) fn publish(path: &std::path::Path, report: &Report) -> Result<(), ObserverError> {
+    publish_with_close(path, report, close_file)
+}
+fn publish_with_close(
+    path: &std::path::Path,
+    report: &Report,
+    mut close: impl FnMut(std::fs::File) -> Result<(), ObserverError>,
+) -> Result<(), ObserverError> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let bytes = encoded(report)?;
+    let dir = directory(path)?;
+    let fd = unsafe {
+        nix::libc::openat(
+            dir.as_raw_fd(),
+            c"terminal-observation.json".as_ptr(),
+            nix::libc::O_WRONLY
+                | nix::libc::O_CREAT
+                | nix::libc::O_EXCL
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let _ = close(dir);
+        return Err(ObserverError::ReportIo);
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let result = (|| {
+        checked_file(&f)?;
+        f.write_all(&bytes).map_err(|_| ObserverError::ReportIo)?;
+        checked_file(&f)
+    })();
+    let file_closed = close(f);
+    let dir_closed = close(dir);
+    result?;
+    file_closed?;
+    dir_closed
+}
+pub(super) fn read_report(path: &std::path::Path) -> Result<Vec<u8>, ObserverError> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let dir = directory(path)?;
+    let fd = unsafe {
+        nix::libc::openat(
+            dir.as_raw_fd(),
+            c"terminal-observation.json".as_ptr(),
+            nix::libc::O_RDONLY
+                | nix::libc::O_NOFOLLOW
+                | nix::libc::O_CLOEXEC
+                | nix::libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let _ = close_file(dir);
+        return Err(ObserverError::ReportIo);
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    let result = (|| {
+        checked_file(&f)?;
+        (&mut f)
+            .take((CAP + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ObserverError::ReportIo)?;
+        if bytes.len() > CAP {
+            return Err(ObserverError::ReportLimit);
+        }
+        checked_file(&f)
+    })();
+    let file_closed = close_file(f);
+    let dir_closed = close_file(dir);
+    result?;
+    file_closed?;
+    dir_closed?;
+    Ok(bytes)
+}
+pub(super) fn project_report(
+    bytes: &[u8],
+    binding: &Binding,
+    admitted: Option<([u64; 3], i32)>,
+    complete_gate: bool,
+) -> Projection {
+    if complete_gate {
+        if let Ok(p) = validate_report(bytes, binding, admitted) {
+            return p;
+        }
+    }
+    let error = validate_report(bytes, binding, admitted)
+        .err()
+        .unwrap_or(ObserverError::Binding);
+    let mut p = unavailable(error);
+    if admitted.is_some() && bytes.len() <= CAP {
+        if let Ok(r) = serde_json::from_slice::<Report>(bytes) {
+            if r.binding == *binding {
+                p.state = "refused";
+                for (i, c) in r.closes.iter().take(3).enumerate() {
+                    p.closes[i] = c.fd == i as i32 && c.success && c.errno.is_none()
+                }
+            }
+        }
+    }
+    p
+}
+#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
+pub(super) mod real {
+    use super::*;
+    use nix::libc;
+    pub(super) struct Native {
+        directory: Option<*mut libc::DIR>,
+    }
+    impl Native {
+        pub(super) fn new() -> Self {
+            Self { directory: None }
+        }
+    }
+    impl Drop for Native {
+        fn drop(&mut self) {
+            if let Some(d) = self.directory.take() {
+                unsafe {
+                    libc::closedir(d);
+                }
+            }
+        }
+    }
+    impl Ops for Native {
+        fn now(&mut self) -> u128 {
+            let mut t: libc::timespec = unsafe { std::mem::zeroed() };
+            if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } < 0 {
+                u128::MAX
+            } else {
+                t.tv_sec as u128 * 1_000_000_000 + t.tv_nsec as u128
+            }
+        }
+        fn process(&mut self) -> Result<(i32, i32, i32), ObserverError> {
+            let p = unsafe { libc::getpid() };
+            let sid = unsafe { libc::getsid(0) };
+            let group = unsafe { libc::getpgrp() };
+            if p <= 0 || sid <= 0 || group <= 0 {
+                Err(ObserverError::Binding)
+            } else {
+                Ok((p, sid, group))
+            }
+        }
+        fn foreground(&mut self) -> Result<i32, ObserverError> {
+            let p = unsafe { libc::tcgetpgrp(0) };
+            if p <= 0 {
+                Err(ObserverError::Stat)
+            } else {
+                Ok(p)
+            }
+        }
+        fn begin(&mut self) -> Result<Descriptor, ObserverError> {
+            let fd = unsafe {
+                libc::open(
+                    c"/dev/fd".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(ObserverError::Enumeration);
+            }
+            let dir = unsafe { libc::fdopendir(fd) };
+            if dir.is_null() {
+                unsafe {
+                    libc::close(fd);
+                };
+                return Err(ObserverError::Enumeration);
+            }
+            self.directory = Some(dir);
+            let owned = unsafe { libc::dirfd(dir) };
+            match self.descriptor(owned) {
+                Ok(d) => Ok(d),
+                Err(e) => {
+                    let _ = self.finish();
+                    Err(e)
+                }
+            }
+        }
+        fn next(&mut self) -> Result<Option<String>, ObserverError> {
+            let dir = self.directory.ok_or(ObserverError::Enumeration)?;
+            unsafe { *libc::__error() = 0 };
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                if unsafe { *libc::__error() } != 0 {
+                    return Err(ObserverError::Enumeration);
+                }
+                return Ok(None);
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            Ok(Some(
+                name.to_str()
+                    .map_err(|_| ObserverError::MalformedEntry)?
+                    .to_owned(),
+            ))
+        }
+        fn descriptor(&mut self, fd: i32) -> Result<Descriptor, ObserverError> {
+            let mut a: libc::stat = unsafe { std::mem::zeroed() };
+            let mut b: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut a) } < 0 {
+                return Err(ObserverError::Stat);
+            }
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fstat(fd, &mut b) } < 0 {
+                return Err(ObserverError::DescriptorRace);
+            }
+            let record = |s: libc::stat| Descriptor {
+                fd,
+                dev: s.st_dev as u64,
+                rdev: s.st_rdev as u64,
+                ino: s.st_ino,
+                mode: s.st_mode as u32,
+                flags,
+            };
+            let first = record(a);
+            if first != record(b) {
+                return Err(ObserverError::DescriptorRace);
+            }
+            Ok(first)
+        }
+        fn finish(&mut self) -> Result<(), ObserverError> {
+            let d = self.directory.take().ok_or(ObserverError::EnumClose)?;
+            if unsafe { libc::closedir(d) } == 0 {
+                Ok(())
+            } else {
+                Err(ObserverError::EnumClose)
+            }
+        }
+        fn close_original(&mut self, fd: i32) -> Result<(), i32> {
+            if unsafe { libc::close(fd) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
+pub(super) fn capture(binding: &Binding) -> Report {
+    observe_closes(binding, &mut real::Native::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,284 +1090,4 @@ mod tests {
             actor.find("observation::publish").unwrap() < actor.find("observation::gate").unwrap()
         );
     }
-}
-
-// Files are private fixture evidence, never PTY bytes or public diagnostics.
-fn directory(path: &std::path::Path) -> Result<std::fs::File, ObserverError> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| ObserverError::ReportIo)?;
-    let m = f.metadata().map_err(|_| ObserverError::ReportIo)?;
-    if !m.is_dir() || m.uid() != unsafe { nix::libc::geteuid() } || m.mode() & 0o077 != 0 {
-        return Err(ObserverError::ReportIo);
-    }
-    Ok(f)
-}
-fn close_file(f: std::fs::File) -> Result<(), ObserverError> {
-    use std::os::fd::IntoRawFd;
-    let fd = f.into_raw_fd();
-    if unsafe { nix::libc::close(fd) } == 0 {
-        Ok(())
-    } else {
-        Err(ObserverError::ReportIo)
-    }
-}
-fn checked_file(f: &std::fs::File) -> Result<(), ObserverError> {
-    use std::os::unix::fs::MetadataExt;
-    let m = f.metadata().map_err(|_| ObserverError::ReportIo)?;
-    if !m.is_file()
-        || m.uid() != unsafe { nix::libc::geteuid() }
-        || m.mode() & 0o777 != 0o600
-        || m.nlink() != 1
-        || m.len() > CAP as u64
-    {
-        return Err(ObserverError::ReportIo);
-    }
-    Ok(())
-}
-pub(super) fn publish(path: &std::path::Path, report: &Report) -> Result<(), ObserverError> {
-    publish_with_close(path, report, close_file)
-}
-fn publish_with_close(
-    path: &std::path::Path,
-    report: &Report,
-    mut close: impl FnMut(std::fs::File) -> Result<(), ObserverError>,
-) -> Result<(), ObserverError> {
-    use std::io::Write;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let bytes = encoded(report)?;
-    let dir = directory(path)?;
-    let fd = unsafe {
-        nix::libc::openat(
-            dir.as_raw_fd(),
-            c"terminal-observation.json".as_ptr(),
-            nix::libc::O_WRONLY
-                | nix::libc::O_CREAT
-                | nix::libc::O_EXCL
-                | nix::libc::O_NOFOLLOW
-                | nix::libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd < 0 {
-        let _ = close(dir);
-        return Err(ObserverError::ReportIo);
-    }
-    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-    let result = (|| {
-        checked_file(&f)?;
-        f.write_all(&bytes).map_err(|_| ObserverError::ReportIo)?;
-        checked_file(&f)
-    })();
-    let file_closed = close(f);
-    let dir_closed = close(dir);
-    result?;
-    file_closed?;
-    dir_closed
-}
-pub(super) fn read_report(path: &std::path::Path) -> Result<Vec<u8>, ObserverError> {
-    use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let dir = directory(path)?;
-    let fd = unsafe {
-        nix::libc::openat(
-            dir.as_raw_fd(),
-            c"terminal-observation.json".as_ptr(),
-            nix::libc::O_RDONLY
-                | nix::libc::O_NOFOLLOW
-                | nix::libc::O_CLOEXEC
-                | nix::libc::O_NONBLOCK,
-        )
-    };
-    if fd < 0 {
-        let _ = close_file(dir);
-        return Err(ObserverError::ReportIo);
-    }
-    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    let result = (|| {
-        checked_file(&f)?;
-        (&mut f)
-            .take((CAP + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ObserverError::ReportIo)?;
-        if bytes.len() > CAP {
-            return Err(ObserverError::ReportLimit);
-        }
-        checked_file(&f)
-    })();
-    let file_closed = close_file(f);
-    let dir_closed = close_file(dir);
-    result?;
-    file_closed?;
-    dir_closed?;
-    Ok(bytes)
-}
-pub(super) fn project_report(
-    bytes: &[u8],
-    binding: &Binding,
-    admitted: Option<([u64; 3], i32)>,
-    complete_gate: bool,
-) -> Projection {
-    if complete_gate {
-        if let Ok(p) = validate_report(bytes, binding, admitted) {
-            return p;
-        }
-    }
-    let error = validate_report(bytes, binding, admitted)
-        .err()
-        .unwrap_or(ObserverError::Binding);
-    let mut p = unavailable(error);
-    if admitted.is_some() && bytes.len() <= CAP {
-        if let Ok(r) = serde_json::from_slice::<Report>(bytes) {
-            if r.binding == *binding {
-                p.state = "refused";
-                for (i, c) in r.closes.iter().take(3).enumerate() {
-                    p.closes[i] = c.fd == i as i32 && c.success && c.errno.is_none()
-                }
-            }
-        }
-    }
-    p
-}
-#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
-pub(super) mod real {
-    use super::*;
-    use nix::libc;
-    pub(super) struct Native {
-        directory: Option<*mut libc::DIR>,
-    }
-    impl Native {
-        pub(super) fn new() -> Self {
-            Self { directory: None }
-        }
-    }
-    impl Drop for Native {
-        fn drop(&mut self) {
-            if let Some(d) = self.directory.take() {
-                unsafe {
-                    libc::closedir(d);
-                }
-            }
-        }
-    }
-    impl Ops for Native {
-        fn now(&mut self) -> u128 {
-            let mut t: libc::timespec = unsafe { std::mem::zeroed() };
-            if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } < 0 {
-                u128::MAX
-            } else {
-                t.tv_sec as u128 * 1_000_000_000 + t.tv_nsec as u128
-            }
-        }
-        fn process(&mut self) -> Result<(i32, i32, i32), ObserverError> {
-            let p = unsafe { libc::getpid() };
-            let sid = unsafe { libc::getsid(0) };
-            let group = unsafe { libc::getpgrp() };
-            if p <= 0 || sid <= 0 || group <= 0 {
-                Err(ObserverError::Binding)
-            } else {
-                Ok((p, sid, group))
-            }
-        }
-        fn foreground(&mut self) -> Result<i32, ObserverError> {
-            let p = unsafe { libc::tcgetpgrp(0) };
-            if p <= 0 {
-                Err(ObserverError::Stat)
-            } else {
-                Ok(p)
-            }
-        }
-        fn begin(&mut self) -> Result<Descriptor, ObserverError> {
-            let fd = unsafe {
-                libc::open(
-                    c"/dev/fd".as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(ObserverError::Enumeration);
-            }
-            let dir = unsafe { libc::fdopendir(fd) };
-            if dir.is_null() {
-                unsafe {
-                    libc::close(fd);
-                };
-                return Err(ObserverError::Enumeration);
-            }
-            self.directory = Some(dir);
-            let owned = unsafe { libc::dirfd(dir) };
-            match self.descriptor(owned) {
-                Ok(d) => Ok(d),
-                Err(e) => {
-                    let _ = self.finish();
-                    Err(e)
-                }
-            }
-        }
-        fn next(&mut self) -> Result<Option<String>, ObserverError> {
-            let dir = self.directory.ok_or(ObserverError::Enumeration)?;
-            unsafe { *libc::__error() = 0 };
-            let entry = unsafe { libc::readdir(dir) };
-            if entry.is_null() {
-                if unsafe { *libc::__error() } != 0 {
-                    return Err(ObserverError::Enumeration);
-                }
-                return Ok(None);
-            }
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            Ok(Some(
-                name.to_str()
-                    .map_err(|_| ObserverError::MalformedEntry)?
-                    .to_owned(),
-            ))
-        }
-        fn descriptor(&mut self, fd: i32) -> Result<Descriptor, ObserverError> {
-            let mut a: libc::stat = unsafe { std::mem::zeroed() };
-            let mut b: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut a) } < 0 {
-                return Err(ObserverError::Stat);
-            }
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            if flags < 0 || unsafe { libc::fstat(fd, &mut b) } < 0 {
-                return Err(ObserverError::DescriptorRace);
-            }
-            let record = |s: libc::stat| Descriptor {
-                fd,
-                dev: s.st_dev as u64,
-                rdev: s.st_rdev as u64,
-                ino: s.st_ino,
-                mode: s.st_mode as u32,
-                flags,
-            };
-            let first = record(a);
-            if first != record(b) {
-                return Err(ObserverError::DescriptorRace);
-            }
-            Ok(first)
-        }
-        fn finish(&mut self) -> Result<(), ObserverError> {
-            let d = self.directory.take().ok_or(ObserverError::EnumClose)?;
-            if unsafe { libc::closedir(d) } == 0 {
-                Ok(())
-            } else {
-                Err(ObserverError::EnumClose)
-            }
-        }
-        fn close_original(&mut self, fd: i32) -> Result<(), i32> {
-            if unsafe { libc::close(fd) } == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
-            }
-        }
-    }
-}
-
-#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
-pub(super) fn capture(binding: &Binding) -> Report {
-    observe_closes(binding, &mut real::Native::new())
 }
