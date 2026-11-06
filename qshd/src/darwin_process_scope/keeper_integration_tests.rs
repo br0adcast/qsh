@@ -161,23 +161,127 @@ fn sample_terminal_eof(
         producers: producers(),
     }
 }
+#[derive(Clone, Copy)]
+enum TerminalEofContract {
+    LiveApplication,
+    NormalCompletion,
+}
+impl TerminalEofContract {
+    fn accepts(self, sample: TerminalEofSample) -> bool {
+        match self {
+            Self::LiveApplication => {
+                delivered_eof(sample.eof, sample.reader_drop, sample.retiring_running)
+            }
+            Self::NormalCompletion => {
+                sample.eof && sample.reader_drop && !sample.reader_drop_finished
+            }
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::LiveApplication => "live_application",
+            Self::NormalCompletion => "normal_completion",
+        }
+    }
+}
+
+#[test]
+fn keeper_eof_contract_normal_completion_accepts_real_eof_without_running() {
+    let producers = super::keeper_pty::eof_diagnostics::Producers::default();
+    let sample = sample_terminal_eof(
+        |component| component != EofComponent::RetiringRunning,
+        || false,
+        || producers.sample(),
+    );
+    assert!(!delivered_eof(
+        sample.eof,
+        sample.reader_drop,
+        sample.retiring_running
+    ));
+    assert!(!TerminalEofContract::LiveApplication.accepts(sample));
+    assert!(TerminalEofContract::NormalCompletion.accepts(sample));
+}
+
+#[test]
+fn keeper_eof_contract_requires_real_eof_drop_and_held_normal_reader() {
+    let producers = super::keeper_pty::eof_diagnostics::Producers::default();
+    for mask in 0..8 {
+        for finished in [false, true] {
+            let sample = sample_terminal_eof(
+                |component| mask & (1 << component as u8) != 0,
+                || finished,
+                || producers.sample(),
+            );
+            assert_eq!(
+                TerminalEofContract::LiveApplication.accepts(sample),
+                mask == 7
+            );
+            assert_eq!(
+                TerminalEofContract::NormalCompletion.accepts(sample),
+                mask & 3 == 3 && !finished
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keeper_eof_contract_normal_deadline_keeps_cached_producer_failure() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let producers = super::keeper_pty::eof_diagnostics::Producers::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sampled = calls.clone();
+    let wait = terminal_eof_until_contract(
+        move || {
+            sampled.fetch_add(1, Ordering::SeqCst);
+            sample_terminal_eof(
+                |component| component != EofComponent::Eof,
+                || false,
+                || producers.sample(),
+            )
+        },
+        std::time::Instant::now(),
+        TerminalEofContract::NormalCompletion,
+    );
+    let panic = tokio::spawn(wait).await.unwrap_err().into_panic();
+    let text = panic
+        .downcast_ref::<String>()
+        .expect("cached Shell deadline");
+    assert!(text.contains("contract=normal_completion"));
+    assert!(text
+        .contains("eof=false reader_drop=true retiring_running=true reader_drop_finished=false"));
+    assert!(text.contains("read_phase=NotCalled(0)"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[track_caller]
 fn terminal_eof_until(
+    sample: impl FnMut() -> TerminalEofSample,
+    end: std::time::Instant,
+) -> impl std::future::Future<Output = ()> {
+    terminal_eof_until_contract(sample, end, TerminalEofContract::LiveApplication)
+}
+#[track_caller]
+fn terminal_eof_until_contract(
     mut sample: impl FnMut() -> TerminalEofSample,
     end: std::time::Instant,
+    contract: TerminalEofContract,
 ) -> impl std::future::Future<Output = ()> {
     let caller = std::panic::Location::caller();
     async move {
         loop {
             let cached = sample();
-            if delivered_eof(cached.eof, cached.reader_drop, cached.retiring_running) {
+            if contract.accepts(cached) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < end,
-                "original integrated fixture deadline caller_line={} caller_column={} {}",
+                "original integrated fixture deadline caller_line={} caller_column={} contract={} {}",
                 caller.line(),
                 caller.column(),
+                contract.label(),
                 cached
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1598,10 +1702,26 @@ pub(super) mod native {
                     until(||read_gate(&path.join("stdio-closed")).and_then(|bytes|super::keeper_terminal_observation::parse_gate(&bytes,&nonce)).is_some(),end).await;
                     let observation=f.observation(0).expect("actual factory child ran");
                     terminal_observation(&path,&nonce,raw,kind,screen,Some(observation.clone()),Some(instance.get()));projected_body.store(true,Ordering::SeqCst);
-                    super::terminal_eof_until(||super::sample_terminal_eof(|component|match component {super::EofComponent::Eof=>observation.io.eof.load(Ordering::SeqCst),super::EofComponent::ReaderDrop=>observation.io.reader_drop.load(Ordering::SeqCst),super::EofComponent::RetiringRunning=>observation.io.retiring_running.load(Ordering::SeqCst)},||observation.io.reader_drop_finished.load(Ordering::SeqCst),||observation.io.producers.sample()),end).await;
-                    assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
-                    let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
-                    assert!(snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
+                    let eof_sample=||super::sample_terminal_eof(|component|match component {super::EofComponent::Eof=>observation.io.eof.load(Ordering::SeqCst),super::EofComponent::ReaderDrop=>observation.io.reader_drop.load(Ordering::SeqCst),super::EofComponent::RetiringRunning=>observation.io.retiring_running.load(Ordering::SeqCst)},||observation.io.reader_drop_finished.load(Ordering::SeqCst),||observation.io.producers.sample());
+                    match kind {
+                        ChannelKind::Command => {
+                            super::terminal_eof_until_contract(eof_sample,end,super::TerminalEofContract::LiveApplication).await;
+                            assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
+                            let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
+                            assert!(snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
+                        }
+                        ChannelKind::Shell => {
+                            // Normal Shell release follows real input/geometry/echo and live custody.
+                            until(||{let output=events.output.lock().unwrap();output.windows(b"KEEPER_RESIZED".len()).any(|w|w==b"KEEPER_RESIZED")&&output.windows(b"keeper-input-proof".len()).any(|w|w==b"keeper-input-proof")},end).await;
+                            let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert_eq!(NativeOps.classify(app).unwrap().class,Class::Session(snapshot.sid));
+                            assert!(!snapshot.custody_lost&&snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
+                            exclusive(&path.join("release"),nonce.as_bytes());
+                            // Real EOF and positive process receipts may complete in either order.
+                            super::terminal_eof_until_contract(eof_sample,end,super::TerminalEofContract::NormalCompletion).await;
+                            until(||observation.authority.snapshot().is_some_and(|s|!s.custody_lost&&s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed),end).await;
+                            assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
+                        }
+                    }
                     assert!(registry.retiring_count()>0&&registry.try_cleanup_snapshot().unwrap().unique_cleanup_debt>0);
                     assert!(!events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{stream,..}|ServerRecord::ExitStatusUnavailable{stream} if *stream==FIRST_CHANNEL_STREAM)));
                     // Screen memory follows Channel lifetime at consumed EOF;
@@ -1609,10 +1729,10 @@ pub(super) mod native {
                     until(||budget.used()==crate::screen_budget::Usage::default(),end).await;
                     client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::Open(OpenRequest{stream:FIRST_CHANNEL_STREAM+1,kind:ChannelKind::Command,cols:80,rows:24,screen:false,command:b"/usr/bin/true".to_vec()}))).unwrap();
                     until(||events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{stream,code:0} if *stream==FIRST_CHANNEL_STREAM+1)),end).await;
-                    assert_eq!(f.count(),2);assert!(observation.authority.snapshot().unwrap().app_status.is_none());
+                    assert_eq!(f.count(),2);if kind==ChannelKind::Command{assert!(observation.authority.snapshot().unwrap().app_status.is_none());}
                     let output=events.output.lock().unwrap().clone();let echoed=output.windows(b"keeper-input-proof".len()).any(|w|w==b"keeper-input-proof");assert_eq!(echoed,kind==ChannelKind::Shell);
                     assert!(output.windows(b"KEEPER_RESIZED".len()).any(|w|w==b"KEEPER_RESIZED"));
-                    exclusive(&path.join("release"),nonce.as_bytes());
+                    if kind==ChannelKind::Command{exclusive(&path.join("release"),nonce.as_bytes());}
                     until(||observation.authority.snapshot().is_some_and(|s|s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed),end).await;
                     assert!(registry.retiring_count()>0);
                     assert!(!events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{stream,..}|ServerRecord::ExitStatusUnavailable{stream} if *stream==FIRST_CHANNEL_STREAM)));
@@ -1627,7 +1747,10 @@ pub(super) mod native {
                 if !projected.load(Ordering::SeqCst){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0),None);}
                 if !body_ok {let _retained=d.keep();}
                 settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();
-                eprintln!("keeper223 terminal kind={kind:?} screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false");
+                match kind {
+                    ChannelKind::Command => eprintln!("keeper223 terminal kind=Command screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false"),
+                    ChannelKind::Shell => eprintln!("keeper223 terminal kind=Shell screen={screen} eof_contract=normal_completion real_eof_delivered=true reader_join_held=true cleanup_receipts=true screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false"),
+                }
             }}
         });
     }

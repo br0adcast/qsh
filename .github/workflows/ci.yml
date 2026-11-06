@@ -248,7 +248,13 @@ jobs:
           if grep -F 'rescue=true' "$runtime/keeper-integrated-results.log"; then exit 1; fi
           grep -F 'test result: ok. 6 passed; 0 failed; 0 ignored;' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 route=keeper source=compiled-missing' "$runtime/keeper-integrated-results.log"
-          test "$(grep -Fc 'real_eof_delivered_alive=true' "$runtime/keeper-integrated-results.log")" -eq 4
+          for screen in false true
+          do
+            test "$(grep -Fxc "keeper223 terminal kind=Command screen=$screen real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false" "$runtime/keeper-integrated-results.log")" -eq 1
+            test "$(grep -Fxc "keeper223 terminal kind=Shell screen=$screen eof_contract=normal_completion real_eof_delivered=true reader_join_held=true cleanup_receipts=true screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false" "$runtime/keeper-integrated-results.log")" -eq 1
+          done
+          test "$(grep -c '^keeper223 terminal ' "$runtime/keeper-integrated-results.log")" -eq 4
+          if grep -E 'SKIPPED|rescue=true|boundary=failure_rescue' "$runtime/keeper-integrated-results.log"; then exit 1; fi
           test "$(grep -Fc 'keeper223 open_executor mode=' "$runtime/keeper-integrated-results.log")" -eq 4
           grep -F 'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false' "$runtime/keeper-integrated-results.log"
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"

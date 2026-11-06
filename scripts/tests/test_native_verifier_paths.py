@@ -550,6 +550,60 @@ elif name == 'python3':
         self.assertNotIn('Qualify the production Intel Darwin process owner', portable)
         self.assertNotIn('Observe the Intel Darwin runtime', portable)
 
+    def test_corrected_terminal_contract_literal_admission(self):
+        command = 'keeper223 terminal kind=Command screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false'
+        shell = 'keeper223 terminal kind=Shell screen={screen} eof_contract=normal_completion real_eof_delivered=true reader_join_held=true cleanup_receipts=true screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false'
+        records = [template.format(screen=screen) for template in (command, shell) for screen in ('false', 'true')]
+        blocks = []
+        for workflow, job, step in (
+                ('ci.yml', 'macos', 'Qualify the production Darwin process owner'),
+                ('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')):
+            owner = self.body(workflow, job, step)
+            start = owner.index('for screen in false true')
+            stop = owner.index('test "$(grep -Fc \'keeper223 open_executor', start)
+            block = owner[start:stop]
+            blocks.append(block)
+            good = '\n'.join(records) + '\n'
+            variants = [(good, True)]
+            for row in records:
+                variants.extend([(good.replace(row + '\n', ''), False), (good + row + '\n', False)])
+            variants.append(('\n'.join(command.format(screen=screen).replace('kind=Command', 'kind=' + kind)
+                                       for kind in ('Shell', 'Command') for screen in ('false', 'true')) + '\n', False))
+            for before, after in (('kind=Shell', 'kind=Other'), ('screen=false', 'screen=other'),
+                                  ('real_eof_delivered=true', 'real_eof_delivered=false'),
+                                  ('reader_join_held=true', 'reader_join_held=false'),
+                                  ('cleanup_receipts=true', 'cleanup_receipts=false'),
+                                  ('terminal=37', 'terminal=0'), ('session=0', 'session=1'),
+                                  ('rescue=false', 'rescue=true')):
+                variants.append((good.replace(before, after), False))
+            variants.extend([(good + 'keeper223 terminal extra=true\n', False),
+                             (good + 'keeper223 settlement boundary=failure_rescue_entry\n', False),
+                             (good + 'SKIPPED\n', False)])
+            with tempfile.TemporaryDirectory(prefix='terminal-contract-inert-') as directory:
+                env = os.environ.copy(); env['runtime'] = directory
+                for output, accepted in variants:
+                    (Path(directory) / 'keeper-integrated-results.log').write_text(output)
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, accepted, output + result.stdout + result.stderr)
+        self.assertEqual(blocks[0], blocks[1])
+        source = (ROOT / 'qshd/src/darwin_process_scope/keeper_integration_tests.rs').read_text()
+        terminal = source.split('fn terminal_run(command_only: bool)', 1)[1].split('pub(super) fn cancel_setup()', 1)[0]
+        branches = terminal.split('match kind {', 1)[1]
+        command, shell = branches.split('ChannelKind::Shell => {', 1)
+        shell = shell.split('assert!(registry.retiring_count()', 1)[0]
+        self.assertIn('TerminalEofContract::LiveApplication', command)
+        self.assertLess(command.index('terminal_eof_until_contract'), command.index('snapshot.app_status.is_none()'))
+        self.assertIn('for kind in [ChannelKind::Shell,ChannelKind::Command]', terminal)
+        release = 'exclusive(&path.join("release"),nonce.as_bytes());'
+        self.assertLess(shell.index('KEEPER_RESIZED'), shell.index(release))
+        self.assertLess(shell.index('snapshot.app_status.is_none()'), shell.index(release))
+        self.assertLess(shell.index(release), shell.index('TerminalEofContract::NormalCompletion'))
+        self.assertLess(shell.index('TerminalEofContract::NormalCompletion'), shell.index('s.app_status==Some(37)'))
+        self.assertIn('!s.custody_lost&&s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed', shell)
+        self.assertIn('let fence=registry.begin_restart_fence().unwrap();assert!(fence.wait_until(Instant::now()).is_none(),"reader has not joined");', terminal)
+        self.assertLess(terminal.index('reader has not joined'), terminal.index('observation.io.release_reader()'))
+
     def test_command_contrast_literal_gate_executes_only_inert_harness(self):
         selector = 'darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast'
         blocks = []
