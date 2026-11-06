@@ -1469,10 +1469,11 @@ fn helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inheri
                 assert_eq!(status.code(), Some(1));
                 break;
             }
-            assert!(
-                std::time::Instant::now() < until,
-                "failed status setup abandoned worker custody"
-            );
+            // Establish the original failure before any diagnostic I/O. The
+            // assertion's formatting arguments are evaluated only on failure.
+            assert!(std::time::Instant::now() < until, "{}", {
+                common::status508_projection(&refused.status508_sample())
+            });
             std::thread::yield_now();
         }
         let refused_log = std::fs::read_to_string(common::daemon_log_path()).unwrap();
@@ -1488,3 +1489,118 @@ fn helper_status143_real_parent_endpoint_is_root_only_and_worker_does_not_inheri
 #[cfg(target_os = "linux")]
 #[path = "serve_system_split/worker_no_new_privs.rs"]
 mod worker_no_new_privs;
+
+#[test]
+fn status508_diagnostics_missing_and_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("empty");
+    assert_eq!(
+        common::status508_read_tail(&path).kind,
+        common::Status508TailKind::Missing
+    );
+    std::fs::write(&path, []).unwrap();
+    let tail = common::status508_read_tail(&path);
+    assert_eq!(tail.kind, common::Status508TailKind::Present);
+    assert!(tail.bytes.is_empty());
+}
+
+#[test]
+fn status508_diagnostics_exact_bounded_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized");
+    let bytes: Vec<_> = (0..common::STATUS508_TAIL_CAP * 3 + 17)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let tail = common::status508_read_tail(&path);
+    assert_eq!(tail.kind, common::Status508TailKind::Present);
+    assert_eq!(
+        tail.bytes,
+        bytes[bytes.len() - common::STATUS508_TAIL_CAP..]
+    );
+}
+
+#[test]
+fn status508_diagnostics_nonregular_replaced_and_truncated() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        common::status508_read_tail(dir.path()).kind,
+        common::Status508TailKind::NonRegular
+    );
+    let path = dir.path().join("log");
+    symlink("inert-missing-target", &path).unwrap();
+    assert_eq!(
+        common::status508_read_tail(&path).kind,
+        common::Status508TailKind::NonRegular
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, b"synthetic old bytes").unwrap();
+    let tail = common::status508_read_tail_after_open(&path, || {
+        std::fs::rename(&path, dir.path().join("previous")).unwrap();
+        std::fs::write(&path, b"synthetic new bytes").unwrap();
+    });
+    assert_eq!(tail.kind, common::Status508TailKind::Changed);
+    let tail = common::status508_read_tail_after_open(&path, || {
+        std::fs::write(&path, b"x").unwrap();
+    });
+    assert_eq!(tail.kind, common::Status508TailKind::Truncated);
+}
+
+#[test]
+fn status508_diagnostics_public_projection_excludes_canaries() {
+    let canary = "INERT_508_PRIVATE_CANARY /inert-path inert-account inert-key-like-text";
+    let sample = common::Status508Sample {
+        stderr: common::Status508Tail::present(canary.as_bytes().to_vec()),
+        current: common::Status508Tail::present(
+            format!("{canary} requested helper status endpoint failed").into_bytes(),
+        ),
+        rotated: common::Status508Tail::present(format!("{canary} runtime workers").into_bytes()),
+    };
+    let public = common::status508_projection(&sample);
+    for forbidden in [
+        "INERT_508_PRIVATE_CANARY",
+        "inert-path",
+        "inert-account",
+        "inert-key-like-text",
+    ] {
+        assert!(!public.contains(forbidden));
+    }
+    assert!(public.contains("current_setup_failure=true"));
+    assert!(public.contains("rotated_runtime=true"));
+}
+
+#[test]
+fn status508_diagnostics_bounded_capture_errors_keep_failure() {
+    for kind in [
+        common::Status508TailKind::Missing,
+        common::Status508TailKind::NonRegular,
+        common::Status508TailKind::OpenFailed,
+        common::Status508TailKind::SeekFailed,
+        common::Status508TailKind::ReadFailed,
+        common::Status508TailKind::Changed,
+        common::Status508TailKind::Truncated,
+        common::Status508TailKind::Unavailable,
+    ] {
+        let sample = common::Status508Sample {
+            stderr: common::Status508Tail {
+                kind,
+                bytes: vec![b'x'; common::STATUS508_TAIL_CAP],
+            },
+            current: common::Status508Tail {
+                kind,
+                bytes: Vec::new(),
+            },
+            rotated: common::Status508Tail {
+                kind,
+                bytes: Vec::new(),
+            },
+        };
+        let public = common::status508_projection(&sample);
+        assert!(public.starts_with(
+            "failed status setup abandoned worker custody; deadline_expired=true child=running"
+        ));
+        assert!(public.len() <= 4096);
+        assert!(!public.contains(&"x".repeat(32)));
+    }
+}
