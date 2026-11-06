@@ -259,7 +259,7 @@ jobs:
     if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native Intel Darwin process owner
     runs-on: macos-15-intel
-    timeout-minutes: 35
+    timeout-minutes: 45
     env:
       NATIVE_TARGET: x86_64-apple-darwin
     steps:
