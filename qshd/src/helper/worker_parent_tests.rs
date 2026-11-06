@@ -153,6 +153,345 @@ mod worker_parent {
         (dir, worker, child)
     }
 
+    // The separate stream is a fixture barrier, never worker protocol evidence.
+    // Removing the production pre-stage send guard must fail these assertions.
+    #[test]
+    #[ignore = "runs only inside the owned stage-barrier subprocess"]
+    fn worker508_stage_barrier_child_body() {
+        use std::io::{Read, Write};
+        let inherited = |name| {
+            let fd: i32 = std::env::var(name).unwrap().parse().unwrap();
+            // SAFETY: each exact inherited fixture descriptor has one owner.
+            unsafe { UnixStream::from_raw_fd(fd) }
+        };
+        let socket = inherited("QSH_TEST_508_CONTROL");
+        let mut barrier = inherited("QSH_TEST_508_BARRIER");
+        let mut publisher = Publisher::new(socket);
+        loop {
+            let mut command = [0];
+            barrier.read_exact(&mut command).unwrap();
+            match command[0] {
+                b'C' => {
+                    let reader = publisher.reader().unwrap();
+                    let empty = matches!(
+                        worker_control::receive(&reader),
+                        Ok(worker_control::Received::Empty)
+                    );
+                    barrier.write_all(if empty { b"E" } else { b"X" }).unwrap();
+                }
+                b'P' => {
+                    publisher.establish().unwrap();
+                    barrier.write_all(b"P").unwrap();
+                }
+                b'F' => {
+                    publisher.init_failed(nix::libc::EIO).unwrap();
+                    return;
+                }
+                b'D' | b'S' => {
+                    let stop = WorkerStop::default();
+                    let shutdown = stop.shutdown();
+                    let manager = async {
+                        if command[0] == b'S' {
+                            shutdown.requested().await;
+                        }
+                        Ok(())
+                    };
+                    let reader = publisher.reader().unwrap();
+                    let inspection = publisher.reader().unwrap();
+                    let manager = crate::helper::worker_child::drive(
+                        reader,
+                        nix::unistd::getppid().as_raw() as u32,
+                        stop.clone(),
+                        manager,
+                    );
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    let mut threads = WorkerThreads::default();
+                    for role in [
+                        Role::ChannelReader,
+                        Role::AuthReader,
+                        Role::TellReleaser,
+                        Role::NoncePool,
+                    ] {
+                        threads.register(role, std::thread::spawn(|| Ok(())), || Ok(()));
+                    }
+                    let outcome =
+                        crate::helper::worker_drain::run(runtime, manager, threads, stop.clone());
+                    if command[0] == b'S' {
+                        assert_eq!(
+                            stop.snapshot().first_stop,
+                            Some(crate::helper::worker_protocol::StopReason::Requested)
+                        );
+                        assert!(
+                            matches!(
+                                worker_control::receive(&inspection),
+                                Ok(worker_control::Received::Empty)
+                            ),
+                            "exactly one Stop"
+                        );
+                    }
+                    publisher.finish(outcome).unwrap();
+                    return;
+                }
+                _ => panic!("unknown stage fixture command"),
+            }
+        }
+    }
+
+    struct StageFixture {
+        child: std::process::Child,
+        barrier: UnixStream,
+    }
+    impl Drop for StageFixture {
+        fn drop(&mut self) {
+            loop {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("owned stage fixture observation: {e}"),
+                    Ok(None) => break,
+                }
+            }
+            // The exact child may exit between observation and cancellation.
+            let _ = self.child.kill();
+            loop {
+                match self.child.wait() {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD) => break,
+                    result => {
+                        result.unwrap();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    impl StageFixture {
+        fn command(&mut self, command: u8) {
+            use std::io::Write;
+            self.barrier.write_all(&[command]).unwrap();
+        }
+        fn answer(&mut self) -> u8 {
+            use std::io::Read;
+            let mut answer = [0];
+            self.barrier.read_exact(&mut answer).unwrap();
+            answer[0]
+        }
+        fn exited(&self, worker: &mut WorkerDomain) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !matches!(
+                worker.owner.leader(),
+                crate::process_scope::scope::LeaderStatus::Exited(_)
+            ) {
+                assert!(Instant::now() < deadline, "owned producer exit observation");
+                std::thread::yield_now();
+            }
+        }
+        fn product_reaped(&mut self) -> bool {
+            matches!(self.child.try_wait(), Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD))
+        }
+    }
+    fn stage_fixture() -> (WorkerDomain, StageFixture) {
+        use std::os::fd::AsRawFd;
+        let view = crate::process_scope::prepare().unwrap();
+        let (private, peer) = worker_control::pair().unwrap();
+        let (barrier, child_barrier) = UnixStream::pair().unwrap();
+        barrier
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let fd = peer.as_raw_fd();
+        let barrier_fd = child_barrier.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "helper::server::tests::worker_parent::worker508_stage_barrier_child_body",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("QSH_TEST_508_CONTROL", fd.to_string())
+            .env("QSH_TEST_508_BARRIER", barrier_fd.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only the exact owned fixture descriptors cross exec.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in [fd, barrier_fd] {
+                    if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let fixture = StageFixture {
+            child: command.spawn().unwrap(),
+            barrier,
+        };
+        let owner = WorkerOwner::new(
+            NonZeroU32::new(fixture.child.id()).unwrap(),
+            view,
+            private,
+            Instant::now() + Duration::from_secs(5),
+        );
+        drop(peer);
+        drop(child_barrier);
+        (WorkerDomain::new(owner), fixture)
+    }
+    fn settle_stage_fixture(worker: &mut WorkerDomain) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.settled() && Instant::now() < deadline {
+            worker.advance();
+            worker.send_stop();
+            std::thread::yield_now();
+        }
+        assert!(worker.settled(), "actual owned worker settlement");
+    }
+
+    fn stage_service_failed(worker: &WorkerDomain) -> bool {
+        HelperPhysicalOutcome {
+            worker: worker.physical_outcome(),
+            pam_received: PamCompletion::NotOpened,
+            cleanup_failure: None,
+            missing_pam: 0,
+            channel_receipts: ChannelReceiptDebt::default(),
+            pending_requests: false,
+            monitor_failure: None,
+            adoption_failed: false,
+            forced_worker: false,
+            required_publication: None,
+        }
+        .failed()
+    }
+
+    #[test]
+    fn worker508_pre_stage_stop_is_retained_without_publication() {
+        use crate::helper::worker_protocol::StopReason;
+        let (mut worker, mut fixture) = stage_fixture();
+        worker.request_stop(StopReason::Requested);
+        worker.request_stop(StopReason::Protocol);
+        worker.advance(); // fixture cannot publish until P
+        worker.send_stop();
+        assert!(
+            worker.pending.is_some(),
+            "pre-stage Stop must remain queued"
+        );
+        assert!(!worker.stop_attempted);
+        assert!(!worker.stop_writable());
+        assert_eq!(worker.stop_reason, Some(StopReason::Requested));
+        fixture.command(b'C');
+        assert_eq!(
+            fixture.answer(),
+            b'E',
+            "no Stop on the child control socket"
+        );
+        fixture.command(b'P');
+        assert_eq!(fixture.answer(), b'P');
+        worker.advance();
+        assert!(worker.owner.stop_ready() && worker.stop_writable());
+        worker.send_stop();
+        assert!(worker.stop_attempted && worker.pending.is_none());
+        worker.send_stop(); // a completed publication never queues a duplicate
+                            // Consume exactly one original Stop, then let the real drive/drain path finish.
+        fixture.command(b'S');
+        settle_stage_fixture(&mut worker);
+        assert!(fixture.product_reaped());
+        assert!(worker.owner.terminal_received());
+        assert!(
+            worker.first_failure.is_none(),
+            "original Requested reason must survive"
+        );
+    }
+
+    #[test]
+    fn worker508_init_failure_before_stage_acceptance_settles() {
+        use crate::helper::{worker_owner::WorkerFailure, worker_protocol::StopReason};
+        let (mut worker, mut fixture) = stage_fixture();
+        worker.record(ParentFailure::Setup(nix::libc::ECONNREFUSED));
+        worker.request_stop(StopReason::Protocol);
+        worker.advance();
+        worker.send_stop();
+        fixture.command(b'P');
+        assert_eq!(fixture.answer(), b'P');
+        fixture.command(b'F');
+        fixture.exited(&mut worker); // non-reaping observation before any owner receive
+        worker.advance();
+        assert!(
+            worker.owner.stop_ready(),
+            "authentic stage accepted before failed initialization"
+        );
+        settle_stage_fixture(&mut worker);
+        assert!(fixture.product_reaped());
+        assert!(worker.owner.terminal_received());
+        assert_eq!(
+            worker.owner.first_failure(),
+            Some(WorkerFailure::Init(nix::libc::EIO))
+        );
+        assert!(matches!(
+            worker.first_failure,
+            Some(ParentFailure::Setup(nix::libc::ECONNREFUSED))
+        ));
+        assert!(stage_service_failed(&worker));
+    }
+
+    #[test]
+    fn worker508_post_stage_unread_stop_settles_failed() {
+        use crate::helper::{
+            worker_owner::WorkerFailure,
+            worker_protocol::{Fault, StopReason},
+        };
+        let (mut worker, mut fixture) = stage_fixture();
+        fixture.command(b'P');
+        assert_eq!(fixture.answer(), b'P');
+        worker.advance();
+        worker.request_stop(StopReason::Requested);
+        worker.send_stop();
+        assert!(worker.stop_attempted && worker.pending.is_none());
+        fixture.command(b'F');
+        fixture.exited(&mut worker);
+        settle_stage_fixture(&mut worker);
+        assert!(fixture.product_reaped());
+        assert!(worker.owner.terminal_received());
+        assert!(matches!(
+            worker.owner.first_failure(),
+            Some(
+                WorkerFailure::Init(nix::libc::EIO)
+                    | WorkerFailure::Protocol(Fault::Os(nix::libc::ECONNRESET))
+            )
+        ));
+        assert!(stage_service_failed(&worker));
+    }
+
+    #[test]
+    fn worker508_terminal_before_pending_send_suppresses_stop() {
+        use crate::helper::worker_protocol::StopReason;
+        for terminal in [b'F', b'D'] {
+            let (mut worker, mut fixture) = stage_fixture();
+            worker.request_stop(StopReason::Requested);
+            fixture.command(b'P');
+            assert_eq!(fixture.answer(), b'P');
+            worker.advance();
+            assert!(worker.stop_writable());
+            fixture.command(terminal);
+            fixture.exited(&mut worker);
+            worker.advance(); // terminal frame, still no queue-drained fence
+            assert!(worker.owner.terminal_received());
+            worker.send_stop();
+            assert!(
+                !worker.stop_attempted,
+                "terminal evidence suppresses queued Stop"
+            );
+            assert!(worker.pending.is_none());
+            assert!(!worker.owner.stop_ready() && !worker.stop_writable());
+            settle_stage_fixture(&mut worker);
+            assert!(fixture.product_reaped());
+        }
+    }
+
     #[test]
     fn worker40_parent_channel_eof_retains_actual_held_manager_and_auth_route() {
         let (dir, worker, mut child) = child_fixture(false);
@@ -326,6 +665,7 @@ mod worker_parent {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while !worker.settled() && Instant::now() < deadline {
                     worker.advance();
+                    worker.send_stop();
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 let settled = worker.settled();
