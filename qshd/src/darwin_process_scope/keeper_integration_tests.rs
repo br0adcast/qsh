@@ -1,6 +1,8 @@
 //! Source-bound compatibility fixtures. The six connected tests exist only in
 //! the explicit Darwin fixture build; host controls never count as native runs.
 use super::{Class, Classified, Failure, Identity};
+#[path = "keeper_terminal_observation.rs"]
+mod keeper_terminal_observation;
 
 // Fresh OPEN identities arrive through authenticated first-stream Geometry.
 fn established_instance(
@@ -1442,6 +1444,63 @@ pub(super) mod native {
     fn actor_command(mode: &str, path: &Path, nonce: &str, raw: u128, echo: bool) -> Vec<u8> {
         format!("/usr/bin/env QSH_KEEPER_TEST_MODE={mode} QSH_KEEPER_TEST_DIR={} QSH_KEEPER_TEST_NONCE={nonce} QSH_KEEPER_TEST_END={raw} QSH_KEEPER_TEST_ECHO={} {} --exact darwin_process_scope::keeper_integration_tests::keeper_owned_actor --nocapture",quoted(path),u8::from(echo),quoted(&std::env::current_exe().unwrap())).into_bytes()
     }
+    fn terminal_observation(
+        path: &Path,
+        nonce: &str,
+        end: u128,
+        kind: ChannelKind,
+        screen: bool,
+        observed: Option<super::super::keeper_pty::FixtureObservation>,
+    ) {
+        use super::keeper_terminal_observation as observation;
+        let admitted = observed.and_then(|o| o.authority.snapshot()).and_then(|s| {
+            if s.app_status.is_some() || s.session_wait.is_some() {
+                return None;
+            }
+            let app = s.app?;
+            let classified = NativeOps.classify(app).ok()?;
+            match classified.class {
+                Class::Session(sid) if sid == s.sid => {
+                    let id = classified.identity;
+                    Some(([id.pid as u64, id.unique, id.version as u64], sid))
+                }
+                _ => None,
+            }
+        });
+        let projection = if monotonic() >= end {
+            observation::unavailable(observation::ObserverError::Deadline)
+        } else {
+            match admitted {
+                Some((actor, sid)) => {
+                    let binding = observation::Binding {
+                        schema: 1,
+                        nonce: nonce.to_owned(),
+                        end,
+                        actor,
+                        source: observation::source_digest(),
+                    };
+                    let gate = read_gate(&path.join("stdio-closed"))
+                        .and_then(|b| observation::parse_gate(&b, nonce));
+                    match observation::read_report(path) {
+                        Ok(bytes) => observation::project_report(
+                            &bytes,
+                            &binding,
+                            Some((actor, sid)),
+                            gate == Some(true),
+                        ),
+                        Err(e) => observation::unavailable(e),
+                    }
+                }
+                None => observation::unavailable(observation::ObserverError::Binding),
+            }
+        };
+        if let Ok(json) = serde_json::to_string(&projection) {
+            super::emit_settlement(
+                &mut std::io::stderr(),
+                format_args!("keeper223 terminal_observation kind={kind:?} screen={screen} {json}"),
+            );
+        }
+    }
     pub(super) fn terminal() {
         let _serial = SERIAL.lock().unwrap();
         let end = Instant::now() + Duration::from_secs(60);
@@ -1451,9 +1510,10 @@ pub(super) mod native {
             for kind in [ChannelKind::Shell,ChannelKind::Command] {for screen in [false,true] {
                 let d=directory();let nonce=nonce();let release=Release{path:d.path().to_path_buf(),nonce:nonce.clone()};
                 let mut fixture=fixture();fixture.eof_deadline=Some(end);let c=Connected::new(fixture,end).await;
+                let projected=Arc::new(std::sync::atomic::AtomicBool::new(false));let projected_body=projected.clone();
                 let client=c.client.clone();let events=c.events.clone();let registry=c.registry.clone();let budget=c.budget.clone();let f=c.fixture.clone();let path=d.path().to_path_buf();
                 let command=actor_command("terminal",&path,&nonce,raw,kind==ChannelKind::Shell);
-                if c.open(kind,if kind==ChannelKind::Shell {vec![]}else{command.clone()},screen).is_err(){c.finish(false).await;panic!("OPEN enqueue failed");}
+                if c.open(kind,if kind==ChannelKind::Shell {vec![]}else{command.clone()},screen).is_err(){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0));let _retained=d.keep();c.finish(false).await;panic!("OPEN enqueue failed");}
                 let result=tokio::spawn(async move {
                     until(||events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Opened{stream} if *stream==FIRST_CHANNEL_STREAM)),end).await;
                     if kind==ChannelKind::Shell {let mut bytes=b"exec ".to_vec();bytes.extend_from_slice(&command);bytes.push(b'\n');client.send_bytes(FIRST_CHANNEL_STREAM,bytes).unwrap();}
@@ -1463,8 +1523,9 @@ pub(super) mod native {
                     client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::ResizeRequest{stream:FIRST_CHANNEL_STREAM,instance,request_id:transport::channel_geometry::ResizeRequestId::new(1).unwrap(),cols:91,rows:31})).unwrap();
                     until(||events.geometries.lock().unwrap().iter().any(|g|g.instance==instance&&g.request_id==1&&g.outcome==transport::channel_geometry::GeometryOutcome::Applied&&g.cols==91&&g.rows==31),end).await;
                     client.send_bytes(FIRST_CHANNEL_STREAM,b"keeper-input-proof\n".to_vec()).unwrap();
-                    until(||read_gate(&path.join("stdio-closed")).as_deref()==Some(nonce.as_bytes()),end).await;
+                    until(||read_gate(&path.join("stdio-closed")).and_then(|bytes|super::keeper_terminal_observation::parse_gate(&bytes,&nonce)).is_some(),end).await;
                     let observation=f.observation(0).expect("actual factory child ran");
+                    terminal_observation(&path,&nonce,raw,kind,screen,Some(observation.clone()));projected_body.store(true,Ordering::SeqCst);
                     super::terminal_eof_until(||super::sample_terminal_eof(|component|match component {super::EofComponent::Eof=>observation.io.eof.load(Ordering::SeqCst),super::EofComponent::ReaderDrop=>observation.io.reader_drop.load(Ordering::SeqCst),super::EofComponent::RetiringRunning=>observation.io.retiring_running.load(Ordering::SeqCst)},||observation.io.reader_drop_finished.load(Ordering::SeqCst),||observation.io.producers.sample()),end).await;
                     assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
                     let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
@@ -1490,7 +1551,10 @@ pub(super) mod native {
                     until(||registry.outstanding()==0&&registry.retiring_count()==0,end).await;
                     assert!(fence.wait_until(Instant::now()).is_some());fence.reopen();f.assert_settled(2);
                 }).await;
-                let body_ok=result.is_ok();settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();
+                let body_ok=result.is_ok();
+                if !projected.load(Ordering::SeqCst){terminal_observation(d.path(),&release.nonce,raw,kind,screen,c.fixture.observation(0));}
+                if !body_ok {let _retained=d.keep();}
+                settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();
                 eprintln!("keeper223 terminal kind={kind:?} screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false");
             }}
         });
@@ -1660,10 +1724,28 @@ pub(super) mod native {
             assert_eq!((size.ws_col, size.ws_row), (91, 31));
             println!("KEEPER_RESIZED");
             std::io::stdout().flush().unwrap();
-            for fd in [0, 1, 2] {
-                assert_eq!(unsafe { nix::libc::close(fd) }, 0);
-            }
-            exclusive(&path.join("stdio-closed"), nonce.as_bytes());
+            use super::keeper_terminal_observation as observation;
+            let actor = NativeOps
+                .identity(std::process::id() as i32)
+                .ok()
+                .map(|id| [id.pid as u64, id.unique, id.version as u64])
+                .unwrap_or([std::process::id() as u64, 0, 0]);
+            let binding = observation::Binding {
+                schema: 1,
+                nonce: nonce.clone(),
+                end,
+                actor,
+                source: observation::source_digest(),
+            };
+            let report = observation::capture(&binding);
+            let closed = observation::closes_succeeded(&report);
+            let complete = observation::complete(&report);
+            let published = observation::publish(&path, &report).is_ok();
+            assert!(closed, "original actor stdio close failed");
+            exclusive(
+                &path.join("stdio-closed"),
+                &observation::gate(&nonce, complete && published && monotonic() < end),
+            );
             wait("release");
             unsafe { nix::libc::_exit(37) };
         } else if mode == "foreign-parent" {
