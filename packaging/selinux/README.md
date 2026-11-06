@@ -241,6 +241,122 @@ reinstall. Partial failure or uncertain publication may leave PENDING or changed
 state and must refuse readiness. Historical basis and a parsed COMPLETE record
 alone do not prove current policy state or authorize repair.
 
+### Supported teardown, reinstall and recovery limits
+
+This subsection states the current source contract and its fail-closed limits.
+It is not Fedora transaction acceptance (see the end of this section), and it
+does not authorize adopting unknown state, automatic repair or relaxed checks.
+
+**Configuration prerequisites.** These checks apply to more than upgrade.
+While the consumer is installed, every phase checks the PAM and sidecar
+conditions below: consumer upgrade, consumer post, final consumer erase,
+provider upgrade and managed prestart. The retained-entry limits apply to every
+phase, including fresh provider activation and final provider erase.
+
+- `/etc/pam.d/qshd` holds exactly the packaged bytes, owned by root:root with
+  mode 0644. The provider ships the same canonical bytes as
+  `/usr/share/qshd-selinux/qshd.fedora-selinux`, and `rpm -V qshd` must not
+  report the file. A customized profile, even a deliberate one, refuses
+  maintenance and managed start alike. The paired contract has no supported
+  customized PAM profile.
+- `/etc/pam.d/qshd.rpmnew` and `/etc/pam.d/qshd.rpmsave` are absent.
+- Retained entries are finite. `/etc/qshd` may contain only `host_key`.
+  `/var/log/qshd` may contain only `qshd.log` and `qshd.log.1`. `/run/qshd`
+  may contain only `helper-status.sock.lock`; the helper socket must be gone
+  because the daemon is stopped. Each present entry has the following
+  properties:
+  - it is owned by root with the daemon's mode: the host key 0400 or 0600 and
+    64 bytes, log and lock files 0600, `/run/qshd` 0700;
+  - it has no set-ID or sticky bits;
+  - it carries the label the phase expects: defaults before fresh provider
+    activation, qshd types afterward.
+
+  `/var/run` must be the usual symlink to `/run`. Any other entry refuses, for
+  example an extra or compressed rotated log or a key backup.
+- While the consumer is not installed, `/usr/bin/qshd`, `/etc/pam.d/qshd` and
+  both sidecars must be absent. This covers fresh provider activation, a fresh
+  consumer install, a provider upgrade without the consumer, and final
+  provider erase. A leftover profile from another `qshd` package therefore
+  refuses these phases too.
+
+**Preserving administrator data.** Hooks never adopt, rewrite, move or delete
+administrator data, and refusal does not imply that the data must be discarded.
+Before maintenance:
+
+1. Keep a copy of a customized PAM profile in a root-only location outside
+   `/etc/pam.d`. Every file there is a PAM service, and the `.rpmnew` and
+   `.rpmsave` names refuse.
+2. Move any extra retained entries the same way, outside the three retained
+   directories.
+3. Restore the canonical PAM bytes, owner and mode.
+
+Retained `host_key` and logs that satisfy the limits above stay in place
+through erase and reinstall. Fresh activation relabels them; final provider
+erase restores their default labels. Reapplying a customization after
+maintenance is the administrator's decision. Under the present contract it
+again refuses managed start and the next upgrade or erase.
+
+**Teardown and pristine reinstall.** The only supported sequence from a working
+installation to a pristine reinstall is the following:
+
+1. Stop and drain, as above. If the unit was enabled, disable it explicitly so
+   that a later reinstall does not inherit that enablement. This holds
+   whether or not the consumer hook also disables the unit.
+2. Erase the consumer.
+3. Erase the provider.
+4. Install both packages fresh.
+
+The acceptance driver exercises steps 2 and 3 as separate erase transactions
+and step 4 as one install transaction. A dnf transaction that removes both
+packages at once, including dependency cleanup of the provider, is not
+separately qualified.
+
+A successful consumer-only erase deliberately leaves the loaded pair, the
+managed labels and `PENDING consumer-erase` in
+`/var/lib/qshd/selinux-activation`. From that state the following refuse:
+
+- installing the consumer again;
+- upgrading or reinstalling the provider;
+- every other consumer phase.
+
+Final provider erase is the only admitted next step. Continuing with only the
+consumer is unsupported under the present contract.
+
+**Partial states.** A refusal before PENDING publication leaves the previous
+state, so the transaction can be retried after the prerequisite is fixed. A
+fresh provider install publishes `PENDING provider-fresh` already in its pre.
+Any later refusal in its post therefore comes after publication, even a
+refusal that changed nothing else. After publication, the routes are as
+follows.
+
+- **`PENDING consumer-install`** (failed consumer post). The consumer stays
+  installed and managed start refuses. A final consumer erase is admitted;
+  continue with the provider erase.
+- **`PENDING consumer-erase`** after a failed final consumer erase. The package
+  stays installed, and a retried consumer erase is admitted.
+- **`PENDING provider-fresh`, `PENDING provider-refresh` or
+  `PENDING provider-erase`** (a failed or uncertain provider pre, post or
+  final erase). No ordinary package-manager route exists. Provider erase
+  refuses (`ERASE_SLOT`). Provider upgrade, consumer install and a later fresh
+  provider install refuse as well. Managed start refuses.
+
+In a state without a route, do not invent a recovery:
+
+- do not use `--noscripts`, `--nopreun` or `tsflags=noscripts`. They remove the
+  payload without the phase and leave the loaded pair, labels and slot for a
+  later fresh install to refuse;
+- do not edit or delete `/var/lib/qshd/selinux-activation` or
+  `/var/lib/qshd/selinux-contexts`;
+- do not remove the modules with `semodule`;
+- do not relabel retained entries;
+- do not start the daemon manually.
+
+Preserve the failing transaction's output, including the phase refusal
+frame, plus the journal and the read-only package, module and label listings.
+Report them without host key or log contents. Any future continuation or
+recovery feature must be reviewed and qualified on its own; it is not part
+of this contract.
+
 Actual finished three-RPM construction/header/payload review and Fedora Enforcing
 x86_64/aarch64 installed lifecycle qualification remain pending. Source, staging
 and synthetic-header checks do not establish policy load/HLL equality, package
