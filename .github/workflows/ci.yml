@@ -206,6 +206,24 @@ jobs:
           select_artifact "$runtime/feature-harness.jsonl" "$runtime/feature-harness" lib test-build-labels,test-darwin-keeper
           feature_harness="$(cat "$runtime/feature-harness.path")"
           verify_harness "$feature_harness" "$runtime/feature-harness.sha256"
+          timed command-terminal-contrast "$feature_harness" --ignored --exact darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/keeper-command-contrast-results.log"
+          awk -v expected="test darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast ... " '
+            /^test .* \.\.\. / { starts++ }
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(starts == 1 && seen == 1 && passed == 1) }
+          ' "$runtime/keeper-command-contrast-results.log"
+          test "$(grep -Fxc 'running 1 test' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fxc 'keeper223 terminal kind=Command screen=false real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          test "$(grep -Fxc 'keeper223 connected_join=normal registry=0 screen_credits=0 two_io_joins=terminal_certificate rescue=false' "$runtime/keeper-command-contrast-results.log")" -eq 1
+          if grep -E 'SKIPPED|rescue=true|boundary=failure_rescue' "$runtime/keeper-command-contrast-results.log"; then exit 1; fi
+          verify_harness "$feature_harness" "$runtime/feature-harness.sha256"
           timed integrated-runtime "$feature_harness" darwin_process_scope::keeper_integration_tests::keeper_integrated_ \
             --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-integrated-results.log"
           for name in \

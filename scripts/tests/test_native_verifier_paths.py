@@ -550,6 +550,72 @@ elif name == 'python3':
         self.assertNotIn('Qualify the production Intel Darwin process owner', portable)
         self.assertNotIn('Observe the Intel Darwin runtime', portable)
 
+    def test_command_contrast_literal_gate_executes_only_inert_harness(self):
+        selector = 'darwin_process_scope::keeper_integration_tests::keeper_command_terminal_contrast'
+        blocks = []
+        for workflow, job, step in (
+                ('ci.yml', 'macos', 'Qualify the production Darwin process owner'),
+                ('native-crypto.yml', 'darwin-owner-intel', 'Qualify the production Intel Darwin process owner')):
+            owner = self.body(workflow, job, step)
+            self.assertEqual(owner.count('timed command-terminal-contrast '), 1)
+            start = owner.index('timed command-terminal-contrast ')
+            stop = owner.index('verify_harness "$feature_harness"', start)
+            block = owner[start:stop]
+            blocks.append(block)
+            self.assertIn('--ignored --exact ' + selector, block)
+            self.assertLess(start, owner.index('timed integrated-runtime '))
+            self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
+            with tempfile.TemporaryDirectory(prefix='contrast-inert-') as directory:
+                runtime = Path(directory)
+                harness = runtime / 'inert-harness'
+                harness.write_text('#!/bin/bash\ntest "$*" = "--ignored --exact ' + selector + ' --nocapture --test-threads=1" || exit 9\ncat "$runtime/inert-output"\nexit "$inert_status"\n')
+                harness.chmod(0o700)
+                good = ('running 1 test\n' + 'test ' + selector + ' ... observing\nok\n'
+                        'keeper223 terminal kind=Command screen=false real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false\n'
+                        'keeper223 connected_join=normal registry=0 screen_credits=0 two_io_joins=terminal_certificate rescue=false\n'
+                        'test result: ok. 1 passed; 0 failed; 0 ignored;\n')
+                variants = [(good, '0', True), (good, '7', False),
+                            (good.replace('running 1 test', 'running 0 tests'), '0', False),
+                            (good.replace('1 passed', '0 passed'), '0', False),
+                            (good.replace(selector, selector + '_wrong'), '0', False),
+                            (good + 'test ' + selector + ' ... ok\n', '0', False),
+                            (good.replace('connected_join=normal', 'connected_join=absent'), '0', False),
+                            (good + 'test unexpected ... ok\n', '0', False),
+                            (good + 'keeper223 settlement boundary=failure_rescue_entry\n', '0', False)]
+                for output, status, accepted in variants:
+                    (runtime / 'inert-output').write_text(output)
+                    env = os.environ.copy()
+                    env.update(runtime=directory, feature_harness=str(harness), inert_status=status)
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\ntimed() { shift; "$@"; }\n' + block],
+                                            env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                (runtime / 'inert-output').write_text(good)
+                env['inert_status'] = '0'
+                for mutation in (block.replace('--exact ', ''), block.replace('--ignored ', ''),
+                                 block.replace('--exact ' + selector, '--exact wrong_selector')):
+                    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' +
+                                             'timed() { shift; "$@"; }\n' + mutation],
+                                            env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+
+        self.assertEqual(blocks[0], blocks[1])
+        source = (ROOT / 'qshd/src/darwin_process_scope/keeper_integration_tests.rs').read_text()
+        self.assertIn('#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]\n'
+                      '#[test]\n#[ignore = "requires exact owned native qualification"]\n'
+                      'fn keeper_command_terminal_contrast() {\n    native::terminal_command_contrast();\n}', source)
+        self.assertIn('pub(super) fn terminal() {\n        terminal_run(false);\n    }', source)
+        self.assertIn('pub(super) fn terminal_command_contrast() {\n        terminal_run(true);\n    }', source)
+        self.assertEqual(source.count('fn terminal_run(command_only: bool)'), 1)
+        self.assertIn('s.app_status==Some(37)&&s.session_wait==Some(0)&&s.drained&&s.broker_terminal&&s.census&&s.consumed', source)
+        self.assertIn('settlement("terminal_release_entry",body_ok);release.release();settlement("terminal_release_return",body_ok);c.finish(body_ok).await;result.unwrap();', source)
+        self.assertNotIn('keeper_integrated_', selector)
+        self.assertNotIn('keeper_native_', selector)
+        for path in (ROOT / '.github/workflows').glob('*.yml'):
+            for line in path.read_text().splitlines():
+                if 'nextest run' in line or 'run-nextest-ci.py' in line:
+                    self.assertNotIn('--include-ignored', line)
+        self.assertNotIn('--include-ignored', (ROOT / 'scripts/run-nextest-ci.py').read_text())
+
     def test_intel_owner_preserves_artifact_and_acceptance_contract(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         self.assertIn('  darwin-owner-intel:\n', native, 'independent Intel owner job is missing')
@@ -558,6 +624,28 @@ elif name == 'python3':
         import re
         names = lambda body: re.findall(r'^  (darwin_process_scope::\S+)\s*\\?$', body, re.MULTILINE)
         self.assertEqual(len(names(owner)), 20)
+        self.assertEqual(names(owner), [
+            'darwin_process_scope::native_tests::darwin223_native_noncooperative_token_exec_and_bound_exit',
+            'darwin_process_scope::native_tests::darwin223_native_signaled_leader_scope_uses_portable_code_one',
+            'darwin_process_scope::native_tests::darwin223_native_already_zombie_handshake_child_keeps_reserved_leader',
+            'darwin_process_scope::native_tests::darwin223_native_classification_bracket_refuses_exec_and_one_sided_zombie',
+            'darwin_process_scope::native_tests::darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins',
+            'darwin_process_scope::native_tests::darwin223_native_connected_close_stop_rebind_and_fresh_session',
+            'darwin_process_scope::native_tests::darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork',
+            'darwin_process_scope::native_tests::darwin223_native_term_and_interrupt_join_real_manager_and_workers',
+            'darwin_process_scope::native_tests::darwin223_native_partial_descriptor_failure_retains_real_process_owner',
+            'darwin_process_scope::native_tests::darwin223_native_actual_daemon_replacement_reaps_parked_scope_and_fresh_session',
+            'darwin_process_scope::keeper_tests::keeper_native_exit37_and_pty_eof',
+            'darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork',
+            'darwin_process_scope::keeper_tests::keeper_native_broker_group_intrusion',
+            'darwin_process_scope::keeper_tests::keeper_native_cancel_before_admit_no_application',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_terminal_status_and_io',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_open_cancel_and_setup_failure',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_close_stop_rebind_and_fresh_session',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_term_interrupt_join',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_actual_daemon_replacement',
+            'darwin_process_scope::keeper_integration_tests::keeper_integrated_foreign_sid_retains_debt',
+        ])
         self.assertEqual(names(owner), names(arm))
         for count in (10, 4, 6):
             self.assertIn(f'test result: ok. {count} passed; 0 failed; 0 ignored;', owner)
@@ -565,7 +653,7 @@ elif name == 'python3':
         self.assertEqual(owner.count('--no-run --message-format=json-render-diagnostics'), 2)
         self.assertEqual(owner.count('--bin qshd --profile test'), 2)
         self.assertEqual(owner.count('verify_harness "$ordinary_harness"'), 2)
-        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 1)
+        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
         for required in ('--features test-build-labels', '--features test-darwin-keeper',
                          'timed feature-check cargo check', 'timed feature-clippy cargo clippy',
                          '-- -D warnings', '--target "$NATIVE_TARGET"',

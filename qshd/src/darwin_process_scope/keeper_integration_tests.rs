@@ -6,6 +6,23 @@ mod keeper_owner_observation;
 #[path = "keeper_terminal_observation.rs"]
 mod keeper_terminal_observation;
 
+fn terminal_case_selected(command_only: bool, command: bool, screen: bool) -> bool {
+    !command_only || (command && !screen)
+}
+
+#[test]
+fn keeper_terminal_case_selection_preserves_original_order_and_fixed_contrast() {
+    let cases = [(false, false), (false, true), (true, false), (true, true)];
+    let selected = |command_only| {
+        cases
+            .into_iter()
+            .filter(|&(command, screen)| terminal_case_selected(command_only, command, screen))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(selected(false), cases);
+    assert_eq!(selected(true), [(true, false)]);
+}
+
 // Fresh OPEN identities arrive through authenticated first-stream Geometry.
 fn established_instance(
     geometries: &[transport::channel_geometry::GeometryRecord],
@@ -1550,12 +1567,19 @@ pub(super) mod native {
         }
     }
     pub(super) fn terminal() {
+        terminal_run(false);
+    }
+    pub(super) fn terminal_command_contrast() {
+        terminal_run(true);
+    }
+    fn terminal_run(command_only: bool) {
         let _serial = SERIAL.lock().unwrap();
         let end = Instant::now() + Duration::from_secs(60);
         let raw = monotonic() + 60_000_000_000;
         let _shell = Env::set(&[("SHELL", std::ffi::OsStr::new("/bin/sh"))]);
         runtime().block_on(async {
             for kind in [ChannelKind::Shell,ChannelKind::Command] {for screen in [false,true] {
+                if !super::terminal_case_selected(command_only,kind==ChannelKind::Command,screen){continue;}
                 let d=directory();let nonce=nonce();let release=Release{path:d.path().to_path_buf(),nonce:nonce.clone()};
                 let mut fixture=fixture();fixture.eof_deadline=Some(end);let c=Connected::new(fixture,end).await;
                 let projected=Arc::new(std::sync::atomic::AtomicBool::new(false));let projected_body=projected.clone();
@@ -1866,6 +1890,12 @@ fn keeper_owned_actor() {
 #[test]
 fn keeper_integrated_terminal_status_and_io() {
     native::terminal();
+}
+#[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
+#[test]
+#[ignore = "requires exact owned native qualification"]
+fn keeper_command_terminal_contrast() {
+    native::terminal_command_contrast();
 }
 #[cfg(all(target_os = "macos", feature = "test-darwin-keeper"))]
 #[test]
