@@ -41,11 +41,10 @@ class RouteTests(unittest.TestCase):
             root = Path(directory); target = root / 'target'; arch = 'aarch64-apple-darwin'
             deps = target / arch / 'debug/deps'; deps.mkdir(parents=True)
             libroot = root / 'registry/libc'; libroot.mkdir(parents=True)
-            (libroot / '.cargo-checksum.json').write_text(json.dumps({'package': owner.LIBC_CHECKSUM}))
             image = deps / 'qshd-image'; image.write_bytes(b'inert'); image.chmod(0o700)
             lib = deps / 'liblibc-current.rlib'; lib.write_bytes(b'inert')
             test = dict(reason='compiler-artifact', target=dict(name='qshd', kind=['lib'], src_path=str(root / 'qshd/src/lib.rs')), executable=str(image), profile=dict(test=True), manifest_path=str(root / 'qshd/Cargo.toml'), features=['test-build-labels', 'test-darwin-keeper'])
-            libc = dict(reason='compiler-artifact', target=dict(name='libc', kind=['lib']), package_id='registry+local#libc@0.2.189', filenames=[str(lib)], manifest_path=str(libroot / 'Cargo.toml'))
+            libc = dict(reason='compiler-artifact', target=dict(name='libc', kind=['lib']), package_id='registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189', filenames=[str(lib)], manifest_path=str(libroot / 'Cargo.toml'))
             host_libc = dict(libc, filenames=[str(target / 'debug/deps/liblibc-host.rlib')])
             self.assertEqual(owner.select_artifacts([test, libc, host_libc], root, target, arch), (image, lib))
             for rows in ([test, test, libc], [test, libc, libc], [test, host_libc], [dict(test, features=[]), libc], [dict(test, manifest_path=str(root / 'other/Cargo.toml')), libc]):
@@ -56,7 +55,7 @@ class RouteTests(unittest.TestCase):
                                  ([dict(test, manifest_path=str(root / 'other')), libc], 'artifact_source'),
                                  ([dict(test, executable=str(outsider)), libc], 'artifact_placement'),
                                  ([test, dict(libc, filenames=[str(lib), str(deps / 'second.rlib')])], 'libc_artifact'),
-                                 ([test, dict(libc, package_id='registry+local#libc@0.2.188')], 'libc_version')):
+                                 ([test, dict(libc, package_id='registry+https://github.com/rust-lang/crates.io-index#libc@0.2.188')], 'libc_version')):
                 with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts(rows, root, target, arch)
                 self.assertEqual(caught.exception.reason, reason)
             with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, 'unknown')
@@ -65,9 +64,36 @@ class RouteTests(unittest.TestCase):
             with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, arch)
             self.assertEqual(caught.exception.reason, 'artifact_executable')
             image.chmod(0o700)
-            (libroot / '.cargo-checksum.json').write_text(json.dumps({'package': '0' * 64}))
+            # Irrelevant marker bytes cannot confer or remove registry authority.
+            (libroot / '.cargo-checksum.json').write_text('PRIVATE_MARKER_CANARY')
+            self.assertEqual(owner.select_artifacts([test, libc], root, target, arch), (image, lib))
+            for bad in ('path+file:///private#libc@0.2.189', 'registry+https://alternate.invalid/index#libc@0.2.189', owner.LIBC_PACKAGE_ID + 'suffix', owner.LIBC_PACKAGE_ID + '.0'):
+                with self.assertRaises(owner.Refusal) as caught:
+                    owner.select_artifacts([test, dict(libc, package_id=bad)], root, target, arch)
+                self.assertEqual(caught.exception.reason, 'libc_version' if bad.startswith(owner.LIBC_SOURCE + '#libc@') else 'artifact_source')
+            lib.unlink()
             with self.assertRaises(owner.Refusal) as caught: owner.select_artifacts([test, libc], root, target, arch)
-            self.assertEqual(caught.exception.reason, 'libc_checksum')
+            self.assertEqual(caught.exception.reason, 'artifact_placement')
+
+    def test_exact_locked_libc_tuple_and_closed_refusals(self):
+        valid = dict(name='libc', version='0.2.189', source=owner.LIBC_SOURCE, checksum=owner.LIBC_CHECKSUM)
+        owner.validate_locked_libc({'package': [valid]})
+        cases = [({}, 'libc_version'), ({'package': []}, 'libc_version'),
+                 ({'package': [valid, valid]}, 'libc_version'),
+                 ({'package': [None]}, 'libc_version')]
+        for key, values, reason in [('version', ['0.2.188', None], 'libc_version'),
+                                    ('source', ['git+PRIVATE_CANARY', None], 'artifact_source'),
+                                    ('checksum', ['0' * 64, None], 'libc_checksum')]:
+            for value in values:
+                row = dict(valid)
+                if value is None: row.pop(key)
+                else: row[key] = value
+                cases.append(({'package': [row]}, reason))
+        for lock, reason in cases:
+            with self.subTest(lock=lock):
+                with self.assertRaises(owner.Refusal) as caught: owner.validate_locked_libc(lock)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertNotIn('PRIVATE_CANARY', str(caught.exception))
 
     def test_fixture_copies_are_literal(self):
         owner.verify_copies(ROOT)
@@ -213,10 +239,13 @@ class AdmissionTests(unittest.TestCase):
     def test_mocked_build_route_stops_without_native_or_helper_execution(self):
         self.mocked_route('pty-eof-build', disagreement=False)
 
+    def test_invalid_lock_main_refuses_before_build(self):
+        self.mocked_route('pty-eof-build', False, invalid_lock=True)
+
     def test_mocked_control_preserves_all_settled_disagreement_summaries(self):
         self.mocked_route('pty-eof-control', disagreement=True)
 
-    def mocked_route(self, mode, disagreement, fail_substage=None):
+    def mocked_route(self, mode, disagreement, fail_substage=None, invalid_lock=False):
         # Inert file/argv doubles only. No compiler or native image is executed.
         calls = []
         ActualOwner = owner.Owner
@@ -266,6 +295,11 @@ class AdmissionTests(unittest.TestCase):
             environ = dict(GITHUB_EVENT_NAME='workflow_dispatch', PTY_EOF_MODE=mode, GITHUB_SHA='a' * 40, RUNNER_TEMP=str(base), OPENSSL_DIR=str(crypto))
             output = io.StringIO()
             actual_digest, actual_chmod = owner.digest, Path.chmod
+            actual_bounded = owner.bounded
+            def bounded(path, limit):
+                if invalid_lock and Path(path) == ROOT / 'Cargo.lock':
+                    return b'[[package]]\nname="libc"\nversion="0.2.189"\nsource="registry+https://github.com/rust-lang/crates.io-index"\nchecksum="PRIVATE_LOCK_CANARY"\n'
+                return actual_bounded(path, limit)
             def select(*args):
                 if fail_substage == 'artifact_select': raise owner.Refusal('artifact_ambiguity')
                 return image, libc
@@ -277,9 +311,16 @@ class AdmissionTests(unittest.TestCase):
                 if fail_substage == 'helper_permissions' and path.name == 'helper':
                     raise OSError('PRIVATE_PERMISSION_CANARY')
                 return actual_chmod(path, mode, **kwargs)
-            with mock.patch.object(owner, 'digest', side_effect=artifact_digest), mock.patch.object(Path, 'chmod', chmod), mock.patch.dict(owner.os.environ, environ, clear=True), mock.patch.object(owner.sys, 'argv', ['owner', mode, 'aarch64-apple-darwin']), mock.patch.object(owner.sys, 'platform', 'darwin'), mock.patch.object(owner.platform, 'machine', return_value='arm64'), mock.patch.object(owner, 'Owner', FakeOwner), mock.patch.object(owner, 'select_artifacts', side_effect=select), contextlib.redirect_stdout(output):
+            with mock.patch.object(owner, 'bounded', side_effect=bounded), mock.patch.object(owner, 'digest', side_effect=artifact_digest), mock.patch.object(Path, 'chmod', chmod), mock.patch.dict(owner.os.environ, environ, clear=True), mock.patch.object(owner.sys, 'argv', ['owner', mode, 'aarch64-apple-darwin']), mock.patch.object(owner.sys, 'platform', 'darwin'), mock.patch.object(owner.platform, 'machine', return_value='arm64'), mock.patch.object(owner, 'Owner', FakeOwner), mock.patch.object(owner, 'select_artifacts', side_effect=select), contextlib.redirect_stdout(output):
                 status = owner.main()
             summary = json.loads(output.getvalue())
+            if invalid_lock:
+                self.assertEqual(status, 1)
+                self.assertEqual(summary['reason'], 'libc_checksum')
+                self.assertFalse(any(a[0] in ('cargo', 'rustc') for a in calls))
+                self.assertNotIn('PRIVATE_LOCK_CANARY', output.getvalue())
+                self.assertNotIn(str(base), output.getvalue())
+                return summary
             if fail_substage is not None:
                 self.assertEqual(status, 1)
                 self.assertEqual(summary['substage'], fail_substage)
@@ -297,6 +338,12 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(status, int(disagreement))
             self.assertEqual(summary['build_completed'], list(owner.BUILD_SUBSTAGES))
             self.assertEqual(summary['portable_passed'], 7)
+            self.assertEqual(summary['artifacts']['libc_rlib_sha256'], actual_digest(libc))
+            self.assertEqual(summary['artifacts']['libc_package_sha256'], owner.LIBC_CHECKSUM)
+            self.assertEqual(summary['artifacts']['libc_integrity_basis'], 'cargo_locked_registry')
+            helper_argv = next(a for a in calls if a[0] == 'rustc' and '-o' in a)
+            self.assertEqual(helper_argv[helper_argv.index('--extern') + 1], 'libc=' + str(libc))
+            self.assertEqual(helper_argv[helper_argv.index('-L') + 1], 'dependency=' + str(libc.parent))
             self.assertEqual(summary['native_executed'], int(disagreement))
             executions = [a for a in calls if a[0] == str(image) and '--ignored' in a and '--list' not in a]
             self.assertEqual(len(executions), int(disagreement))

@@ -30,6 +30,9 @@ PORTABLE = sorted(PREFIX + name for name in (
     "tests::finite_inventory_overflow_is_a_real_receiver_refusal",
 ))
 TARGETS = {"aarch64-apple-darwin": "arm64", "x86_64-apple-darwin": "x86_64"}
+LIBC_VERSION = "0.2.189"
+LIBC_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+LIBC_PACKAGE_ID = LIBC_SOURCE + "#libc@" + LIBC_VERSION
 LIBC_CHECKSUM = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 LABELS = ((1, True, False), (2, True, False), (3, True, False), (4, True, False),
           (2, False, False), (3, False, False), (2, False, True), (3, False, True))
@@ -440,6 +443,19 @@ def verify_copies(root):
             raise ValueError("fixture copy")
 
 
+def validate_locked_libc(lock):
+    packages = lock.get("package") if type(lock) is dict else None
+    if type(packages) is not list or any(type(p) is not dict for p in packages):
+        raise Refusal("libc_version")
+    libc = [p for p in packages if p.get("name") == "libc"]
+    if len(libc) != 1 or libc[0].get("version") != LIBC_VERSION:
+        raise Refusal("libc_version")
+    if libc[0].get("source") != LIBC_SOURCE:
+        raise Refusal("artifact_source")
+    if libc[0].get("checksum") != LIBC_CHECKSUM:
+        raise Refusal("libc_checksum")
+
+
 def select_artifacts(records, root, target_dir, target=None):
     if target not in TARGETS:
         raise Refusal("artifact_target")
@@ -448,18 +464,14 @@ def select_artifacts(records, root, target_dir, target=None):
     tests = [r for r in artifacts if r.get("target", {}).get("name") == "qshd"
              and r.get("target", {}).get("kind") == ["lib"] and r.get("executable")
              and r.get("profile", {}).get("test") is True]
-    libs = [r for r in artifacts if r.get("target", {}).get("name") == "libc"
-            and "lib" in r.get("target", {}).get("kind", [])
-            and re.search(r"(?:libc@0\.2\.189|libc 0\.2\.189)", r.get("package_id", ""))
-            and any(Path(p).resolve().parent == target_deps for p in r.get("filenames", []) if p.endswith(".rlib"))]
+    target_libs = [r for r in artifacts if r.get("target", {}).get("name") == "libc"
+                   and "lib" in r.get("target", {}).get("kind", [])
+                   and any(Path(p).resolve().parent == target_deps for p in r.get("filenames", []) if p.endswith(".rlib"))]
+    libs = [r for r in target_libs if r.get("package_id") == LIBC_PACKAGE_ID]
     if len(tests) != 1 or len(libs) != 1:
-        if len(tests) == 1 and not libs and any(
-            r.get("target", {}).get("name") == "libc"
-            and "lib" in r.get("target", {}).get("kind", [])
-            and not re.search(r"(?:libc@0\.2\.189|libc 0\.2\.189)", r.get("package_id", ""))
-            and any(Path(p).resolve().parent == target_deps for p in r.get("filenames", []) if p.endswith(".rlib"))
-            for r in artifacts
-        ):
+        if len(tests) == 1 and not libs and target_libs:
+            if any(type(r.get("package_id")) is not str or not r["package_id"].startswith(LIBC_SOURCE + "#libc@") for r in target_libs):
+                raise Refusal("artifact_source")
             raise Refusal("libc_version")
         raise Refusal("artifact_ambiguity")
     test, lib = tests[0], libs[0]
@@ -476,13 +488,6 @@ def select_artifacts(records, root, target_dir, target=None):
             raise Refusal("artifact_placement")
     if not os.access(image, os.X_OK):
         raise Refusal("artifact_executable")
-    libroot = Path(lib["manifest_path"]).resolve().parent
-    try:
-        checksum = json.loads(bounded(libroot / ".cargo-checksum.json", 1024 * 1024))
-    except (OSError, ValueError):
-        raise Refusal("libc_checksum") from None
-    if type(checksum) is not dict or checksum.get("package") != LIBC_CHECKSUM:
-        raise Refusal("libc_checksum")
     return image, rlibs[0]
 
 
@@ -744,9 +749,8 @@ def main():
         if checkout.decode().strip() != sha:
             raise ValueError("checkout")
         lock = tomllib.loads(bounded(root / "Cargo.lock", 1024 * 1024).decode())
-        libc_locked = [p for p in lock["package"] if p["name"] == "libc"]
-        if len(libc_locked) != 1 or libc_locked[0]["version"] != "0.2.189" or libc_locked[0]["checksum"] != LIBC_CHECKSUM:
-            raise ValueError("locked libc")
+        # Registry integrity relies on trusted successful locked Cargo, not vendoring markers.
+        validate_locked_libc(lock)
         summary.update(mode=mode, target=target, source_sha=sha, cargo_lock_sha256=digest(root / "Cargo.lock"))
         stage = "provenance"
         _, version = owner.command(["rustc", "-vV"], limit=65536)
@@ -793,7 +797,8 @@ def main():
         helper.chmod(0o500)
         summary["build_completed"].append(substage)
         substage = "artifact_hashes"
-        summary["artifacts"] = {"test_sha256": digest(image), "helper_sha256": digest(helper), "libc_rlib_sha256": digest(libc), "libc_package_sha256": LIBC_CHECKSUM}
+        # Compatibility field: expected lock package checksum, not a new archive/source digest.
+        summary["artifacts"] = {"test_sha256": digest(image), "helper_sha256": digest(helper), "libc_rlib_sha256": digest(libc), "libc_package_sha256": LIBC_CHECKSUM, "libc_integrity_basis": "cargo_locked_registry"}
         summary["build_completed"].append(substage)
         substage = None
         stage = "portable"
