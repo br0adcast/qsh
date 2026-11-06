@@ -223,7 +223,11 @@ activation schema 2, canonical PAM and the fixed pair/type/path profile. Before
 install, upgrade or erase, the administrator must stop and drain the system
 service and manual daemons, and exclude concurrent starts and privileged writers
 through maintenance. Hooks never force stop, kill, enable, start or restart the
-service. The consumer system unit checks current readiness through
+service. Only after final consumer erase admission succeeds, while the unit file
+still exists, consumer preun runs `systemctl --no-reload disable qshd.service`
+without `--now`; upgrades and non-final erase leave enablement unchanged. A
+failed disable fails the erase after PENDING publication, keeping the package
+for a retried erase. The consumer system unit checks current readiness through
 `managed-prestart` before ExecStart; its 460-second outer startup allowance does
 not renew helper deadlines or exclude maintenance begun afterward.
 

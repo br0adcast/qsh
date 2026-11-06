@@ -23,6 +23,7 @@ TRUST = dict(provider_version='0.3.0', manifest_sha256='a' * 64,
 INCOMING = json.dumps(TRUST, sort_keys=True, separators=(',', ':'))
 NAMES = ('provider-pre', 'provider-post', 'provider-preun', 'provider-postun',
          'consumer-pre', 'consumer-post', 'consumer-preun', 'consumer-postun')
+DISABLE = ['systemctl', '--no-reload', 'disable', 'qshd.service']
 
 
 class HookTests(unittest.TestCase):
@@ -185,16 +186,55 @@ raise SystemExit(int(os.environ.get('QSH_TEST_''' + name.upper() + '''_STATUS', 
                 with self.subTest(hook=name, count=count):
                     self.log.unlink(missing_ok=True)
                     result = self.run_hook(name, [count], env={'QSH_TEST_SYSTEMCTL_STATUS': '7'})
-                    if not (count == '0' and name in ('provider-pre', 'provider-post', 'consumer-pre', 'consumer-post')):
+                    final_erase = name == 'consumer-preun' and count == '0'
+                    if not (final_erase or count == '0' and name in ('provider-pre', 'provider-post', 'consumer-pre', 'consumer-post')):
                         self.assertEqual(result.returncode, 0, result.stderr)
                     for event in self.events():
                         if event[0] == 'systemctl':
-                            self.assertEqual(event, ['systemctl', '--system', 'daemon-reload'])
+                            self.assertEqual(event, DISABLE if final_erase else ['systemctl', '--system', 'daemon-reload'])
         self.manager.rmdir()
         self.log.unlink(missing_ok=True)
         result = self.run_hook('consumer-postun', ['0'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.events(), [])
+
+    def test_final_consumer_erase_disables_fixed_unit_only_after_admission(self):
+        result = self.run_hook('consumer-preun', ['0'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events(), [['phase', 'consumer-preun-final'], DISABLE])
+        # Upgrade and non-final erase preserve current enablement and activity.
+        for count in ('1', '2', '17'):
+            with self.subTest(count=count):
+                self.log.unlink(missing_ok=True)
+                result = self.run_hook('consumer-preun', [count])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.events(), [])
+        # A refused or failed admission leaves enablement untouched.
+        self.log.unlink(missing_ok=True)
+        result = self.run_hook('consumer-preun', ['0'], env={'QSH_TEST_PHASE_FAIL': 'yes'})
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertEqual(self.events(), [['phase', 'consumer-preun-final']])
+
+    def test_final_consumer_erase_disable_failure_fails_erase_visibly(self):
+        for status in ('1', '5', '7'):
+            with self.subTest(status=status):
+                self.log.unlink(missing_ok=True)
+                result = self.run_hook('consumer-preun', ['0'], env={'QSH_TEST_SYSTEMCTL_STATUS': status})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b'QSHD_UNIT_DISABLE_REFUSED', result.stderr)
+                self.assertEqual(self.events(), [['phase', 'consumer-preun-final'], DISABLE])
+
+    def test_final_consumer_erase_disable_is_not_skipped_without_manager_directory(self):
+        # The admitted phase already required the supported manager; a later
+        # missing directory or optional-reload guard must not hide the disable.
+        self.manager.rmdir()
+        result = self.run_hook('consumer-preun', ['0'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.events(), [['phase', 'consumer-preun-final'], DISABLE])
+        self.log.unlink()
+        result = self.run_hook('consumer-preun', ['0'], env={'QSH_TEST_SYSTEMCTL_STATUS': '7'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b'QSHD_UNIT_DISABLE_REFUSED', result.stderr)
 
     def test_fresh_provider_capsule_does_not_need_installed_phase_or_fallback(self):
         self.endpoint.unlink()

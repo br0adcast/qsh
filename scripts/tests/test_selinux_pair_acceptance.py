@@ -141,6 +141,12 @@ class AcceptanceTests(unittest.TestCase):
                                        executed=True, normal=True, script_sha256='c' * 64, phase_frames=[])],
                                  [('provider', 'A', 'preun', 'positive')])
 
+    def test_literal_erase_hooks_pin_reviewed_hook_bytes(self):
+        hooks = DRIVER.parents[2] / 'packaging/selinux/maintainer'
+        self.assertEqual(self.d.LITERAL_ERASE_HOOKS, {
+            (role, hook): hashlib.sha256((hooks / (role + '-' + hook)).read_bytes()).hexdigest()
+            for role in ('provider', 'consumer') for hook in ('preun', 'postun')})
+
     def test_old_incoming_roles_are_distinct(self):
         expected = [('provider', 'B', 'prein', 'two-or-more'), ('provider', 'A', 'preun', 'positive')]
         events = [dict(role=r, artifact=a, hook=h, count_class=c, executed=True, normal=True,
@@ -651,11 +657,11 @@ else:raise AssertionError('unreaped child')
 
 def load_tests(loader, tests, pattern):
     suite = loader.loadTestsFromTestCase(AcceptanceTests)
-    if suite.countTestCases() != 34:
+    if suite.countTestCases() != 35:
         raise AssertionError('required offline acceptance case count drift')
     return suite
 
 
 if __name__ == '__main__':
     result = unittest.main(exit=False).result
-    raise SystemExit(0 if result.wasSuccessful() and result.testsRun == 34 and not result.skipped else 1)
+    raise SystemExit(0 if result.wasSuccessful() and result.testsRun == 35 and not result.skipped else 1)
