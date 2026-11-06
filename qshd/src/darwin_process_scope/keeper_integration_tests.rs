@@ -1707,13 +1707,13 @@ pub(super) mod native {
                         ChannelKind::Command => {
                             super::terminal_eof_until_contract(eof_sample,end,super::TerminalEofContract::LiveApplication).await;
                             assert!(Instant::now()<end&&!observation.io.reader_drop_finished.load(Ordering::SeqCst));
-                            let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
+                            let snapshot=super::snapshot_available_until(|| observation.authority.snapshot(),end).await.expect("snapshot unavailable before original deadline");let app=snapshot.app.expect("real admitted A");assert!(matches!(NativeOps.classify(app).unwrap().class,Class::Session(_)));
                             assert!(snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
                         }
                         ChannelKind::Shell => {
                             // Normal Shell release follows real input/geometry/echo and live custody.
                             until(||{let output=events.output.lock().unwrap();output.windows(b"KEEPER_RESIZED".len()).any(|w|w==b"KEEPER_RESIZED")&&output.windows(b"keeper-input-proof".len()).any(|w|w==b"keeper-input-proof")},end).await;
-                            let snapshot=observation.authority.snapshot().unwrap();let app=snapshot.app.expect("real admitted A");assert_eq!(NativeOps.classify(app).unwrap().class,Class::Session(snapshot.sid));
+                            let snapshot=super::snapshot_available_until(|| observation.authority.snapshot(),end).await.expect("snapshot unavailable before original deadline");let app=snapshot.app.expect("real admitted A");assert_eq!(NativeOps.classify(app).unwrap().class,Class::Session(snapshot.sid));
                             assert!(!snapshot.custody_lost&&snapshot.app_status.is_none()&&snapshot.session_wait.is_none());
                             exclusive(&path.join("release"),nonce.as_bytes());
                             // Real EOF and positive process receipts may complete in either order.
@@ -1729,7 +1729,17 @@ pub(super) mod native {
                     until(||budget.used()==crate::screen_budget::Usage::default(),end).await;
                     client.send_bytes(CONTROL_STREAM,encode_client(&ClientRecord::Open(OpenRequest{stream:FIRST_CHANNEL_STREAM+1,kind:ChannelKind::Command,cols:80,rows:24,screen:false,command:b"/usr/bin/true".to_vec()}))).unwrap();
                     until(||events.records.lock().unwrap().iter().any(|r|matches!(r,ServerRecord::Exit{stream,code:0} if *stream==FIRST_CHANNEL_STREAM+1)),end).await;
-                    assert_eq!(f.count(),2);if kind==ChannelKind::Command{assert!(observation.authority.snapshot().unwrap().app_status.is_none());}
+                    assert_eq!(f.count(),2);if kind==ChannelKind::Command{
+                        let mut snapshot = Box::pin(async {
+                            assert!(super::snapshot_available_until(|| observation.authority.snapshot(),end).await.expect("snapshot unavailable before original deadline").app_status.is_none());
+                        });
+                        observation.authority.with_core_locked_for_fixture(|| {
+                            assert!(observation.authority.snapshot().is_none());
+                            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                            assert!(std::future::Future::poll(snapshot.as_mut(), &mut context).is_pending());
+                        });
+                        snapshot.await;
+                    }
                     let output=events.output.lock().unwrap().clone();let echoed=output.windows(b"keeper-input-proof".len()).any(|w|w==b"keeper-input-proof");assert_eq!(echoed,kind==ChannelKind::Shell);
                     assert!(output.windows(b"KEEPER_RESIZED".len()).any(|w|w==b"KEEPER_RESIZED"));
                     if kind==ChannelKind::Command{exclusive(&path.join("release"),nonce.as_bytes());}
