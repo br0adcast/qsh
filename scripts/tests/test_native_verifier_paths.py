@@ -519,7 +519,7 @@ elif name == 'python3':
         self.assertIn('  darwin-owner-intel:\n', native, 'Intel ownership needs its independent budget')
         job = native.split('  darwin-owner-intel:\n', 1)[1].split('\n  system-floors:', 1)[0]
         for required in ('name: Native Intel Darwin process owner', 'runs-on: macos-15-intel',
-                         'timeout-minutes: 35', 'NATIVE_TARGET: x86_64-apple-darwin',
+                         'timeout-minutes: 45', 'NATIVE_TARGET: x86_64-apple-darwin',
                          'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
                          'test "$checkout_sha" = "$GITHUB_SHA"',
                          '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
