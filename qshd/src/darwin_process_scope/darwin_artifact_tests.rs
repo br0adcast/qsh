@@ -874,7 +874,9 @@ mod native {
             isolated(&mut client, &client_home);
             unsafe {
                 client.pre_exec(|| {
-                    if nix::libc::setsid() < 0 || nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) < 0 {
+                    if nix::libc::setsid() < 0
+                        || nix::libc::ioctl(0, nix::libc::TIOCSCTTY.into(), 0) < 0
+                    {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
