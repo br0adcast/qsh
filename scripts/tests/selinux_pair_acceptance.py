@@ -423,7 +423,7 @@ RPM_ADMISSION_KEYS = frozenset(('schema', 'status', 'rpm_nevra', 'source_rpm', '
     'fedora_patchset_sha256', 'review_receipt_sha256', 'source_files', 'runtime'))
 LITERAL_ERASE_HOOKS = {
     ('provider', 'preun'): '3be75997766007143b6abf8d59fac42ce3d9238ffc7dab14a5eee4bf2d770205',
-    ('consumer', 'preun'): '09285f93b23aeaca099c30d51b4a3f2a888a6b60e07d4949fa7353e4a4416f55',
+    ('consumer', 'preun'): '86bcc4c12b2106edc672b559d26f52285fb0daf019769cda0c3598ccd4876634',
     ('provider', 'postun'): '1b9bf018c7dae525fbcec22eaf9e4045df65940536f70045124f20a239577dc7',
     ('consumer', 'postun'): '2033fc276f50c390bbbfadf241d8dd428c358183336904f106be7b7abf8661f7'}
 

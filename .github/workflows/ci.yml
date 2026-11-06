@@ -958,7 +958,7 @@ jobs:
               if isinstance(node, unittest.TestCase): return [node.id()]
               return [name for child in node for name in inventory(child)]
           ids = inventory(suite)
-          if len(ids) != 32 or len(set(ids)) != 32:
+          if len(ids) != 35 or len(set(ids)) != 35:
               raise SystemExit('packaging source test inventory drift')
           class Counted(unittest.TextTestResult):
               def __init__(self, *args):
@@ -971,8 +971,8 @@ jobs:
           expected = [(native, 'set QSH_RPM_TOOL for synthetic real RPM header control')]
           print('SOURCE_PACKAGING_ACCOUNTING ' + json.dumps(dict(discovered=ids, tests_run=result.testsRun,
               successful=result.success_ids, skipped=skipped), sort_keys=True))
-          accepted = (result.testsRun == 32 and result.wasSuccessful() and not result.unexpectedSuccesses
-              and skipped == expected and len(result.success_ids) == 31
+          accepted = (result.testsRun == 35 and result.wasSuccessful() and not result.unexpectedSuccesses
+              and skipped == expected and len(result.success_ids) == 34
               and set(result.success_ids) == set(ids) - {native})
           raise SystemExit(0 if accepted else 1)
           PY
