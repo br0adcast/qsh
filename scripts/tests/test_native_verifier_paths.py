@@ -589,7 +589,21 @@ elif name == 'python3':
     def test_four_native_targets_and_required_workflow_consumers_remain_wired(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         import re
-        self.assertEqual(re.findall(r'          - runner: (\S+)\n            target: (\S+)', native), list(self.TARGETS))
+        portable = native.split('  portable:\n', 1)[1].split('\n  darwin-owner-intel:', 1)[0]
+        diagnostic = native.split('  pty-eof-diagnostic:\n', 1)[1]
+        pairs = r'          - runner: (\S+)\n            target: (\S+)'
+        self.assertEqual(re.findall(pairs, portable), list(self.TARGETS))
+        self.assertEqual(re.findall(pairs, diagnostic), list(self.TARGETS[2:]))
+        selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        for job in ('portable', 'darwin-owner-intel', 'system-floors'):
+            beginning = native.split('  ' + job + ':\n', 1)[1].split('\n', 1)[0]
+            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") }}")
+        self.assertIn("    if: ${{ " + selection + " }}", diagnostic)
+        self.assertIn('options: [qualification, pty-eof-build, pty-eof-control]', native)
+        self.assertIn('ref: ${{ github.sha }}', diagnostic)
+        self.assertIn('scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"', diagnostic)
+        for forbidden in ('--include-ignored', 'native_tests::', 'keeper_tests::', 'keeper_integration_tests::', 'upload-artifact'):
+            self.assertNotIn(forbidden, diagnostic)
         self.assertEqual(native.count("      - 'cli/Cargo.toml'"), 2)
         helper = self.body('native-crypto.yml', 'portable', 'Qualify offline release authentication')
         self.assertIn('-p test_native_verifier_paths.py', helper)

@@ -569,6 +569,30 @@ pub(super) fn master_read_result(result: std::io::Result<usize>) -> std::io::Res
     }
 }
 struct MasterReader(File);
+/// Standalone controls use fresh private masters, never an integrated fixture.
+#[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
+#[allow(clippy::type_complexity)]
+pub(super) fn eof_control_io(
+    file: File,
+    normalized: bool,
+) -> std::io::Result<(
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Box<dyn transport::shell_server::ResizeHandle>,
+)> {
+    let master = Master::new(file);
+    let reader: Box<dyn Read + Send> = if normalized {
+        master.try_clone_reader().map_err(std::io::Error::other)?
+    } else {
+        Box::new(master.file.try_clone()?)
+    };
+    let writer = master.take_writer().map_err(std::io::Error::other)?;
+    Ok((
+        reader,
+        writer,
+        Box::new(crate::pty::PtyResizeHandle::new(Box::new(master))),
+    ))
+}
 impl Read for MasterReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         master_read_result(self.0.read(buffer))
@@ -939,7 +963,17 @@ pub(super) mod eof_diagnostics {
     }
     impl std::fmt::Display for Sample {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "producer_fields=individually_sampled read_phase={}({}) read_raw_os_error={:?} exit_poll_phase={}({}) leader_poll_phase={}({})", read_label(self.read), self.read, self.has_raw_error.then_some(self.raw_error), exit_label(self.exit), self.exit, leader_label(self.leader), self.leader)
+            write!(
+                f,
+                "producer_fields=individually_sampled read_phase={}({}) read_raw_os_error={:?} exit_poll_phase={}({}) leader_poll_phase={}({})",
+                read_label(self.read),
+                self.read,
+                self.has_raw_error.then_some(self.raw_error),
+                exit_label(self.exit),
+                self.exit,
+                leader_label(self.leader),
+                self.leader
+            )
         }
     }
     impl Producers {

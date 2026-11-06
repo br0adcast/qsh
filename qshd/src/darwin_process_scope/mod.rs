@@ -160,8 +160,12 @@ impl ObservedRuntime {
     fn receipt(&self) -> String {
         format!(
             "darwin223 public_source={} runtime_release={} os_build={} kernel_build={} machine={} native_arch={} premise=conditional",
-            self.family.public_source, self.release, self.build,
-            self.kernel_token, self.machine, self.native_arch,
+            self.family.public_source,
+            self.release,
+            self.build,
+            self.kernel_token,
+            self.machine,
+            self.native_arch,
         )
     }
 }
@@ -262,5 +266,7 @@ pub(crate) fn keeper_helper_entry(args: &[std::ffi::OsString]) -> Option<std::io
 
 #[cfg(test)]
 mod keeper_integration_tests;
+#[cfg(test)]
+mod keeper_pty_eof_tests;
 #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
 pub(crate) use keeper_pty::KeeperFixture;

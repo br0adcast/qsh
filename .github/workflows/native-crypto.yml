@@ -1,4 +1,5 @@
 name: Native crypto prerequisite
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-build' && format('PTY EOF build · {0} · {1}', github.ref_name, github.sha) || github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-control' && format('PTY EOF control · {0} · {1}', github.ref_name, github.sha) || '' }}
 
 on:
   pull_request:
@@ -65,6 +66,13 @@ on:
       - 'scripts/tests/test_rpm_tool.py'
       - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixed qualification or standalone PTY EOF diagnostic stage
+        type: choice
+        required: true
+        default: qualification
+        options: [qualification, pty-eof-build, pty-eof-control]
   workflow_call:
 
 permissions:
@@ -77,6 +85,7 @@ env:
 
 jobs:
   portable:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -247,6 +256,7 @@ jobs:
   # Ownership gets its own budget; measured crypto/product prerequisites used
   # almost 31 minutes of the shared 35-minute Intel job before owner compilation.
   darwin-owner-intel:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native Intel Darwin process owner
     runs-on: macos-15-intel
     timeout-minutes: 35
@@ -537,6 +547,7 @@ jobs:
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
 
   system-floors:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
     name: Native system floor (${{ matrix.format }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -600,3 +611,68 @@ jobs:
                 fi
               done
             '
+
+  dispatch-mode:
+    name: Validate manual mode
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Refuse unknown manual modes
+        env:
+          PTY_EOF_MODE: ${{ inputs.mode }}
+        run: |
+          python3 -I -B - <<'PY_MODE'
+          import os
+          if os.environ['PTY_EOF_MODE'] not in ('qualification', 'pty-eof-build', 'pty-eof-control'):
+              raise SystemExit('manual mode refused')
+          PY_MODE
+
+  pty-eof-diagnostic:
+    name: PTY EOF ${{ inputs.mode == 'pty-eof-build' && 'build' || 'control' }} (${{ matrix.target }})
+    needs: dispatch-mode
+    if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install native diagnostic prerequisites
+        run: brew install gnupg
+      - name: Qualify the pinned diagnostic backend
+        shell: bash
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion"
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion")
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Install qualified Rust for standalone controls
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add "$NATIVE_TARGET"
+          rustup component add clippy --toolchain "$RUSTUP_TOOLCHAIN"
+          scripts/check-qualified-rust.sh
+      - name: Build and qualify only the fixed standalone stage
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+          PTY_EOF_MODE: ${{ inputs.mode }}
+        run: |
+          python3 -I -B scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"
