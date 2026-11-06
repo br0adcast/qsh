@@ -728,6 +728,62 @@ elif name == 'python3':
         self.assertLess(owner.index('timed modern-runtime'), owner.index('timed keeper-runtime'))
         self.assertLess(owner.index('timed keeper-runtime'), owner.index('timed integrated-runtime'))
 
+    def test_reusable_native_qualification_defaults_for_release_dispatch(self):
+        # Source/interface simulation of Release's no-input manual caller, not
+        # a GitHub execution. Read the callee default rather than inventing one.
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        called = native.split('  workflow_call:\n', 1)[1].split('\npermissions:', 1)[0]
+        fields = dict(line.strip().split(': ', 1) for line in called.splitlines()
+                      if line.startswith('        ') and ': ' in line)
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('  workflow_dispatch:\n\nenv:', release)
+        caller = release.split('  native-crypto:\n', 1)[1].split('\n  linux:', 1)[0]
+        self.assertEqual(caller.strip(), 'uses: ./.github/workflows/native-crypto.yml')
+        validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
+        with self.fixture('x86_64-unknown-linux-musl') as (work, env):
+            env['PTY_EOF_MODE'] = fields.get('default', '')
+            result, calls, records = self.execute(validator, work, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue((work / 'completed').is_file())
+            self.assertEqual((calls, records), ([], []))
+        self.assertIn('    inputs:\n      mode:\n', called)
+        self.assertEqual(fields, {'type': 'string', 'required': 'false', 'default': 'qualification'})
+
+    def test_native_manual_mode_contract(self):
+        native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        direct = native.split('  workflow_dispatch:\n', 1)[1].split('  workflow_call:', 1)[0]
+        for declaration in ('type: choice', 'required: true', 'default: qualification',
+                            'options: [qualification, pty-eof-build, pty-eof-control]'):
+            self.assertIn(declaration, direct)
+        validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
+        for mode, accepted in (('qualification', True), ('pty-eof-build', True),
+                               ('pty-eof-control', True), ('', False), ('unknown', False)):
+            with self.subTest(mode=mode), self.fixture('x86_64-unknown-linux-musl') as (work, env):
+                env['PTY_EOF_MODE'] = mode
+                result, calls, records = self.execute(validator, work, env)
+                self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
+                self.assertEqual((work / 'completed').exists(), accepted)
+                self.assertEqual((calls, records), ([], []))
+        selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        for job in ('portable', 'darwin-owner-intel', 'system-floors', 'pty-eof-diagnostic'):
+            condition = native.split('  ' + job + ':\n', 1)[1].splitlines()
+            condition = next(line for line in condition if line.startswith('    if:'))
+            expected = selection if job == 'pty-eof-diagnostic' else '!(' + selection + ')'
+            self.assertEqual(condition, '    if: ${{ ' + expected + ' }}')
+        dispatch = native.split('  dispatch-mode:\n', 1)[1].split('  pty-eof-diagnostic:', 1)[0]
+        self.assertIn("    if: github.event_name == 'workflow_dispatch'\n", dispatch)
+        # Truth table for the exact literal predicate checked above, not an
+        # expression interpreter. Invalid manual modes still fail validation.
+        for event, mode, diagnostic in (('workflow_dispatch', 'qualification', False),
+                                       ('workflow_dispatch', 'pty-eof-build', True),
+                                       ('workflow_dispatch', 'pty-eof-control', True),
+                                       ('pull_request', '', False), ('push', '', False),
+                                       ('pull_request', 'pty-eof-build', False)):
+            with self.subTest(event=event, mode=mode):
+                selected = event == 'workflow_dispatch' and mode in ('pty-eof-build', 'pty-eof-control')
+                self.assertEqual(selected, diagnostic)
+                self.assertEqual(not selected, not diagnostic)
+
     def test_four_native_targets_and_required_workflow_consumers_remain_wired(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         import re
