@@ -447,6 +447,160 @@ def _receipt_file(path):
     finally:os.close(fd)
 
 
+# The runner is trusted source instrumentation; these checks do not authenticate
+# arbitrary JSON, provide containment after runner loss, or qualify older macOS.
+FIXED_TESTS={
+    'failure':'darwin_process_scope::darwin_artifact_tests::native::darwin185_archive_failure_after_registration',
+    'positive':'darwin_process_scope::darwin_artifact_tests::native::darwin185_archive_authenticated_pair',
+}
+
+
+def _native_host():
+    import ctypes
+    import platform
+    import sys
+    if sys.platform!='darwin':fail('HOST')
+    library=ctypes.CDLL(None,use_errno=True)
+    def sysctl(name):
+        size=ctypes.c_size_t(256);data=ctypes.create_string_buffer(256)
+        if library.sysctlbyname(name.encode(),data,ctypes.byref(size),None,0)!=0:fail('HOST')
+        return data.raw[:size.value].rstrip(b'\0').decode('ascii')
+    # ENOENT is normal on native Intel; every other unknown error refuses.
+    translated=ctypes.c_int();size=ctypes.c_size_t(ctypes.sizeof(translated))
+    code=library.sysctlbyname(b'sysctl.proc_translated',ctypes.byref(translated),ctypes.byref(size),None,0)
+    import errno
+    if code and ctypes.get_errno()!=errno.ENOENT:fail('HOST')
+    if not code and translated.value not in (0,1):fail('HOST')
+    return dict(arch=platform.machine(),execution='translated' if not code and translated.value else 'native',
+                os_version=sysctl('kern.osproductversion'))
+
+
+def select_harness(messages,root,target):
+    """Select one fresh default-feature lib-test compiler artifact, never a bin."""
+    root=Path(root)
+    if not root.is_absolute() or root.resolve()!=root or root.name!='deps' or root.parent.name!='debug' or root.parent.parent.name!=target:fail('HARNESS')
+    fd,snapshot=_open_input(messages,8*1024**2)
+    try:
+        with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read(8*1024**2+1)
+        _recheck(messages,fd,snapshot)
+    finally:os.close(fd)
+    selected=[]
+    for line in raw.splitlines():
+        if len(line)>1024**2:fail('HARNESS')
+        value=_json(line,1024**2)
+        if type(value) is not dict:fail('HARNESS')
+        if value.get('reason')!='compiler-artifact' or not value.get('executable'):continue
+        target_record=value.get('target',{});profile=value.get('profile',{})
+        if type(target_record) is not dict or type(profile) is not dict:fail('HARNESS')
+        if target_record.get('name')!='qshd' or target_record.get('kind')!=['lib'] or profile.get('test') is not True:continue
+        if value.get('fresh') is not False or value.get('features')!=[]:fail('HARNESS')
+        if type(value['executable']) is not str or type(value.get('manifest_path')) is not str:fail('HARNESS')
+        path=Path(value['executable'])
+        if path.parent!=root or not path.name.startswith('qshd-') or path.resolve()!=path:fail('HARNESS')
+        manifest=Path(value.get('manifest_path',''))
+        if manifest!=Path(__file__).resolve().parents[1]/'qshd/Cargo.toml':fail('HARNESS')
+        selected.append(path)
+    if len(selected)!=1:fail('HARNESS')
+    return selected[0]
+
+
+def _executable(path):
+    path=Path(path)
+    if not path.is_absolute() or path.resolve()!=path:fail('EXECUTABLE')
+    fd,snapshot=_open_input(path,EXECUTABLE_LIMIT)
+    try:
+        if snapshot[3]!=1 or snapshot[4]!=os.geteuid() or not snapshot[2]&0o100 or snapshot[2]&0o022:fail('EXECUTABLE')
+        return fd,snapshot,_hash_fd(fd,EXECUTABLE_LIMIT)
+    except BaseException:os.close(fd);raise
+
+
+def _failure_result(raw,prepared_sha):
+    _keys(raw,('schema','kind','prepared_sha256','bound','actor_exit','daemon_exit','waited','io_joined','rescue','unresolved'))
+    if (raw['schema']!=1 or type(raw['schema']) is not int or raw['kind']!='darwin-archive-controlled-failure'
+            or raw['prepared_sha256']!=prepared_sha or any(raw[k] is not True for k in ('bound','actor_exit','waited','io_joined'))
+            or raw['rescue'] is not False or type(raw['daemon_exit']) is not int or raw['daemon_exit']!=0
+            or type(raw['unresolved']) is not int or raw['unresolved']!=0):fail('FAILURE_CUSTODY')
+    return raw
+
+
+def _invoke_fixed(harness,request,mode):
+    import subprocess
+    import time
+    # No generic timeout kill: the fixed harness owns the cancellation/settlement
+    # protocol. An unresponsive runner retains fixtures and fails the job.
+    directory=Path(request['directory'])/mode;directory.mkdir(mode=0o700)
+    request=dict(request,directory=str(directory))
+    request_file=directory/'request.json';request_file.write_bytes(canonical(request));request_file.chmod(0o600)
+    env=os.environ.copy()
+    env.update(HOME=str(directory),XDG_CACHE_HOME=str(directory/'cache'),XDG_CONFIG_HOME=str(directory/'config'),
+               HISTFILE='/dev/null',QSH_DARWIN185_REQUEST=str(request_file))
+    for key in ('SSH_AUTH_SOCK','SSH_AGENT_PID'):env.pop(key,None)
+    # Capture to private bounded files in the harness; libtest's bounded summary
+    # goes to a private regular file and never enters workflow stdout.
+    with (directory/'harness.log').open('xb') as log:
+        child=subprocess.Popen([str(harness),'--exact',FIXED_TESTS[mode],'--ignored','--test-threads=1'],
+                               env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log)
+        failure=None
+        try:
+            end=time.monotonic()+60
+            while child.poll() is None:
+                if time.monotonic()>=end:fail('DEADLINE')
+                if os.fstat(log.fileno()).st_size>65536:fail('HARNESS_OUTPUT')
+                time.sleep(.02)
+            status=child.wait()
+            if os.fstat(log.fileno()).st_size>65536:fail('HARNESS_OUTPUT')
+            if status!=0:fail('HARNESS_FAILED')
+        except BaseException as error:
+            failure=error
+            # Every post-spawn refusal follows the same owned cancellation path.
+            # No signal/timeout kill can erase a descendant obligation.
+            try:(directory/'cancel').touch(mode=0o600,exist_ok=True)
+            except OSError:pass
+            end=time.monotonic()+20
+            while child.poll() is None and time.monotonic()<end:time.sleep(.02)
+            if child.poll() is None:fail('UNSETTLED_HARNESS')
+            child.wait()
+        if failure is not None:raise failure
+    return _json(_receipt_file(directory/'result.json'),RECEIPT_LIMIT)
+
+
+def run_archive(archive,metadata,version,target,destination,harness,*,source_commit):
+    """Fixed failure then positive observation, surrounded by file bindings."""
+    _selection(version,target);host=_native_host()
+    if host.get('arch')!=DARWIN_TARGETS[target] or host.get('execution')!='native' or host.get('os_version','').split('.')[0]!='15':fail('HOST')
+    destination=Path(destination)
+    if not destination.is_absolute() or destination.resolve()!=destination:fail('DESTINATION')
+    destination.mkdir(mode=0o700)
+    if stat.S_IMODE(destination.stat().st_mode)!=0o700:fail('DESTINATION')
+    held=[]
+    try:
+        for path,limit in ((Path(archive),ARCHIVE_LIMIT),(Path(metadata),METADATA_LIMIT)):
+            fd,snapshot=_open_input(path,limit);held.append((path,fd,snapshot,_hash_fd(fd,limit)))
+        prepared=prepare(archive,metadata,version,target,destination/'pair',source_commit=source_commit)
+        prepared_raw=canonical(prepared)
+        for name in PROGRAMS:
+            path=destination/'pair'/name;fd,snapshot,sha=_executable(path);held.append((path,fd,snapshot,sha))
+            if sha!=prepared['binaries'][name]['sha256']:fail('STAGING_DRIFT')
+        harness=Path(harness);fd,snapshot,sha=_executable(harness);held.append((harness,fd,snapshot,sha))
+        request=dict(schema=1,prepared=prepared,prepared_sha256=digest(prepared_raw),source_commit=source_commit,
+                     harness_sha256=sha,client=str(destination/'pair'/'qsh'),daemon=str(destination/'pair'/'qshd'),directory=str(destination))
+        def recheck():
+            for path,fd,snapshot,sha in held:
+                _recheck(path,fd,snapshot)
+                if _hash_fd(fd)!=sha:fail('INPUT_DRIFT')
+        recheck();negative=_failure_result(_invoke_fixed(harness,request,'failure'),request['prepared_sha256']);recheck()
+        native=_invoke_fixed(harness,request,'positive');verify_result(prepared_raw,canonical(native));recheck()
+        # Public closed evidence excludes the private prepared nonce and paths.
+        public_native={key:value for key,value in native.items() if key!='request_id'}
+        public_native['kind']='darwin-archive-observation'
+        public_native['receipt_sha256']=digest(canonical(native))
+        return dict(native=public_native,controlled_failure=negative,
+                    harness=dict(schema=1,kind='darwin-archive-harness',source_commit=source_commit,
+                                 target=target,sha256=sha,features=[],profile='test'))
+    finally:
+        for _,fd,_,_ in reversed(held):os.close(fd)
+
+
 def main(argv=None):
     import argparse
     import sys
@@ -458,9 +612,19 @@ def main(argv=None):
         for name in ('archive','metadata','version','target','destination','source-commit'):stage.add_argument('--'+name,required=True)
         verify=commands.add_parser('verify-result')
         verify.add_argument('--prepared',required=True);verify.add_argument('--native',required=True)
+        run=commands.add_parser('run-archive')
+        for name in ('archive','metadata','version','target','destination','source-commit','cargo-messages','harness-root','evidence'):
+            run.add_argument('--'+name,required=True)
         args=parser.parse_args(argv)
         if args.command=='prepare':
             result=prepare(args.archive,args.metadata,args.version,args.target,args.destination,source_commit=args.source_commit)
+        elif args.command=='run-archive':
+            harness=select_harness(args.cargo_messages,Path(args.harness_root),args.target)
+            result=run_archive(args.archive,args.metadata,args.version,args.target,args.destination,harness,source_commit=args.source_commit)
+            evidence=Path(args.evidence)
+            for key,value in result.items():
+                with (evidence/(args.target+'-'+key+'.json')).open('xb') as output:output.write(canonical(value))
+            return 0
         else:result=verify_result(_receipt_file(args.prepared),_receipt_file(args.native))
         sys.stdout.buffer.write(canonical(result));sys.stdout.buffer.flush()
         return 0

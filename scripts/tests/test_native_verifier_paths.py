@@ -486,10 +486,11 @@ elif name == 'python3':
                 result, calls, _ = self.execute(self.body('release.yml', 'linux', self.LINUX), work, env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.environment(calls, env, [target], linux=True)
-        with self.fixture(self.DARWIN[0]) as (work, env):
-            result, calls, _ = self.execute(self.body('release.yml', 'macos', 'Build both architectures'), work, env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.environment(calls, env, self.DARWIN, linux=False)
+        for target in self.DARWIN:
+            with self.fixture(target) as (work, env):
+                result, calls, _ = self.execute(self.body('release.yml', 'macos', 'Build the native pair'), work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.environment(calls, env, [target], linux=False)
 
     def test_release_poststrip_path_refusal_precedes_packaging(self):
         for _, target in self.TARGETS[:2]:
@@ -501,18 +502,51 @@ elif name == 'python3':
                 self.assertTrue((work / 'completed').exists())
             self.refusal(body, target)
         body = self.body('release.yml', 'macos', 'Strip')
-        with self.fixture(self.DARWIN[0], explicit_cargo=False) as (work, env):
-            for target in self.DARWIN:
+        for target in self.DARWIN:
+            with self.fixture(target, explicit_cargo=False) as (work, env):
                 for role in ('qsh', 'qshd'):
                     path = work / 'target' / target / 'release' / role
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(b'inert-unstripped')
-            result, calls, records = self.execute(body, work, env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.products(calls, records, work, env, self.DARWIN, 'release-product-path-qualification')
-            self.assertTrue((work / 'completed').exists())
+                result, calls, records = self.execute(body, work, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.products(calls, records, work, env, [target], 'release-product-path-qualification')
+                self.assertTrue((work / 'completed').exists())
+            self.refusal(body, target, prepopulate=[target])
+
+    def test_darwin_archive_gate_runs_fixed_native_target_and_failure_blocks_upload(self):
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        job = release.split('  macos:\n',1)[1].split('  server-packages:\n',1)[0]
+        self.assertIn('needs: [native-crypto]',job)
+        for runner,target in self.TARGETS[2:]:
+            self.assertIn('runner: '+runner+'\n            target: '+target,job)
+        smoke=self.body('release.yml','macos','Authenticate the exact extracted native archive')
+        self.assertLess(job.index('- name: Package'),job.index('- name: Authenticate the exact'))
+        self.assertLess(job.index('- name: Authenticate the exact'),job.index('name: macos-${{ matrix.target }}'))
+        self.assertNotIn('continue-on-error',job);self.assertNotIn('if: always()',job);self.assertNotIn('|| true',smoke)
+        self.assertNotIn('--features',smoke);self.assertNotIn('--release',smoke)
+        self.assertIn('--no-run',smoke);self.assertIn('--message-format=json',smoke)
         for target in self.DARWIN:
-            self.refusal(body, target, prepopulate=self.DARWIN)
+            for status in (0,17):
+                with self.subTest(target=target,status=status),self.fixture(target) as (work,env):
+                    # Execute the literal shell with an inert fixed driver. Its
+                    # nonzero result must prevent the next upload-step marker.
+                    driver=work/'scripts/darwin-artifact-smoke.py'
+                    driver.write_text('import os,sys\nfrom pathlib import Path\n'
+                        'Path(os.environ["FIXTURE_DRIVER_ARGS"]).write_text("\\n".join(sys.argv[1:]))\n'
+                        'raise SystemExit(int(os.environ["FIXTURE_DRIVER_STATUS"]))\n')
+                    env.update(RELEASE_VERSION='0.5.0',GITHUB_SHA='a'*40,
+                               FIXTURE_DRIVER_ARGS=str(work/'driver-args'),FIXTURE_DRIVER_STATUS=str(status))
+                    # Use fixture-owned tmp storage; no product is executed.
+                    body=smoke.replace('/tmp/qsh185.XXXXXXXX',str(work/'qsh185.XXXXXXXX'))
+                    result,_,_=self.execute(body,work,env)
+                    self.assertEqual(result.returncode,status,result.stderr)
+                    args=(work/'driver-args').read_text().splitlines()
+                    self.assertEqual(args[0],'run-archive')
+                    self.assertEqual(args[args.index('--target')+1],target)
+                    self.assertEqual(args[args.index('--source-commit')+1],'a'*40)
+                    self.assertEqual(args[args.index('--archive')+1],'dist/qsh-0.5.0-'+target+'.tar.gz')
+                    self.assertEqual((work/'completed').exists(),status==0)
 
     def test_intel_owner_has_independent_budget_and_required_setup(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
@@ -814,7 +848,7 @@ elif name == 'python3':
         linux = release.split('  linux:\n', 1)[1].split('  macos:\n', 1)[0]
         macos = release.split('  macos:\n', 1)[1].split('  server-packages:\n', 1)[0]
         self.assertLess(linux.index('- name: ' + self.LINUX), linux.index('- name: Package'))
-        self.assertLess(macos.index('- name: Build both architectures'), macos.index('- name: Strip'))
+        self.assertLess(macos.index('- name: Build the native pair'), macos.index('- name: Strip'))
         self.assertLess(macos.index('- name: Strip'), macos.index('- name: Package'))
 
 

@@ -12,6 +12,8 @@ import unittest
 from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
+DARWIN_TARGETS=('aarch64-apple-darwin','x86_64-apple-darwin')
+ARM_PRODUCER='macos-aarch64-apple-darwin'
 PEER_NAMES=('identity.txt','passed.txt','current_qsh_pastes_a_megabyte_into_current_daemon.log',
     'protocol2_client_cannot_allocate_a_connection_on_published_v050.log',
     'protocol2_client_cannot_mutate_published_v050_daemon.log',
@@ -24,7 +26,8 @@ def names(version='0.5.0',deb='0.5.0-1'):
     result={}
     for target,deb_arch,rpm_arch in [('x86_64-unknown-linux-musl','amd64','x86_64'),('aarch64-unknown-linux-musl','arm64','aarch64')]:
         result['linux-'+target]=(f'qsh-{version}-{target}.tar.gz',f'qsh_{deb}_{deb_arch}.deb',f'qsh-{version}-1.{rpm_arch}.rpm')
-    result['macos']=tuple(f'qsh-{version}-{target}.tar.gz' for target in ('aarch64-apple-darwin','x86_64-apple-darwin'))
+    for target in DARWIN_TARGETS:
+        result['macos-'+target]=(f'qsh-{version}-{target}.tar.gz',)
     result['server-packages']=tuple(f'qshd_{deb}_{a}.deb' for a in ('amd64','arm64'))+tuple(f'qshd-{version}-1.{a}.rpm' for a in ('x86_64','aarch64'))
     return result
 
@@ -41,7 +44,7 @@ class Layout(unittest.TestCase):
                 (directory/name).write_bytes(data);self.expected[name]=data
         peer=self.artifacts/'released-peer-evidence';peer.mkdir()
         for name in PEER_NAMES:(peer/name).write_bytes(b'PUBLIC SYNTHETIC EVIDENCE; NOT A PRODUCT\n')
-        for directory in ('darwin-producer-evidence','native-evidence','future-evidence'):
+        for directory in (*('darwin-producer-evidence-'+target for target in DARWIN_TARGETS),'native-evidence','future-evidence'):
             path=self.artifacts/directory;path.mkdir();(path/'evidence.json').write_text('{}')
         (self.artifacts/'future-evidence'/next(iter(self.expected))).write_bytes(b'WRONG COLLISION')
         self.dest=self.root/'dist'
@@ -80,7 +83,7 @@ class WorkflowTests(Layout):
 
     def test_actual_workflow_shell_propagates_invalid_version_and_missing_input(self):
         result=self.shell('not-a-version');self.assertNotEqual(result.returncode,0);self.assertFalse(self.dest.exists())
-        (self.artifacts/'macos'/names()['macos'][0]).unlink()
+        (self.artifacts/ARM_PRODUCER/names()[ARM_PRODUCER][0]).unlink()
         result=self.shell();self.assertNotEqual(result.returncode,0);self.assertFalse(self.dest.exists())
 
 
@@ -114,24 +117,48 @@ class AssemblerTests(Layout):
             hidden.rename(path)
 
     def test_extra_nested_wrong_version_arch_and_duplicate_placement_refuse(self):
-        producer=self.artifacts/'macos'
+        producer=self.artifacts/ARM_PRODUCER
         for extra,directory in [('qsh-0.4.0-aarch64-apple-darwin.tar.gz',False),('qsh-0.5.0-wrong.tar.gz',False),('nested',True),(names()['server-packages'][0],False)]:
             path=producer/extra
-            if directory:path.mkdir();(path/names()['macos'][0]).write_bytes(b'nested')
+            if directory:path.mkdir();(path/names()[ARM_PRODUCER][0]).write_bytes(b'nested')
             else:path.write_bytes(b'extra')
             with self.subTest(extra=extra):self.refuse()
             if directory:shutil.rmtree(path)
             else:path.unlink()
 
+    def test_combined_legacy_macos_cannot_replace_native_producers(self):
+        combined=self.artifacts/'macos';combined.mkdir()
+        for target in DARWIN_TARGETS:
+            producer='macos-'+target
+            for name in names()[producer]:
+                shutil.copyfile(self.artifacts/producer/name,combined/name)
+            shutil.rmtree(self.artifacts/producer)
+        self.refuse()
+
+    def test_each_native_producer_rejects_other_target_and_symlink_payload(self):
+        for target in DARWIN_TARGETS:
+            producer=self.artifacts/('macos-'+target)
+            name=names()['macos-'+target][0]
+            other=next(value for value in DARWIN_TARGETS if value!=target)
+            extra=producer/names()['macos-'+other][0]
+            extra.write_bytes(b'PUBLIC SYNTHETIC WRONG TARGET')
+            with self.subTest(target=target,kind='other-target'):self.refuse()
+            extra.unlink()
+            leaf=producer/name;data=leaf.read_bytes();leaf.unlink()
+            held=self.root/'held-payload';held.write_bytes(data);leaf.symlink_to(held)
+            with self.subTest(target=target,kind='symlink'):self.refuse()
+            self.assertEqual(held.read_bytes(),data)
+            leaf.unlink();leaf.write_bytes(data);held.unlink()
+
     def test_symlink_root_producer_and_file_refuse_without_touching_targets(self):
-        path=self.artifacts/'macos';hidden=self.root/'original';path.rename(hidden);path.symlink_to(hidden,target_is_directory=True);self.refuse();path.unlink();hidden.rename(path)
-        leaf=path/names()['macos'][0];data=leaf.read_bytes();leaf.unlink();target=self.root/'target';target.write_bytes(data);leaf.symlink_to(target);self.refuse();self.assertEqual(target.read_bytes(),data)
+        path=self.artifacts/ARM_PRODUCER;hidden=self.root/'original';path.rename(hidden);path.symlink_to(hidden,target_is_directory=True);self.refuse();path.unlink();hidden.rename(path)
+        leaf=path/names()[ARM_PRODUCER][0];data=leaf.read_bytes();leaf.unlink();target=self.root/'target';target.write_bytes(data);leaf.symlink_to(target);self.refuse();self.assertEqual(target.read_bytes(),data)
         alias=self.root/'alias';alias.symlink_to(self.artifacts,target_is_directory=True)
         with self.assertRaises(self.module.AssemblyError):self.module.assemble(alias,'0.5.0',self.dest)
 
     @unittest.skipUnless(hasattr(os,'mkfifo'),'Unix FIFO fixture')
     def test_fifo_and_directory_input_refuse_without_blocking(self):
-        path=self.artifacts/'macos'/names()['macos'][0];path.unlink();os.mkfifo(path)
+        path=self.artifacts/ARM_PRODUCER/names()[ARM_PRODUCER][0];path.unlink();os.mkfifo(path)
         result=subprocess.run([sys.executable,'-B',str(ROOT/'scripts/assemble-release-assets.py'),'--artifacts',str(self.artifacts),'--version','0.5.0','--output',str(self.dest)],capture_output=True,timeout=2)
         self.assertNotEqual(result.returncode,0);self.assertFalse(self.dest.exists())
         path.unlink();path.mkdir();self.refuse()
@@ -140,7 +167,7 @@ class AssemblerTests(Layout):
         self.dest.mkdir();sentinel=self.dest/'keep';sentinel.write_bytes(b'preserve')
         with self.assertRaises(self.module.AssemblyError):self.assemble()
         self.assertEqual(sentinel.read_bytes(),b'preserve');shutil.rmtree(self.dest)
-        for path in (self.artifacts/'dist',self.artifacts/'macos'/'dist',self.artifacts):
+        for path in (self.artifacts/'dist',self.artifacts/ARM_PRODUCER/'dist',self.artifacts):
             with self.subTest(output=path),self.assertRaises(self.module.AssemblyError):self.module.assemble(self.artifacts,'0.5.0',path)
         alias=self.root/'input-alias';alias.symlink_to(self.artifacts,target_is_directory=True)
         with self.assertRaises(self.module.AssemblyError):self.module.assemble(self.artifacts,'0.5.0',alias/'dist')

@@ -476,4 +476,135 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):adapter.verify_result(encoded(prepared),encoded(changed))
 
 
+class RuntimeDriverTests(unittest.TestCase):
+    """Producer-coupled controls use inert executables and a fixed fake runner."""
+    setUp=PrepareTests.setUp
+    adapter=PrepareTests.adapter
+    archive_bytes=PrepareTests.archive_bytes
+
+    def setup_run(self):
+        self.archive.write_bytes(self.archive_bytes())
+        self.harness=self.root/'harness';self.harness.write_bytes(b'inert harness');self.harness.chmod(0o700)
+        return self.adapter()
+
+    def test_output_limit_requests_owned_cancellation_and_waits_before_refusing(self):
+        import subprocess
+        adapter=self.setup_run();owned=[]
+        script="""#!/usr/bin/python3
+import os,time
+from pathlib import Path
+root=Path(os.environ['QSH_DARWIN185_REQUEST']).parent
+print('x'*70000,flush=True)
+end=time.monotonic()+2
+while time.monotonic()<end:
+    if (root/'cancel').exists():
+        (root/'settled').touch();break
+    time.sleep(.005)
+"""
+        self.harness.write_text(script)
+        original=subprocess.Popen
+        def spawn(*args,**kwargs):
+            child=original(*args,**kwargs);owned.append(child);return child
+        try:
+            with patch.object(subprocess,'Popen',side_effect=spawn),self.assertRaises(ValueError):
+                adapter._invoke_fixed(self.harness,dict(directory=str(self.root)),'failure')
+            self.assertTrue((self.root/'failure'/'settled').is_file())
+            self.assertIsNotNone(owned[0].returncode)
+        finally:
+            for child in owned:child.wait(timeout=3)
+
+    def test_success_projection_excludes_private_binding_but_retains_receipt_hash(self):
+        adapter=self.setup_run();raw_native=[]
+        def invoke(harness,request,mode):
+            if mode=='failure':
+                return dict(schema=1,kind='darwin-archive-controlled-failure',prepared_sha256=request['prepared_sha256'],
+                            bound=True,actor_exit=True,daemon_exit=0,waited=True,io_joined=True,rescue=False,unresolved=0)
+            native=native_fixture(request['prepared']);raw_native.append(native);return native
+        with patch.object(adapter,'_native_host',return_value=dict(arch='arm64',execution='native',os_version='15.0')), \
+                patch.object(adapter,'_invoke_fixed',side_effect=invoke):
+            result=adapter.run_archive(self.archive,self.meta,VERSION,TARGET,self.root/'run',self.harness,source_commit='a'*40)
+        self.assertNotIn('request_id',result['native'])
+        self.assertEqual(result['native']['receipt_sha256'],digest(adapter.canonical(raw_native[0])))
+        self.assertNotIn(str(self.root).encode(),adapter.canonical(result))
+        private=raw_native[0]['request_id']
+        self.assertNotIn(private.encode(),adapter.canonical(result))
+
+    def test_source_symlink_or_pair_drift_prevents_execution_or_positive_transition(self):
+        for mutation in ('source','symlink','pair'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                adapter=self.setup_run();calls=[]
+                harness=self.harness
+                if mutation=='symlink':
+                    harness=self.root/'link';harness.symlink_to(self.harness)
+                def invoke(harness,request,mode):
+                    calls.append(mode);Path(request['client']).write_bytes(b'changed extracted payload')
+                    return dict(schema=1,kind='darwin-archive-controlled-failure',prepared_sha256=request['prepared_sha256'],
+                                bound=True,actor_exit=True,daemon_exit=0,waited=True,io_joined=True,rescue=False,unresolved=0)
+                with patch.object(adapter,'_native_host',return_value=dict(arch='arm64',execution='native',os_version='15.0')), \
+                        patch.object(adapter,'_invoke_fixed',side_effect=invoke),self.assertRaises(ValueError):
+                    adapter.run_archive(self.archive,self.meta,VERSION,TARGET,self.root/('run-'+mutation),harness,
+                                        source_commit='b'*40 if mutation=='source' else 'a'*40)
+                self.assertEqual(calls,['failure'] if mutation=='pair' else [])
+
+    def test_cargo_selection_refuses_stale_ambiguous_features_and_nonobject_records(self):
+        adapter=self.setup_run();root=self.root/TARGET/'debug'/'deps';root.mkdir(parents=True)
+        selected=root/'qshd-inert'
+        record=dict(reason='compiler-artifact',executable=str(selected),target=dict(name='qshd',kind=['lib']),
+                    profile=dict(test=True),fresh=False,features=[],manifest_path=str(ROOT/'qshd/Cargo.toml'))
+        messages=self.root/'cargo.json'
+        messages.write_bytes(adapter.canonical(record));self.assertEqual(adapter.select_harness(messages,root,TARGET),selected)
+        for records in ([dict(record,fresh=True)],[record,record],[dict(record,features=['test-darwin-keeper'])], [dict(record,executable=True)], [dict(record,manifest_path=3)], [[]]):
+            messages.write_bytes(b''.join(adapter.canonical(item) for item in records))
+            with self.subTest(records=records),self.assertRaises(ValueError):adapter.select_harness(messages,root,TARGET)
+
+    def test_linux_helper_keeps_darwin_refusal_before_any_version_process(self):
+        spec=importlib.util.spec_from_file_location('linux_smoke_guard',ROOT/'scripts/client-artifact-smoke.py')
+        helper=importlib.util.module_from_spec(spec);spec.loader.exec_module(helper)
+        with patch.object(helper.sys,'platform','darwin'),patch.object(helper,'version_check') as version, \
+                self.assertRaises(helper.SmokeError):
+            helper.smoke('/inert/qsh','/inert/qshd',VERSION)
+        version.assert_not_called()
+
+    def test_runtime_refuses_host_before_any_executor(self):
+        adapter=self.setup_run()
+        for host in (dict(arch='x86_64',execution='native',os_version='15.0'),
+                     dict(arch='arm64',execution='translated',os_version='15.0'),
+                     dict(arch='arm64',execution='native',os_version='14.0')):
+            with self.subTest(host=host),patch.object(adapter,'_native_host',return_value=host), \
+                    patch.object(adapter,'_invoke_fixed') as invoke,self.assertRaises(ValueError):
+                adapter.run_archive(self.archive,self.meta,VERSION,TARGET,self.root/'run',
+                                    self.harness,source_commit='a'*40)
+            invoke.assert_not_called()
+
+    def test_fixed_failure_must_settle_before_positive_and_archive_is_rechecked(self):
+        adapter=self.setup_run();calls=[]
+        def invoke(harness,request,mode):
+            calls.append(mode)
+            self.assertEqual(request['client'],str(self.root/'run'/'pair'/'qsh'))
+            self.assertEqual(request['daemon'],str(self.root/'run'/'pair'/'qshd'))
+            self.assertEqual(request['harness_sha256'],digest(b'inert harness'))
+            if mode=='failure':
+                return dict(schema=1,kind='darwin-archive-controlled-failure',
+                            prepared_sha256=request['prepared_sha256'],bound=True,actor_exit=True,
+                            daemon_exit=0,waited=True,io_joined=True,rescue=False,unresolved=0)
+            self.archive.write_bytes(b'drift after synthetic observation')
+            return native_fixture(request['prepared'])
+        with patch.object(adapter,'_native_host',return_value=dict(arch='arm64',execution='native',os_version='15.0')), \
+                patch.object(adapter,'_invoke_fixed',side_effect=invoke),self.assertRaises(ValueError):
+            adapter.run_archive(self.archive,self.meta,VERSION,TARGET,self.root/'run',self.harness,source_commit='a'*40)
+        self.assertEqual(calls,['failure','positive'])
+
+    def test_incomplete_controlled_failure_never_starts_positive(self):
+        adapter=self.setup_run();calls=[]
+        def invoke(harness,request,mode):
+            calls.append(mode)
+            return dict(schema=1,kind='darwin-archive-controlled-failure',
+                        prepared_sha256=request['prepared_sha256'],bound=True,actor_exit=True,
+                        daemon_exit=0,waited=True,io_joined=False,rescue=False,unresolved=0)
+        with patch.object(adapter,'_native_host',return_value=dict(arch='arm64',execution='native',os_version='15.0')), \
+                patch.object(adapter,'_invoke_fixed',side_effect=invoke),self.assertRaises(ValueError):
+            adapter.run_archive(self.archive,self.meta,VERSION,TARGET,self.root/'run',self.harness,source_commit='a'*40)
+        self.assertEqual(calls,['failure'])
+
+
 if __name__=='__main__':unittest.main()
