@@ -372,11 +372,56 @@ class DarwinMetadataTests(unittest.TestCase):
             with self.subTest(key=key),mock.patch.dict(os.environ,bad,clear=True),mock.patch.object(output.subprocess,'Popen') as spawn,self.assertRaises(ValueError):output._metadata_rustc()
             spawn.assert_not_called()
 
+    def test_completed_metadata_refusals_keep_only_status_and_stderr_presence(self):
+        # Synthetic canaries exercise hostile output, not real credentials.
+        stdout=b'/synthetic/private/stdout-canary\n'
+        stderr=b'/synthetic/private/stderr-canary\nTOKEN=synthetic-only\n'
+        for status,err,want in ((7,b'','status=7 stderr_present=false'),
+                                (7,stderr,'status=7 stderr_present=true'),
+                                (0,stderr,'status=0 stderr_present=true')):
+            program=self.helper.executable('private-tool-canary',
+                'import os\nos.write(1,'+repr(stdout)+')\nos.write(2,'+repr(err)+')\nraise SystemExit('+str(status)+')\n')
+            children=[];native=subprocess.Popen
+            def spawn(*args,**kwargs):
+                child=native(*args,**kwargs);children.append(child);return child
+            public_out=io.StringIO();public_err=io.StringIO()
+            with self.subTest(status=status,stderr_present=bool(err)):
+                with mock.patch.object(output.subprocess,'Popen',side_effect=spawn), \
+                        mock.patch.object(output.sys,'stdout',public_out), \
+                        mock.patch.object(output.sys,'stderr',public_err), \
+                        self.assertRaises(ValueError) as error:
+                    output.metadata_command([str(program)],category='rust-toolchain')
+                self.assertEqual(str(error.exception),'Darwin metadata rust-toolchain: tool refused '+want)
+                self.assertEqual(public_out.getvalue(),'');self.assertEqual(public_err.getvalue(),'')
+                for canary in (stdout.decode(),stderr.decode(),str(program)):
+                    self.assertNotIn(canary,str(error.exception)+repr(error.exception))
+                self.assertEqual(len(children),1)
+                self.assertIsNotNone(children[0].returncode)
+                with self.assertRaises(ChildProcessError):os.waitpid(children[0].pid,os.WNOHANG)
+        program=self.helper.executable('success-tool','import os\nos.write(1,'+repr(stdout)+')\n')
+        self.assertEqual(output.metadata_command([str(program)]),stdout)
+
+    def test_metadata_refusal_formatter_bounds_status_and_closes_inputs(self):
+        class Hostile:
+            def __str__(self):raise AssertionError('must not stringify untrusted status')
+        for status,want in ((-2147483648,'-2147483648'),(2147483647,'2147483647'),
+                            (-9,'-9'),(0,'0'),(True,'unknown'),(False,'unknown'),
+                            (-2147483649,'unknown'),(2147483648,'unknown'),
+                            (None,'unknown'),('7','unknown'),(Hostile(),'unknown')):
+            with self.subTest(want=want):
+                error=output._MetadataRefusal('rust-toolchain',status,True)
+                self.assertIsInstance(error,ValueError)
+                self.assertEqual(str(error),'Darwin metadata rust-toolchain: tool refused status='+want+' stderr_present=true')
+        for category,present in (('private-category',True),('rust-toolchain',1),
+                                 ('rust-toolchain','private-stderr'),(Hostile(),True)):
+            with self.assertRaisesRegex(ValueError,'^invalid Darwin metadata refusal fields$'):
+                output._MetadataRefusal(category,7,present)
+
     def test_metadata_query_category_diagnostics_are_private_and_causal(self):
         for body,category,reason,timeout in (
             ('import time;time.sleep(30)','xcode-version','timed out',.1),
             ('import os;os.write(1,b"x"*70000)','binary-load-commands','output limit',10),
-            ('import sys;sys.stderr.write("PRIVATE");raise SystemExit(2)','rust-version','tool refused',10),
+            ('import sys;sys.stderr.write("PRIVATE");raise SystemExit(2)','rust-version','tool refused status=2 stderr_present=true',10),
             ('import os;os.write(1,b"\\xff")','sdk-path','invalid output',10)):
             program=self.helper.executable('PRIVATE-tool',body+'\n')
             with self.subTest(category=category),self.assertRaises(ValueError) as error:

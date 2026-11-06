@@ -133,6 +133,18 @@ def _metadata_failure(category, reason):
     return ValueError('Darwin metadata '+category+': '+reason)
 
 
+class _MetadataRefusal(ValueError):
+    """Completed query refusal containing only closed, public scalar facts."""
+    def __init__(self, category, status, stderr_present):
+        if (type(category) is not str or category not in METADATA_CATEGORIES
+                or type(stderr_present) is not bool):
+            raise ValueError('invalid Darwin metadata refusal fields')
+        public_status = (str(status) if type(status) is int
+                         and -2147483648 <= status <= 2147483647 else 'unknown')
+        super().__init__('Darwin metadata '+category+': tool refused status='+public_status
+                         +' stderr_present='+('true' if stderr_present else 'false'))
+
+
 def _metadata_home(value):
     return (type(value) is str and bool(value) and not any(c in value for c in '\0\n\r')
             and Path(value).is_absolute() and str(Path(value))==value and '..' not in Path(value).parts)
@@ -180,7 +192,7 @@ def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_home
             try: status=child.wait(timeout=max(0,deadline-time.monotonic()))
             except subprocess.TimeoutExpired: raise _metadata_failure(category,'timed out')
             if time.monotonic()>=deadline: raise _metadata_failure(category,'timed out')
-            if status or captured[1]: raise _metadata_failure(category,'tool refused')
+            if status or captured[1]: raise _MetadataRefusal(category,status,bool(captured[1]))
             return bytes(captured[0])
         except OSError:
             raise _metadata_failure(category,'tool unavailable') from None

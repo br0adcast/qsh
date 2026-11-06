@@ -1,0 +1,1147 @@
+use super::scope::{Progress, Scope};
+use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+
+fn process(pid: i32, unique: u64, sid: i32) -> Classified {
+    Classified {
+        identity: Identity {
+            pid,
+            unique,
+            version: 1,
+        },
+        class: Class::Session(sid),
+    }
+}
+struct Watch {
+    identity: Identity,
+    cookie: u64,
+}
+struct Model {
+    before: Vec<Classified>,
+    after: BTreeMap<i32, Classified>,
+    raw: Vec<i32>,
+    gone: BTreeSet<i32>,
+    denied: BTreeSet<i32>,
+    events: Vec<&'static str>,
+    signals: Vec<(Identity, Signal)>,
+    reaps: usize,
+    leader: Result<Option<i32>, Failure>,
+    reap: Result<i32, Failure>,
+    event_error: bool,
+    bad_event: u8,
+    foreign_cookie: bool,
+    token_version: Option<u32>,
+    token_error: bool,
+    signal_error: bool,
+    exit_on_token: bool,
+    bytes: Option<usize>,
+    raw_error: Option<Failure>,
+}
+impl Model {
+    fn new(values: Vec<Classified>) -> Self {
+        Self {
+            raw: values.iter().map(|value| value.identity.pid).collect(),
+            before: values.clone(),
+            after: values.into_iter().map(|p| (p.identity.pid, p)).collect(),
+            gone: BTreeSet::new(),
+            denied: BTreeSet::new(),
+            events: vec![],
+            signals: vec![],
+            reaps: 0,
+            leader: Ok(Some(0)),
+            reap: Ok(0),
+            event_error: false,
+            bad_event: 0,
+            foreign_cookie: false,
+            token_version: None,
+            token_error: false,
+            signal_error: false,
+            exit_on_token: false,
+            bytes: None,
+            raw_error: None,
+        }
+    }
+    fn remove(&mut self, pid: i32) {
+        self.before.retain(|p| p.identity.pid != pid);
+        self.after.remove(&pid);
+        self.raw.retain(|p| *p != pid);
+    }
+}
+impl Ops<usize> for Model {
+    type Watch = Watch;
+    type Token = Identity;
+    fn baseline(&mut self) -> Result<Vec<Classified>, Failure> {
+        self.events.push("baseline");
+        Ok(self.before.clone())
+    }
+    fn raw_all(&mut self, buffer: &mut [i32; CAPACITY]) -> Result<usize, Failure> {
+        self.events.push("raw");
+        if let Some(error) = self.raw_error {
+            return Err(error);
+        }
+        for (slot, pid) in buffer.iter_mut().zip(&self.raw) {
+            *slot = *pid;
+        }
+        Ok(self.bytes.unwrap_or(self.raw.len() * size_of::<i32>()))
+    }
+    fn confirm(&mut self, identity: Identity) -> Result<Identity, Failure> {
+        self.events.push("confirm");
+        self.after
+            .get(&identity.pid)
+            .map(|p| p.identity)
+            .ok_or(Failure::Errno(3))
+    }
+    fn classify(&mut self, pid: i32) -> Result<Classified, Failure> {
+        self.events.push("classify");
+        self.after.get(&pid).copied().ok_or(Failure::Errno(3))
+    }
+    fn bind_exit(
+        &mut self,
+        value: Classified,
+        cookie: u64,
+    ) -> Result<Registration<Watch>, Failure> {
+        self.events.push("bind");
+        if self.denied.contains(&value.identity.pid) {
+            return Err(Failure::Errno(3));
+        }
+        Ok(Registration {
+            identity: value.identity,
+            cookie,
+            handle: Watch {
+                identity: value.identity,
+                cookie,
+            },
+        })
+    }
+    fn observe_exit(&mut self, watch: &mut Watch) -> Result<Option<ExitEvent>, Failure> {
+        self.events.push("exit");
+        if self.event_error {
+            return Err(Failure::LostBinding);
+        }
+        Ok(self
+            .gone
+            .contains(&watch.identity.pid)
+            .then_some(ExitEvent {
+                pid: watch.identity.pid,
+                cookie: watch.cookie + u64::from(self.foreign_cookie),
+                process_filter: self.bad_event != 1,
+                note_exit: self.bad_event != 2,
+                error: self.bad_event == 3,
+            }))
+    }
+    fn acquire_signal_token(
+        &mut self,
+        identity: Identity,
+        sid: i32,
+    ) -> Result<SignalToken<Identity>, Failure> {
+        self.events.push("token");
+        if self.exit_on_token {
+            self.leader = Ok(Some(0));
+            for value in &mut self.before {
+                if value.identity.pid == identity.pid {
+                    value.class = Class::Zombie;
+                }
+            }
+            self.after.get_mut(&identity.pid).unwrap().class = Class::Zombie;
+            return Err(Failure::Errno(3));
+        }
+        if self.token_error {
+            return Err(Failure::Mach(5));
+        }
+        let mut value = identity;
+        if let Some(version) = self.token_version {
+            value.version = version;
+        }
+        Ok(SignalToken {
+            identity: value,
+            sid,
+            handle: value,
+        })
+    }
+    fn signal_exact(&mut self, token: &Identity, signal: Signal) -> Result<(), Failure> {
+        self.events.push("signal");
+        if self.signal_error {
+            return Err(Failure::Errno(1));
+        }
+        self.signals.push((*token, signal));
+        Ok(())
+    }
+    fn observe_leader(&mut self, _child: &mut usize) -> Result<Option<i32>, Failure> {
+        self.events.push("leader");
+        self.leader
+    }
+    fn reap_leader(&mut self, child: &mut usize) -> Result<i32, Failure> {
+        self.events.push("reap");
+        self.reaps += 1;
+        *child += 1;
+        self.reap
+    }
+}
+fn owner() -> Scope<usize, Watch> {
+    Scope::new(
+        0,
+        Some(process(10, 100, 10).identity),
+        QualifiedDarwin {
+            contract: "model-xnu-contract",
+        },
+    )
+}
+
+#[test]
+fn darwin223_direct_leader_exit_cannot_complete_with_live_descendant() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(scope.retained(), (0, 1));
+    assert_eq!(model.reaps, 0);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.reaps, 0);
+    model.gone.insert(11);
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_quick_exit_needs_later_strong_exclusion_not_esrch() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(scope.retained(), (1, 0));
+    assert_eq!(model.reaps, 0);
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_cookie_exhaustion_cannot_drop_new_obligation() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    let mut scope = owner();
+    scope.set_cookie_for_test(u64::MAX);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 0);
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 0);
+}
+#[test]
+fn darwin223_reserved_leader_identity_mismatch_cannot_reap() {
+    let mut model = Model::new(vec![process(10, 999, 10)]);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 0);
+}
+
+#[test]
+fn darwin223_capacity_uses_both_strict_bounds_and_checked_arithmetic() {
+    use super::scope::capacity_for_test;
+    assert!(capacity_for_test(20, 1));
+    assert!(!capacity_for_test(21, 1));
+    assert!(!capacity_for_test(CAPACITY, CAPACITY));
+    assert!(!capacity_for_test(1, usize::MAX));
+    // Stable final classifications cannot compensate for an incomplete raw census.
+    let values = (10..31).map(|pid| process(pid, pid as u64, 99)).collect();
+    let mut model = Model::new(values);
+    model.before = vec![process(10, 100, 10)];
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+}
+
+#[test]
+fn darwin223_malformed_raw_cannot_certify_empty_scope() {
+    for bytes in [0, 1, CAPACITY * size_of::<i32>() + 4] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        model.bytes = Some(bytes);
+        assert_eq!(owner().step(&mut model), Progress::Incomplete);
+        assert_eq!(model.reaps, 0);
+    }
+    for raw in [vec![10, 10], vec![10, -1]] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        model.raw = raw;
+        assert_eq!(owner().step(&mut model), Progress::Incomplete);
+        assert_eq!(model.reaps, 0);
+    }
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.raw.push(0);
+    assert_eq!(owner().step(&mut model), Progress::Complete(0));
+    assert!(model.signals.is_empty());
+}
+
+#[test]
+fn darwin223_identity_churn_and_session_transition_invalidate_final_pass() {
+    for changed in [process(11, 999, 99), process(11, 101, 99)] {
+        let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+        model.after.insert(11, changed);
+        assert_eq!(owner().step(&mut model), Progress::Incomplete);
+        assert_eq!(model.reaps, 0);
+    }
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 99)]);
+    model.after.remove(&11);
+    assert_eq!(owner().step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+}
+
+#[test]
+fn darwin223_retains_member_despite_later_unknown_classification() {
+    let mut model = Model::new(vec![
+        process(10, 100, 10),
+        process(11, 101, 10),
+        process(12, 102, 99),
+    ]);
+    model.after.remove(&12);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(scope.retained(), (0, 1));
+    model.remove(12);
+    model.gone.insert(11);
+    model.remove(11);
+    model.events.clear();
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert!(
+        model.events.iter().position(|e| *e == "exit").unwrap()
+            < model.events.iter().position(|e| *e == "raw").unwrap()
+    );
+    assert!(
+        model.events.iter().position(|e| *e == "baseline").unwrap()
+            < model.events.iter().position(|e| *e == "raw").unwrap()
+    );
+}
+
+#[test]
+fn darwin223_last_fork_requires_new_watch_and_later_pass() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.remove(11);
+    let child = process(12, 102, 10);
+    model.before.push(child);
+    model.after.insert(12, child);
+    model.raw.push(12);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(scope.retained(), (1, 1));
+    assert_eq!(model.reaps, 0);
+    model.gone.insert(12);
+    model.remove(12);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+}
+
+#[test]
+fn darwin223_candidate_zombie_requires_same_call_double_classification() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.after.get_mut(&11).unwrap().class = Class::Zombie;
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+    model
+        .before
+        .iter_mut()
+        .find(|p| p.identity.pid == 11)
+        .unwrap()
+        .class = Class::Zombie;
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+}
+
+#[test]
+fn darwin223_lost_bound_watcher_cannot_be_downgraded_to_candidate() {
+    for bad_cookie in [false, true] {
+        let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+        let mut scope = owner();
+        assert_eq!(scope.step(&mut model), Progress::Pending);
+        model.event_error = !bad_cookie;
+        model.foreign_cookie = bad_cookie;
+        model.gone.insert(11);
+        model.remove(11);
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(scope.retained(), (0, 1));
+        model.event_error = false;
+        model.foreign_cookie = false;
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(model.reaps, 0);
+    }
+}
+
+#[test]
+fn darwin223_exec_uses_fresh_token_and_sticky_signal_stages() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.after.get_mut(&11).unwrap().identity.version = 2;
+    model
+        .before
+        .iter_mut()
+        .find(|p| p.identity.pid == 11)
+        .unwrap()
+        .identity
+        .version = 2;
+    model.token_version = Some(1);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert!(model.signals.is_empty());
+    model.token_version = None;
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(
+        model.signals,
+        vec![(
+            Identity {
+                pid: 11,
+                unique: 101,
+                version: 2
+            },
+            Signal::Hup
+        )]
+    );
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals.len(), 1);
+    scope.escalate();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals.len(), 2);
+    assert_eq!(model.signals[1].1, Signal::Kill);
+}
+
+#[test]
+fn darwin223_reused_foreign_pid_never_receives_old_member_signal() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    let reused = process(11, 999, 99);
+    model.before[1] = reused;
+    model.after.insert(11, reused);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert!(model.signals.is_empty());
+}
+
+#[test]
+fn darwin223_leader_observation_or_reap_failure_never_retries_consuming_wait() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.reap = Err(Failure::Mach(5));
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 1);
+    model.reap = Ok(0);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 1);
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.leader = Err(Failure::Leader);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    model.leader = Ok(Some(0));
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 0);
+}
+
+#[test]
+fn darwin223_live_candidate_can_bind_after_transient_registration_failure() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.denied.clear();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(scope.retained(), (0, 1));
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals.len(), 1);
+    model.gone.insert(11);
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+}
+
+#[test]
+fn darwin223_non_exit_or_error_event_never_releases_watcher() {
+    for bad_event in 1..=3 {
+        let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+        let mut scope = owner();
+        assert_eq!(scope.step(&mut model), Progress::Pending);
+        model.gone.insert(11);
+        model.remove(11);
+        model.bad_event = bad_event;
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(model.reaps, 0);
+    }
+}
+#[test]
+fn darwin223_previous_baseline_cannot_certify_later_raw_call() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.leader = Ok(None);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.before.clear();
+    model.leader = Ok(Some(0));
+    model.events.clear();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+    assert_eq!(
+        model
+            .events
+            .iter()
+            .filter(|event| **event == "baseline")
+            .count(),
+        1
+    );
+}
+#[test]
+fn darwin223_missing_postspawn_identity_keeps_original_child_unreaped() {
+    let mut scope: Scope<usize, Watch> = Scope::new(
+        0,
+        None,
+        QualifiedDarwin {
+            contract: "model-xnu-contract",
+        },
+    );
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert!(model.events.is_empty());
+    assert_eq!(model.reaps, 0);
+}
+#[test]
+fn darwin223_returned_new_pid_forces_fresh_preclassification() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    let child = process(11, 101, 10);
+    model.after.insert(11, child);
+    model.raw.push(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(scope.retained(), (0, 1));
+    assert_eq!(model.reaps, 0);
+    model.before.push(child);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.gone.insert(11);
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+}
+
+#[test]
+fn darwin223_live_reserved_leader_receives_exact_sticky_hup_then_kill() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.leader = Ok(None);
+    let mut scope = owner();
+    scope.request_stop();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(
+        model.signals,
+        vec![(process(10, 100, 10).identity, Signal::Hup)]
+    );
+    assert_eq!(model.reaps, 0);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals.len(), 1);
+    scope.escalate();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(
+        model.signals[1],
+        (process(10, 100, 10).identity, Signal::Kill)
+    );
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals.len(), 2);
+    assert_eq!(model.reaps, 0);
+    model.leader = Ok(Some(0));
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+    assert_eq!(model.signals.len(), 2);
+}
+
+#[test]
+fn darwin223_leader_token_denial_or_staleness_never_signals_or_reaps() {
+    for denial in 0..3 {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        model.leader = Ok(None);
+        model.token_error = denial == 0;
+        model.token_version = (denial == 1).then_some(99);
+        model.signal_error = denial == 2;
+        let mut scope = owner();
+        scope.request_stop();
+        assert_eq!(scope.step(&mut model), Progress::Incomplete);
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+        model.token_error = false;
+        model.token_version = None;
+        model.signal_error = false;
+        assert_eq!(scope.step(&mut model), Progress::Pending);
+        assert_eq!(model.signals.len(), 1);
+        assert_eq!(model.reaps, 0);
+    }
+}
+#[test]
+fn darwin223_leader_exec_refreshes_exact_token_before_each_new_stage() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.leader = Ok(None);
+    model.after.get_mut(&10).unwrap().identity.version = 2;
+    model.before[0].identity.version = 2;
+    let mut scope = owner();
+    scope.request_stop();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals[0].0.version, 2);
+    model.after.get_mut(&10).unwrap().identity.version = 3;
+    model.before[0].identity.version = 3;
+    scope.escalate();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.signals[1].0.version, 3);
+    assert_eq!(model.signals[1].1, Signal::Kill);
+    assert_eq!(model.reaps, 0);
+}
+#[test]
+fn darwin223_leader_identity_or_wait_custody_loss_permanently_blocks_signals() {
+    for identity_loss in [true, false] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        model.leader = Ok(None);
+        if identity_loss {
+            model.after.get_mut(&10).unwrap().identity.unique = 999;
+        } else {
+            model.leader = Err(Failure::Leader);
+        }
+        let mut scope = owner();
+        scope.request_stop();
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        model.after.insert(10, process(10, 100, 10));
+        model.leader = Ok(None);
+        scope.escalate();
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
+}
+#[test]
+fn darwin223_leader_exit_racing_token_waits_for_next_actual_observation() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.leader = Ok(None);
+    model.exit_on_token = true;
+    let mut scope = owner();
+    scope.request_stop();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+    assert!(model.signals.is_empty());
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+    assert_eq!(
+        model
+            .events
+            .iter()
+            .filter(|event| **event == "token")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn darwin223_completion_exposes_same_call_capacity_evidence() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(scope.census(), Some((1, 1, 1)));
+}
+
+#[test]
+fn darwin223_candidate_receipt_is_published_only_after_actual_reap() {
+    let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+    model.denied.insert(11);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(scope.discharged_for_test(), (0, 0));
+    model.remove(11);
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(scope.discharged_for_test(), (1, 0));
+}
+
+// Mirrors the production post-handshake constructor with original child custody.
+fn post_handshake_owner(model: &mut Model, pid: i32) -> Scope<usize, Watch> {
+    let initial = model.classify(pid);
+    Scope::post_handshake(
+        0,
+        Some(pid),
+        initial,
+        QualifiedDarwin {
+            contract: "model-xnu-contract",
+        },
+    )
+}
+
+#[test]
+fn darwin223_bootstrap_delayed_initial_identity_requires_owned_waitability() {
+    let leader = process(10, 100, 10);
+    let mut model = Model::new(vec![leader]);
+    model.leader = Ok(None);
+    model.after.remove(&10); // Initial classification bracket has no stable result.
+    let mut scope = post_handshake_owner(&mut model, 10);
+    assert!(model.signals.is_empty());
+    assert_eq!(model.reaps, 0);
+    model.after.insert(10, leader);
+    let before = model.events.len();
+    assert_eq!(scope.poll_leader(&mut model), Ok(None));
+    assert_eq!(&model.events[before..], ["leader", "classify"]);
+    assert!(model.signals.is_empty());
+    assert_eq!(model.reaps, 0);
+    scope.request_stop();
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    assert_eq!(model.reaps, 0);
+    model.leader = Ok(Some(0));
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_bootstrap_pending_preserves_running_terminal_and_stop() {
+    for terminal in [false, true] {
+        let leader = process(10, 100, 10);
+        let mut model = Model::new(vec![leader]);
+        model.leader = if terminal { Ok(Some(0)) } else { Ok(None) };
+        model.after.remove(&10);
+        let mut scope = post_handshake_owner(&mut model, 10);
+        for _ in 0..3 {
+            let before = model.events.len();
+            assert_eq!(scope.poll_leader(&mut model), model.leader);
+            assert_eq!(&model.events[before..], ["leader", "classify"]);
+            let status = scope::leader_status(scope.poll_leader(&mut model));
+            if terminal {
+                assert!(matches!(
+                    status,
+                    transport::channel_server::LeaderStatus::Exited { code: Some(0) }
+                ));
+            } else {
+                assert!(matches!(
+                    status,
+                    transport::channel_server::LeaderStatus::Running
+                ));
+            }
+            assert!(matches!(
+                scope::cleanup_status(scope.step(&mut model)),
+                transport::channel_server::ChildStatus::Running
+            ));
+            assert!(model.signals.is_empty());
+            assert_eq!(model.reaps, 0);
+        }
+        scope.request_stop();
+        model.after.insert(10, leader);
+        assert_eq!(
+            scope.step(&mut model),
+            if terminal {
+                Progress::Complete(0)
+            } else {
+                Progress::Pending
+            }
+        );
+        if !terminal {
+            assert_eq!(model.signals, [(leader.identity, Signal::Hup)]);
+            model.leader = Ok(Some(0));
+            assert_eq!(scope.step(&mut model), Progress::Complete(0));
+        }
+        assert_eq!(model.reaps, 1);
+    }
+}
+
+#[test]
+fn darwin223_bootstrap_contradiction_or_wait_loss_is_sticky() {
+    for kind in 0..4 {
+        let leader = process(10, 100, 10);
+        let mut model = Model::new(vec![leader]);
+        model.after.remove(&10);
+        let mut scope = post_handshake_owner(&mut model, 10);
+        match kind {
+            0 => model.leader = Err(Failure::Errno(10)),
+            1 => {
+                model.after.insert(10, process(10, 100, 99));
+            }
+            2 => {
+                model.after.insert(10, process(11, 100, 10));
+            }
+            _ => {
+                model.after.insert(10, process(10, 0, 10));
+            }
+        }
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        model.after.insert(10, leader);
+        model.leader = Ok(Some(0));
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
+}
+
+#[test]
+fn darwin223_bootstrap_zombie_still_requires_full_census() {
+    let mut zombie = process(10, 100, 10);
+    zombie.class = Class::Zombie;
+    let mut model = Model::new(vec![zombie]);
+    model.after.remove(&10);
+    let mut scope = post_handshake_owner(&mut model, 10);
+    assert_eq!(scope.step(&mut model), Progress::Pending);
+    model.after.insert(10, zombie);
+    model.bytes = Some(0);
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert_eq!(model.reaps, 0);
+    model.bytes = None;
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_bootstrap_initial_contradiction_and_invalid_pid_never_recover() {
+    for (pid, initial) in [
+        (Some(10), Ok(process(10, 100, 99))),
+        (Some(10), Ok(process(11, 100, 10))),
+        (Some(10), Ok(process(10, 0, 10))),
+        (None, Err(Failure::Errno(3))),
+        (Some(0), Err(Failure::Invalid)),
+    ] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        let mut scope: Scope<usize, Watch> = Scope::post_handshake(
+            0,
+            pid,
+            initial,
+            QualifiedDarwin {
+                contract: "model-xnu-contract",
+            },
+        );
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.events.is_empty());
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
+}
+
+#[test]
+fn darwin223_incomplete_census_production_projection_preserves_polling() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    let mut scope = owner();
+    model.bytes = Some(0);
+    let progress = scope.step(&mut model);
+    assert_eq!(progress, Progress::Incomplete);
+    assert!(matches!(
+        scope::cleanup_status(progress),
+        transport::channel_server::ChildStatus::Running
+    ));
+    assert_eq!(model.reaps, 0);
+    assert!(model.signals.is_empty());
+    model.bytes = None;
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+
+#[test]
+fn darwin223_incomplete_census_cannot_mask_same_call_permanent_loss() {
+    for resource_loss in [false, true] {
+        let mut model = Model::new(vec![process(10, 100, 10), process(11, 101, 10)]);
+        let mut scope = owner();
+        if resource_loss {
+            scope.set_cookie_for_test(u64::MAX);
+            let foreign = process(12, 102, 99);
+            model.before.push(foreign);
+            model.raw.push(12); // Missing post-classification invalidates this census.
+        } else {
+            assert_eq!(scope.step(&mut model), Progress::Pending);
+            model.event_error = true;
+            model.bytes = Some(0);
+        }
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(matches!(
+            scope::cleanup_status(Progress::Unknown),
+            transport::channel_server::ChildStatus::Unknown(_)
+        ));
+        assert_eq!(model.reaps, 0);
+        let bindings = model
+            .events
+            .iter()
+            .filter(|event| **event == "bind")
+            .count();
+        model.event_error = false;
+        model.bytes = None;
+        model.remove(11);
+        model.remove(12);
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert_eq!(
+            model
+                .events
+                .iter()
+                .filter(|event| **event == "bind")
+                .count(),
+            bindings
+        );
+        assert_eq!(model.reaps, 0);
+        assert!(model.signals.is_empty());
+    }
+}
+
+#[test]
+fn darwin223_complete_pass_leader_contradiction_dominates_signal_refusal() {
+    for wrong_sid in [false, true] {
+        let mut model = Model::new(vec![process(10, 100, 10)]);
+        model.leader = Ok(None);
+        model.token_error = true;
+        // No leader in the final census, or exact identity in a foreign session.
+        if wrong_sid {
+            model.before[0].class = Class::Session(99);
+            model.after.get_mut(&10).unwrap().class = Class::Session(99);
+        } else {
+            model.before.clear();
+            model.raw.clear();
+            model.raw.push(0);
+        }
+        let mut scope = owner();
+        scope.request_stop();
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        model.before = vec![process(10, 100, 10)];
+        model.after.insert(10, process(10, 100, 10));
+        model.raw = vec![10];
+        model.token_error = false;
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+        assert!(model.signals.is_empty());
+        assert_eq!(model.reaps, 0);
+    }
+}
+
+#[test]
+fn darwin223_incomplete_raw_query_requires_fresh_success_before_reap() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.raw_error = Some(Failure::Errno(5));
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Incomplete);
+    assert!(matches!(
+        scope::cleanup_status(Progress::Incomplete),
+        transport::channel_server::ChildStatus::Running
+    ));
+    assert_eq!(model.reaps, 0);
+    assert!(model.signals.is_empty());
+    model.raw_error = None;
+    assert_eq!(scope.step(&mut model), Progress::Complete(0));
+    assert_eq!(model.reaps, 1);
+}
+#[test]
+fn darwin223_exhausted_generation_is_not_retryable_incomplete_proof() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    let mut scope = owner();
+    scope.set_generation_for_test(u64::MAX);
+    for _ in 0..2 {
+        assert_eq!(scope.step(&mut model), Progress::Unknown);
+    }
+    assert_eq!(model.reaps, 0);
+    assert!(model.signals.is_empty());
+}
+#[test]
+fn darwin223_mismatching_consuming_status_permanently_loses_wait_authority() {
+    let mut model = Model::new(vec![process(10, 100, 10)]);
+    model.reap = Ok(1);
+    let mut scope = owner();
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 1);
+    model.reap = Ok(0);
+    assert_eq!(scope.step(&mut model), Progress::Unknown);
+    assert_eq!(model.reaps, 1);
+    assert!(model.signals.is_empty());
+}
+
+#[test]
+fn darwin223_family_accepts_observed_non_ci_hardware_build() {
+    let version = "Darwin Kernel Version 24.5.1: controlled date root:xnu-11417.140.69.999~3/RELEASE_ARM64_T6000";
+    assert!(runtime_contract("24.5.1", version, "24F123", "arm64", "aarch64").is_some());
+}
+
+fn observed_version(release: &str, kernel: &str) -> String {
+    format!("Darwin Kernel Version {release}: controlled build description root:xnu-{kernel}")
+}
+#[test]
+fn darwin223_family_exact_bases_vendor_revisions_and_native_architectures() {
+    for (base, release, build, id) in [
+        (
+            "10063.141.1",
+            "23.6.0",
+            "23G123",
+            "xnu-10063.141.1-conditional-v1",
+        ),
+        (
+            "11417.140.69",
+            "24.5.1",
+            "24F123",
+            "xnu-11417.140.69-conditional-v1",
+        ),
+    ] {
+        for (machine, arch, flavor) in [
+            ("arm64", "aarch64", "ARM64"),
+            ("x86_64", "x86_64", "X86_64"),
+        ] {
+            for revision in ["", ".1", ".999.04"] {
+                for hardware in ["", "_VMAPPLE", "_T6000_123"] {
+                    let token = format!("{base}{revision}~3/RELEASE_{flavor}{hardware}");
+                    let observed = runtime_contract(
+                        release,
+                        &observed_version(release, &token),
+                        build,
+                        machine,
+                        arch,
+                    )
+                    .unwrap();
+                    assert_eq!(observed.family.id, id);
+                    assert_eq!(observed.family.public_source, format!("xnu-{base}"));
+                    assert_eq!(observed.kernel_token, token);
+                    assert!(observed.receipt().len() < 1024);
+                }
+            }
+        }
+    }
+    assert_ne!(SOURCE_FAMILIES[0].id, SOURCE_FAMILIES[1].id);
+}
+#[test]
+fn darwin223_family_refuses_malformed_uncovered_or_injected_observations() {
+    let release = "24.6.0";
+    let token = "11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE";
+    let version = observed_version(release, token);
+    let baseline = [
+        release.to_string(),
+        version.clone(),
+        "24H232".into(),
+        "arm64".into(),
+        "aarch64".into(),
+    ];
+    let rejected = |fields: &[String; 5]| {
+        assert!(
+            runtime_contract(&fields[0], &fields[1], &fields[2], &fields[3], &fields[4]).is_none(),
+            "{fields:?}"
+        )
+    };
+    for (field, maximum) in [(0, 63), (1, 511), (2, 63), (3, 31)] {
+        for replacement in [
+            String::new(),
+            "x".repeat(maximum + 1),
+            " nonempty".into(),
+            "nonempty ".into(),
+            "é".into(),
+        ] {
+            let mut fields = baseline.clone();
+            fields[field] = replacement;
+            rejected(&fields);
+        }
+        for control in [0u8, 9, 10, 13, 27, 31, 127] {
+            let mut fields = baseline.clone();
+            fields[field].push(char::from(control));
+            rejected(&fields);
+        }
+    }
+    // Preserve otherwise-valid syntax so description validation and caps are causal.
+    for description in [
+        "private\tcanary",
+        "private\ncanary",
+        "private\0canary",
+        "privateécanary",
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = format!("Darwin Kernel Version {release}: {description} root:xnu-{token}");
+        rejected(&fields);
+    }
+    let mut fields = baseline.clone();
+    let prefix = format!("Darwin Kernel Version {release}: ");
+    let tail = format!(" root:xnu-{token}");
+    fields[1] = format!(
+        "{prefix}{}{tail}",
+        "X".repeat(512 - prefix.len() - tail.len())
+    );
+    assert_eq!(fields[1].len(), 512);
+    rejected(&fields);
+    fields = baseline.clone();
+    fields[0] = format!("24.{}.0", "1".repeat(59));
+    fields[1] = observed_version(&fields[0], token);
+    assert_eq!(fields[0].len(), 64);
+    rejected(&fields);
+    fields = baseline.clone();
+    fields[2] = format!("24A{}", "X".repeat(61));
+    assert_eq!(fields[2].len(), 64);
+    rejected(&fields);
+    for release in [
+        "24", "24.6", "24.6.0.1", "24..0", "24.a.0", "23.6.0", "25.0.0", "024.6.0", "24.6.1",
+    ] {
+        let mut fields = baseline.clone();
+        fields[0] = release.into();
+        rejected(&fields);
+    }
+    for build in ["24", "24G", "24g123", "23G123", "24G1-", "24G 123"] {
+        let mut fields = baseline.clone();
+        fields[2] = build.into();
+        rejected(&fields);
+    }
+    for token in [
+        "11417.140.690~2/RELEASE_ARM64",
+        "11417.140.68~2/RELEASE_ARM64",
+        "11417.141.69~2/RELEASE_ARM64",
+        "10063.141.10~2/RELEASE_ARM64",
+        "10063.141.1~2/RELEASE_ARM64",
+        "11417.140.69.~2/RELEASE_ARM64",
+        "11417.140.69..1~2/RELEASE_ARM64",
+        "11417.140.69.a~2/RELEASE_ARM64",
+        "11417.140.69/RELEASE_ARM64",
+        "11417.140.69~/RELEASE_ARM64",
+        "11417.140.69~a/RELEASE_ARM64",
+        "11417.140.69~2~3/RELEASE_ARM64",
+        "11417.140.69~2/RELEASE_ARM64/EXTRA",
+        "11417.140.69~2/DEBUG_ARM64",
+        "11417.140.69~2/DEVELOPMENT_ARM64",
+        "11417.140.69~2/RELEASE_ARM640",
+        "11417.140.69~2/RELEASE_ARM64_",
+        "11417.140.69~2/RELEASE_ARM64__T6000",
+        "11417.140.69~2/RELEASE_ARM64_T6000_",
+        "11417.140.69~2/RELEASE_ARM64_vmapple",
+        "11417.140.69~2/RELEASE_X86_64",
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = observed_version(release, token);
+        rejected(&fields);
+    }
+    for version in [
+        format!("root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}:  root:xnu-{token}"),
+        format!("{version} trailing"),
+        format!("{version} root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: embedded-root:xnu-other root:xnu-{token}"),
+        format!("Darwin Kernel Version {release}: description embedded-root:xnu-{token}"),
+    ] {
+        let mut fields = baseline.clone();
+        fields[1] = version;
+        rejected(&fields);
+    }
+    for (machine, arch) in [
+        ("arm64", "x86_64"),
+        ("x86_64", "aarch64"),
+        ("x86_64", "x86_64"),
+        ("arm64e", "aarch64"),
+        ("arm64", "unknown"),
+    ] {
+        let mut fields = baseline.clone();
+        fields[3] = machine.into();
+        fields[4] = arch.into();
+        rejected(&fields);
+    }
+}
+#[test]
+fn darwin223_family_receipt_owns_actual_metadata_and_preserves_ci_text() {
+    for (build, kernel, machine, arch, expected) in [
+        ("24H232", "11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE", "arm64", "aarch64", "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24H232 kernel_build=11417.140.69.713.47~2/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional"),
+        ("24G830", "11417.140.69.711.44~1/RELEASE_X86_64", "x86_64", "x86_64", "darwin223 public_source=xnu-11417.140.69 runtime_release=24.6.0 os_build=24G830 kernel_build=11417.140.69.711.44~1/RELEASE_X86_64 machine=x86_64 native_arch=x86_64 premise=conditional"),
+    ] {
+        let observed=runtime_contract("24.6.0", &observed_version("24.6.0",kernel),build,machine,arch).unwrap();
+        assert_eq!(observed.receipt(),expected);
+    }
+    let mut version="Darwin Kernel Version 23.6.1: PRIVATE_DESCRIPTION_CANARY root:xnu-10063.141.1.999~7/RELEASE_ARM64_T8103".to_string();
+    let observed = runtime_contract("23.6.1", &version, "23G456a", "arm64", "aarch64").unwrap();
+    version.clear();
+    assert_eq!(observed.receipt(), "darwin223 public_source=xnu-10063.141.1 runtime_release=23.6.1 os_build=23G456a kernel_build=10063.141.1.999~7/RELEASE_ARM64_T8103 machine=arm64 native_arch=aarch64 premise=conditional");
+    assert!(!observed.receipt().contains("PRIVATE_DESCRIPTION_CANARY"));
+    assert!(!observed.receipt().contains("24H232"));
+    let release = format!("24.{}.0", "1".repeat(58));
+    assert_eq!(release.len(), 63);
+    let prefix = format!("Darwin Kernel Version {release}: ");
+    let token = "root:xnu-11417.140.69~1/RELEASE_ARM64";
+    let version = format!(
+        "{prefix}{} {token}",
+        "X".repeat(511 - prefix.len() - 1 - token.len())
+    );
+    let build = format!("24A{}", "X".repeat(60));
+    assert_eq!(version.len(), 511);
+    assert_eq!(build.len(), 63);
+    let maximal = runtime_contract(&release, &version, &build, "arm64", "aarch64").unwrap();
+    assert!(maximal.receipt().len() < 1024);
+    assert!(!maximal.receipt().contains(&"X".repeat(100)));
+}

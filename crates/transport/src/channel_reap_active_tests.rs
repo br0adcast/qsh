@@ -387,6 +387,8 @@ fn cleanup143_cleanup_failure_and_backend_panic_keep_typed_first_observation() {
             runtime.spawn_blocking(|| ()).await.unwrap();
         });
         let snapshot = registry.cleanup_snapshot().unwrap();
+        assert_eq!(snapshot.retiring_channels, 1);
+        assert!(!snapshot.leader_unconfirmed);
         assert_eq!(snapshot.unique_cleanup_debt, 1);
         assert_eq!(snapshot.observed_unconfirmed_owners, 1);
         assert_eq!(
@@ -407,7 +409,13 @@ fn cleanup143_cleanup_failure_and_backend_panic_keep_typed_first_observation() {
                 .await
                 .unwrap();
         });
-        assert_eq!(registry.cleanup_snapshot().unwrap().unique_cleanup_debt, 0);
+        let settled = registry.cleanup_snapshot().unwrap();
+        assert_eq!(settled.retiring_channels, 0);
+        assert_eq!(settled.unique_cleanup_debt, 0);
+        assert_eq!(settled.observed_unconfirmed_owners, 0);
+        assert!(!settled.leader_unconfirmed);
+        assert!(!settled.cleanup_unconfirmed);
+        assert!(!settled.observation_panicked);
         drop(reaps);
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
@@ -468,3 +476,96 @@ fn cleanup143_exact_completion_clears_observation_even_without_a_retiring_map_en
 }
 
 include!("channel_reap_deadline_tests.rs");
+
+struct BootstrapPendingWait {
+    inner: ActiveWait,
+    stop: mpsc::SyncSender<()>,
+}
+impl ChannelWait for BootstrapPendingWait {
+    fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+        self.inner.poll_leader_status()
+    }
+    fn poll_exit(&mut self) -> ChildStatus {
+        self.inner.poll_exit()
+    }
+    fn kill(&mut self) {
+        let _ = self.stop.try_send(());
+    }
+    fn wait(self: Box<Self>) -> i32 {
+        panic!("exclusive polling owner required")
+    }
+    fn cleanup_uninstalled(
+        &mut self,
+        _: &crate::channel_open::CleanupAuthority<'_>,
+    ) -> crate::channel_open::CleanupStatus {
+        crate::channel_open::CleanupStatus::Unknown
+    }
+}
+#[test]
+fn bootstrap223_running_pending_delivers_stop_before_exact_completion() {
+    let runtime = runtime();
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let mut reaps = ReapSet::new(registry.clone());
+    let complete = Arc::new(AtomicBool::new(false));
+    let (entered, observed) = mpsc::sync_channel(1);
+    let (stop, stopped) = mpsc::sync_channel(1);
+    runtime.block_on(async {
+        reaps.start_active(
+            16,
+            1,
+            Box::new(BootstrapPendingWait {
+                inner: ActiveWait {
+                    complete: complete.clone(),
+                    entered,
+                },
+                stop,
+            }),
+            None,
+        );
+        reaps.observe_active();
+    });
+    observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    let exact_owner = reaps.owners.get(&1).unwrap().clone();
+    reaps.stop_all();
+    let stop_delivered = stopped.recv_timeout(Duration::from_secs(2)).is_ok();
+    let pending = registry.cleanup_snapshot();
+    let held = !reaps.is_empty() && registry.outstanding() == 1;
+    let early = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_millis(40), reaps.next())
+            .await
+            .is_ok()
+    });
+    // Settle the exact controlled owner before asserting even on causal RED.
+    complete.store(true, Ordering::SeqCst);
+    exact_owner.notify();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), reaps.next())
+            .await
+            .unwrap();
+    });
+    let settled = registry.cleanup_snapshot();
+    let outstanding = registry.outstanding();
+    let empty = reaps.is_empty();
+    drop(reaps);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    assert!(stop_delivered);
+    assert!(held);
+    assert!(!early);
+    assert_eq!(outstanding, 0);
+    assert!(empty);
+    // Healthy pending custody is debt, not a backend observation failure.
+    let pending = pending.unwrap();
+    assert_eq!(pending.retiring_channels, 1);
+    assert_eq!(pending.unique_cleanup_debt, 1);
+    assert_eq!(pending.observed_unconfirmed_owners, 0);
+    assert!(!pending.leader_unconfirmed);
+    assert!(!pending.cleanup_unconfirmed);
+    assert!(!pending.observation_panicked);
+    let settled = settled.unwrap();
+    assert_eq!(settled.retiring_channels, 0);
+    assert_eq!(settled.unique_cleanup_debt, 0);
+    assert_eq!(settled.observed_unconfirmed_owners, 0);
+    assert!(!settled.leader_unconfirmed);
+    assert!(!settled.cleanup_unconfirmed);
+    assert!(!settled.observation_panicked);
+}

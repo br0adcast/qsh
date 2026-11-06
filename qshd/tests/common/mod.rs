@@ -130,6 +130,170 @@ pub(crate) fn daemon_log_path() -> PathBuf {
     PathBuf::from(SYSTEM_LOG_DIR).join("qshd.log")
 }
 
+pub(crate) const STATUS508_TAIL_CAP: usize = 65536;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status508TailKind {
+    Present,
+    Missing,
+    NonRegular,
+    OpenFailed,
+    SeekFailed,
+    ReadFailed,
+    Changed,
+    Truncated,
+    Unavailable,
+}
+pub(crate) struct Status508Tail {
+    pub(crate) kind: Status508TailKind,
+    pub(crate) bytes: Vec<u8>,
+}
+impl Status508Tail {
+    pub(crate) fn present(mut bytes: Vec<u8>) -> Self {
+        if bytes.len() > STATUS508_TAIL_CAP {
+            bytes.drain(..bytes.len() - STATUS508_TAIL_CAP);
+        }
+        Self {
+            kind: Status508TailKind::Present,
+            bytes,
+        }
+    }
+}
+pub(crate) struct Status508Sample {
+    pub(crate) stderr: Status508Tail,
+    pub(crate) current: Status508Tail,
+    pub(crate) rotated: Status508Tail,
+}
+pub(crate) fn status508_read_tail(path: &Path) -> Status508Tail {
+    status508_read_tail_after_open(path, || {})
+}
+pub(crate) fn status508_read_tail_after_open(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> Status508Tail {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let empty = |kind| Status508Tail {
+        kind,
+        bytes: Vec::new(),
+    };
+    let named = match std::fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return empty(Status508TailKind::Missing)
+        }
+        Err(_) => return empty(Status508TailKind::OpenFailed),
+    };
+    if !named.is_file() {
+        return empty(Status508TailKind::NonRegular);
+    }
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return empty(Status508TailKind::OpenFailed),
+    };
+    let before = match file.metadata() {
+        Ok(value) if value.is_file() => value,
+        Ok(_) => return empty(Status508TailKind::NonRegular),
+        Err(_) => return empty(Status508TailKind::ReadFailed),
+    };
+    let offset = before.len().saturating_sub(STATUS508_TAIL_CAP as u64);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return empty(Status508TailKind::SeekFailed);
+    }
+    // This test-harness seam exercises real replacement/truncation handling.
+    // Ordinary capture passes no callback and never mutates the sampled file.
+    after_open();
+    let wanted = (before.len() - offset) as usize;
+    let mut tail = Status508Tail::present(Vec::with_capacity(wanted));
+    let mut interrupted = 0;
+    while tail.bytes.len() < wanted {
+        let mut buffer = [0; 4096];
+        let count = buffer.len().min(wanted - tail.bytes.len());
+        match file.read(&mut buffer[..count]) {
+            Ok(0) => {
+                tail.kind = Status508TailKind::Truncated;
+                break;
+            }
+            Ok(count) => tail.bytes.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted && interrupted < 8 => {
+                interrupted += 1
+            }
+            Err(_) => {
+                tail.kind = Status508TailKind::ReadFailed;
+                break;
+            }
+        }
+    }
+    let identity = |v: &std::fs::Metadata| {
+        (
+            v.dev(),
+            v.ino(),
+            v.mode(),
+            v.uid(),
+            v.gid(),
+            v.nlink(),
+            v.len(),
+            v.mtime(),
+            v.mtime_nsec(),
+            v.ctime(),
+            v.ctime_nsec(),
+        )
+    };
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(after), _) if after.len() < before.len() => tail.kind = Status508TailKind::Truncated,
+        (Ok(after), Ok(named))
+            if identity(&before) == identity(&after) && identity(&after) == identity(&named) => {}
+        _ => tail.kind = Status508TailKind::Changed,
+    }
+    tail
+}
+impl Status508TailKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Missing => "missing",
+            Self::NonRegular => "nonregular",
+            Self::OpenFailed => "open_failed",
+            Self::SeekFailed => "seek_failed",
+            Self::ReadFailed => "read_failed",
+            Self::Changed => "changed",
+            Self::Truncated => "truncated",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+/// Closed public facts only. Marker absence applies to these independent tails,
+/// never the whole log or an atomic current/rotation timeline. Child=running is
+/// the existing try_wait(None) observation immediately before the deadline check.
+pub(crate) fn status508_projection(sample: &Status508Sample) -> String {
+    let mut public = String::from(
+        "failed status setup abandoned worker custody; deadline_expired=true child=running",
+    );
+    for (label, tail) in [
+        ("stderr", &sample.stderr),
+        ("current", &sample.current),
+        ("rotated", &sample.rotated),
+    ] {
+        let bytes = &tail.bytes[tail.bytes.len().saturating_sub(STATUS508_TAIL_CAP)..];
+        let contains = |marker: &[u8]| bytes.windows(marker.len()).any(|part| part == marker);
+        use std::fmt::Write;
+        // All interpolated strings are literal allowlisted categories. No raw
+        // bytes, paths, account names, error messages or banners are printable.
+        let _ = write!(
+            public,
+            " {label}_kind={} {label}_bytes={} {label}_setup_failure={} {label}_runtime={}",
+            tail.kind.label(),
+            bytes.len(),
+            contains(b"requested helper status endpoint failed"),
+            contains(b"runtime workers")
+        );
+    }
+    public
+}
+
 /// The directory `serve::cache_dir` hands `qshd::log::init` in the system
 /// mode -- taken FROM THE CRATE, not written out again here. A second copy
 /// of a path is a second source of truth for it, and the daemon moving its
@@ -175,6 +339,23 @@ pub(crate) struct Daemon {
 impl Daemon {
     pub(crate) fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr_tail.lock().unwrap()).into_owned()
+    }
+
+    pub(crate) fn status508_sample(&self) -> Status508Sample {
+        // No wait for the drainer, flush or new child poll. Its existing
+        // lifecycle supplies bounded memory, not an EOF or join certificate.
+        let stderr = match self.stderr_tail.try_lock() {
+            Ok(bytes) => Status508Tail::present(bytes.clone()),
+            Err(_) => Status508Tail {
+                kind: Status508TailKind::Unavailable,
+                bytes: Vec::new(),
+            },
+        };
+        Status508Sample {
+            stderr,
+            current: status508_read_tail(&daemon_log_path()),
+            rotated: status508_read_tail(&PathBuf::from(SYSTEM_LOG_DIR).join("qshd.log.1")),
+        }
     }
 }
 
