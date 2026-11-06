@@ -122,7 +122,15 @@ impl WorkerDomain {
             );
         }
     }
+    fn stop_writable(&self) -> bool {
+        self.pending.is_some() && !self.native_complete && self.owner.stop_ready()
+    }
     fn send_stop(&mut self) {
+        // Retain the queued first reason until authenticated stage acceptance;
+        // do not count a gated publication as an attempted Stop.
+        if !self.stop_writable() {
+            return;
+        }
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
@@ -164,7 +172,7 @@ impl WorkerDomain {
             self.native_exit = Some(code);
             self.native_complete = true;
         }
-        if self.native_complete {
+        if self.native_complete || self.owner.terminal_received() {
             self.pending = None;
         }
     }

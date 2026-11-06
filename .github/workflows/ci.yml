@@ -1439,8 +1439,9 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 73` is the exact compiled system-library body count:
-          # the prior 71 plus two isolated qshd library log diagnostic bodies.
+          # `--ignored 74` is the exact compiled system-library body count:
+          # the prior 73 plus the owned worker stage-barrier fixture body.
+          # Its four required parent regressions below drive that body.
           # The deleted-cwd body is in qshd's binary test target, not this
           # library binary. Keep the strict count and require both library
           # wrappers below so a missing body or wrapper fails visibly.
@@ -1477,12 +1478,12 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 73 isolated bodies are a separate matter and get no
+          # The 74 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 73 \
+          run_suite lib qshd --ignored 74 \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
             --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
@@ -1492,6 +1493,10 @@ jobs:
             --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \
             --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \
             --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \
+            --require helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication \
+            --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \
+            --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \
+            --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
             an_undeliverable_signal_is_reported_to_the_helper \

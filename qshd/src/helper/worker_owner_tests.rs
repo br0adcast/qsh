@@ -324,3 +324,40 @@ fn worker40_native_signal_diagnostic_survives_first_protocol_fault_and_later_err
         "native diagnostics cannot erase the earlier fault"
     );
 }
+
+#[test]
+fn worker508_accepted_stage_survives_injected_reset_until_real_reap() {
+    let (mut owner, mut fixture) = fixture("good");
+    assert!(wait_for_exit(&mut owner));
+    let stage = owner.poll(Instant::now());
+    assert_eq!(stage.failure, None);
+    assert!(owner.established && owner.stop_ready());
+    let reset = owner.poll_with(Instant::now(), |_| Err(Fault::Os(nix::libc::ECONNRESET)));
+    assert_eq!(
+        reset.failure,
+        Some(WorkerFailure::Protocol(Fault::Os(nix::libc::ECONNRESET)))
+    );
+    assert!(
+        owner.established,
+        "post-stage reset cannot revoke accepted authority"
+    );
+    assert!(
+        owner.stop_ready(),
+        "accepted authority survives reset until terminal evidence"
+    );
+    let receipt = owner.poll(Instant::now());
+    assert!(receipt.receipt.is_some());
+    assert!(!owner.stop_ready());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut progress = receipt;
+    while !matches!(progress.native, Progress::Complete(_)) && Instant::now() < deadline {
+        progress = owner.poll(Instant::now());
+        std::thread::yield_now();
+    }
+    assert_eq!(progress.native, Progress::Complete(0));
+    assert_eq!(progress.failure, reset.failure);
+    assert!(
+        matches!(fixture.child.try_wait(), Err(e) if e.raw_os_error() == Some(nix::libc::ECHILD))
+    );
+    fixture.reaped = true;
+}

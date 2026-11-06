@@ -87,6 +87,11 @@ impl WorkerOwner {
     pub(super) fn terminal_received(&self) -> bool {
         self.receipt.is_some() || self.init_failed
     }
+    /// Accepted session authority permits Stop publication, even though the
+    /// child's control reader may not yet be running. Terminal evidence ends it.
+    pub(super) fn stop_ready(&self) -> bool {
+        self.established && !self.terminal_received() && !self.eof
+    }
     #[cfg(test)]
     pub(super) fn first_failure(&self) -> Option<WorkerFailure> {
         self.failure
