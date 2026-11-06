@@ -74,6 +74,11 @@ on:
         default: qualification
         options: [qualification, pty-eof-build, pty-eof-control]
   workflow_call:
+    inputs:
+      mode:
+        type: string
+        required: false
+        default: qualification
 
 permissions:
   contents: read
