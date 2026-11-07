@@ -47,6 +47,10 @@ jobs:
           actual=$(git rev-parse HEAD)
           echo "Source commit: $actual (run $GITHUB_RUN_ID, attempt $GITHUB_RUN_ATTEMPT)"
           test "$actual" = "$GITHUB_SHA"
+      - name: Check client installation bootstrap
+        run: |
+          sh -n scripts/install.sh
+          python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'
       - name: Qualify Darwin process identity, signaling and exit primitives
         run: |
           bash scripts/qualify-darwin-direct-child.sh
@@ -74,6 +78,35 @@ jobs:
           prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
           echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Test managed client installation on macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-client-install.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK
+          # Retained signed-release assets are not available in this job.
+          # Do not opt in to ignored release-authentication acceptance tests.
+          cargo test -p qsh --lib --locked client_install -- --color never \
+            --skip client_install::signed_tests::production_signed_install_and_explicit_update_policy \
+            2>&1 | tee "$runtime/store-policy.log"
+          grep -E '^test client_install::.* \.\.\. ok$' "$runtime/store-policy.log"
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/store-policy.log"
+          cargo test -p qsh --lib --locked releases::client -- --color never \
+            2>&1 | tee "$runtime/release-client.log"
+          grep -E '^test releases::client::.* \.\.\. ok$' "$runtime/release-client.log"
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/release-client.log"
+          cargo test -p qsh --test client_install --locked -- --color never \
+            2>&1 | tee "$runtime/command.log"
+          grep -F 'test managed_help_capability_pty_has_no_state ... ok' "$runtime/command.log"
+          grep -F 'test development_managed_commands_pty_refuse_without_state ... ok' "$runtime/command.log"
+          grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/command.log"
       - name: Qualify the production Darwin process owner
         shell: bash
         run: |
@@ -949,6 +982,8 @@ jobs:
 
       - name: Build and release script controls
         run: |
+          sh -n scripts/install.sh
+          python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'

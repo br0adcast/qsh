@@ -7,6 +7,24 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=QSH_OFFICIAL_RELEASE");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    let official = std::env::var("QSH_OFFICIAL_RELEASE").as_deref() == Ok("1");
+    let source = if official {
+        let source = std::env::var("GITHUB_SHA").expect("official release requires GITHUB_SHA");
+        assert!(
+            source.len() == 40 && source.bytes().all(|b| b.is_ascii_hexdigit()),
+            "official release requires a full source commit"
+        );
+        source
+    } else {
+        String::new()
+    };
+    println!(
+        "cargo:rustc-env=QSH_CLIENT_OFFICIAL={}",
+        if official { "1" } else { "0" }
+    );
+    println!("cargo:rustc-env=QSH_CLIENT_SOURCE={source}");
     // Rebuild when HEAD (or a ref it points at) moves. The git directory is
     // asked for rather than assumed: in a submodule `.git` is a file.
     let git_dir = git(&["rev-parse", "--absolute-git-dir"]).unwrap_or_else(|| "../.git".into());

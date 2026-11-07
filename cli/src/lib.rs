@@ -5,6 +5,7 @@
 
 pub mod args;
 pub mod background;
+pub mod client_install;
 pub mod climb;
 pub mod connect;
 pub mod escape;
