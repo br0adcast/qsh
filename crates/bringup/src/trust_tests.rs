@@ -1,5 +1,9 @@
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    process::Command,
+};
 
 fn native_os() -> ServerOs {
     if cfg!(target_os = "macos") {
@@ -25,6 +29,47 @@ fn inspect(path: &std::path::Path, purpose: Purpose) -> Result<String, BringUpEr
 fn mode(path: &std::path::Path, value: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(value)).unwrap();
 }
+fn effective_ids() -> (u32, u32) {
+    let id = |flag| {
+        let output = Command::new("/usr/bin/id").arg(flag).output().unwrap();
+        assert!(output.status.success(), "fixture id {flag} failed");
+        let text = std::str::from_utf8(&output.stdout).unwrap().trim();
+        assert!(!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()));
+        text.parse::<u32>().unwrap()
+    };
+    (id("-u"), id("-g"))
+}
+
+fn prepare_special_leaf(path: &std::path::Path) -> (u32, u32) {
+    let ids = effective_ids();
+    let before = fs::metadata(path).unwrap();
+    assert!(before.is_file());
+    assert_eq!(
+        before.uid(),
+        ids.0,
+        "fixture leaf must belong to effective UID"
+    );
+    // Darwin may inherit a parent's group; establish membership before chmod.
+    std::os::unix::fs::chown(path, None, Some(ids.1)).unwrap();
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid()),
+        ids,
+        "fixture ownership setup failed"
+    );
+    ids
+}
+
+fn special_leaf_mode(path: &std::path::Path, requested: u32, ids: (u32, u32)) {
+    mode(path, requested);
+    let actual = fs::metadata(path).unwrap();
+    assert!(
+        actual.mode() & 0o7777 == requested && (actual.uid(), actual.gid()) == ids,
+        "fixture setup failed: requested={requested:04o} actual={:04o} effective UID/GID={ids:?} file UID/GID=({}, {})",
+        actual.mode() & 0o7777, actual.uid(), actual.gid()
+    );
+}
+
 // Reachability tests need a public ancestor even when TMPDIR is private.
 // Only unpredictable owned children are changed; /tmp itself is untouched.
 fn public_tempdir() -> tempfile::TempDir {
@@ -132,14 +177,21 @@ fn trust_quotes_spaces_and_control_limits() {
 #[test]
 fn trust_leaf_must_be_regular_executable_without_special_bits() {
     let (root, file) = fixture();
+    let ids = prepare_special_leaf(&file);
     assert!(inspect(root.path(), Purpose::Execute).is_err());
-    mode(&file, 0o600);
+    special_leaf_mode(&file, 0o600, ids);
     assert!(inspect(&file, Purpose::Execute).is_err());
     for permissions in [0o4700, 0o2700, 0o6700] {
-        mode(&file, permissions);
-        assert!(inspect(&file, Purpose::Execute).is_err());
+        special_leaf_mode(&file, permissions, ids);
+        let result = inspect(&file, Purpose::Execute);
+        let actual = fs::metadata(&file).unwrap();
+        assert!(
+            result.is_err(),
+            "policy accepted requested={permissions:04o} actual={:04o} effective UID/GID={ids:?} file UID/GID=({}, {}) result={result:?}",
+            actual.mode() & 0o7777, actual.uid(), actual.gid()
+        );
     }
-    mode(&file, 0o700);
+    special_leaf_mode(&file, 0o700, ids);
     assert!(inspect(&file, Purpose::Execute).is_ok());
     assert!(inspect(root.path(), Purpose::InstallDirectory).is_ok());
 }
@@ -271,6 +323,7 @@ fn trust_link_and_component_limits_are_enforced_on_existing_paths() {
 #[test]
 fn trust_darwin_metadata_format_fixture() {
     let (root, file) = fixture();
+    let ids = prepare_special_leaf(&file);
     let utility = root.path().join("stat-fixture");
     // Model Apple's numeric M (special) and L (low permission) pieces explicitly.
     fs::write(
@@ -291,7 +344,7 @@ esac
     .unwrap();
     mode(&utility, 0o700);
     for permissions in [0o0000, 0o0700, 0o0755, 0o1777, 0o2700, 0o4700, 0o6700] {
-        mode(&file, permissions);
+        special_leaf_mode(&file, permissions, ids);
         for (format, expected) in [
             ("%Lp:%u", format!("{:o}", permissions & 0o777)),
             ("%OMp%03OLp:%u", format!("{permissions:04o}")),
@@ -329,7 +382,7 @@ esac
             std::str::from_utf8(&output.stdout).unwrap(),
         )
     };
-    mode(&file, 0o700);
+    special_leaf_mode(&file, 0o700, ids);
     // A protected child under a sticky public ancestor remains trusted.
     mode(root.path(), 0o1777);
     assert_eq!(
@@ -341,9 +394,15 @@ esac
     assert!(inspect_darwin(&file, Purpose::Execute).is_err());
     mode(root.path(), 0o700);
     for permissions in [0o4700, 0o2700, 0o6700] {
-        mode(&file, permissions);
-        assert!(inspect_darwin(&file, Purpose::Execute).is_err());
+        special_leaf_mode(&file, permissions, ids);
+        let result = inspect_darwin(&file, Purpose::Execute);
+        let actual = fs::metadata(&file).unwrap();
+        assert!(
+            result.is_err(),
+            "policy accepted requested={permissions:04o} actual={:04o} effective UID/GID={ids:?} file UID/GID=({}, {}) result={result:?}",
+            actual.mode() & 0o7777, actual.uid(), actual.gid()
+        );
     }
-    mode(&file, 0o700);
+    special_leaf_mode(&file, 0o700, ids);
     assert!(inspect_darwin(&file, Purpose::Execute).is_ok());
 }
