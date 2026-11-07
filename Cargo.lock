@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "bringup"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "client",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "prediction",
  "terminal",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "connect"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "knock",
 ]
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "knock"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "socket2",
  "sshauth",
@@ -1700,7 +1700,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "logging"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "libc",
  "log",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "prediction"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "terminal",
  "unicode-width",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "qsh"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "bringup",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "qshd"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2507,7 +2507,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "release-auth"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "alacritty_terminal",
  "terminal",
@@ -3285,7 +3285,7 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "ssh"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3368,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "sshauth"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "alacritty_terminal",
  "memchr",
@@ -3484,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-size"
-version = "0.5.0"
+version = "0.6.0-rc1"
 
 [[package]]
 name = "thiserror"
@@ -3693,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.0"
+version = "0.6.0-rc1"
 dependencies = [
  "blake2 0.10.6",
  "chacha20poly1305",

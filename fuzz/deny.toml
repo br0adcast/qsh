@@ -10,10 +10,10 @@ confidence-threshold = 0.8
 allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
 exceptions = [
     { crate = "qsh-channel-fuzz@0.0.0", allow = ["AGPL-3.0-only"] },
-    { crate = "sshauth@0.5.0", allow = ["AGPL-3.0-only"] },
-    { crate = "terminal@0.5.0", allow = ["AGPL-3.0-only"] },
-    { crate = "transport@0.5.0", allow = ["AGPL-3.0-only"] },
-    { crate = "terminal-size@0.5.0", allow = ["AGPL-3.0-only"] },
+    { crate = "sshauth@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
+    { crate = "transport@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
+    { crate = "terminal-size@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "libfuzzer-sys@0.4.13", allow = ["NCSA", "Apache-2.0 WITH LLVM-exception"] },
 ]
 [licenses.private]
